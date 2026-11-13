@@ -82,4 +82,5 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - [x] ~~ns 0 per-mount flags~~ DONE (ns0flags 2026-11-13): ns-0 alias/bind/self-bind mounts carry ro/nodev/noexec, enforced via mnt_flag_check + exec check; remount replaces flags, MS_BIND|MS_RDONLY single call ignored (Linux); ns-0 dirfds follow the live mount's flags and /proc/mounts + mountinfo print ro/nodev/noexec (ns0mounts 2026-11-13)
+- [ ] ns-0 mount identity for dirfds is a hash of the mountpoint path (`alias::id_of`, lane ns0mounts 7f8edbcc): after a umount + new mount at the same path, an old dirfd picks up the NEW mount's flags (Linux keeps the detached vfsmount, so a ro bind stays ro). Root-only to trigger; give ns-0 mounts a unique generation id instead.
 - /proc/mounts doesn't print ro for ns-0 mounts; ns-0 dirfd flags recorded at open go stale after a later remount
