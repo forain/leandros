@@ -25,6 +25,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **UDP/IP gaps**: no PMTUD (IP_MTU_DISCOVER/IP_MTU, DF on Frag-Needed), no IGMPv3/SSM. (IP fragmentation/reassembly works: udptest `udp_huge` + peer_frag_echo guard it.)
 - ~~**Real NIC drivers program no multicast filter**~~ FIXED 2026-11-11 (lane/nicmcast): macb, e1000e, r8169, iwlwifi already accepted all multicast; brcmf (Pi Wi-Fi) now sets `allmulti` (Pi wifi0 rx of 30 mDNS-group datagrams: +5 before, +37 after). Pass-all, no per-group list. See artifacts/notes/lane-nicmcast-2026-11-11.md.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
+- **brtest fwd_port_reserved flake** (lane brflake 2026-11-13): "flow holder exited cleanly" fails ~2/30 on Mac aarch64 HVF after the TCP flow to the resolver is established; separate from the dead-netns drain bug (fixed; veth_tcp_bulk_exit guards it). Not yet investigated. The earlier veth_pair/veth_tcp_reap/bridge_l2 flakes are FIXED.
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
 - **Podman published ports**: rootful `-p` and `--internal` firewall semantics open (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
@@ -33,15 +34,13 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Venus/Vulkan**: cross-open dmabuf import deferred (`artifacts/notes/m9-crossopen-dmabuf/`), aarch64 vkwl untested; Venus submit still synchronous (parks on fence IRQ, no async completion).
 - **i915** (cursors to 256x256, async flips, hardware WAIT_VBLANK and IN_FENCE_FD landed in lane/i915feat): `WAIT_VBLANK` polls PIPE_FRMCOUNT every 500 us, not IRQ-driven; `DRM_VBLANK_EVENT`/`SIGNAL` return EINVAL; `IN_FENCE_FD` is a CPU wait before the commit, so a NONBLOCK commit blocks on an unsignalled in-fence; wide cursors use the capped plane-1A watermark (no own skl_compute_wm); async flips need the on-screen fb's pitch/size.
 - **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
-- **x86 audio clipping** in DOOM/PipeWire (lane/doomvis).
 - **Minimize applet un-hide unverified** (needs a live session with an open window; applet is a 1x1 hidden surface with zero toplevels by upstream design). `cosmic-files-applet` smithay-clipboard OOM panic: no root cause, needs an in-guest repro with RUST_BACKTRACE (triage 2026-11-13: not reproduced, no runtime log kept). `cosmic-notifications` panel-dbus Broken pipe: the p2p zbus socketpair made in `NotificationsSocket::get_fd` (src/subscriptions/applet.rs) breaks when the applet end closes (applet restart / panel respawn); likely benign upstream behaviour, unverified. Greeter's cosmic-comp logs `eglMakeCurrent BadDisplay` on exit (cosmetic, teardown order).
 - **Panel-embedded applets render with tiny-skia** (root cause: cosmic-panel creates zwp_linux_dmabuf_v1 only if its GLES renderer exists at bind_display(); ours comes ~0.3 s later; needs a cosmic-panel source change, out of bounds - not a kernel bug); aarch64 desktop clicks need a physical-mouse check (P0 #5).
-- **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp; `EVIOCGRAB` exclusive delivery unmeasured; `EVIOCREVOKE` ignored; Ctrl+Alt+Esc swallowed.
+- **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp. (`EVIOCGRAB` exclusivity, `EVIOCREVOKE` and the Ctrl+Alt+Esc escape hatch are implemented and covered by `vttest`; see artifacts/notes/lane-evdevvt-2026-11-13.md.)
 - **One permanent COSMIC patch** (`ports/cosmic-comp/0001-toplevel-info-weak-window.patch`) until upstream has an equivalent (checked 2026-11-13: pop-os/cosmic-comp#2084 and Smithay#1562 still OPEN, PR #2095 closed unmerged - patch stays).
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
-- **Why Limine leaves RAM above 4 GiB out of the HHDM is unexplained** (`lane-fbmm`); aarch64 has no HHDM gap walker.
 - **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
 
 ### Build / tooling
