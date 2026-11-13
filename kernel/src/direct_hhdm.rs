@@ -187,3 +187,54 @@ pub unsafe fn extend(regions: &[MemoryRegion], gb: bool) -> Outcome {
     core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
     o
 }
+
+/// Map every page of `[phys, phys+len)` above 2 GiB that the HHDM does not
+/// map yet as 4 KiB write-back pages, from the same BSS pool. Present
+/// entries (1 GiB / 2 MiB / 4 KiB) are never touched. Returns the number of
+/// pages newly mapped; stops quietly when the pool is exhausted.
+///
+/// # Safety
+/// Direct boot only, after [`extend`], on the BSP.
+pub unsafe fn map_phys_4k(phys: u64, len: u64) -> usize {
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4 = tab(cr3);
+    let mut n = 0;
+    let mut a = (phys & !0xfff).max(LOW_DONE);
+    let end = (phys.saturating_add(len).saturating_add(0xfff)) & !0xfff;
+    while a < end {
+        let l4 = HHDM_L4 + (a >> 39) as usize;
+        if l4 >= HHDM_L4_END { break; }
+        let Some(pdpt) = next_level(pml4, l4) else { break };
+        let ge = pdpt.add(((a >> 30) & 511) as usize).read();
+        if ge & P != 0 && ge & PS != 0 { a = (a & !(GIB - 1)) + GIB; continue; }
+        let Some(pd) = next_level(pdpt, ((a >> 30) & 511) as usize) else { break };
+        let de = pd.add(((a >> 21) & 511) as usize).read();
+        if de & P != 0 && de & PS != 0 { a = (a & !(MIB2 - 1)) + MIB2; continue; }
+        let Some(pt) = next_level(pd, ((a >> 21) & 511) as usize) else { break };
+        let slot = pt.add(((a >> 12) & 511) as usize);
+        if slot.read() & P == 0 { slot.write(a | P | W); n += 1; }
+        a += 4096;
+    }
+    n
+}
+
+/// Map the pages of every ACPI table reachable from `rsdp` that the HHDM
+/// lacks (tables in firmware-Reserved RAM above 2 GiB, which `extend` skips),
+/// then flush. Returns the number of pages mapped. MMIO / EFI runtime ranges
+/// of the same memory-map type stay unmapped: only table pages are touched.
+///
+/// # Safety
+/// As [`map_phys_4k`]; `hhdm` is the HHDM base.
+pub unsafe fn map_acpi(rsdp: u64, hhdm: u64) -> usize {
+    let mut pages = 0usize;
+    boot::acpi_pages::walk(
+        rsdp, boot::memmap::MAX_PHYS,
+        &mut |p, l| pages += map_phys_4k(p, l),
+        &mut |p, b| core::ptr::copy_nonoverlapping((p + hhdm) as *const u8, b.as_mut_ptr(), b.len()),
+    );
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+    pages
+}

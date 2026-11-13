@@ -1417,6 +1417,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         serial_print_str("\n");
         unsafe { (*core::ptr::addr_of_mut!(BOOT_INFO)).rsdp_addr = r; }
     }
+    // ACPI tables in firmware-Reserved RAM above 2 GiB (Limine's type 8) reach
+    // us as plain Reserved, which `extend` leaves unmapped: map just their pages.
+    #[cfg(target_arch = "x86_64")]
+    // `direct.acpimap=0` skips it (fail-first switch for kexecacpitest.py).
+    if !is_limine && cmdline_knob("direct.acpimap").map_or(true, |v| v != "0") {
+        let rsdp = unsafe { (*core::ptr::addr_of!(BOOT_INFO)).rsdp_addr };
+        let n = unsafe { direct_hhdm::map_acpi(rsdp, hhdm_offset as u64) };
+        serial_print_str("[early] direct HHDM: mapped ");
+        serial_print_hex(n);
+        serial_print_str(" ACPI page(s)\n");
+    }
     // Usable RAM the bootloader's HHDM does not actually map is dropped
     // before mm writes into it (lane fbmm: HP, Fast Boot OFF).
     #[cfg(target_arch = "x86_64")]

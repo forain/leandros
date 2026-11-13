@@ -4,6 +4,9 @@
 #[path = "../../src/memmap.rs"]
 pub mod memmap;
 
+#[path = "../../src/acpi_pages.rs"]
+pub mod acpi_pages;
+
 #[path = "../../src/hhdm_a64.rs"]
 pub mod hhdm_a64;
 #[path = "../../../mm/src/dma_cache.rs"]
@@ -548,5 +551,65 @@ mod psci_ap_tests {
         let arrive = off.find("str     x12, [x11, x16, lsl #3]").expect("arrival marker");
         let psci = off.find("#0x8400, lsl #16").expect("CPU_OFF fid");
         assert!(cisw < arrive && arrive < park && park < psci);
+    }
+
+    mod acpi_walk {
+        use super::super::acpi_pages::walk;
+
+        fn put(m: &mut Vec<u8>, at: usize, b: &[u8]) { if m.len() < at + b.len() { m.resize(at + b.len(), 0); } m[at..at + b.len()].copy_from_slice(b); }
+        fn hdr(m: &mut Vec<u8>, at: usize, sig: &[u8; 4], len: u32) { put(m, at, sig); put(m, at + 4, &len.to_le_bytes()); }
+
+        /// RSDP at 0x1000, XSDT 0x2000 (2 entries), FADT 0x3000 (DSDT 0x10_0000, FACS 0x20_0000), MADT 0x4000.
+        fn image() -> Vec<u8> {
+            let mut m = vec![0u8; 0x4000 + 0x100];
+            put(&mut m, 0x1000, b"RSD PTR ");
+            m[0x1000 + 15] = 2;
+            put(&mut m, 0x1000 + 24, &0x2000u64.to_le_bytes());
+            hdr(&mut m, 0x2000, b"XSDT", 36 + 16);
+            put(&mut m, 0x2000 + 36, &0x3000u64.to_le_bytes());
+            put(&mut m, 0x2000 + 44, &0x4000u64.to_le_bytes());
+            hdr(&mut m, 0x3000, b"FACP", 148);
+            put(&mut m, 0x3000 + 36, &0x20_0000u32.to_le_bytes());
+            put(&mut m, 0x3000 + 40, &0x10_0000u32.to_le_bytes());
+            hdr(&mut m, 0x4000, b"APIC", 0x100);
+            hdr(&mut m, 0x10_0000, b"DSDT", 0x3000);
+            hdr(&mut m, 0x20_0000, b"FACS", 64);
+            put(&mut m, 0x20_0000 + 4, &64u32.to_le_bytes());
+            m
+        }
+
+        fn collect(m: &Vec<u8>, rsdp: u64, max: u64) -> Vec<(u64, u64)> {
+            let got = std::cell::RefCell::new(Vec::<(u64, u64)>::new());
+            let mut want = |p: u64, l: u64| got.borrow_mut().push((p, l));
+            let mut rd = |p: u64, b: &mut [u8]| {
+                for (i, x) in b.iter_mut().enumerate() {
+                    let a = p + i as u64;
+                    // A read of a byte not yet requested is the bug the walker exists to avoid.
+                    assert!(got.borrow().iter().any(|&(s, l)| a >= s && a < s + l), "read of {a:#x} before want");
+                    *x = m.get(a as usize).copied().unwrap_or(0);
+                }
+            };
+            walk(rsdp, max, &mut want, &mut rd);
+            got.into_inner()
+        }
+
+        #[test]
+        fn collects_every_table_range() {
+            let m = image();
+            let r = collect(&m, 0x1000, 1 << 40);
+            for want in [(0x1000, 36), (0x2000, 52), (0x3000, 148), (0x4000, 0x100), (0x10_0000, 0x3000), (0x20_0000, 64)] {
+                assert!(r.contains(&want), "missing {want:x?} in {r:x?}");
+            }
+        }
+
+        #[test]
+        fn rejects_bad_rsdp_and_oversize() {
+            let mut m = image();
+            assert!(collect(&m, 0x5000, 1 << 40).len() == 1, "non-RSDP: only the 36 B probe");
+            hdr(&mut m, 0x4000, b"APIC", 0x4000_0000);
+            let r = collect(&m, 0x1000, 1 << 40);
+            assert!(!r.iter().any(|&(p, l)| p == 0x4000 && l > 0x100));
+            assert!(collect(&m, 0x1000, 0x1800).iter().all(|&(p, _)| p < 0x1800));
+        }
     }
 }

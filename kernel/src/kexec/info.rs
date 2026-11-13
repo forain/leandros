@@ -18,6 +18,7 @@ pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
     let mut v = Vec::new();
     if !lim.is_empty() {
         for e in lim { v.push(Raw { base: e.base, length: e.length, raw_type: e.raw_type }); }
+        acpi_resvd(bi, &mut v);
         return v;
     }
     use boot::MemoryType::*;
@@ -26,6 +27,36 @@ pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
         v.push(Raw { base: r.base, length: r.length, raw_type: t });
     }
     v
+}
+
+/// `kexec.test=acpiresvd`: retype every ACPI reclaimable/NVS entry holding an
+/// ACPI table above 2 GiB to raw 8, as firmware keeping tables in Reserved RAM
+/// would. x86_64 only (aarch64 has no ACPI path).
+#[allow(unused_variables)]
+#[allow(dead_code)]
+static RETYPED_LO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[allow(unused_variables)]
+fn acpi_resvd(bi: &boot::BootInfo, v: &mut Vec<Raw>) {
+    #[cfg(target_arch = "x86_64")]
+    if super::acpi_resvd() && bi.rsdp_addr != 0 {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        boot::acpi_pages::walk(
+            bi.rsdp_addr, boot::memmap::MAX_PHYS,
+            &mut |p, l| ranges.push((p, l)),
+            &mut |p, b| unsafe { core::ptr::copy_nonoverlapping(mm::phys_to_virt(p as usize) as *const u8, b.as_mut_ptr(), b.len()) },
+        );
+        let mut n = 0;
+        for r in v.iter_mut() {
+            if matches!(r.raw_type, 2 | 3) && ranges.iter().any(|&(p, l)| p >= (2u64 << 30) && p < r.base + r.length && p + l > r.base) {
+                crate::serial_print_str(&alloc::format!("[KEXEC] retype {:#x}+{:#x} type {} -> 8\n", r.base, r.length, r.raw_type));
+                r.raw_type = 8;
+                RETYPED_LO.fetch_min(r.base, core::sync::atomic::Ordering::SeqCst);
+                n += 1;
+            }
+        }
+        crate::serial_print_str(&alloc::format!("[KEXEC] test acpiresvd: {} table range(s), {} map entr(ies) retyped to 8\n", ranges.len(), n));
+    }
 }
 
 /// Sorted, merged spans of memory the old kernel may overwrite at kexec time
@@ -89,8 +120,23 @@ pub struct Inputs<'a> {
 #[cfg(target_arch = "x86_64")]
 pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> Result<u64, isize> {
     use boot::mb2_build::*;
+    // `kexec.test=acpiresvd`: firmware keeps such tables above the last usable
+    // RAM; QEMU puts them mid-RAM, where the next kernel's HHDM covers them
+    // anyway. Make the tables the top of RAM: everything usable above the
+    // lowest retyped (type 8) table entry becomes Reserved in the handed-over map.
+    let mut cut: Vec<Raw> = map.to_vec();
+    if super::acpi_resvd() {
+        let lo = RETYPED_LO.load(core::sync::atomic::Ordering::SeqCst);
+        if lo != u64::MAX {
+            let mut n = 0;
+            for r in cut.iter_mut().filter(|r| r.base >= lo && matches!(r.raw_type, 0 | 2 | 3 | 5 | 6)) { r.raw_type = 1; n += 1; }
+            crate::serial_print_str(&alloc::format!("[KEXEC] test acpiresvd: {} usable entr(ies) >= {:#x} made Reserved\n", n, lo));
+        }
+    }
+    let map = &cut[..];
     let regions: Vec<RawRegion> = map.iter()
         .map(|r| RawRegion { base: r.base, length: r.length, raw_type: r.raw_type }).collect();
+    for r in map.iter().filter(|r| r.base >= (2u64 << 30)) { crate::serial_print_str(&alloc::format!("[KEXEC] mbi-in {:#x}+{:#x} t{}\n", r.base, r.length, r.raw_type)); }
     let reserve: Vec<(u64, u64)> = inp.footprint.iter().map(|&(s, e)| (s, e - s)).collect();
 
     // RSDP bytes through the HHDM.
