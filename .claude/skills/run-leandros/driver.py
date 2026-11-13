@@ -786,7 +786,10 @@ def _netdev_args(arch="aarch64"):
     port = _ssh_host_port(arch)
     with open(SSH_STATE_FILE, "w") as f:
         f.write(f"127.0.0.1 {port}\n")
-    return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"]
+    # LEANDROS_HOSTFWD: more net0 hostfwd rules (comma separated), e.g.
+    # "tcp:127.0.0.1:18581-:18081" (podbridgetest: published port reached from the host).
+    extra = "".join(f",hostfwd={r}" for r in os.environ.get("LEANDROS_HOSTFWD", "").split(",") if r)
+    return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22{extra}"]
 
 
 def eth0_lease(log_bytes):

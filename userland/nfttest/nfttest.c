@@ -204,6 +204,13 @@ int main(void)
     run("nft add table inet t && nft add chain inet t a && nft add chain inet t b && nft add rule inet t a jump b", out, sizeof out);
     CHECK("delete referenced chain fails", run("nft delete chain inet t b 2>&1", out, sizeof out) != 0);
     CHECK("delete missing chain fails", run("nft delete chain inet t nope 2>&1", out, sizeof out) != 0);
+    /* netavark's JSON delete of a chain carries no DELRULE for its own rules (capture b_teardown). */
+    run("nft add chain inet t d && nft add rule inet t d accept && nft add rule inet t a jump d", out, sizeof out);
+    CHECK("delete chain with own rules, jump still there: EBUSY",
+          run("echo '{\"nftables\":[{\"delete\":{\"chain\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"d\"}}}]}' | nft -j -f - 2>&1", out, sizeof out) != 0);
+    run("nft flush chain inet t a", out, sizeof out);
+    CHECK("delete chain with own rules once unreferenced",
+          run("echo '{\"nftables\":[{\"delete\":{\"chain\":{\"family\":\"inet\",\"table\":\"t\",\"name\":\"d\"}}}]}' | nft -j -f - 2>&1", out, sizeof out) == 0);
     CHECK("flush chain then delete", run("nft flush chain inet t a && nft delete chain inet t b && nft delete chain inet t a", out, sizeof out) == 0);
     CHECK("delete table", run("nft delete table inet t && nft -j list ruleset | grep -vq '\"table\"'", out, sizeof out) == 0);
 
