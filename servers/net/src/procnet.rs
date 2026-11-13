@@ -187,6 +187,7 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"tcp"   => inet(&mut w, true),
         b"udp"   => inet(&mut w, false),
         b"unix"  => unix(&mut w),
+        b"if_inet6" => crate::ip6::proc_if_inet6(&mut w),
         b"nic"   => nic(&mut w),
         b"tcpsnd" => tcpsnd(&mut w),
         b"listen" => super::listen::proc_listen(&mut w),
