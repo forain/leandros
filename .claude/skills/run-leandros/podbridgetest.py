@@ -113,6 +113,79 @@ def main():
         check("podman_internal_forwarding_kept", fm is not None and fm.group(1) == "0", "out=" + out.strip()[-160:].replace("\n", " | "))
         run("podman stop -t 0 pbintc >/dev/null 2>&1; sleep 3; podman rm -f pbintc >/dev/null 2>&1; podman network rm -f pbint >/dev/null 2>&1")
 
+        # ---- L3 (podnft): firewall_driver = "nftables": published ports through the bridge ----
+        def srv_tcp(name, extra, port):
+            return run(f"podman run -d --rm --name {name} {extra} {IMG} sh -c "
+                       f"'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-{name}\\n\" | nc -l -p {port}; done' 2>&1; sleep 2")
+
+        def hostwget(url):  # a --network=host container = a client in the guest's host netns
+            return run(f"podman run --rm --network=host {IMG} wget -T 10 -qO- {url} 2>&1")
+
+        rc, out = run("ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1")
+        nicip = (out.strip().splitlines() or ["10.0.2.15"])[-1].strip()
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", nicip):
+            nicip = "10.0.2.15"
+        run("podman rm -af >/dev/null 2>&1; true")
+        run(f"podman run --rm {IMG} true >/dev/null 2>&1")  # bridge + base netavark table exist
+        rc, base = run("nft list ruleset | md5sum")
+        rc, out = srv_tcp("pbpub", "-p 18081:80", 80)
+        rc, rs = run("nft list ruleset 2>&1")
+        check("podman_nft_driver", re.search(r"dport 18081", rs) is not None and "NETAVARK-HOSTPORT-DNAT" in rs,
+              "ruleset: " + rs.strip()[-160:].replace("\n", " | "))
+        for nm, u in (("lo", "127.0.0.1"), ("nicip", nicip)):
+            rc, out = hostwget(f"http://{u}:18081/")
+            check(f"podman_publish_local_{nm}", rc == 0 and "hello-pbpub" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        for nm, u in (("bridge", "10.88.0.1"), ("nicip", nicip)):
+            rc, out = run(f"podman run --rm {IMG} wget -T 10 -qO- http://{u}:18081/ 2>&1")
+            check(f"podman_publish_ctr_{nm}", rc == 0 and "hello-pbpub" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        # The Mac reaches it through the QEMU hostfwd (net0 -> nic_rx -> PREROUTING DNAT).
+        hp = int(os.environ.get("PODBRIDGE_HOSTFWD_PORT", "18581"))
+        got = b""
+        try:
+            import socket
+            c = socket.create_connection(("127.0.0.1", hp), timeout=15)
+            c.settimeout(15)
+            c.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            while True:
+                d = c.recv(512)
+                if not d:
+                    break
+                got += d
+            c.close()
+        except Exception as e:  # noqa: BLE001
+            got = f"ERR {e}".encode()
+        check("podman_publish_ext", b"hello-pbpub" in got, got.decode(errors="replace")[:100])
+        run("podman rm -f pbpub >/dev/null 2>&1")
+
+        # UDP on loopback only, and a port range.
+        run(f"podman run -d --rm --name pbudp -p 127.0.0.1:19090:90/udp {IMG} sh -c "
+            "'while :; do echo udp-pong | nc -u -l -p 90; done' >/dev/null 2>&1; sleep 2")
+        rc, out = run(f"podman run --rm --network=host {IMG} sh -c 'echo ping | nc -u -w 3 127.0.0.1 19090' 2>&1")
+        check("podman_publish_udp", "udp-pong" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        run("podman rm -f pbudp >/dev/null 2>&1")
+        srv_tcp("pbrng", "-p 18100-18102:8100-8102", 8101)
+        rc, rs = run("nft list ruleset 2>&1")
+        rc, out = hostwget("http://127.0.0.1:18101/")
+        check("podman_publish_range", rc == 0 and "hello-pbrng" in out and "18100-18102" in rs, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        run("podman rm -f pbrng >/dev/null 2>&1")
+
+        # --internal: a default route added by hand must still not leave the network.
+        run("podman network rm -f pbint2 >/dev/null 2>&1; podman network create --internal pbint2 2>&1")
+        rc, out = run(f"gwi=$(podman network inspect pbint2 -f '{{{{(index .Subnets 0).Gateway}}}}'); "
+                      f"podman run --rm --network=pbint2 --cap-add NET_ADMIN {IMG} sh -c "
+                      f"\"ip route add default via $gwi; wget -T 6 -qO- http://{gw}:{port}/ 2>&1; echo W=\\$?\" 2>&1")
+        wm = re.search(r"W=(\d+)", out)
+        check("podman_internal_unreachable", wm is not None and wm.group(1) != "0" and "hello-from-host" not in out, out.strip()[-160:].replace("\n", " | "))
+        run("podman network rm -f pbint2 >/dev/null 2>&1")
+
+        # Teardown: 5 create/remove cycles leave the ruleset where it started.
+        run(f"i=0; while [ $i -lt 5 ]; do podman run -d --rm --name pbcyc -p 18090:80 {IMG} sleep 30 >/dev/null 2>&1; "
+            "podman rm -f pbcyc >/dev/null 2>&1; i=$((i+1)); done")
+        rc, now = run("nft list ruleset | md5sum")
+        rc, rs = run("nft list ruleset 2>&1")
+        check("podman_publish_teardown", now.strip() == base.strip() and "18090" not in rs and "18081" not in rs,
+              "left: " + rs.strip()[-200:].replace("\n", " | "))
+
         rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
         bl = out.strip().splitlines()[-1:] 
         base_mnt = int(bl[0]) if bl and bl[0].isdigit() else 0
