@@ -1385,7 +1385,11 @@ static void nn_case(const char *name, int mode) {
     FILE *fp = fopen("/tmp/nn.nft", "w");
     if (fp) { fputs(NN_RULES, fp); fclose(fp); }
     snprintf(msg, sizeof msg, "%s: nft -f loads the netavark-shaped ruleset", name);
-    CHECK(msg, system("nft -f /tmp/nn.nft") == 0);
+    int nr = system("nft -f /tmp/nn.nft >/tmp/nn.err 2>&1");
+    if (nr) { char eb[200] = ""; FILE *ef = fopen("/tmp/nn.err", "r"); if (ef) { size_t n = fread(eb, 1, 190, ef); eb[n] = 0; fclose(ef); }
+        for (char *q = eb; *q; q++) if (*q == '\n') *q = ' ';
+        printf("# nft rc=%d: %s\n", nr, eb); }
+    CHECK(msg, nr == 0);
     g_nn_mode = mode; g_nn_role = 0;
     pid_t c = spawn_ns(nn_body);
     int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
