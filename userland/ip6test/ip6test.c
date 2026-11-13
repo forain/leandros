@@ -577,6 +577,42 @@ static void test_ping6_ll_router(void) {
     CHECK("ping6_ll_router", good == 4);
 }
 
+static void test_slaac_addr(void) {
+    unsigned char m[6];
+    char line[256], want[40];
+    int ok = eth0_mac(m), found = 0;
+    for (int i = 0; ok && i < 100 && !found; i++) {
+        found = if_inet6_find("eth0", "fec0", line, sizeof line);
+        if (!found) usleep(100000);
+    }
+    if (ok) {
+        snprintf(want, sizeof want, "fec0000000000000%02x%02x%02xfffe%02x%02x%02x",
+                 m[0] ^ 2, m[1], m[2], m[3], m[4], m[5]);
+        ok = found && !strncmp(line, want, 32);
+    }
+    CHECK("slaac_addr", ok);
+}
+
+static void test_ping6_global(void) {
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_global", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, "fec0::2", &a.sin6_addr);
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4322, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping fec0::2: %d/4\n", good);
+    CHECK("ping6_global", good == 4);
+}
+
 static void test_ll_noscope(void) {
     struct sockaddr_in6 a = router_ll();
     a.sin6_port = htons(53);
@@ -659,6 +695,8 @@ int main(int argc, char **argv) {
     test_localhost_fallback();
     test_ll_present();
     test_ping6_ll_router();
+    test_slaac_addr();
+    test_ping6_global();
     test_ll_noscope();
     test_ll_bind_scope();
     test_disable_ipv6();
