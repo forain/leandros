@@ -45,6 +45,7 @@ fn acpi_resvd(bi: &boot::BootInfo, v: &mut Vec<Raw>) {
         let mut n = 0;
         for r in v.iter_mut() {
             if matches!(r.raw_type, 2 | 3) && ranges.iter().any(|&(p, l)| p >= (2u64 << 30) && p < r.base + r.length && p + l > r.base) {
+                crate::serial_print_str(&alloc::format!("[KEXEC] retype {:#x}+{:#x} type {} -> 8\n", r.base, r.length, r.raw_type));
                 r.raw_type = 8;
                 n += 1;
             }
@@ -116,6 +117,7 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
     use boot::mb2_build::*;
     let regions: Vec<RawRegion> = map.iter()
         .map(|r| RawRegion { base: r.base, length: r.length, raw_type: r.raw_type }).collect();
+    for r in map.iter().filter(|r| r.base >= (2u64 << 30)) { crate::serial_print_str(&alloc::format!("[KEXEC] mbi-in {:#x}+{:#x} t{}\n", r.base, r.length, r.raw_type)); }
     let reserve: Vec<(u64, u64)> = inp.footprint.iter().map(|&(s, e)| (s, e - s)).collect();
 
     // RSDP bytes through the HHDM.
