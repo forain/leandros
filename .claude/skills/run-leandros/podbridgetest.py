@@ -70,6 +70,7 @@ def main():
                 gw = ".".join(str(b) for b in g)
         print(f"podbridge: host gateway {gw}, http port {port}")
 
+        run("podman rm -af >/dev/null 2>&1")  # stale containers of an earlier aborted run
         rc, out = run(f"podman run --rm {IMG} echo hi 2>&1")
         check("podman_echo", rc == 0 and "Rolling back" not in out and "level=error" not in out and "ERRO" not in out and re.search(r"^hi\s*$", out, re.M) is not None,
               f"rc={rc} " + out.strip()[-200:].replace("\n", " | ") if rc != 0 or "Rolling" in out or "ERRO" in out else "")
@@ -94,13 +95,11 @@ def main():
         else:
             print(f"podman_dns: SKIP rc={rc} " + out.strip()[-120:].replace("\n", " | "))
 
-        # L0 (podl0): rootful -p works today through --network=pasta (bridge -p awaits nf_tables).
-        run("podman rm -f pbpasta >/dev/null 2>&1")
-        run(f"podman run -d --rm --name pbpasta --network=pasta -p 18081:80 {IMG} sh -c "
-            "'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-rootful-pasta\\n\" | nc -l -p 80; done' 2>&1; sleep 3")
-        rc, out = run("busybox.static wget -T 15 -qO- http://127.0.0.1:18081/ 2>&1; echo")
-        check("podman_pasta_root_portfwd", "hello-rootful-pasta" in out, f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))
-        run("podman rm -f pbpasta >/dev/null 2>&1")
+        # L0 (podl0) REFUTED: podman 5.8.9 rejects `--network=pasta` as root ("pasta networking is
+        # only supported for rootless mode or when inside a nested userns"), a podman-side gate.
+        # Published ports work today only rootless (podpastatest pasta_portfwd).
+        rc, out = run(f"podman run --rm --network=pasta -p 18081:80 {IMG} true 2>&1")
+        check("podman_pasta_root_rejected", rc != 0 and "only supported for rootless" in out, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
 
         # --internal (podl0): netavark writes conf/<bridge>/forwarding=0; a later non-internal
         # setup's ip_forward=1 must not clobber it (Linux fans out only when the value changes).
@@ -112,7 +111,7 @@ def main():
                       "echo FWD=$(cat /proc/sys/net/ipv4/conf/$br/forwarding)")
         fm = re.search(r"FWD=(\d)", out)
         check("podman_internal_forwarding_kept", fm is not None and fm.group(1) == "0", "out=" + out.strip()[-160:].replace("\n", " | "))
-        run("podman rm -f pbintc >/dev/null 2>&1; podman network rm -f pbint >/dev/null 2>&1")
+        run("podman stop -t 0 pbintc >/dev/null 2>&1; sleep 3; podman rm -f pbintc >/dev/null 2>&1; podman network rm -f pbint >/dev/null 2>&1")
 
         rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
         bl = out.strip().splitlines()[-1:] 
