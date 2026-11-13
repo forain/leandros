@@ -331,6 +331,8 @@ static int echo_server_body(void) {
  * exit (0) or, with tcp_accepts == 0, signal and pause with the listener left open. */
 static int tcp_accepts;
 static int tcp_net;
+static int tcp_bulk;   /* serve a BULK_BYTES stream instead of an echo */
+#define BULK_BYTES (192 * 1024)
 static int tcp_body(void) {
     char ip[32]; snprintf(ip, sizeof ip, "10.99.%d.2", tcp_net);
     int s = nl_sock();
@@ -344,6 +346,18 @@ static int tcp_body(void) {
         struct pollfd p = { t, POLLIN, 0 };
         if (poll(&p, 1, 15000) <= 0) return 3;
         int c = accept(t, NULL, NULL);
+        if (tcp_bulk) {
+            static char blk[4096];
+            memset(blk, 'z', sizeof blk);
+            char go; if (read(c, &go, 1) != 1) return 4;
+            for (int sent = 0; sent < BULK_BYTES; ) {
+                ssize_t w = write(c, blk, sizeof blk);
+                if (w <= 0) return 5;
+                sent += (int)w;
+            }
+            close(c);
+            continue;
+        }
         char b[64]; ssize_t n = read(c, b, sizeof b);
         if (n > 0) write(c, b, n);
         close(c);
@@ -417,6 +431,36 @@ static pid_t tcp_ns_start(int s, const char *host_if, int net, int accepts) {
     char ch = 'g'; write(ctl[1], &ch, 1);
     if (rd_to(done_[0], &ch) != 1) { kill(c, SIGKILL); wait_child(c); return -1; }
     return c;
+}
+
+/* The netns child writes BULK_BYTES, closes and exits at once; the unsent/unread tail must survive the
+ * reaping of its netns (the dead stacks are kept until their TCP data drains). Repeated: loss was racy. */
+static void veth_tcp_bulk_exit(void) {
+    int s = nl_sock();
+    int bad = 0, rounds = 6;
+    for (int r = 0; r < rounds; r++) {
+        tcp_bulk = 1;
+        pid_t c = tcp_ns_start(s, "vethK", 97, 1);
+        tcp_bulk = 0;
+        if (c <= 0) { bad++; break; }
+        int t = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { 5, 0 };
+        setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+        inet_pton(AF_INET, "10.99.97.2", &to.sin_addr);
+        long got = 0;
+        if (connect(t, (struct sockaddr *)&to, sizeof to) == 0 && write(t, "x", 1) == 1) {
+            static char rb[8192];
+            ssize_t n;
+            while ((n = read(t, rb, sizeof rb)) > 0) got += n;
+        }
+        close(t);
+        if (got != BULK_BYTES) { printf("  round %d: got %ld of %d\n", r, got, BULK_BYTES); bad++; }
+        wait_child(c);
+        if (!gone_within(s, "vethK", 5000)) bad++;
+    }
+    CHECK("veth_tcp_bulk_exit: every round delivered all bytes after the writer exited", bad == 0);
+    close(s);
 }
 
 static void veth_tcp_reap(void) {
@@ -1285,6 +1329,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "veth_pair")) veth_pair();
     if (!only || !strcmp(only, "accept_ns")) accept_ns();
     if (!only || !strcmp(only, "veth_tcp_reap")) veth_tcp_reap();
+    if (!only || !strcmp(only, "veth_tcp_bulk_exit")) veth_tcp_bulk_exit();
     if (!only || !strcmp(only, "veth_listen_reap")) veth_listen_reap();
     if (!only || !strcmp(only, "veth_ping")) veth_ping();
     if (!only || !strcmp(only, "veth_dellink")) veth_dellink();

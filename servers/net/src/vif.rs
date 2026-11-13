@@ -128,6 +128,8 @@ pub(crate) fn set_lo(ns: u16, up: bool) {
     if !up { return; }
     // Slots exhausted: namespaces that died since the daemon's last pass.
     if !VIFS.lock()[FIRST_DYN as usize..].iter().any(|x| x.is_none()) { daemon_pass(); }
+    // Still full: dead namespaces in their drain grace give their sids up now.
+    if !VIFS.lock()[FIRST_DYN as usize..].iter().any(|x| x.is_none()) { finish_dying(true); }
     let sid = {
         let mut n = NETNS.lock();
         let mut v = VIFS.lock();
@@ -159,6 +161,7 @@ pub(crate) fn daemon_pass() {
             if bits & (1 << b) != 0 { reap((w * 64 + b) as u16); }
         }
     }
+    finish_dying(false);
 }
 
 /// Free the given (netns, sid) vifs wherever they live: drop them from their
@@ -166,18 +169,23 @@ pub(crate) fn daemon_pass() {
 pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
     {
         let mut n = NETNS.lock();
-        let mut v = VIFS.lock();
         for &(ns, sid) in list {
             if let Some(st) = n.get_mut(&ns) {
                 st.sids.retain(|&s| s != sid);
                 st.routes.retain(|r| r.oif != sid);
             }
-            v[sid as usize] = None;
         }
     }
     for &(_, sid) in list { crate::l2::forget(sid); }
     // No table lock is held: the stack locks are taken alone.
     for &(_, sid) in list { *crate::STACKS[sid as usize].lock() = None; }
+    // The VIFS slot (the sid allocator's "taken" mark) is released only after
+    // the stack is gone: freeing it first let a new veth reuse the sid and have
+    // its fresh stack wiped by this late `= None`.
+    {
+        let mut v = VIFS.lock();
+        for &(_, sid) in list { v[sid as usize] = None; }
+    }
 }
 
 fn reap(ns: u16) {
@@ -195,10 +203,69 @@ fn reap(ns: u16) {
                 }
             }
         }
-        for &sid in st.sids.iter() { v[sid as usize] = None; }
     }
-    free_vifs(&peers);
-    for &sid in st.sids.iter() { crate::l2::forget(sid); }
-    // No stack lock is held here (VIFS/NETNS are released).
-    for &sid in st.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
+    // The namespace id is free for reuse from here on (its NETNS entry is
+    // gone); its stacks and those of the veth peers it takes along live on
+    // in DYING until their TCP traffic has drained (`finish_dying`).
+    DYING.lock().push(Dying { sids: st.sids, peers, deadline: sched::ticks() + REAP_GRACE_TICKS });
+    finish_dying(false);
+}
+
+/// A dead namespace whose stacks are not freed yet.
+struct Dying { sids: Vec<Sid>, peers: Vec<(u16, Sid)>, deadline: u64 }
+static DYING: Mutex<Vec<Dying>> = Mutex::new(Vec::new());
+
+/// Longest a dead namespace's stacks wait for their TCP traffic (2 s at
+/// 100 ticks/s): bounded, so a veth end still goes within seconds.
+const REAP_GRACE_TICKS: u64 = 200;
+
+/// Whether stack `sid` still carries TCP data in flight: an orphaned
+/// connection of the exited process whose reply or FIN is not yet acked, or a
+/// live socket (on a veth peer in another namespace) holding bytes its owner
+/// has not read yet. Freeing the stack then would drop them: the process's
+/// last write() before exit never reached the peer, and the peer's read()
+/// lost bytes already delivered. Linux keeps such sockets (and their netns)
+/// alive past the owner's exit; this keeps the stacks for a bounded grace.
+fn tcp_busy(sid: Sid) -> bool {
+    use smoltcp::socket::{tcp, AnySocket};
+    let st = crate::STACKS[sid as usize].lock();
+    let Some(s) = st.as_ref() else { return false };
+    let busy = s.socket_set.iter().any(|(_, sock)| match tcp::Socket::downcast(sock) {
+        Some(t) => match t.state() {
+            tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => false,
+            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => true,
+            _ => t.send_queue() > 0 || t.recv_queue() > 0,
+        },
+        None => false,
+    });
+    busy
+}
+
+/// Free every dead namespace whose stacks have drained or whose grace ran
+/// out (`force`: all of them, for an exhausted sid table).
+fn finish_dying(force: bool) {
+    let now = sched::ticks();
+    let ready: Vec<Dying> = {
+        let mut d = DYING.lock();
+        if d.is_empty() { return; }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < d.len() {
+            let x = &d[i];
+            // Stack locks are leaves: taking them under DYING is safe.
+            let busy = !force && now < x.deadline
+                && (x.sids.iter().any(|&s| tcp_busy(s)) || x.peers.iter().any(|&(_, s)| tcp_busy(s)));
+            if busy { i += 1; } else { out.push(d.swap_remove(i)); }
+        }
+        out
+    };
+    for x in ready {
+        free_vifs(&x.peers);
+        for &sid in x.sids.iter() { crate::l2::forget(sid); }
+        // No stack lock is held here (VIFS/NETNS are released).
+        for &sid in x.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
+        // Release the sids only now (see free_vifs): a reused sid must not lose its new stack.
+        let mut v = VIFS.lock();
+        for &sid in x.sids.iter() { v[sid as usize] = None; }
+    }
 }
