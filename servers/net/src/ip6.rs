@@ -50,7 +50,8 @@ pub(crate) fn needs_scope(ip: IpAddress) -> bool {
 pub(crate) fn scope_sid(ns: u16, scope: u32) -> Result<Sid, i32> {
     if scope == 0 { return Err(-22); }
     let sid = scope - 1;
-    if ns == 0 && sid >= 1 && sid < FIRST_DYN as u32 && crate::stack_for(sid as Sid).is_some() { Ok(sid as Sid) } else { Err(-19) }
+    if ns == 0 && sid >= 1 && sid < FIRST_DYN as u32 && crate::stack_for(sid as Sid).is_some() { Ok(sid as Sid) }
+    else if let Some(s) = crate::tunbe::sid_by_ifindex(ns, scope) { Ok(s) } else { Err(-19) }
 }
 
 /// The link-local address of netif `id`, while installed.

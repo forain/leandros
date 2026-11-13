@@ -155,10 +155,14 @@ pub(crate) fn route_select(ns: u16, dst: IpAddress) -> Option<Sid> {
         // A non-initial netns sees only its own stacks: no fall-through to
         // netns 0's lo or NICs.
         if matches!(dst, IpAddress::Ipv6(_)) && is_loopback(dst) { return crate::vif::lo_up_sid(ns); }
+        if let IpAddress::Ipv6(a) = dst { return crate::tunbe::route6_in_ns(ns, a.0); }
         return v4(dst).and_then(|d| crate::vif::route_in_ns(ns, d));
     }
     if is_loopback(dst) { return Some(LO); }
-    if let IpAddress::Ipv6(a) = dst { return if crate::ip6::is_link_local(&a.0) { None } else { crate::ip6::route(a) }; }
+    if let IpAddress::Ipv6(a) = dst {
+        if crate::ip6::is_link_local(&a.0) { return None; }
+        return crate::tunbe::route6_in_ns(0, a.0).or_else(|| crate::ip6::route(a));
+    }
     let d = v4(dst)?;
     let n = netdev::count().min(MAX_NETIF);
     let t = IFRT.lock();
