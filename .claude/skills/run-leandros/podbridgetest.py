@@ -203,22 +203,29 @@ def main():
         def ctn():
             rc, o = run("grep -h '^fwd:' /proc/net/nic")
             m = re.search(r"fwd: conntrack (\d+)", o)
-            return int(m.group(1)) if m else -1
+            return int(m.group(1)) if m else 0
 
-        run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 pb6 2>&1")
+        # slirp's v6 prefix is whatever the guest's SLAAC address says (fec0::/64 by default): gateway ::2, DNS ::3.
+        rc, o = run("cat /proc/net/if_inet6")
+        g6 = re.search(r"^([0-9a-f]{16})[0-9a-f]{16} 02 40 00 \w+\s+eth0", o, re.M)
+        pfx = ":".join(g6.group(1)[i:i + 4] for i in range(0, 16, 4)) if g6 else "fec0:0:0:0"
+        gw6, dns6 = pfx + "::2", pfx + "::3"
+        print(f"podbridge: v6 gateway {gw6} dns {dns6}")
+
+        run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns pb6 2>&1")
         ct0 = ctn()
-        rc, out = run(f"podman run --rm --network pb6 {IMG} ping -6 -c3 -W 5 fec0::2 2>&1")
+        rc, out = run(f"podman run --rm --network pb6 {IMG} ping -6 -c3 -W 5 {gw6} 2>&1")
         check("podman_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
-        rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com fec0::3 2>&1")
+        rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
         check("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         if port6:
-            rc, out = run(f"podman run --rm --network pb6 {IMG} wget -T 10 -qO- http://[fec0::2]:{port6}/ 2>&1")
+            rc, out = run(f"podman run --rm --network pb6 {IMG} wget -T 10 -qO- http://[{gw6}]:{port6}/ 2>&1")
             check("podman_v6_tcp", rc == 0 and "hello-from-host-podbridge" in out, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
-        run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --internal pb6i 2>&1")
-        rc, out = run(f"podman run --rm --network pb6i {IMG} ping -6 -c1 -W 4 fec0::2 2>&1")
+        run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns --internal pb6i 2>&1")
+        rc, out = run(f"podman run --rm --network pb6i {IMG} ping -6 -c1 -W 4 {gw6} 2>&1")
         check("podman_v6_internal_blocked", rc != 0 and "1 packets received" not in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
-        run("podman network rm -f pb6i >/dev/null 2>&1; podman network create --ipv6 pb6 2>&1")
-        run(f"i=0; while [ $i -lt {CHURN} ]; do podman run --rm --network pb6 {IMG} ping -6 -c1 -W 5 fec0::2 >/dev/null 2>&1; i=$((i+1)); done", timeout=1800)
+        run("podman network rm -f pb6i >/dev/null 2>&1; podman network create --ipv6 --disable-dns pb6 2>&1")
+        run(f"i=0; while [ $i -lt {CHURN} ]; do podman run --rm --network pb6 {IMG} ping -6 -c1 -W 5 {gw6} >/dev/null 2>&1; i=$((i+1)); done", timeout=1800)
         run("podman network rm -f pb6 >/dev/null 2>&1; sleep 40")
         ct1 = ctn()
         check("podman_v6_leaks", ct0 >= 0 and ct1 <= ct0, f"conntrack {ct0} -> {ct1}")
