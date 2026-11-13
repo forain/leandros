@@ -2466,6 +2466,7 @@ static int e7_child(int m) {
     struct stat st; if (fstatat(dfd, "f", &st, 0) < 0 || st.st_size != 4) { printf("  fstatat errno=%d\n", errno); return 22; }
     if (mkdirat(dfd, "m", 0755) < 0) { printf("  mkdirat errno=%d\n", errno); return 23; }
     if (unlinkat(dfd, "u", 0) < 0) { printf("  unlinkat errno=%d\n", errno); return 24; }
+    if (m == 1) return 0; /* the chroot has no procfs, as on Linux */
     char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/f", dfd);
     memset(b, 0, sizeof b);
     if (slurp(p, b, sizeof b) < 0 || strncmp(b, "HOST", 4)) { printf("  procfd read '%s'\n", b); return 25; }
