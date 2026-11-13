@@ -105,22 +105,19 @@ fn finish(f: &mut [u8], p: &P6) { csum6(f, p.proto, p.l4len); }
 
 /// Bridge `br`, port `port`: an IPv6 frame addressed to the bridge MAC. `Some(frame)` = leave it to the
 /// bridge's stack (on-link, ND, host-local, non-forwardable); `None` = consumed (forwarded or dropped).
-pub static D6: [core::sync::atomic::AtomicU32; 64] = [const { core::sync::atomic::AtomicU32::new(0) }; 64];
-fn dbg(i: usize) { D6[i].fetch_add(1, Ordering::Relaxed); }
 
 pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Option<Vec<u8>> {
-    dbg(0);
     let dst: [u8; 16] = f[38..54].try_into().unwrap();
     let src: [u8; 16] = f[22..38].try_into().unwrap();
     if dst[0] == 0xff || (dst[0] == 0xfe && dst[1] & 0xc0 == 0x80) || dst == [0; 16] || crate::ip6::is_host6(&dst) { return Some(f); }
     let addrs = crate::tunbe::addrs6_of(br);
     if addrs.iter().any(|&(a, p)| prefix_match(&a, &dst, p)) { return Some(f); }
     // Anti-spoof: a global source inside one of the bridge's prefixes, never the bridge itself.
-    if !addrs.iter().any(|&(a, p)| a[0] != 0xfe && a != src && prefix_match(&a, &src, p)) { return { dbg(1); None }; }
-    let Some(p) = parse(&mut f, false) else { return { dbg(2); None } };
-    if f[21] <= 1 { return { dbg(3); None }; }
-    let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { return { dbg(4); None } };
-    let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return { dbg(5); None } };
+    if !addrs.iter().any(|&(a, p)| a[0] != 0xfe && a != src && prefix_match(&a, &src, p)) { return None; }
+    let Some(p) = parse(&mut f, false) else { return None };
+    if f[21] <= 1 { return None; }
+    let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { return None };
+    let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return None };
     let now = sched::monotonic_ns();
     let cmac: [u8; 6] = f[6..12].try_into().unwrap();
     let rport = if p.proto == PROTO_ICMP6 { 0 } else { p.dport };
@@ -133,19 +130,19 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
     let nat = match found {
         Some(n) => n,
         None => {
-            if p.proto == PROTO_TCP && p.flags & 0x12 != 0x02 { return { dbg(6); None }; }
+            if p.proto == PROTO_TCP && p.flags & 0x12 != 0x02 { return None; }
             drop(st);
             if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
                 let mut m = crate::nfnl::Pkt { l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
-                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return { dbg(7); None }; }
-                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return { dbg(8); None }; }
+                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return None; }
+                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return None; }
             }
             let mut pick = None;
             let claimed = if crate::nfnl::has_tables(0) { crate::nfnl::dnat_ports(0) } else { Vec::new() };
             for _ in 0..16 {
                 let mut g = FWD.lock();
-                if fwd::ct4_len(&g) + g.ct6.len() >= fwd::CT_CAP { return { dbg(9); None }; }
+                if fwd::ct4_len(&g) + g.ct6.len() >= fwd::CT_CAP { return None; }
                 let mut cand = None;
                 for _ in 0..fwd::NAT_SPAN {
                     let c = fwd::NAT_BASE + g.next % fwd::NAT_SPAN;
@@ -153,7 +150,7 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
                     let v4 = fwd::v4_nat_busy(&g, c, if p.proto == PROTO_ICMP6 { 1 } else { p.proto });
                     if !v4 && !g.ct6.iter().any(|e| e.nat == c && e.proto == p.proto) && !claimed.iter().any(|&(a, b)| c >= a && c <= b) { cand = Some(c); break; }
                 }
-                let Some(c) = cand else { return { dbg(10); None } };
+                let Some(c) = cand else { return None };
                 g.ct6.push(Ct6 { proto: p.proto, nat: c, cip: p.src, cport: p.sport, cmac, br, port, bmac, rip: p.dst, rport,
                     nic, nicip, last: now, replied: false, tst: 0, fins: 0 });
                 drop(g);
@@ -161,7 +158,7 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
                 let mut g = FWD.lock();
                 if let Some(i) = g.ct6.iter().position(|e| e.nat == c && e.proto == p.proto && e.cip == p.src && e.cport == p.sport) { g.ct6.swap_remove(i); }
             }
-            let Some(n) = pick else { return { dbg(11); None } };
+            let Some(n) = pick else { return None };
             st = FWD.lock();
             n
         }
@@ -169,7 +166,6 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
     if p.proto == PROTO_TCP {
         if let Some(e) = st.ct6.iter_mut().find(|e| e.nat == nat && e.proto == PROTO_TCP) { fwd::tcp_fsm(&mut e.tst, &mut e.fins, p.flags, true); }
     }
-    dbg(30);
     f[21] -= 1;
     f[22..38].copy_from_slice(&nicip);
     if p.proto != PROTO_ICMP6 { f[54..56].copy_from_slice(&nat.to_be_bytes()); } else { f[58..60].copy_from_slice(&nat.to_be_bytes()); }
@@ -224,8 +220,7 @@ fn learn(st: &mut fwd::St, nic: u8, ip: [u8; 16], mac: [u8; 6], now: u64) {
 
 /// NIC rx hook for IPv6 frames. True = taken (a reply of a forwarded flow).
 pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
-    dbg(38);
-    if !USED6.load(Ordering::Relaxed) { return { dbg(41); false }; }
+    if !USED6.load(Ordering::Relaxed) { return false; }
     let plen = u16::from_be_bytes([buf[18], buf[19]]) as usize;
     if buf[20] == PROTO_ICMP6 && plen >= 24 && buf.len() >= 54 + 24 {
         let ty = buf[54];
@@ -241,18 +236,17 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
             }
             drop(st);
             drivers::netdev::kick();
-            return { dbg(42); false };
+            return false;
         }
-        if ty != 129 { return { dbg(43); false }; }
-    } else if buf[20] != PROTO_TCP && buf[20] != PROTO_UDP { return { dbg(44); false }; }
-    dbg(39);
+        if ty != 129 { return false; }
+    } else if buf[20] != PROTO_TCP && buf[20] != PROTO_UDP { return false; }
     let mut st = FWD.lock();
-    if st.ct6.is_empty() { return { dbg(45); false }; }
+    if st.ct6.is_empty() { return false; }
     let mut f = buf.to_vec();
-    let Some(p) = parse(&mut f, buf[20] == PROTO_ICMP6) else { return { dbg(46); false } };
+    let Some(p) = parse(&mut f, buf[20] == PROTO_ICMP6) else { return false };
     let now = sched::monotonic_ns();
     let Some(e) = st.ct6.iter_mut().find(|e| e.nic == nic && e.proto == p.proto && e.nicip == p.dst && e.nat == p.dport
-        && e.rip == p.src && (p.proto == PROTO_ICMP6 || e.rport == p.sport)) else { return { dbg(47); false } };
+        && e.rip == p.src && (p.proto == PROTO_ICMP6 || e.rport == p.sport)) else { return false };
     e.last = now; e.replied = true;
     if p.proto == PROTO_TCP { fwd::tcp_fsm(&mut e.tst, &mut e.fins, p.flags, false); }
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);

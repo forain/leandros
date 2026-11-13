@@ -147,7 +147,6 @@ fn nic(w: &mut Out) {
         for p in ports { let _ = write!(w, " {}", p); }
         let _ = writeln!(w);
     }
-    { let mut o = alloc::string::String::new(); for (i, c) in crate::fwd6::D6.iter().enumerate() { let v = c.load(core::sync::atomic::Ordering::Relaxed); if v != 0 { let _ = write!(o, " {}={}", i, v); } } let _ = writeln!(w, "fwd6dbg:{}", o); }
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} virtio_rx_irqs {} tcp_rx_buf {} netctl_wakes {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),
                      NETD_TAG_WAKES.load(Ordering::Relaxed), NETD_BCAST_WAKES.load(Ordering::Relaxed),
