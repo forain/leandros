@@ -94,6 +94,26 @@ def main():
         else:
             print(f"podman_dns: SKIP rc={rc} " + out.strip()[-120:].replace("\n", " | "))
 
+        # L0 (podl0): rootful -p works today through --network=pasta (bridge -p awaits nf_tables).
+        run("podman rm -f pbpasta >/dev/null 2>&1")
+        run(f"podman run -d --rm --name pbpasta --network=pasta -p 18081:80 {IMG} sh -c "
+            "'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-rootful-pasta\\n\" | nc -l -p 80; done' 2>&1; sleep 3")
+        rc, out = run("busybox.static wget -T 15 -qO- http://127.0.0.1:18081/ 2>&1; echo")
+        check("podman_pasta_root_portfwd", "hello-rootful-pasta" in out, f"rc={rc} " + out.strip()[-200:].replace("\n", " | "))
+        run("podman rm -f pbpasta >/dev/null 2>&1")
+
+        # --internal (podl0): netavark writes conf/<bridge>/forwarding=0; a later non-internal
+        # setup's ip_forward=1 must not clobber it (Linux fans out only when the value changes).
+        run("podman network rm -f pbint >/dev/null 2>&1; podman rm -f pbintc >/dev/null 2>&1; podman network create --internal pbint 2>&1")
+        rc, out = run("podman run -d --rm --name pbintc --network=pbint " + IMG + " sleep 120 2>&1; "
+                      "podman run --rm " + IMG + " true 2>&1; "
+                      "br=$(podman network inspect pbint -f '{{.NetworkInterface}}'); echo BR=$br; "
+                      "echo 1 > /proc/sys/net/ipv4/ip_forward; "
+                      "echo FWD=$(cat /proc/sys/net/ipv4/conf/$br/forwarding)")
+        fm = re.search(r"FWD=(\d)", out)
+        check("podman_internal_forwarding_kept", fm is not None and fm.group(1) == "0", "out=" + out.strip()[-160:].replace("\n", " | "))
+        run("podman rm -f pbintc >/dev/null 2>&1; podman network rm -f pbint >/dev/null 2>&1")
+
         rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
         bl = out.strip().splitlines()[-1:] 
         base_mnt = int(bl[0]) if bl and bl[0].isdigit() else 0
