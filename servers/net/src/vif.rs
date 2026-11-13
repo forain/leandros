@@ -139,7 +139,7 @@ pub(crate) fn set_lo(ns: u16, up: bool) {
         name[..2].copy_from_slice(b"lo");
         v[sid] = Some(Vif {
             netns: ns, ifindex: 1, name, kind: VifKind::Lo, admin_up: true, mtu: 65536, mac: [0; 6],
-            addrs: alloc::vec![([127, 0, 0, 1], 8)], rxq: Default::default(), rxsrc: Default::default(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
+            addrs: alloc::vec![([127, 0, 0, 1], 8)], addrs6: Vec::new(), rxq: Default::default(), rxsrc: Default::default(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
         });
         st.lo = Some(sid as Sid);
         st.sids.insert(0, sid as Sid);

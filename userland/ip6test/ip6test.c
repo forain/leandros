@@ -623,7 +623,7 @@ static int nsudp6_body(void) {
     // an unreachable global destination is a routing error, not a blanket refusal
     struct sockaddr_in6 far; memset(&far, 0, sizeof far); far.sin6_family = AF_INET6; far.sin6_port = htons(9);
     inet_pton(AF_INET6, "2001:db8::1", &far.sin6_addr);
-    if (sendto(b, "x", 1, 0, (struct sockaddr *)&far, sizeof far) >= 0 || errno != ENETUNREACH) return 9;
+    { int fs = socket(AF_INET6, SOCK_DGRAM, 0); ssize_t fr = sendto(fs, "x", 1, 0, (struct sockaddr *)&far, sizeof far); if (fr >= 0) return 9; if (errno != ENETUNREACH) return 100 + errno; }
     return 0;
 }
 static void test_netns_udp6(void) {
@@ -856,6 +856,7 @@ int main(int argc, char **argv) {
     test_mapped_connect_v6only();
     test_udp_dual();
     test_netns_v6_tcp();
+    test_netns_udp6();
     test_ping6_dgram_lo();
     test_ping6_raw_lo();
     test_raw6_eperm();

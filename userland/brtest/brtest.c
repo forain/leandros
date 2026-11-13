@@ -563,13 +563,14 @@ static int ping6_once(const char *dst, int ifidx) {
     close(ic);
     return n >= 8 && rb[0] == 129 ? 0 : 3;
 }
-static int tcp6_echo_srv(const char *bindip, int port) {
+static int tcp6_echo_srv(const char *bindip, int port, int notify) {
     int l = socket(AF_INET6, SOCK_STREAM, 0);
     struct sockaddr_in6 a; memset(&a, 0, sizeof a); a.sin6_family = AF_INET6; a.sin6_port = htons(port);
     inet_pton(AF_INET6, bindip, &a.sin6_addr);
     struct timeval tv = { 8, 0 };
     setsockopt(l, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (bind(l, (struct sockaddr *)&a, sizeof a) || listen(l, 2)) return 1;
+    if (notify >= 0) { char ch = 'x'; write(notify, &ch, 1); }
     int c = accept(l, NULL, NULL);
     if (c < 0) return 2;
     char b[8]; ssize_t n = read(c, b, 8);
@@ -581,8 +582,7 @@ static int v6_child_body(void) {
     int idx = link_get(cs, "eth0", NULL, NULL);
     if (!idx || addr6_add(cs, idx, "fd00:6::2", 64) || link_set_up(cs, idx)) return 2;
     link_set_up(cs, link_get(cs, "lo", NULL, NULL));
-    char ch = 'x'; write(done_[1], &ch, 1);
-    int r = tcp6_echo_srv("fd00:6::2", 47661);
+    int r = tcp6_echo_srv("fd00:6::2", 47661, done_[1]);
     if (r) return 10 + r;
     return ping6_once("fd00:6::1", 0) ? 20 : 0;
 }
@@ -595,7 +595,9 @@ static void veth6(void) {
     close(nsfd);
     CHECK("veth6: pair created", e == 0);
     int ia = link_get(s, "veth6A", NULL, NULL);
-    CHECK("veth6: host end gets fd00:6::1/64", ia > 0 && addr6_add(s, ia, "fd00:6::1", 64) == 0);
+    int ar = ia > 0 ? addr6_add(s, ia, "fd00:6::1", 64) : -1;
+    errno = ar;
+    CHECK("veth6: host end gets fd00:6::1/64", ar == 0);
     link_set_up(s, ia);
     write(ctl[1], "g", 1);
     char ch;

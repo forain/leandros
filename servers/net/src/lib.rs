@@ -4891,8 +4891,9 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>, scope: 
         if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) {
             return vif::lo_up_sid(ns).ok_or(-101);
         }
-        // No IPv6 route off the loopback in a netns yet.
-        if matches!(dest, Some(IpAddress::Ipv6(_))) { return Err(-101); }
+        if let Some(IpAddress::Ipv6(d)) = dest {
+            return tunbe::route6_in_ns(ns, d.0).ok_or(-101);
+        }
         if let Some(a) = local.filter(|a| !a.is_unspecified()) {
             return stack_holding(ns, a).ok_or(-99);
         }
@@ -5491,28 +5492,6 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     // Gate on the SOCKET's own domain and captured netns, never on the user
     // sa_family (which a sibling thread can flip, or which can simply lie).
     // Folded into this read: one table lock per send.
-    // A non-initial netns stack is v4-only. A connected AF_INET6 stream there can
-    // only be a v4-mapped flow (connect refuses a real v6 peer), so its sends are
-    // ordinary IPv4 and pass; the refusal keeps to datagram / unconnected sends,
-    // whose destination may be a genuine v6 address (ip6nswake).
-    let v4_mapped_stream = tbl.socks[slot].sock_type == SOCK_STREAM as u8
-        && matches!(tbl.socks[slot].state, SockState::InetConnected { .. });
-    if tbl.socks[slot].netns() != 0 && tbl.socks[slot].domain == 10 && !v4_mapped_stream {
-        let e = &tbl.socks[slot];
-        let dom = if e.domain == 2 || e.domain == 10 { Some(e.domain) } else { None };
-        if let Some(dom) = dom {
-            drop(tbls);
-            // Error selection only (Linux: a mismatched family is EAFNOSUPPORT);
-            // the refusal below does not depend on what user memory says.
-            if addr_ptr != 0 && addrlen >= 2 {
-                if let Some(f) = sched::uaccess::read_user::<u16>(addr_ptr) {
-                    if f as usize != dom as usize && f as usize != AF_UNSPEC { return err_reply(-97); }
-                }
-            }
-            return err_reply(-101);
-        }
-    }
-
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     let sock_domain = tbl.socks[slot].domain as usize;
