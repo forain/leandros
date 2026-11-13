@@ -227,6 +227,8 @@ def main():
         rc, out = run(f"podman run --rm --network pb6 {IMG} ping -6 -c3 -W 5 {gw6} 2>&1")
         check6("podman_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
+        _rc, _o = run("grep fwd6dbg /proc/net/nic; ip -6 addr 2>&1 | head -20")
+        print("DBG6 " + _o.replace("\n", " | "))
         check6("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         if port6 and v6ok:
             rc, out = run(f"podman run --rm --network pb6 {IMG} wget -T 10 -qO- http://[{gw6}]:{port6}/ 2>&1")
