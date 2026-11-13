@@ -603,6 +603,37 @@ static void test_netns_v6_tcp(void) {
     }
 }
 
+
+// ---- L8 ip6ns: UDP / unconnected v6 in a non-initial netns ----
+static int nsudp6_body(void) {
+    if (unshare(CLONE_NEWNET) != 0) return 2;
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
+    if (u < 0 || ioctl(u, SIOCSIFFLAGS, &q) != 0) return 3;
+    close(u);
+    int a = socket(AF_INET6, SOCK_DGRAM, 0), b = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (a < 0 || b < 0) return 4;
+    tmo(a, 3); tmo(b, 3);
+    struct sockaddr_in6 la; memset(&la, 0, sizeof la); la.sin6_family = AF_INET6; la.sin6_addr = in6addr_loopback; la.sin6_port = htons(47520);
+    if (bind(a, (struct sockaddr *)&la, sizeof la)) return 5;
+    if (sendto(b, "udp6", 4, 0, (struct sockaddr *)&la, sizeof la) != 4) return 6;
+    char r[8]; struct sockaddr_in6 from; socklen_t fl = sizeof from;
+    if (recvfrom(a, r, sizeof r, 0, (struct sockaddr *)&from, &fl) != 4 || memcmp(r, "udp6", 4)) return 7;
+    if (!IN6_IS_ADDR_LOOPBACK(&from.sin6_addr)) return 8;
+    // an unreachable global destination is a routing error, not a blanket refusal
+    struct sockaddr_in6 far; memset(&far, 0, sizeof far); far.sin6_family = AF_INET6; far.sin6_port = htons(9);
+    inet_pton(AF_INET6, "2001:db8::1", &far.sin6_addr);
+    { int fs = socket(AF_INET6, SOCK_DGRAM, 0); ssize_t fr = sendto(fs, "x", 1, 0, (struct sockaddr *)&far, sizeof far); if (fr >= 0) return 9; if (errno != ENETUNREACH) return 100 + errno; }
+    return 0;
+}
+static void test_netns_udp6(void) {
+    pid_t k = fork();
+    if (k == 0) _exit(nsudp6_body());
+    int st = 0; waitpid(k, &st, 0);
+    errno = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    CHECK("ns_udp6_lo", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
 // ---- L4 ip6link: link-local addresses, scope ids, NDP on the real NIC ----
 #include <sys/ioctl.h>
 
@@ -825,6 +856,7 @@ int main(int argc, char **argv) {
     test_mapped_connect_v6only();
     test_udp_dual();
     test_netns_v6_tcp();
+    test_netns_udp6();
     test_ping6_dgram_lo();
     test_ping6_raw_lo();
     test_raw6_eperm();

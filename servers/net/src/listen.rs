@@ -85,7 +85,8 @@ pub(crate) fn stacks_for(ns: u16, local: IpEndpoint) -> alloc::vec::Vec<Sid> {
     if ns != 0 {
         // Only its own lo (a down lo still holds the listener: it is just
         // unreachable until up).
-        if local.addr.is_unspecified() || is_loopback_addr(local.addr) { v.extend(dynamic); }
+        // A specific address too: `create` filters by what each stack holds.
+        v.extend(dynamic);
         return v;
     }
     if local.addr.is_unspecified() {

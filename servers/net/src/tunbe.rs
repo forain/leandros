@@ -91,7 +91,7 @@ fn attach(ns: u16, name: &[u8; 16], tap: bool, h: TunHandle) -> Result<(u32, [u8
         st.next_ifindex += 1;
         let mac = [0x02, 0x00, 0x5e, 0x10, (sid as u8), 0x01];
         v[sid] = Some(Vif { netns: ns, ifindex, name: fin, kind, admin_up: false, mtu: 1500, mac,
-                            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
+                            addrs: Vec::new(), addrs6: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: h, pending: false, peer: NO_PEER, master: NO_PEER });
         st.sids.push(sid as Sid);
         (sid as Sid, fin, ifindex, mac)
     };
@@ -426,12 +426,111 @@ fn net_of(a: [u8; 4], p: u8) -> u32 {
 
 /// Push the vif's address list into its smoltcp stack (VIFS released).
 fn sync_addrs(sid: Sid, addrs: &[([u8; 4], u8)]) {
+    let v6 = addrs6_of(sid);
     if let Some(s) = stack_for(sid).as_mut() {
         s.interface.update_ip_addrs(|v| {
             v.clear();
             for &(a, p) in addrs { let _ = v.push(IpCidr::new(IpAddress::v4(a[0], a[1], a[2], a[3]), p)); }
+            for &(a, p) in &v6 { let _ = v.push(IpCidr::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address(a)), p)); }
         });
     }
+}
+
+/// The modified EUI-64 link-local address of a MAC.
+pub(crate) fn ll_from_mac(m: [u8; 6]) -> [u8; 16] {
+    [0xfe, 0x80, 0, 0, 0, 0, 0, 0, m[0] ^ 2, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]
+}
+
+/// Every v6 address a vif's stack holds: link-local while up, then the static ones.
+fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
+    let v = VIFS.lock();
+    let Some(x) = v[sid as usize].as_ref() else { return Vec::new() };
+    let mut o = Vec::new();
+    if is_tun_kind(x.kind) && x.admin_up && !sched::ns::ipv6_disabled(x.netns, &x.name[..name_len(&x.name)]) { o.push((ll_from_mac(x.mac), 64)); }
+    o.extend(x.addrs6.iter().copied());
+    o
+}
+
+/// Re-push a vif's address list (after link state or address changes).
+fn resync(sid: Sid) {
+    let a = { let v = VIFS.lock(); v[sid as usize].as_ref().map(|x| x.addrs.clone()) };
+    if let Some(a) = a { sync_addrs(sid, &a); }
+}
+
+/// IPv6 addresses of the tun/tap/veth/bridge links of `ns` (rtnetlink view).
+pub(crate) fn addrs6(ns: u16) -> Vec<rtnetlink::A6> {
+    let nss = NETNS.lock();
+    let mut out = Vec::new();
+    let Some(st) = nss.get(&ns) else { return out };
+    let sids: Vec<Sid> = st.sids.iter().copied().collect();
+    let idx: Vec<(Sid, u32)> = { let v = VIFS.lock(); sids.iter().filter_map(|&s| v[s as usize].as_ref().filter(|x| is_tun_kind(x.kind)).map(|x| (s, x.ifindex))).collect() };
+    drop(nss);
+    for (s, i) in idx {
+        for (k, (a, p)) in addrs6_of(s).into_iter().enumerate() {
+            let ll = a[0] == 0xfe && a[1] == 0x80;
+            let _ = k;
+            out.push(rtnetlink::A6 { index: i, addr: a, prefix: p, scope: if ll { 253 } else { 0 }, flags: 0x80 });
+        }
+    }
+    out
+}
+
+/// Connected IPv6 routes of the vifs of `ns`.
+pub(crate) fn routes6(ns: u16) -> Vec<rtnetlink::R6> {
+    let mut out = Vec::new();
+    for a in addrs6(ns) {
+        let mut d = a.addr; let p = a.prefix;
+        for (i, b) in d.iter_mut().enumerate() { let keep = (p as i32 - i as i32 * 8).clamp(0, 8) as u32; *b &= if keep == 0 { 0 } else { 0xffu8 << (8 - keep) }; }
+        out.push(rtnetlink::R6 { dst: d, plen: p, gw: None, oif: a.index, metric: 256, proto: 2 });
+    }
+    out
+}
+
+/// The vif of `ns` a v6 destination leaves through: the longest on-link prefix.
+pub(crate) fn route6_in_ns(ns: u16, dst: [u8; 16]) -> Option<Sid> {
+    let sids: Vec<Sid> = { let nss = NETNS.lock(); nss.get(&ns)?.sids.iter().copied().collect() };
+    let mut best: Option<(u8, Sid)> = None;
+    for s in sids {
+        for (a, p) in addrs6_of(s) {
+            if a[0] == 0xfe && a[1] == 0x80 { continue; }
+            let full = (p / 8) as usize;
+            let ok = dst[..full] == a[..full] && (p % 8 == 0 || (dst[full] ^ a[full]) >> (8 - p % 8) == 0);
+            if ok && best.map_or(true, |b| p > b.0) { best = Some((p, s)); }
+        }
+    }
+    best.map(|b| b.1)
+}
+
+/// The sid of the vif of `ns` with interface index `index`.
+pub(crate) fn sid_by_ifindex(ns: u16, index: u32) -> Option<Sid> {
+    let nss = NETNS.lock();
+    let v = VIFS.lock();
+    sid_of_index(nss.get(&ns)?, &v, index)
+}
+
+fn rtnl_addr6(ns: u16, op: RtOp) -> Option<i32> {
+    let (index, addr, prefix, add, excl) = match op {
+        RtOp::AddAddr6 { index, addr, prefix, excl, .. } => (index, addr, prefix, true, excl),
+        RtOp::DelAddr6 { index, addr, prefix } => (index, addr, prefix, false, false),
+        _ => return None,
+    };
+    let sid = sid_by_ifindex(ns, index)?;
+    {
+        let mut v = VIFS.lock();
+        let x = v[sid as usize].as_mut()?;
+        if add {
+            if addr == [0; 16] || addr[0] == 0xff { return Some(22); }
+            if x.addrs6.iter().any(|&(a, _)| a == addr) { return Some(if excl { 17 } else { 0 }); }
+            if x.addrs6.len() >= 5 { return Some(105); }
+            x.addrs6.push((addr, prefix));
+        } else {
+            let Some(i) = x.addrs6.iter().position(|&(a, p)| a == addr && (prefix == 0 || p == prefix)) else { return Some(99) };
+            x.addrs6.remove(i);
+        }
+    }
+    resync(sid);
+    drivers::netdev::kick();
+    Some(0)
 }
 
 /// Rebuild the stack's gateway routes from the namespace's route list.
@@ -459,6 +558,7 @@ fn sid_of_index(st: &NetNsState, v: &vifsel::VifTable, index: u32) -> Option<Sid
 pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
     if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), CAP_NET_ADMIN) { return 1; }
     match op {
+        RtOp::AddAddr6 { .. } | RtOp::DelAddr6 { .. } if sid_by_ifindex(ns, match &op { RtOp::AddAddr6 { index, .. } | RtOp::DelAddr6 { index, .. } => *index, _ => 0 }).is_some() => rtnl_addr6(ns, op).unwrap_or(19),
         RtOp::AddAddr6 { .. } | RtOp::DelAddr6 { .. } | RtOp::AddRoute6 { .. } | RtOp::DelRoute6 { .. } => crate::ip6::apply(ns, op),
         RtOp::SetLink { index, up, mtu, mac, name, master, ns: nsel } => {
             let sid;
@@ -501,6 +601,7 @@ pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
                     if e != 0 { return e; }
                 }
             }
+            resync(sid);
             drivers::netdev::kick();
             0
         }
@@ -706,7 +807,7 @@ fn veth_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>, m
         let ib = { let st = nss.get_mut(&pns).unwrap(); let i = st.next_ifindex; st.next_ifindex += 1; i };
         let mk = |ns, ifindex, name, up, mtu: Option<u32>, mac, peer| Vif {
             netns: ns, ifindex, name, kind: VifKind::Veth, admin_up: up, mtu: mtu.unwrap_or(1500), mac,
-            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
+            addrs: Vec::new(), addrs6: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer, master: NO_PEER,
         };
         v[sa] = Some(mk(ns, ia, na, up, mtu, ma, sb as Sid));
         v[sb] = Some(mk(pns, ib, nb, peer.up, peer.mtu, mb, sa as Sid));
@@ -787,7 +888,7 @@ fn bridge_create(ns: u16, name: Option<alloc::string::String>, mtu: Option<u32>,
         st.next_ifindex += 1;
         v[sid] = Some(Vif {
             netns: ns, ifindex, name: nm, kind: VifKind::Bridge, admin_up: up, mtu: mtu.unwrap_or(1500), mac: m,
-            addrs: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
+            addrs: Vec::new(), addrs6: Vec::new(), rxq: VecDeque::new(), rxsrc: VecDeque::new(), tun: NO_TUN, pending: false, peer: NO_PEER, master: NO_PEER,
         });
         st.sids.push(sid as Sid);
         (sid as Sid, m)
