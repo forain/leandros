@@ -647,7 +647,11 @@ fn apply_inner(st: &mut NfState, msg: u16, h: &Hdr) -> Result<(), i32> {
             let id = find(&a, 11).and_then(be32).unwrap_or(0);
             let i = t.chains.iter().position(|c| name.map_or(false, |n| c.name == n)
                 || hd.map_or(false, |x| x == c.handle) || (id != 0 && c.id == id)).ok_or(ENOENT)?;
-            if chain_use(t, &t.chains[i]) > 0 { return Err(EBUSY); }
+            // Like nf_tables_delchain: the chain's own rules go with it (nft_delrule_by_chain);
+            // only jumps from other chains keep it busy.
+            let cn = t.chains[i].name.clone();
+            let jumped = t.chains.iter().enumerate().any(|(j, oc)| j != i && oc.rules.iter().any(|r| rule_jumps_to(&r.exprs, &cn)));
+            if jumped { return Err(EBUSY); }
             t.chains.remove(i);
             Ok(())
         }
