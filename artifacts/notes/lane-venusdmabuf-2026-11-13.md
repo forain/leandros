@@ -1,0 +1,5 @@
+# lane/venusdmabuf 2026-11-13 - REFUTED as open (already fixed); one test-timing finding
+
+- Cross-open dmabuf import is NOT open: 51d92486 (PRIME_FD_TO_HANDLE mints the importer its own handle on a blob) + e758d090 (venustest phase 5b, drmsmoke dumb case) landed via p0/zink2. The m9-crossopen-dmabuf design's Stage 3 is done; TODO line was stale.
+- Box run of main b6b9cd1b, `regress.sh main <arch> --gpu venus /bin/venustest`: x86_64 KVM PASS (venustest 1/1). aarch64 TCG: all phase5/5b cases PASS (11/11 phase5b: import in other open, own handle, same resource, map, alias pages, dedup, close), single FAIL `virtgpu_wait_nowait_busy_after_kick` (2 of 2 runs). Not cross-open related: the case needs NOWAIT to see "busy" once in 3 kicks; under TCG the host retires the fence first. Left open (test-timing hedge, not a kernel bug).
+- aarch64 vkwl: already measured 2026-08-07 (artifacts/notes/m9-vkwl-aarch64/m4-aarch64-pixels.md, 28/28 frames, pixel census identical to x86_64). Venus needs virtio-gpu-gl-pci, absent from the Mac QEMU build (`Device 'virtio-gpu-gl-pci' not found`), so any re-run is box-only (box aarch64 QEMU has venus).
