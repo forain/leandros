@@ -6,7 +6,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Known bugs
 
-- [ ] mntiso E7: add a host_to_view hint to the fd_ns_path reopen so links whose target is only reachable from another view resolve without the identity-check fallback (design-mntiso.md E7; open after lane/mntiso-procfd).
 ### Kernel / VFS
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
 - **Flakes to root-cause**: `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
