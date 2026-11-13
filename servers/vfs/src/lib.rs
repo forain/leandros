@@ -4497,6 +4497,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/unix",  data: b"" },
     RamEntry { path: b"/proc/net/tcp6",  data: b"" },
     RamEntry { path: b"/proc/net/if_inet6", data: b"" },
+    RamEntry { path: b"/proc/net/ipv6_route", data: b"" },
     RamEntry { path: b"/proc/net/udp6",  data: b"" },
     RamEntry { path: b"/proc/net/raw",   data: b"" },
     RamEntry { path: b"/proc/net/raw6",  data: b"" },
