@@ -51,6 +51,8 @@ def main():
     try:
         rc, out = drv("start", "x86_64")
         check("boot gen0", rc == 0, out[-200:])
+        rc, out = drv("login", "root", "root", "180", timeout=400)
+        check("login gen0", rc == 0, out[-200:])
         rc, out = guest("grep -c '^processor' /proc/cpuinfo")
         ncpu = out.split()[-1] if out.split() else "?"
         rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=1 kexec.test=acpiresvd{NOFIX}'")
