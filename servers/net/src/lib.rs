@@ -1477,7 +1477,12 @@ pub fn sock_cloexec(key: u32, fd: usize) -> bool {
 }
 
 fn find_tbl<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
-    tbls.iter_mut().find(|t| t.in_use && t.pid == tk(pid))
+    let k = tk(pid);
+    let pos = tbls.iter().position(|t| t.in_use && t.pid == k);
+    if pos.is_none() && sched::tgid_of(pid) == sched::current_tgid() {
+        crate::dbg_brflake(pid, k, tbls.iter().filter(|t| t.in_use).count());
+    }
+    tbls.iter_mut().find(|t| t.in_use && t.pid == k)
 }
 
 fn get_or_create<'a>(pid: u32, tbls: &'a mut SockTables) -> Option<&'a mut ProcSockTable> {
@@ -9051,4 +9056,19 @@ pub fn dump_sockets() {
             ps("\n");
         }
     }
+}
+
+#[inline(never)]
+fn dbg_brflake(pid: u32, key: u32, live: usize) {
+    fn u(mut v: u64) { let mut b=[0u8;20]; let mut i=20; if v==0 { dbgf("0"); return; }
+        while v>0 { i-=1; b[i]=b'0'+(v%10) as u8; v/=10; } dbgf(unsafe { core::str::from_utf8_unchecked(&b[i..]) }); }
+    dbgf("\n[BRDBG] net find_tbl self-miss pid="); u(pid as u64);
+    dbgf(" key="); u(key as u64);
+    dbgf(" cur="); u(sched::current_pid() as u64);
+    dbgf(" tables="); u(live as u64); dbgf("\n");
+}
+
+fn dbgf(msg: &str) {
+    extern "C" { fn arch_serial_putc(c: u8); }
+    for &b in msg.as_bytes() { unsafe { arch_serial_putc(b); } }
 }
