@@ -4110,23 +4110,6 @@ impl TblSlot {
 /// Lock `pid`'s table into `slot` (reusing it if it already holds that
 /// table). None: the process has no table (or it exited).
 fn find_tbl<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> {
-    let raw = pid;
-    if find_tbl_in(pid, slot).is_none() {
-        if raw == sched::current_tgid() {
-            let k = tbl_key(raw);
-            let inmap = FD_TABLES.lock().map.contains_key(&k);
-            dbg_str("\n[BRDBG] vfs find_tbl self-miss raw="); dbg_dec(raw as usize);
-            dbg_str(" key="); dbg_dec(k as usize);
-            dbg_str(" cur="); dbg_dec(sched::current_pid() as usize);
-            dbg_str(" any="); dbg_dec(sched::fdkey::any() as usize);
-            dbg_str(" inmap="); dbg_dec(inmap as usize); dbg_str("\n");
-        }
-        return None;
-    }
-    Some(slot.get())
-}
-
-fn find_tbl_in<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTable> {
     let pid = tbl_key(pid);
     if !slot.holds(pid) {
         let t = table_ref(pid)?;
@@ -4137,10 +4120,7 @@ fn find_tbl_in<'a>(pid: u32, slot: &'a mut TblSlot) -> Option<&'a mut ProcFdTabl
             slot.release();
             let t = table_ref_uncached(pid)?;
             slot.lock(t);
-            if !slot.holds(pid) {
-                slot.release();
-                return None;
-            }
+            if !slot.holds(pid) { slot.release(); return None; }
         }
     }
     Some(slot.get())
