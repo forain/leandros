@@ -2453,6 +2453,7 @@ static int e7_child(int m) {
         if (chdir(E7R) < 0) return 14;
         if (syscall(SYS_pivot_root, ".", "old") < 0) return 15;
         if (chdir("/") < 0) return 16;
+        if (umount2("/old", MNT_DETACH) < 0) return 18;
         if (exists("/tmp/e7/host/d/m")) return 17;
     } else {
         if (chroot(E7R) < 0) return 15;
