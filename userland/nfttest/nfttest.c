@@ -136,15 +136,32 @@ int main(void)
     /* teardown by handle (netavark: list, then delete rules, then chains). */
     run("nft flush ruleset 2>&1", out, sizeof out);
     apply_json(cap_b);
-    rc = run("nft -a list table inet netavark 2>&1 | awk '"
-             "$1==\"chain\"{c=$2; next} /# handle/ && c!=\"\" && "
-             "(c ~ /^nv_/ || /nv_/ || /10\\.89\\.0\\.0\\/24/ || /podman1/ || /dport 8080/) "
-             "{print \"delete rule inet netavark \" c \" handle \" $NF}' > /tmp/nft-td.nft; "
-             "nft -f /tmp/nft-td.nft 2>&1", out, sizeof out);
-    CHECK("teardown: delete rules by handle", rc == 0);
-    if (rc) printf("  nft: %.300s\n", out);
-    rc = run("for c in $(nft list table inet netavark | awk '$1==\"chain\" && $2 ~ /^nv_/{print $2}'); do nft delete chain inet netavark $c || exit 1; done", out, sizeof out);
-    CHECK("teardown: delete per-network chains", rc == 0);
+    /* netavark-style: read the table, delete matching rules by handle, then the per-network chains. */
+    run("nft -a list table inet netavark 2>&1", got, sizeof got);
+    {
+        static char cmds[BUFSZ], chains[4096];
+        char chain[128] = "", *line, *save;
+        cmds[0] = chains[0] = 0;
+        for (line = strtok_r(got, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+            while (*line == ' ' || *line == '\t') line++;
+            if (!strncmp(line, "chain ", 6)) {
+                sscanf(line + 6, "%127s", chain);
+                if (!strncmp(chain, "nv_", 3)) { strcat(chains, "delete chain inet netavark "); strcat(chains, chain); strcat(chains, "\n"); }
+                continue;
+            }
+            char *h = strstr(line, "# handle ");
+            if (!h || !chain[0]) continue;
+            if (!strncmp(chain, "nv_", 3) || strstr(line, "nv_") || strstr(line, "10.89.0.0/24") || strstr(line, "podman1") || strstr(line, "dport 8080")) {
+                char one[256];
+                snprintf(one, sizeof one, "delete rule inet netavark %s handle %d\n", chain, atoi(h + 9));
+                strcat(cmds, one);
+            }
+        }
+        strcat(cmds, chains);
+        wfile("/tmp/nft-td.nft", cmds);
+    }
+    rc = run("nft -f /tmp/nft-td.nft 2>&1", out, sizeof out);
+    CHECK("teardown: delete rules by handle, then per-network chains", rc == 0);
     if (rc) printf("  nft: %.300s\n", out);
     same(cap_td, "b_teardown");
 
