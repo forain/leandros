@@ -129,7 +129,7 @@ pub fn build(bi: &boot::BootInfo, map: &[Raw], inp: &Inputs, _a: &mut Alloc) -> 
         let lo = RETYPED_LO.load(core::sync::atomic::Ordering::SeqCst);
         if lo != u64::MAX {
             let mut n = 0;
-            for r in cut.iter_mut().filter(|r| r.base >= lo && matches!(r.raw_type, 0 | 5 | 6)) { r.raw_type = 1; n += 1; }
+            for r in cut.iter_mut().filter(|r| r.base >= lo && matches!(r.raw_type, 0 | 2 | 3 | 5 | 6)) { r.raw_type = 1; n += 1; }
             crate::serial_print_str(&alloc::format!("[KEXEC] test acpiresvd: {} usable entr(ies) >= {:#x} made Reserved\n", n, lo));
         }
     }
