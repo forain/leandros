@@ -11,6 +11,7 @@ mod procnet;
 pub mod rtnetlink;
 mod nlsock;
 mod iface;
+mod ip6;
 mod vifsel;
 mod vif;
 pub mod tundev;
@@ -3442,11 +3443,7 @@ fn apply_lease(nif: drivers::netdev::Netif, addr: smoltcp::wire::Ipv4Cidr,
     {
         let mut stack = stack_for(iface::sid_of(nif.id));
         if let Some(ref mut s) = *stack {
-            s.interface.update_ip_addrs(|addrs| {
-                addrs.clear();
-                let cidr = IpCidr::new(IpAddress::Ipv4(addr.address()), addr.prefix_len());
-                addrs.push(cidr).unwrap();
-            });
+            ip6::replace_v4(&mut s.interface, Some(IpCidr::new(IpAddress::Ipv4(addr.address()), addr.prefix_len())));
             if let Some(gateway) = router {
                 s.interface.routes_mut().add_default_ipv4_route(gateway).unwrap();
             }
@@ -3540,7 +3537,7 @@ fn deconfigure(nif: drivers::netdev::Netif, why: &str) {
     {
         let mut stack = stack_for(iface::sid_of(nif.id));
         if let Some(ref mut s) = *stack {
-            s.interface.update_ip_addrs(|addrs| addrs.clear());
+            ip6::replace_v4(&mut s.interface, None);
             s.interface.routes_mut().remove_default_ipv4_route();
             use smoltcp::socket::AnySocket;
             for (_, sock) in s.socket_set.iter_mut() {
@@ -3686,6 +3683,7 @@ pub fn net_daemon() -> ! {
             // until then, and while admin down, its frames are dropped here
             // so `rx_rearm` below does not report them forever.
             let has_stack = stack_for(sid).is_some();
+            if has_stack { ip6::sync(nif, admin_down); }
             match rxpolicy::nif_action(has_stack, admin_down, !has_stack && nif.mac().is_some()) {
                 rxpolicy::NifAction::Poll => {}
                 rxpolicy::NifAction::InitStack => {
@@ -4282,6 +4280,10 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 let ofd = sock_entry(pid, fd).map_or(0, |e| e.ofd);
                 if sock_opts(ofd).v6only { return err_reply(-22); }
             }
+            // A link-local address needs its interface named (Linux inet6_bind: EINVAL without a scope id).
+            if ip6::needs_scope(ip) {
+                if let Err(e) = ip6::scope_sid(sock_netns(pid, slot), parsed.scope) { return err_reply(e); }
+            }
             // A fresh network namespace has only a DOWN loopback: no address
             // can be bound but the wildcard.
             if !ip.is_unspecified() && sock_netns(pid, slot) != 0 && vif::lo_up_sid(sock_netns(pid, slot)).is_none() { return err_reply(-99); }
@@ -4399,7 +4401,7 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 // A non-initial netns has only a down loopback: its UDP bind
                 // stays a pure table entry, no host-stack socket (unreachable).
                 if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() {
-                    if let Err(e) = udp_materialize(pid, slot, None, server) { return err_reply(e); }
+                    if let Err(e) = udp_materialize(pid, slot, None, 0, server) { return err_reply(e); }
                 }
             }
             ok_reply()
@@ -4869,7 +4871,7 @@ fn no_route_err() -> i32 { if drivers::netdev::count() == 0 { -100 } else { -101
 
 /// The stack a UDP socket bound to `local` (if bound) and first sending to
 /// `dest` (if known) lives on (see `udp_materialize`).
-fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Result<Sid, i32> {
+fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>, scope: u32) -> Result<Sid, i32> {
     if ns != 0 {
         // Loopback stays on the namespace's own lo (down = no route); anything
         // else leaves over its own tun/tap interfaces only, never a host NIC.
@@ -4893,6 +4895,7 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Resu
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
     }
+    if let Some(d) = dest.filter(|d| ip6::needs_scope(*d)) { return ip6::scope_sid(ns, scope); }
     match dest {
         Some(d) => iface::route_select(ns, d).ok_or_else(no_route_err),
         None => iface::default_sid().ok_or(-100),
@@ -4902,7 +4905,7 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>) -> Resu
 /// `server`: a wildcard bind to a chosen port, which gets a socket on every
 /// stack (`udpany`) and so needs no route to exist yet: its primary is the
 /// default route's stack, else loopback.
-fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool) -> Result<(), i32> {
+fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, scope: u32, server: bool) -> Result<(), i32> {
     let mut resv = [0u16; MAX_TIME_WAIT];
     let nresv = time_wait_snapshot(&mut resv);
     let mut tbls = SOCK_TABLES.lock();
@@ -4933,7 +4936,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, server: bool)
     } else {
         ephemeral.ok_or(-98i32)? // EADDRINUSE: range exhausted
     };
-    let sid = match udp_stack(tbl.socks[slot].netns(), local_addr, dest) {
+    let sid = match udp_stack(tbl.socks[slot].netns(), local_addr, dest, scope) {
         Ok(s) => s,
         Err(_) if server && tbl.socks[slot].netns() == 0 => LO,
         Err(e) => return Err(e),
@@ -5127,7 +5130,11 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
             if let Err(e) = udp_rebind_port(pid, slot) { return err_reply(e); }
         }
         let cns = sock_netns(pid, slot);
-        let sid = match bound_addr.filter(|a| cns == 0 && !a.is_unspecified() && !is_loopback_addr(*a))
+        // A link-local peer is reached through the interface its scope id names.
+        let scoped = if ip6::needs_scope(remote_ip) {
+            match ip6::scope_sid(cns, parsed.scope) { Ok(s) => Some(s), Err(e) => return err_reply(e) }
+        } else { None };
+        let sid = if let Some(s) = scoped { s } else { match bound_addr.filter(|a| cns == 0 && !a.is_unspecified() && !is_loopback_addr(*a))
             .and_then(iface::holder_of)
         {
             Some(sid) if !is_loopback_addr(remote_ip) => sid,
@@ -5135,7 +5142,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 Some(sid) => sid,
                 None => return err_reply(if cns != 0 { -101 } else { no_route_err() }),
             },
-        };
+        } };
 
         // TIME_WAIT snapshot before SOCK_TABLES — the leaf-lock rule again.
         let mut resv = [0u16; MAX_TIME_WAIT];
@@ -5762,8 +5769,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         {
             drop(tbls);
             if addr_ptr == 0 || addrlen < 8 { return err_reply(-89); } // EDESTADDRREQ
-            let dest = match sa::parse(addr_ptr, addrlen) { Ok(a) => a.ip, Err(e) => return err_reply(e) };
-            if let Err(e) = udp_materialize(pid, slot, Some(dest), false) { return err_reply(e); }
+            let (dest, dscope) = match sa::parse(addr_ptr, addrlen) { Ok(a) => (a.ip, a.scope), Err(e) => return err_reply(e) };
+            if let Err(e) = udp_materialize(pid, slot, Some(dest), dscope, false) { return err_reply(e); }
             handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, kdata)
         }
         SockState::IcmpUnbound => {
@@ -5787,7 +5794,12 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 
             // The ping socket lives on the stack its first destination routes
             // through, and stays there.
-            let sid = match iface::route_select(sock_netns(pid, slot), dest_ip) { Some(s) => s, None => return err_reply(if sock_netns(pid, slot) != 0 { -101 } else { no_route_err() }) };
+            let dscope = if sock_domain == AF_INET6 { sa::parse(addr_ptr, addrlen).map_or(0, |a| a.scope) } else { 0 };
+            if ip6::needs_scope(dest_ip) {
+                if let Err(e) = ip6::scope_sid(sock_netns(pid, slot), dscope) { return err_reply(e); }
+            }
+            let scoped = if ip6::needs_scope(dest_ip) { ip6::scope_sid(sock_netns(pid, slot), dscope).ok() } else { None };
+            let sid = match scoped.or_else(|| iface::route_select(sock_netns(pid, slot), dest_ip)) { Some(s) => s, None => return err_reply(if sock_netns(pid, slot) != 0 { -101 } else { no_route_err() }) };
             let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();

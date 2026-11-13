@@ -1382,6 +1382,13 @@ pub fn forwarding(ns: NsId, ifname: &[u8]) -> bool {
         }
     }
 }
+/// Is IPv6 disabled on interface `ifname` of netns `ns` (`conf/all/disable_ipv6` or the interface's own)?
+pub fn ipv6_disabled(ns: NsId, ifname: &[u8]) -> bool {
+    if netctl_find(b"ipv6/conf/all/disable_ipv6").map_or(false, |k| netctl_get(ns, k) != 0) { return true; }
+    { let t = IFCTL.lock();
+      for e in t.iter() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == ifname { return e.v[4] != 0; } } }
+    static_field(ns, "default", "ipv6", "disable_ipv6") != 0
+}
 /// May `pid` (an unprivileged ICMP "ping" socket) be created in its netns?
 pub fn ping_allowed(pid: u32) -> bool {
     let ns = netns_of(pid);
