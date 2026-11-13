@@ -2433,6 +2433,54 @@ static void mntiso_procfd_suite(void) {
     report("procfd_host_sentinel_intact", mi_host_intact());
 }
 
+/* ── lane mntiso-e7: a dirfd keeps its object after the tree changes ──── */
+#define E7H "/tmp/e7/host/d"
+#define E7R "/tmp/e7/root"
+static void e7_mk(void) {
+    mkdir("/tmp/e7", 0755); mkdir("/tmp/e7/host", 0755); mkdir(E7H, 0755);
+    mkdir(E7R, 0755); mkdir(E7R "/tmp", 0755); mkdir(E7R "/tmp/e7", 0755);
+    mkdir(E7R "/tmp/e7/host", 0755); mkdir(E7R "/tmp/e7/host/d", 0755);
+    mkdir(E7R "/old", 0755); mkdir(E7R "/proc", 0755);
+    put(E7H "/f", "HOST", 0644); put(E7H "/u", "HOST", 0644);
+    put(E7R E7H "/f", "VIEW", 0644); put(E7R E7H "/u", "VIEW", 0644);
+}
+static int e7_child(int m) {
+    int dfd = open(E7H, O_DIRECTORY | O_RDONLY); if (dfd < 0) return 10;
+    if (unshare(CLONE_NEWNS) < 0) return 11;
+    if (mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 12;
+    if (m == 0) {
+        if (mount(E7R, E7R, NULL, MS_BIND | MS_REC, NULL) < 0) return 13;
+        if (chdir(E7R) < 0) return 14;
+        if (syscall(SYS_pivot_root, ".", "old") < 0) return 15;
+        if (chdir("/") < 0) return 16;
+        if (exists("/tmp/e7/host/d/m")) return 17;
+    } else {
+        if (chroot(E7R) < 0) return 15;
+        if (chdir("/") < 0) return 16;
+    }
+    char b[16] = {0}; int fd = openat(dfd, "f", O_RDONLY);
+    if (fd < 0) { printf("  openat errno=%d\n", errno); return 20; }
+    if (read(fd, b, 15) < 0) {} close(fd);
+    if (strncmp(b, "HOST", 4)) { printf("  openat read '%s'\n", b); return 21; }
+    struct stat st; if (fstatat(dfd, "f", &st, 0) < 0 || st.st_size != 4) { printf("  fstatat errno=%d\n", errno); return 22; }
+    if (mkdirat(dfd, "m", 0755) < 0) { printf("  mkdirat errno=%d\n", errno); return 23; }
+    if (unlinkat(dfd, "u", 0) < 0) { printf("  unlinkat errno=%d\n", errno); return 24; }
+    char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/f", dfd);
+    memset(b, 0, sizeof b);
+    if (slurp(p, b, sizeof b) < 0 || strncmp(b, "HOST", 4)) { printf("  procfd read '%s'\n", b); return 25; }
+    return 0;
+}
+static void mntiso_e7_suite(void) {
+    for (int m = 0; m < 2; m++) {
+        e7_mk();
+        int ok = nn_in_child(e7_child, m);
+        char n[40]; snprintf(n, sizeof n, "e7_dirfd_keeps_object_%s", m ? "chroot" : "pivot");
+        int host = exists(E7H "/m") && !exists(E7H "/u") && exists(E7R E7H "/u") && !exists(E7R E7H "/m");
+        report(n, ok && host);
+        system("rm -rf /tmp/e7");
+    }
+}
+
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
     if (unshare(CLONE_NEWNS) < 0) return 91;
@@ -2766,6 +2814,7 @@ int main(int argc, char **argv) {
     fdbindprop_suite();
     mro_suite();
     mntiso_procfd_suite();
+    mntiso_e7_suite();
     shmbind_suite();
     devbind_suite();
     mntiso_busy_suite();
