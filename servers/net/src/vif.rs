@@ -153,18 +153,23 @@ pub(crate) fn daemon_pass() {
 pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
     {
         let mut n = NETNS.lock();
-        let mut v = VIFS.lock();
         for &(ns, sid) in list {
             if let Some(st) = n.get_mut(&ns) {
                 st.sids.retain(|&s| s != sid);
                 st.routes.retain(|r| r.oif != sid);
             }
-            v[sid as usize] = None;
         }
     }
     for &(_, sid) in list { crate::l2::forget(sid); }
     // No table lock is held: the stack locks are taken alone.
     for &(_, sid) in list { *crate::STACKS[sid as usize].lock() = None; }
+    // The VIFS slot (the sid allocator's "taken" mark) is released only after
+    // the stack is gone: freeing it first let a new veth reuse the sid and have
+    // its fresh stack wiped by this late `= None`.
+    {
+        let mut v = VIFS.lock();
+        for &(_, sid) in list { v[sid as usize] = None; }
+    }
 }
 
 fn reap(ns: u16) {
@@ -182,10 +187,14 @@ fn reap(ns: u16) {
                 }
             }
         }
-        for &sid in st.sids.iter() { v[sid as usize] = None; }
     }
     free_vifs(&peers);
     for &sid in st.sids.iter() { crate::l2::forget(sid); }
     // No stack lock is held here (VIFS/NETNS are released).
     for &sid in st.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
+    // Release the sids only now (see free_vifs): a reused sid must not lose its new stack.
+    {
+        let mut v = VIFS.lock();
+        for &sid in st.sids.iter() { v[sid as usize] = None; }
+    }
 }
