@@ -5088,8 +5088,9 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
             // dirfd with no name in this namespace: the flags of the mount it
             // was opened on still apply (Linux: the fd keeps its vfsmount).
             if hf & (mnt::MNT_RDONLY | mnt::MNT_NODEV) != 0 { mnt_flag_check(msg.tag, msg, path, hf)?; }
-            return Ok(());
-        }
+            // Unflagged ns-0 mount (carried only for identity): resolve as usual.
+            if hf != 0 { return Ok(()); }
+        } else {
         let ns = sched::current_mntns();
         if ns != 0 { sched::set_strict_links(true); }
         let jail = sched::current_root_arc();
@@ -5112,6 +5113,7 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
                 msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(nptr as u64).to_le_bytes());
                 return Ok(());
             }
+        }
         }
     }
     if !is_tmp_path(path) { return Ok(()); }
@@ -5294,7 +5296,7 @@ fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
                 if fd >= 0 {
                     match cx.hidden_flags {
                         // Inherit the originating mount's flags (ns MAX: no live table).
-                        Some(hf) => fd_note_mnt(caller_pid, fd as usize, u16::MAX, 1, hf),
+                        Some(hf) => fd_note_mnt(caller_pid, fd as usize, u16::MAX, cx.mnt_id.max(1), hf),
                         None => fd_note_mnt(caller_pid, fd as usize, sched::current_mntns(), cx.mnt_id, mnt::flags_of(sched::current_mntns(), cx.mnt_id)),
                     }
                 }
@@ -6483,7 +6485,7 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if p >= buf.len() { return start; }
     }
     // Alias mounts (proc/devtmpfs/sysfs/bind), where the reader sees them.
-    for (dev, mp, fstype, _sbi) in alias_mounts_for_reader() {
+    for (dev, mp, fstype, _sbi, fl) in alias_mounts_for_reader() {
         let start = p;
         p = write_lit(buf, p, &dev);
         p = write_lit(buf, p, b" ");
@@ -6491,7 +6493,8 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         p = write_lit(buf, p, b" ");
         p = write_lit(buf, p, fstype.as_bytes());
         // Alias mounts are always nosuid (see alias.rs).
-        p = write_lit(buf, p, b" rw,nosuid 0 0\n");
+        p = write_alias_opts(buf, p, fl);
+        p = write_lit(buf, p, b" 0 0\n");
         if p >= buf.len() { return start; }
     }
     // The built-in mqueue tree (served at /dev/mqueue like /dev/pts) is a mount
@@ -6515,18 +6518,29 @@ fn write_mtab_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
 /// The alias mounts as the calling task sees them: mount points inside its
 /// chroot with the root stripped; the rest omitted (as Linux hides mounts
 /// outside a reader's root). Unjailed readers see them all.
-fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Option<u32>)> {
+fn alias_mounts_for_reader() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Option<u32>, u8)> {
     let root = sched::current_root_arc();
     alias::list().into_iter().filter_map(|(dev, mp, fstype, sbi)| {
+        let fl = alias::flags_at(&mp);
         match root.as_deref() {
             Some(r) if r.len() > 1 => {
                 if !alias::under(&mp, r) { return None; }
                 let v = if mp.len() == r.len() { b"/".to_vec() } else { mp[r.len()..].to_vec() };
-                Some((dev, v, fstype, sbi))
+                Some((dev, v, fstype, sbi, fl))
             }
-            _ => Some((dev, mp, fstype, sbi)),
+            _ => Some((dev, mp, fstype, sbi, fl)),
         }
     }).collect()
+}
+
+/// Per-mount options of an ns-0 alias/bind mount: `ro`/`rw`, `nosuid`, then
+/// `nodev`/`noexec` when set (Linux order).
+fn write_alias_opts(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize, fl: u8) -> usize {
+    p = write_lit(buf, p, if fl & mnt::MNT_RDONLY != 0 { b"ro" } else { b"rw" });
+    p = write_lit(buf, p, b",nosuid");
+    if fl & mnt::MNT_NODEV != 0 { p = write_lit(buf, p, b",nodev"); }
+    if fl & mnt::MNT_NOEXEC != 0 { p = write_lit(buf, p, b",noexec"); }
+    p
 }
 
 /// ` shared:N`, ` master:N`, ` unbindable` for the ns-0 mount at `path`.
@@ -6619,7 +6633,7 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         if p >= buf.len() { return start; }
         mount_id += 1;
     }
-    for (dev, mp, fstype, sbi) in alias_mounts_for_reader() {
+    for (dev, mp, fstype, sbi, fl) in alias_mounts_for_reader() {
         let start = p;
         p = write_u32(buf, p, mount_id);
         p = write_lit(buf, p, b" 20 ");
@@ -6631,7 +6645,8 @@ fn write_mountinfo_lines(buf: &mut [u8; TMP_BUF_SIZE], mut p: usize) -> usize {
         }
         p = write_lit(buf, p, b" / ");
         p = write_lit(buf, p, &mp);
-        p = write_lit(buf, p, b" rw,nosuid,relatime");
+        p = write_alias_opts(buf, p, fl);
+        p = write_lit(buf, p, b",relatime");
         p = write_prop_fields(buf, p, &mp);
         p = write_lit(buf, p, b" - ");
         p = write_lit(buf, p, fstype.as_bytes());
@@ -14871,6 +14886,7 @@ fn fd_mnt_ro(pid: u32, fd: usize) -> bool {
         }
     };
     match ofd::mnt_of(ofd) {
+        Some((u16::MAX, mid)) => alias::flags_by_id(mid).or_else(|| ofd::mnt_flags_of(ofd)).map_or(false, |f| f & mnt::MNT_RDONLY != 0),
         Some((ns, mid)) => mnt::flags_of(ns, mid) & mnt::MNT_RDONLY != 0,
         None => false,
     }
