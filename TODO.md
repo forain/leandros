@@ -26,7 +26,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **brtest fwd_port_reserved flake** (lane brflake 2026-11-13): "flow holder exited cleanly" fails ~2/30 on Mac aarch64 HVF after the TCP flow to the resolver is established; separate from the dead-netns drain bug (fixed; veth_tcp_bulk_exit guards it). Not yet investigated. The earlier veth_pair/veth_tcp_reap/bridge_l2 flakes are FIXED.
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
-- **Podman published ports**: rootful `-p` and `--internal` firewall semantics open (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
+- **Podman published ports**: bridge `-p` (needs nf_tables, design-podnat) and the nft isolation drops open; `--internal` forwarding=0 now survives ip_forward=1 (lane podl0); rootful `--network=pasta` is rejected by podman itself, rootless `-p` works (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
 ### Desktop / GPU / COSMIC
