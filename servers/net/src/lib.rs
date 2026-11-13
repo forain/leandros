@@ -10,6 +10,7 @@ pub mod netctl;
 mod procnet;
 pub mod rtnetlink;
 mod nlsock;
+mod nfnl;
 mod iface;
 mod ip6;
 mod vifsel;
@@ -4211,10 +4212,10 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
                 }
             }
         }
-        // NETLINK_ROUTE only (`rtnetlink`): getifaddrs, if_nameindex, nICEr.
+        // NETLINK_ROUTE (`rtnetlink`) and NETLINK_NETFILTER (`nfnl`): getifaddrs, if_nameindex, nICEr.
         AF_NETLINK => {
             if sock_type & 0xf != SOCK_RAW && sock_type & 0xf != SOCK_DGRAM { return err_reply(-94); } // ESOCKTNOSUPPORT
-            if protocol != rtnetlink::NETLINK_ROUTE { return err_reply(-93); } // EPROTONOSUPPORT
+            if protocol != rtnetlink::NETLINK_ROUTE && protocol != nfnl::NETLINK_NETFILTER { return err_reply(-93); } // EPROTONOSUPPORT
         }
         _                 => return err_reply(-97),
     }
@@ -4261,7 +4262,7 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         o.v6only = true;
         set_sock_opts(ofd, o);
     }
-    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid)); }
+    if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid), protocol); }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 

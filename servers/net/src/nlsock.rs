@@ -15,12 +15,15 @@ use alloc::vec::Vec;
 const MSG_TRUNC_F: usize = 0x20;
 const MAX_REQ: usize = 64 * 1024;
 const MAX_QUEUED: usize = 64;
+const MAX_QUEUED_NF: usize = 4096;
 
 struct NlSock {
     pid: u32,
     /// Network namespace the socket was created in.
     ns: sched::ns::NsRef,
     groups: u32,
+    /// Netlink protocol (NETLINK_ROUTE or NETLINK_NETFILTER).
+    proto: usize,
     /// connect(2) destination (pid, groups); only the kernel (pid 0) is meaningful.
     peer: Option<(u32, u32)>,
     q: VecDeque<Vec<u8>>,
@@ -32,10 +35,10 @@ static NL: Mutex<BTreeMap<u32, NlSock>> = Mutex::new(BTreeMap::new());
 static NL_EVER: AtomicU32 = AtomicU32::new(0);
 
 /// A new netlink description `ofd` owned by process `tgid`.
-pub fn create(ofd: u32, tgid: u32, netns: u16) {
+pub fn create(ofd: u32, tgid: u32, netns: u16, proto: usize) {
     let mut m = NL.lock();
     m.retain(|&k, _| vfs::ofd::live(k));
-    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, peer: None, q: VecDeque::new(), gen: 0 });
+    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, proto, peer: None, q: VecDeque::new(), gen: 0 });
     NL_EVER.store(1, Ordering::Release);
 }
 
@@ -182,7 +185,19 @@ fn trace_rep(replies: &[Vec<u8>], ns: u16) {
 
 /// A request arrived: queue the replies and wake pollers. Returns the length.
 pub fn send(ofd: u32, data: &[u8]) -> Message {
-    let (pid, ns) = match NL.lock().get(&ofd) { Some(s) => (s.pid, s.ns.id()), None => return err_reply(-9) };
+    let (pid, ns, proto) = match NL.lock().get(&ofd) { Some(s) => (s.pid, s.ns.id(), s.proto), None => return err_reply(-9) };
+    if proto == crate::nfnl::NETLINK_NETFILTER {
+        let admin = sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), 12);
+        let replies = crate::nfnl::handle(ns, pid, admin, data);
+        let mut m = NL.lock();
+        if let Some(s) = m.get_mut(&ofd) {
+            for r in replies { if s.q.len() >= MAX_QUEUED_NF { break; } s.q.push_back(r); }
+            s.gen += 1;
+        }
+        drop(m);
+        sock_state_moved(&[sock_state_key(ofd)]);
+        return val_reply(data.len() as u64);
+    }
     crate::vif::daemon_pass(); // reap veth pairs of namespaces that died
     let links = rt::current_links(ns);
     let routes = rt::current_routes(ns);
