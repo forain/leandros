@@ -137,13 +137,13 @@ int main(void)
     run("nft flush ruleset 2>&1", out, sizeof out);
     apply_json(cap_b);
     rc = run("nft -a list table inet netavark 2>&1 | awk '"
-             "/^\\tchain /{c=$2; next} /# handle/ && c!=\"\" && !/type / && "
+             "$1==\"chain\"{c=$2; next} /# handle/ && c!=\"\" && "
              "(c ~ /^nv_/ || /nv_/ || /10\\.89\\.0\\.0\\/24/ || /podman1/ || /dport 8080/) "
              "{print \"delete rule inet netavark \" c \" handle \" $NF}' > /tmp/nft-td.nft; "
              "nft -f /tmp/nft-td.nft 2>&1", out, sizeof out);
     CHECK("teardown: delete rules by handle", rc == 0);
     if (rc) printf("  nft: %.300s\n", out);
-    rc = run("for c in $(nft list table inet netavark | awk '/^\\tchain nv_/{print $2}'); do nft delete chain inet netavark $c || exit 1; done", out, sizeof out);
+    rc = run("for c in $(nft list table inet netavark | awk '$1==\"chain\" && $2 ~ /^nv_/{print $2}'); do nft delete chain inet netavark $c || exit 1; done", out, sizeof out);
     CHECK("teardown: delete per-network chains", rc == 0);
     if (rc) printf("  nft: %.300s\n", out);
     same(cap_td, "b_teardown");
