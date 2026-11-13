@@ -47,7 +47,12 @@ def main():
             fails.append(name)
 
     rc, out = guest("cat /proc/modules")
-    check("gen0 virtio_blk is a module", "virtio_blk" in out, out.strip()[-80:])
+    if "virtio_blk" not in out:
+        # The stock build has VIRTIO_BLK=y; this gate only means something on the =m kernel that
+        # scripts/kmod/kexecblktest.sh builds. Do not report a stock-kernel run as a failure.
+        print("RESULT: SKIP (virtio_blk is built in; run scripts/kmod/kexecblktest.sh for the =m kernel)")
+        return 0
+    check("gen0 virtio_blk is a module", True)
     rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=1'")
     check("gen0 load", rc == 0, out.strip()[-80:])
     m = os.path.getsize(driver.SERIAL_FULL_LOG)
