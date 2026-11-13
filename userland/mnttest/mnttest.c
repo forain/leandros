@@ -2591,6 +2591,46 @@ static int e7x_ns0(int m) {
     rmdir("/tmp/e7x/src/m5");
     return rc;
 }
+static int e7x_ns0_view(int m) {
+    (void)m;
+    static char b[16384];
+    int rc = 0;
+    mkdir("/tmp/e7x/vw", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/vw", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7x/vw", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NODEV | MS_NOEXEC, NULL) < 0) { umount("/tmp/e7x/vw"); return 14; }
+    int n = slurp("/proc/self/mounts", b, sizeof b);
+    char *l = n > 0 ? strstr(b, " /tmp/e7x/vw ") : NULL;
+    if (!l) rc = 15;
+    else if (!strstr(l, " ro,nosuid,nodev,noexec ")) { printf("  mounts line: %.80s\n", l); rc = 16; }
+    if (!rc) {
+        n = slurp("/proc/self/mountinfo", b, sizeof b);
+        l = n > 0 ? strstr(b, " /tmp/e7x/vw ") : NULL;
+        if (!l) rc = 17;
+        else if (strncmp(l + 13, "ro,nosuid,nodev,noexec,relatime", 31) != 0) { printf("  mountinfo line: %.80s\n", l); rc = 18; }
+        else { char *e = strchr(l, '\n'); if (e && !(e - l >= 3 && strncmp(e - 3, " rw", 3) == 0)) rc = 19; }
+    }
+    umount("/tmp/e7x/vw");
+    return rc;
+}
+static int e7x_ns0_dirfd(int m) {
+    (void)m;
+    int rc = 0;
+    mkdir("/tmp/e7x/dv", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/dv", NULL, MS_BIND, NULL) < 0) return 13;
+    int d = open("/tmp/e7x/dv", O_RDONLY | O_DIRECTORY);
+    if (d < 0) { umount("/tmp/e7x/dv"); return 14; }
+    if (mount(NULL, "/tmp/e7x/dv", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) rc = 15;
+    errno = 0; if (!rc && (mkdirat(d, "s1", 0755) == 0 || errno != EROFS)) { printf("  stale rw dirfd errno=%d\n", errno); rc = 16; }
+    rmdir("/tmp/e7x/src/s1");
+    int d2 = rc ? -1 : open("/tmp/e7x/dv", O_RDONLY | O_DIRECTORY);
+    if (!rc && d2 < 0) rc = 17;
+    if (!rc && mount(NULL, "/tmp/e7x/dv", NULL, MS_REMOUNT | MS_BIND, NULL) < 0) rc = 18;
+    errno = 0; if (!rc && mkdirat(d2, "s2", 0755) != 0) { printf("  stale ro dirfd errno=%d\n", errno); rc = 19; }
+    rmdir("/tmp/e7x/src/s2");
+    close(d); if (d2 >= 0) close(d2);
+    umount("/tmp/e7x/dv");
+    return rc;
+}
 static void e7x_suite(void) {
     e7_mk();
     mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
@@ -2598,6 +2638,8 @@ static void e7x_suite(void) {
     mknod("/tmp/e7x/src/nul", S_IFCHR | 0666, makedev(1, 3));
     report("e7_hidden_fd_noexec_nodev", nn_in_child(e7x_child, 0));
     report("e7_ns0_permount_flags_enforced", nn_in_child(e7x_ns0, 0));
+    report("e7_ns0_mounts_show_flags", nn_in_child(e7x_ns0_view, 0));
+    report("e7_ns0_dirfd_flags_live", nn_in_child(e7x_ns0_dirfd, 0));
     system("rm -rf /tmp/e7 /tmp/e7x");
 }
 

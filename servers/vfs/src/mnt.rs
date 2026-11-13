@@ -1137,6 +1137,33 @@ pub fn flags_at(p: &[u8]) -> u8 {
     best.map_or(0, |b| b.1 & ENFORCED)
 }
 
+/// Identity of the ns-0 mount at `mountpoint` (what an fd records; nonzero).
+pub fn id_of(mountpoint: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in mountpoint { h ^= b as u32; h = h.wrapping_mul(0x0100_0193); }
+    h | 0x8000_0000
+}
+
+/// `(identity, flags)` of the ns-0 mount whose mount point is the longest
+/// prefix of namespace path `p`; None when `p` lies in no alias/bind mount.
+pub fn mount_at(p: &[u8]) -> Option<(u32, u8)> {
+    let mut best: Option<(usize, u32, u8)> = None;
+    for a in ALIASES.lock().iter() {
+        if under(p, &a.mountpoint) && best.map_or(true, |b| a.mountpoint.len() >= b.0) { best = Some((a.mountpoint.len(), id_of(&a.mountpoint), a.flags)); }
+    }
+    for m in SELF_BINDS.lock().iter() {
+        if under(p, &m.0) && best.map_or(true, |b| m.0.len() >= b.0) { best = Some((m.0.len(), id_of(&m.0), m.1)); }
+    }
+    best.map(|b| (b.1, b.2 & ENFORCED))
+}
+
+/// Live flags of the ns-0 mount with identity `id`; None once it is gone.
+pub fn flags_by_id(id: u32) -> Option<u8> {
+    for a in ALIASES.lock().iter() { if id_of(&a.mountpoint) == id { return Some(a.flags & ENFORCED); } }
+    for m in SELF_BINDS.lock().iter() { if id_of(&m.0) == id { return Some(m.1 & ENFORCED); } }
+    None
+}
+
 /// Replace the flags of the mount at exactly `mountpoint`. False when none is.
 pub fn set_flags(mountpoint: &[u8], flags: u8) -> bool {
     let flags = flags & ENFORCED;

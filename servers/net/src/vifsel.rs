@@ -24,6 +24,8 @@ pub(crate) struct Vif {
     pub addrs: Vec<([u8; 4], u8)>,
     /// Static IPv6 addresses (netlink); the link-local one is derived from `mac` while up.
     pub addrs6: Vec<([u8; 16], u8)>,
+    /// Static v6 gateway routes of a netns vif: (dst, plen, gateway, metric).
+    pub routes6: Vec<([u8; 16], u8, [u8; 16], u32)>,
     /// Frames waiting to enter the stack (cap `RXQ_CAP`).
     pub rxq: VecDeque<Vec<u8>>,
     /// Bridge only: the port sid each `rxq` frame entered on, parallel to `rxq` (`NO_PEER` = unknown).
