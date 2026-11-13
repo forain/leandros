@@ -159,7 +159,7 @@ fn do_load(kfd: usize, initrd_fd: Option<usize>, cmdline: &[u8]) -> Result<Image
     let bi = unsafe { &*(bi_ptr as *const boot::BootInfo) };
 
     ACPI_RESVD.store(
-        core::str::from_utf8(cmdline).map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "kexec.test=acpiresvd")),
+        core::str::from_utf8(cmdline).map_or(false, |c| c.split_ascii_whitespace().any(|t| t.trim_end_matches('\0') == "kexec.test=acpiresvd")),
         Ordering::SeqCst);
     let parsed = elf::parse(kfd)?;
     let map = info::raw_map(bi);
