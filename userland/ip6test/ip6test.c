@@ -560,6 +560,12 @@ static int ns6_body(int mode) {
     int pr = poll(&p, 1, 3000);
     if (pr != 1) return 11;
     if (!(p.revents & POLLIN)) return 14;
+    // The data may be readable before the FIN has been processed.
+    for (int i = 0; i < 150 && !(p.revents & POLLRDHUP); i++) {
+        usleep(20000);
+        p.revents = 0;
+        poll(&p, 1, 0);
+    }
     if (!(p.revents & POLLRDHUP)) return 16;
     if (p.revents & POLLHUP) return 17;
     char b[8];
