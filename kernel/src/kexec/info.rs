@@ -33,6 +33,7 @@ pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
 /// ACPI table above 2 GiB to raw 8, as firmware keeping tables in Reserved RAM
 /// would. x86_64 only (aarch64 has no ACPI path).
 #[allow(unused_variables)]
+#[allow(dead_code)]
 static RETYPED_LO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
 #[allow(unused_variables)]
