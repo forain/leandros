@@ -190,6 +190,14 @@ pub struct NfState { gen: u32, next_table: u64, tables: Vec<Table> }
 static NF: Mutex<BTreeMap<u16, NfState>> = Mutex::new(BTreeMap::new());
 
 /// True when netns `ns` has at least one table (cheap gate for the later datapath).
+/// Does any base chain of `ns` sit on `hook`?
+pub fn has_hook(ns: u16, hook: u32) -> bool {
+    let g = NF.lock();
+    let Some(st) = g.get(&ns) else { return false };
+    st.tables.iter().filter(|t| t.family == 1 || t.family == 2).any(|t| t.chains.iter().any(|c|
+        c.hook.as_ref().map_or(false, |h| find(&attrs(h), 1).and_then(be32) == Some(hook))))
+}
+
 pub fn has_tables(ns: u16) -> bool { NF.lock().get(&ns).map_or(false, |s| !s.tables.is_empty()) }
 
 /// Drop a dead namespace's rules.
