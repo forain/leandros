@@ -1306,7 +1306,7 @@ pub fn crosses(path: &[u8]) -> bool {
 
 /// The mount point of the alias whose mount point is exactly `path`.
 pub fn is_mountpoint(path: &[u8]) -> bool {
-    if ACTIVE.load(Ordering::Acquire) == 0 { return false; }
+    if ACTIVE.load(Ordering::Acquire) == 0 { return SELF_BINDS.lock().iter().any(|m| m.0.as_slice() == path); }
     ALIASES.lock().iter().any(|a| a.mountpoint == path) || SELF_BINDS.lock().iter().any(|m| m.0.as_slice() == path)
 }
 
