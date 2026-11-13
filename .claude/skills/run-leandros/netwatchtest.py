@@ -134,7 +134,13 @@ def main(argv):
         if want("loss"):
             set_cmdline("netwatch.loss=10")
             env.pop("LEANDROS_NIC", None)
-            subprocess.run([sys.executable, DRV, "start", arch], env=env, capture_output=True, text=True, timeout=900)
+            try:  # a stale log from an earlier/killed run would fake DHCP and the loss line
+                os.remove(driver.SERIAL_FULL_LOG)
+            except FileNotFoundError:
+                pass
+            rs = subprocess.run([sys.executable, DRV, "start", arch], env=env, capture_output=True, text=True, timeout=900)
+            if rs.returncode != 0:
+                print("loss: driver start failed (missing f2fs-data*.img in this worktree?): " + (rs.stdout + rs.stderr)[-200:])
             lg = subprocess.run([sys.executable, DRV, "login", "root", "root", str(int(120 * scale))],
                                 env=env, capture_output=True, text=True, timeout=1200)
             pid = driver._qemu_pid()

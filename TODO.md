@@ -26,7 +26,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - ~~**Real NIC drivers program no multicast filter**~~ FIXED 2026-11-11 (lane/nicmcast): macb, e1000e, r8169, iwlwifi already accepted all multicast; brcmf (Pi Wi-Fi) now sets `allmulti` (Pi wifi0 rx of 30 mDNS-group datagrams: +5 before, +37 after). Pass-all, no per-group list. See artifacts/notes/lane-nicmcast-2026-11-11.md.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
-- **`netwatch.loss=S` x86_64/TCG case fails in the harness** (2026-11-13: aarch64 PASS, line 15.1 s after set_link; x86_64 `netwatchtest.py --only loss` FAIL: `dhcp=False`, `cannot connect to monitor`, no reset seen; likely harness QMP/monitor socket or DHCP wait too short on TCG, not yet diagnosed).
 - **Podman published ports**: rootful `-p` and `--internal` firewall semantics open (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
