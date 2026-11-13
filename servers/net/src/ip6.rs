@@ -561,3 +561,27 @@ fn sync_static_routes(oif: u32) {
     }
     iface::notify(nif.id);
 }
+
+/// The NIC's global v6 address (SLAAC, else a static one with scope global).
+pub(crate) fn nic_global(id: u8) -> Option<[u8; 16]> {
+    if let Some((g, _)) = SLAAC.lock()[id as usize].addr { return Some(g); }
+    let idx = id as u32 + 2;
+    STATIC_A.lock().iter().find(|&&(i, a, _)| i == idx && !is_link_local(&a) && a[0] != 0xff).map(|&(_, a, _)| a)
+}
+
+/// Egress for a forwarded v6 packet: `(nic id, next hop, source address)`. Only NICs (never a dynamic link).
+pub(crate) fn nic_route6(dst: [u8; 16]) -> Option<(u8, [u8; 16], [u8; 16])> {
+    let (oif, gw) = lookup6(dst)?;
+    if oif < 2 { return None; }
+    let id = (oif - 2) as u8;
+    if (id as usize) >= netdev::count() { return None; }
+    let src = nic_global(id)?;
+    Some((id, gw.unwrap_or(dst), src))
+}
+
+/// True when `a` is an address of this host's initial namespace (NIC, loopback, any ns-0 link).
+pub(crate) fn is_host6(a: &[u8; 16]) -> bool {
+    if addrs6().iter().any(|x| &x.addr == a) { return true; }
+    let v = crate::vif::VIFS.lock();
+    v.iter().flatten().any(|x| x.netns == 0 && x.addrs6.iter().any(|&(p, _)| &p == a))
+}

@@ -1386,6 +1386,13 @@ pub fn forwarding(ns: NsId, ifname: &[u8]) -> bool {
         }
     }
 }
+/// IPv6 forwarding of interface `ifname` in netns `ns`: `conf/all/forwarding` or the interface's own.
+pub fn forwarding6(ns: NsId, ifname: &[u8]) -> bool {
+    if netctl_find(b"ipv6/conf/all/forwarding").map_or(false, |k| netctl_get(ns, k) != 0) { return true; }
+    { let t = IFCTL.lock();
+      for e in t.iter() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == ifname { return e.v[5] != 0; } } }
+    static_field(ns, "default", "ipv6", "forwarding") != 0
+}
 /// Is IPv6 disabled on interface `ifname` of netns `ns` (`conf/all/disable_ipv6` or the interface's own)?
 pub fn ipv6_disabled(ns: NsId, ifname: &[u8]) -> bool {
     if netctl_find(b"ipv6/conf/all/disable_ipv6").map_or(false, |k| netctl_get(ns, k) != 0) { return true; }
