@@ -69,6 +69,19 @@ pub(crate) fn init() {
 
 /// `sched::ns` hook: the `idx`-th non-loopback link of `ns` (0 = none), for /proc/sys/net/*/conf/<if>.
 fn ifnames(ns: u16, idx: usize, out: &mut [u8; 16]) -> usize {
+    // The initial namespace's links are the NICs, then its dynamic ones.
+    let mut idx = idx;
+    if ns == 0 {
+        let nics = drivers::netdev::count().min(drivers::netdev::MAX_NETIF);
+        if idx < nics {
+            let Some(n) = drivers::netdev::iter().nth(idx) else { return 0 };
+            let name = n.name();
+            let l = name.len().min(15);
+            out[..l].copy_from_slice(&name.as_bytes()[..l]);
+            return l;
+        }
+        idx -= nics;
+    }
     let v = VIFS.lock();
     let mut n = 0;
     for x in v.iter().flatten() {
