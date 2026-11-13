@@ -28,14 +28,14 @@ static int npass, nfail;
 
 struct req { struct nlmsghdr h; struct rtgenmsg g; };
 
-static int dump(int s, int type, unsigned seq, char *buf, int cap) {
+static int dump_fam(int s, int type, unsigned seq, int fam, char *buf, int cap) {
     struct req r;
     memset(&r, 0, sizeof r);
     r.h.nlmsg_len = sizeof r;
     r.h.nlmsg_type = type;
     r.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
     r.h.nlmsg_seq = seq;
-    r.g.rtgen_family = AF_UNSPEC;
+    r.g.rtgen_family = fam;
     struct sockaddr_nl to = { .nl_family = AF_NETLINK };
     if (sendto(s, &r, sizeof r, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof r) return -1;
     int total = 0;
@@ -63,6 +63,8 @@ static int dump(int s, int type, unsigned seq, char *buf, int cap) {
 #ifndef RTM_SETLINK
 #define RTM_SETLINK 19
 #endif
+
+static int dump(int s, int type, unsigned seq, char *buf, int cap) { return dump_fam(s, type, seq, AF_UNSPEC, buf, cap); }
 
 struct nlb { char b[1024]; int len; };
 static void nl_begin(struct nlb *m, int type, int flags, const void *body, int blen) {
@@ -258,8 +260,185 @@ static void rtnl_write_tests(void) {
     CHECK("newroute_needs_cap", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
+
+/* ---- IPv6 (design-ipv6 L6) ---- */
+static int nl_addr6(int s, int type, int flags, int idx, const char *ip, int plen) {
+    struct ifaddrmsg a; memset(&a, 0, sizeof a);
+    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = idx; a.ifa_flags = IFA_F_NODAD;
+    struct in6_addr in; inet_pton(AF_INET6, ip, &in);
+    struct nlb m; nl_begin(&m, type, flags, &a, sizeof a);
+    nl_attr(&m, IFA_LOCAL, &in, 16);
+    nl_attr(&m, IFA_ADDRESS, &in, 16);
+    return nl_do(s, &m);
+}
+/* Find an address in an AF_INET6 dump (idx 0 = any): returns scope+1, or 0. */
+static int find_addr6(int s, int idx, const char *ip, int plen, int fam) {
+    static char b[16384];
+    int n = dump_fam(s, RTM_GETADDR, 20, fam, b, sizeof b), found = 0;
+    struct in6_addr want; inet_pton(AF_INET6, ip, &want);
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+        if (h->nlmsg_type != RTM_NEWADDR) continue;
+        struct ifaddrmsg *a = NLMSG_DATA(h);
+        if (a->ifa_family != AF_INET6 || (idx && (int)a->ifa_index != idx) || a->ifa_prefixlen != plen) continue;
+        int al = IFA_PAYLOAD(h);
+        for (struct rtattr *r = IFA_RTA(a); RTA_OK(r, al); r = RTA_NEXT(r, al))
+            if (r->rta_type == IFA_ADDRESS && !memcmp(RTA_DATA(r), &want, 16)) found = a->ifa_scope + 1;
+    }
+    return found;
+}
+static int nl_route6(int s, int type, int flags, const char *dst, int plen, const char *gw, int oif) {
+    struct rtmsg r; memset(&r, 0, sizeof r);
+    r.rtm_family = AF_INET6; r.rtm_dst_len = plen; r.rtm_table = RT_TABLE_MAIN;
+    r.rtm_protocol = RTPROT_BOOT; r.rtm_scope = RT_SCOPE_UNIVERSE; r.rtm_type = RTN_UNICAST;
+    struct nlb m; nl_begin(&m, type, flags, &r, sizeof r);
+    struct in6_addr in;
+    inet_pton(AF_INET6, dst, &in); nl_attr(&m, RTA_DST, &in, 16);
+    if (gw) { inet_pton(AF_INET6, gw, &in); nl_attr(&m, RTA_GATEWAY, &in, 16); }
+    if (oif) nl_attr(&m, RTA_OIF, &oif, 4);
+    return nl_do(s, &m);
+}
+/* RTM_GETROUTE for dst: 0 if answered (oif/gw filled), else the positive errno. */
+static int get_route6(int s, const char *dst, int *oif, struct in6_addr *gw, int *has_gw) {
+    struct rtmsg r; memset(&r, 0, sizeof r);
+    r.rtm_family = AF_INET6; r.rtm_dst_len = 128;
+    struct nlb m; nl_begin(&m, RTM_GETROUTE, 0, &r, sizeof r);
+    struct in6_addr in; inet_pton(AF_INET6, dst, &in); nl_attr(&m, RTA_DST, &in, 16);
+    ((struct nlmsghdr *)m.b)->nlmsg_len = m.len;
+    if (send(s, m.b, m.len, 0) != m.len) return -1;
+    char rb[2048];
+    ssize_t n = recv(s, rb, sizeof rb, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)rb;
+    if (n < (ssize_t)NLMSG_HDRLEN) return -1;
+    if (h->nlmsg_type == NLMSG_ERROR) return -((struct nlmsgerr *)NLMSG_DATA(h))->error;
+    if (h->nlmsg_type != RTM_NEWROUTE) return -1;
+    struct rtmsg *rt = NLMSG_DATA(h);
+    int al = RTM_PAYLOAD(h); *oif = 0; *has_gw = 0;
+    for (struct rtattr *a = RTM_RTA(rt); RTA_OK(a, al); a = RTA_NEXT(a, al)) {
+        if (a->rta_type == RTA_OIF) memcpy(oif, RTA_DATA(a), 4);
+        if (a->rta_type == RTA_GATEWAY) { memcpy(gw, RTA_DATA(a), 16); *has_gw = 1; }
+    }
+    return 0;
+}
+static int in_dump6(int s, const char *dst, int plen) {
+    static char b[16384];
+    int n = dump_fam(s, RTM_GETROUTE, 21, AF_INET6, b, sizeof b), found = 0;
+    struct in6_addr d; inet_pton(AF_INET6, dst, &d);
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+        if (h->nlmsg_type != RTM_NEWROUTE) continue;
+        struct rtmsg *r = NLMSG_DATA(h);
+        if (r->rtm_family != AF_INET6 || r->rtm_dst_len != plen) continue;
+        int al = RTM_PAYLOAD(h);
+        for (struct rtattr *a = RTM_RTA(r); RTA_OK(a, al); a = RTA_NEXT(a, al))
+            if (a->rta_type == RTA_DST && !memcmp(RTA_DATA(a), &d, 16)) found = 1;
+    }
+    return found;
+}
+/* The default router in /proc/net/ipv6_route as text; 0 when none. */
+static int proc_router6(char *out, int cap) {
+    FILE *f = fopen("/proc/net/ipv6_route", "r");
+    if (!f) return 0;
+    char l[256]; int ok = 0;
+    while (fgets(l, sizeof l, f)) {
+        char dst[40], src[40], nh[40]; unsigned dl, sl;
+        if (sscanf(l, "%32s %x %32s %x %32s", dst, &dl, src, &sl, nh) == 5 && dl == 0
+            && strcmp(dst, "00000000000000000000000000000000") == 0 && strcmp(nh, "00000000000000000000000000000000") != 0) {
+            snprintf(out, cap, "%s", nh); ok = 1; break;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+static int proc_has(const char *file, const char *needle) {
+    FILE *f = fopen(file, "r");
+    if (!f) return 0;
+    char l[512]; int ok = 0;
+    while (fgets(l, sizeof l, f)) if (strstr(l, needle)) ok = 1;
+    fclose(f);
+    return ok;
+}
+
+static void v6_tests(void) {
+    int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    int eth = if_nametoindex("eth0");
+    CHECK("getaddr6_dump lo ::1/128 host", find_addr6(s, 1, "::1", 128, AF_INET6) == RT_SCOPE_HOST + 1);
+    if (eth) {
+        struct in6_addr ll; memset(&ll, 0, 16);
+        CHECK("getaddr6_dump fe80 on eth0 scope link", ({ static char b[16384]; int n = dump_fam(s, RTM_GETADDR, 22, AF_INET6, b, sizeof b), f = 0;
+            for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+                if (h->nlmsg_type != RTM_NEWADDR) continue;
+                struct ifaddrmsg *a = NLMSG_DATA(h);
+                int al = IFA_PAYLOAD(h);
+                for (struct rtattr *r = IFA_RTA(a); RTA_OK(r, al); r = RTA_NEXT(r, al))
+                    if (r->rta_type == IFA_ADDRESS && a->ifa_index == (unsigned)eth && a->ifa_prefixlen == 64
+                        && a->ifa_scope == RT_SCOPE_LINK && ((unsigned char *)RTA_DATA(r))[0] == 0xfe) f = 1;
+            } f; }));
+        CHECK("getaddr6 AF_UNSPEC dump has both families", find_addr6(s, 1, "::1", 128, AF_UNSPEC) != 0);
+    }
+    struct ifaddrs *ifa, *p; int saw6 = 0;
+    if (getifaddrs(&ifa) == 0) {
+        for (p = ifa; p; p = p->ifa_next) if (p->ifa_addr && p->ifa_addr->sa_family == AF_INET6) saw6 = 1;
+        freeifaddrs(ifa);
+    }
+    CHECK("getifaddrs6 returns AF_INET6 entries", saw6);
+
+    /* newaddr6: add, bind succeeds, dump shows; delete, bind EADDRNOTAVAIL */
+    struct sockaddr_in6 sa; memset(&sa, 0, sizeof sa);
+    sa.sin6_family = AF_INET6; inet_pton(AF_INET6, "2001:db8:1::5", &sa.sin6_addr);
+    int b0 = socket(AF_INET6, SOCK_DGRAM, 0);
+    CHECK("newaddr6 bind before: EADDRNOTAVAIL", bind(b0, (struct sockaddr *)&sa, sizeof sa) < 0 && errno == EADDRNOTAVAIL);
+    close(b0);
+    CHECK("newaddr6 add", nl_addr6(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, 1, "2001:db8:1::5", 64) == 0);
+    int b1 = socket(AF_INET6, SOCK_DGRAM, 0);
+    CHECK("newaddr6 bind succeeds", bind(b1, (struct sockaddr *)&sa, sizeof sa) == 0);
+    close(b1);
+    CHECK("newaddr6 dump shows it", find_addr6(s, 1, "2001:db8:1::5", 64, AF_INET6) != 0);
+    CHECK("newaddr6 EEXIST", nl_addr6(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, 1, "2001:db8:1::5", 64) == EEXIST);
+    CHECK("newaddr6 ENODEV", nl_addr6(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, 999, "2001:db8:1::6", 64) == ENODEV);
+    CHECK("deladdr6", nl_addr6(s, RTM_DELADDR, 0, 1, "2001:db8:1::5", 64) == 0);
+    CHECK("deladdr6 again EADDRNOTAVAIL", nl_addr6(s, RTM_DELADDR, 0, 1, "2001:db8:1::5", 64) == EADDRNOTAVAIL);
+    int b2 = socket(AF_INET6, SOCK_DGRAM, 0);
+    CHECK("deladdr6 bind EADDRNOTAVAIL", bind(b2, (struct sockaddr *)&sa, sizeof sa) < 0 && errno == EADDRNOTAVAIL);
+    close(b2);
+
+    /* routes: discover the router, never hardcode it */
+    char nh[40]; int have = eth && proc_router6(nh, sizeof nh);
+    struct in6_addr gw, want; int oif, hg;
+    if (have) {
+        for (int i = 0; i < 16; i++) { unsigned v; sscanf(nh + 2 * i, "%2x", &v); ((unsigned char *)&want)[i] = v; }
+        CHECK("route6_get global via router on eth0", get_route6(s, "2001:db8:ffff::3", &oif, &gw, &hg) == 0
+              && oif == eth && hg && !memcmp(&gw, &want, 16));
+        char gs[64]; inet_ntop(AF_INET6, &want, gs, sizeof gs);
+        CHECK("newroute6 add", nl_route6(s, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, "2001:db8:2::", 64, gs, eth) == 0);
+        CHECK("newroute6 in dump", in_dump6(s, "2001:db8:2::", 64));
+        CHECK("newroute6 GETROUTE picks it", get_route6(s, "2001:db8:2::9", &oif, &gw, &hg) == 0 && oif == eth && hg);
+        CHECK("newroute6 EEXIST", nl_route6(s, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, "2001:db8:2::", 64, gs, eth) == EEXIST);
+        CHECK("delroute6", nl_route6(s, RTM_DELROUTE, 0, "2001:db8:2::", 64, gs, eth) == 0);
+        CHECK("delroute6 gone", !in_dump6(s, "2001:db8:2::", 64));
+    } else {
+        CHECK("route6_get no router: ENETUNREACH", get_route6(s, "2001:db8:ffff::3", &oif, &gw, &hg) == ENETUNREACH);
+    }
+    CHECK("route6_get ::1 via lo", get_route6(s, "::1", &oif, &gw, &hg) == 0 && oif == 1);
+    close(s);
+
+    /* proc_tcp6: a [::1] listener is in tcp6, not tcp */
+    int l = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 lo6; memset(&lo6, 0, sizeof lo6);
+    lo6.sin6_family = AF_INET6; lo6.sin6_addr = in6addr_loopback; lo6.sin6_port = htons(40611);
+    CHECK("proc_tcp6 listen", bind(l, (struct sockaddr *)&lo6, sizeof lo6) == 0 && listen(l, 1) == 0);
+    CHECK("proc_tcp6 listed in tcp6", proc_has("/proc/net/tcp6", "00000000000000000000000001000000:9EA3 00000000000000000000000000000000:0000 0A"));
+    CHECK("proc_tcp6 not in tcp", !proc_has("/proc/net/tcp", ":9EA3 "));
+    close(l);
+    int u = socket(AF_INET6, SOCK_DGRAM, 0);
+    lo6.sin6_port = htons(40612);
+    CHECK("proc_udp6 bind", bind(u, (struct sockaddr *)&lo6, sizeof lo6) == 0);
+    CHECK("proc_udp6 listed in udp6", proc_has("/proc/net/udp6", "00000000000000000000000001000000:9EA4 "));
+    CHECK("proc_udp6 not in udp", !proc_has("/proc/net/udp", ":9EA4 "));
+    close(u);
+}
+
 int main(void) {
     rtnl_write_tests();
+    v6_tests();
     int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     CHECK("socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)", s >= 0);
     CHECK("other netlink protocol refused", socket(AF_NETLINK, SOCK_RAW, 99) < 0 && errno == EPROTONOSUPPORT);
