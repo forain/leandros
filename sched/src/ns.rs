@@ -1237,10 +1237,14 @@ pub fn netctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
     if cnt != want { return -22; }
     for j in 0..want { if v[j] > NETCTL[k + j].max as u64 { return -22; } }
     if want == 2 && NETCTL[k].path != "ipv4/ping_group_range" && v[0] > v[1] { return -22; }
-    for j in 0..want { NETCTL_V[ns as usize][k + j].store(v[j] as u32, Release); }
-    // Linux devinet_ctl: ip_forward and conf/all/forwarding set every interface.
+    // Linux devinet_sysctl_forward: ip_forward and conf/all/forwarding are one variable and
+    // fan out to every interface ONLY when the value changes (`*valp != val`), so a repeated
+    // ip_forward=1 keeps a per-bridge forwarding=0 (netavark --internal).
     let p = NETCTL[k].path;
-    if p == "ipv4/ip_forward" || p == "ipv4/conf/all/forwarding" {
+    let fwd_all = p == "ipv4/ip_forward" || p == "ipv4/conf/all/forwarding";
+    let changed = fwd_all && netctl_find(b"ipv4/conf/all/forwarding").map(|a| netctl_get(ns, a) != v[0] as u32).unwrap_or(true);
+    for j in 0..want { NETCTL_V[ns as usize][k + j].store(v[j] as u32, Release); }
+    if changed {
         fwd4_fanout(ns, v[0] as u32);
     }
     0
