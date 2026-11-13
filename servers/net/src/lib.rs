@@ -8750,6 +8750,12 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     let socket = s.socket_set.get_mut::<tcp::Socket>(socket_handle);
                     let mut ev = 0;
                     if socket.can_recv() || tcp_rx_eof(socket) { ev |= POLLIN; }
+                    // Peer FIN (read side retired): Linux tcp_poll adds
+                    // POLLRDHUP; with the send side retired as well, POLLHUP.
+                    if tcp_rx_eof(socket) {
+                        ev |= POLLRDHUP;
+                        if !socket.may_send() { ev |= POLLHUP; }
+                    }
                     if socket.can_send() && socket.is_active() { ev |= POLLOUT; }
                     if !socket.is_active() {
                         // A dead connection is writable as on Linux, so a
