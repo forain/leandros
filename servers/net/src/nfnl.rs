@@ -223,7 +223,7 @@ const EXPR_OK: [&[u8]; 12] = [
 fn resolve_exprs(body: &[u8], t: &Table) -> Result<Vec<u8>, i32> {
     let mut out = Vec::new();
     for (ty, e) in attrs(body) {
-        if ty != 1 { return Err(EINVAL); }
+        let _ = ty; // libnftnl numbers list entries 1,2,3...; the kernel ignores the type
         let ea = attrs(e);
         let name = find(&ea, 1).map(cstr).ok_or(EINVAL)?;
         if !EXPR_OK.contains(&name) { return Err(EOPNOTSUPP); }
@@ -751,7 +751,7 @@ fn apply_inner(st: &mut NfState, msg: u16, h: &Hdr) -> Result<(), i32> {
             let sname = find(&a, 2).map(cstr);
             let si = t.sets.iter().position(|s| sname.map_or(false, |n| s.name == n) || (sid != 0 && s.id == sid)).ok_or(ENOENT)?;
             let list = find(&a, 3);
-            let elems: Vec<&[u8]> = match list { Some(l) => attrs(l).into_iter().filter(|x| x.0 == 1).map(|x| x.1).collect(), None => Vec::new() };
+            let elems: Vec<&[u8]> = match list { Some(l) => attrs(l).into_iter().map(|x| x.1).collect(), None => Vec::new() };
             let s = &mut t.sets[si];
             if msg == NEWSETELEM {
                 for e in elems {
