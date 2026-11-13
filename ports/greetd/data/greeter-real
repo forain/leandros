@@ -51,4 +51,7 @@ export GREETD_SOCK_DIR
 cd "$XDG_RUNTIME_DIR"
 
 echo "GREETER-REAL: launching greetd"
-exec /bin/greetd
+# Greeter-side stderr (greetd, cosmic-comp, the greeter) otherwise goes to
+# pipes; keep it in /tmp/greeter.log (one rotated generation).
+[ -f /tmp/greeter.log ] && mv -f /tmp/greeter.log /tmp/greeter.log.1 2>/dev/null
+exec /bin/greetd 2>>/tmp/greeter.log
