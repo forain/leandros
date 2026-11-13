@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kexecacpitest.py -- ACPI tables in firmware-Reserved RAM above 2 GiB survive kexec (x86_64).
 
-Own boot: OVMF q35 with max-ram-below-4g=3G and 6 GiB, which puts OVMF's ACPI
+Own boot: OVMF q35 with 2800M of RAM (all below 4 GiB), which puts OVMF's ACPI
 tables above 2 GiB. gen0 loads a kernel with kexec.test=acpiresvd, so the
 next kernel's memory map carries those tables as raw type 8 (plain Reserved
 for the direct-boot kernel: not in the HHDM). Before the fix gen1 faults or
@@ -15,8 +15,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-os.environ["LEANDROS_QEMU_MEM"] = "6G"
-os.environ["LEANDROS_QEMU_EXTRA"] = "-machine q35,max-ram-below-4g=3G"
+# RAM < 0xb0000000 keeps all of it below 4 GiB (q35 caps lowmem at 2 GiB otherwise; max-ram-below-4g
+# cannot raise it), so OVMF puts its ACPI tables at ~0xAExxxxxx, above 2 GiB.
+os.environ["LEANDROS_QEMU_MEM"] = "2800M"
 import driver  # noqa: E402
 
 REPO = driver.REPO_ROOT
