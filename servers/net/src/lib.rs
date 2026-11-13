@@ -1750,6 +1750,12 @@ fn release_inet_state(state: SockState, sock_type: u8, park: bool) {
 /// poll() never reporting POLLIN, and the reader waited forever for an EOF
 /// that had already arrived. A connect still in flight (SynSent/SynReceived)
 /// has not received anything yet and is not at EOF.
+/// The peer's FIN has been received (whether or not unread data remains).
+fn tcp_peer_fin(socket: &tcp::Socket) -> bool {
+    matches!(socket.state(), tcp::State::CloseWait | tcp::State::LastAck
+        | tcp::State::Closing | tcp::State::TimeWait | tcp::State::Closed)
+}
+
 fn tcp_rx_eof(socket: &tcp::Socket) -> bool {
     !socket.may_recv()
         && !matches!(socket.state(), tcp::State::SynSent | tcp::State::SynReceived)
@@ -8752,7 +8758,9 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     if socket.can_recv() || tcp_rx_eof(socket) { ev |= POLLIN; }
                     // Peer FIN (read side retired): Linux tcp_poll adds
                     // POLLRDHUP; with the send side retired as well, POLLHUP.
-                    if tcp_rx_eof(socket) {
+                    // State-based: smoltcp's may_recv() stays true in CLOSE-WAIT
+                    // while unread data remains, hiding the FIN.
+                    if tcp_peer_fin(socket) {
                         ev |= POLLRDHUP;
                         if !socket.may_send() { ev |= POLLHUP; }
                     }
