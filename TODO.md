@@ -81,4 +81,5 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **zig to clang** migration (est. 2-4 days, not started).
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
-- [ ] ns 0 has no per-mount flags: `mount -o remount,bind,ro` is accepted but not enforced (alias mounts); pinned by mnttest e7_ns0_has_no_permount_flags (lane e7flags2)
+- [x] ~~ns 0 per-mount flags~~ DONE (ns0flags 2026-11-13): ns-0 alias/bind/self-bind mounts carry ro/nodev/noexec, enforced via mnt_flag_check + exec check; remount replaces flags, MS_BIND|MS_RDONLY single call ignored (Linux); ns-0 dirfds keep flags (recorded at open; stale after a later remount-rw); /proc/mounts does not yet print ro for them
+- /proc/mounts doesn't print ro for ns-0 mounts; ns-0 dirfd flags recorded at open go stale after a later remount

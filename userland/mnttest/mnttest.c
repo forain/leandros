@@ -2548,17 +2548,48 @@ static int e7x_child(int m) {
 }
 static int e7x_ns0(int m) {
     (void)m;
+    int rc = 0;
     mkdir("/tmp/e7x/mp", 0755);
-    if (mount("/tmp/e7x/src", "/tmp/e7x/mp", NULL, MS_BIND, NULL) < 0) return 13;
-    if (mount(NULL, "/tmp/e7x/mp", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { printf("  ns0 remount errno=%d\n", errno); return 14; }
-    errno = 0; int r = mkdir("/tmp/e7x/mp/m", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/mp", NULL, MS_BIND | MS_RDONLY, NULL) < 0) return 13;
+    /* MS_BIND|MS_RDONLY in one call: ro is ignored (Linux), writable. */
+    errno = 0; if (mkdir("/tmp/e7x/mp/m0", 0755) != 0) rc = 20;
+    rmdir("/tmp/e7x/src/m0");
+    if (mount(NULL, "/tmp/e7x/mp", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { printf("  ns0 remount errno=%d\n", errno); umount("/tmp/e7x/mp"); return 14; }
+    errno = 0; if (!rc && (mkdir("/tmp/e7x/mp/m", 0755) == 0 || errno != EROFS)) { printf("  ns0 ro mkdir errno=%d\n", errno); rc = 21; }
+    errno = 0; if (!rc && (open("/tmp/e7x/mp/c", O_WRONLY | O_CREAT, 0644) >= 0 || errno != EROFS)) rc = 22;
+    errno = 0; if (!rc && (open("/tmp/e7x/mp/bin", O_WRONLY) >= 0 || errno != EROFS)) rc = 23;
+    if (!rc) { int fd = open("/tmp/e7x/mp/bin", O_RDONLY); if (fd < 0) rc = 24; else close(fd); }
+    if (!rc) { /* a dirfd keeps the mount's flags */
+        int d = open("/tmp/e7x/mp", O_RDONLY | O_DIRECTORY);
+        if (d < 0) rc = 25;
+        else {
+            errno = 0; if (mkdirat(d, "m2", 0755) == 0 || errno != EROFS) { printf("  ns0 dirfd mkdirat errno=%d\n", errno); rc = 26; }
+            errno = 0; if (!rc && (openat(d, "c2", O_WRONLY | O_CREAT, 0644) >= 0 || errno != EROFS)) rc = 27;
+            errno = 0; if (!rc && (unlinkat(d, "bin", 0) == 0 || errno != EROFS)) rc = 28;
+            close(d);
+        }
+    }
+    /* the source stays writable */
+    if (!rc && mkdir("/tmp/e7x/src/ok", 0755) != 0) rc = 29;
+    rmdir("/tmp/e7x/src/ok");
+    /* noexec + nodev */
+    if (!rc && mount(NULL, "/tmp/e7x/mp", NULL, MS_REMOUNT | MS_BIND | MS_NOEXEC | MS_NODEV, NULL) < 0) rc = 30;
+    if (!rc) { /* rw again after the remount replaced the flags */
+        if (mkdir("/tmp/e7x/mp/m3", 0755) != 0) { printf("  ns0 rw again errno=%d\n", errno); rc = 31; }
+        rmdir("/tmp/e7x/src/m3");
+    }
+    if (!rc) { pid_t p = fork(); if (p == 0) { execl("/tmp/e7x/mp/bin", "bin", (char *)0); _exit(errno == EACCES ? 0 : 1); }
+        int st = 0; waitpid(p, &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) rc = 32; }
+    errno = 0; if (!rc && (open("/tmp/e7x/mp/nul", O_RDONLY) >= 0 || errno != EACCES)) rc = 33;
     umount("/tmp/e7x/mp");
-    /* Documented gap: ns 0 binds are alias mounts without per-mount flags, so the
-     * remount is accepted but ro is not enforced. Hence a hidden dirfd from ns 0
-     * has nothing to inherit. Flip this to EROFS when ns 0 grows mount flags. */
-    if (r != 0) { printf("  ns0 now enforces ro (errno=%d): update the test and the hidden path\n", errno); return 21; }
-    rmdir("/tmp/e7x/src/m");
-    return 0;
+    /* self-bind hardening pattern */
+    if (!rc && mount("/tmp/e7x/src", "/tmp/e7x/src", NULL, MS_BIND, NULL) < 0) rc = 40;
+    if (!rc && mount(NULL, "/tmp/e7x/src", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) rc = 41;
+    errno = 0; if (!rc && (mkdir("/tmp/e7x/src/m4", 0755) == 0 || errno != EROFS)) rc = 42;
+    umount("/tmp/e7x/src");
+    if (!rc && mkdir("/tmp/e7x/src/m5", 0755) != 0) rc = 43;
+    rmdir("/tmp/e7x/src/m5");
+    return rc;
 }
 static void e7x_suite(void) {
     e7_mk();
@@ -2566,7 +2597,7 @@ static void e7x_suite(void) {
     system("cp /bin/true /tmp/e7x/src/bin; chmod 755 /tmp/e7x/src/bin");
     mknod("/tmp/e7x/src/nul", S_IFCHR | 0666, makedev(1, 3));
     report("e7_hidden_fd_noexec_nodev", nn_in_child(e7x_child, 0));
-    report("e7_ns0_has_no_permount_flags", nn_in_child(e7x_ns0, 0));
+    report("e7_ns0_permount_flags_enforced", nn_in_child(e7x_ns0, 0));
     system("rm -rf /tmp/e7 /tmp/e7x");
 }
 
