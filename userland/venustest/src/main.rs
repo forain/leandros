@@ -1720,7 +1720,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             let mut busy_seen = 0;
             let mut settled = true;
             for _ in 0..3 {
-                if exec_with_bos(fd, &[blob.bo_handle]) != 0 { settled = false; break; }
+                // Queue a burst so the host cannot retire the LAST fence before
+                // the probe, even when the guest is slow (aarch64 TCG).
+                let mut burst_ok = true;
+                for _ in 0..64 {
+                    if exec_with_bos(fd, &[blob.bo_handle]) != 0 { burst_ok = false; break; }
+                }
+                if !burst_ok { settled = false; break; }
                 let mut w = DrmVirtgpu3dWait { handle: blob.bo_handle, flags: VIRTGPU_WAIT_NOWAIT };
                 if ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) != 0 { busy_seen += 1; }
                 if wait_bo(fd, blob.bo_handle) != 0 { settled = false; }
