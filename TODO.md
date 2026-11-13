@@ -21,12 +21,12 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - ~~**mntunshare is not an isolation boundary for root-run workloads** (M6)~~ DONE (mntiso chroot/busy/procfd/entry/strict/bindpin 2026-11-11; the remaining reopen hint is the E7 line above).
 
 ### Network
-- **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. No SLAAC/RA (L5), no global v6 on NICs, own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs, netns, podman IPv6 yet: design-ipv6 L4+).
+- **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. SLAAC/RA (L5: RS x3, RA -> global addr + on-link prefix + default router + lifetimes, /proc/net/ipv6_route) done; no DAD, no DHCPv6/RDNSS, RA MTU ignored; own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs, netns, podman IPv6 yet: design-ipv6 L4+).
 - **UDP/IP gaps**: no PMTUD (IP_MTU_DISCOVER/IP_MTU, DF on Frag-Needed), no IGMPv3/SSM. (IP fragmentation/reassembly works: udptest `udp_huge` + peer_frag_echo guard it.)
 - ~~**Real NIC drivers program no multicast filter**~~ FIXED 2026-11-11 (lane/nicmcast): macb, e1000e, r8169, iwlwifi already accepted all multicast; brcmf (Pi Wi-Fi) now sets `allmulti` (Pi wifi0 rx of 30 mDNS-group datagrams: +5 before, +37 after). Pass-all, no per-group list. See artifacts/notes/lane-nicmcast-2026-11-11.md.
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
-- **`netwatch.loss=S` not exercised in QEMU.**
+- **`netwatch.loss=S` x86_64/TCG case fails in the harness** (2026-11-13: aarch64 PASS, line 15.1 s after set_link; x86_64 `netwatchtest.py --only loss` FAIL: `dhcp=False`, `cannot connect to monitor`, no reset seen; likely harness QMP/monitor socket or DHCP wait too short on TCG, not yet diagnosed).
 - **Podman published ports**: rootful `-p` and `--internal` firewall semantics open (iptables-shim design: artifacts/notes/lane-podports-2026-11-11.md); TCP NAT port reservation done; host-NIC reach deferred.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
@@ -39,7 +39,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Panel-embedded applets render with tiny-skia** (root cause: cosmic-panel creates zwp_linux_dmabuf_v1 only if its GLES renderer exists at bind_display(); ours comes ~0.3 s later; needs a cosmic-panel source change, out of bounds - not a kernel bug); aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp; `EVIOCGRAB` exclusive delivery unmeasured; `EVIOCREVOKE` ignored; Ctrl+Alt+Esc swallowed.
 - **One permanent COSMIC patch** (`ports/cosmic-comp/0001-toplevel-info-weak-window.patch`) until upstream has an equivalent (checked 2026-11-13: pop-os/cosmic-comp#2084 and Smithay#1562 still OPEN, PR #2095 closed unmerged - patch stays).
-- **x86_64/TCG COSMIC settle timing is stale** — re-measure (clock fixed 2026-09-16).
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).

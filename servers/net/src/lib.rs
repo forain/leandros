@@ -3368,6 +3368,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
     let mut socket_set = SocketSet::new(alloc::vec![]);
     let dhcp_socket = smoltcp::socket::dhcpv4::Socket::new();
     let dhcp_handle = socket_set.add(dhcp_socket);
+    ip6::attach(nif.id, &mut socket_set);
 
     let stack = NetStack {
         interface,
@@ -3714,6 +3715,10 @@ pub fn net_daemon() -> ! {
                 readiness_changed |= changed;
                 wake_mask |= mask;
                 reap_orphans(s);
+                if let Some(ns) = ip6::slaac_pass(nif, s, admin_down, sched::monotonic_ns()) {
+                    let d = smoltcp::time::Duration::from_micros(ns / 1000);
+                    next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
+                }
 
                 let ev = match s.dhcp_handle {
                     Some(h) => {
