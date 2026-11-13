@@ -76,7 +76,7 @@ import sys
 import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "runtests")
-if "podbridge" in sys.argv[1:]:
+if any("podbridge" in a for a in sys.argv[1:]):
     os.environ.setdefault("LEANDROS_HOSTFWD", "tcp:127.0.0.1:18581-:18081")  # podbridgetest publish_ext
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(HERE, "../../..")))

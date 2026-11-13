@@ -121,10 +121,10 @@ def main():
         def hostwget(url):  # a --network=host container = a client in the guest's host netns
             return run(f"podman run --rm --network=host {IMG} wget -T 10 -qO- {url} 2>&1")
 
-        rc, out = run("ip -4 -o addr show dev eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1")
-        nicip = (out.strip().splitlines() or ["10.0.2.15"])[-1].strip()
-        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", nicip):
-            nicip = "10.0.2.15"
+        rc, out = run(f"podman run --rm --network=host {IMG} ip -4 -o addr show dev eth0 2>&1 | head -n 1")
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        nicip = m.group(1) if m else "10.0.2.15"
+        print(f"podbridge: guest NIC address {nicip}")
         run("podman rm -af >/dev/null 2>&1; true")
         run(f"podman run --rm {IMG} true >/dev/null 2>&1")  # bridge + base netavark table exist
         rc, base = run("nft list ruleset | md5sum")
@@ -143,7 +143,8 @@ def main():
         got = b""
         try:
             import socket
-            c = socket.create_connection(("127.0.0.1", hp), timeout=15)
+            # SLIRP: through the QEMU hostfwd; vmnet (192.168.x): straight at the guest's address.
+            c = socket.create_connection(("127.0.0.1", hp) if nicip.startswith("10.0.2.") else (nicip, 18081), timeout=15)
             c.settimeout(15)
             c.sendall(b"GET / HTTP/1.0\r\n\r\n")
             while True:
