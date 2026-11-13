@@ -1104,11 +1104,48 @@ pub struct Alias {
     pub fstype: &'static str,
     /// The `mount(2)` source string, for /proc/mounts.
     pub device: Vec<u8>,
+    /// Per-mount `MNT_RDONLY | MNT_NODEV | MNT_NOEXEC` (enforced like a non-zero namespace's mount).
+    pub flags: u8,
 }
 
+/// The per-mount flags ns-0 mounts can carry and the VFS/exec paths enforce.
+pub const ENFORCED: u8 = super::MNT_RDONLY | super::MNT_NODEV | super::MNT_NOEXEC;
+
 static ALIASES: Mutex<Vec<Alias>> = Mutex::new(Vec::new());
-/// Mount points created by binding a path onto itself.
-static SELF_BINDS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Mount points created by binding a path onto itself, with their flags.
+static SELF_BINDS: Mutex<Vec<(Vec<u8>, u8)>> = Mutex::new(Vec::new());
+/// Number of ns-0 mounts (aliases + self-binds) with nonzero flags.
+static FLAGGED: AtomicUsize = AtomicUsize::new(0);
+
+fn recount() {
+    let n = ALIASES.lock().iter().filter(|a| a.flags != 0).count()
+        + SELF_BINDS.lock().iter().filter(|m| m.1 != 0).count();
+    FLAGGED.store(n, Ordering::Release);
+}
+
+/// Flags of the ns-0 mount whose mount point is the longest prefix of
+/// namespace path `p` (0 when none). Lock-free when no mount carries flags.
+pub fn flags_at(p: &[u8]) -> u8 {
+    if FLAGGED.load(Ordering::Acquire) == 0 { return 0; }
+    let mut best: Option<(usize, u8)> = None;
+    for a in ALIASES.lock().iter() {
+        if under(p, &a.mountpoint) && best.map_or(true, |b| a.mountpoint.len() >= b.0) { best = Some((a.mountpoint.len(), a.flags)); }
+    }
+    for m in SELF_BINDS.lock().iter() {
+        if under(p, &m.0) && best.map_or(true, |b| m.0.len() >= b.0) { best = Some((m.0.len(), m.1)); }
+    }
+    best.map_or(0, |b| b.1 & ENFORCED)
+}
+
+/// Replace the flags of the mount at exactly `mountpoint`. False when none is.
+pub fn set_flags(mountpoint: &[u8], flags: u8) -> bool {
+    let flags = flags & ENFORCED;
+    let mut hit = false;
+    if let Some(a) = ALIASES.lock().iter_mut().find(|a| a.mountpoint == mountpoint) { a.flags = flags; hit = true; }
+    else if let Some(m) = SELF_BINDS.lock().iter_mut().find(|m| m.0.as_slice() == mountpoint) { m.1 = flags; hit = true; }
+    recount();
+    hit
+}
 
 /// Prefix of the synthetic source of a bind mount whose source is an nsfs
 /// file: `/.leandros-ns/<link kind>/<namespace id>`. The alias holds one
@@ -1125,7 +1162,7 @@ pub fn ns_src(p: &[u8]) -> Option<(u8, u16)> {
 }
 
 /// Mount points made by self-binds (for `ns0_mountpoints`).
-pub fn self_binds() -> Vec<Vec<u8>> { SELF_BINDS.lock().clone() }
+pub fn self_binds() -> Vec<Vec<u8>> { SELF_BINDS.lock().iter().map(|m| m.0.clone()).collect() }
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// `p` equals `prefix` or lies below it (component boundary respected).
@@ -1156,9 +1193,9 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
         // A self-bind (`mount --bind /run/netns /run/netns`): the path stays
         // as it is, but becomes a mount point so its propagation can change.
         let mut sb = SELF_BINDS.lock();
-        if !sb.iter().any(|m| m.as_slice() == mountpoint) {
+        if !sb.iter().any(|m| m.0.as_slice() == mountpoint) {
             if sb.len() >= MAX_ALIASES { return Err(-28); }
-            sb.push(mountpoint.to_vec());
+            sb.push((mountpoint.to_vec(), 0));
         }
         return Ok(());
     }
@@ -1171,6 +1208,7 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
         a.source = source.to_vec();
         a.fstype = fstype;
         a.device = device.to_vec();
+        a.flags = 0;
         if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
         if let Some(n) = crate::devpts::inst_of_backing(source) { crate::devpts::get(n); }
         drop(t);
@@ -1180,7 +1218,7 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
     }
     if t.len() >= MAX_ALIASES { return Err(-28); }
     t.push(Alias { mountpoint: mountpoint.to_vec(), source: source.to_vec(), fstype,
-                   device: device.to_vec() });
+                   device: device.to_vec(), flags: 0 });
     ACTIVE.store(t.len(), Ordering::Release);
     // A mount holds a reference on the tmpfs instance it exposes.
     if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
@@ -1200,7 +1238,7 @@ pub fn tmpfs_inst_of(p: &[u8]) -> Option<u32> {
 pub fn remove(mountpoint: &[u8]) -> bool {
     {
         let mut sb = SELF_BINDS.lock();
-        if let Some(i) = sb.iter().position(|m| m.as_slice() == mountpoint) { sb.remove(i); return true; }
+        if let Some(i) = sb.iter().position(|m| m.0.as_slice() == mountpoint) { sb.remove(i); drop(sb); recount(); return true; }
     }
     let mut t = ALIASES.lock();
     let nsid = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| ns_src(&a.source));
@@ -1211,6 +1249,7 @@ pub fn remove(mountpoint: &[u8]) -> bool {
     ACTIVE.store(t.len(), Ordering::Release);
     let removed = t.len() != before;
     drop(t);
+    recount();
     // A devpts instance lives as long as its last mount (copies hold refs).
     if let Some(id) = gone { crate::devpts::put(id); }
     // The last mount of a tmpfs instance frees it.
@@ -1267,8 +1306,8 @@ pub fn crosses(path: &[u8]) -> bool {
 
 /// The mount point of the alias whose mount point is exactly `path`.
 pub fn is_mountpoint(path: &[u8]) -> bool {
-    if ACTIVE.load(Ordering::Acquire) == 0 { return false; }
-    ALIASES.lock().iter().any(|a| a.mountpoint == path) || SELF_BINDS.lock().iter().any(|m| m.as_slice() == path)
+    if ACTIVE.load(Ordering::Acquire) == 0 { return SELF_BINDS.lock().iter().any(|m| m.0.as_slice() == path); }
+    ALIASES.lock().iter().any(|a| a.mountpoint == path) || SELF_BINDS.lock().iter().any(|m| m.0.as_slice() == path)
 }
 
 /// Snapshot `(mountpoint, source, fstype, device)` of every alias.
@@ -1280,7 +1319,7 @@ pub fn entries() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Vec<u8>)> {
 /// Snapshot `(device, mountpoint, fstype)` of every alias, for /proc/mounts.
 pub fn list() -> Vec<(Vec<u8>, Vec<u8>, &'static str, Option<u32>)> {
     let mut v: Vec<_> = ALIASES.lock().iter().map(|a| (a.device.clone(), a.mountpoint.clone(), a.fstype, tmpfs_inst_of(&a.source))).collect();
-    for m in SELF_BINDS.lock().iter() { v.push((b"none".to_vec(), m.clone(), "none", None)); }
+    for m in SELF_BINDS.lock().iter() { v.push((b"none".to_vec(), m.0.clone(), "none", None)); }
     v
 }
 
