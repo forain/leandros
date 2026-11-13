@@ -18,6 +18,7 @@ pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
     let mut v = Vec::new();
     if !lim.is_empty() {
         for e in lim { v.push(Raw { base: e.base, length: e.length, raw_type: e.raw_type }); }
+        acpi_resvd(bi, &mut v);
         return v;
     }
     use boot::MemoryType::*;
@@ -26,6 +27,27 @@ pub fn raw_map(bi: &boot::BootInfo) -> Vec<Raw> {
         v.push(Raw { base: r.base, length: r.length, raw_type: t });
     }
     v
+}
+
+/// `kexec.test=acpiresvd`: retype every ACPI reclaimable/NVS entry holding an
+/// ACPI table above 2 GiB to raw 8, as firmware keeping tables in Reserved RAM
+/// would. x86_64 only (aarch64 has no ACPI path).
+#[allow(unused_variables)]
+fn acpi_resvd(bi: &boot::BootInfo, v: &mut Vec<Raw>) {
+    #[cfg(target_arch = "x86_64")]
+    if super::acpi_resvd() && bi.rsdp_addr != 0 {
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        boot::acpi_pages::walk(
+            bi.rsdp_addr, boot::memmap::MAX_PHYS,
+            &mut |p, l| ranges.push((p, l)),
+            &mut |p, b| unsafe { core::ptr::copy_nonoverlapping(mm::phys_to_virt(p as usize) as *const u8, b.as_mut_ptr(), b.len()) },
+        );
+        for r in v.iter_mut() {
+            if matches!(r.raw_type, 2 | 3) && ranges.iter().any(|&(p, l)| p >= (2u64 << 30) && p < r.base + r.length && p + l > r.base) {
+                r.raw_type = 8;
+            }
+        }
+    }
 }
 
 /// Sorted, merged spans of memory the old kernel may overwrite at kexec time

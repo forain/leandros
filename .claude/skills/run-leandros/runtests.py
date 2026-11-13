@@ -24,6 +24,7 @@ Options:
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
+                             kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
@@ -224,6 +225,8 @@ SUITES = {
     "kexecfdt": ["host:kexecfdttest.py"],
     # lane kmodblk: a kexec'd kernel mounts root with VIRTIO_BLK=m (CONFIG_VIRTIO_BLK=m build only).
     "kexecblk": ["host:kexecblktest.py"],
+    # lane kexecacpi: x86_64 ACPI tables in Reserved RAM above 2 GiB survive kexec (own boot, 6G + max-ram-below-4g=3G).
+    "kexecacpi": ["host:kexecacpitest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
     "usbisoch": ["host:usbisochtest.py"],
