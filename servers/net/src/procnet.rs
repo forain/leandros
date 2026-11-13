@@ -202,13 +202,10 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
             drivers::iwlwifi::scan_lines(&mut t);
             let _ = w.write_str(&t);
         }
-        b"tcp6" | b"udp6" => {
-            let _ = w.write_str("  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
-        }
+        b"tcp6" => inet6(&mut w, true),
+        b"udp6" => inet6(&mut w, false),
         b"raw" => raw(&mut w),
-        b"raw6" => {
-            let _ = w.write_str("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
-        }
+        b"raw6" => raw6(&mut w),
         _ => return false,
     }
     true
@@ -328,7 +325,7 @@ fn tcp_st(s: tcp::State) -> u8 {
     }
 }
 
-struct InetRow { local: ([u8; 4], u16), remote: ([u8; 4], u16), st: u8, txq: usize, rxq: usize, uid: u32, inode: u32 }
+struct InetRow { local: ([u8; 16], u16), remote: ([u8; 16], u16), st: u8, txq: usize, rxq: usize, uid: u32, inode: u32 }
 
 /// `(state, local, remote, send_queue, recv_queue)` of the TCP socket behind
 /// `h`, found without `SocketSet::get` (which panics on a stale handle).
@@ -340,17 +337,38 @@ fn tcp_info(sid: Sid, h: SocketHandle) -> Option<(tcp::State, Option<IpEndpoint>
     Some((t.state(), t.local_endpoint(), t.remote_endpoint(), t.send_queue(), t.recv_queue()))
 }
 
-fn udp_local(sid: Sid, h: SocketHandle) -> Option<([u8; 4], u16)> {
+fn udp_local(sid: Sid, h: SocketHandle) -> Option<([u8; 16], u16)> {
     let stack = stack_for(sid);
     let s = stack.as_ref()?;
     let (_, sock) = s.socket_set.iter().find(|(hh, _)| *hh == h)?;
     let u = udp::Socket::downcast(sock)?;
     let ep = u.endpoint();
-    Some((ep.addr.map(v4).unwrap_or([0; 4]), ep.port))
+    Some((ep.addr.map(a16).unwrap_or([0; 16]), ep.port))
 }
 
-fn ep4(e: Option<IpEndpoint>) -> ([u8; 4], u16) {
-    e.map(|e| (v4(e.addr), e.port)).unwrap_or(([0; 4], 0))
+fn ep4(e: Option<IpEndpoint>) -> ([u8; 16], u16) {
+    e.map(|e| (a16(e.addr), e.port)).unwrap_or(([0; 16], 0))
+}
+
+/// An address as 16 bytes: v6 as is, v4 in its v4-mapped form (the v4 tables print the last four).
+fn a16(a: IpAddress) -> [u8; 16] {
+    let mut o = [0u8; 16];
+    match a {
+        IpAddress::Ipv4(x) => { o[10] = 0xff; o[11] = 0xff; o[12..].copy_from_slice(&x.0); }
+        IpAddress::Ipv6(x) => o = x.0,
+    }
+    o
+}
+
+/// /proc/net/tcp6 and udp6.
+fn inet6(w: &mut Out, tcp_wanted: bool) { inet_fam(w, tcp_wanted, true) }
+
+/// Format an address for the v4 (`v6` false) or v6 table.
+fn fa(a: &([u8; 16], u16), v6: bool) -> alloc::string::String {
+    let b = a.0;
+    if !v6 { return alloc::format!("{:08X}:{:04X}", u32::from_le_bytes([b[12], b[13], b[14], b[15]]), a.1); }
+    alloc::format!("{:08X}{:08X}{:08X}{:08X}:{:04X}", u32::from_le_bytes([b[0], b[1], b[2], b[3]]), u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                   u32::from_le_bytes([b[8], b[9], b[10], b[11]]), u32::from_le_bytes([b[12], b[13], b[14], b[15]]), a.1)
 }
 
 /// /proc/net/tcpsnd (LeandrOS-specific): the sender state of every TCP socket
@@ -376,9 +394,18 @@ fn tcpsnd(w: &mut Out) {
 }
 
 /// /proc/net/tcp (`tcp`) or /proc/net/udp.
-fn inet(w: &mut Out, tcp_wanted: bool) {
+fn inet(w: &mut Out, tcp_wanted: bool) { inet_fam(w, tcp_wanted, false) }
+
+fn inet_fam(w: &mut Out, tcp_wanted: bool, v6: bool) {
     let start = w.0.len();
-    if tcp_wanted {
+    if v6 {
+        let _ = w.write_str(if tcp_wanted {
+            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+        } else {
+            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops"
+        });
+        w.pad_line(start, if tcp_wanted { 149 } else { 149 });
+    } else if tcp_wanted {
         let _ = w.write_str("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode");
         w.pad_line(start, 149);
     } else {
@@ -387,24 +414,24 @@ fn inet(w: &mut Out, tcp_wanted: bool) {
     }
     let want_type = if tcp_wanted { SOCK_STREAM } else { SOCK_DGRAM } as u8;
     let mut rows: Vec<InetRow> = Vec::new();
-    for s in snapshot(AF_INET) {
+    for s in snapshot(if v6 { AF_INET6 } else { AF_INET }) {
         if s.sock_type != want_type { continue; }
         let uid = sched::euid_of(s.pid);
         let row = match s.state {
             // rx_queue of a listener: connections waiting for accept(), as
             // on Linux.
             SockState::InetListening { lid, local } if tcp_wanted => Some(InetRow {
-                local: (v4(local.addr), local.port), remote: ([0; 4], 0), st: 0x0A,
+                local: (a16(local.addr), local.port), remote: ([0; 16], 0), st: 0x0A,
                 txq: 0, rxq: crate::listen::backlog(lid).1, uid, inode: s.ofd }),
             SockState::InetConnected { socket_handle, sid, .. } if tcp_wanted => {
                 tcp_info(sid, socket_handle).map(|(st, l, r, tx, rx)| InetRow {
                     local: ep4(l), remote: ep4(r), st: tcp_st(st), txq: tx, rxq: rx, uid, inode: s.ofd })
             }
             SockState::InetBound { local_endpoint, .. } if !tcp_wanted => Some(InetRow {
-                local: (v4(local_endpoint.addr), local_endpoint.port), remote: ([0; 4], 0),
+                local: (a16(local_endpoint.addr), local_endpoint.port), remote: ([0; 16], 0),
                 st: 0x07, txq: 0, rxq: 0, uid, inode: s.ofd }),
             SockState::InetConnected { socket_handle, remote_endpoint, sid } if !tcp_wanted => {
-                let local = udp_local(sid, socket_handle).unwrap_or(([0; 4], s.bound_port));
+                let local = udp_local(sid, socket_handle).unwrap_or(([0; 16], s.bound_port));
                 Some(InetRow { local, remote: ep4(remote_endpoint),
                                st: if remote_endpoint.is_some() { 0x01 } else { 0x07 },
                                txq: 0, rxq: 0, uid, inode: s.ofd })
@@ -432,13 +459,13 @@ fn inet(w: &mut Out, tcp_wanted: bool) {
     for (sl, r) in rows.iter().enumerate() {
         let start = w.0.len();
         if tcp_wanted {
-            let _ = write!(w, "{:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 1 0000000000000000 100 0 0 10 0",
-                           sl, hex_ip(r.local.0), r.local.1, hex_ip(r.remote.0), r.remote.1, r.st,
+            let _ = write!(w, "{:4}: {} {} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 1 0000000000000000 100 0 0 10 0",
+                           sl, fa(&r.local, v6), fa(&r.remote, v6), r.st,
                            r.txq, r.rxq, r.uid, 0, r.inode);
             w.pad_line(start, 149);
         } else {
-            let _ = write!(w, "{:5}: {:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 2 0000000000000000 0",
-                           sl, hex_ip(r.local.0), r.local.1, hex_ip(r.remote.0), r.remote.1, r.st,
+            let _ = write!(w, "{:5}: {} {} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 2 0000000000000000 0",
+                           sl, fa(&r.local, v6), fa(&r.remote, v6), r.st,
                            r.txq, r.rxq, r.uid, 0, r.inode);
             w.pad_line(start, 127);
         }
@@ -456,6 +483,20 @@ fn raw(w: &mut Out) {
         if !matches!(s.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { continue; }
         let _ = writeln!(w, "{:4}: {:08X}:{:04X} {:08X}:{:04X} 07 00000000:00000000 00:00000000 00000000 {:5} {:8} {} 2 0000000000000000 0",
                          sl, 0, 1, 0, 0, sched::euid_of(s.pid), 0, s.ofd);
+        sl += 1;
+    }
+}
+
+/// /proc/net/raw6: the AF_INET6 ICMPv6 sockets (local "port" is IPPROTO_ICMPV6, 58).
+fn raw6(w: &mut Out) {
+    let _ = w.write_str("  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
+    let mut sl = 0;
+    for s in snapshot(AF_INET6) {
+        if s.sock_type != SOCK_RAW as u8 { continue; }
+        if !matches!(s.state, SockState::IcmpUnbound | SockState::IcmpBound { .. }) { continue; }
+        let z = ([0u8; 16], 58u16);
+        let _ = writeln!(w, "{:4}: {} {} 07 00000000:00000000 00:00000000 00000000 {:5} {:8} {} 2 0000000000000000 0",
+                         sl, fa(&z, true), fa(&([0u8; 16], 0), true), sched::euid_of(s.pid), 0, s.ofd);
         sl += 1;
     }
 }

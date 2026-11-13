@@ -459,6 +459,7 @@ fn sid_of_index(st: &NetNsState, v: &vifsel::VifTable, index: u32) -> Option<Sid
 pub(crate) fn rtnl_apply(ns: u16, op: RtOp) -> i32 {
     if !sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), CAP_NET_ADMIN) { return 1; }
     match op {
+        RtOp::AddAddr6 { .. } | RtOp::DelAddr6 { .. } | RtOp::AddRoute6 { .. } | RtOp::DelRoute6 { .. } => crate::ip6::apply(ns, op),
         RtOp::SetLink { index, up, mtu, mac, name, master, ns: nsel } => {
             let sid;
             {

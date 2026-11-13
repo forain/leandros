@@ -64,6 +64,12 @@ const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_MULTI: u16 = 0x2;
 const NLM_F_DUMP: u16 = 0x300;
 const AF_INET6: u8 = 10;
+const IFA_CACHEINFO: u16 = 6;
+const IFA_FLAGS: u16 = 8;
+pub const IFA_F_NODAD: u32 = 0x02;
+pub const IFA_F_PERMANENT: u32 = 0x80;
+pub const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+const RTPROT_RA: u8 = 9;
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
@@ -227,6 +233,45 @@ fn addr_msg(l: &Link, a: [u8; 4], prefix: u8, seq: u32, pid: u32) -> Vec<u8> {
     v
 }
 
+fn addr6_msg(a: &A6, name: &str, seq: u32, pid: u32) -> Vec<u8> {
+    let mut v = Vec::new();
+    let s = begin_msg(&mut v, RTM_NEWADDR, NLM_F_MULTI, seq, pid);
+    v.push(AF_INET6);
+    v.push(a.prefix);
+    v.push(a.flags as u8);
+    v.push(a.scope);
+    put32(&mut v, a.index);
+    attr(&mut v, IFA_ADDRESS, &a.addr);
+    attr(&mut v, IFA_LABEL, name.as_bytes());
+    let mut ci = [0u8; 16]; // ifa_cacheinfo: forever
+    ci[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+    ci[4..8].copy_from_slice(&u32::MAX.to_ne_bytes());
+    attr(&mut v, IFA_CACHEINFO, &ci);
+    attr(&mut v, IFA_FLAGS, &a.flags.to_ne_bytes());
+    end_msg(&mut v, s);
+    v
+}
+
+fn route6_msg(r: &R6, seq: u32, pid: u32, multi: bool, dst128: Option<[u8; 16]>) -> Vec<u8> {
+    let mut v = Vec::new();
+    let s = begin_msg(&mut v, RTM_NEWROUTE, if multi { NLM_F_MULTI } else { 0 }, seq, pid);
+    let (dst, plen) = match dst128 { Some(d) => (d, 128), None => (r.dst, r.plen) };
+    v.extend_from_slice(&[AF_INET6, plen, 0, 0, RT_TABLE_MAIN, r.proto, RT_SCOPE_UNIVERSE, RTN_UNICAST]);
+    put32(&mut v, 0);
+    attr(&mut v, RTA_TABLE, &(RT_TABLE_MAIN as u32).to_ne_bytes());
+    if plen != 0 { attr(&mut v, RTA_DST, &dst); }
+    attr(&mut v, RTA_PRIORITY, &r.metric.to_ne_bytes());
+    attr(&mut v, RTA_OIF, &r.oif.to_ne_bytes());
+    if let Some(g) = r.gw { attr(&mut v, RTA_GATEWAY, &g); }
+    end_msg(&mut v, s);
+    v
+}
+
+fn req_dst6(msg: &[u8]) -> Option<[u8; 16]> {
+    if msg.len() < 28 || msg[16] != AF_INET6 { return None; }
+    a16(find_attr(msg, 12, RTA_DST))
+}
+
 fn done_msg(seq: u32, pid: u32) -> Vec<u8> {
     let mut v = Vec::new();
     let s = begin_msg(&mut v, NLMSG_DONE, NLM_F_MULTI, seq, pid);
@@ -300,6 +345,14 @@ fn req_dst(msg: &[u8]) -> Option<[u8; 4]> {
     None
 }
 
+/// One IPv6 address of an interface, as the GETADDR dump exports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct A6 { pub index: u32, pub addr: [u8; 16], pub prefix: u8, pub scope: u8, pub flags: u32 }
+
+/// One IPv6 route of the main table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct R6 { pub dst: [u8; 16], pub plen: u8, pub gw: Option<[u8; 16]>, pub oif: u32, pub metric: u32, pub proto: u8 }
+
 /// One entry of the main routing table, as the GETROUTE dump exports it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteEnt {
@@ -314,6 +367,10 @@ pub struct RouteEnt {
 /// up/down to the caller namespace's loopback and returns false when the
 /// namespace cannot change it (the initial one).
 pub struct Env<'a> {
+    pub addrs6: &'a [A6],
+    pub routes6: &'a [R6],
+    /// Longest-match IPv6 lookup: (oif, gateway).
+    pub route6: &'a dyn Fn([u8; 16]) -> Option<(u32, Option<[u8; 16]>)>,
     pub links: &'a [Link],
     pub routes: &'a [RouteEnt],
     pub route: &'a dyn Fn([u8; 4]) -> Option<RouteHit>,
@@ -339,6 +396,10 @@ pub enum RtOp {
     DelLink { index: u32 },
     AddRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: u32, excl: bool, replace: bool },
     DelRoute { dst: [u8; 4], prefix: u8, gw: Option<[u8; 4]>, oif: u32, metric: Option<u32> },
+    AddAddr6 { index: u32, addr: [u8; 16], prefix: u8, flags: u32, excl: bool, replace: bool },
+    DelAddr6 { index: u32, addr: [u8; 16], prefix: u8 },
+    AddRoute6 { dst: [u8; 16], plen: u8, gw: Option<[u8; 16]>, oif: u32, metric: u32, excl: bool, replace: bool },
+    DelRoute6 { dst: [u8; 16], plen: u8, gw: Option<[u8; 16]>, oif: u32, metric: Option<u32> },
 }
 
 /// Where a veth peer end goes.
@@ -359,7 +420,56 @@ fn a4(a: Option<&[u8]>) -> Option<[u8; 4]> {
 
 /// Parse an `RTM_NEWADDR/DELADDR/NEWROUTE/DELROUTE` message into a [`RtOp`].
 /// `Err` is a positive errno.
+fn a16(a: Option<&[u8]>) -> Option<[u8; 16]> {
+    let a = a?;
+    if a.len() != 16 { return None; }
+    let mut o = [0u8; 16];
+    o.copy_from_slice(a);
+    Some(o)
+}
+
+fn clamp6(a: [u8; 16], plen: u8) -> [u8; 16] {
+    let mut o = a;
+    for (i, b) in o.iter_mut().enumerate() {
+        let lo = (i * 8) as u32;
+        let keep = (plen as u32).saturating_sub(lo).min(8);
+        *b &= if keep == 0 { 0 } else { 0xffu8 << (8 - keep) };
+    }
+    o
+}
+
+fn parse_write6(msg: &[u8], ty: u16, flags: u16) -> Result<RtOp, i32> {
+    match ty {
+        RTM_NEWADDR | RTM_DELADDR => {
+            if msg.len() < 24 { return Err(22); }
+            let addr = a16(find_attr(msg, 8, IFA_LOCAL)).or_else(|| a16(find_attr(msg, 8, IFA_ADDRESS))).ok_or(22)?;
+            let (prefix, index) = (msg[17], rd32(msg, 20));
+            if prefix > 128 { return Err(22); }
+            let fl = find_attr(msg, 8, IFA_FLAGS).filter(|f| f.len() == 4).map_or(msg[18] as u32, |f| rd32(f, 0));
+            Ok(if ty == RTM_NEWADDR {
+                RtOp::AddAddr6 { index, addr, prefix, flags: fl, excl: flags & NLM_F_EXCL != 0, replace: flags & NLM_F_REPLACE != 0 }
+            } else { RtOp::DelAddr6 { index, addr, prefix } })
+        }
+        _ => {
+            if msg.len() < 28 { return Err(22); }
+            let plen = msg[17];
+            if plen > 128 { return Err(22); }
+            let table = find_attr(msg, 12, RTA_TABLE).filter(|t| t.len() == 4).map_or(msg[20] as u32, |t| rd32(t, 0));
+            if table != RT_TABLE_MAIN as u32 && table != 0 { return Err(95); }
+            if msg[23] != RTN_UNICAST && ty == RTM_NEWROUTE { return Err(95); }
+            let dst = if plen == 0 { [0; 16] } else { clamp6(a16(find_attr(msg, 12, RTA_DST)).ok_or(22)?, plen) };
+            let gw = a16(find_attr(msg, 12, RTA_GATEWAY));
+            let oif = find_attr(msg, 12, RTA_OIF).filter(|o| o.len() == 4).map_or(0, |o| rd32(o, 0));
+            let prio = find_attr(msg, 12, RTA_PRIORITY).filter(|o| o.len() == 4).map(|o| rd32(o, 0));
+            Ok(if ty == RTM_NEWROUTE {
+                RtOp::AddRoute6 { dst, plen, gw, oif, metric: prio.unwrap_or(1024), excl: flags & NLM_F_EXCL != 0, replace: flags & NLM_F_REPLACE != 0 }
+            } else { RtOp::DelRoute6 { dst, plen, gw, oif, metric: prio } })
+        }
+    }
+}
+
 pub fn parse_write(msg: &[u8], ty: u16, flags: u16) -> Result<RtOp, i32> {
+    if msg.len() > 16 && msg[16] == AF_INET6 { return parse_write6(msg, ty, flags); }
     match ty {
         RTM_NEWADDR | RTM_DELADDR => {
             if msg.len() < 24 { return Err(22); }
@@ -566,7 +676,7 @@ fn new_addr(msg: &[u8], flags: u16, env: &Env) -> i32 {
 /// [`handle_request`] with a route lookup for non-dump RTM_GETROUTE.
 pub fn handle_request_r(req: &[u8], links: &[Link], pid: u32,
                         route: &dyn Fn([u8; 4]) -> Option<RouteHit>) -> Vec<Vec<u8>> {
-    handle_request_env(req, pid, &Env { links, routes: &[], route, lo_set: &|_| false, apply: &|_| 95, admin: true })
+    handle_request_env(req, pid, &Env { addrs6: &[], routes6: &[], route6: &|_| None, links, routes: &[], route, lo_set: &|_| false, apply: &|_| 95, admin: true })
 }
 
 /// Answer the netlink request(s) in `req` from `env`.
@@ -604,21 +714,37 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
             },
             RTM_GETADDR if dump => {
                 let want_idx = if len >= 24 { rd32(msg, 20) } else { 0 };
-                let msgs = links.iter()
+                let mut msgs: Vec<Vec<u8>> = links.iter()
                     .filter(|l| want_idx == 0 || l.index == want_idx)
                     .filter(|_| fam == AF_UNSPEC || fam == AF_INET)
                     .filter_map(|l| l.addr.map(|(a, p)| addr_msg(l, a, p, seq, pid)))
                     .collect();
+                if fam == AF_UNSPEC || fam == AF_INET6 {
+                    for a in env.addrs6.iter().filter(|a| want_idx == 0 || a.index == want_idx) {
+                        let name = links.iter().find(|l| l.index == a.index).map_or("", |l| l.name.as_str());
+                        msgs.push(addr6_msg(a, name, seq, pid));
+                    }
+                }
                 pack(msgs, &mut out);
                 out.push(done_msg(seq, pid));
             }
             RTM_GETROUTE if dump => {
-                let msgs = env.routes.iter()
+                let mut msgs: Vec<Vec<u8>> = env.routes.iter()
                     .filter(|_| fam == AF_UNSPEC || fam == AF_INET)
                     .map(|r| route_ent_msg(r, seq, pid)).collect();
+                if fam == AF_UNSPEC || fam == AF_INET6 {
+                    for r in env.routes6 { msgs.push(route6_msg(r, seq, pid, true, None)); }
+                }
                 pack(msgs, &mut out);
                 out.push(done_msg(seq, pid));
             }
+            RTM_GETROUTE if fam == AF_INET6 => match req_dst6(msg).and_then(|d| (env.route6)(d).map(|h| (d, h))) {
+                Some((d, (oif, gw))) => {
+                    let r = R6 { dst: d, plen: 128, gw, oif, metric: 0, proto: RTPROT_KERNEL };
+                    out.push(route6_msg(&r, seq, pid, false, Some(d)));
+                }
+                None => { out.push(error_msg(101, msg, seq, pid)); ack = false; }
+            },
             RTM_GETROUTE => match req_dst(msg).and_then(|d| (env.route)(d).map(|h| (d, h))) {
                 Some((d, h)) => out.push(route_msg(d, h, links, seq, pid)),
                 None => { out.push(error_msg(101, msg, seq, pid)); ack = false; } // ENETUNREACH
@@ -627,6 +753,10 @@ pub fn handle_request_env(req: &[u8], pid: u32, env: &Env) -> Vec<Vec<u8>> {
             RTM_NEWLINK | RTM_SETLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE
                 if flags & NLM_F_REQUEST != 0 && !env.admin => {
                 out.push(error_msg(1, msg, seq, pid)); ack = false; // EPERM
+            }
+            RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE if flags & NLM_F_REQUEST != 0 && fam == AF_INET6 => {
+                let e = match parse_write(msg, ty, flags) { Ok(op) => (env.apply)(op), Err(e) => e };
+                if e != 0 { out.push(error_msg(e, msg, seq, pid)); ack = false; }
             }
             RTM_DELLINK if flags & NLM_F_REQUEST != 0 => {
                 let e = if len < 32 { 22 } else {
@@ -1050,7 +1180,7 @@ mod tests {
     }
 
     fn run(req: &[u8], ls: &[Link], routes: &[RouteEnt], lo: bool) -> Vec<(u16, Vec<u8>)> {
-        let env = Env { links: ls, routes, route: &|_| None, lo_set: &|_| lo, apply: &|_| 95, admin: true };
+        let env = Env { addrs6: &[], routes6: &[], route6: &|_| None, links: ls, routes, route: &|_| None, lo_set: &|_| lo, apply: &|_| 95, admin: true };
         split(&handle_request_env(req, 1, &env).concat())
     }
 

@@ -187,7 +187,8 @@ pub fn send(ofd: u32, data: &[u8]) -> Message {
     let links = rt::current_links(ns);
     let routes = rt::current_routes(ns);
     let lo_set = |up: bool| { if ns == 0 { false } else { sched::ns::set_lo_admin_up(ns, up); true } };
-    let env = rt::Env { links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set,
+    let (addrs6, routes6) = if ns == 0 { (crate::ip6::addrs6(), crate::ip6::routes6()) } else { (crate::ip6::lo_addrs6(ns), alloc::vec::Vec::new()) };
+    let env = rt::Env { addrs6: &addrs6, routes6: &routes6, route6: &|d| if ns == 0 { crate::ip6::lookup6(d) } else { None }, links: &links, routes: &routes, route: &|d| if ns == 0 { rt::route_lookup(d) } else { None }, lo_set: &lo_set,
         apply: &|op| crate::tunbe::rtnl_apply(ns, op),
         admin: sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), 12) };
     let tr = nltrace();
