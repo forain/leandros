@@ -25,10 +25,10 @@ if [[ "$mod" == "e1000e" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch" LEANDROS_NIC=e1000e
     python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "/bin/nettest" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] e1000e loaded id' "e1000e autoloaded"
-    check "$L" '^\[kmod e1000e\].*found 8086:10d3' "probe line"
-    check "$L" '^\[kmod e1000e\].*interrupt: MSI vector' "MSI"
-    check "$L" '^\[NET\] DHCP configured' "DHCP"
+    check "$L" '\[kmod\] e1000e loaded id' "e1000e autoloaded"
+    check "$L" '\[kmod e1000e\].*found 8086:10d3' "probe line"
+    check "$L" '\[kmod e1000e\].*interrupt: MSI vector' "MSI"
+    check "$L" '\[NET\] DHCP configured' "DHCP"
     check "$L" '^nettest: .* 0 failed' "nettest passes"
     check "$L" '^e1000e [0-9]* [0-9]* - Live' "listed in /proc/modules"
     check "$L" '^e1000e .* Live ' "listed by kmodctl list"
@@ -81,7 +81,7 @@ if [[ "$mod" == "virtio_keyboard" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] virtio_keyboard loaded id' "virtio_keyboard autoloaded"
+    check "$L" '\[kmod\] virtio_keyboard loaded id' "virtio_keyboard autoloaded"
     check "$L" '\[INPUT\] -> keyboard (event0)' "keyboard claimed event0"
     check "$L" '\[INPUT\] -> tablet (event1)' "tablet claimed event1"
     check "$L" '^virtio_keyboard [0-9]* [0-9]* - Live' "listed in /proc/modules"
@@ -103,8 +103,8 @@ if [[ "$mod" == "virtio_snd" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "sndtest all" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] virtio_snd loaded id' "virtio_snd autoloaded"
-    check "$L" '^\[kmod virtio_snd\].*virtio-sound attached' "backend attached by the module"
+    check "$L" '\[kmod\] virtio_snd loaded id' "virtio_snd autoloaded"
+    check "$L" '\[kmod virtio_snd\].*virtio-sound attached' "backend attached by the module"
     check "$L" '^virtio_snd [0-9]* [0-9]* - Live' "listed in /proc/modules"
     check "$L" '^virtio_snd .* Live ' "listed by kmodctl list"
     check "$L" 'both channels done: [0-9]* B' "sndtest played through the module"
@@ -176,8 +176,8 @@ if [[ "$mod" == "hda" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch" LEANDROS_SND=hda-duplex
     python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "sndtest all" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] hda loaded id' "hda autoloaded"
-    check "$L" '^\[kmod hda\].*hda attached' "backend attached by the module"
+    check "$L" '\[kmod\] hda loaded id' "hda autoloaded"
+    check "$L" '\[kmod hda\].*hda attached' "backend attached by the module"
     check "$L" '^hda [0-9]* [0-9]* - Live' "listed in /proc/modules"
     check "$L" '^hda .* Live ' "listed by kmodctl list"
     check "$L" 'both channels done: [0-9]* B' "sndtest played through the module"
@@ -199,9 +199,9 @@ if [[ "$mod" == "virtio_net" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "/bin/nettest" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] virtio_net loaded id' "virtio_net autoloaded"
-    check "$L" '^\[kmod virtio_net\].*registered netif' "netif registered by the module"
-    check "$L" '^\[NET\] DHCP configured' "DHCP"
+    check "$L" '\[kmod\] virtio_net loaded id' "virtio_net autoloaded"
+    check "$L" '\[kmod virtio_net\].*registered netif' "netif registered by the module"
+    check "$L" '\[NET\] DHCP configured' "DHCP"
     check "$L" '^nettest: .* 0 failed' "nettest passes"
     check "$L" '^virtio_net [0-9]* [0-9]* - Live' "listed in /proc/modules"
     check "$L" '^virtio_net .* Live ' "listed by kmodctl list"
@@ -226,16 +226,16 @@ if [[ "$mod" == "of" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 --cmdline "plat.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[plat\] DT compatibles' "DT walker ran"
-    check "$L" '^\[kmod\] of leandros,test -> hello' "of alias autoload via the platform registry"
-    check "$L" '^\[kmod\] hello loaded id' "hello loaded"
+    check "$L" '\[plat\] DT compatibles' "DT walker ran"
+    check "$L" '\[kmod\] of leandros,test -> hello' "of alias autoload via the platform registry"
+    check "$L" '\[kmod\] hello loaded id' "hello loaded"
     check "$L" '^hello [0-9]* [0-9]* - Live' "listed in /proc/modules"
     python3 "$RT" "$arch" alt2 --cmdline "plat.alias_selftest=1 modules.blacklist=hello" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt2/serial-full.log
     check "$L" 'alias of leandros,test hello: Blacklisted' "blacklist refuses the of load"
     python3 "$RT" "$arch" alt3 --cmdline "kmod=0 plat.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt3/serial-full.log
-    if grep -aq '^\[kmod\] hello loaded' "$L"; then echo "FAIL kmod=0 still loaded hello"; fail=1; else echo "ok   kmod=0 blocks the of hook"; fi
+    if grep -aq '\[kmod\] hello loaded' "$L"; then echo "FAIL kmod=0 still loaded hello"; fail=1; else echo "ok   kmod=0 blocks the of hook"; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest of: PASS" || { echo "autoloadtest of: FAIL"; exit 1; }
     exit 0
 fi
@@ -252,14 +252,14 @@ if [[ "$mod" == "usb_hid" ]]; then
     export LEANDROS_QEMU_EXTRA="-device qemu-xhci,id=xhs -device usb-kbd,bus=xhs.0,id=kbd1"
     python3 "$RT" "$arch" alt1 "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] usb .* 030101 -> usb_hid' "usb alias autoload at enumerate"
-    check "$L" '^\[kmod\] usb_hid loaded id' "usb_hid loaded"
+    check "$L" '\[kmod\] usb .* 030101 -> usb_hid' "usb alias autoload at enumerate"
+    check "$L" '\[kmod\] usb_hid loaded id' "usb_hid loaded"
     check "$L" '\[USB-HID\].*keyboard' "keyboard bound by the module"
     check "$L" '^usb_hid [0-9]* [0-9]* - Live' "listed in /proc/modules"
     python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=usb_hid" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt2/serial-full.log
     check "$L" 'usb_hid: Blacklisted' "blacklist refuses the alias load"
-    if grep -aq '^\[kmod\] usb_hid loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+    if grep -aq '\[kmod\] usb_hid loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest usb_hid: PASS" || { echo "autoloadtest usb_hid: FAIL"; exit 1; }
     exit 0
 fi
@@ -283,13 +283,13 @@ PY
     export LEANDROS_QEMU_EXTRA="-drive if=none,id=stk0,file=$IMG,format=raw -device qemu-xhci,id=xhs -device usb-storage,bus=xhs.0,drive=stk0,id=stick0"
     python3 "$RT" "$arch" alt1 "cat /proc/modules" "sh -c 'dd if=/dev/sda bs=512 skip=3 count=1 2>/dev/null | head -c 15; echo'" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] usb_storage loaded id' "usb_storage loaded"
+    check "$L" '\[kmod\] usb_storage loaded id' "usb_storage loaded"
     check "$L" '\[USB-MSC\] interface 0 LUN 0: 16384 x 512-byte sectors' "disk probed by the module"
     check "$L" '^usb_storage [0-9]* [0-9]* - Live' "listed in /proc/modules"
     check "$L" 'KMODSTOR-BLOCK3' "known block 3 reads back through /dev/sda"
     python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=usb_storage" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt2/serial-full.log
-    if grep -aq '^\[kmod\] usb_storage loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; else echo "ok   blacklist refuses the load"; fi
+    if grep -aq '\[kmod\] usb_storage loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; else echo "ok   blacklist refuses the load"; fi
     unset LEANDROS_QEMU_EXTRA
     [[ $fail -eq 0 ]] && echo "autoloadtest usb_storage: PASS" || { echo "autoloadtest usb_storage: FAIL"; exit 1; }
     exit 0
@@ -306,14 +306,14 @@ if [[ "$mod" == "bt" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 --cmdline "usb.alias_selftest=bt" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] usb 1234:5678 e00101 -> bt' "usb alias autoload at enumerate"
-    check "$L" '^\[kmod\] bt loaded id' "bt loaded"
+    check "$L" '\[kmod\] usb 1234:5678 e00101 -> bt' "usb alias autoload at enumerate"
+    check "$L" '\[kmod\] bt loaded id' "bt loaded"
     check "$L" 'usb alias selftest: class driver wants the interface: Some(224)' "module's class driver registered"
     check "$L" '^bt [0-9]* [0-9]* - Live' "listed in /proc/modules"
     python3 "$RT" "$arch" alt3 --cmdline "usb.alias_selftest=bt modules.blacklist=bt" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt3/serial-full.log
     check "$L" 'alias usb 1234:5678 e00101 bt: Blacklisted' "blacklist refuses the alias load"
-    if grep -aq '^\[kmod\] bt loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+    if grep -aq '\[kmod\] bt loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest bt: PASS" || { echo "autoloadtest bt: FAIL"; exit 1; }
     exit 0
 fi
@@ -330,8 +330,8 @@ if [[ "$mod" == "uvc" ]]; then
     export LEANDROS_RUN_ID="autoloadtest-$arch"
     python3 "$RT" "$arch" alt1 --cmdline "usb.alias_selftest=1" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt1/serial-full.log
-    check "$L" '^\[kmod\] usb 1234:5678 0e0200 -> uvc' "usb alias autoload at enumerate"
-    check "$L" '^\[kmod\] uvc loaded id' "uvc loaded"
+    check "$L" '\[kmod\] usb 1234:5678 0e0200 -> uvc' "usb alias autoload at enumerate"
+    check "$L" '\[kmod\] uvc loaded id' "uvc loaded"
     check "$L" 'usb alias selftest: class driver wants the interface: Some(14)' "module's class driver registered"
     check "$L" '^uvc [0-9]* [0-9]* - Live' "listed in /proc/modules"
     python3 "$RT" "$arch" alt2 --cmdline "uvc.fake=1 modules.load=uvc" "/bin/camtest --probe" "/bin/camtest 8" > /dev/null 2>&1 || true
@@ -341,7 +341,7 @@ if [[ "$mod" == "uvc" ]]; then
     python3 "$RT" "$arch" alt3 --cmdline "usb.alias_selftest=1 modules.blacklist=uvc" "cat /proc/modules" > /dev/null 2>&1 || true
     L=/tmp/ffsession/tests-alt3/serial-full.log
     check "$L" 'alias usb 1234:5678 0e0200 uvc: Blacklisted' "blacklist refuses the alias load"
-    if grep -aq '^\[kmod\] uvc loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+    if grep -aq '\[kmod\] uvc loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
     [[ $fail -eq 0 ]] && echo "autoloadtest uvc: PASS" || { echo "autoloadtest uvc: FAIL"; exit 1; }
     exit 0
 fi
@@ -356,14 +356,14 @@ check() { # check <log> <pattern> <what>
 export LEANDROS_RUN_ID="autoloadtest-$arch"
 python3 "$RT" "$arch" alt1 "cat /proc/modules" "kmodctl list" "head -c 16 /dev/urandom | wc -c" > /dev/null 2>&1 || true
 L=/tmp/ffsession/tests-alt1/serial-full.log
-check "$L" '^\[kmod\] virtio_rng loaded id' "virtio_rng autoloaded"
-check "$L" '^\[kmod virtio_rng\].*virtio-rng bound' "module bound"
-check "$L" '^\[RANDOM\] reseeded (late source) from: virtio-rng' "CSPRNG reseeded from the module"
+check "$L" '\[kmod\] virtio_rng loaded id' "virtio_rng autoloaded"
+check "$L" '\[kmod virtio_rng\].*virtio-rng bound' "module bound"
+check "$L" '\[RANDOM\] reseeded (late source) from: virtio-rng' "CSPRNG reseeded from the module"
 check "$L" '^virtio_rng [0-9]* 1 - Live' "listed in /proc/modules"
 check "$L" '^virtio_rng .* Live ' "listed by kmodctl list"
-if grep -aq '^\[RNG\] virtio-rng bound' "$L"; then echo "FAIL built-in driver also bound"; fail=1; fi
+if grep -aq '\[RNG\] virtio-rng bound' "$L"; then echo "FAIL built-in driver also bound"; fail=1; fi
 python3 "$RT" "$arch" alt2 --cmdline "modules.blacklist=virtio_rng" "kmodctl list" > /dev/null 2>&1 || true
 L=/tmp/ffsession/tests-alt2/serial-full.log
 check "$L" 'alias pci 1af4:1044 virtio_rng: Blacklisted' "blacklist refuses the alias load"
-if grep -aq '^\[kmod\] virtio_rng loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
+if grep -aq '\[kmod\] virtio_rng loaded' "$L"; then echo "FAIL blacklisted module loaded"; fail=1; fi
 [[ $fail -eq 0 ]] && echo "autoloadtest: PASS" || { echo "autoloadtest: FAIL"; exit 1; }

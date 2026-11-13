@@ -528,8 +528,31 @@ static OUTBOX: spin::Mutex<Outbox> =
 /// Lines written past the lock because the outbox was full (may splice).
 pub static OUTBOX_OVERFLOWS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Prefix every staged kernel line with monotonic uptime (Linux dmesg style).
+static PRINTK_TIME: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+fn push_stamp(st: &mut Stage, direct: bool) {
+    let ns = sched::monotonic_ns();
+    let (sec, us) = (ns / 1_000_000_000, (ns / 1000) % 1_000_000);
+    let mut t = [b' '; 15];
+    t[0] = b'[';
+    let mut v = sec;
+    let mut i = 5; // seconds right-aligned in t[1..=5]
+    loop { t[i] = b'0' + (v % 10) as u8; v /= 10; if v == 0 || i == 1 { break; } i -= 1; }
+    t[6] = b'.';
+    let mut u = us;
+    for k in (7..13).rev() { t[k] = b'0' + (u % 10) as u8; u /= 10; }
+    t[13] = b']';
+    t[14] = b' ';
+    for &c in &t { st.buf[st.len] = c as u16 | if direct { STAGE_DIRECT } else { 0 }; st.len += 1; }
+}
+
 /// Turn line staging on (BSP, right before it enters the scheduler).
 pub fn console_staging_enable() {
+    // `printk.time=0` turns the "[   12.345678] " line prefix off (default on).
+    if cmdline_knob("printk.time").map_or(false, |v| v == "0") {
+        PRINTK_TIME.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
     STAGING_ON.store(true, core::sync::atomic::Ordering::Release);
 }
 
@@ -578,6 +601,9 @@ fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
         let tag = b as u16 | if direct { STAGE_DIRECT } else { 0 };
         let f = unsafe { arch_interrupt_save() };
         let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
+        if st.len == 0 && b != b'\n' && PRINTK_TIME.load(core::sync::atomic::Ordering::Relaxed) {
+            push_stamp(st, direct);
+        }
         st.buf[st.len] = tag;
         st.len += 1;
         if b == b'\n' || st.len == STAGE_CAP {
