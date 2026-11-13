@@ -2433,6 +2433,95 @@ static void mntiso_procfd_suite(void) {
     report("procfd_host_sentinel_intact", mi_host_intact());
 }
 
+/* ── lane mntiso-e7: a dirfd keeps its object after the tree changes ──── */
+#define E7H "/tmp/e7/host/d"
+#define E7R "/tmp/e7/root"
+static void e7_mk(void) {
+    mkdir("/tmp/e7", 0755); mkdir("/tmp/e7/host", 0755); mkdir(E7H, 0755);
+    mkdir(E7R, 0755); mkdir(E7R "/tmp", 0755); mkdir(E7R "/tmp/e7", 0755);
+    mkdir(E7R "/tmp/e7/host", 0755); mkdir(E7R "/tmp/e7/host/d", 0755);
+    mkdir(E7R "/old", 0755); mkdir(E7R "/proc", 0755);
+    put(E7H "/f", "HOST", 0644); put(E7H "/u", "HOST", 0644);
+    put(E7R E7H "/f", "VIEW", 0644); put(E7R E7H "/u", "VIEW", 0644);
+}
+static int e7_child(int m) {
+    int dfd = open(E7H, O_DIRECTORY | O_RDONLY); if (dfd < 0) return 10;
+    if (unshare(CLONE_NEWNS) < 0) return 11;
+    if (mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 12;
+    if (m == 0) {
+        if (mount(E7R, E7R, NULL, MS_BIND | MS_REC, NULL) < 0) return 13;
+        if (chdir(E7R) < 0) return 14;
+        if (syscall(SYS_pivot_root, ".", "old") < 0) return 15;
+        if (chdir("/") < 0) return 16;
+        if (umount2("/old", MNT_DETACH) < 0) return 18;
+        if (exists("/tmp/e7/host/d/m")) return 17;
+    } else {
+        if (chroot(E7R) < 0) return 15;
+        if (chdir("/") < 0) return 16;
+    }
+    char b[16] = {0}; int fd = openat(dfd, "f", O_RDONLY);
+    if (fd < 0) { printf("  openat errno=%d\n", errno); return 20; }
+    if (read(fd, b, 15) < 0) {} close(fd);
+    if (strncmp(b, "HOST", 4)) { printf("  openat read '%s'\n", b); return 21; }
+    struct stat st; if (fstatat(dfd, "f", &st, 0) < 0 || st.st_size != 4) { printf("  fstatat errno=%d\n", errno); return 22; }
+    if (mkdirat(dfd, "m", 0755) < 0) { printf("  mkdirat errno=%d\n", errno); return 23; }
+    if (unlinkat(dfd, "u", 0) < 0) { printf("  unlinkat errno=%d\n", errno); return 24; }
+    if (m == 1) return 0; /* the chroot has no procfs, as on Linux */
+    char p[64]; snprintf(p, sizeof p, "/proc/self/fd/%d/f", dfd);
+    memset(b, 0, sizeof b);
+    if (slurp(p, b, sizeof b) < 0 || strncmp(b, "HOST", 4)) { printf("  procfd read '%s'\n", b); return 25; }
+    return 0;
+}
+static void mntiso_e7_suite(void) {
+    for (int m = 0; m < 2; m++) {
+        e7_mk();
+        int ok = nn_in_child(e7_child, m);
+        char n[40]; snprintf(n, sizeof n, "e7_dirfd_keeps_object_%s", m ? "chroot" : "pivot");
+        int host = exists(E7H "/m") && !exists(E7H "/u") && exists(E7R E7H "/u") && !exists(E7R E7H "/m");
+        report(n, ok && host);
+        system("rm -rf /tmp/e7");
+    }
+}
+
+/* ── lane e7flags: a hidden dirfd keeps its mount's flags ── */
+static int e7f_child(int m) {
+    mkdir("/tmp/e7f/ro", 0755);
+    if (unshare(CLONE_NEWNS) < 0) return 11;
+    if (mount("", "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) return 12;
+    if (mount("/tmp/e7f/src", "/tmp/e7f/ro", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7f/ro", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) return 14;
+    int dfd = open("/tmp/e7f/ro", O_DIRECTORY | O_RDONLY); if (dfd < 0) return 15;
+    if (mount(E7R, E7R, NULL, MS_BIND | MS_REC, NULL) < 0) return 16;
+    if (chdir(E7R) < 0) return 17;
+    if (syscall(SYS_pivot_root, ".", "old") < 0) return 18;
+    if (chdir("/") < 0) return 19;
+    if (umount2("/old", MNT_DETACH) < 0) return 20;
+    if (exists("/tmp/e7f/ro")) return 21;
+    char b[16] = {0}; int fd = openat(dfd, "f", O_RDONLY);
+    if (fd < 0) { printf("  ro read errno=%d\n", errno); return 22; }
+    if (read(fd, b, 15) < 0) {} close(fd);
+    if (strncmp(b, "HOST", 4)) return 23;
+    errno = 0; if (mkdirat(dfd, "m", 0755) == 0 || errno != EROFS) { printf("  mkdirat errno=%d\n", errno); return 24; }
+    errno = 0; fd = openat(dfd, "n", O_WRONLY | O_CREAT, 0644);
+    if (fd >= 0 || errno != EROFS) { printf("  creat fd=%d errno=%d\n", fd, errno); return 25; }
+    errno = 0; fd = openat(dfd, "f", O_WRONLY);
+    if (fd >= 0 || errno != EROFS) { printf("  open wr fd=%d errno=%d\n", fd, errno); return 26; }
+    errno = 0; if (unlinkat(dfd, "u", 0) == 0 || errno != EROFS) { printf("  unlinkat errno=%d\n", errno); return 27; }
+    errno = 0; if (renameat(dfd, "u", dfd, "u2") == 0 || errno != EROFS) { printf("  renameat errno=%d\n", errno); return 28; }
+    errno = 0; if (symlinkat("x", dfd, "sl") == 0 || errno != EROFS) { printf("  symlinkat errno=%d\n", errno); return 29; }
+    (void)m; return 0;
+}
+static void e7flags_suite(void) {
+    e7_mk();
+    mkdir("/tmp/e7f", 0755); mkdir("/tmp/e7f/src", 0755);
+    put("/tmp/e7f/src/f", "HOST", 0644); put("/tmp/e7f/src/u", "HOST", 0644);
+    int ok = nn_in_child(e7f_child, 0);
+    int host = !exists("/tmp/e7f/src/m") && !exists("/tmp/e7f/src/n") && exists("/tmp/e7f/src/u")
+            && !exists("/tmp/e7f/src/u2") && !exists("/tmp/e7f/src/sl");
+    report("e7_hidden_fd_keeps_mount_flags", ok && host);
+    system("rm -rf /tmp/e7 /tmp/e7f");
+}
+
 /* ── lane mntiso-busy: mount roots are EBUSY, cross-mount ops EXDEV ── */
 static int mb_prep(void) {
     if (unshare(CLONE_NEWNS) < 0) return 91;
@@ -2766,6 +2855,8 @@ int main(int argc, char **argv) {
     fdbindprop_suite();
     mro_suite();
     mntiso_procfd_suite();
+    mntiso_e7_suite();
+    e7flags_suite();
     shmbind_suite();
     devbind_suite();
     mntiso_busy_suite();

@@ -109,6 +109,9 @@ if command -v zig >/dev/null 2>&1; then
     # netlinktest: NETLINK_ROUTE dumps, getifaddrs, if_nameindex, SIOCGIF* (nICEr / Firefox WebRTC ICE gathering).
     echo "[userland] Building netlinktest (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netlinktest" userland/netlinktest/netlinktest.c
+    # nfttest: NETLINK_NETFILTER / nf_tables control plane via Alpine nft (podnat L1).
+    echo "[userland] Building nfttest (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nfttest" userland/nfttest/nfttest.c
     # ip6test: AF_INET6 TCP/UDP on ::1, the family filter (design-ipv6 L1).
     echo "[userland] Building ip6test (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ip6test" userland/ip6test/ip6test.c

@@ -58,6 +58,7 @@ pkg icu-data-en 78.1-r0 main Q17Laif12iHw4CsLP+czfKj+4aNtY= 3fa1dfb91a081f73c32a
 pkg icu-libs 78.1-r0 main Q1YULmZdkQfFs4QsGjjH+pMK5XHR8= 2393882dcf1e3f5be98696665c3468dd0d2a85cd568d50abd232729863df9738 -
 pkg inih 62-r0 main Q1y0egRdFgJmjOsdfMAcILIvvG9vE= a85dba72b9443d587e1bb27ea863b15763eced90b47911af519e465e7e971616 -
 pkg iso-codes 4.20.1-r0 main Q1LuDQR4RydwYIve+Gea8VKrHe6nY= eec1dfa77f283a5a4b1e95c7657f03c1e7634ef8ff9ff4ab9ed3512caa11c8ad -
+pkg jansson 2.15.0-r0 main Q185lBVZZFfo04G/qflaBhcPayHJs= a13822f5ca1772cced4bb7d3d178ec5dee770d8accba5b4816b2ddc413e6f055 -
 pkg json-c 0.18-r1 main Q1gzT6UPtMBS5pi2S6756O2bqVMx8= 2b9ac9f748f4c7b8a19edd51f3ae4cdf4275541763058381627f55a8bbf71ae6 -
 pkg kbd-bkeymaps 2.8.0-r0 main Q1p14X575JCV6vPFJjTxEruMeWGUQ= 11420d1bf0aa7b364e4284d652c04d6c2acb1cead2c866d22c320f1b73720832 -
 pkg lame-libs 3.100-r5 main Q15xEsz+tbfUAw4uThIuXuf4MVAMw= f419c674f87667947534be07c1f5388a12d614da464a9be97522e3d932d8f48f -
@@ -96,8 +97,10 @@ pkg libksba 1.7.0-r0 main Q1sSyu+gG75GzJAUpMfPs187FVzmQ= 4883f60845115c70f9137ac
 pkg libldap 2.6.15-r0 main Q1jHJ3RCVJd6fQONGqJ/ufKgeS2vU= 2cb81082866cc8571a89fd9c29c8d3cf0bde83d604275492a24bb9563c9466bf -
 pkg libltdl 2.6.0-r1 main Q1eNTNZYJyffPNN2tPDljQVYxhIwQ= 16d92108ccd2f7155c88348a144ee51fd1c28ff483ec8a1dec5f20ff67f1e079 -
 pkg libmd 1.2.0-r0 main Q11/X8F6WgoMpSQJpmegXim1doPNc= cb94430ebc45dbd5dd6882bfd296bb73ea3c337691f469bd1438e696a6e867eb -
+pkg libmnl 1.0.5-r2 main Q1hEKvOZvv8fBWUp+l57eRAPiG1T4= 0ca382c70f78affef3a4a28016aab25ad8c3ccf1bcdad59f3968d4536a7b2478 -
 pkg libmount 2.42.3-r1 main Q1O97hkdg5maEN3JdC2MJaz5BcNpE= a2a6fc6aab7a59c70ec060f5fb8c950be42d1a017934bf32e5dd6984eaab15cc -
 pkg libncursesw 6.6_p20260516-r0 main Q1wNl5+kek1M3VEWlcXl8M4+jPHqI= 51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6 -
+pkg libnftnl 1.3.1-r0 main Q1K/EtkqrW/Ch8vrksthxYMu4krsE= 8b31395671e910c294d7f0e29d3ac3c7efe9d89264db255f39aa9944dd4b6cac -
 pkg libogg 1.3.6-r0 main Q1k1stdlUhbxPOlG8Yq0+XMjW8t4w= a1805de4000502059b6de5a721b12d807ee99833efe76b9b0780e0544ae504b5 -
 pkg libpng 1.6.59-r0 main Q1tghdLeQRR5bv9IoSfKJRO91rI4c= bccd127f8c42bc5c21c018b6b1dc977128f3bad64c3412e541c09e96e8b227a4 -
 pkg libpsl 0.21.5-r3 main Q1H8lLDChibFToqCKIZfSVqiTlq2c= b31e91371425d5f80c1db5cba2a849956b65c802add0b49de844b2ca961aa8da -
@@ -145,6 +148,7 @@ pkg nano 9.3-r0 main Q1xprJAiB1TlYE5bJh/CKbZFWnu2A= ce4c7b3e014780850b9920fd91a6
 pkg ncurses-terminfo-base 6.6_p20260516-r0 main Q1/MzFElM7Tf9vRK02sG+bQ+iEjR8= e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d -
 pkg netavark 1.17.2-r0 community Q1gkP2RFSdwlG9jyPfdXZ1+xj/gv4= afda7687cd15e0bb341787e82f6b34a01531346d50d23d7e5d9a7a7a07d5ca77 -
 pkg nettle 3.10.2-r0 main Q1OVTkQAOGFs/E+43jBSSFItgqFAA= 573c54ecb55b157d9cd5323eb3a9bb9d87b375ee20392a6a9d16c0ba098af9e5 -
+pkg nftables 1.1.6-r1 main Q1TZV+GUqb8OKwRjco5tm5KgffM0g= e350dc0ae7667486f925a6719add6df562055799baf0e402077ef2b11839ac9e post-upgrade
 pkg nghttp2-libs 1.70.0-r0 main Q1oTifXm7i5p3OauTSX1L9ZHst41g= 7ef451f4dcdc065aa872c2f3c78b9d9bb4348caa5bcc70dee0c9e1fcf8e4c1fd -
 pkg npth 1.8-r0 main Q1BKQ4iH93R3mTf+FRFBB30AEeFQY= 5c86144c3d17bff10fa9ff68f9fb3de1c591cd37fd73d02bd9f041e62b394f7b -
 pkg nspr 4.38.2-r0 main Q1LggU0/SkgfhobKBuh/Oq2upHDQk= e98abeff25fcbf006ed9081bed87ce2a60c96ea75df7672b3b69350bec840219 -
@@ -162,6 +166,7 @@ pkg pinentry 1.3.2-r0 main Q1RvrOI1bUSqcpSylTci8hb72DOhc= c747cb22f8efbb8d49005a
 pkg pkgconf 2.5.1-r0 main Q1PMQRkQTC7cl4aHi2R5185JoJqto= 6b716719ac9457bd35c8ea5373da1dc33ae86863bbb0f411aed0cb5e71b9cf2d -
 pkg podman 5.8.9-r0 community Q1l1lThIECiHj/aI2xOrnp5gmE+Qs= 0688368357745fb2091b6ab27241875cff7dce1b5de3d09de58abc784ab84738 post-install,post-upgrade
 pkg rav1e-libs 0.8.1-r0 community Q1EwyhyFDDZ3oIrOfDMRXCZ1f7uT0= f0fabb8a0f5762c8bace671fb6745d9783b8541903368b91e9e74d4479abb411 -
+pkg readline 8.3.3-r1 main Q1GPvWxvOSv5J0EQfi4YdIeWwjGK8= 9f0ae0923c02b0d6aba62e9173542b65396ba3f0efefcbf087ea32f1120e7b34 -
 pkg ripgrep 15.1.0-r0 community Q10Piu1K0ZvxVFGInYIbwSHU6vaGI= 1bf67cfa4464bc91e1dd1a4f537c40664c473ce92bf16ebba64bc7968d7545eb -
 pkg scudo-malloc 22.1.3-r0 main Q1qJu4oqgYxpDlz2lXkOLvSvfo7sY= 186aa6cd23e901a21f76b12775cfe035c9ed15eecc5b5c322b9725ab62ff50f8 -
 pkg shadow-libs 4.18.0-r1 community Q1+s4tEDPAylqCJFZcSXyn1Kvxi5Q= a9d2a0468be8ebade258ab57dbe9a0fabf3fe94078be5ce1c0b4ac8bc5226f48 -
@@ -196,6 +201,7 @@ held /bin/sh icu-data-en
 held /bin/sh libglycin
 held /bin/sh librsvg
 held /bin/sh mkfontscale
+held /bin/sh nftables
 held /bin/sh pinentry
 held /bin/sh podman
 held /bin/sh shared-mime-info

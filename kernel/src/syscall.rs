@@ -11892,6 +11892,7 @@ impl KPath {
         if let Some((fd, below)) = proc_own_fd(&ns) {
             if !below.is_empty() {
                 if let Some(p) = fd_ns_path(mns, fd, below) { return KPath::from_ns_mnt(p, mns); }
+                if let Some(h) = fd_hidden_host(mns, fd) { return hidden_below(h, below, fd); }
             }
         }
         let (mut denied, mut crossed) = (false, false);
@@ -11905,7 +11906,7 @@ impl KPath {
         kp.mnt_id = mid;
         kp.ns_prefix_len = plen;
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid, hidden_flags: None });
         kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
@@ -12112,6 +12113,63 @@ fn fd_ns_path(mns: sched::ns::NsId, fd: usize, below: &[u8]) -> Option<Vec<u8>> 
     Some(p)
 }
 
+/// The backing path of `fd` when the caller is in a mount namespace and the
+/// descriptor's object has no name there (opened before a pivot_root or in
+/// another namespace). Such a descriptor still refers to its object, so
+/// relative lookups go below its backing path; that path is never spelled
+/// into the namespace tree, where it could name a different file.
+fn fd_hidden_host(mns: sched::ns::NsId, fd: usize) -> Option<Vec<u8>> {
+    if mns == 0 { return None; }
+    let host = fd_host_path(fd)?;
+    let hint = match vfs::fd_mnt(current_pid(), fd) { Some((n, m)) if n == mns => m, _ => 0 };
+    match vfs::mnt::reverse(mns, &host, hint) {
+        None => Some(host),
+        // Named in the namespace but outside the caller's chroot: still not
+        // reachable by any path the caller can spell.
+        Some(p) => match sched::current_root_arc() {
+            Some(r) if r.len() > 1 && !vfs::alias::under(&p, &r) => Some(host),
+            _ => None,
+        },
+    }
+}
+
+/// `host`/`rel` as a verbatim backing path. Lexical `..` may not climb above
+/// the descriptor's directory (EXDEV: that parent is outside the caller's
+/// tree), so a hidden fd never reaches beyond its own subtree.
+fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize> {
+    let rel = match rel.iter().position(|&b| b == 0) { Some(n) => &rel[..n], None => rel };
+    let base = host.len();
+    for comp in rel.split(|&b| b == b'/') {
+        if comp.is_empty() || comp == b"." { continue; }
+        if comp == b".." {
+            if host.len() <= base { return Err(-18); }
+            while host.len() > base && host.last() != Some(&b'/') { host.pop(); }
+            host.pop();
+            continue;
+        }
+        if comp.len() > NAME_MAX { return Err(-36); }
+        if host.last() != Some(&b'/') { host.push(b'/'); }
+        host.extend_from_slice(comp);
+        if host.len() >= HOST_PATH_MAX { return Err(-36); }
+    }
+    let mut kp = KPath::raw(&host);
+    // The fd keeps its vfsmount: enforce that mount's flags (live if the mount
+    // still exists, else as recorded at open). Unknown mount => read-only.
+    let fl = match vfs::fd_mnt(current_pid(), fd) {
+        Some((n, m)) => match vfs::mnt::flags_opt(n, m) {
+            Some(f) => f,
+            None => vfs::fd_mnt_flags(current_pid(), fd).unwrap_or(vfs::mnt::MNT_RDONLY),
+        },
+        None => 0, // opened outside any mount-ns tree (ns 0): no per-mount flags
+    };
+    if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV) != 0 {
+        let pid = current_pid();
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: 0, hidden_flags: Some(fl) });
+        kp.ctx_pid = pid;
+    }
+    Ok(kp)
+}
+
 /// `/proc/<own pid>/fd/N[/rest]` → (N, rest without its leading '/'), for
 /// the caller's own descriptor table only (`self`, `thread-self` or a pid of
 /// the calling thread group).
@@ -12290,6 +12348,10 @@ fn fd_host_path(fd: usize) -> Option<Vec<u8>> {
 fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
     let raw = copy_user_path(path_ptr)?;
     if raw.is_empty() { return Err(-2); }
+    let d = dirfd as u32 as i32 as isize as usize;
+    if d != AT_FDCWD && raw.first() != Some(&b'/') {
+        if let Some(h) = fd_hidden_host(sched::current_mntns(), d) { return hidden_below(h, &raw, d); }
+    }
     KPath::from_ns(resolve_at_ns(dirfd, &raw)?)
 }
 
@@ -12300,6 +12362,10 @@ fn resolve_at_ns(dirfd: usize, raw: &[u8]) -> Result<Vec<u8>, isize> {
     let dirfd = dirfd as u32 as i32 as isize as usize;
     // An absolute path ignores the dirfd entirely, per POSIX.
     if dirfd == AT_FDCWD || raw.first() == Some(&b'/') { return resolve_ns(raw); }
+    // A descriptor with no name in the caller's namespace must not have its
+    // backing path reinterpreted as a namespace path (that can name another
+    // file); callers that cannot walk it by backing path fail closed.
+    if fd_hidden_host(sched::current_mntns(), dirfd).is_some() { return Err(-2); }
     let base = match fd_abs_path(dirfd) {
         Some(b) => b,
         None    => return resolve_ns(raw),
