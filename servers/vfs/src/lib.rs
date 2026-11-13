@@ -16257,11 +16257,12 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         VnodeKind::TmpFile { idx, .. } => {
             let t = TMP_FILES.lock();
             let e = &t[idx];
-            if e.is_dir       { (S_IFDIR | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
-            else if e.is_sock { (S_IFSOCK | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
-            else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
-            else if e.devtype != 0 { ((if e.devtype == 1 { 0o020000 } else { 0o060000 }) | (e.mode & 0o7777), 0, 0x2000_0000 + idx as u64) }
-            else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, 0x2000_0000 + idx as u64) }
+            let ino = t[tmp_owner(&t, idx)].ino;
+            if e.is_dir       { (S_IFDIR | (e.mode & 0o7777), 0, ino) }
+            else if e.is_sock { (S_IFSOCK | (e.mode & 0o7777), 0, ino) }
+            else if e.is_fifo { (S_IFIFO | (e.mode & 0o7777), 0, ino) }
+            else if e.devtype != 0 { ((if e.devtype == 1 { 0o020000 } else { 0o060000 }) | (e.mode & 0o7777), 0, ino) }
+            else              { (S_IFREG | (e.mode & 0o7777), e.len as u64, ino) }
         }
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
         VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } | VnodeKind::Mq { .. }
@@ -16458,7 +16459,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 // that the directory it holds open is the one at its path
                 // (the Claude Code CLI pins its task-output directory that
                 // way) took it for a swapped one.
-                let ino = 0x2000_0000 + idx as u64;
+                let ino = e.ino;
                 let mode = 0o040000 | if e.mode != 0 { e.mode } else { 0o755 };
                 let (uid, gid) = (e.uid, e.gid);
                 let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
@@ -16616,7 +16617,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                                 else { 0o100000 };
                 let default_mode = if ifmt == 0o120000 { 0o777 } else { 0o644 };
                 let mode = ifmt | if e.mode != 0 { e.mode } else { default_mode };
-                let ino = 0x2000_0000 + owner as u64;
+                let ino = e.ino;
                 let (uid, gid) = (e.uid, e.gid);
                 let (at, mt, ct) = (e.atime, e.mtime, e.ctime);
                 let blocks = if ifmt == 0o100000 { Some(tmp_st_blocks(owner)) } else { None };

@@ -2679,8 +2679,9 @@ static int bp_case(int m) {
     if (read(up[0], &x, 1) != 1) { int st; waitpid(c, &st, 0); printf("  child setup failed %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 1; }
     if (m == 2) { mkdir("/tmp/bp/other", 0755); rename("/tmp/bp/other", "/tmp/bp/other2"); rmdir("/tmp/bp/other2"); }
     else {
-        rename("/tmp/bp/vol", "/tmp/bp/x");
-        if (m == 0) { mkdir("/tmp/bp/vol", 0755); put("/tmp/bp/vol/f", "NEW", 0644); }
+        if (m == 3) { unlink("/tmp/bp/vol/f"); if (rmdir("/tmp/bp/vol") < 0) return 5; }
+        else rename("/tmp/bp/vol", "/tmp/bp/x");
+        if (m == 0 || m == 3) { mkdir("/tmp/bp/vol", 0755); put("/tmp/bp/vol/f", "NEW", 0644); }
         else if (symlink("/root", "/tmp/bp/vol") < 0) return 2;
     }
     if (write(dn[1], &x, 1) != 1) return 3;
@@ -2693,6 +2694,27 @@ static void bindpin_suite(void) {
     report("bindpin_dir_swap", bp_case(0) == 0);
     report("bindpin_link_swap", bp_case(1) == 0);
     report("bindpin_unrelated_ok", bp_case(2) == 0);
+    report("bindpin_dir_replaced_same_path", bp_case(3) == 0);
+}
+
+/* tmpfsino: tmpfs st_ino is a per-inode number, as on Linux. */
+static int ino_of(const char *p) { struct stat st; return stat(p, &st) < 0 ? -1 : (int)(st.st_ino & 0x7fffffff); }
+static void tmpfs_ino_suite(void) {
+    system("rm -rf /tmp/ino"); mkdir("/tmp/ino", 0755);
+    put("/tmp/ino/a", "x", 0644);
+    int a = ino_of("/tmp/ino/a");
+    rename("/tmp/ino/a", "/tmp/ino/b");
+    report("tmpfs_ino_rename_stable", a > 0 && ino_of("/tmp/ino/b") == a);
+    unlink("/tmp/ino/b"); put("/tmp/ino/b", "y", 0644);
+    report("tmpfs_ino_new_file_fresh", ino_of("/tmp/ino/b") != a);
+    int d = ino_of("/tmp/ino"); mkdir("/tmp/ino/d1", 0755); int d1 = ino_of("/tmp/ino/d1");
+    rmdir("/tmp/ino/d1"); mkdir("/tmp/ino/d1", 0755);
+    report("tmpfs_ino_new_dir_fresh", d1 > 0 && ino_of("/tmp/ino/d1") != d1 && d1 != d);
+    link("/tmp/ino/b", "/tmp/ino/c");
+    struct stat sb, sc; stat("/tmp/ino/b", &sb); stat("/tmp/ino/c", &sc);
+    int fd = open("/tmp/ino/c", O_RDONLY); struct stat sf; int fr = fstat(fd, &sf); close(fd);
+    report("tmpfs_ino_hardlink_shared", sb.st_ino == sc.st_ino && sb.st_nlink == 2 && fr == 0 && sf.st_ino == sb.st_ino);
+    system("rm -rf /tmp/ino");
 }
 
 /* mntiso-bindpin cost: stat through a bind in a mntns, (a) quiet: no name-changing op between
@@ -2751,6 +2773,7 @@ int main(int argc, char **argv) {
     entry_ns_suite();
     strict_ns_suite();
     bindpin_suite();
+    tmpfs_ino_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
