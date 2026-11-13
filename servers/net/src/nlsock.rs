@@ -189,6 +189,14 @@ pub fn send(ofd: u32, data: &[u8]) -> Message {
     if proto == crate::nfnl::NETLINK_NETFILTER {
         let admin = sched::caps::ns_capable_in(sched::ns::owner_userns(1, ns), 12);
         let replies = crate::nfnl::handle(ns, pid, admin, data);
+        if nltrace() {
+            use alloc::format;
+            for (tag, d) in core::iter::once(("REQ", data)).chain(replies.iter().map(|r| ("REP", &r[..]))) {
+                let mut hx = alloc::string::String::new();
+                for c in d.iter().take(300) { hx.push_str(&format!("{:02x}", c)); }
+                trace_out(&format!("nfnl {} {} {}", tag, d.len(), hx));
+            }
+        }
         let mut m = NL.lock();
         if let Some(s) = m.get_mut(&ofd) {
             for r in replies { if s.q.len() >= MAX_QUEUED_NF { break; } s.q.push_back(r); }
