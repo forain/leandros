@@ -231,6 +231,19 @@ def main():
         if port6 and v6ok:
             rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        # ---- L9 phase 2 (ip6dnat): DNAT66 for a published port -----------------------------
+        rc, o6 = run("cat /proc/net/if_inet6")
+        m6 = re.search(r"^([0-9a-f]{32}) 02 40 00 \w+\s+eth0", o6, re.M)
+        nic6 = ":".join(m6.group(1)[i:i + 4] for i in range(0, 32, 4)) if m6 else gw6
+        run("podman rm -af >/dev/null 2>&1; true")
+        rc, out = run(f"podman run -d --rm --network pb6 --name pb6srv -p 18082:80 {IMG} sh -c "
+                      "'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-pb6srv\\n\\n\" | nc -l -p 80 -s ::; done' 2>&1; sleep 3")
+        for nm, u in (("lo", "::1"), ("nicip", nic6)):
+            rc, out = hostwget(f"http://[{u}]:18082/")
+            check6(f"podman_v6_publish_{nm}", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        rc, out = run(f"podman run --rm --network pb6 {IMG} wget -T 10 -qO- http://[{nic6}]:18082/ 2>&1")
+        check6("podman_v6_publish_ctr", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        run("podman rm -f pb6srv >/dev/null 2>&1")
         run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns --internal pb6i 2>&1")
         rc, out = run(f"podman run --rm --network pb6i {IMG} ping -6 -c1 -W 4 {gw6} 2>&1")
         check6("podman_v6_internal_blocked", rc != 0 and "1 packets received" not in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
