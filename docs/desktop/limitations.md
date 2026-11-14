@@ -48,12 +48,12 @@ this page is the explanation.
 
 ### Login and privilege
 
-- **No PAM stack and no utmpx.** greetd authenticates through `pam-leandros`, a Rust
+- **No PAM stack.** greetd authenticates through `pam-leandros`, a Rust
   implementation of the libpam application ABI backed by `/etc/shadow`
   ([login.md](login.md#no-pam-stack-pam-leandros)); the greeter's lock-screen role links an
   older C shim from outside the repository. Whether to grow the shim or port Linux-PAM (which
-  `dlopen`s modules) is undecided. Nothing shipped reads utmpx — upstream greetd has no utmpx
-  code at all — so implementing it waits on a consumer that would make it testable.
+  `dlopen`s modules) is undecided. greetd sessions are recorded in utmpx by `pam_open_session`/`pam_close_session`
+  (line `greetd`).
 - **The greeter's compositor runs as root.** In the user session every COSMIC process,
   cosmic-comp included, runs as the user. In the *greeter* session cosmic-comp stays root,
   because `libseat` is a shim with no seatd behind it to broker revocable device fds; only the

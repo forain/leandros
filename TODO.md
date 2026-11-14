@@ -53,10 +53,9 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - inotify L2/L3 (beyond the default-on L1).
 - **Interrupt paths**: virtio keyboard/blk/net/snd and the aarch64 GPU control queue are still polled (INTx via GIC SPI is the aarch64 step).
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
-- **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
 - **Replace the C `libpam.so.0` shim** with a Rust cdylib or Linux-PAM (decision open; guard must show wrong passwords rejected).
 - **VT console**: TAB advance and double-width glyphs.
-- **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups, utmp/lastlog; password hashes are single-pass salted SHA-256.
+- **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups; password hashes are single-pass salted SHA-256.
 
 ### Network / Wi-Fi
 - **iwlwifi**: 40 MHz on 2.4 GHz, finer rate control.
