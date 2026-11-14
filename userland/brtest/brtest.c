@@ -1210,6 +1210,15 @@ static int nat_scan(void) {
     fclose(f);
     return port;
 }
+/* Failure diagnostic: print the kernel's live TCP NAT entries (fwd_nat_ent lines of /proc/net/nic). */
+static void nat_dump(void) {
+    FILE *f = fopen("/proc/net/nic", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "fwd_nat_ent:", 12) || !strncmp(line, "fwd:", 4)) printf("DIAG %s", line);
+    fclose(f);
+}
 /* A host bind() to `p` must fail with EADDRINUSE. */
 static int nat_inuse(int p) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1346,11 +1355,16 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     char ch = 'g'; write(cc[1], &ch, 1);
     int rd = rd_to(dd[0], &ch);
     snprintf(msg, sizeof msg, "%s: netns configured eth0 + default via 10.97.0.1", name); CHECK(msg, rd == 1);
+    /* The precondition must be sampled BEFORE "go": once the child is released its own resolver flow
+     * can be established before the parent looks (seen on slow TCG: the only entry was the case's own
+     * 10.97.0.2 -> resolver flow, age 0), which is not a leak. */
+    if (mode >= 4 && mode != 6) {
+        snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
+        { int held = nat_scan(); if (held) nat_dump(); CHECK(msg, held == 0); }
+    }
     if (rd == 1) write(cc[1], &ch, 1); /* go */
     int natp = 0;
     if (mode >= 4 && mode != 6) {
-        snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
-        CHECK(msg, nat_scan() == 0);
         rd = rd_to(dd[0], &ch);
         snprintf(msg, sizeof msg, "%s: TCP flow to the resolver established through NAT", name); CHECK(msg, rd == 1);
         natp = nat_scan();
@@ -1390,9 +1404,10 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     }
     int rc = wait_child(c);
     if (mode == 5) {
-        usleep(500000);
+        /* netns teardown (veth/vif forget) is asynchronous; on a loaded TCG box it takes longer than 0.5 s */
+        for (int i = 0; i < 100 && !(natp > 0 && nat_bindable(natp) && nat_scan() == 0); i++) usleep(100000);
         snprintf(msg, sizeof msg, "%s: after the netns died its NAT port %d is released", name, natp);
-        CHECK(msg, natp > 0 && nat_bindable(natp));
+        { int rel = natp > 0 && nat_bindable(natp); if (!rel) nat_dump(); CHECK(msg, rel); }
         snprintf(msg, sizeof msg, "%s: no NAT port stays reserved", name); CHECK(msg, nat_scan() == 0);
         rc = 0;
     }
@@ -1525,7 +1540,8 @@ static int nn_body(void) {
     if (!g_nn_role) return nn_serve(g_nn_mode == 0 ? NULL : "10.97.0.1");
     int c = nn_connect("10.97.0.1", 8080);
     if (c < 0) return 20;
-    if (g_nn_ms > 500) { printf("# KNOWN-OPEN: first connect took %d ms (park on learn miss does not remove the ~700 ms)\n", g_nn_ms); fflush(stdout); }
+    /* The parked SYN is replayed on the ARP reply; the ARP request must be kicked out at once (was a ~450 ms tick wait). */
+    { char m2[96]; snprintf(m2, sizeof m2, "first connect through DNAT is fast (%d ms < 100)", g_nn_ms); CHECK(m2, g_nn_ms < 100); }
     char b[8] = { 0 };
     if (!nn_poll(c, POLLIN, 8000) || read(c, b, 2) != 2) return 21;
     return !strcmp(b, "hi") ? 0 : 22;
