@@ -77,7 +77,15 @@ import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "runtests")
 if any("podbridge" in a for a in sys.argv[1:]):
-    os.environ.setdefault("LEANDROS_HOSTFWD", "tcp:127.0.0.1:18581-:18081")  # podbridgetest publish_ext
+    # podbridgetest publish_ext: a host port unique per run (a fixed one made concurrent runs collide).
+    if "LEANDROS_HOSTFWD" not in os.environ:
+        import socket as _s
+        _sk = _s.socket()
+        _sk.bind(("127.0.0.1", 0))
+        _hp = _sk.getsockname()[1]
+        _sk.close()
+        os.environ["PODBRIDGE_HOSTFWD_PORT"] = str(_hp)
+        os.environ["LEANDROS_HOSTFWD"] = f"tcp:127.0.0.1:{_hp}-:18081"
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.environ.get("REPO", os.path.abspath(os.path.join(HERE, "../../..")))
 DRV = os.path.join(HERE, "driver.py")

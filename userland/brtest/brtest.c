@@ -1540,7 +1540,8 @@ static int nn_body(void) {
     if (!g_nn_role) return nn_serve(g_nn_mode == 0 ? NULL : "10.97.0.1");
     int c = nn_connect("10.97.0.1", 8080);
     if (c < 0) return 20;
-    if (g_nn_ms > 500) { printf("# KNOWN-OPEN: first connect took %d ms (park on learn miss does not remove the ~700 ms)\n", g_nn_ms); fflush(stdout); }
+    /* The parked SYN is replayed on the ARP reply; the ARP request must be kicked out at once (was a ~450 ms tick wait). */
+    { char m2[96]; snprintf(m2, sizeof m2, "first connect through DNAT is fast (%d ms < 100)", g_nn_ms); CHECK(m2, g_nn_ms < 100); }
     char b[8] = { 0 };
     if (!nn_poll(c, POLLIN, 8000) || read(c, b, 2) != 2) return 21;
     return !strcmp(b, "hi") ? 0 : 22;
