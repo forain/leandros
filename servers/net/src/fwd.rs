@@ -28,23 +28,23 @@ use spin::Mutex;
 
 use crate::vifsel::{Sid, VifKind};
 
-const PROTO_ICMP: u8 = 1;
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
-const CT_CAP: usize = 1024;
+pub(crate) const PROTO_ICMP: u8 = 1;
+pub(crate) const PROTO_TCP: u8 = 6;
+pub(crate) const PROTO_UDP: u8 = 17;
+pub(crate) const CT_CAP: usize = 1024;
 const ARP_CAP: usize = 64;
 const PEND_FRAMES: usize = 4;
-const NAT_BASE: u16 = 61000;
-const NAT_SPAN: u16 = 4000;
-const UDP_NS: u64 = 30_000_000_000;
-const UDP_REPLIED_NS: u64 = 180_000_000_000;
-const ICMP_NS: u64 = 30_000_000_000;
-const TCP_SYN_NS: u64 = 60_000_000_000;
-const TCP_EST_NS: u64 = 7_200_000_000_000;
-const TCP_FIN_NS: u64 = 60_000_000_000;
-const TCP_TW_NS: u64 = 10_000_000_000;
-const PEND_NS: u64 = 1_000_000_000;
-const ARP_NS: u64 = 300_000_000_000;
+pub(crate) const NAT_BASE: u16 = 61000;
+pub(crate) const NAT_SPAN: u16 = 4000;
+pub(crate) const UDP_NS: u64 = 30_000_000_000;
+pub(crate) const UDP_REPLIED_NS: u64 = 180_000_000_000;
+pub(crate) const ICMP_NS: u64 = 30_000_000_000;
+pub(crate) const TCP_SYN_NS: u64 = 60_000_000_000;
+pub(crate) const TCP_EST_NS: u64 = 7_200_000_000_000;
+pub(crate) const TCP_FIN_NS: u64 = 60_000_000_000;
+pub(crate) const TCP_TW_NS: u64 = 10_000_000_000;
+pub(crate) const PEND_NS: u64 = 1_000_000_000;
+pub(crate) const ARP_NS: u64 = 300_000_000_000;
 
 struct Ct {
     proto: u8, nat: u16,
@@ -62,17 +62,18 @@ struct Park { br: Sid, ip: [u8; 4], t: u64, port: Sid, frame: Vec<u8> }
 struct Lrn { br: Sid, ip: [u8; 4], mac: [u8; 6], port: Sid, t: u64 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
-struct St {
+pub(crate) struct St {
+    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>,
     ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>, park: Vec<Park>,
-    txq: VecDeque<(u8, Vec<u8>)>, inq: VecDeque<(Sid, Sid, Vec<u8>)>,
-    next: u16, swept: u64,
+    pub(crate) txq: VecDeque<(u8, Vec<u8>)>, pub(crate) inq: VecDeque<(Sid, Sid, Vec<u8>)>,
+    pub(crate) next: u16, pub(crate) swept: u64,
 }
-static FWD: Mutex<St> = Mutex::new(St { ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
+pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
-static USED: AtomicBool = AtomicBool::new(false);
-static TXQ_N: AtomicUsize = AtomicUsize::new(0);
-static INQ_N: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static USED: AtomicBool = AtomicBool::new(false);
+pub(crate) static TXQ_N: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static INQ_N: AtomicUsize = AtomicUsize::new(0);
 
 fn ct_ttl(e: &Ct) -> u64 {
     match e.proto {
@@ -83,18 +84,19 @@ fn ct_ttl(e: &Ct) -> u64 {
 }
 
 /// Advance the TCP lite FSM of `e` for a segment with `flags` (`from_ctr`: sent by the container).
-fn tcp_step(e: &mut Ct, flags: u8, from_ctr: bool) {
+fn tcp_step(e: &mut Ct, flags: u8, from_ctr: bool) { tcp_fsm(&mut e.tst, &mut e.fins, flags, from_ctr) }
+pub(crate) fn tcp_fsm(tst: &mut u8, fins: &mut u8, flags: u8, from_ctr: bool) {
     const FIN: u8 = 1; const SYN: u8 = 2; const RST: u8 = 4; const ACK: u8 = 16;
-    if flags & RST != 0 { e.tst = 4; return; }
+    if flags & RST != 0 { *tst = 4; return; }
     if flags & SYN != 0 {
-        if from_ctr && flags & ACK == 0 { if e.tst >= 3 { e.tst = 0; e.fins = 0; } }
-        else if !from_ctr && flags & ACK != 0 && e.tst == 0 { e.tst = 1; }
+        if from_ctr && flags & ACK == 0 { if *tst >= 3 { *tst = 0; *fins = 0; } }
+        else if !from_ctr && flags & ACK != 0 && *tst == 0 { *tst = 1; }
         return;
     }
-    if from_ctr && e.tst == 1 && flags & ACK != 0 { e.tst = 2; }
-    if flags & FIN != 0 && e.tst >= 1 && e.tst < 4 {
-        e.fins |= if from_ctr { 1 } else { 2 };
-        e.tst = if e.fins == 3 { 4 } else { 3 };
+    if from_ctr && *tst == 1 && flags & ACK != 0 { *tst = 2; }
+    if flags & FIN != 0 && *tst >= 1 && *tst < 4 {
+        *fins |= if from_ctr { 1 } else { 2 };
+        *tst = if *fins == 3 { 4 } else { 3 };
     }
 }
 
@@ -103,7 +105,9 @@ pub(crate) fn reserved(tcp: bool, port: u16) -> bool {
     if !USED.load(Ordering::Relaxed) || port < NAT_BASE || port >= NAT_BASE + NAT_SPAN { return false; }
     let proto = if tcp { PROTO_TCP } else { PROTO_UDP };
     let now = sched::monotonic_ns();
-    FWD.lock().ct.iter().any(|e| e.proto == proto && e.nat == port && now.saturating_sub(e.last) < ct_ttl(e))
+    let g = FWD.lock();
+    g.ct.iter().any(|e| e.proto == proto && e.nat == port && now.saturating_sub(e.last) < ct_ttl(e))
+        || g.ct6.iter().any(|e| e.proto == proto && e.nat == port && now.saturating_sub(e.last) < crate::fwd6::ttl(e))
 }
 
 /// Live TCP NAT ports (the ones `reserved(true, _)` reports), for /proc/net/nic.
@@ -114,8 +118,20 @@ pub(crate) fn live_tcp_nat_ports(out: &mut alloc::vec::Vec<u16>) {
     }
 }
 
+/// One line per live TCP entry (diagnostics for failing tests): nat port, flow, kind, FSM state, age, ttl, bridge/port ids.
+pub(crate) fn dump_tcp_ct(w: &mut dyn core::fmt::Write) {
+    let now = sched::monotonic_ns();
+    for e in FWD.lock().ct.iter() {
+        if e.proto == PROTO_TCP && now.saturating_sub(e.last) < ct_ttl(e) {
+            let _ = writeln!(w, "fwd_nat_ent: nat {} {}.{}.{}.{}:{}->{}.{}.{}.{}:{} kind {} tst {} fins {} age_ms {} ttl_ms {} br {} port {}",
+                e.nat, e.cip[0], e.cip[1], e.cip[2], e.cip[3], e.cport, e.rip[0], e.rip[1], e.rip[2], e.rip[3], e.rport,
+                e.kind, e.tst, e.fins, now.saturating_sub(e.last) / 1_000_000, ct_ttl(e) / 1_000_000, e.br, e.port);
+        }
+    }
+}
+
 /// Number of live conntrack entries (diagnostics).
-pub(crate) fn ct_len() -> usize { FWD.lock().ct.len() }
+pub(crate) fn ct_len() -> usize { let mut g = FWD.lock(); let now = sched::monotonic_ns(); sweep(&mut g, now); g.ct.len() + g.ct6.len() }
 
 /// Drop every entry that belongs to bridge `sid` or entered through port `sid` (it went away).
 pub(crate) fn forget(sid: Sid) {
@@ -123,6 +139,7 @@ pub(crate) fn forget(sid: Sid) {
     let mut g = FWD.lock();
     g.ct.retain(|e| e.br != sid && e.port != sid && e.tbr != sid && e.tps != sid);
     g.lrn.retain(|l| l.br != sid && l.port != sid);
+    g.ct6.retain(|e| e.br != sid && e.port != sid);
 }
 
 // ---- checksums ---------------------------------------------------------------
@@ -240,8 +257,9 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
     };
     let Some((bmac, name, addrs)) = info else { return rx };
     let n = name.iter().position(|&c| c == 0).unwrap_or(16);
-    let on = sched::ns::forwarding(0, &name[..n]);
-    if !on { return rx; }
+    let on4 = sched::ns::forwarding(0, &name[..n]);
+    let on6 = sched::ns::forwarding6(0, &name[..n]);
+    if !on4 && !on6 { return rx; }
     let mut keep = VecDeque::with_capacity(rx.len());
     let aligned = rxsrc.len() == rx.len();
     let nft = crate::nfnl::has_tables(0);
@@ -251,7 +269,11 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
         if nft && port != crate::vifsel::NO_PEER && port != br {
             if let Some(ip) = learn(br, port, bmac, &f) { for q in unpark(br, ip).into_iter().rev() { work.push_front(q); } }
         }
-        if f.len() < 34 || f[0..6] != bmac || f[12] != 0x08 || f[13] != 0 {
+        if on6 && f.len() >= 54 && f[12] == 0x86 && f[13] == 0xdd && f[0..6] == bmac && port != crate::vifsel::NO_PEER && port != br {
+            match crate::fwd6::divert(br, port, bmac, f) { Some(back) => keep.push_back(back), None => {} }
+            continue;
+        }
+        if !on4 || f.len() < 34 || f[0..6] != bmac || f[12] != 0x08 || f[13] != 0 {
             keep.push_back(f);
             continue;
         }
@@ -300,7 +322,7 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
             // verdict (netavark: an internal network has none, so a leaked ip_forward=1 cannot SNAT it).
             if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
-                let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false };
+                let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
                 if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return; }
                 if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return; }
             }
@@ -360,7 +382,7 @@ fn emit_nic(st: &mut St, now: u64, nic: u8, nh: [u8; 4], nicip: [u8; 4], nicmac:
     }
 }
 
-fn push_tx(st: &mut St, nic: u8, f: Vec<u8>) {
+pub(crate) fn push_tx(st: &mut St, nic: u8, f: Vec<u8>) {
     if st.txq.len() >= 256 { return; }
     st.txq.push_back((nic, f));
     TXQ_N.fetch_add(1, Ordering::Relaxed);
@@ -379,6 +401,9 @@ fn arp_request(mac: [u8; 6], ip: [u8; 4], target: [u8; 4]) -> Vec<u8> {
     r
 }
 
+pub(crate) fn ct4_len(st: &St) -> usize { st.ct.len() }
+pub(crate) fn v4_nat_busy(st: &St, c: u16, proto: u8) -> bool { st.ct.iter().any(|e| e.nat == c && e.proto == proto) }
+pub(crate) fn sweep_pub(st: &mut St, now: u64) { sweep(st, now) }
 fn sweep(st: &mut St, now: u64) {
     if now.saturating_sub(st.swept) < 1_000_000_000 { return; }
     st.swept = now;
@@ -386,6 +411,7 @@ fn sweep(st: &mut St, now: u64) {
     st.pend.retain(|q| now.saturating_sub(q.t) < PEND_NS);
     st.arp.retain(|a| now.saturating_sub(a.t) < ARP_NS);
     st.lrn.retain(|l| now.saturating_sub(l.t) < ARP_NS);
+    crate::fwd6::sweep6(st, now);
 }
 
 // ---- NIC side --------------------------------------------------------------------
@@ -393,6 +419,7 @@ fn sweep(st: &mut St, now: u64) {
 /// NIC rx hook, before smoltcp. Learns ARP and un-NATs replies of forwarded
 /// flows. True = the frame was taken and must not reach the NIC's stack.
 pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
+    if buf.len() >= 54 && buf[12] == 0x86 && buf[13] == 0xdd { return crate::fwd6::nic_rx(nic, buf); }
     if !USED.load(Ordering::Relaxed) || buf.len() < 34 { return false; }
     if buf[12] == 0x08 && buf[13] == 0x06 { arp_learn(nic, buf); return false; }
     if buf[12] == 0x08 && buf[13] == 0x00 && buf[23] == PROTO_ICMP && icmp_error_type(buf) {
@@ -595,7 +622,7 @@ fn is_new_flow(p: &Pkt) -> bool { p.proto == PROTO_UDP || (p.proto == PROTO_TCP 
 /// Creates an In entry. 0 = not ours (pass to the stack), 1 = dropped, 2 = entry created.
 fn new_in(st: &mut St, nic: u8, p: &Pkt, now: u64) -> u8 {
     if !is_new_flow(p) || !crate::iface::is_nic_addr(p.dst) { return 0; }
-    let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true };
+    let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
     let (acc, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
     let crate::nfnl::Nat::Dnat(cip, cport) = nat else { return if acc { 0 } else { 1 } };
     let cport = if cport == 0 { p.dport } else { cport };
@@ -656,7 +683,7 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
     }
     if hit.is_none() {
         if !is_new_flow(p) || !host_local(p.dst) || st.ct.len() >= CT_CAP { return false; }
-        let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true };
+        let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
         let (_, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
         let crate::nfnl::Nat::Dnat(cip, cport) = nat else { return false };
         let cport = if cport == 0 { p.dport } else { cport };
@@ -672,6 +699,8 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
             }
             let r = arp_request(t.mac, t.addr, cip);
             st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
+            drop(st);
+            drivers::netdev::kick(); // else the ARP request waits for the next housekeeping tick (~450 ms)
             return true;
         };
         let claimed = crate::nfnl::dnat_ports(0);

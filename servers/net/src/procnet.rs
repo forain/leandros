@@ -146,6 +146,7 @@ fn nic(w: &mut Out) {
         let _ = write!(w, "fwd_nat_tcp:");
         for p in ports { let _ = write!(w, " {}", p); }
         let _ = writeln!(w);
+        super::fwd::dump_tcp_ct(w);
     }
     let _ = writeln!(w, "netd: passes {} max_rx_per_pass {} wakes tagged {} broadcast {} rx_irq {} virtio_rx_irqs {} tcp_rx_buf {} netctl_wakes {}",
                      NETD_PASSES.load(Ordering::Relaxed), NETD_MAX_RX.load(Ordering::Relaxed),

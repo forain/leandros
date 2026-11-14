@@ -20,6 +20,7 @@ pub mod tunbe;
 mod framedev;
 mod l2;
 mod fwd;
+mod fwd6;
 pub mod netwatch;
 
 use iface::{Sid, LO, MAX_STACKS};
@@ -5117,7 +5118,7 @@ fn nft_output_dnat(pid: u32, fd: usize, slot: usize, ip: IpAddress, ep: IpEndpoi
     let d = a.0;
     if !fwd::host_local(d) { return (ip, ep) }
     let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
-    let mut m = nfnl::Pkt { l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true };
+    let mut m = nfnl::Pkt { l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None };
     let (acc, nat) = nfnl::eval(0, nfnl::H_OUT, &mut m);
     let _ = acc;
     let nfnl::Nat::Dnat(c, cp) = nat else { return (ip, ep) };

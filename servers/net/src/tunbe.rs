@@ -442,7 +442,7 @@ pub(crate) fn ll_from_mac(m: [u8; 6]) -> [u8; 16] {
 }
 
 /// Every v6 address a vif's stack holds: link-local while up, then the static ones.
-fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
+pub(crate) fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
     let v = VIFS.lock();
     let Some(x) = v[sid as usize].as_ref() else { return Vec::new() };
     let mut o = Vec::new();
@@ -484,8 +484,9 @@ pub(crate) fn routes6(ns: u16) -> Vec<rtnetlink::R6> {
         out.push(rtnetlink::R6 { dst: d, plen: p, gw: None, oif: a.index, metric: 256, proto: 2 });
     }
     {
+        let sids = sids_of(ns); // NETNS before VIFS: never take NETNS with VIFS held
         let v = VIFS.lock();
-        for s in sids_of(ns) {
+        for s in sids {
             let Some(x) = v[s as usize].as_ref() else { continue };
             for &(d, p, g, m) in &x.routes6 { out.push(rtnetlink::R6 { dst: d, plen: p, gw: Some(g), oif: x.ifindex, metric: m, proto: 3 }); }
         }
@@ -507,8 +508,9 @@ pub(crate) fn route6_in_ns(ns: u16, dst: [u8; 16]) -> Option<Sid> {
     }
     if best.is_none() {
         // No on-link prefix: the longest static gateway route (a default route included).
+        let sids = sids_of(ns); // NETNS before VIFS (lock order)
         let v = VIFS.lock();
-        for s in sids_of(ns) {
+        for s in sids {
             let Some(x) = v[s as usize].as_ref() else { continue };
             for &(d, p, _, _) in &x.routes6 {
                 if pfx_match(&d, &dst, p) && best.map_or(true, |b| p > b.0) { best = Some((p, s)); }

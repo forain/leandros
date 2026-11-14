@@ -835,6 +835,8 @@ pub struct Pkt {
     pub mark: u32,
     /// `fib daddr type local`.
     pub local: bool,
+    /// IPv6 source/destination (a v6 packet: `src`/`dst` unused, family ip6/inet).
+    pub v6: Option<([u8; 16], [u8; 16])>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -894,12 +896,18 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
         match name {
             b"payload" => {
                 let (dreg, base, off, len) = (g(1)?, g(2)?, g(3)? as usize, g(4)? as usize);
-                let mut net = [0u8; 20];
-                net[0] = 0x45; net[9] = cx.m.l4;
-                net[12..16].copy_from_slice(&cx.m.src); net[16..20].copy_from_slice(&cx.m.dst);
+                let mut net = [0u8; 40];
+                if let Some((s6, d6)) = cx.m.v6 {
+                    net[0] = 0x60; net[6] = cx.m.l4;
+                    net[8..24].copy_from_slice(&s6); net[24..40].copy_from_slice(&d6);
+                } else {
+                    net[0] = 0x45; net[9] = cx.m.l4;
+                    net[12..16].copy_from_slice(&cx.m.src); net[16..20].copy_from_slice(&cx.m.dst);
+                }
+                let nlen = if cx.m.v6.is_some() { 40 } else { 20 };
                 let mut tr = [0u8; 4];
                 tr[0..2].copy_from_slice(&cx.m.sport.to_be_bytes()); tr[2..4].copy_from_slice(&cx.m.dport.to_be_bytes());
-                let h: &[u8] = match base { 1 => &net, 2 => &tr, _ => return None };
+                let h: &[u8] = match base { 1 => &net[..nlen], 2 => &tr, _ => return None };
                 if off + len > h.len() { return None; }
                 rset(&mut regs, dreg, &h[off..off + len])?;
             }
@@ -911,7 +919,7 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
                     match g(2)? {
                         3 => rset(&mut regs, dreg, &cx.m.mark.to_ne_bytes())?,
                         7 => { let o = cx.m.oif; rset(&mut regs, dreg, &o)? }
-                        15 => rset(&mut regs, dreg, &[2])?,
+                        15 => rset(&mut regs, dreg, &[if cx.m.v6.is_some() { 10 } else { 2 }])?,
                         16 => rset(&mut regs, dreg, &[cx.m.l4])?,
                         _ => rset(&mut regs, dreg, &[0u8; 16])?,
                     }
@@ -996,7 +1004,7 @@ pub fn eval(ns: u16, hook: u32, m: &mut Pkt) -> (bool, Nat) {
     let Some(st) = g.get(&ns) else { return (true, Nat::None) };
     let mut chains: Vec<(i32, &Table, &Chain)> = Vec::new();
     for t in &st.tables {
-        if t.family != 1 && t.family != 2 { continue; }
+        if t.family != 1 && t.family != (if m.v6.is_some() { 10 } else { 2 }) { continue; }
         for c in &t.chains {
             let Some(h) = &c.hook else { continue };
             let ha = attrs(h);
