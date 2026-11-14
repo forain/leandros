@@ -257,7 +257,11 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
                 return failures;
             }
             b"stoprem" => {
-                if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
+                // `sigtest stoprem N`: N loops (default 1) to catch the flake.
+                let n = if argc >= 3 { iters } else { 1 };
+                for _ in 0..n {
+                    if !test_timed_wait_stop_resumes_remainder() { failures += 1; }
+                }
                 puts(b"--- sigtest stoprem done ---\n\0".as_ptr());
                 return failures;
             }
@@ -1953,12 +1957,16 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
                 _exit(0);
             }
             close(fds[1]);
+            let tf = now_ns();
             sleep_ms(stop_ms);
+            let t_stop = (now_ns() - tf) / 1_000_000;
             kill(child, SIGSTOP);
             sleep_ms(cont_ms - stop_ms);
+            let t_cont = (now_ns() - tf) / 1_000_000;
             kill(child, SIGCONT);
             let mut out: [i64; 2] = [-9999, 0];
             read(fds[0], out.as_mut_ptr() as *mut u8, 16);
+            let t_done = (now_ns() - tf) / 1_000_000;
             close(fds[0]);
             let mut st = 0;
             waitpid(child, &mut st, 0);
@@ -1973,6 +1981,23 @@ unsafe fn test_timed_wait_stop_resumes_remainder() -> bool {
             write(1, b" r=".as_ptr(), 3); put_i32(r as i32);
             write(1, b" el_ms=".as_ptr(), 7); put_i32(el_ms as i32);
             write(1, if c { b" ok\n".as_ptr() } else { b" BAD\n".as_ptr() }, if c { 4 } else { 5 });
+            if !c {
+                // Failure-only detail: requested 500 ms; the child should
+                // finish at ~500 + (cont - stop) ms. t_* are parent-side ms
+                // since fork: SIGSTOP sent, SIGCONT sent, result read.
+                // late_ms = elapsed - expected: >0 the resume/timeout was late.
+                let expect = 500 + (cont_ms - stop_ms) as i64;
+                write(1, b"    DETAIL req_ms=500 expect_ms=".as_ptr(), 32); put_i32(expect as i32);
+                write(1, b" range=".as_ptr(), 7); put_i32(lo as i32);
+                write(1, b"..".as_ptr(), 2); put_i32(hi as i32);
+                write(1, b" late_ms=".as_ptr(), 9); put_i32((el_ms - expect) as i32);
+                write(1, b" r_ok=".as_ptr(), 6); put_i32(want_ok as i32);
+                write(1, b" t_stop=".as_ptr(), 8); put_i32(t_stop as i32);
+                write(1, b" t_cont=".as_ptr(), 8); put_i32(t_cont as i32);
+                write(1, b" t_done=".as_ptr(), 8); put_i32(t_done as i32);
+                write(1, b" after_cont_ms=".as_ptr(), 15); put_i32((t_done - t_cont) as i32);
+                write(1, b"\n".as_ptr(), 1);
+            }
             ok &= c;
         }
     }

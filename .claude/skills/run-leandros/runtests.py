@@ -477,6 +477,7 @@ def main(argv):
         if not booted:
             all_ok = False
             continue
+        miss_seen = False
         with open(os.path.join(rdir, "results.txt"), "w") as res:
             for c in cmds:
                 try:
@@ -510,6 +511,23 @@ def main(argv):
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
                                          "secs": r["secs"], "fails": fails})
+                # sig_kick guard: any writer of signal state that forgot sig_kick
+                # shows up as `miss` > 0 in /proc/rqhold (cumulative since boot).
+                # Checked after each command that ran on this VM; the first
+                # command after which it is non-zero fails the run.
+                if not miss_seen and not self_boots(c) and driver._qemu_pid() is not None:
+                    try:
+                        q = driver.serial_run("grep '^# sigfast' /proc/rqhold", timeout=60, arch=arch)
+                        m = re.search(r"\bmiss (\d+)\b(?: miss_pid (\S+))?", q["output"])
+                        if m and int(m.group(1)) > 0:
+                            miss_seen = True
+                            all_ok = False
+                            print(f"=== sig_kick guard: FAIL miss={m.group(1)} (after {c}): {q['output'].strip()[-200:]}", flush=True)
+                            res.write(f"=== sig_kick guard: FAIL after {c}\n{q['output']}\n")
+                            entry["results"].append({"cmd": "sig_kick-guard", "rc": 1, "status": "ok",
+                                                     "secs": 0, "fails": ["sig_kick_miss"]})
+                    except Exception:  # noqa: BLE001
+                        pass
         if os.path.exists(driver.SERIAL_LOG):
             subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
         if os.path.exists(driver.SERIAL_FULL_LOG):
