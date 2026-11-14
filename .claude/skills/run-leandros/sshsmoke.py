@@ -171,9 +171,35 @@ def quick(ssh, user, pw):
     for tag, dev in (("v4", "127.0.0.1"), ("v6", "::1")):
         rc, out, err = ssh.run(user, f"/bin/ip6test banner {dev} 22", password=pw)
         step(f"loopback_banner_{tag}", rc == 0 and out.startswith("SSH-"), f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    utmp(ssh, user, pw)
     rc, out, err = ssh.run(user, "cat /proc/self/cgroup", password=pw)
     step("session_cgroup", rc == 0 and "/user.slice/user-" in out and "/session-" in out,
          f"rc={rc} out={out.strip()!r}")
+
+
+def utmp(ssh, user, pw):
+    """utmpx/wtmp/lastlog (lane utmp). Alpine busybox reads them: `who` through
+    the utmps socket (served by /bin/utmpd), `last` straight from wtmp."""
+    bb = "/bin/busybox.static"
+    # An ssh pty session is a login: `who` run inside it lists itself, and the
+    # console root session the harness logged in on is listed too (/bin/login).
+    rc, out, err = ssh.run(user, f"{bb} who", password=pw, extra=("-tt",))
+    who = [l.split() for l in out.replace("\r", "").splitlines() if l.strip()]
+    step("utmp_who_ssh", any(w[0] == user and w[1].startswith("pts/") for w in who),
+         f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    step("utmp_who_console_login", any(w[0] == "root" and w[1].startswith("tty") for w in who),
+         f"out={out.strip()!r}")
+    # The first session has ended: DEAD_PROCESS, so a plain exec (no pty, never
+    # recorded) sees only the current console and ssh-less state.
+    rc, out, err = ssh.run(user, f"{bb} who", password=pw)
+    lines = [l.split() for l in out.splitlines() if l.strip()]
+    step("utmp_dead_after_exit", rc == 0 and not any(w[0] == user for w in lines),
+         f"rc={rc} out={out.strip()!r}")
+    rc, out, err = ssh.run(user, f"{bb} last", password=pw)
+    step("utmp_last_history", rc == 0 and any(l.split()[:1] == [user] and "pts/" in l for l in out.splitlines())
+         and ("system boot" in out or "reboot" in out), f"rc={rc} out={out.strip()[-300:]!r}")
+    rc, out, err = ssh.run(user, "ls -l /var/log/lastlog /var/log/wtmp /run/utmps/utmp", password=pw)
+    step("utmp_files", rc == 0 and out.count("/var/log/") == 2, f"rc={rc} out={out.strip()!r}")
 
 
 def full(ssh, user, pw, tmp):
