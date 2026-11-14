@@ -840,7 +840,7 @@ pub struct Pkt {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Nat { None, Dnat([u8; 4], u16), Masq }
+pub enum Nat { None, Dnat([u8; 4], u16), Dnat6([u8; 16], u16), Masq }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Flow { Fall, Ret, Accept, Drop }
@@ -985,9 +985,16 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
             }
             b"nat" => {
                 if g(1)? != 1 { return None; }
+                let port = match g(5) { Some(r) => { let p = rget(&regs, r, 2)?; u16::from_be_bytes([p[0], p[1]]) } None => 0 };
+                if g(2) == Some(10) {
+                    let a = rget(&regs, g(3)?, 16)?;
+                    let mut addr = [0u8; 16];
+                    addr.copy_from_slice(a);
+                    cx.nat = Nat::Dnat6(addr, port);
+                    return Some(Flow::Accept);
+                }
                 let a = rget(&regs, g(3)?, 4)?;
                 let addr = [a[0], a[1], a[2], a[3]];
-                let port = match g(5) { Some(r) => { let p = rget(&regs, r, 2)?; u16::from_be_bytes([p[0], p[1]]) } None => 0 };
                 cx.nat = Nat::Dnat(addr, port);
                 return Some(Flow::Accept);
             }
