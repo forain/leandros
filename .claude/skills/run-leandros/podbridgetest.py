@@ -47,6 +47,10 @@ class _H(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def fails6_publish(out):
+    return "hello-pb6srv" not in out
+
+
 def main():
     arch = os.environ.get("LEANDROS_TEST_ARCH")
     ser = driver._Serial()
@@ -231,7 +235,7 @@ def main():
         if port6 and v6ok:
             rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
-        rc, out = run(f"podman run --rm --network pb6 {IMG} traceroute6 -n -m 1 -q 1 -w 4 {gw6} 2>&1")
+        rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} traceroute6 -n -m 1 -q 1 -w 4 {gw6} 2>&1")
         check6("podman_v6_time_exceeded", re.search(r"^\s*1\s+[0-9a-f]+:[0-9a-f:]+\s", out, re.M) is not None, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
         # ---- L9 phase 2 (ip6dnat): DNAT66 for a published port -----------------------------
         rc, o6 = run("cat /proc/net/if_inet6")
@@ -245,6 +249,9 @@ def main():
             check6(f"podman_v6_publish_{nm}", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
         rc, out = run(f"podman run --rm --network pb6 {IMG} wget -T 10 -qO- http://[{nic6}]:18082/ 2>&1")
         check6("podman_v6_publish_ctr", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        if fails6_publish(out):
+            rc, rs = run("nft list ruleset 2>&1 | grep -n -B3 -A3 18082; podman ps -a 2>&1; podman logs pb6srv 2>&1 | tail -n 5")
+            print("DIAG v6 publish:\n" + rs[-1800:])
         run("podman rm -f pb6srv >/dev/null 2>&1")
         run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns --internal pb6i 2>&1")
         rc, out = run(f"podman run --rm --network pb6i {IMG} ping -6 -c1 -W 4 {gw6} 2>&1")
