@@ -53,6 +53,7 @@
  *   udp_burst           3000 nonblocking 1200-byte sends to an unread socket
  *                       answer the length or EAGAIN, nothing else; 500
  *                       blocking sends all succeed
+ *   udp_pmtud           IP_MTU_DISCOVER / IP_MTU, frag-needed shrinks the path, DO sends past it are EMSGSIZE
  *   udp_huge            4000-, 60000- and 65507-byte datagrams round-trip over loopback; 65508 is EMSGSIZE
  *   udp_large           an 8000-byte datagram over loopback arrives whole
  *   udp_gso             UDP_SEGMENT (cmsg and socket option) splits one send
@@ -820,6 +821,87 @@ static void udp_huge(void) {
     else pass(N);
 }
 
+/* Path-MTU discovery (IP_MTU_DISCOVER, IP_MTU, ICMP "fragmentation needed").
+ * The frag-needed message is injected through a raw ICMP socket aimed at
+ * loopback, quoting a datagram this socket "sent" to 127.0.0.2. */
+#ifndef IP_MTU_DISCOVER
+#define IP_MTU_DISCOVER 10
+#endif
+#ifndef IP_MTU
+#define IP_MTU 14
+#endif
+static uint16_t pmtu_csum(const void *p, size_t n) {
+    const uint8_t *b = p; uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) sum += (b[i] << 8) | b[i + 1];
+    if (n & 1) sum += b[n - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static void udp_pmtud(void) {
+    const char *N = "udp_pmtud";
+    if (skipped(N)) return;
+    struct sockaddr_in ra;
+    int r = udp_bound("127.0.0.2", 0, &ra), s = socket(AF_INET, SOCK_DGRAM, 0);
+    static char d[4000];
+    memset(d, 7, sizeof d);
+    int v = -1; socklen_t vl = sizeof v;
+    char why[200] = "";
+    if (getsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &v, &vl) || v != 1)
+        snprintf(why, sizeof why, "default IP_MTU_DISCOVER %d (%s), want 1 (WANT)", v, strerror(errno));
+    int on = 2;
+    if (!why[0] && setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &on, sizeof on))
+        snprintf(why, sizeof why, "set IP_MTU_DISCOVER=DO: %s", strerror(errno));
+    on = 9; errno = 0;
+    if (!why[0] && (setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &on, sizeof on) == 0 || errno != EINVAL))
+        snprintf(why, sizeof why, "IP_MTU_DISCOVER=9 not EINVAL (%s)", strerror(errno));
+    v = -1;
+    if (!why[0] && (getsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &v, &vl) || v != 2))
+        snprintf(why, sizeof why, "IP_MTU_DISCOVER reads %d, want 2", v);
+    if (!why[0] && connect(s, (struct sockaddr *)&ra, sizeof ra)) snprintf(why, sizeof why, "connect: %s", strerror(errno));
+    v = 0;
+    if (!why[0] && (getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl) || v != 65536))
+        snprintf(why, sizeof why, "IP_MTU before ICMP: %d (%s), want 65536", v, strerror(errno));
+    if (!why[0] && send(s, d, 3000, 0) != 3000) snprintf(why, sizeof why, "3000-byte DO send: %s", strerror(errno));
+    struct sockaddr_in la; socklen_t ll = sizeof la;
+    getsockname(s, (struct sockaddr *)&la, &ll);
+    int raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (!why[0] && raw < 0) snprintf(why, sizeof why, "raw icmp socket: %s", strerror(errno));
+    if (!why[0]) {
+        uint8_t m[8 + 20 + 8];
+        memset(m, 0, sizeof m);
+        m[0] = 3; m[1] = 4; m[6] = 1000 >> 8; m[7] = 1000 & 255;
+        uint8_t *ip = m + 8;
+        ip[0] = 0x45; ip[3] = 28 + 1500; ip[2] = (28 + 1500) >> 8; ip[6] = 0x40; ip[8] = 64; ip[9] = 17;
+        uint32_t src = htonl(INADDR_LOOPBACK);
+        memcpy(ip + 12, &src, 4); memcpy(ip + 16, &ra.sin_addr, 4);
+        uint16_t c = pmtu_csum(ip, 20); ip[10] = c >> 8; ip[11] = c & 255;
+        memcpy(ip + 20, &la.sin_port, 2); memcpy(ip + 22, &ra.sin_port, 2);
+        c = pmtu_csum(m, sizeof m); m[2] = c >> 8; m[3] = c & 255;
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        if (sendto(raw, m, sizeof m, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof m)
+            snprintf(why, sizeof why, "inject frag-needed: %s", strerror(errno));
+        msleep(200);
+    }
+    if (raw >= 0) close(raw);
+    ssize_t big = -2, small = -2; int be = 0;
+    if (!why[0]) {
+        errno = 0; big = send(s, d, 1200, 0); be = errno;
+        small = send(s, d, 900, 0);
+        v = 0;
+        if (big != -1 || be != EMSGSIZE) snprintf(why, sizeof why, "1200-byte send over a 1000 path: %zd %s, want EMSGSIZE", big, strerror(be));
+        else if (small != 900) snprintf(why, sizeof why, "900-byte send over a 1000 path: %zd %s", small, strerror(errno));
+        else if (getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl) || v != 1000) snprintf(why, sizeof why, "IP_MTU after ICMP %d, want 1000", v);
+    }
+    /* IP_PMTUDISC_DONT ignores the path: the same 1200 bytes go out. */
+    if (!why[0]) {
+        on = 0; setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &on, sizeof on);
+        if (send(s, d, 1200, 0) != 1200) snprintf(why, sizeof why, "DONT send of 1200: %s", strerror(errno));
+    }
+    close(r); close(s);
+    if (why[0]) fail(N, "%s", why); else pass(N);
+}
+
 static void udp_gso(void) {
     const char *N = "udp_gso";
     if (skipped(N)) return;
@@ -992,6 +1074,7 @@ int main(int argc, char **argv) {
     udp_burst();
     udp_large();
     udp_huge();
+    udp_pmtud();
     udp_gso();
     udp_mmsg();
     udp_dup();
