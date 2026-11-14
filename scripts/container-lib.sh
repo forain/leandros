@@ -84,6 +84,13 @@ leandros_pick_container() {
   return 1
 }
 
+# leandros_port_fresh PORTDIR ARCH: true iff PORTDIR/out/ARCH/.stamp exists and no
+# file of the port (outside out/) is newer than it.
+leandros_port_fresh() {
+  [ -f "$1/out/$2/.stamp" ] || return 1
+  [ -z "$(find "$1" -path "$1/out" -prune -o -type f -newer "$1/out/$2/.stamp" -print 2>/dev/null | head -n 1)" ]
+}
+
 leandros_port_reuse() {
   _pr_dir=$1 _pr_arch=$2 _pr_name=$3
   _pr_dst="$_pr_dir/out/$_pr_arch"
