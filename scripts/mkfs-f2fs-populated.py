@@ -1098,6 +1098,7 @@ def main():
         m4_share_dirs.add("/sys/bus/platform")
     for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
               "/sys/class", "/sys/class/block",
+              "/sys/class/drm", "/sys/class/input",
               "/sys/class/power_supply", "/sys/class/backlight",
               "/sys/firmware", "/sys/firmware/acpi", "/sys/firmware/acpi/tables",
               "/sys/fs", "/sys/fs/cgroup"):
@@ -1114,6 +1115,13 @@ def main():
         for d in ("/sys/dev", "/sys/dev/char", _base, _dev,
                   _dev + "/drm", _dev + "/drm/" + _node):
             m4_share_dirs.add(d)
+        # Node-level identity (Linux: the drm minor's own uevent) and the
+        # /sys/class/drm/<node> entry. These are NEW paths: nothing libdrm or
+        # drm-rs stats today (device/*, device/drm, device/subsystem) moves.
+        _sysfs_attr(_base, "uevent",
+                    f"MAJOR={DRM_MAJOR}\nMINOR={_minor}\nDEVNAME=dri/{_node}\nDEVTYPE=drm_minor\n")
+        _sysfs_attr(_base, "subsystem", "../../../class/drm", 0o120777)
+        _sysfs_attr("/sys/class/drm", _node, f"../../dev/char/{DRM_MAJOR}:{_minor}", 0o120777)
         # `../../../../bus/pci`: from /sys/dev/char/<maj>:<min>/device, four
         # levels up is /sys. Only the trailing "/pci" is ever inspected.
         if os.environ.get("LEANDROS_BOARD") == "rpi5":
@@ -1136,6 +1144,32 @@ def main():
         _sysfs_attr(_dev, "revision",         f"0x{PCI_REVISION:02x}\n")
         _sysfs_attr(_dev, "class",            f"0x{PCI_CLASS:06x}\n")
         _sysfs_attr(_dev, "config",           bytes(_cfg))
+
+    # evdev nodes that always exist (servers/evdev: event0 = aggregate
+    # keyboard 13:64, event1 = virtio-tablet 13:65). Hot-plugged nodes
+    # (event2..) are NOT staged; the libudev shim learns those from
+    # /dev/input/hotplug. Capabilities mirror what the evdev server answers to
+    # EVIOCGBIT for these two fixed devices.
+    _kbd_key = " ".join(["ffffffffffffffff"] * 4)
+    for _n, _name, _prod, _caps in (
+        (0, "QEMU Virtio Keyboard", 1,
+         {"ev": "120013", "key": _kbd_key, "rel": "0", "abs": "0"}),
+        (1, "QEMU Virtio Tablet", 3,
+         {"ev": "1b", "key": "30000 0 0 0 0", "rel": "1940", "abs": "3"}),
+    ):
+        _ib = f"/sys/dev/char/13:{64 + _n}"
+        _idev = _ib + "/device"
+        for d in ("/sys/dev", "/sys/dev/char", _ib, _idev, _idev + "/capabilities", _idev + "/id"):
+            m4_share_dirs.add(d)
+        _sysfs_attr(_ib, "uevent", f"MAJOR=13\nMINOR={64 + _n}\nDEVNAME=input/event{_n}\n")
+        _sysfs_attr(_ib, "subsystem", "../../../class/input", 0o120777)
+        _sysfs_attr("/sys/class/input", f"event{_n}", f"../../dev/char/13:{64 + _n}", 0o120777)
+        _sysfs_attr(_idev, "name", _name + "\n")
+        _sysfs_attr(_idev, "uevent", f"PRODUCT=6/0/{_prod}/1\nNAME=\"{_name}\"\n")
+        for _k, _v in _caps.items():
+            _sysfs_attr(_idev + "/capabilities", _k, _v + "\n")
+        for _k, _v in (("bustype", "0006"), ("vendor", "0000"), ("product", f"{_prod:04x}"), ("version", "0001")):
+            _sysfs_attr(_idev + "/id", _k, _v + "\n")
 
     # ── M2 Venus ship set (Mesa's virtio Vulkan ICD + the vktest smoke test) ──
     # Sourced from the venus-lane stage dir directly rather than by copying into
