@@ -1404,9 +1404,10 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     }
     int rc = wait_child(c);
     if (mode == 5) {
-        usleep(500000);
+        /* netns teardown (veth/vif forget) is asynchronous; on a loaded TCG box it takes longer than 0.5 s */
+        for (int i = 0; i < 100 && !(natp > 0 && nat_bindable(natp) && nat_scan() == 0); i++) usleep(100000);
         snprintf(msg, sizeof msg, "%s: after the netns died its NAT port %d is released", name, natp);
-        CHECK(msg, natp > 0 && nat_bindable(natp));
+        { int rel = natp > 0 && nat_bindable(natp); if (!rel) nat_dump(); CHECK(msg, rel); }
         snprintf(msg, sizeof msg, "%s: no NAT port stays reserved", name); CHECK(msg, nat_scan() == 0);
         rc = 0;
     }
