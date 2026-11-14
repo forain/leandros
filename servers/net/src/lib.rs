@@ -240,7 +240,9 @@ const IPV6_V6ONLY:   usize = 26;
 const IP_TOS:        usize = 1;
 const IP_TTL:        usize = 2;
 const IP_PKTINFO:    usize = 8;
+const IP_MTU_DISCOVER: usize = 10;
 const IP_RECVERR:    usize = 11;
+const IP_MTU:        usize = 14;
 const IP_RECVTTL:    usize = 12;
 const IP_RECVTOS:    usize = 13;
 const IP_MULTICAST_IF:   usize = 32;
@@ -1306,6 +1308,8 @@ struct SockOpts {
     /// IP_TTL (0 = default, 64) and IP_TOS (recorded and read back).
     ttl:       u8,
     tos:       u8,
+    /// IP_MTU_DISCOVER + 1 (0 = never set: Linux's default, IP_PMTUDISC_WANT).
+    pmtud1:    u8,
     /// Ancillary data recvmsg adds (`RECV_*`): IP_PKTINFO, IP_RECVTOS,
     /// IP_RECVTTL, UDP_GRO; and IP_RECVERR (accepted, read back).
     recv:      u8,
@@ -1356,10 +1360,23 @@ const RECV6_ERR: u8 = 8;
 const BIND_ADDR_LOCK: u8 = 1;
 const BIND_PORT_LOCK: u8 = 2;
 
+/// The IPv4 path MTU towards `d` over stack `sid`: the link's, or what an
+/// ICMP "fragmentation needed" taught the cache, if smaller.
+fn path_mtu(sid: Sid, d: smoltcp::wire::Ipv4Address) -> u32 {
+    let link: u32 = if sid == iface::LO { 65536 } else { 1500 };
+    let now = sched::monotonic_ns() / 1_000_000;
+    match smoltcp::pmtu::lookup(u32::from_be_bytes(d.0), now) {
+        Some(m) => link.min(m as u32),
+        None => link,
+    }
+}
+
 impl SockOpts {
+    /// IP_MTU_DISCOVER as Linux reports it (default IP_PMTUDISC_WANT).
+    fn pmtud_mode(&self) -> u8 { if self.pmtud1 == 0 { 1 } else { self.pmtud1 - 1 } }
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
-                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
+                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0,
                                  recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
@@ -5762,6 +5779,13 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     meta.hop_limit = if mcast { Some(opts.mc_ttl) }
                                      else if opts.ttl != 0 { Some(opts.ttl) } else { None };
                     meta.meta.tos = opts.tos;
+                    // Path-MTU discovery (IP_MTU_DISCOVER): DONT sends without
+                    // DF; DO / PROBE refuse a datagram larger than the path.
+                    let pd = opts.pmtud_mode();
+                    if pd == 0 { meta.meta.nodf = true; }
+                    if let (IpAddress::Ipv4(d), true) = (endpoint.addr, pd >= 2) {
+                        if data.len() + 28 > path_mtu(sid, d) as usize { return err_reply(-90); } // EMSGSIZE
+                    }
                     // A copy for this host: multicast unless IP_MULTICAST_LOOP
                     // is off, broadcast always (Linux ip_mc_output). Built
                     // before the send, while the socket's port and the
@@ -7780,6 +7804,11 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
             Ok(_) => return err_reply(-22),
             Err(x) => return err_reply(x),
         },
+        IP_MTU_DISCOVER => match int_val() {
+            Ok(v) if (0..=3).contains(&v) => o.pmtud1 = v as u8 + 1,
+            Ok(_) => return err_reply(-22),
+            Err(x) => return err_reply(x),
+        },
         IP_PKTINFO | IP_RECVTTL | IP_RECVTOS | IP_RECVERR => match int_val() {
             Ok(v) => flag(&mut o, match optname {
                 IP_PKTINFO => RECV_PKTINFO, IP_RECVTTL => RECV_TTL, IP_RECVTOS => RECV_TOS, _ => RECV_ERR,
@@ -7858,6 +7887,18 @@ fn ip_getsockopt(e: &SockEntry, optname: usize) -> Option<u32> {
     Some(match optname {
         IP_TOS => o.tos as u32,
         IP_TTL => if o.ttl == 0 { 64 } else { o.ttl as u32 },
+        IP_MTU_DISCOVER => o.pmtud_mode() as u32,
+        // Connected sockets only (Linux: ENOTCONN, which this reports as ENOPROTOOPT).
+        IP_MTU => match e.state {
+            SockState::InetConnected { socket_handle, sid, .. } if is_udp_entry(e) => {
+                let peer = stack_for(sid).as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).peer());
+                match peer {
+                    Some(IpEndpoint { addr: IpAddress::Ipv4(d), .. }) => path_mtu(sid, d),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
         IP_PKTINFO => (o.recv & RECV_PKTINFO != 0) as u32,
         IP_RECVTTL => (o.recv & RECV_TTL != 0) as u32,
         IP_RECVTOS => (o.recv & RECV_TOS != 0) as u32,

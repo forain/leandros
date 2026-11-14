@@ -1337,6 +1337,7 @@ impl InterfaceInner {
                 let payload_len =
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
                 let icmpv4_reply_repr = Icmpv4Repr::DstUnreachable {
+                    mtu: 0,
                     reason: Icmpv4DstUnreachable::PortUnreachable,
                     header: ipv4_repr,
                     data: &ip_payload[0..payload_len],
@@ -1863,10 +1864,11 @@ impl InterfaceInner {
 
                         emit_ip(&ip_repr, tx_buffer);
                         // LEANDROS: IP_TOS.
-                        if meta.tos != 0 {
+                        if meta.tos != 0 || meta.nodf {
                             let mut p = Ipv4Packet::new_unchecked(&mut tx_buffer[..]);
                             p.set_dscp(meta.tos >> 2);
                             p.set_ecn(meta.tos & 3);
+                            if meta.nodf { p.set_dont_frag(false); }
                             if caps.checksum.ipv4.tx() {
                                 p.fill_checksum();
                             }
