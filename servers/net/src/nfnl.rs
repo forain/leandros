@@ -985,6 +985,8 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
             }
             b"nat" => {
                 if g(1)? != 1 { return None; }
+                // An inet-table chain mixes ip and ip6 DNAT targets: a nat expr of the other family never applies.
+                if (g(2) == Some(10)) != cx.m.v6.is_some() { return None; }
                 let port = match g(5) { Some(r) => { let p = rget(&regs, r, 2)?; u16::from_be_bytes([p[0], p[1]]) } None => 0 };
                 if g(2) == Some(10) {
                     let a = rget(&regs, g(3)?, 16)?;
