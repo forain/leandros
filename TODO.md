@@ -26,7 +26,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **smoltcp "handle does not refer to a valid socket" panic recurred** (net server, during `podman pull`, box x86_64 on lane/ip6dnat 2026-11-14) despite the smolpanic generation-handle fix (artifacts/notes/lane-smolpanic-2026-11-10.md): some path still calls a panicking SocketSet get/get_mut; not yet known whether it is on main or only in the new fwd6 code.
 - **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
 - **Podman published ports**: rootful bridge `-p` works through netavark `firewall_driver = "nftables"` (lane podnft, podbridgetest); open: filter chains only on new flows, no routed forwarding without NAT, rootful `--network=pasta` is rejected by podman itself, `--internal` is the forwarding=0 switch only.
-- **Podman published ports, first-connect latency**: root-caused (hairpin ARP request queued without `netdev::kick`, ~450 ms until the next drain); fix on lane/synlat (447 -> 0 ms, brtest gates < 100 ms), awaiting box aarch64 regress before merge.
+- **Podman published ports, NIC learn-miss parking**: NIC-side learn-miss parking needs hostfwd (L3). (First-connect latency FIXED lane synlat: the hairpin ARP request was queued without a kick and waited ~450 ms for the next net tick; now 0 ms, brtest gates < 100 ms.)
 - **Unmarked cross-network DNAT (capture g_two_nets_b) unverified**: hair() `!= Masq => return false` should DNAT and route un-NATed (src kept); needs a Ct flag + reverse match.
 - **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
