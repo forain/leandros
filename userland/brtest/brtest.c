@@ -1751,6 +1751,62 @@ static void stale_stack(void) {
     close(s);
 }
 
+/* Race: a child keeps driving TCP/UDP/ICMP sockets that sit on a veth stack while the
+ * parent deletes and recreates the pair (stack freed, slot reused) many times. The
+ * per-op heal_stale check is racy against the reap; the net server must never panic
+ * ("handle does not refer to a valid socket"), only answer errors. */
+static void stale_race(void) {
+    int s = nl_sock();
+    int ok_rounds = 0;
+    for (int round = 0; round < 60; round++) {
+        pid_t c = spawn_ns(idle_body);
+        int nsfd = netns_fd_of(c);
+        int e = veth_new(s, "vethR", "eth0", nsfd);
+        close(nsfd);
+        int iz = link_get(s, "vethR", NULL, NULL);
+        if (e != 0 || iz <= 0) { kill(c, SIGKILL); wait_child(c); continue; }
+        addr_add(s, iz, "10.99.8.1", 24); link_set_up(s, iz);
+        pid_t hs[3];
+        for (int d = 0; d < 3; d++) {
+            hs[d] = fork();
+            if (hs[d] != 0) continue;
+            struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
+            inet_pton(AF_INET, "10.99.8.2", &to.sin_addr);
+            char b[64];
+            for (int k = 0; k < 600; k++) {
+                int t = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+                int u = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+                int i = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_ICMP);
+                connect(t, (struct sockaddr *)&to, sizeof to);
+                connect(u, (struct sockaddr *)&to, sizeof to);
+                connect(i, (struct sockaddr *)&to, sizeof to);
+                for (int j = 0; j < 8; j++) {
+                    struct pollfd p[3] = { { t, POLLIN | POLLOUT, 0 }, { u, POLLIN | POLLOUT, 0 }, { i, POLLIN | POLLOUT, 0 } };
+                    poll(p, 3, 0);
+                    send(t, "x", 1, MSG_NOSIGNAL); send(u, "x", 1, MSG_NOSIGNAL); send(i, b, 8, MSG_NOSIGNAL);
+                    recv(t, b, sizeof b, 0); recv(u, b, sizeof b, 0); recv(i, b, sizeof b, 0);
+                    int se; socklen_t sl = sizeof se;
+                    getsockopt(t, SOL_SOCKET, SO_ERROR, &se, &sl);
+                    struct sockaddr_in a; socklen_t al = sizeof a;
+                    getsockname(t, (struct sockaddr *)&a, &al); getpeername(u, (struct sockaddr *)&a, &al);
+                }
+                close(t); close(u); close(i);
+            }
+            _exit(0);
+        }
+        usleep(1000 + (round * 937) % 15000);
+        link_del(s, iz);
+        veth_new(s, "vethRa", "vethRb", -1);
+        for (int d = 0; d < 3; d++) wait_child(hs[d]);
+        { int ia = link_get(s, "vethRa", NULL, NULL); if (ia > 0) link_del(s, ia); }
+        kill(c, SIGKILL); wait_child(c);
+        ok_rounds++;
+    }
+    CHECK("stale_race: 60 reap rounds, drivers finished", ok_rounds >= 45);
+    CHECK("stale_race: net server alive", link_get(s, "lo", NULL, NULL) > 0);
+    close(s);
+}
+
 int main(int argc, char **argv) {
     const char *only = NULL;
     for (int i = 1; i < argc; i++) {
@@ -1791,6 +1847,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
     if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
     if (!only || !strcmp(only, "stale_stack")) stale_stack();
+    if (!only || !strcmp(only, "stale_race")) stale_race();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
