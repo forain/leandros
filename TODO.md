@@ -11,9 +11,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
 - **Flakes to root-cause**: `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
-- **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
-- **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
-- **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
 
 ### Podman / namespaces / cgroups
 - **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
@@ -23,11 +20,9 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **UDP/IP gaps**: no PMTUD (IP_MTU_DISCOVER/IP_MTU, DF on Frag-Needed), no IGMPv3/SSM. (IP fragmentation/reassembly works: udptest `udp_huge` + peer_frag_echo guard it.)
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **smoltcp "handle does not refer to a valid socket" panic recurred** (net server, during `podman pull`, box x86_64 on lane/ip6dnat 2026-11-14) despite the smolpanic generation-handle fix (artifacts/notes/lane-smolpanic-2026-11-10.md): some path still calls a panicking SocketSet get/get_mut; not yet known whether it is on main or only in the new fwd6 code.
-- **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
 - **Podman published ports**: rootful bridge `-p` works through netavark `firewall_driver = "nftables"` (lane podnft, podbridgetest); open: filter chains only on new flows, no routed forwarding without NAT, rootful `--network=pasta` is rejected by podman itself, `--internal` is the forwarding=0 switch only.
 - **Podman published ports, NIC learn-miss parking**: NIC-side learn-miss parking needs hostfwd (L3). (First-connect latency FIXED lane synlat: the hairpin ARP request was queued without a kick and waited ~450 ms for the next net tick; now 0 ms, brtest gates < 100 ms.)
 - **Unmarked cross-network DNAT (capture g_two_nets_b) unverified**: hair() `!= Masq => return false` should DNAT and route un-NATed (src kept); needs a Ct flag + reverse match.
-- **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
 ### Desktop / GPU / COSMIC
 - **Venus/Vulkan**: cross-open dmabuf import LANDED (51d92486, venustest phase 5b 11/11 on x86_64 KVM + aarch64 TCG, box 2026-11-13), aarch64 vkwl measured 2026-08-07 (`artifacts/notes/m9-vkwl-aarch64/`); Mac QEMU has no virtio-gpu-gl so Venus is box-only; venustest `virtgpu_wait_nowait_busy_after_kick` + `phase7_fence_fd_unsignalled_at_return` are SKIP (not fail) on aarch64 TCG: NOWAIT never sees a pending fence even behind a 64-submission burst, i.e. fence retires before the ioctl chain returns (measured box 2026-11-13, lane/venuswait; an in-fence cannot make it pending, it only blocks the kick); x86 KVM still asserts them; Venus submit still synchronous (parks on fence IRQ, no async completion).
@@ -36,11 +31,9 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Minimize applet un-hide unverified** (needs a live session with an open window; applet is a 1x1 hidden surface with zero toplevels by upstream design). `cosmic-files-applet` smithay-clipboard OOM panic: no root cause, needs an in-guest repro with RUST_BACKTRACE (triage 2026-11-13: not reproduced, no runtime log kept). `cosmic-notifications` panel-dbus Broken pipe: the p2p zbus socketpair made in `NotificationsSocket::get_fd` (src/subscriptions/applet.rs) breaks when the applet end closes (applet restart / panel respawn); likely benign upstream behaviour, unverified. Greeter's cosmic-comp logs `eglMakeCurrent BadDisplay` on exit (cosmetic, teardown order).
 - **Panel-embedded applets render with tiny-skia** (root cause: cosmic-panel creates zwp_linux_dmabuf_v1 only if its GLES renderer exists at bind_display(); ours comes ~0.3 s later; measured 2026-11-13 aarch64: comp->panel start 0.42 s, no kernel DRM step visible in that window (handoff/klogms.md); needs a cosmic-panel source change, out of bounds - not a kernel bug); aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp. (`EVIOCGRAB` exclusivity, `EVIOCREVOKE` and the Ctrl+Alt+Esc escape hatch are implemented and covered by `vttest`; see artifacts/notes/lane-evdevvt-2026-11-13.md.)
-- **One permanent COSMIC patch** (`ports/cosmic-comp/0001-toplevel-info-weak-window.patch`) until upstream has an equivalent (checked 2026-11-13: pop-os/cosmic-comp#2084 and Smithay#1562 still OPEN, PR #2095 closed unmerged - patch stays).
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
-- **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
 
 ### Build / tooling
 - **build-all silently reuses stale container-built ports when Docker is not running** (PipeWire shipped an old sink, lane smallfix 2026-11-11); same class as the buildguard guards: should fail loudly.
@@ -68,7 +61,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **A permanent Vulkan-Wayland test** (needs a dynamic-musl build shape).
 - **VRR** (`VRR_ENABLED` DRM property).
 - **Mesa v3d / Pi 5 acceleration** wiring (`GET_PARAM`+`CREATE_BO` first; single-device design).
-- **XWayland, accountsservice, hotplug, multi-seat** are explicitly out of scope.
 
 ### Firefox
 - **Firefox on the laptop iris GPU**; x86 KVM audio verification (?).
@@ -82,3 +74,14 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - /proc/mounts doesn't print ro for ns-0 mounts; ns-0 dirfd flags recorded at open go stale after a later remount
+
+## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
+
+- **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
+- **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
+- **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
+- **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
+- **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
+- **One permanent COSMIC patch** (`ports/cosmic-comp/0001-toplevel-info-weak-window.patch`) until upstream has an equivalent (checked 2026-11-13: pop-os/cosmic-comp#2084 and Smithay#1562 still OPEN, PR #2095 closed unmerged - patch stays).
+- **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
+- **XWayland, accountsservice, hotplug, multi-seat** are explicitly out of scope.
