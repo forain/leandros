@@ -1355,11 +1355,16 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     char ch = 'g'; write(cc[1], &ch, 1);
     int rd = rd_to(dd[0], &ch);
     snprintf(msg, sizeof msg, "%s: netns configured eth0 + default via 10.97.0.1", name); CHECK(msg, rd == 1);
-    if (rd == 1) write(cc[1], &ch, 1); /* go */
-    int natp = 0;
+    /* The precondition must be sampled BEFORE "go": once the child is released its own resolver flow
+     * can be established before the parent looks (seen on slow TCG: the only entry was the case's own
+     * 10.97.0.2 -> resolver flow, age 0), which is not a leak. */
     if (mode >= 4 && mode != 6) {
         snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
         { int held = nat_scan(); if (held) nat_dump(); CHECK(msg, held == 0); }
+    }
+    if (rd == 1) write(cc[1], &ch, 1); /* go */
+    int natp = 0;
+    if (mode >= 4 && mode != 6) {
         rd = rd_to(dd[0], &ch);
         snprintf(msg, sizeof msg, "%s: TCP flow to the resolver established through NAT", name); CHECK(msg, rd == 1);
         natp = nat_scan();
