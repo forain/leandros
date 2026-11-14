@@ -136,7 +136,10 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
     // Anti-spoof: a global source inside one of the bridge's prefixes, never the bridge itself.
     if !addrs.iter().any(|&(a, p)| a[0] != 0xfe && a != src && prefix_match(&a, &src, p)) { return None; }
     let Some(p) = parse(&mut f, false) else { return None };
-    if f[21] <= 1 { return None; }
+    if f[21] <= 1 {
+        if let Some(&(ba, _)) = addrs.iter().find(|&&(a, pl)| a[0] != 0xfe && a != src && prefix_match(&a, &src, pl)) { time_exceeded(br, port, bmac, ba, &f); }
+        return None;
+    }
     let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { return None };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return None };
     let now = sched::monotonic_ns();
@@ -259,6 +262,7 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
             drivers::netdev::kick();
             return false;
         }
+        if (1..=4).contains(&ty) { return icmp6_err_rx(nic, buf); }
         if ty != 129 { return false; }
     } else if buf[20] != PROTO_TCP && buf[20] != PROTO_UDP { return false; }
     let mut st = FWD.lock();
@@ -465,6 +469,61 @@ fn hair6(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &P6) -> bool {
     }
     finish(f, p);
     if st.inq.len() < 256 { st.inq.push_back((dbr, dsid, core::mem::take(f))); fwd::INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+    true
+}
+
+// ---- ICMPv6 errors for forwarded flows (design-ipv6 L9 phase 2, B) ----------------------
+
+/// Hop limit exhausted on `f` (the container's packet): Time Exceeded back to it from the bridge address `ba`.
+fn time_exceeded(br: Sid, port: Sid, bmac: [u8; 6], ba: [u8; 16], f: &[u8]) {
+    let inv = &f[14..f.len().min(14 + 1232)];
+    let mut r = alloc::vec![0u8; 14 + 40 + 8 + inv.len()];
+    r[0..6].copy_from_slice(&f[6..12]);
+    r[6..12].copy_from_slice(&bmac);
+    r[12] = 0x86; r[13] = 0xdd;
+    r[14] = 0x60;
+    r[18..20].copy_from_slice(&((8 + inv.len()) as u16).to_be_bytes());
+    r[20] = PROTO_ICMP6; r[21] = 64;
+    r[22..38].copy_from_slice(&ba);
+    r[38..54].copy_from_slice(&f[22..38]);
+    r[54] = 3;
+    r[62..].copy_from_slice(inv);
+    let n = 8 + inv.len();
+    csum6(&mut r, PROTO_ICMP6, n);
+    let mut st = FWD.lock();
+    if st.inq.len() < 256 { st.inq.push_back((br, port, r)); fwd::INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+}
+
+/// An ICMPv6 error (1 unreachable, 2 too big, 3 time exceeded, 4 parameter) from the NIC about a forwarded flow:
+/// the embedded packet is rewritten back to the container's addresses and the error handed to the bridge.
+fn icmp6_err_rx(nic: u8, buf: &[u8]) -> bool {
+    if buf.len() < 54 + 8 + 40 + 8 { return false; }
+    let ip = 62;
+    let proto = buf[ip + 6];
+    if proto != PROTO_TCP && proto != PROTO_UDP { return false; }
+    let isrc: [u8; 16] = buf[ip + 8..ip + 24].try_into().unwrap();
+    let idst: [u8; 16] = buf[ip + 24..ip + 40].try_into().unwrap();
+    let isp = u16::from_be_bytes([buf[ip + 40], buf[ip + 41]]);
+    let idp = u16::from_be_bytes([buf[ip + 42], buf[ip + 43]]);
+    let mut st = FWD.lock();
+    let Some(e) = st.ct6.iter().find(|e| e.kind == 0 && e.nic == nic && e.proto == proto && e.nicip == isrc && e.nat == isp
+        && e.rip == idst && e.rport == idp && buf[38..54] == e.nicip) else { return false };
+    let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
+    let mut f = buf.to_vec();
+    let plen = u16::from_be_bytes([f[18], f[19]]) as usize;
+    if 54 + plen > f.len() || plen < 8 + 40 + 8 { return false; }
+    f.truncate(54 + plen);
+    f[38..54].copy_from_slice(&cip);
+    f[ip + 8..ip + 24].copy_from_slice(&cip);
+    f[ip + 40..ip + 42].copy_from_slice(&cport.to_be_bytes());
+    csum6(&mut f, PROTO_ICMP6, plen);
+    f[0..6].copy_from_slice(&cmac);
+    f[6..12].copy_from_slice(&bmac);
+    if st.inq.len() < 256 { st.inq.push_back((br, port, f)); fwd::INQ_N.fetch_add(1, Ordering::Relaxed); }
     drop(st);
     drivers::netdev::kick();
     true
