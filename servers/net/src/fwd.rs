@@ -118,6 +118,18 @@ pub(crate) fn live_tcp_nat_ports(out: &mut alloc::vec::Vec<u16>) {
     }
 }
 
+/// One line per live TCP entry (diagnostics for failing tests): nat port, flow, kind, FSM state, age, ttl, bridge/port ids.
+pub(crate) fn dump_tcp_ct(w: &mut dyn core::fmt::Write) {
+    let now = sched::monotonic_ns();
+    for e in FWD.lock().ct.iter() {
+        if e.proto == PROTO_TCP && now.saturating_sub(e.last) < ct_ttl(e) {
+            let _ = writeln!(w, "fwd_nat_ent: nat {} {}.{}.{}.{}:{}->{}.{}.{}.{}:{} kind {} tst {} fins {} age_ms {} ttl_ms {} br {} port {}",
+                e.nat, e.cip[0], e.cip[1], e.cip[2], e.cip[3], e.cport, e.rip[0], e.rip[1], e.rip[2], e.rip[3], e.rport,
+                e.kind, e.tst, e.fins, now.saturating_sub(e.last) / 1_000_000, ct_ttl(e) / 1_000_000, e.br, e.port);
+        }
+    }
+}
+
 /// Number of live conntrack entries (diagnostics).
 pub(crate) fn ct_len() -> usize { let mut g = FWD.lock(); let now = sched::monotonic_ns(); sweep(&mut g, now); g.ct.len() + g.ct6.len() }
 

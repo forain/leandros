@@ -1210,6 +1210,15 @@ static int nat_scan(void) {
     fclose(f);
     return port;
 }
+/* Failure diagnostic: print the kernel's live TCP NAT entries (fwd_nat_ent lines of /proc/net/nic). */
+static void nat_dump(void) {
+    FILE *f = fopen("/proc/net/nic", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "fwd_nat_ent:", 12) || !strncmp(line, "fwd:", 4)) printf("DIAG %s", line);
+    fclose(f);
+}
 /* A host bind() to `p` must fail with EADDRINUSE. */
 static int nat_inuse(int p) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1350,7 +1359,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     int natp = 0;
     if (mode >= 4 && mode != 6) {
         snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
-        CHECK(msg, nat_scan() == 0);
+        { int held = nat_scan(); if (held) nat_dump(); CHECK(msg, held == 0); }
         rd = rd_to(dd[0], &ch);
         snprintf(msg, sizeof msg, "%s: TCP flow to the resolver established through NAT", name); CHECK(msg, rd == 1);
         natp = nat_scan();
