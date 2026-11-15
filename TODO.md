@@ -62,7 +62,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Sandbox follow-ups**: secirq, zaplog, credxlate residuals (`lane-secirq/zaplog/credxlate-2026-11-09.md`).
 
 ### Cloud
-- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (image boots in QEMU as an NVMe-only UEFI disk, `--dry-run` tested; docs/hardware/aws-ec2.md). Still needed: an ENA (Elastic Network Adapter) network driver, EBS NVMe quirks (no legacy INTx: MSI-X), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
+- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (docs/hardware/aws-ec2.md), L2 Amazon EBS NVMe quirks / by-id links / auto-writable root / 300 s stall cap (QEMU-verified by the `nvmeebs` suite; real EBS verification still open: QEMU cannot set the EBS model string). Still needed: an ENA (Elastic Network Adapter) network driver, NVMe MSI-X (optional, driver polls), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
 
 ### Installer
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
