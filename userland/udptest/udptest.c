@@ -58,6 +58,7 @@
  *   tcp_pmtud_clamp     frag-needed shrinks TCP's segment size (TCP_INFO snd_mss/pmtu)
  *   udp6_pmtud          IPV6_MTU_DISCOVER / IPV6_MTU, ICMPv6 packet-too-big, EMSGSIZE
  *   udp_pmtud           IP_MTU_DISCOVER / IP_MTU, frag-needed shrinks the path, DO sends past it are EMSGSIZE
+ *   udp6_recverr_*      IPV6_RECVERR: ICMPv6 dest-unreachable/time-exceeded entries (Linux icmpv6_err_convert)
  *   udp_recverr_*       IP_RECVERR: MSG_ERRQUEUE sock_extended_err cmsg (ICMP port unreachable, frag-needed MTU, local EMSGSIZE), POLLERR
  *   udp_huge            4000-, 60000- and 65507-byte datagrams round-trip over loopback; 65508 is EMSGSIZE
  *   udp_large           an 8000-byte datagram over loopback arrives whole
@@ -1088,6 +1089,8 @@ int main(int argc, char **argv) {
     udp6_pmtud();
     udp_recverr_refused();
     udp_recverr_emsgsize();
+    udp6_recverr_dstunreach();
+    udp6_icmp6_refused_plain();
     udp_gso();
     udp_mmsg();
     udp_dup();
