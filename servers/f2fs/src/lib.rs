@@ -3254,6 +3254,25 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
 
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
+/// lxchain (M2/L3): is `seg` the chain segment S or a filler head of the
+/// durable or the prepared checkpoint (warm/cold data, warm/cold node)? Such a
+/// segment must stay empty and unallocated while a Linux mount of that
+/// checkpoint may read its curseg. Always false with the knob off.
+pub(crate) fn lx_reserved(ms: &MountState, seg: u32) -> bool {
+    if !durable::lx_enabled() { return false; }
+    [1usize, 2, 4, 5].iter().any(|&t| ms.dur.lx_heads[t].0 == seg || ms.cp.logs[t].0 == seg)
+        || ms.dur.lx_seg == seg
+}
+
+/// `lx_reserved` as seen by filler head `t` of the next checkpoint: its own
+/// previous segment (and S for t = 4) may be kept, everything another head
+/// holds may not be taken.
+fn lx_reserved_but(ms: &MountState, seg: u32, t: usize) -> bool {
+    if !durable::lx_enabled() { return false; }
+    [1usize, 2, 4, 5].iter().any(|&u| u != t && (ms.dur.lx_heads[u].0 == seg || ms.cp.logs[u].0 == seg))
+        || (t != 4 && ms.dur.lx_seg == seg)
+}
+
 fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32> {
     // Bound the scan by the real main-area segment count, not a hardcoded
     // 1024: on a volume with fewer segments the modulo wrapped onto segments
@@ -3268,6 +3287,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
         if pass == 0 && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if lx_reserved(ms, seg) { continue; }
         // Never hand back a segment one of the logs is *currently* writing
         // into. Before reclaim existed this could not happen — vblocks only
         // ever grew — but once a segment can drop back to zero valid blocks
@@ -3704,7 +3724,7 @@ fn lx_ovp_segs(ms: &MountState) -> u32 {
 fn lx_empty_segs(ms: &mut MountState, limit: u32) -> u32 {
     let mut n = 0;
     for seg in 0..ms.sb.seg_cnt_main {
-        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) || lx_reserved(ms, seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 {
             n += 1;
@@ -4085,6 +4105,7 @@ fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
         if !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if lx_reserved(ms, seg) { continue; }
         // A data block in a node segment (or the reverse) is something
         // fsck.f2fs cannot repair: reuse only a segment of the same class.
         let (blkno, off) = sit_entry_loc(ms, seg);
@@ -4313,7 +4334,8 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, logs: &LinuxLogs)
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
     // Linux's log heads in the standard fields, this kernel's in CP_OWN_HEADS.
     linux_cp_fields(ms, &mut buf, logs);
-    ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 };
+    ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 }
+        | if durable::lx_enabled() { cpflags::CP_CRC_RECOVERY_FLAG } else { 0 };
     w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
     (cp_blkno as u64, buf)
 }
@@ -4362,7 +4384,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
         let (seg, off) = ms.cp.logs[t];
         if seg < main && off == 0 && !logs.iter().any(|l| l.0 == seg)
             && seg != ms.cp.cur_data_segno && seg != ms.cp.cur_node_segno
-            && !avoid.contains(&seg) && !prot_any(ms, seg) {
+            && !avoid.contains(&seg) && !prot_any(ms, seg) && !lx_reserved_but(ms, seg, t) {
             let (blkno, o) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), o) & SIT_VBLOCKS_MASK == 0 {
                 logs[t] = (seg, 0);
@@ -4378,6 +4400,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             // segment the durable checkpoint still points into: the
             // allocator may be moved there (below).
             if avoid.contains(&seg) || prot_any(ms, seg) { continue; }
+            if lx_reserved_but(ms, seg, t) { continue; }
             let (blkno, off) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { pick = Some(seg); break; }
         }
@@ -4393,7 +4416,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
                 Some(h) => { ssr[t] = true; h }
                 // Nothing valid exists: at least not a segment another head has.
                 None => ((0..main).find(|&g| !logs.iter().any(|l| l.0 == g)
-                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno).unwrap_or(t as u32), 0),
+                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno && !lx_reserved_but(ms, g, t)).unwrap_or(t as u32), 0),
             },
         };
         logs[t] = (seg, off);
@@ -4429,7 +4452,7 @@ fn lx_ssr_head(ms: &mut MountState, logs: &LinuxLogs, t: usize, avoid: &[u32]) -
     for pass in 0..3 {
         for seg in 0..ms.sb.seg_cnt_main {
             if logs.iter().any(|l| l.0 == seg) || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno
-                || avoid.contains(&seg) { continue; }
+                || avoid.contains(&seg) || lx_reserved_but(ms, seg, t) { continue; }
             let (blkno, o) = sit_entry_loc(ms, seg);
             let v = r16(ms.cache.read(ms.dev, blkno), o);
             let ok = match pass {
@@ -9526,7 +9549,13 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
             dbg_dec(reaped);
             dbg_str("\n");
         }
-        if (recovered > 0 || reaped > 0 || foreign) && !ms.read_only { write_checkpoint(ms, false); }
+        // lxchain (H1/B): with the knob on, or after a CP that carries the
+        // chain flag, commit a non-umount CP before accepting writes, so a
+        // stale chain stamped against the old CP is dead and the first fsync
+        // of the session can chain. A failed commit leaves `lx_open` false.
+        let lx_mount_cp = durable::lx_enabled()
+            || (!foreign && ms.cp.flags & cpflags::CP_CRC_RECOVERY_FLAG != 0);
+        if (recovered > 0 || reaped > 0 || foreign || lx_mount_cp) && !ms.read_only { write_checkpoint(ms, false); }
         ms.dur.ext_free = durable::count_ext_free(ms);
     }
 
@@ -9672,6 +9701,8 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == port {
+                // lxchain: a remount ro->rw commits nothing; the newest CP is
+                // this umount CP, so `settle` never opened a chain era (B).
                 if ro && !ms.read_only {
                     write_checkpoint(ms, true);
                     ms.read_only = true;

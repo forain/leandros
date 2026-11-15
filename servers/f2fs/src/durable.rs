@@ -211,6 +211,27 @@ pub(crate) fn rf_enabled() -> bool {
     }
 }
 
+/// `f2fs.lxchain=1` (default OFF; lane f2fsnlog1): roll-forward fsync also
+/// writes a Linux warm-node chain, so a Linux mount replays it. Needs `rf`.
+pub(crate) fn lx_enabled() -> bool {
+    static S: atomic::AtomicU8 = atomic::AtomicU8::new(0);
+    match S.load(atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = rf_enabled() && drivers::nvidia_probe::cmdline_opt("f2fs.lxchain") == Some(1);
+            S.store(if on { 1 } else { 2 }, atomic::Ordering::Relaxed);
+            if on { dbg_str("[F2FS] f2fs.lxchain=1: fsync also writes the Linux warm-node chain\n"); }
+            on
+        }
+    }
+}
+pub(crate) static LX_CHAINED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+pub(crate) static LX_FALLBACK: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+pub(crate) static LX_NODES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+/// Checkpoints committed since boot (never reset, unlike `CP_COUNT`).
+pub(crate) static CP_TOTAL: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
 /// `f2fs.crashpt=N` (crash-consistency test only): on the volume mounted
 /// under /mnt, every device write after the N-th block is dropped, as if the
 /// power failed there, and reported as failed (so is every flush), so no
@@ -423,6 +444,30 @@ pub(crate) struct Durable {
     /// never allocates (capacity `2 * cache.cap`; never grown).
     pub emerg_a: Vec<u32>,
     pub emerg_b: Vec<u32>,
+    // ── Linux warm-node fsync chain (lane f2fsnlog1, knob `f2fs.lxchain`) ──
+    // The `lx_*` fields are read and written only under CP_MUTEX or the
+    // mount-time lock, and changed only in `settle` (committed branch),
+    // `fsync_rf` and the two closers (`cp_finish`, `cp_emergency_in` after
+    // `settle`). Nothing else may touch them (invariant M1).
+    /// Log heads of the checkpoint in flight, and whether it is an umount CP.
+    pub inflight_logs: crate::LinuxLogs,
+    pub inflight_umount: bool,
+    /// The durable checkpoint's six heads (`[(MAX,0);6]` until a commit).
+    pub lx_heads: crate::LinuxLogs,
+    /// The chain segment S (warm node head of the durable CP); u32::MAX: none.
+    pub lx_seg: u32,
+    /// cp_ver | head-commit CRC << 32: the stamp every chain footer carries.
+    pub lx_stamp: u64,
+    /// Next free block of S.
+    pub lx_next: u32,
+    /// The era is open: chained fsyncs allowed.
+    pub lx_open: bool,
+    /// A flush already separates the era's data from its first chain block.
+    pub lx_flushed: bool,
+    /// Inos whose node was freed this era (pending) / before the snapshot of
+    /// the checkpoint in flight (M4).
+    pub lx_freed_pending: BTreeSet<u32>,
+    pub lx_freed_inflight: Vec<u32>,
 }
 
 impl Durable {
@@ -434,6 +479,9 @@ impl Durable {
             durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, commit_unknown: false, rf_start: 0, rf_seq: 0,
             ns: BTreeMap::new(), rf_last: BTreeMap::new(),
             ext_free: 0, emerg_a: Vec::new(), emerg_b: Vec::new(),
+            inflight_logs: [(u32::MAX, 0); 6], inflight_umount: false, lx_heads: [(u32::MAX, 0); 6], lx_seg: u32::MAX,
+            lx_stamp: 0, lx_next: 0, lx_open: false, lx_flushed: false,
+            lx_freed_pending: BTreeSet::new(), lx_freed_inflight: Vec::new(),
         }
     }
 }
@@ -446,6 +494,22 @@ pub(crate) static RF_FALLBACK: atomic::AtomicU32 = atomic::AtomicU32::new(0);
 
 fn committed_slot(port: u32) -> Option<&'static atomic::AtomicU64> {
     CP_SEQ.iter().position(|s| s.port.load(atomic::Ordering::Acquire) == port).map(|i| &COMMITTED[i])
+}
+
+/// Per mount slot: `(ver as u32) << 32 | head-commit-block CRC` of the newest
+/// commit sent (stored before `COMMITTED`, so `settle` can stamp the chain).
+static COMMITTED_LX: [atomic::AtomicU64; MAX_MOUNTS] = [const { atomic::AtomicU64::new(0) }; MAX_MOUNTS];
+
+fn committed_lx_set(port: u32, ver: u64, cp_buf: &[u8; BLOCK_SIZE], big: bool) {
+    if !lx_enabled() { return; }
+    if let Some(i) = CP_SEQ.iter().position(|s| s.port.load(atomic::Ordering::Acquire) == port) {
+        let crc = crate::lxchain::head_crc(cp_buf, big) as u64;
+        COMMITTED_LX[i].store(((ver as u32 as u64) << 32) | crc, atomic::Ordering::SeqCst);
+    }
+}
+fn committed_lx_get(port: u32) -> u64 {
+    CP_SEQ.iter().position(|s| s.port.load(atomic::Ordering::Acquire) == port)
+        .map_or(0, |i| COMMITTED_LX[i].load(atomic::Ordering::SeqCst))
 }
 
 pub(crate) fn committed_init(slot: usize, ver: u64) { COMMITTED[slot].store(ver, atomic::Ordering::SeqCst); }
@@ -621,6 +685,28 @@ pub(crate) struct CpJob {
     pub reg_blocks: [u32; REGS],
 }
 
+/// The committed branch of `settle`: open (or keep closed) the Linux chain era
+/// that starts with checkpoint `v` (invariants I2, I10, B).
+fn lx_open_era(ms: &mut MountState, v: u64) {
+    ms.dur.lx_heads = ms.dur.inflight_logs;
+    ms.dur.lx_next = 0;
+    ms.dur.lx_flushed = false;
+    ms.dur.lx_freed_inflight.clear();
+    ms.dur.lx_open = false;
+    ms.dur.lx_seg = u32::MAX;
+    if !lx_enabled() || ms.dur.inflight_umount { return; }
+    let tag = committed_lx_get(ms.port);
+    if (tag >> 32) as u32 != v as u32 { return; }
+    let (seg, off) = ms.dur.inflight_logs[4];
+    if seg >= ms.sb.seg_cnt_main || off != 0 || ms.sb.seg_cnt_sit < 2 { return; }
+    let (blkno, o) = sit_entry_loc(ms, seg);
+    if r16(ms.cache.read(ms.dev, blkno), o) & SIT_VBLOCKS_MASK != 0 { return; }
+    if ms.cache.poisoned() { return; }
+    ms.dur.lx_seg = seg;
+    ms.dur.lx_stamp = v | (tag << 32);
+    ms.dur.lx_open = true;
+}
+
 /// Resolve the checkpoint prepared last: committed (its frees, fresh
 /// blocks and ids are durable; its pack is the durable one and its spare
 /// blocks the roll-forward area) or failed (everything goes back to
@@ -643,6 +729,8 @@ pub(crate) fn settle(ms: &mut MountState) {
         ms.dur.rf_seq = 0;
         ms.dur.rf_last.clear();
         ms.dur.commit_unknown = false;
+        CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
+        lx_open_era(ms, v);
         let done = cp_seq(ms.port).map_or(0, |s| s.done.load(atomic::Ordering::SeqCst));
         ms.dur.ns.retain(|_, e| e.0 > done);
         ms.dur.ext_free = count_ext_free(ms);
@@ -656,6 +744,11 @@ pub(crate) fn settle(ms: &mut MountState) {
         prot_committed(ms, false);
         let ids = core::mem::take(&mut ms.dur.nid_inflight);
         ms.dur.nid_pending.extend(ids);
+        let fr = core::mem::take(&mut ms.dur.lx_freed_inflight);
+        ms.dur.lx_freed_pending.extend(fr);
+        // The old era's S stays reserved (`lx_heads`/`lx_seg` unchanged): the
+        // old checkpoint may still be the durable one.
+        if ms.dur.commit_unknown { ms.dur.lx_open = false; }
         // The fresh blocks of the failed snapshot are still fresh.
         let f = core::mem::take(&mut ms.dur.fresh_inflight);
         for (seg, m) in f {
@@ -674,7 +767,7 @@ pub(crate) fn count_ext_free(ms: &mut MountState) -> u32 {
     let mut seg = ms.sb.seg_cnt_main;
     while (cnt as usize) < CPJ_EXT_MAX && seg > 0 {
         seg -= 1;
-        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) || crate::lx_reserved(ms, seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { cnt += 1; }
     }
@@ -689,7 +782,7 @@ fn pick_ext(ms: &mut MountState, out: &mut [u32; CPJ_EXT_MAX], n: usize) -> bool
     while cnt < n && seg > 0 {
         seg -= 1;
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
-        if ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if ms.cp.logs.iter().any(|l| l.0 == seg) || crate::lx_reserved(ms, seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         let vb = r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK;
         if vb == 0 { out[cnt] = seg; cnt += 1; }
@@ -815,6 +908,10 @@ pub(crate) fn cp_prepare(ms: &mut MountState, umount: bool, with_wb: bool) -> Re
     ms.dur.inflight_ver = ms.cp.ver;
     ms.dur.inflight_pack = pack;
     ms.dur.inflight_rf_start = rf_start;
+    ms.dur.inflight_logs = logs;
+    ms.dur.inflight_umount = umount;
+    let fr = core::mem::take(&mut ms.dur.lx_freed_pending);
+    ms.dur.lx_freed_inflight.extend(fr);
     let ext = ext_segs.iter().map(|&s| ms.sb.main_blkaddr as u64 + s as u64 * ms.sb.blocks_per_seg as u64).collect();
     let zero_tail = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
     let tail_sums = crate::lx_tail_sums(ms, &logs, umount);
@@ -905,6 +1002,7 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     if cpunk_hit(dev) { io.ok = false; }
     io.flush_ns += sched::monotonic_ns().saturating_sub(tf);
     if !io.ok { io.home_ok = false; return io; }
+    committed_lx_set(port, job.ver, &job.cp_buf, job.big);
     if let Some(c) = committed_slot(port) { c.fetch_max(job.ver, atomic::Ordering::SeqCst); }
     // Home writes, adjacent homes merged (the images are in home order).
     let mut q = 0;
@@ -953,6 +1051,7 @@ pub(crate) fn cp_finish(ms: &mut MountState, job: &CpJob, io: &CpIo) {
     if !io.ok { ms.dirty_writes = ms.dirty_writes.max(1); }
     if io.commit_sent && !io.ok { ms.dur.commit_unknown = true; ms.dur.rf_end = 0; }
     settle(ms);
+    if !io.ok || !io.home_ok { ms.dur.lx_open = false; }
 }
 
 // ── Mount: journal replay ────────────────────────────────────────────────────
@@ -1612,6 +1711,10 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     ms.dur.inflight_ver = ver;
     ms.dur.inflight_pack = pack;
     ms.dur.inflight_rf_start = rf_start;
+    ms.dur.inflight_logs = logs;
+    ms.dur.inflight_umount = umount;
+    let fr = core::mem::take(&mut ms.dur.lx_freed_pending);
+    ms.dur.lx_freed_inflight.extend(fr);
     let pbase = pack_base(ms, pack);
     // Phase 1: direct blocks, then the journal (index blocks, then images).
     let mut ok = true;
@@ -1658,6 +1761,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         if cpunk_hit(dev) { ok = false; }
     }
     if ok {
+        committed_lx_set(ms.port, ver, &cp_buf, ms.sb.big_cp());
         if let Some(c) = committed_slot(ms.port) { c.fetch_max(ver, atomic::Ordering::SeqCst); }
         // Direct blocks are on the medium: clean. Journaled blocks go home.
         for &i in a.iter() { ms.cache.set_flags(i as usize, false, false); }
@@ -1671,5 +1775,6 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
     // Same rule as `cp_finish`: a commit block sent whose outcome is unknown.
     if sent && !ok { ms.dur.commit_unknown = true; ms.dur.rf_end = 0; }
     settle(ms);
+    if !ok { ms.dur.lx_open = false; }
     ok
 }
