@@ -191,6 +191,12 @@ def utmp(ssh, user, pw):
     who = [l.split() for l in out.replace("\r", "").splitlines() if l.strip()]
     step("utmp_who_ssh", any(w[0] == user and w[1].startswith("pts/") for w in who),
          f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    # Native readers (lane utmpread): w / users inside a pty session list it.
+    rc, out, err = ssh.run(user, "/bin/w; /bin/users", password=pw, extra=("-tt",))
+    o = out.replace("\r", "")
+    step("utmp_w_users_ssh", rc == 0 and "load average:" in o and "LOGIN@" in o
+         and any(l.split()[:2] and l.split()[0] == user and l.split()[1].startswith("pts/") for l in o.splitlines())
+         and o.strip().splitlines()[-1].split().count(user) >= 1, f"rc={rc} out={o.strip()[-400:]!r}")
     step("utmp_who_console_login", any(w[0] == "root" and (w[1].startswith("tty") or w[1] == "console") for w in who),
          f"out={out.strip()!r}")
     # The first session has ended: DEAD_PROCESS, so a plain exec (no pty, never
@@ -205,6 +211,9 @@ def utmp(ssh, user, pw):
     rc2, wt, _ = ssh.run(user, f"{bb} od -An -tx2 -N2 /var/log/wtmp", password=pw)
     step("utmp_last_history", rc == 0 and any(l.split()[:1] == [user] and "pts/" in l for l in out.splitlines())
          and wt.split() == ["0002"], f"rc={rc} out={out.strip()[-300:]!r} wtmp0={wt.strip()!r}")
+    rc, out, err = ssh.run(user, f"/bin/lastlog -u {user}", password=pw)
+    step("utmp_lastlog_reader", rc == 0 and any(l.split()[:1] == [user] and "pts/" in l and "Never" not in l
+         for l in out.splitlines()), f"rc={rc} out={out.strip()!r}")
     rc, out, err = ssh.run(user, "ls -l /var/log/lastlog /var/log/wtmp /run/utmps/utmp", password=pw)
     step("utmp_files", rc == 0 and out.count("/var/log/") == 2, f"rc={rc} out={out.strip()!r}")
 
