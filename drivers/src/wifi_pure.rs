@@ -48,13 +48,20 @@ pub const IEEE_REASON_8021X_FAILED: u16 = 23;
 /// like Linux (no periodic scan while associated without a roaming
 /// trigger; NetworkManager's bgscan "simple" is signal-gated too).
 pub const CONNECTED_SCAN_MS: u64 = 120_000;
+/// The interval in use (tests shorten it; `wifisim.roamscan=<ms>`).
+pub static ROAM_SCAN_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(CONNECTED_SCAN_MS);
+/// A roaming candidate must be at least this much stronger (dB) than the
+/// current BSS, so two similar APs do not trade the station back and forth.
+pub const ROAM_MARGIN_DB: i32 = 10;
+/// Whether a candidate at `cand_dbm` is worth leaving `cur_dbm` for.
+pub fn roam_better(cur_dbm: i32, cand_dbm: i32) -> bool { cur_dbm != 0 && cand_dbm >= cur_dbm + ROAM_MARGIN_DB }
 /// A connected background scan needs the signal below this (dBm).
 pub const ROAM_SCAN_DBM: i32 = -75;
 
 /// Whether the connected loop should start a background scan `since_ms`
 /// after the last one, with the current signal `signal_dbm` (0 = unknown).
 pub fn connected_bg_scan_due(since_ms: u64, signal_dbm: i32) -> bool {
-    since_ms >= CONNECTED_SCAN_MS && signal_dbm != 0 && signal_dbm < ROAM_SCAN_DBM
+    since_ms >= ROAM_SCAN_MS.load(core::sync::atomic::Ordering::Relaxed) && signal_dbm != 0 && signal_dbm < ROAM_SCAN_DBM
 }
 
 /// Group-key state and TKIP receive counters, shared by the Intel driver and

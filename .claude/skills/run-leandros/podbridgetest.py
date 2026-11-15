@@ -186,6 +186,14 @@ def main():
         check("podman_publish_range", rc == 0 and "hello-pbrng" in out and "18100-18102" in rs, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
         run("podman rm -f pbrng >/dev/null 2>&1")
 
+        # Cross-network: a client on network pbx1 reaches pbx2's published port through the NIC address.
+        # netavark sets no masquerade mark for it, so the flow is DNATed and routed with the client's source kept.
+        run("podman network rm -f pbx1 pbx2 >/dev/null 2>&1; podman network create pbx1 >/dev/null 2>&1; podman network create pbx2 >/dev/null 2>&1")
+        srv_tcp("pbxsrv", "--network=pbx2 -p 18083:80", 80)
+        rc, out = run(f"podman run --rm --network=pbx1 {IMG} wget -T 10 -qO- http://{nicip}:18083/ 2>&1")
+        check("podman_publish_crossnet", rc == 0 and "hello-pbxsrv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        run("podman rm -f pbxsrv >/dev/null 2>&1; podman network rm -f pbx1 pbx2 >/dev/null 2>&1")
+
         # --internal: a default route added by hand must still not leave the network.
         run("podman network rm -f pbint2 >/dev/null 2>&1; podman network create --internal pbint2 2>&1")
         rc, out = run(f"gwi=$(podman network inspect pbint2 -f '{{{{(index .Subnets 0).Gateway}}}}'); "

@@ -1,0 +1,29 @@
+<!doctype html><meta charset=utf-8><title>canvasperf</title>
+<body style="margin:0;background:#000"><canvas id=c width=1900 height=1000></canvas>
+<script>
+// Canvas-2D CPU-raster benchmark (lane canvasperf): 1500 gradient arcs + 40 text
+// lines per frame at 1900x1000. Logs "CANVASPERF fps=N" once a second to the
+// console (Firefox: devtools.console.stdout.content=true -> ff.log).
+const c = document.getElementById('c'), g = c.getContext('2d');
+let seed = 12345; const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+const arcs = [];
+for (let i = 0; i < 1500; i++) arcs.push({x: rnd()*1900, y: rnd()*1000, r: 10+rnd()*60,
+  a0: rnd()*6.28, a1: rnd()*6.28, h: Math.floor(rnd()*360), w: 2+rnd()*6});
+let frames = 0, t0 = performance.now(), n = 0;
+function frame(t) {
+  g.fillStyle = '#101018'; g.fillRect(0, 0, 1900, 1000);
+  for (const a of arcs) {
+    const gr = g.createLinearGradient(a.x-a.r, a.y-a.r, a.x+a.r, a.y+a.r);
+    gr.addColorStop(0, `hsl(${a.h},80%,60%)`); gr.addColorStop(1, `hsl(${(a.h+90)%360},80%,40%)`);
+    g.strokeStyle = gr; g.lineWidth = a.w; g.beginPath();
+    g.arc(a.x, a.y, a.r, a.a0 + t/2000, a.a1 + t/2000); g.stroke();
+  }
+  g.fillStyle = '#eee'; g.font = '18px sans-serif';
+  for (let i = 0; i < 40; i++) g.fillText('Line ' + i + ': the quick brown fox jumps over the lazy dog ' + n, 20, 24 + i*24);
+  n++; frames++;
+  const now = performance.now();
+  if (now - t0 >= 1000) { console.log('CANVASPERF fps=' + (frames*1000/(now-t0)).toFixed(2)); frames = 0; t0 = now; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>

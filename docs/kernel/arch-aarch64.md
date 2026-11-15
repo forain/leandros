@@ -98,6 +98,10 @@ Secondary CPUs are enumerated from the ACPI MADT GICC entries, else the device t
 
 The **conduit** is HVC unless the kernel was entered at EL2 (QEMU then registers PSCI on SMC) or is an `rpi5` build (TF-A at EL3, reached by SMC; HVC would fault with no hypervisor). `SYSTEM_OFF` (`0x8400_0008`) and `SYSTEM_RESET` (`0x8400_0009`) implement `reboot(2)`. On `raspi4b` SMP is skipped: that board releases all cores at reset and its SMC dispatch hangs on `CPU_ON` for an already-running core.
 
+### ACPI-only boot (`acpi=force`)
+
+With `acpi=force` on the kernel command line the kernel ignores any DTB and takes the platform from the ACPI tables handed over by Limine (`boot/src/acpi_a64.rs`): MADT (GICD/GICC/GICR bases, GIC version, CPU list, ITS parsed but unused), GTDT (timer PPIs), SPCR (console UART; interface types 0x03, 0x0D and 0x0E are PL011, 16550 types use the MMIO 16550 backend, which is untested in QEMU), MCFG (single ECAM segment only) and FADT (PSCI conduit HVC/SMC). The runtime values reach `gic::set_platform`, `uart::set_platform` and `smp`. Without the flag the DTB path is unchanged. Test: `.claude/skills/run-leandros/a64acpitest.py` (QEMU virt + edk2, 7 checks). Open: MSI via the ITS (needed for EC2 Graviton), multi-segment PCI.
+
 ## Design decisions
 
 ### Detect the GIC version by behaviour, not by ID register

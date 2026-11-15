@@ -9,7 +9,9 @@ is its data path). The kernel self-test then drives the Wi-Fi manager through
 the netctl seam -- scan (security bits per AP, coalescing, hidden SSID),
 wrong passphrase (FAILED wrong-key after the AP's message-1 retries),
 right passphrase, DHCP DISCOVER/OFFER over the data path, scan while
-associated, DISCONNECT under 2 s, failure reasons (SAE-only, no AP,
+associated, DISCONNECT under 2 s, WPA3-SAE (H2E, hunt-and-peck, anti-clogging, wrong password,
+PMKSA reuse), PMF (spoofed deauth ignored, SA Query), WPA3 transition
+fallback, roaming between two BSSs, failure reasons (no AP,
 association refused), beacon loss, deauth, BSS aging, radio off/on,
 autoconnect by priority / blocked after DISCONNECT / skipping a wrong-key
 profile / after link loss, DISCONNECT preempting an attempt -- and prints
