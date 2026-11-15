@@ -117,3 +117,81 @@ static void udp_recverr_emsgsize(void) {
         fail(N, "local ee errno %u origin %u info %u, want 90/1/1000", q2.ee.ee_errno, q2.ee.ee_origin, q2.ee.ee_info);
     else pass(N);
 }
+
+/* Lane udp6err: ICMPv6 destination-unreachable / time-exceeded reach a
+ * connected UDP6 socket: IPV6_RECVERR queue entry (origin ICMP6, ee_type/
+ * ee_code = the ICMPv6 type/code, Linux icmpv6_err_convert errno) and, for
+ * fatal codes without RECVERR, the pending socket error. */
+static int icmp6_inject(int s, struct sockaddr_in6 *ra, int ty, int code) {
+    struct sockaddr_in6 la; socklen_t ll = sizeof la;
+    int raw = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (raw < 0 || getsockname(s, (struct sockaddr *)&la, &ll)) return -1;
+    uint8_t m[8 + 40 + 8];
+    memset(m, 0, sizeof m);
+    m[0] = ty; m[1] = code;
+    uint8_t *ip = m + 8;
+    ip[0] = 0x60; ip[4] = 0; ip[5] = 8; ip[6] = 17; ip[7] = 64;
+    memcpy(ip + 8, &in6addr_loopback, 16); memcpy(ip + 24, &ra->sin6_addr, 16);
+    memcpy(ip + 40, &la.sin6_port, 2); memcpy(ip + 42, &ra->sin6_port, 2);
+    uint16_t c = csum6(&in6addr_loopback, &in6addr_loopback, m, sizeof m); m[2] = c >> 8; m[3] = c & 255;
+    struct sockaddr_in6 to = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    int on2 = 2; setsockopt(raw, IPPROTO_IPV6, IPV6_CHECKSUM, &on2, sizeof on2);
+    ssize_t r = sendto(raw, m, sizeof m, 0, (struct sockaddr *)&to, sizeof to);
+    msleep(200);
+    close(raw);
+    return r == (ssize_t)sizeof m ? 0 : -1;
+}
+
+static void udp6_recverr_one(const char *N, int ty, int code, int want_errno, int fatal) {
+    if (skipped(N)) return;
+    int r = socket(AF_INET6, SOCK_DGRAM, 0), s = socket(AF_INET6, SOCK_DGRAM, 0), on = 1;
+    struct sockaddr_in6 ra = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    socklen_t rl = sizeof ra;
+    if (r < 0 || s < 0 || bind(r, (struct sockaddr *)&ra, sizeof ra) || getsockname(r, (struct sockaddr *)&ra, &rl)
+        || setsockopt(s, IPPROTO_IPV6, IPV6_RECVERR, &on, sizeof on)
+        || connect(s, (struct sockaddr *)&ra, sizeof ra)) { fail(N, "setup: %s", strerror(errno)); return; }
+    if (icmp6_inject(s, &ra, ty, code)) { fail(N, "inject: %s", strerror(errno)); return; }
+    int ev = wait_ev(s, 0, 1500);
+    char data[64], cbuf[128], b[8];
+    struct sockaddr_in6 nm;
+    struct iovec iov = { data, sizeof data };
+    struct msghdr m = { .msg_name = &nm, .msg_namelen = sizeof nm, .msg_iov = &iov, .msg_iovlen = 1,
+                        .msg_control = cbuf, .msg_controllen = sizeof cbuf };
+    /* plain recv first: reading the queue clears the pending error */
+    ssize_t r0 = recv(s, b, sizeof b, MSG_DONTWAIT); int e0 = errno;
+    ssize_t n = recvmsg(s, &m, MSG_ERRQUEUE | MSG_DONTWAIT);
+    int have = 0; struct sock_extended_err ee; memset(&ee, 0, sizeof ee);
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); n >= 0 && c; c = CMSG_NXTHDR(&m, c))
+        if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_RECVERR) { have = 1; memcpy(&ee, CMSG_DATA(c), sizeof ee); }
+    close(s); close(r);
+    if (!(ev & POLLERR)) fail(N, "poll %#x, want POLLERR", ev);
+    else if (n < 0 || !have) fail(N, "no IPV6_RECVERR entry: %zd %s", n, strerror(errno));
+    else if (ee.ee_errno != want_errno || ee.ee_origin != SO_EE_ORIGIN_ICMP6 || ee.ee_type != ty || ee.ee_code != code)
+        fail(N, "ee errno %u origin %u type %u code %u, want %d/3/%d/%d", ee.ee_errno, ee.ee_origin, ee.ee_type, ee.ee_code, want_errno, ty, code);
+    else if (fatal && (r0 >= 0 || e0 != want_errno)) fail(N, "plain recv: %zd %s, want %d", r0, strerror(e0), want_errno);
+    else pass(N);
+}
+
+static void udp6_recverr_dstunreach(void) {
+    udp6_recverr_one("udp6_recverr_port_unreach", 1, 4, ECONNREFUSED, 1);
+    udp6_recverr_one("udp6_recverr_no_route", 1, 0, ENETUNREACH, 0);
+    udp6_recverr_one("udp6_recverr_adm_prohibited", 1, 1, EACCES, 1);
+    udp6_recverr_one("udp6_recverr_time_exceeded", 3, 0, EHOSTUNREACH, 0);
+}
+
+/* Without IPV6_RECVERR a fatal code still fails the connected socket. */
+static void udp6_icmp6_refused_plain(void) {
+    const char *N = "udp6_icmp6_refused_plain";
+    if (skipped(N)) return;
+    int r = socket(AF_INET6, SOCK_DGRAM, 0), s = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 ra = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    socklen_t rl = sizeof ra;
+    if (r < 0 || s < 0 || bind(r, (struct sockaddr *)&ra, sizeof ra) || getsockname(r, (struct sockaddr *)&ra, &rl)
+        || connect(s, (struct sockaddr *)&ra, sizeof ra)) { fail(N, "setup: %s", strerror(errno)); return; }
+    if (icmp6_inject(s, &ra, 1, 4)) { fail(N, "inject: %s", strerror(errno)); return; }
+    char b[8];
+    ssize_t r0 = recv(s, b, sizeof b, MSG_DONTWAIT); int e0 = errno;
+    close(s); close(r);
+    if (r0 >= 0 || e0 != ECONNREFUSED) fail(N, "recv %zd %s, want ECONNREFUSED", r0, strerror(e0));
+    else pass(N);
+}

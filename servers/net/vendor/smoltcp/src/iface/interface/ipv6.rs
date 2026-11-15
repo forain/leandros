@@ -187,6 +187,60 @@ impl InterfaceInner {
         }
     }
 
+    /// LEANDROS: IPV6_RECVERR (Linux __udp6_lib_err -> ipv6_icmp_error).
+    #[cfg(feature = "socket-udp")]
+    fn icmpv6_error_q(&mut self, sockets: &mut SocketSet, errno: u8, ty: u8, code: u8, info: u32, offender: IpAddress, header: &Ipv6Repr, data: &[u8]) {
+        if header.next_header != IpProtocol::Udp || data.len() < 8 {
+            return;
+        }
+        let sport = u16::from_be_bytes([data[0], data[1]]);
+        let dport = u16::from_be_bytes([data[2], data[3]]);
+        let local = IpAddress::Ipv6(header.src_addr);
+        let remote = IpEndpoint::new(IpAddress::Ipv6(header.dst_addr), dport);
+        for u in sockets.items_mut().filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket)) {
+            let ep = u.endpoint();
+            if u.recverr()
+                && ep.port == sport
+                && ep.addr.map_or(true, |a| a == local)
+                && u.peer().map_or(true, |p| p == remote)
+            {
+                u.push_err(crate::socket::udp::ErrEntry {
+                    errno,
+                    origin: 3,
+                    ty,
+                    code,
+                    info,
+                    offender,
+                    dst: remote,
+                    payload: data[8..].to_vec(),
+                });
+                u.set_error(errno);
+            }
+        }
+    }
+    #[cfg(not(feature = "socket-udp"))]
+    fn icmpv6_error_q(&mut self, _: &mut SocketSet, _: u8, _: u8, _: u8, _: u32, _: IpAddress, _: &Ipv6Repr, _: &[u8]) {}
+
+    /// A fatal ICMPv6 error reaches a connected UDP socket as its pending error.
+    #[cfg(feature = "socket-udp")]
+    fn icmpv6_error_fatal(&mut self, sockets: &mut SocketSet, errno: u8, header: &Ipv6Repr, data: &[u8]) {
+        if header.next_header != IpProtocol::Udp || data.len() < 8 {
+            return;
+        }
+        let sport = u16::from_be_bytes([data[0], data[1]]);
+        let dport = u16::from_be_bytes([data[2], data[3]]);
+        let local = IpAddress::Ipv6(header.src_addr);
+        let remote = IpEndpoint::new(IpAddress::Ipv6(header.dst_addr), dport);
+        for u in sockets.items_mut().filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket)) {
+            let ep = u.endpoint();
+            if ep.port == sport && ep.addr.map_or(true, |a| a == local) && u.peer() == Some(remote) {
+                u.set_error(errno);
+            }
+        }
+    }
+    #[cfg(not(feature = "socket-udp"))]
+    fn icmpv6_error_fatal(&mut self, _: &mut SocketSet, _: u8, _: &Ipv6Repr, _: &[u8]) {}
+
     pub(super) fn process_icmpv6<'frame>(
         &mut self,
         _sockets: &mut SocketSet,
@@ -252,40 +306,34 @@ impl InterfaceInner {
                 _ => unreachable!(),
             },
 
+            // LEANDROS: Linux icmpv6_err_convert -- (errno, fatal).
+            Icmpv6Repr::DstUnreachable { reason, header, data } => {
+                let code: u8 = reason.into();
+                const TABLE: [(u8, bool); 7] = [
+                    (101, false), // no route: ENETUNREACH
+                    (13, true),   // administratively prohibited: EACCES
+                    (113, false), // (reserved): EHOSTUNREACH
+                    (113, false), // address unreachable: EHOSTUNREACH
+                    (111, true),  // port unreachable: ECONNREFUSED
+                    (13, true),   // source address failed policy: EACCES
+                    (13, true),   // reject route: EACCES
+                ];
+                let (errno, fatal) = TABLE.get(code as usize).copied().unwrap_or((113, false));
+                self.icmpv6_error_q(_sockets, errno, 1, code, 0, ip_repr.src_addr(), &header, data);
+                if fatal {
+                    self.icmpv6_error_fatal(_sockets, errno, &header, data);
+                }
+                None
+            }
+            Icmpv6Repr::TimeExceeded { reason, header, data } => {
+                self.icmpv6_error_q(_sockets, 113, 3, reason.into(), 0, ip_repr.src_addr(), &header, data);
+                None
+            }
+
             // LEANDROS: RFC 8201 -- a "packet too big" teaches the path MTU
             // towards the quoted datagram's destination.
             Icmpv6Repr::PktTooBig { mtu, header, data } => {
-                // LEANDROS: IPV6_RECVERR (Linux __udp6_lib_err -> ipv6_icmp_error).
-                #[cfg(feature = "socket-udp")]
-                if header.next_header == IpProtocol::Udp && data.len() >= 8 {
-                    let sport = u16::from_be_bytes([data[0], data[1]]);
-                    let dport = u16::from_be_bytes([data[2], data[3]]);
-                    let local = IpAddress::Ipv6(header.src_addr);
-                    let remote = IpEndpoint::new(IpAddress::Ipv6(header.dst_addr), dport);
-                    for u in _sockets
-                        .items_mut()
-                        .filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket))
-                    {
-                        let ep = u.endpoint();
-                        if u.recverr()
-                            && ep.port == sport
-                            && ep.addr.map_or(true, |a| a == local)
-                            && u.peer().map_or(true, |p| p == remote)
-                        {
-                            u.push_err(crate::socket::udp::ErrEntry {
-                                errno: 90,
-                                origin: 3,
-                                ty: 2,
-                                code: 0,
-                                info: mtu,
-                                offender: ip_repr.src_addr(),
-                                dst: remote,
-                                payload: data[8..].to_vec(),
-                            });
-                            u.set_error(90);
-                        }
-                    }
-                }
+                self.icmpv6_error_q(_sockets, 90, 2, 0, mtu, ip_repr.src_addr(), &header, data);
                 let m = mtu.min(u16::MAX as u32) as u16;
                 crate::pmtu::update(self.pmtu_scope, header.dst_addr.0, m, crate::pmtu::MIN_PMTU6, self.now.total_millis() as u64);
                 None
