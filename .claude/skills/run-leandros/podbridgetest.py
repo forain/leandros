@@ -236,14 +236,15 @@ def main():
 
         run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns pb6 2>&1")
         ct0 = ctn()
-        rc, out = run(f"podman run --rm --network pb6 {IMG} ping -6 -c3 -W 5 {gw6} 2>&1")
+        # the 1 s IPv6 DAD on the container veth (tentative address is held out of the stack, as on Linux): wait it out
+        rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; ping -6 -c3 -W 5 {gw6}' 2>&1")
         check6("podman_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
         check6("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         if port6 and v6ok:
-            rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
+            rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
-        rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} traceroute6 -n -m 1 -q 1 -w 4 2001:4860:4860::8888 2>&1")
+        rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} sh -c 'sleep 2; traceroute6 -n -m 1 -q 1 -w 4 2001:4860:4860::8888' 2>&1")
         # Time Exceeded for a forwarded flow (fwd6::time_exceeded) reaches traceroute6's raw ICMPv6 socket,
         # which never sent anything itself: the first hop prints an address.
         te_ok = re.search(r"^\s*1\s+[0-9a-f]+:[0-9a-f:]+\s", out, re.M) is not None
@@ -258,7 +259,7 @@ def main():
         for nm, u in (("lo", "::1"), ("nicip", nic6)):
             rc, out = hostwget(f"http://[{u}]:18082/")
             check6(f"podman_v6_publish_{nm}", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
-        rc, out = run(f"podman run --rm --network pb6 {IMG} wget -T 10 -qO- http://[{nic6}]:18082/ 2>&1")
+        rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; wget -T 10 -qO- http://[{nic6}]:18082/' 2>&1")
         check6("podman_v6_publish_ctr", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
         if fails6_publish(out):
             rc, rs = run("nft list ruleset 2>&1 | grep -n -B3 -A3 18082; podman ps -a 2>&1; podman logs pb6srv 2>&1 | tail -n 5")

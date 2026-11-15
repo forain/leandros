@@ -546,6 +546,8 @@ static int addr6_add(int s, int idx, const char *ip, int plen) {
     struct in6_addr in; inet_pton(AF_INET6, ip, &in);
     struct nlb m; nl_begin(&m, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &a, sizeof a);
     nl_attr(&m, IFA_LOCAL, &in, 16); nl_attr(&m, IFA_ADDRESS, &in, 16);
+    unsigned nodad = 0x02; /* IFA_F_NODAD: these cases test forwarding, not RFC 4862 (tuntest dad_*) */
+    nl_attr(&m, 8 /* IFA_FLAGS */, &nodad, 4);
     return nl_do(s, &m);
 }
 /* ICMPv6 echo through an unprivileged ping socket; 0 on a reply. */

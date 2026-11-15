@@ -92,6 +92,18 @@ static int rd_timeout(int fd, unsigned char *b, int n, int ms)
     return read(fd, b, n);
 }
 
+/* An up L2 link sends its IPv6 DAD NS (RFC 4862) the moment it has a link-local address:
+ * let it out and discard what the IPv4 cases do not expect. */
+static void tap_settle(int fd)
+{
+    unsigned char b[2048];
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    usleep(300 * 1000);
+    while (read(fd, b, sizeof b) > 0) ;
+    fcntl(fd, F_SETFL, fl);
+}
+
 static uint16_t csum16(const unsigned char *d, int n)
 {
     uint32_t s = 0;
@@ -112,6 +124,7 @@ static int ns_cases(void)
     CHECK("tap_create", fd >= 0 && strcmp(name, "tap0") == 0);
     if (fd < 0) return 1;
     CHECK("tap_addr_up", set_addr("tap0", "10.9.0.1", "255.255.255.0") == 0);
+    tap_settle(fd);
     {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         struct ifreq ifr; memset(&ifr, 0, sizeof ifr); strcpy(ifr.ifr_name, "tap0");
@@ -293,6 +306,7 @@ static int tcp_cases(void)
     if (enter_ns() != 0) { printf("tcp_out: FAIL (unshare errno %d)\n", errno); return 1; }
     fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
     if (fd < 0 || set_addr(name, "10.9.0.1", "255.255.255.0") != 0) { printf("tcp_out: FAIL (tap setup fd %d name %s errno %d)\n", fd, name, errno); return 1; }
+    tap_settle(fd);
 
     /* tcp_out: connect over the tap, SYN on the fd, inject SYN-ACK / data / FIN */
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -375,6 +389,7 @@ static int vec_cases(void)
     CHECK("vec_tap_create", fd >= 0);
     if (fd < 0) return 1;
     CHECK("vec_tap_addr_up", set_addr(name, "10.9.0.1", "255.255.255.0") == 0);
+    tap_settle(fd);
     unsigned char tapmac[6] = { 0 };
     {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -508,6 +523,7 @@ static int selfconn_cases(void)
     if (enter_ns() != 0) { printf("selfconn: unshare failed\n"); return 1; }
     int fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
     CHECK("selfconn_tap", fd >= 0 && set_addr(name, "10.9.0.1", "255.255.255.0") == 0);
+    if (fd >= 0) tap_settle(fd);
     if (fd < 0) return 1;
     int l = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in any = { .sin_family = AF_INET, .sin_port = htons(7777) };
@@ -533,6 +549,211 @@ static int selfconn_cases(void)
     return nfail != 0;
 }
 
+/* ── IPv6 on tun/tap: DAD (RFC 4862) and the L3 neighbour proxy ─────────── */
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <netinet/in.h>
+#include <time.h>
+struct nlb { char b[2048]; int len; };
+static void nl_begin(struct nlb *m, int type, int flags, const void *body, int blen) {
+    memset(m, 0, sizeof *m);
+    struct nlmsghdr *h = (struct nlmsghdr *)m->b;
+    h->nlmsg_type = type; h->nlmsg_flags = flags | NLM_F_REQUEST; h->nlmsg_seq = 77;
+    memcpy(m->b + NLMSG_HDRLEN, body, blen);
+    m->len = NLMSG_HDRLEN + NLMSG_ALIGN(blen);
+}
+static void nl_attr(struct nlb *m, int type, const void *d, int dl) {
+    struct rtattr *a = (struct rtattr *)(m->b + m->len);
+    a->rta_type = type; a->rta_len = RTA_LENGTH(dl);
+    memcpy(RTA_DATA(a), d, dl);
+    m->len += RTA_ALIGN(a->rta_len);
+}
+static int nl_do(int s, struct nlb *m) {
+    ((struct nlmsghdr *)m->b)->nlmsg_len = m->len;
+    ((struct nlmsghdr *)m->b)->nlmsg_flags |= NLM_F_ACK;
+    if (send(s, m->b, m->len, 0) != m->len) return -1;
+    char rb[2048];
+    ssize_t n = recv(s, rb, sizeof rb, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)rb;
+    if (n < (ssize_t)NLMSG_HDRLEN || h->nlmsg_type != NLMSG_ERROR) return -1;
+    return -((struct nlmsgerr *)NLMSG_DATA(h))->error;
+}
+static int addr6_add(int s, const char *ifn, const char *ip, int plen) {
+    struct ifaddrmsg a; memset(&a, 0, sizeof a);
+    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = if_nametoindex(ifn);
+    struct in6_addr in; inet_pton(AF_INET6, ip, &in);
+    struct nlb m; nl_begin(&m, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &a, sizeof a);
+    nl_attr(&m, IFA_LOCAL, &in, 16); nl_attr(&m, IFA_ADDRESS, &in, 16);
+    return nl_do(s, &m);
+}
+/* IFA_FLAGS of `ip` in a GETADDR dump; -1 if the address is absent. */
+static int addr6_flags(int s, const char *ip) {
+    struct { struct nlmsghdr h; struct ifaddrmsg a; } r;
+    memset(&r, 0, sizeof r);
+    r.h.nlmsg_len = sizeof r; r.h.nlmsg_type = RTM_GETADDR; r.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    r.h.nlmsg_seq = 78; r.a.ifa_family = AF_INET6;
+    if (send(s, &r, sizeof r, 0) != sizeof r) return -2;
+    struct in6_addr want; inet_pton(AF_INET6, ip, &want);
+    int found = -1;
+    for (;;) {
+        char rb[8192];
+        ssize_t n = recv(s, rb, sizeof rb, 0);
+        if (n <= 0) return -2;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)rb; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type == NLMSG_DONE) return found;
+            if (h->nlmsg_type != RTM_NEWADDR) continue;
+            struct ifaddrmsg *a = NLMSG_DATA(h);
+            int len = IFA_PAYLOAD(h), fl = a->ifa_flags, hit = 0;
+            for (struct rtattr *t = IFA_RTA(a); RTA_OK(t, len); t = RTA_NEXT(t, len)) {
+                if (t->rta_type == IFA_ADDRESS && !memcmp(RTA_DATA(t), &want, 16)) hit = 1;
+                if (t->rta_type == IFA_FLAGS) fl = *(unsigned *)RTA_DATA(t);
+            }
+            if (hit) found = fl;
+        }
+    }
+}
+/* ICMPv6 checksum over the pseudo header. */
+static uint16_t icmp6_csum(const unsigned char *src, const unsigned char *dst, const unsigned char *p, int len)
+{
+    unsigned char ph[40 + 4096]; memset(ph, 0, 40);
+    memcpy(ph, src, 16); memcpy(ph + 16, dst, 16);
+    ph[34] = len >> 8; ph[35] = len; ph[39] = 58;
+    memcpy(ph + 40, p, len);
+    return csum16(ph, 40 + len);
+}
+/* Next ICMPv6 message of `type` with target `tgt` from an L2 tap (ethertype 86dd). Returns src ip in sip. */
+static int next_icmp6(int fd, int type, const unsigned char *tgt, unsigned char *sip, int ms)
+{
+    unsigned char b[1600];
+    for (int i = 0; i < 20; i++) {
+        int n = rd_timeout(fd, b, sizeof b, ms);
+        if (n < 14 + 40 + 24) { if (n < 0) return 0; continue; }
+        if (b[12] != 0x86 || b[13] != 0xdd || b[14 + 6] != 58 || b[14 + 40] != type) continue;
+        if (memcmp(b + 14 + 40 + 8, tgt, 16)) continue;
+        if (sip) memcpy(sip, b + 14 + 8, 16);
+        return 1;
+    }
+    return 0;
+}
+static int tun6_cases(void)
+{
+    if (enter_ns() != 0) { printf("tun6: unshare failed\n"); return 1; }
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    char tn[IFNAMSIZ];
+    int tp = tun_open("tap%d", F_TAP | F_NO_PI, tn);
+    CHECK("tun6_tap_create", tp >= 0 && nl >= 0);
+    if (tp < 0 || nl < 0) return 1;
+    CHECK("tun6_tap_up", set_addr(tn, "10.7.0.1", "255.255.255.0") == 0);
+    struct in6_addr a1, a2, zero = IN6ADDR_ANY_INIT, allnodes;
+    inet_pton(AF_INET6, "fd00:7::1", &a1);
+    inet_pton(AF_INET6, "fd00:7::2", &a2);
+    inet_pton(AF_INET6, "ff02::1", &allnodes);
+    CHECK("tun6_addr_add", addr6_add(nl, tn, "fd00:7::1", 64) == 0 && addr6_add(nl, tn, "fd00:7::2", 64) == 0);
+    /* RFC 4862: tentative while the NS from :: is out, nothing else uses it */
+    int f1 = addr6_flags(nl, "fd00:7::1");
+    CHECK("dad_tentative_flag", f1 >= 0 && (f1 & 0x40) && !(f1 & 0x800));
+    unsigned char sip[16];
+    CHECK("dad_ns_from_unspecified", next_icmp6(tp, 135, (unsigned char *)&a1, sip, 3000) && !memcmp(sip, &zero, 16));
+    /* a defender answers for fd00:7::2: NA to ff02::1 */
+    {
+        unsigned char f[14 + 40 + 32]; memset(f, 0, sizeof f);
+        memcpy(f, "\x33\x33\x00\x00\x00\x01", 6); memcpy(f + 6, p_mac, 6); f[12] = 0x86; f[13] = 0xdd;
+        unsigned char *ip = f + 14; ip[0] = 0x60; ip[5] = 32; ip[6] = 58; ip[7] = 255;
+        memcpy(ip + 8, &a2, 16); memcpy(ip + 24, &allnodes, 16);
+        unsigned char *ic = ip + 40; ic[0] = 136; ic[4] = 0x20; memcpy(ic + 8, &a2, 16);
+        ic[24] = 2; ic[25] = 1; memcpy(ic + 26, p_mac, 6);
+        uint16_t c = icmp6_csum(ip + 8, ip + 24, ic, 32); ic[2] = c >> 8; ic[3] = c;
+        CHECK("dad_defend_write", write(tp, f, sizeof f) == (ssize_t)sizeof f);
+    }
+    usleep(1500 * 1000);
+    int f2 = addr6_flags(nl, "fd00:7::2"), f1b = addr6_flags(nl, "fd00:7::1");
+    CHECK("dad_failed_flag", f2 >= 0 && (f2 & 0x800) && (f2 & 0x40));
+    CHECK("dad_success_clears_tentative", f1b >= 0 && !(f1b & 0x40) && !(f1b & 0x800));
+    /* a DADFAILED address is never bound */
+    {
+        int u = socket(AF_INET6, SOCK_DGRAM, 0);
+        struct sockaddr_in6 b = { .sin6_family = AF_INET6, .sin6_addr = a2 };
+        CHECK("dad_failed_not_bindable", bind(u, (struct sockaddr *)&b, sizeof b) != 0);
+        close(u);
+    }
+    /* a peer's NS for the now-valid address is answered with an NA */
+    {
+        unsigned char f[14 + 40 + 32]; memset(f, 0, sizeof f);
+        unsigned char sol[16]; memcpy(sol, "\xff\x02\0\0\0\0\0\0\0\0\0\x01\xff", 13); memcpy(sol + 13, ((unsigned char *)&a1) + 13, 3);
+        memcpy(f, "\x33\x33", 2); memcpy(f + 2, sol + 12, 4); memcpy(f + 6, p_mac, 6); f[12] = 0x86; f[13] = 0xdd;
+        struct in6_addr peer; inet_pton(AF_INET6, "fd00:7::99", &peer);
+        unsigned char *ip = f + 14; ip[0] = 0x60; ip[5] = 32; ip[6] = 58; ip[7] = 255;
+        memcpy(ip + 8, &peer, 16); memcpy(ip + 24, sol, 16);
+        unsigned char *ic = ip + 40; ic[0] = 135; memcpy(ic + 8, &a1, 16);
+        ic[24] = 1; ic[25] = 1; memcpy(ic + 26, p_mac, 6);
+        uint16_t c = icmp6_csum(ip + 8, ip + 24, ic, 32); ic[2] = c >> 8; ic[3] = c;
+        write(tp, f, sizeof f);
+        CHECK("ns_answered_with_na", next_icmp6(tp, 136, (unsigned char *)&a1, NULL, 3000));
+    }
+    close(tp);
+    close(nl);
+    printf("tun6_cases: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+static int tun6_l3_cases(void)
+{
+    if (enter_ns() != 0) { printf("tun6_l3: unshare failed\n"); return 1; }
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    /* IFF_TUN (L3): packets carry ethertype 0x86dd in the PI header; v6 on tun answers no DAD (NOARP) */
+    {
+        char un[IFNAMSIZ];
+        int tf = tun_open("tun%d", F_TUN, un);
+        CHECK("tun6_create_pi", tf >= 0);
+        CHECK("tun6_up", set_addr(un, "10.8.0.1", "255.255.255.0") == 0);
+        CHECK("tun6_addr_add", addr6_add(nl, un, "fd00:8::1", 64) == 0);
+        int fl = addr6_flags(nl, "fd00:8::1");
+        CHECK("tun6_noarp_no_dad", fl >= 0 && !(fl & 0x40));
+        int u = socket(AF_INET6, SOCK_DGRAM, 0);
+        struct sockaddr_in6 d = { .sin6_family = AF_INET6, .sin6_port = htons(7777) };
+        inet_pton(AF_INET6, "fd00:8::2", &d.sin6_addr);
+        sendto(u, "v6", 2, 0, (struct sockaddr *)&d, sizeof d);
+        unsigned char b[1600]; int got = 0, n;
+        for (int i = 0; i < 10 && !got; i++) {
+            n = rd_timeout(tf, b, sizeof b, 3000);
+            if (n < 0) break;
+            /* no NS may leak to a L3 reader (it cannot answer; the stack proxies it) */
+            if (n >= 4 + 40 && b[2] == 0x86 && b[3] == 0xdd && b[4] >> 4 == 6 && b[4 + 6] == 17) got = 1;
+            if (n >= 4 + 40 && b[4 + 6] == 58 && b[4 + 40] == 135) { CHECK("tun6_no_ns_leak", 0); }
+        }
+        CHECK("tun6_pi_ethertype_86dd", got && memcmp(b + 4 + 24, &d.sin6_addr, 16) == 0 && memcmp(b + 4 + 40 + 8, "v6", 2) == 0);
+        /* write a v6 packet back: PI says 86dd, a UDP socket receives it */
+        int r = socket(AF_INET6, SOCK_DGRAM, 0);
+        struct sockaddr_in6 me = { .sin6_family = AF_INET6, .sin6_port = htons(7778) };
+        inet_pton(AF_INET6, "fd00:8::1", &me.sin6_addr);
+        {   /* a fresh netns has lo down: only the wildcard binds until it is up */
+            int ls = socket(AF_INET, SOCK_DGRAM, 0); struct ifreq lr; memset(&lr, 0, sizeof lr); strcpy(lr.ifr_name, "lo");
+            ioctl(ls, SIOCGIFFLAGS, &lr); lr.ifr_flags |= IFF_UP; ioctl(ls, SIOCSIFFLAGS, &lr); close(ls);
+        }
+        struct sockaddr_in6 any = me;
+        CHECK("tun6_bind", bind(r, (struct sockaddr *)&any, sizeof any) == 0);
+        unsigned char pk[4 + 40 + 8 + 2]; memset(pk, 0, sizeof pk);
+        pk[2] = 0x86; pk[3] = 0xdd;
+        unsigned char *ip = pk + 4; ip[0] = 0x60; ip[5] = 10; ip[6] = 17; ip[7] = 64;
+        memcpy(ip + 8, &d.sin6_addr, 16); memcpy(ip + 24, &me.sin6_addr, 16);
+        unsigned char *ud = ip + 40; ud[0] = 0x1e; ud[1] = 0x61; ud[2] = 0x1e; ud[3] = 0x62; ud[5] = 10;
+        memcpy(ud + 8, "hi", 2);
+        uint16_t c = icmp6_csum(ip + 8, ip + 24, ud, 10);
+        /* UDP csum uses next header 17, not 58: recompute with the pseudo header */
+        {
+            unsigned char ph[40 + 10]; memset(ph, 0, 40); memcpy(ph, ip + 8, 32); ph[35] = 10; ph[39] = 17; memcpy(ph + 40, ud, 10);
+            c = csum16(ph, 50); if (!c) c = 0xffff;
+        }
+        ud[6] = c >> 8; ud[7] = c;
+        CHECK("tun6_write_v6", write(tf, pk, sizeof pk) == (ssize_t)sizeof pk);
+        struct pollfd pf = { r, POLLIN, 0 };
+        char rbuf[16]; int rn = poll(&pf, 1, 3000) > 0 ? (int)recv(r, rbuf, sizeof rbuf, 0) : -1;
+        CHECK("tun6_udp_delivered", rn == 2 && !memcmp(rbuf, "hi", 2));
+        close(r); close(u); close(tf);
+    }
+    printf("tun6_l3_cases: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+
 int main(void)
 {
     pid_t c = fork();
@@ -554,6 +775,16 @@ int main(void)
     if (c == 0) _exit(selfconn_cases());
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("selfconn_cases: FAIL (status %d)\n", st); }
+
+    c = fork();
+    if (c == 0) _exit(tun6_cases());
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tun6_cases: FAIL (status %d)\n", st); }
+
+    c = fork();
+    if (c == 0) _exit(tun6_l3_cases());
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tun6_l3_cases: FAIL (status %d)\n", st); }
 
     /* unprivileged, initial namespaces */
     c = fork();
