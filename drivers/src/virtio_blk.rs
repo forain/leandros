@@ -331,8 +331,19 @@ static BLK_IRQ_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 const IRQ_MISS_LIMIT: u32 = 64;
 
 /// Record whether a parked wait saw its completion interrupt.
+static DBG_W: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DBG_M: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 fn irq_health(saw_irq: bool) {
     use core::sync::atomic::Ordering::Relaxed;
+    let w = DBG_W.fetch_add(1, Relaxed) + 1;
+    if !saw_irq { DBG_M.fetch_add(1, Relaxed); }
+    if w % 256 == 0 {
+        crate::kenv::pci::serial_debug("[VIRTIO-BLK] DBG waits ");
+        crate::kenv::pci::serial_debug_hex(w);
+        crate::kenv::pci::serial_debug(" no-irq ");
+        crate::kenv::pci::serial_debug_hex(DBG_M.load(Relaxed));
+        crate::kenv::pci::serial_debug("\n");
+    }
     if saw_irq { BLK_IRQ_MISSES.store(0, Relaxed); return; }
     if BLK_IRQ_MISSES.fetch_add(1, Relaxed) + 1 == IRQ_MISS_LIMIT {
         BLK_IRQ_DEAD.store(true, Relaxed);
