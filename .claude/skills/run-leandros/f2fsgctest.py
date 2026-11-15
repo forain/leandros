@@ -70,7 +70,7 @@ def main(argv):
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     stop_caller_vm(caller)
     run_id = f"{caller}-f2fsgc" if caller else "f2fsgc"
-    out = os.environ.get("F2FSGC_OUT", f"/tmp/f2fsgc-{arch}")
+    out = os.environ.get("F2FSGC_OUT", f"/tmp/f2fsgc-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
     img = os.path.join(out, "gc.img")
     if os.path.exists(img):

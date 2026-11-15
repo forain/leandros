@@ -15,6 +15,7 @@
 #
 # Usage: build.sh [aarch64|x86_64|both] [app...]   (default: both, all apps)
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src"
@@ -77,7 +78,7 @@ for app in "${APPS[@]}"; do
       echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
       exit 1
     fi
-    install -m 0755 "$SRC/$app/target/$arch-unknown-linux-musl/release/$app" "$M6/out/$app-$arch"
+    stage_file 0755 "$SRC/$app/target/$arch-unknown-linux-musl/release/$app" "$M6/out/$app-$arch"
     echo "staged $arch: $M6/out/$app-$arch"
   done
 done
