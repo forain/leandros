@@ -25,6 +25,10 @@ mod utmpx;
 mod shadowhash;
 mod session;
 mod userauth;
+#[allow(dead_code)] // privsep P3/P4 building blocks, wired in by the monitor/netchild split
+mod rpc;
+#[allow(dead_code)]
+mod sandbox;
 
 use std::fs;
 use std::io::Write;
