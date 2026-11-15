@@ -53,6 +53,10 @@
  *   udp_burst           3000 nonblocking 1200-byte sends to an unread socket
  *                       answer the length or EAGAIN, nothing else; 500
  *                       blocking sends all succeed
+ *   udp_pmtud_notconn   IP_MTU on an unconnected socket is ENOTCONN
+ *   udp_pmtud_netns     a path MTU learned in one namespace is invisible in another
+ *   tcp_pmtud_clamp     frag-needed shrinks TCP's segment size (TCP_INFO snd_mss/pmtu)
+ *   udp6_pmtud          IPV6_MTU_DISCOVER / IPV6_MTU, ICMPv6 packet-too-big, EMSGSIZE
  *   udp_pmtud           IP_MTU_DISCOVER / IP_MTU, frag-needed shrinks the path, DO sends past it are EMSGSIZE
  *   udp_huge            4000-, 60000- and 65507-byte datagrams round-trip over loopback; 65508 is EMSGSIZE
  *   udp_large           an 8000-byte datagram over loopback arrives whole
@@ -1029,6 +1033,7 @@ static void udp_wildcard_connect(void) {
 
 /* Lane udp2: ICMP errors, multicast, broadcast, cmsgs, disconnect. */
 #include "udp2cases.c"
+#include "pmtud2.c"
 
 /* Cases against the frame-level peer of udppeertest.py (second NIC). */
 #include "peer.c"
@@ -1075,6 +1080,10 @@ int main(int argc, char **argv) {
     udp_large();
     udp_huge();
     udp_pmtud();
+    udp_pmtud_notconn();
+    udp_pmtud_netns();
+    tcp_pmtud_clamp();
+    udp6_pmtud();
     udp_gso();
     udp_mmsg();
     udp_dup();
