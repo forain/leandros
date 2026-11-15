@@ -136,6 +136,10 @@ pub enum TscSource {
     Nominal = 3,
     /// Measured against the PIT (min of three 10 ms windows).
     Pit = 4,
+    /// KVM paravirtual clock (pvclock): the hypervisor's TSC-to-nanosecond
+    /// scale. What a Nitro instance has when no leaf states the frequency and
+    /// there is no PIT to measure against.
+    KvmClock = 5,
 }
 
 /// Where the TSC frequency came from.
@@ -145,6 +149,7 @@ pub fn tsc_source() -> TscSource {
         2 => TscSource::Crystal,
         3 => TscSource::Nominal,
         4 => TscSource::Pit,
+        5 => TscSource::KvmClock,
         _ => TscSource::None,
     }
 }
@@ -157,6 +162,7 @@ impl TscSource {
             TscSource::Crystal => "cpuid 0x15",
             TscSource::Nominal => "cpuid 0x15+0x16",
             TscSource::Pit => "pit",
+            TscSource::KvmClock => "kvmclock",
         }
     }
 }
@@ -167,6 +173,52 @@ impl TscSource {
 /// nominal frequency of 16H. Returns `None` on CPUs and hypervisors that state
 /// nothing (QEMU TCG, `-cpu` models below level 0x15, pre-Skylake parts).
 fn tsc_khz_from_cpuid() -> Option<(u64, TscSource)> {
+    tsc_khz_from_leaves().or_else(|| unsafe { tsc_khz_from_kvmclock() })
+}
+
+/// MSR_KVM_SYSTEM_TIME_NEW (KVM_FEATURE_CLOCKSOURCE2).
+const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+
+/// The TSC frequency from the KVM pvclock scale (`tsc_to_system_mul`,
+/// `tsc_shift`), the way Linux's `kvm_get_tsc_khz` does: ns = ((tsc << shift)
+/// * mul) >> 32, so kHz = 10^6 * 2^32 / (mul * 2^shift). Registers a scratch
+/// page, reads the scale the host filled in, and unregisters it. `None` on a
+/// non-KVM hypervisor, without CLOCKSOURCE2, or if the host never fills the page.
+unsafe fn tsc_khz_from_kvmclock() -> Option<(u64, TscSource)> {
+    use core::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx & (1 << 31) == 0 { return None; }
+    let hv = __cpuid(0x4000_0000);
+    if hv.ebx != 0x4b4d_564b || hv.ecx != 0x564b_4d56 || hv.edx != 0x4d {
+        return None; // "KVMKVMKVM"
+    }
+    if hv.eax < 0x4000_0001 || __cpuid(0x4000_0001).eax & (1 << 3) == 0 { return None; }
+    let phys = mm::buddy::alloc(0)?;
+    let page = mm::phys_to_virt(phys) as *mut u8;
+    core::ptr::write_bytes(page, 0, 4096);
+    apic::wrmsr(MSR_KVM_SYSTEM_TIME_NEW, phys as u64 | 1);
+    // struct pvclock_vcpu_time_info: version u32, pad u32, tsc_timestamp u64,
+    // system_time u64, tsc_to_system_mul u32, tsc_shift i8, flags u8.
+    let mut out = None;
+    for _ in 0..1_000_000 {
+        let v0 = core::ptr::read_volatile(page as *const u32);
+        if v0 & 1 != 0 { core::hint::spin_loop(); continue; }
+        let mul = core::ptr::read_volatile(page.add(24) as *const u32) as u128;
+        let shift = core::ptr::read_volatile(page.add(28) as *const i8) as i32;
+        let v1 = core::ptr::read_volatile(page as *const u32);
+        if v0 != v1 || v0 == 0 || mul == 0 || !(-32..=32).contains(&shift) {
+            core::hint::spin_loop();
+            continue;
+        }
+        let khz = (1_000_000u128 << (32 - shift)) / mul;
+        if khz != 0 && khz < u64::MAX as u128 { out = Some((khz as u64, TscSource::KvmClock)); }
+        break;
+    }
+    apic::wrmsr(MSR_KVM_SYSTEM_TIME_NEW, 0);
+    mm::buddy::free(phys, 0);
+    out
+}
+
+fn tsc_khz_from_leaves() -> Option<(u64, TscSource)> {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     {
         if __cpuid(1).ecx & (1 << 31) != 0 {
@@ -256,6 +308,14 @@ unsafe fn pit_window_10ms() -> Option<(u32, u64)> {
     apic::write(apic::LAPIC_LVT_TIMER,  (1 << 16) | 0xFF); // masked, vec=0xFF
     apic::write(apic::LAPIC_TIMER_INIT, 0xFFFF_FFFF);
 
+    // Mode 0 drives OUT low after the load. If OUT already reads high (floating
+    // bus 0xFF, or a stub 0x61 with no 8254 behind it: QEMU pit=off, Nitro),
+    // there is no PIT and an instant "done" would be a ~0 cycle window.
+    if inb(KBD_PORT) & (1 << 5) != 0 {
+        apic::write(apic::LAPIC_LVT_TIMER, (1 << 16) | 0xFF);
+        return None;
+    }
+
     let start = apic::read(apic::LAPIC_TIMER_CURR);
     // The PIT window is exactly one 100 Hz tick, so the TSC delta across it is
     // TSC-cycles-per-tick — the scale `monotonic_ns` needs, measured on the same
@@ -277,7 +337,8 @@ unsafe fn pit_window_10ms() -> Option<(u32, u64)> {
     // Mask the APIC timer again; we are not yet in periodic mode.
     apic::write(apic::LAPIC_LVT_TIMER, (1 << 16) | 0xFF);
 
-    if !done { return None; }
+    // A real 10 ms window is at least 10^5 TSC cycles (a >10 MHz counter).
+    if !done || tsc_elapsed < 100_000 { return None; }
     // The counter counts *down*; elapsed = start - end.
     Some((start.wrapping_sub(end), tsc_elapsed))
 }
@@ -297,6 +358,28 @@ unsafe fn calibrate_pit() -> Option<(u32, u64)> {
             Some(b) if b.1 <= w.1 => Some(b),
             _ => Some(w),
         };
+    }
+    best
+}
+
+/// APIC timer ticks (divide-by-16) in 10 ms of TSC time, `khz` being the TSC
+/// frequency. Shortest of three windows, as `calibrate_pit`. `None` if the
+/// counter did not move.
+unsafe fn calibrate_apic_tsc(khz: u64) -> Option<u32> {
+    let span = khz * 10; // TSC cycles in 10 ms
+    let mut best: Option<u32> = None;
+    for _ in 0..3 {
+        apic::write(apic::LAPIC_TIMER_DIV, 0x3);
+        apic::write(apic::LAPIC_LVT_TIMER, (1 << 16) | 0xFF);
+        apic::write(apic::LAPIC_TIMER_INIT, 0xFFFF_FFFF);
+        let start = apic::read(apic::LAPIC_TIMER_CURR);
+        let t0 = rdtsc();
+        while rdtsc().wrapping_sub(t0) < span { core::hint::spin_loop(); }
+        let end = apic::read(apic::LAPIC_TIMER_CURR);
+        apic::write(apic::LAPIC_LVT_TIMER, (1 << 16) | 0xFF);
+        let d = start.wrapping_sub(end);
+        if d == 0 { return None; }
+        best = Some(best.map_or(d, |b| b.min(d)));
     }
     best
 }
@@ -366,6 +449,9 @@ pub unsafe fn init() {
     // 10 ms = 625_000 ticks.
     let ticks_10ms = match pit {
         Some((apic, _)) if apic != 0 => apic,
+        // No PIT (Nitro): measure the APIC timer against the TSC, whose
+        // frequency a leaf or kvmclock stated.
+        _ if src != TscSource::None => calibrate_apic_tsc(khz).unwrap_or(625_000),
         _ => 625_000,
     };
 
