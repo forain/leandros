@@ -145,7 +145,10 @@ pub(crate) fn set_lo(ns: u16, up: bool) {
         st.sids.insert(0, sid as Sid);
         sid as Sid
     };
-    *crate::STACKS[sid as usize].lock() = Some(crate::make_loopback_stack());
+    let mut st = crate::make_loopback_stack();
+    st.interface.set_pmtu_scope(sid as u16);
+    smoltcp::pmtu::clear_scope(sid as u16);
+    *crate::STACKS[sid as usize].lock() = Some(st);
 }
 
 /// Daemon pass: free the vifs and stacks of every namespace that died. A
