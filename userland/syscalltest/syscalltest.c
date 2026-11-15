@@ -2696,6 +2696,15 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--comm-check")) return comm_check();
+    if (argc > 1 && !strcmp(argv[1], "--pidfd-wake-loop")) {
+        /* Flake hunter: --pidfd-wake-loop <runs> [cpu-hogs] */
+        int runs = argc > 2 ? atoi(argv[2]) : 10, hogs = argc > 3 ? atoi(argv[3]) : 0;
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        for (int i = 0; i < hogs; i++) if (fork() == 0) { for (;;) __asm__ volatile(""); }
+        for (int i = 0; i < runs; i++) pidfd_wake_conmon();
+        signal(SIGTERM, SIG_IGN); kill(0, SIGTERM);
+        return 0;
+    }
     const char *dirs[8];
     int ndirs = 0;
     int o;
