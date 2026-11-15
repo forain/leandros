@@ -221,7 +221,7 @@ SUITES = {
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
-                "host:uartgaptest.py", "host:nvmemsixtest.py",
+                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
