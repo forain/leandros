@@ -59,7 +59,7 @@ You provide:
 
 ## ENA network driver and LLQ
 
-The ENA driver (`drivers/src/ena.rs`, core in `ena_hw.rs`) is polled and brings up one TX and one RX
+The ENA driver (`drivers/src/ena.rs`, core in `ena_hw.rs`) brings up one TX and one RX
 queue pair. If the device offers the **low-latency queue** (`GET_FEATURE LLQ`) and BAR2 maps, TX
 uses device placement: each frame is one 128-byte entry (two descriptors, then up to 96 bytes of
 header) written to BAR2, mapped write-combining (x86_64 PAT WC, aarch64 Normal-NC), followed by a
@@ -68,6 +68,27 @@ memory. Entry size falls back to 256 or 192 bytes per the caps. If the device ha
 usable layout, no BAR2, refuses the device-placement queue, or the cmdline has `ena.llq=0`, TX uses
 host placement. The boot log prints `[ena] LLQ active: ...` or the reason it is not used; the same
 facts are in `/proc/net/nic`.
+
+**Interrupts (MSI-X).** On x86_64 the driver programs two MSI-X entries: entry 0 carries the
+admin/AENQ interrupt, entry 1 the IO queue pair (both CQs are created with `interrupt_mode_enabled`
+and that vector). The ISR only counts and wakes the network daemon; the device masks the vector after
+firing, and the daemon's `rx_rearm` unmasks it through the CQ's interrupt-unmask register (bit 30)
+after draining the ring, then re-checks for frames that slipped in (NAPI style). Polling remains the
+fallback: `ena.msix=0`, no MSI-X capability or fewer than two entries, the device refusing an
+interrupt-mode CQ or giving no unmask register (the bring-up is redone polled), and aarch64 until the
+GICv3 ITS lane lands (`MsixTable::enable` returns `Unsupported`; the same code lights up once it
+succeeds). The boot log prints `[ena] MSI-X active: ...` or `polled completions (...)`;
+`/proc/net/nic` shows `irq_mode`, `irqs_mgmt` and `irqs_io`. Verified on the mock only, like the rest
+of the driver (`drivers/ena-tests`: vector assignment, unmask doorbells, completion-driven wakeups,
+10k-frame loopback without a lost wakeup, both fallbacks, reset recovery).
+
+**NVMe interrupts.** The NVMe driver also supports one MSI-X vector (admin + I/O CQ) on x86_64. It
+is opt-in with `nvme.msix=1` (polling stays the default: on QEMU, with and without an IOPS
+throttle, the interrupt path used no less CPU than the polled slices; real EBS latency is unmeasured). The first 200 us of a command still spin; after that a
+sleeping waiter parks until the interrupt, with a 2 ms safety wake that re-checks the CQ so a lost
+interrupt cannot hang I/O. The boot log shows `MSI-X vector 0 -> IDT vector ...` and the power-off
+statistics print `MSI-X interrupts since boot`. Test: `python3 .claude/skills/run-leandros/nvmemsixtest.py`
+(QEMU `-device nvme`, x86_64).
 
 **Caveat: unproven on real hardware.** There is no QEMU ENA model. The register, admin command,
 descriptor and LLQ entry layouts (including the meta descriptor, the header-length field and the
