@@ -64,11 +64,12 @@ class Ssh:
         os.chmod(self.askpass, 0o700)
         self.known = os.path.join(tmp, "known_hosts")
         self.key = os.path.join(tmp, "id_ed25519")
+        self.proxy = None  # ProxyCommand reaching a second sshd through the first one
 
     def base_opts(self):
         return ["-F", "/dev/null", "-o", "StrictHostKeyChecking=no",
                 "-o", f"UserKnownHostsFile={self.known}", "-o", "ConnectTimeout=20",
-                "-o", "LogLevel=ERROR"]
+                "-o", "LogLevel=ERROR", *(["-o", f"ProxyCommand={self.proxy}"] if self.proxy else [])]
 
     def pw_opts(self):
         return self.base_opts() + ["-o", "PreferredAuthentications=password,keyboard-interactive",
@@ -599,6 +600,245 @@ def accounts_extra(ssh, user, pw, tmp):
     sudo_write(ssh, user, pw, "/etc/shadow", orig)
 
 
+SSHD2_PORT = 2222
+SSHD2_BIN = os.environ.get("SSHDCFG_BIN", "/usr/sbin/sshd")
+
+
+def sshd2_start(ssh, user, pw, conf):
+    """(Re)start a second sshd (root, port 2222, config `conf`) in the guest; True when it listens."""
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", conf)
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg-start.sh", "\n".join([
+        "trap '' HUP",  # the ssh session's hangup must not take the daemon down (no setsid in the guest)
+        "kill $(cat /tmp/sshdcfg.pid 2>/dev/null) 2>/dev/null; sleep 1",
+        ": > /tmp/sshdcfg.log",
+        f"{SSHD2_BIN} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
+        "echo $! > /tmp/sshdcfg.pid",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do grep -q ready /tmp/sshdcfg.log && exit 0; sleep 1; done; exit 1",
+    ]))
+    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshdcfg-start.sh")
+    if rc != 0:
+        _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log /tmp/sshdcfg-start.sh")
+        print(f"sshdcfg: second sshd did not start: rc={rc} out={out.strip()[-200:]!r} err={err.strip()[-200:]!r} log={lg[-600:]!r}", flush=True)
+    return rc == 0
+
+
+def cert_run(ssh2, user, ukey, cert, cmd, extra=()):
+    argv = ["ssh", *ssh2.base_opts(), "-o", "PreferredAuthentications=publickey", "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes", "-i", ukey, *(["-o", f"CertificateFile={cert}"] if cert else []), *extra,
+            "-p", str(ssh2.port), f"{user}@{ssh2.host}", cmd]
+    r = subprocess.run(argv, capture_output=True, timeout=90, stdin=subprocess.DEVNULL)
+    return r.returncode, r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
+
+
+def sshdcfg(ssh, user, pw, tmp):
+    """sshd_config Match blocks, ForceCommand, AllowTcpForwarding and user certificates
+    (TrustedUserCAKeys, authorized_keys cert-authority), on a second sshd (port 2222) reached
+    through the first one with ProxyCommand -W."""
+    import socket
+    import threading
+    pub = open(ssh.key + ".pub").read().strip()
+    set_keys(ssh, user, pw, pub)
+    global SSHD2_BIN
+    if os.environ.get("SSHDCFG_UPLOAD"):  # fail-first runs: test another sshd build as the second daemon
+        with open(os.environ["SSHDCFG_UPLOAD"], "rb") as f:
+            ssh.run(user, "cat > /tmp/sshd-under-test && chmod 755 /tmp/sshd-under-test", key=True, stdin=f.read(), timeout=300)
+        SSHD2_BIN = "/tmp/sshd-under-test"
+    ssh2 = Ssh("127.0.0.1", SSHD2_PORT, tmp)
+    ssh2.key = ssh.key
+    ssh2.known = os.path.join(tmp, "known_hosts2")
+    ssh2.askpass = ssh.askpass
+    ssh2.proxy = " ".join(["ssh", *ssh.key_opts(), "-p", str(ssh.port), "-W", "%h:%p", f"{user}@{ssh.host}"])
+    base = "HostKey /etc/ssh/ssh_host_ed25519_key\nPermitRootLogin no\nPasswordAuthentication yes\nPubkeyAuthentication yes\n"
+
+    def conf(extra):
+        ok = sshd2_start(ssh, user, pw, base + extra)
+        if not ok:
+            step("cfg_second_sshd_starts", False, extra[:80].replace("\n", "|"))
+        return ok
+
+    def login(cmd="id -un", password=False):
+        if password:
+            return ssh2.run(user, cmd, password=pw)
+        return ssh2.run(user, cmd, key=True)
+
+    rc, gname, _ = ssh.run(user, "id -gn", key=True)
+    gname = gname.strip() or user
+
+    # --- Match blocks, ForceCommand ---------------------------------------
+    if not conf("Match User nobody-such\n  PasswordAuthentication no\n"):
+        return
+    rc, out, err = login(password=True)
+    step("cfg_match_user_other_keeps_password", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("Match User " + user + "\n  PasswordAuthentication no\n")
+    rc, out, err = login(password=True)
+    step("cfg_match_user_disables_password", rc == 255, f"rc={rc}")
+    rc, out, err = login()
+    step("cfg_match_user_pubkey_still_ok", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("Match User !" + user + "\n  PasswordAuthentication no\n")
+    rc, out, err = login(password=True)
+    step("cfg_match_user_negation", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("PasswordAuthentication no\nMatch User " + user + "\n  PasswordAuthentication yes\n")
+    rc, out, err = login(password=True)
+    step("cfg_match_overrides_global", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("PubkeyAuthentication no\nMatch User " + user + "\n  PubkeyAuthentication yes\n")
+    rc, out, err = login()
+    step("cfg_match_enables_pubkey", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    conf(f"Match Group {gname}\n  ForceCommand echo grp-forced\n")
+    rc, out, err = login()
+    step("cfg_match_group", out.strip() == "grp-forced", f"rc={rc} out={out.strip()!r}")
+    conf("Match Address 127.0.0.0/8\n  ForceCommand echo addr-forced\n")
+    rc, out, err = login()
+    step("cfg_match_address", out.strip() == "addr-forced", f"rc={rc} out={out.strip()!r}")
+    conf("Match Address 10.99.*,!10.99.1.1\n  ForceCommand echo addr-forced\n")
+    rc, out, err = login()
+    step("cfg_match_address_miss", rc == 0 and out.strip() == user, f"rc={rc} out={out.strip()!r}")
+    conf(f"Match User {user} LocalPort {SSHD2_PORT}\n  ForceCommand echo lp-forced\nMatch User {user} LocalPort 1\n  ForceCommand echo wrong\n")
+    rc, out, err = login()
+    step("cfg_match_localport_all_criteria", out.strip() == "lp-forced", f"rc={rc} out={out.strip()!r}")
+    conf(f"Match User {user} LocalPort 1\n  ForceCommand echo wrong\nMatch all\n  ForceCommand echo all-forced\n")
+    rc, out, err = login()
+    step("cfg_match_all", out.strip() == "all-forced", f"rc={rc} out={out.strip()!r}")
+    conf(f"Match User {user}\n  ForceCommand echo first\nMatch all\n  ForceCommand echo second\n")
+    rc, out, err = login()
+    step("cfg_match_first_value_wins", out.strip() == "first", f"rc={rc} out={out.strip()!r}")
+    conf("ForceCommand echo orig=$SSH_ORIGINAL_COMMAND\n")
+    rc, out, err = login("hello world")
+    step("cfg_forcecommand_original_command", out.strip() == "orig=hello world", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = sudo_sh(ssh, user, pw, f"printf 'Match Bogus x\\\\n' > /tmp/sshdcfg-bad.conf; {SSHD2_BIN} -t -f /tmp/sshdcfg-bad.conf")
+    step("cfg_match_bad_criterion_rejected", rc != 0, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    # --- AllowTcpForwarding -----------------------------------------------
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    echo_port = srv.getsockname()[1]
+
+    def echo():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                c.sendall(c.recv(256))
+            except OSError:
+                pass
+            c.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+
+    def can_local():  # -L to the guest's own port 22 (the target is resolved by the guest)
+        lp = free_port()
+        p = fwd_client(ssh2, user, "-L", f"{lp}:127.0.0.1:22")
+        got = tcp_exchange(lp, want=b"SSH-", wait=15)
+        stop(p)
+        return got.startswith(b"SSH-")
+
+    def can_remote():  # -R on the second sshd, read back through a -L on the first
+        rp, lp = free_port(), free_port()
+        p = fwd_client(ssh2, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
+        p2 = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:{rp}")
+        got = tcp_exchange(lp, payload=b"ping-R\n", want=b"ping-R", wait=15)
+        stop(p)
+        stop(p2)
+        return b"ping-R" in got
+
+    for mode, want_l, want_r in (("yes", True, True), ("all", True, True), ("local", True, False),
+                                 ("remote", False, True), ("no", False, False)):
+        conf(f"AllowTcpForwarding {mode}\n")
+        l, r = can_local(), can_remote()
+        step(f"cfg_allowtcpforwarding_{mode}", (l, r) == (want_l, want_r), f"local={l} remote={r}")
+    conf(f"AllowTcpForwarding yes\nMatch User {user}\n  AllowTcpForwarding local\n")
+    l, r = can_local(), can_remote()
+    step("cfg_allowtcpforwarding_match", (l, r) == (True, False), f"local={l} remote={r}")
+    set_keys(ssh, user, pw, pub)
+    conf("AllowTcpForwarding no\n")  # the key allows forwarding, the config does not
+    l, r = can_local(), can_remote()
+    set_keys(ssh, user, pw, f"no-port-forwarding {pub}")
+    conf("AllowTcpForwarding yes\n")  # the key forbids it, the config allows
+    l2 = can_local()
+    set_keys(ssh, user, pw, pub)
+    step("cfg_allowtcpforwarding_most_restrictive", not l and not r and not l2, f"cfg_no: l={l} r={r} key_no: l={l2}")
+    srv.close()
+
+    # --- user certificates --------------------------------------------------
+    def keygen(*a):
+        return subprocess.run(["ssh-keygen", "-q", "-N", "", *a], capture_output=True).returncode == 0
+
+    ca, ca2, uk = (os.path.join(tmp, n) for n in ("ca", "ca2", "ukey"))
+    ok = keygen("-t", "ed25519", "-f", ca) and keygen("-t", "ed25519", "-f", ca2) and keygen("-t", "ed25519", "-f", uk)
+
+    def sign(n, caf=ca, principals=user, *opts):
+        cp = os.path.join(tmp, f"{n}.pub")
+        shutil.copy(uk + ".pub", cp)
+        r = subprocess.run(["ssh-keygen", "-q", "-s", caf, "-I", n, "-n", principals, *opts, cp], capture_output=True)
+        return os.path.join(tmp, f"{n}-cert.pub") if r.returncode == 0 else None
+
+    if not ok:
+        step("cert_keygen", False, "ssh-keygen failed")
+        return
+    cap = open(ca + ".pub").read().strip()
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg-ca.pub", cap)
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ok"), "id -un")
+    step("cert_trusted_ca_login", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, None, "id -un")
+    step("cert_bare_key_refused", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("badp", ca, "someoneelse"), "id -un")
+    step("cert_wrong_principal", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("two", ca, f"x,{user},y"), "id -un")
+    step("cert_principal_in_list", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("exp", ca, user, "-V", "20200101:20200102"), "id -un")
+    step("cert_expired", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("future", ca, user, "-V", "20990101:20991231"), "id -un")
+    step("cert_not_yet_valid", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("other", ca2), "id -un")
+    step("cert_untrusted_ca", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("fc", ca, user, "-O", "force-command=echo cert-forced"), "id -un")
+    step("cert_force_command", out.strip() == "cert-forced", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("srcno", ca, user, "-O", "source-address=10.99.0.0/16"), "id -un")
+    step("cert_source_address_refused", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("srcok", ca, user, "-O", "source-address=127.0.0.0/8"), "id -un")
+    step("cert_source_address_allowed", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("unk", ca, user, "-O", "critical:xyz=1"), "id -un")
+    step("cert_unknown_critical_option", rc == 255, f"rc={rc}")
+    c = sign("hostc", ca, user, "-h")
+    rc, out, err = cert_run(ssh2, user, uk, c, "id -un") if c else (255, "", "")
+    step("cert_host_cert_refused", rc == 255, f"rc={rc}")
+    for kt in ("ecdsa", "rsa"):
+        k2 = os.path.join(tmp, "uk-" + kt)
+        if keygen("-t", kt, "-f", k2):
+            subprocess.run(["ssh-keygen", "-q", "-s", ca, "-I", kt, "-n", user, k2 + ".pub"], capture_output=True)
+            rc, out, err = cert_run(ssh2, user, k2, k2 + "-cert.pub", "id -un")
+            step(f"cert_{kt}_user_key", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    # authorized_keys cert-authority
+    conf("")
+    set_keys(ssh, user, pw, f"{pub}\ncert-authority {cap}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak1"), "id -un")
+    step("cert_authority_line_login", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, ca, None, "id -un")
+    step("cert_authority_key_is_not_a_login_key", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak2", ca2), "id -un")
+    step("cert_authority_other_ca_refused", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, f'{pub}\ncert-authority,principals="deploy,ops-*" {cap}')
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak3", ca, "deploy"), "id -un")
+    step("cert_authority_principals_option", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak4", ca, user), "id -un")
+    step("cert_authority_principals_excludes_username", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, f'{pub}\ncert-authority,from="10.99.*" {cap}')
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak5"), "id -un")
+    step("cert_authority_from_option", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, f'{pub}\ncommand="echo line-forced",cert-authority {cap}')
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak6"), "id -un")
+    step("cert_authority_command_option", out.strip() == "line-forced", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak7", ca, user, "-O", "force-command=echo other"), "id -un")
+    step("cert_force_command_conflict", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, pub)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
+
+
 def main(argv):
     full_mode = "--full" in argv
     user, pw = "leandro", "leandro"
@@ -624,6 +864,7 @@ def main(argv):
     options(ssh, user, pw, tmp)
     forwarding(ssh, user, pw, tmp)
     accounts_extra(ssh, user, pw, tmp)
+    sshdcfg(ssh, user, pw, tmp)
     if full_mode:
         full(ssh, user, pw, tmp)
     shutil.rmtree(tmp, ignore_errors=True)
