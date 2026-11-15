@@ -74,6 +74,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **zig to clang** migration (est. 2-4 days, not started).
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
+- **Unpushed sibling-repo fix**: `sync FILE` → fsync lives in `../coreutils` commit 24b9372 (main, ahead of origin by 1). Push it together with the next leandros push. The box's `leandros-siblings/coreutils` has the same diff only as an uncommitted change, so a reset there silently reverts `sync FILE` to a whole-system sync (the `syncfile` regress suite catches it).
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
 
