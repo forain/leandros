@@ -60,6 +60,8 @@ pub struct Config {
     pub authorized_keys_file: String,
     pub sftp_server: Option<String>,
     pub max_auth_tries: usize,
+    /// `PermitUserEnvironment yes`: honor `environment=` options of authorized_keys lines.
+    pub permit_user_environment: bool,
     pub login_grace_secs: u64,
     /// `MaxStartups start:rate:full` — unauthenticated connections: above
     /// `start` new ones are dropped with probability `rate`% rising linearly
@@ -80,6 +82,7 @@ impl Default for Config {
             authorized_keys_file: ".ssh/authorized_keys".into(),
             sftp_server: Some("/usr/lib/ssh/sftp-server".into()),
             max_auth_tries: 6,
+            permit_user_environment: false,
             login_grace_secs: 120,
             max_startups: (10, 30, 100),
         }
@@ -138,6 +141,7 @@ fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
                     _ => return Err(err(format!("unsupported Subsystem {val}"))),
                 }
             }
+            "permituserenvironment" => cfg.permit_user_environment = yes_no(val, "PermitUserEnvironment")?,
             "maxauthtries" => {
                 cfg.max_auth_tries = val.parse().map_err(|_| err(format!("bad MaxAuthTries {val}")))?
             }
@@ -365,6 +369,7 @@ async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
     }
     if cfg.password_auth {
         methods.push(MethodKind::Password);
+        methods.push(MethodKind::KeyboardInteractive);
     }
     let rcfg = Arc::new(russh::server::Config {
         server_id: russh::SshId::Standard("SSH-2.0-LeandrOS_sshd_russh-0.64".into()),
