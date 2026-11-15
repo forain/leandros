@@ -725,7 +725,11 @@ static int tun6_l3_cases(void)
         int r = socket(AF_INET6, SOCK_DGRAM, 0);
         struct sockaddr_in6 me = { .sin6_family = AF_INET6, .sin6_port = htons(7778) };
         inet_pton(AF_INET6, "fd00:8::1", &me.sin6_addr);
-        struct sockaddr_in6 any = me; any.sin6_addr = in6addr_any; /* a fresh netns has lo down: only the wildcard binds */
+        {   /* a fresh netns has lo down: only the wildcard binds until it is up */
+            int ls = socket(AF_INET, SOCK_DGRAM, 0); struct ifreq lr; memset(&lr, 0, sizeof lr); strcpy(lr.ifr_name, "lo");
+            ioctl(ls, SIOCGIFFLAGS, &lr); lr.ifr_flags |= IFF_UP; ioctl(ls, SIOCSIFFLAGS, &lr); close(ls);
+        }
+        struct sockaddr_in6 any = me;
         CHECK("tun6_bind", bind(r, (struct sockaddr *)&any, sizeof any) == 0);
         unsigned char pk[4 + 40 + 8 + 2]; memset(pk, 0, sizeof pk);
         pk[2] = 0x86; pk[3] = 0xdd;

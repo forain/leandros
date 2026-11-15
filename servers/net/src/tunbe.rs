@@ -475,7 +475,7 @@ const IFA_F_TENTATIVE: u32 = 0x40;
 const IFA_F_DADFAILED: u32 = 0x800;
 #[derive(Clone, Copy, PartialEq)]
 enum DadSt { New, Sent(u64), Done, Failed }
-struct Dad { sid: Sid, addr: [u8; 16], st: DadSt }
+struct Dad { sid: Sid, addr: [u8; 16], st: DadSt, nodad: bool }
 static DAD: Mutex<Vec<Dad>> = Mutex::new(Vec::new());
 
 fn dad_state(sid: Sid, addr: &[u8; 16]) -> DadSt {
@@ -494,8 +494,8 @@ fn dad_flags(sid: Sid, addr: &[u8; 16]) -> u32 {
 pub(crate) fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
     let (all, dad) = all6_of(sid);
     let mut t = DAD.lock();
-    if !dad { t.retain(|d| d.sid != sid); return all; }
-    for &(a, _) in &all { if !t.iter().any(|d| d.sid == sid && d.addr == a) { t.push(Dad { sid, addr: a, st: DadSt::New }); } }
+    if !dad { t.retain(|d| d.sid != sid || d.nodad); return all; }
+    for &(a, _) in &all { if !t.iter().any(|d| d.sid == sid && d.addr == a) { t.push(Dad { sid, addr: a, st: DadSt::New, nodad: false }); } }
     t.retain(|d| d.sid != sid || all.iter().any(|&(a, _)| a == d.addr));
     all.into_iter().filter(|&(a, _)| t.iter().find(|d| d.sid == sid && d.addr == a).map_or(true, |d| d.st == DadSt::Done)).collect()
 }
@@ -716,7 +716,7 @@ fn rtnl_addr6(ns: u16, op: RtOp) -> Option<i32> {
             if x.addrs6.iter().any(|&(a, _)| a == addr) { return Some(if excl { 17 } else { 0 }); }
             if x.addrs6.len() >= 5 { return Some(105); }
             x.addrs6.push((addr, prefix));
-            if nodad { DAD.lock().push(Dad { sid, addr, st: DadSt::Done }); }
+            if nodad { DAD.lock().push(Dad { sid, addr, st: DadSt::Done, nodad: true }); }
         } else {
             let Some(i) = x.addrs6.iter().position(|&(a, p)| a == addr && (prefix == 0 || p == prefix)) else { return Some(99) };
             let gone = x.addrs6.remove(i).0;
