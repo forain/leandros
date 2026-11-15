@@ -115,6 +115,26 @@ SYSFS_CHECK = (
     "test $__f = 0"
 )
 
+# `sync FILE` is fsync(FILE), not sync(): on f2fs it must not take a checkpoint
+# (/proc/f2fsstat cp_total), bare `sync` must; an unopenable file exits 1 and the
+# others are still synced (lane syncfile).
+SYNCFILE_CHECK = (
+    "__f=0; cpt() { while read k v; do [ \"$k\" = cp_total ] && echo $v; done < /proc/f2fsstat; }; "
+    "t() { eval \"$2\" >/dev/null 2>&1 && echo \"syncfile: $1: PASS\" || { echo \"syncfile: $1: FAIL\"; __f=1; }; }; "
+    "echo data > /home/.syncf1; echo data > /home/.syncf2; "
+    "ok=0; for i in 1 2 3 4 5; do sync; sleep 1; echo x >> /home/.syncf1; a=$(cpt); sync /home/.syncf1 /home/.syncf2; b=$(cpt); "
+    "[ -n \"$a\" ] && [ \"$a\" = \"$b\" ] && { ok=1; break; }; done; "
+    "t file_no_checkpoint '[ $ok = 1 ]'; "
+    "t data_no_checkpoint 'sync -d /home/.syncf1 && [ \"$(cpt)\" = \"$b\" ]'; "
+    "t fs_ok 'sync -f /home/.syncf1'; "
+    "sync /home/.nosuch /home/.syncf1; rc=$?; "
+    "t missing_rc1 '[ $rc = 1 ]'; "
+    "echo more >> /home/.syncf1; sync; c=$(cpt); "
+    "t bare_checkpoint '[ \"$c\" -gt \"$b\" ]'; "
+    "rm -f /home/.syncf1 /home/.syncf2; "
+    "test $__f = 0"
+)
+
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
@@ -123,6 +143,7 @@ SUITES = {
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
+                SYNCFILE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
@@ -386,6 +407,7 @@ SUITES = {
     # Synthetic sysfs: /sys/class/{drm,input} and the /sys/dev/char node
     # identity libdrm/udev consumers read (lane sysfs).
     "sysfs": [SYSFS_CHECK],
+    "syncfile": [SYNCFILE_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
