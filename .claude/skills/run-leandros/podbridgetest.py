@@ -244,10 +244,10 @@ def main():
             rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} traceroute6 -n -m 1 -q 1 -w 4 2001:4860:4860::8888 2>&1")
-        # KNOWN-OPEN (TODO.md IPv6 item): Time Exceeded for forwarded v6 flows is not delivered yet; non-gating.
+        # Time Exceeded for a forwarded flow (fwd6::time_exceeded) reaches traceroute6's raw ICMPv6 socket,
+        # which never sent anything itself: the first hop prints an address.
         te_ok = re.search(r"^\s*1\s+[0-9a-f]+:[0-9a-f:]+\s", out, re.M) is not None
-        if v6ok:
-            print(f"podman_v6_time_exceeded: {'PASS' if te_ok else 'KNOWN-OPEN'} rc={rc} " + out.strip()[-120:].replace("\n", " | "), flush=True)
+        check6("podman_v6_time_exceeded", te_ok, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         # ---- L9 phase 2 (ip6dnat): DNAT66 for a published port -----------------------------
         rc, o6 = run("cat /proc/net/if_inet6")
         m6 = re.search(r"^([0-9a-f]{32}) 02 40 00 \w+\s+eth0", o6, re.M)
@@ -273,6 +273,21 @@ def main():
         ct1 = ctn()
         check6("podman_v6_leaks", ct0 >= 0 and ct1 <= ct0, f"conntrack {ct0} -> {ct1}")
 
+        # ---- aardvark-dns: a DNS-enabled custom network (the other cases use --disable-dns) ----------
+        run("podman rm -af >/dev/null 2>&1; podman network rm -f pbdns >/dev/null 2>&1; podman network create pbdns 2>&1")
+        rc, out = run(f"podman run -d --network pbdns --name dnssrv {IMG} sleep 120 2>&1; sleep 2")
+        check("podman_dns_start", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        rc, out = run(f"podman run --rm --network pbdns {IMG} nslookup dnssrv 2>&1")
+        # KNOWN-OPEN (TODO.md IPv6 item): the daemonized aardvark-dns that netavark starts is gone (pid file left,
+        # no :53 listener) by the time the first container resolves a name, so the query is refused.
+        dns_ok = rc == 0 and re.search(r"Address.*\d+\.\d+\.\d+\.\d+", out) is not None
+        print(f"podman_dns_resolve: {'PASS' if dns_ok else 'KNOWN-OPEN'} rc={rc} " + out.strip()[-160:].replace("\n", " | "), flush=True)
+        if not dns_ok:
+            rc2, dg = run("ps | grep [a]ardvark; cat /run/containers/networks/aardvark-dns/pbdns 2>&1; netstat -lnu 2>&1 | grep ':53 '; ip -4 addr show 2>&1 | grep -A1 podman; ls /run/containers/networks/aardvark-dns 2>&1; cat /run/containers/networks/aardvark-dns/aardvark.pid; ls -l /proc/$(cat /run/containers/networks/aardvark-dns/aardvark.pid)/exe 2>&1; ls /var/log/aardvark* 2>&1; (RUST_LOG=trace timeout 4 /usr/libexec/podman/aardvark-dns --config /run/containers/networks/aardvark-dns -p 53 run 2>&1 | tail -n 14); netstat -lnu 2>&1 | grep ':53 '")
+            print("DIAG dns:\n" + dg[-1500:])
+        rc, out = run(f"podman run --rm --network pbdns {IMG} true 2>&1")
+        check("podman_dns_rm_teardown", rc == 0 and "rror" not in out, f"rc={rc} " + out.strip()[-300:].replace("\n", " | "))
+        run("podman rm -f dnssrv >/dev/null 2>&1; podman network rm -f pbdns >/dev/null 2>&1")
         rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
         bl = out.strip().splitlines()[-1:] 
         base_mnt = int(bl[0]) if bl and bl[0].isdigit() else 0
