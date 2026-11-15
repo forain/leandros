@@ -2265,6 +2265,19 @@ fn out_fence_service() -> bool {
     complete
 }
 
+/// Signal every out-fence fd whose fence the floor has already passed, now,
+/// from task context. A CPU wait on a fence (FENCE_FD_IN) returns as soon as
+/// the floor passes it, but the fence's own fd is only signalled by the next
+/// `gpu_fence_event` tick, so without this the fd could still read "pending"
+/// after the wait that proved it done (seen on Venus, where the host retires
+/// instantly: FENCE_FD_IN_WAITS). Retries a few times if the VFS is contended.
+pub fn out_fence_flush() {
+    for _ in 0..8 {
+        if out_fence_service() { return; }
+        ::core::hint::spin_loop();
+    }
+}
+
 // ── Fence waiters (VIRTGPU_WAIT without NOWAIT) ──────────────────────────────
 //
 // Parked with the poll-channel protocol on this tag; `gpu_fence_event` wakes
