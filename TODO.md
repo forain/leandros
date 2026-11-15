@@ -48,7 +48,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
 - **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
 - **Replace the C `libpam.so.0` shim** with a Rust cdylib or Linux-PAM (decision open; guard must show wrong passwords rejected).
-- **VT console**: TAB advance and double-width glyphs.
+- **VT console glyphs**: double-width characters (CJK, emoji) draw as a placeholder box; no CJK/emoji font on the console (fullwidth ASCII U+FF01..FF5E does draw). Combining marks are dropped, not composed.
 - **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups, utmp/lastlog; password hashes are single-pass salted SHA-256.
 
 ### Network / Wi-Fi

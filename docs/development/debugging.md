@@ -140,3 +140,12 @@ Kernel-side CPU questions — "is this process busy, or is the kernel busy on it
 - [Workflow](workflow.md) — the driver and the liveness tools.
 - [Kernel invariants](../kernel/invariants.md)
 - [Scheduler](../kernel/scheduler.md) — watchdog, lock tracking.
+
+## Console cell grid (`/proc/vtstat`)
+
+For every VT with a session, `/proc/vtstat` carries `vtcur <vt> <col> <row>` and
+`vtrow <vt> <r>: <hex code points>` (rows 0-3, 24 cells; `80000000` marks the
+right half of a double-width character). The framebuffer console understands
+TAB with stops (`ESC H`, `CSI g`, `CSI 3 g`, `CSI I`, `CSI Z`) and draws East
+Asian wide/fullwidth and emoji as two cells (placeholder box without a font);
+`vttest` asserts both through this file.
