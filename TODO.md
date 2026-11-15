@@ -43,7 +43,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Missing features
 
 ### Kernel
-- inotify L2/L3 (beyond the default-on L1).
+- inotify: no (dev, ino) identity yet (watches are path-keyed): no self events through a second hard link; fanotify absent.
 - **Interrupt paths**: virtio-input, virtio-net and the virtio-gpu control queue (MSI-X on x86_64, shared INTx SPI on aarch64) are interrupt-driven already. Still polled: virtio-blk (`wait_for_completion` busy-waits the used ring; callers include page faults with IRQs masked, so an IRQ/sleep path needs a masked-context fallback) and virtio-snd TX (reaped by the 100 Hz tick pump, which must run anyway to keep QEMU's stream queue non-empty, so an IRQ gains little).
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
 - **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
@@ -67,7 +67,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Sandbox follow-ups**: secirq, zaplog, credxlate residuals (`lane-secirq/zaplog/credxlate-2026-11-09.md`).
 
 ### Cloud
-- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): needs an ENA (Elastic Network Adapter) network driver, serial console on the EC2 console log, an AMI build/import flow (UEFI, Limine), and first-boot instance metadata (IMDSv2: SSH key, hostname). NVMe/EBS half done (lane nvmeebs: Amazon PCI-id quirks, 300 s stall cap, volume-id `/dev/disk/by-id/nvme-<model>_<serial>`, auto-writable root; QEMU-verified only, real Nitro untested; `/dev/disk/by-id` has no directory listing, only direct opens/stats; QEMU cannot set the EBS model string). Design: orch/designs/design-ec2.md (lane ec2).
+- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (image boots in QEMU as an NVMe-only UEFI disk, `--dry-run` tested; docs/hardware/aws-ec2.md); lane nvmeebs: Amazon NVMe quirks (PCI ids, 48-bit DMA, 300 s stall cap), `/dev/disk/by-id/nvme-<model>_<serial>` (direct opens only, no directory listing), auto-writable root disk; QEMU-verified, real Nitro untested, QEMU cannot set the EBS model string. Still needed: an ENA (Elastic Network Adapter) network driver, NVMe MSI-X (optional, driver polls), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
 
 ### Installer
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
