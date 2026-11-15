@@ -33,7 +33,7 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 **SSH** is a fourth way in. `/usr/sbin/sshd` ([../userland/programs.md](../userland/programs.md#sshd)) listens on `0.0.0.0:22` from boot.
 - It checks passwords against the same `/etc/shadow` hash as `/bin/login`, and keys against `~/.ssh/authorized_keys`.
 - It allows root to log in with a key but not with a password.
-- It forwards TCP (`-L`, `-R`) unless the key line has `no-port-forwarding`/`restrict`; `permitopen=`/`permitlisten=` restrict the destinations. The listener and all sessions still start as root (no privilege separation yet, see [../design/sshd-privsep.md](../design/sshd-privsep.md)): a bug in the pre-auth russh code runs as root.
+- It forwards TCP (`-L`, `-R`) unless the key line has `no-port-forwarding`/`restrict`; `permitopen=`/`permitlisten=` restrict the destinations. The listener and monitor run as root, but the russh network code runs in a per-connection child (uid 22, chroot `/var/empty`, no_new_privs, seccomp allow-list) that holds no host key; see [../design/sshd-privsep.md](../design/sshd-privsep.md).
 - Its children drop privilege the way `login` does (setgroups, then setresgid, then setresuid) and read the ids back.
 - The development passwords above are therefore reachable from the network wherever the VM's port 22 is. With SLIRP that is only the host's loopback, but with `socket_vmnet` or on real hardware it is the LAN. Change them, or disable sshd with `touch /etc/ssh/sshd_not_to_be_run`, before exposing a machine.
 
