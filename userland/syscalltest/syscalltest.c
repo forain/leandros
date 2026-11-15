@@ -134,14 +134,25 @@
 
 static int npass, nfail, nskip;
 
-static void pass(const char *n) { printf("%s: PASS\n", n); npass++; fflush(stdout); }
+static const char *volatile last_case = "(none)";
+static void pass(const char *n) { printf("%s: PASS\n", n); npass++; last_case = n; fflush(stdout); }
+/* A fatal signal used to show only as RC=139: name the case it hit in. */
+static void on_fatal(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    char b[200];
+    int l = snprintf(b, sizeof b, "syscalltest: FATAL signal %d code %d addr %p pid %d tid %ld after case %s\n",
+                     sig, si->si_code, si->si_addr, (int)getpid(), (long)syscall(SYS_gettid), last_case);
+    if (l > 0) write(1, b, (size_t)l);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 static void skip(const char *n, const char *why) { printf("%s: SKIP %s\n", n, why); nskip++; fflush(stdout); }
 static void fail(const char *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void fail(const char *n, const char *fmt, ...) {
     va_list ap;
     printf("%s: FAIL ", n);
     va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
-    printf("\n"); nfail++; fflush(stdout);
+    printf("\n"); nfail++; last_case = n; fflush(stdout);
 }
 
 static long long now_ms(void) {
@@ -867,6 +878,7 @@ static void pidfd_poll_exit(void) {
 static volatile int pw_stop;
 static pthread_t pw_tid[PW_WATCHERS];
 static volatile int pw_tid_ok[PW_WATCHERS];
+static volatile pid_t pw_ktid[PW_WATCHERS];
 static volatile int pw_bad;
 static char pw_msg[PW_WATCHERS][480];
 /* Per-watcher timeline written by the conmon child and grandchild into a
@@ -885,7 +897,11 @@ static void pw_urg(int s) { (void)s; }
 static void *pw_signaller(void *a) {
     (void)a;
     while (!pw_stop) {
-        for (int i = 0; i < PW_WATCHERS; i++) if (pw_tid_ok[i]) pthread_kill(pw_tid[i], SIGURG);
+        /* tgkill by kernel tid, not pthread_kill: a watcher may exit (and be
+         * joined, its pthread freed) between the check and the kill, and
+         * pthread_kill on a freed pthread_t is a use-after-free. A stale tid
+         * is just ESRCH. */
+        for (int i = 0; i < PW_WATCHERS; i++) { pid_t t = pw_ktid[i]; if (pw_tid_ok[i] && t > 0) syscall(SYS_tgkill, getpid(), t, SIGURG); }
         struct timespec ts = { 0, 5000000 };
         nanosleep(&ts, NULL);
     }
@@ -943,6 +959,7 @@ static void pw_conmon_child(struct pw_tl *tl) {
 static void *pw_watcher(void *arg) {
     int idx = (int)(intptr_t)arg;
     pw_tid[idx] = pthread_self();
+    pw_ktid[idx] = (pid_t)syscall(SYS_gettid);
     pw_tid_ok[idx] = 1;
     for (int it = 0; it < pw_iters && !pw_bad; it++) {
         struct pw_tl *tl = &pw_tl[idx];
@@ -2769,6 +2786,12 @@ int main(int argc, char **argv) {
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGALRM, on_alrm);
+    {
+        struct sigaction fa; memset(&fa, 0, sizeof fa);
+        fa.sa_sigaction = on_fatal; fa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        int fsig[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+        for (unsigned i = 0; i < sizeof fsig / sizeof fsig[0]; i++) sigaction(fsig[i], &fa, NULL);
+    }
     printf("syscalltest: uid %d, %ld cpus\n", (int)geteuid(), sysconf(_SC_NPROCESSORS_ONLN));
     /* argv[0] for the exec case: the path we were run by, or /proc/self/exe. */
     const char *self = strchr(argv[0], '/') ? argv[0] : "/proc/self/exe";
