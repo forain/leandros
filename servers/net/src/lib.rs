@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use ipc::Message;
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
-use smoltcp::socket::{tcp, udp, icmp};
+use smoltcp::socket::{tcp, udp, icmp, raw};
 use smoltcp::time::Instant;
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
@@ -2875,6 +2875,14 @@ fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
         if let Some(u) = udp::Socket::downcast_mut(sock) {
             if u.send_pending() { orphan = true; }
         }
+        // Same for a raw/ICMP socket: close() right after sendto must still
+        // transmit the queued packet (Linux sends synchronously).
+        if let Some(i) = icmp::Socket::downcast_mut(sock) {
+            if i.send_pending() { orphan = true; }
+        }
+        if let Some(r) = raw::Socket::downcast_mut(sock) {
+            if r.send_pending() { orphan = true; }
+        }
         if let Some(t) = tcp::Socket::downcast_mut(sock) {
             match t.state() {
                 tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived => {
@@ -2988,7 +2996,10 @@ fn reap_orphans(s: &mut NetStack) {
         let done = match set.iter().find(|(hh, _)| *hh == h).map(|(_, sk)| sk) {
             Some(sk) => match tcp::Socket::downcast(sk) {
                 Some(t) => matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait),
-                None => udp::Socket::downcast(sk).map_or(true, |u| !u.send_pending()),
+                None => if let Some(u) = udp::Socket::downcast(sk) { !u.send_pending() }
+                    else if let Some(i) = icmp::Socket::downcast(sk) { !i.send_pending() }
+                    else if let Some(r) = raw::Socket::downcast(sk) { !r.send_pending() }
+                    else { true },
             },
             None => return false,
         } || now >= deadline;

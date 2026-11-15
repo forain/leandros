@@ -557,6 +557,69 @@ static void tcp_shutdown(void) {
     else { printf("%s: half-close both ways, ENOTCONN on listener/unconnected\n", N); pass(N); }
 }
 
+/* Linux owns all of 127.0.0.0/8 on lo: TCP and UDP to 127.0.0.3/.5 work. */
+static void lo_slash8(void) {
+    const char *N = "lo_slash8";
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = sin4("127.0.0.3", 0);
+    if (l < 0 || bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) {
+        fail(N, "tcp listener on 127.0.0.3: %s", strerror(errno)); if (l >= 0) close(l); return;
+    }
+    char err[128];
+    int c = tcp_connect("127.0.0.3", local_port(l), 3000, err, sizeof err);
+    if (c < 0) { fail(N, "tcp connect 127.0.0.3: %s", err); close(l); return; }
+    struct pollfd p = { l, POLLIN, 0 };
+    poll(&p, 1, 2000);
+    int s = accept(l, NULL, NULL);
+    int ok = s >= 0 && send(c, "hi", 2, 0) == 2;
+    uint8_t b[8];
+    ssize_t n = ok ? read_some(s, b, sizeof b, 3000) : -1;
+    if (s >= 0) close(s);
+    close(c); close(l);
+    if (n != 2) { fail(N, "tcp 127.0.0.3: accept/echo n=%zd", n); return; }
+
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ua = sin4("127.0.0.5", 0);
+    socklen_t ul = sizeof ua;
+    if (u < 0 || bind(u, (struct sockaddr *)&ua, sizeof ua) < 0 || getsockname(u, (struct sockaddr *)&ua, &ul) < 0) {
+        fail(N, "udp bind 127.0.0.5: %s", strerror(errno)); if (u >= 0) close(u); return;
+    }
+    int t = socket(AF_INET, SOCK_DGRAM, 0);
+    if (t < 0 || sendto(t, "dg", 2, 0, (struct sockaddr *)&ua, sizeof ua) != 2) {
+        fail(N, "udp sendto 127.0.0.5: %s", strerror(errno)); if (t >= 0) close(t); close(u); return;
+    }
+    struct pollfd pu = { u, POLLIN, 0 };
+    poll(&pu, 1, 2000);
+    ssize_t un = recv(u, b, sizeof b, MSG_DONTWAIT);
+    close(t); close(u);
+    if (un != 2) fail(N, "udp 127.0.0.5: recv %zd (%s)", un, strerror(errno));
+    else { printf("%s: tcp 127.0.0.3 and udp 127.0.0.5 work\n", N); pass(N); }
+}
+
+/* close() right after sendto must still deliver the queued raw ICMP packet. */
+static void raw_close_delivers(void) {
+    const char *N = "raw_close_delivers";
+    int r = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (r < 0) {
+        if (errno == EPERM && geteuid() != 0) { skip(N, "(not root)"); return; }
+        fail(N, "socket: %s", strerror(errno)); return;
+    }
+    int t = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (t < 0) { fail(N, "socket2: %s", strerror(errno)); close(r); return; }
+    /* The raw socket is created by its first sendto and sees only the echo
+     * replies of its ident, so an observer sends first with the same ident. */
+    struct sockaddr_in to = sin4("127.0.0.1", 0);
+    uint16_t ident = (uint16_t)(getpid() ^ 0x5a00), seq = 0x5a5a;
+    if (send_echo(r, &to, ident, 1) < 0 || !wait_reply(r, 1, 2000)) {
+        fail(N, "observer echo to 127.0.0.1: %s", strerror(errno)); close(t); close(r); return;
+    }
+    if (send_echo(t, &to, ident, seq) < 0) { fail(N, "sendto: %s", strerror(errno)); close(t); close(r); return; }
+    close(t);
+    int got = wait_reply(r, seq, 2000);
+    close(r);
+    if (got) pass(N); else fail(N, "echo sent, then close()d: reply never arrived");
+}
+
 #ifndef SO_PROTOCOL
 #define SO_PROTOCOL 0x1022 /* macOS spelling */
 #endif
@@ -1154,6 +1217,8 @@ int main(int argc, char **argv) {
     tcp_dns(dns, name);
     tcp_http(http);
     tcp_shutdown();
+    lo_slash8();
+    raw_close_delivers();
     icmp_sockopt();
     tcp_nodelay();
     tcp_nodelay_latency(dns, rif);

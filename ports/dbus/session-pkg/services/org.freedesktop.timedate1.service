@@ -1,0 +1,4 @@
+# org.freedesktop.timedate1 for the COSMIC session: ports/sysbus (leandros-sysbus timedate1), activated by busd.
+[D-BUS Service]
+Name=org.freedesktop.timedate1
+Exec=/usr/libexec/leandros-sysbus timedate1

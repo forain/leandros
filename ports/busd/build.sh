@@ -49,7 +49,7 @@ VERSION=0.5.0
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="$HERE/.work"
 PKG="$HERE/../dbus/session-pkg"
-SHIP="$HOME/code/leandros-artifacts/m5-session-ship"
+SHIP="${LEANDROS_M5_SHIP:-$HOME/code/leandros-artifacts/m5-session-ship}"
 SRC="$WORK/busd-$VERSION"
 
 case "${1:-both}" in

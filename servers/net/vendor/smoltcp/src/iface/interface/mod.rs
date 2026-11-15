@@ -929,6 +929,10 @@ impl InterfaceInner {
     #[cfg(feature = "proto-ipv4")]
     #[allow(unused)]
     pub(crate) fn get_source_address_ipv4(&self, _dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
+        // LEANDROS: a loopback destination is its own source (Linux lo).
+        if _dst_addr.is_loopback() && self.has_ip_addr(*_dst_addr) {
+            return Some(*_dst_addr);
+        }
         for cidr in self.ip_addrs.iter() {
             #[allow(irrefutable_let_patterns)] // if only ipv4 is enabled
             if let IpCidr::Ipv4(cidr) = cidr {
@@ -1112,6 +1116,16 @@ impl InterfaceInner {
     /// Check whether the interface has the given IP address assigned.
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
+        // LEANDROS: an interface holding an IPv4 address in 127.0.0.0/8 owns
+        // the whole block, as Linux's lo does (127.0.0.3 is local).
+        #[cfg(feature = "proto-ipv4")]
+        if let IpAddress::Ipv4(a) = addr {
+            if a.is_loopback()
+                && self.ip_addrs.iter().any(|p| matches!(p.address(), IpAddress::Ipv4(q) if q.is_loopback()))
+            {
+                return true;
+            }
+        }
         self.ip_addrs.iter().any(|probe| probe.address() == addr)
     }
 

@@ -106,6 +106,10 @@ An inet (or ICMP) socket's object is a set of smoltcp handles named by value fro
 
 Until lane fdgaps (2026-10-13) a second copy meant a double free of the handles, so fork skipped inet and listening sockets (the child had no descriptor for them), `dup` answered `EINVAL` and `pidfd_getfd` / `SCM_RIGHTS` `EBADF`. Fork also inherits AF_UNIX listeners now (one more reference on the bound address). `syscalltest`'s `inet_fork_shared` and `pidfd_getfd_inet` cover it.
 
+### Loopback is all of 127.0.0.0/8
+
+The loopback interface owns the whole block, as Linux's `lo` does: the vendored smoltcp treats any `127.x.y.z` as a local address once the interface holds one, and a loopback destination is its own source address. TCP, UDP and ICMP to `127.0.0.3`/`127.0.0.5` work (nettest `lo_slash8`). `close()` right after `sendto` on a UDP, raw or ICMP socket keeps the socket as an orphan until its queued packet has left (`release_inet_socket`/`reap_orphans`; nettest `raw_close_delivers`).
+
 ### ICMP and ping
 
 Unprivileged `socket(AF_INET, SOCK_RAW)` is `EPERM`, as on Linux; `ping` ([`userland/ping`](../../userland/ping)) falls back to an `IPPROTO_ICMP` datagram socket. smoltcp's ICMP socket has no peek, so the server keeps **one stashed datagram per socket** (`icmp_peeked`, under the stack's own lock — no new lock, no lock-order edge): a peek stashes what it dequeues, a real read takes it, `FIONREAD` reports its length, readiness counts it, and closing the socket drops it (smoltcp reuses handles, so a stale stash would leak into the next socket). ICMP shares the UDP datagram path, so `recvmsg`/`sendmsg` move one datagram over all iovecs and fill `msg_name`; `SO_PROTOCOL` reports `IPPROTO_ICMP`.
