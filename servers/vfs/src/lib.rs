@@ -5303,6 +5303,19 @@ fn inotify_fd_event(pid: u32, fd: usize, mask: u32) {
     inotify::note_event(o, mask);
 }
 
+/// FAN_ACCESS_PERM gate of a read on `fd` (regular files and directories).
+fn fan_access_gate(pid: u32, fd: usize) -> bool {
+    if inotify_fd_ofd(pid, fd).is_none() { return true; }
+    let mut buf = alloc::vec![0u8; 4096];
+    let r = reply_val(&handle_fd_path(pid, fd, buf.as_mut_ptr() as usize, buf.len()));
+    if r <= 0 { return true; }
+    buf.truncate(r as usize);
+    if buf.ends_with(b" (deleted)") { return true; }
+    let p = tmpfs_path(&buf).unwrap_or_else(|| strip_trailing_slash(&buf)).to_vec();
+    let isdir = inotify_kind(&p) == Some(true);
+    inotify::fan_perm(&p, inotify::FAN_ACCESS_PERM, isdir)
+}
+
 /// Run `dispatch_inner` and, when a watch exists anywhere, emit the events a
 /// successful operation implies (design §2). Only reached when
 /// `inotify::armed()`. Events come from the VFS's own routing points, so one
@@ -5317,6 +5330,13 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
                 Some(p) if flags & (O_CREAT | O_TRUNC) != 0 => inotify_kind_if_watched(p),
                 _ => None,
             };
+            if perm_watched() && flags & O_PATH == 0 {
+                if let Some(p) = &path {
+                    if let Some(isdir) = inotify_kind(p) {
+                        if !fan_perm(p, FAN_OPEN_PERM, isdir) { return err_reply(-1); }
+                    }
+                }
+            }
             let r = dispatch_inner(msg, pid);
             let v = reply_val(&r);
             if let Some(p) = path {
@@ -5420,9 +5440,10 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
             }
             r
         }
-        VFS_READ | VFS_PREAD if access_watched() => {
+        VFS_READ | VFS_PREAD if access_watched() || perm_watched() => {
+            if perm_watched() && !fan_access_gate(pid, arg(msg, 0) as usize) { return err_reply(-1); }
             let r = dispatch_inner(msg, pid);
-            if reply_val(&r) > 0 { inotify_fd_event(pid, arg(msg, 0) as usize, IN_ACCESS); }
+            if access_watched() && reply_val(&r) > 0 { inotify_fd_event(pid, arg(msg, 0) as usize, IN_ACCESS); }
             r
         }
         VFS_CHMOD | VFS_LCHMOD | VFS_CHOWN | VFS_LCHOWN | VFS_UTIMENS | VFS_LUTIMENS
@@ -10501,6 +10522,17 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
         VnodeKind::DevFull => err_reply(-28), // ENOSPC
         VnodeKind::DevUrandom | VnodeKind::DevNull | VnodeKind::DevZero =>
             val_reply(count as u64),
+        // fanotify permission verdict: struct fanotify_response { s32 fd; u32 response }.
+        VnodeKind::Inotify { inst } if inotify::is_perm_group(*inst) => {
+            let inst = *inst;
+            drop(tbls);
+            if count < 8 { return err_reply(-22); }
+            let mut b = [0u8; 8];
+            if !sched::with_current_address_space(|as_| as_.read_user_buf(buf_ptr, &mut b)).unwrap_or(false) { return err_reply(-14); }
+            let fdv = i32::from_le_bytes(b[0..4].try_into().unwrap());
+            let resp = u32::from_le_bytes(b[4..8].try_into().unwrap());
+            match inotify::fan_verdict(inst, fdv, resp) { Ok(()) => val_reply(8), Err(e) => err_reply(e) }
+        }
         // See the read arm: locks dropped before I/O and before the user
         // buffer is read.
         VnodeKind::BlockDev { dev, pos } => {
@@ -13314,14 +13346,15 @@ fn handle_inotify_add(pid: u32, fd: usize, path_ptr: usize, mask: u32) -> Messag
 fn handle_fanotify_init(pid: u32, flags: u32, evflags: u32) -> Message {
     if !inotify_enabled() { return err_reply(-38); }
     // CLOEXEC | NONBLOCK, class NOTIF (0), UNLIMITED_QUEUE | UNLIMITED_MARKS.
-    // Permission classes and FID reporting are not implemented.
-    if flags & !0x33 != 0 || evflags & 3 == 3 { return err_reply(-22); }
+    // FID reporting is not implemented.
+    let cls = flags & 0xc; // FAN_CLASS_NOTIF 0, CONTENT 4, PRE_CONTENT 8
+    if flags & !0x3f != 0 || cls == 0xc || evflags & 3 == 3 { return err_reply(-22); }
     if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return err_reply(-1); }
     let f = (if flags & 1 != 0 { O_CLOEXEC } else { 0 }) | (if flags & 2 != 0 { O_NONBLOCK_FL } else { 0 });
     let r = handle_inotify_create(pid, f);
     let fd = reply_val(&r);
     if fd < 0 { return r; }
-    if let Ok(inst) = inotify_inst_of(pid, fd as usize) { inotify::fan_set(inst, evflags & (3 | O_CLOEXEC | O_NONBLOCK_FL)); }
+    if let Ok(inst) = inotify_inst_of(pid, fd as usize) { inotify::fan_set(inst, evflags & (3 | O_CLOEXEC | O_NONBLOCK_FL), cls != 0, sched::tgid_of(pid) as u32); }
     r
 }
 
@@ -13332,11 +13365,15 @@ fn handle_fanotify_mark(pid: u32, fd: usize, path_ptr: usize, flags: u32, mask: 
     if inst == 0 || !inotify::is_fan(inst) { return err_reply(-22); }
     let op = flags & (inotify::FAN_MARK_ADD | inotify::FAN_MARK_REMOVE | inotify::FAN_MARK_FLUSH);
     // DONT_FOLLOW 4, ONLYDIR 8, MOUNT 0x10, FILESYSTEM 0x100 (treated as MOUNT).
-    if op.count_ones() != 1 || flags & !(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80 | 0x100) != 0 { return err_reply(-22); }
+    if op.count_ones() != 1 || flags & !(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100) != 0 { return err_reply(-22); }
+    let ignore = flags & inotify::FAN_MARK_IGNORED_MASK != 0;
+    let surv = flags & inotify::FAN_MARK_IGNORED_SURV_MODIFY != 0;
+    if surv && !ignore { return err_reply(-22); }
     let mount = flags & (inotify::FAN_MARK_MOUNT | 0x100) != 0;
     if op == inotify::FAN_MARK_FLUSH { inotify::fan_flush(inst, mount); return ok_reply(); }
-    let ok_mask = (inotify::FAN_EVENTS | inotify::FAN_ONDIR | inotify::FAN_ON_CHILD) as u64;
-    if mask & !ok_mask != 0 || mask & inotify::FAN_EVENTS as u64 == 0 { return err_reply(-22); }
+    let perm = inotify::is_perm_group(inst);
+    let ok_mask = (inotify::FAN_EVENTS | inotify::FAN_ONDIR | inotify::FAN_ON_CHILD | if perm { inotify::FAN_PERM } else { 0 }) as u64;
+    if mask & !ok_mask != 0 || mask & (inotify::FAN_EVENTS | inotify::FAN_PERM) as u64 == 0 { return err_reply(-22); }
     let path: Vec<u8> = if path_ptr == 0 {
         let mut buf = alloc::vec![0u8; 4096];
         let r = reply_val(&handle_fd_path(pid, dirfd, buf.as_mut_ptr() as usize, buf.len()));
@@ -13355,7 +13392,7 @@ fn handle_fanotify_mark(pid: u32, fd: usize, path_ptr: usize, flags: u32, mask: 
     };
     if flags & 8 != 0 && !isdir { return err_reply(-20); }
     let remove = op == inotify::FAN_MARK_REMOVE;
-    match inotify::fan_mark(inst, remove, &path, mask as u32, id, nlink, isdir, mount) {
+    match inotify::fan_mark(inst, remove, &path, mask as u32, id, nlink, isdir, mount, ignore, surv) {
         Ok(()) => ok_reply(),
         Err(e) => err_reply(e),
     }
@@ -13370,7 +13407,7 @@ fn handle_fan_read(pid: u32, inst: u32, buf: *mut u8, count: usize) -> Message {
     let evflags = inotify::fan_evflags(inst);
     let mut out: Vec<u8> = Vec::with_capacity(evs.len() * MD);
     let mut fds: Vec<i32> = Vec::new();
-    for (mask, path, epid) in evs {
+    for (mask, path, epid, permid) in evs {
         let mut efd: i32 = -1;
         if !path.is_empty() {
             let mut z = path.clone();
@@ -13378,6 +13415,7 @@ fn handle_fan_read(pid: u32, inst: u32, buf: *mut u8, count: usize) -> Message {
             let r = reply_val(&handle_open(pid, z.as_ptr() as usize, evflags, 0));
             if r >= 0 { efd = r as i32; fds.push(efd); }
         }
+        if permid != 0 { inotify::fan_bind(inst, permid, efd); }
         out.extend_from_slice(&(MD as u32).to_le_bytes());
         out.push(3); // FANOTIFY_METADATA_VERSION
         out.push(0);
