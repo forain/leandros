@@ -194,6 +194,8 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Input event paths in the running VM (lane regresscov2; ~20 s total).
+                "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
                 # stops this VM, so it must come after every suite that uses it.
                 "host:f2fsnidtest.py",
@@ -202,6 +204,8 @@ SUITES = {
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
+                # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
+                "host:blanktest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
