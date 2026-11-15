@@ -167,6 +167,7 @@ impl InterfaceInner {
                 let payload_len =
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
                 let icmp_reply_repr = Icmpv4Repr::DstUnreachable {
+                    mtu: 0,
                     reason: Icmpv4DstUnreachable::ProtoUnreachable,
                     header: ipv4_repr,
                     data: &ip_payload[0..payload_len],
@@ -292,10 +293,14 @@ impl InterfaceInner {
             // socket that sent it (see `icmpv4_error`).
             Icmpv4Repr::DstUnreachable {
                 reason,
+                mtu,
                 header,
                 data,
             } => {
                 let code: u8 = reason.into();
+                if code == 4 {
+                    crate::pmtu::update(self.pmtu_scope, crate::pmtu::v4(header.dst_addr.0), mtu, crate::pmtu::MIN_PMTU, self.now.total_millis() as u64);
+                }
                 // Linux icmp_err_convert: (errno, fatal). Code 4 (fragmentation
                 // needed) is path-MTU discovery, which a socket never sees.
                 const TABLE: [(u8, bool); 16] = [

@@ -379,6 +379,8 @@ pub enum Repr<'a> {
     },
     DstUnreachable {
         reason: DstUnreachable,
+        /// LEANDROS: the next-hop MTU of a "fragmentation needed" (RFC 1191).
+        mtu: u16,
         header: Ipv4Repr,
         data: &'a [u8],
     },
@@ -438,6 +440,7 @@ impl<'a> Repr<'a> {
 
                 Ok(Repr::DstUnreachable {
                     reason: DstUnreachable::from(code),
+                    mtu: NetworkEndian::read_u16(&packet.buffer.as_ref()[6..8]),
                     header: Ipv4Repr {
                         src_addr: ip_packet.src_addr(),
                         dst_addr: ip_packet.dst_addr(),
@@ -534,12 +537,14 @@ impl<'a> Repr<'a> {
 
             Repr::DstUnreachable {
                 reason,
+                mtu,
                 header,
                 data,
             } => {
                 packet.set_msg_type(Message::DstUnreachable);
                 packet.set_msg_code(reason.into());
 
+                NetworkEndian::write_u16(&mut packet.buffer.as_mut()[6..8], mtu);
                 let mut ip_packet = Ipv4Packet::new_unchecked(packet.data_mut());
                 header.emit(&mut ip_packet, checksum_caps);
                 let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
