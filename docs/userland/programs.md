@@ -15,6 +15,7 @@ this page.
 | `utmpd` | Serves `/run/utmps/utmp` on `/run/utmps/.utmpd-socket` using the skarnet `utmps` protocol, which is what Alpine's busybox `who` speaks; started and respawned by init ([below](#utmpx)) |
 | `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter ([../desktop/login.md](../desktop/login.md)) |
 | `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable. As a non-root user with a D-Bus session in the environment it execs `leandros-sysbus power`, so the request goes through login1 like `systemctl poweroff` on Linux |
+| `w`, `users`, `lastlog` | utmp/lastlog readers ([below](#utmpx)) |
 | `ps` | Process status from `/proc`, procps-compatible ([below](#ps)) |
 | `meminfo` | One-line `sysinfo` sample of buddy-allocator total/free, so a session script can read a series rather than a point |
 | `shell` | The original built-in CLI with Unix-style commands and VFS integration, on leandros-libc |
@@ -219,7 +220,7 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 
 ## Limitations & open work
 
-- No `passwd`, `who`/`w`/`last` (and no utmpx for them to read).
+- No `passwd`; `who`/`last` come from Alpine busybox, `w`/`users`/`lastlog` are native (utmpx below).
 - `shell` is legacy; new interactive work goes into brush.
 
 ## Code & tests
@@ -264,9 +265,23 @@ sshd and `pam-leandros`).
 |---|---|---|
 | `/run/utmps/utmp` | current sessions; truncated at boot | `who` through `utmpd` |
 | `/var/log/wtmp` | append-only history (BOOT_TIME, RUN_LVL, USER_PROCESS, DEAD_PROCESS) | `last` |
-| `/var/log/lastlog` | `struct lastlog` (292 bytes) at `uid * 292` | none shipped |
+| `/var/log/lastlog` | `struct lastlog` (292 bytes) at `uid * 292` | `lastlog` |
 
 Writers: init writes BOOT_TIME and RUN_LVL and closes a session (DEAD_PROCESS) when it reaps
 the session leader; `login` records the console/VT login (the shell keeps login's pid);
 sshd records pty sessions with the client address as `ut_host`; the PAM shim records greetd
-sessions. `su` and `sudo` write nothing. Busybox has no `w` applet here.
+sessions. `su` and `sudo` write nothing, as on Linux (pam_unix records no utmp entry;
+only login, sshd, getty and display managers do); `sudotest` guards that.
+
+Native readers (`userland/utmptools`, Linux formats, times in UTC):
+
+| Program | Output |
+|---|---|
+| `users` | sorted names of the logged-in users on one line |
+| `w [-h] [user]` | uptime/load header (`/proc/uptime`, `/proc/loadavg`), then `USER TTY FROM LOGIN@ IDLE WHAT`; IDLE is the tty's atime, WHAT the cmdline of the tty's foreground process |
+| `lastlog [-u user]` | `Username Port From Latest` for each `/etc/passwd` account, `**Never logged in**` if the uid has no record |
+
+Writers coordinate with an exclusive `flock` on utmp (readers take a shared one); wtmp is
+`O_APPEND` (atomic per record) and each lastlog record is one positional write. `utmptest`
+(regress suite `utmp`) runs 20 concurrent login/logout sessions through the shared writer
+and checks whole records, no lost sessions, and the readers' output.

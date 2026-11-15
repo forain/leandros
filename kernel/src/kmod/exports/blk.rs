@@ -100,4 +100,10 @@ pub extern "C" fn kapi_blk_remove(idx: i64) -> i32 {
 pub extern "C" fn kapi_preempt_disabled() -> bool { sched::preempt_disabled() }
 
 #[no_mangle]
+pub extern "C" fn kapi_cpu_id() -> usize { drivers::kenv::ipi::cpu_id() }
+
+#[no_mangle]
+pub extern "C" fn kapi_kick_cpus(mask: u64) { drivers::kenv::ipi::kick_cpus(mask) }
+
+#[no_mangle]
 pub extern "C" fn kapi_preempt_enable_no_resched() { sched::preempt_enable_no_resched() }

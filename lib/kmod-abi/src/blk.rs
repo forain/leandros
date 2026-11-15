@@ -51,10 +51,14 @@ pub mod sys_blk {
     pub type BlkRemoveFn = unsafe extern "C" fn(i64) -> i32;
     pub type BoolFn = unsafe extern "C" fn() -> bool;
     pub type VoidFn = unsafe extern "C" fn();
+    pub type CpuIdFn = unsafe extern "C" fn() -> usize;
+    pub type KickCpusFn = unsafe extern "C" fn(u64);
     extern "C" {
         pub fn kapi_blk_register(owner: KmodId, desc: *const KBlkDesc, ops: *const KBlkOps, ctx: usize) -> i64;
         pub fn kapi_blk_remove(idx: i64) -> i32;
         pub fn kapi_preempt_disabled() -> bool;
         pub fn kapi_preempt_enable_no_resched();
+        pub fn kapi_cpu_id() -> usize;
+        pub fn kapi_kick_cpus(mask: u64);
     }
 }

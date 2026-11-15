@@ -109,6 +109,8 @@ const _: kmod_abi::input::sys_input::InputEventFn = kapi_input_event;
 const _: kmod_abi::input::sys_input::InputSetCapsFn = kapi_input_set_caps;
 const _: kmod_abi::blk::sys_blk::BoolFn = kapi_preempt_disabled;
 const _: kmod_abi::blk::sys_blk::VoidFn = kapi_preempt_enable_no_resched;
+const _: kmod_abi::blk::sys_blk::CpuIdFn = kapi_cpu_id;
+const _: kmod_abi::blk::sys_blk::KickCpusFn = kapi_kick_cpus;
 const _: sys::CurrentPidFn = kapi_current_pid;
 const _: sys::IoremapFn = kapi_ioremap;
 const _: sys::IounmapFn = kapi_iounmap;
@@ -205,7 +207,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 152;
+pub const NEXPORTS: usize = 154;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -341,6 +343,8 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_rel_pointer_advertise", kapi_rel_pointer_advertise),
     sym!("kapi_preempt_disabled", kapi_preempt_disabled),
     sym!("kapi_preempt_enable_no_resched", kapi_preempt_enable_no_resched),
+    sym!("kapi_cpu_id", kapi_cpu_id),
+    sym!("kapi_kick_cpus", kapi_kick_cpus),
     sym!("kapi_plat_register", kapi_plat_register),
     sym!("kapi_plat_unregister", kapi_plat_unregister),
     sym!("kapi_dtb_blob", kapi_dtb_blob),
