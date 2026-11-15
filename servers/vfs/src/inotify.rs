@@ -30,6 +30,7 @@ pub const IN_CREATE: u32 = 0x100;
 pub const IN_DELETE: u32 = 0x200;
 pub const IN_DELETE_SELF: u32 = 0x400;
 pub const IN_MOVE_SELF: u32 = 0x800;
+pub const IN_UNMOUNT: u32 = 0x2000;
 pub const IN_Q_OVERFLOW: u32 = 0x4000;
 pub const IN_IGNORED: u32 = 0x8000;
 pub const IN_ONLYDIR: u32 = 0x0100_0000;
@@ -72,6 +73,19 @@ const BLOOM: usize = 4096;
 static KNOB: AtomicU8 = AtomicU8::new(0);
 /// Live watch count. Every hook starts with one load of this.
 static ARMED: AtomicU32 = AtomicU32::new(0);
+/// Live watches that ask for any inode event (ACCESS/MODIFY/ATTRIB/CLOSE_*/OPEN),
+/// and for ACCESS alone: the write/read/open hooks cost nothing below them.
+static FILEW: AtomicU32 = AtomicU32::new(0);
+static ACCESSW: AtomicU32 = AtomicU32::new(0);
+const FILE_BITS: u32 = IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_OPEN;
+fn track(old: u32, new: u32) {
+    let (o, n) = (old & FILE_BITS != 0, new & FILE_BITS != 0);
+    if n && !o { FILEW.fetch_add(1, Relaxed); } else if o && !n { FILEW.fetch_sub(1, Relaxed); }
+    let (o, n) = (old & IN_ACCESS != 0, new & IN_ACCESS != 0);
+    if n && !o { ACCESSW.fetch_add(1, Relaxed); } else if o && !n { ACCESSW.fetch_sub(1, Relaxed); }
+}
+pub fn files_watched() -> bool { FILEW.load(Relaxed) != 0 }
+pub fn access_watched() -> bool { ACCESSW.load(Relaxed) != 0 }
 static COOKIE: AtomicU32 = AtomicU32::new(1);
 /// Counting bloom over the hash of each watch's directory path.
 static DIR_BLOOM: [AtomicU16; BLOOM] = [const { AtomicU16::new(0) }; BLOOM];
@@ -188,10 +202,11 @@ pub fn create(inst: u32, chain: &[UKey]) -> bool {
 
 /// The last reference to description `inst` is gone: drop its watches.
 pub fn released(inst: u32) {
+    if files_watched() || !NOTES.lock().is_empty() { note_closed(inst); }
     let mut st = STATE.lock();
     if let Some(i) = st.insts.remove(&inst) {
         let n = i.watches.len();
-        for w in &i.watches { index_del(&mut st, inst, w.wd, w.hash); }
+        for w in &i.watches { track(w.mask, 0); index_del(&mut st, inst, w.wd, w.hash); }
         st.nwatches -= n;
         ARMED.fetch_sub(n as u32, Relaxed);
         uc_adj(&mut st.uc, &i.charge, -1, -(n as isize));
@@ -208,7 +223,9 @@ pub fn add(inst: u32, path: &[u8], mask: u32, ino_key: u64) -> Result<i32, i32> 
     let i = match st.insts.get_mut(&inst) { Some(i) => i, None => return Err(-22) };
     if let Some(w) = i.watches.iter_mut().find(|w| w.path == path) {
         if mask & IN_MASK_CREATE != 0 { return Err(-17); }
-        w.mask = if mask & IN_MASK_ADD != 0 { w.mask | ev_mask } else { ev_mask };
+        let nm = if mask & IN_MASK_ADD != 0 { w.mask | ev_mask } else { ev_mask };
+        track(w.mask, nm);
+        w.mask = nm;
         return Ok(w.wd);
     }
     let maxw = MAX_USER_WATCH.load(Relaxed);
@@ -222,6 +239,7 @@ pub fn add(inst: u32, path: &[u8], mask: u32, ino_key: u64) -> Result<i32, i32> 
     i.watches.push(Watch { wd, mask: ev_mask, ino_key, path: path.to_vec(), hash: h });
     st.nwatches += 1;
     ARMED.fetch_add(1, Relaxed);
+    track(0, ev_mask);
     index_add(st, inst, wd, h);
     Ok(wd)
 }
@@ -235,6 +253,7 @@ pub fn rm(inst: u32, wd: i32) -> Result<(), i32> {
         let i = match st.insts.get_mut(&inst) { Some(i) => i, None => return Err(-22) };
         let p = match i.watches.iter().position(|w| w.wd == wd) { Some(p) => p, None => return Err(-22) };
         let w = i.watches.remove(p);
+        track(w.mask, 0);
         push(i, Ev { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
         let ch = i.charge.clone();
         index_del(st, inst, wd, w.hash);
@@ -304,9 +323,11 @@ pub fn dirent(parent: &[u8], name: &[u8], mask: u32, cookie: u32) {
             let w = match i.watches.iter().find(|w| w.wd == wd) { Some(w) => w, None => continue };
             if w.path != parent || w.mask & mask & IN_ALL_EVENTS == 0 { continue; }
             let oneshot = w.mask & IN_ONESHOT != 0;
+            let wmask = w.mask;
             let hh = w.hash;
             let changed = push(i, Ev { wd, mask, cookie, name: name.to_vec() });
             if oneshot {
+                track(wmask, 0);
                 i.watches.retain(|w| w.wd != wd);
                 push(i, Ev { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
                 gone.push((inst, wd, hh, i.charge.clone()));
@@ -322,9 +343,10 @@ pub fn dirent(parent: &[u8], name: &[u8], mask: u32, cookie: u32) {
     wake(&more);
 }
 
-/// `path` (a directory) was removed: DELETE_SELF + IGNORED for every watch
-/// on it, and the watches go away.
-pub fn dir_removed(path: &[u8]) {
+/// `path` (a directory, or a file whose last name and last open description
+/// are gone) was removed: DELETE_SELF + IGNORED for every watch on it, and
+/// the watches go away.
+pub fn removed(path: &[u8], isdir: bool) {
     if !armed() { return; }
     let h = fnv(path);
     if DIR_BLOOM[(h as usize) % BLOOM].load(Relaxed) == 0 { return; }
@@ -337,7 +359,8 @@ pub fn dir_removed(path: &[u8]) {
             let i = match st.insts.get_mut(&inst) { Some(i) => i, None => continue };
             let p = match i.watches.iter().position(|w| w.wd == wd && w.path == path) { Some(p) => p, None => continue };
             let w = i.watches.remove(p);
-            if w.mask & IN_DELETE_SELF != 0 { push(i, Ev { wd, mask: IN_DELETE_SELF | IN_ISDIR, cookie: 0, name: Vec::new() }); }
+            track(w.mask, 0);
+            if w.mask & IN_DELETE_SELF != 0 { push(i, Ev { wd, mask: IN_DELETE_SELF | if isdir { IN_ISDIR } else { 0 }, cookie: 0, name: Vec::new() }); }
             push(i, Ev { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
             keys.push(key(inst));
             let ch = i.charge.clone();
@@ -350,9 +373,10 @@ pub fn dir_removed(path: &[u8]) {
     wake(&keys);
 }
 
-/// Directory `old` was renamed to `new`: every watch on it or below it keeps
-/// following (design §2.2).
-pub fn dir_renamed(old: &[u8], new: &[u8]) {
+/// `old` (a file or directory) was renamed to `new`: every watch on it or
+/// below it keeps following (design §2.2), and so do the open-file notes.
+pub fn renamed(old: &[u8], new: &[u8]) {
+    notes_renamed(old, new);
     if !armed() { return; }
     let mut st = STATE.lock();
     let st = &mut *st;
@@ -370,4 +394,120 @@ pub fn dir_renamed(old: &[u8], new: &[u8]) {
         }
     }
     for (inst, wd, oh, nh) in moves { index_del(st, inst, wd, oh); index_add(st, inst, wd, nh); }
+}
+
+
+/// Directory component split: ("/a/b/c") -> ("/a/b", "c"); None for "/".
+fn split(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    if path.len() < 2 { return None; }
+    let i = path.iter().rposition(|&b| b == b'/')?;
+    Some((if i == 0 { &path[..1] } else { &path[..i] }, &path[i + 1..]))
+}
+
+fn bloom_hit(h: u64) -> bool { DIR_BLOOM[(h as usize) % BLOOM].load(Relaxed) != 0 }
+
+/// True if some watch may be on `path` itself or on its parent directory.
+pub fn may_watch(path: &[u8]) -> bool {
+    if !armed() { return false; }
+    if bloom_hit(fnv(path)) { return true; }
+    split(path).map_or(false, |(p, _)| bloom_hit(fnv(p)))
+}
+
+/// An inode event on `path`: the watch on the object itself (no name) and the
+/// watch on its parent directory (with the name). `mask` carries IN_ISDIR for
+/// directories.
+pub fn inode(path: &[u8], mask: u32) {
+    if !armed() { return; }
+    dirent(path, b"", mask, 0);
+    if let Some((par, name)) = split(path) { dirent(par, name, mask, 0); }
+}
+
+/// The superblock/mount whose backing root is `prefix` went away: UNMOUNT +
+/// IGNORED for every watch on or below it, and those watches die.
+pub fn unmounted(prefix: &[u8]) {
+    if !armed() { return; }
+    let mut keys: Vec<u64> = Vec::new();
+    {
+        let mut st = STATE.lock();
+        let st = &mut *st;
+        let mut dead: Vec<(u32, i32, u64)> = Vec::new();
+        for (&inst, i) in st.insts.iter_mut() {
+            let mut k = 0;
+            while k < i.watches.len() {
+                let w = &i.watches[k];
+                let hit = w.path == prefix || (w.path.len() > prefix.len() && w.path.starts_with(prefix) && w.path[prefix.len()] == b'/');
+                if !hit { k += 1; continue; }
+                let w = i.watches.remove(k);
+                track(w.mask, 0);
+                push(i, Ev { wd: w.wd, mask: IN_UNMOUNT, cookie: 0, name: Vec::new() });
+                push(i, Ev { wd: w.wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
+                dead.push((inst, w.wd, w.hash));
+                let ch = i.charge.clone();
+                uc_adj(&mut st.uc, &ch, 0, -1);
+                if !keys.contains(&key(inst)) { keys.push(key(inst)); }
+            }
+        }
+        for (inst, wd, h) in dead { index_del(st, inst, wd, h); st.nwatches -= 1; ARMED.fetch_sub(1, Relaxed); }
+    }
+    wake(&keys);
+}
+
+// ── open-file notes (design §2.3, path-keyed) ────────────────────────────────
+
+/// What an armed open file description remembers: the backing path it was
+/// opened by (kept current across renames), for MODIFY/CLOSE/ACCESS events.
+struct Note { path: Vec<u8>, hash: u64, phash: u64, writable: bool, isdir: bool, unlinked: bool }
+static NOTES: Mutex<BTreeMap<u32, Note>> = Mutex::new(BTreeMap::new());
+
+pub fn note_set(ofd: u32, path: &[u8], writable: bool, isdir: bool) {
+    let hash = fnv(path);
+    let phash = split(path).map_or(0, |(p, _)| fnv(p));
+    NOTES.lock().insert(ofd, Note { path: path.to_vec(), hash, phash, writable, isdir, unlinked: false });
+}
+
+/// Emit `mask` for the description's file. False if it has no note yet.
+pub fn note_event(ofd: u32, mask: u32) -> bool {
+    let path = {
+        let n = NOTES.lock();
+        let Some(note) = n.get(&ofd) else { return false };
+        if !(bloom_hit(note.hash) || (note.phash != 0 && bloom_hit(note.phash))) { return true; }
+        (note.path.clone(), if note.isdir { IN_ISDIR } else { 0 })
+    };
+    inode(&path.0, mask | path.1);
+    true
+}
+
+/// `path` was unlinked: mark the open descriptions on it. True if any is open
+/// (DELETE_SELF then waits for the last close).
+pub fn note_unlink(path: &[u8]) -> bool {
+    let mut any = false;
+    for n in NOTES.lock().values_mut() { if n.path == path && !n.unlinked { n.unlinked = true; any = true; } }
+    any
+}
+
+fn notes_renamed(old: &[u8], new: &[u8]) {
+    let mut ns = NOTES.lock();
+    for n in ns.values_mut() {
+        let hit = n.path == old || (n.path.len() > old.len() && n.path.starts_with(old) && n.path[old.len()] == b'/');
+        if !hit { continue; }
+        let mut np = new.to_vec();
+        np.extend_from_slice(&n.path[old.len()..]);
+        n.hash = fnv(&np);
+        n.phash = split(&np).map_or(0, |(p, _)| fnv(p));
+        n.path = np;
+    }
+}
+
+/// Last reference to description `ofd` is gone: CLOSE event, and DELETE_SELF
+/// if its file was unlinked while open and nothing else holds it.
+fn note_closed(ofd: u32) {
+    let (note, still) = {
+        let mut ns = NOTES.lock();
+        let Some(note) = ns.remove(&ofd) else { return };
+        let still = ns.values().any(|o| o.path == note.path && o.unlinked);
+        (note, still)
+    };
+    let d = if note.isdir { IN_ISDIR } else { 0 };
+    inode(&note.path, d | if note.writable { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE });
+    if note.unlinked && !still { removed(&note.path, note.isdir); }
 }
