@@ -71,6 +71,8 @@ def main(argv):
     fails = []
 
     def boot(cmdline):
+        extra = os.environ.get("F2FSFULL_CMDLINE", "")  # e.g. f2fs.lxchain=1
+        if extra: cmdline = f"{cmdline or ''} {extra}".strip()
         if os.path.exists(boot_copy): os.unlink(boot_copy)
         if cmdline:
             shutil.copyfile(src, boot_copy)

@@ -1,0 +1,2 @@
+# lane f2fsnlog1 (2026-11-15)
+P1 writer of Linux-format fsync node chains behind f2fs.lxchain (default off). Knob-on gate: f2fstest/mix/nid/commit/cp/orphan, crash, interop fsynce (93+ pass; remaining failures were harness: f2fscrashtest unsplice, E-era regex). Knob-off E runs are the expected fail-first. f2fsgc ENOSPC is pre-existing. Open: P2 f2fscrashtest --linux, fsck chain check, laptop A/B, perf/mount delta.
