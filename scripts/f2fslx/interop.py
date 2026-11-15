@@ -661,7 +661,7 @@ def e_guest_check(image, exp, tag):
     """Mount image in the guest, re-create the manifest from the harness's md5 lines, verify."""
     mf = "; ".join(f"echo '{l}' >> /tmp/MF" for l in exp)
     outs = guest([image], [MNTH, "rm -f /tmp/MF; " + mf + "; cd /mnt/h/t && md5sum -c /tmp/MF 2>&1 | grep -c ': OK'; echo CHK_DONE; cd /"], tag)
-    return bool(outs) and "MNT_FAIL" not in outs[0] and "CHK_DONE" in outs[1] and outs[1].split("\n")[0].strip().split()[-1:] == [str(len(exp))]
+    return bool(outs) and "MNT_FAIL" not in outs[0] and "CHK_DONE" in outs[1] and str(len(exp)) in [x.strip() for x in outs[1].splitlines()]
 
 
 def direction_b(tmp):
