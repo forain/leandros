@@ -363,7 +363,7 @@ def verify_dbus_staging(arch):
     Loud, not silent: this raises SystemExit rather than warning, because a
     warning in a build that then prints a green image is the thing that failed.
     """
-    ship = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
+    ship = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), arch)
     if not os.path.isdir(ship):
         return                      # no D-Bus payload staged at all; nothing to check
     repo = os.path.normpath(os.path.join(
@@ -1500,8 +1500,8 @@ def main():
     # and the fonts are plain data (0644) and ride the shared /usr tree walk
     # (m4_share_files/m4_share_dirs, generalized here beyond /usr/share).
     verify_dbus_staging(arch)
-    m5_arch_root = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
-    m5_fonts_src = os.path.expanduser("~/code/leandros-artifacts/m5-session-ship/share/fonts")
+    m5_arch_root = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), arch)
+    m5_fonts_src = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), "share/fonts")
     # cosmic-comp: LEANDROS_COSMIC_COMP=<file> wins; else the m6 rebuild that
     # carries ports/cosmic-comp's patches (ports/cosmic-comp/build.sh);
     # else the original M5 probe build.

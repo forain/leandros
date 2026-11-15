@@ -58,6 +58,22 @@ echo "🏗️  Architecture(s): $ARCH"
 
 ROOT_DIR="$PWD"
 
+# Per-worktree m5 ship tree (sysbus/busd outputs, fonts): concurrent worktree
+# builds used to overwrite each other's ../leandros-artifacts/m5-session-ship
+# ("STALE leandros-sysbus"). The main checkout keeps the shared path; any other
+# worktree gets m5-session-ship-<dirname>, APFS-cloned from the shared tree on
+# first use. An explicit LEANDROS_M5_SHIP wins. Remove the clone with the worktree.
+if [[ -z "${LEANDROS_M5_SHIP:-}" ]]; then
+    _m5_main="$HOME/code/leandros-artifacts/m5-session-ship"
+    _gc="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || _gc=""
+    if [[ -n "$_gc" && "$(cd "$ROOT_DIR" && pwd -P)" != "$(cd "$(dirname "$_gc")" && pwd -P)" && -d "$_m5_main" ]]; then
+        _m5_wt="$_m5_main-$(basename "$ROOT_DIR")"
+        [[ -d "$_m5_wt" ]] || cp -cpR "$_m5_main" "$_m5_wt"
+        export LEANDROS_M5_SHIP="$_m5_wt"
+        echo "m5 ship tree (per-worktree): $LEANDROS_M5_SHIP"
+    fi
+fi
+
 # sibling_dir NAME: the shared sibling checkout `../NAME`. A git worktree that
 # lives elsewhere (e.g. under .claude/worktrees/) has no such sibling, so fall
 # back to the sibling of the main checkout (parent of the common .git dir).
