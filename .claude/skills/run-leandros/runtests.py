@@ -49,6 +49,7 @@ Options:
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
                              podpasta host:podpastatest.py alone (rootless podman on pasta: echo, host wget, -p port-forward, dns, churn, no leaks)
+                             podsmoke host:podsmoketest.py alone (root podman run --rm alpine echo hi; skips without the alpine image)
                              podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks)
                              podpause host:podpausetest.py alone (podman pause/unpause freezes and resumes a container)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
@@ -114,6 +115,26 @@ SYSFS_CHECK = (
     "test $__f = 0"
 )
 
+# `sync FILE` is fsync(FILE), not sync(): on f2fs it must not take a checkpoint
+# (/proc/f2fsstat cp_total), bare `sync` must; an unopenable file exits 1 and the
+# others are still synced (lane syncfile).
+SYNCFILE_CHECK = (
+    "__f=0; cpt() { while read k v; do [ \"$k\" = cp_total ] && echo $v; done < /proc/f2fsstat; }; "
+    "t() { eval \"$2\" >/dev/null 2>&1 && echo \"syncfile: $1: PASS\" || { echo \"syncfile: $1: FAIL\"; __f=1; }; }; "
+    "echo data > /home/.syncf1; echo data > /home/.syncf2; "
+    "ok=0; for i in 1 2 3 4 5; do sync; sleep 1; echo x >> /home/.syncf1; a=$(cpt); sync /home/.syncf1 /home/.syncf2; b=$(cpt); "
+    "[ -n \"$a\" ] && [ \"$a\" = \"$b\" ] && { ok=1; break; }; done; "
+    "t file_no_checkpoint '[ $ok = 1 ]'; "
+    "t data_no_checkpoint 'sync -d /home/.syncf1 && [ \"$(cpt)\" = \"$b\" ]'; "
+    "t fs_ok 'sync -f /home/.syncf1'; "
+    "sync /home/.nosuch /home/.syncf1; rc=$?; "
+    "t missing_rc1 '[ $rc = 1 ]'; "
+    "echo more >> /home/.syncf1; sync; c=$(cpt); "
+    "t bare_checkpoint '[ \"$c\" -gt \"$b\" ]'; "
+    "rm -f /home/.syncf1 /home/.syncf2; "
+    "test $__f = 0"
+)
+
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
@@ -122,6 +143,7 @@ SUITES = {
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
+                SYNCFILE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
@@ -194,11 +216,26 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Link flap/watch (own boot, ~110 s on both arches; lane suiteharness).
+                "host:netwatchtest.py",
+                # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
+                "host:blkhangtest.py",
+                # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
+                "host:uartgaptest.py", "host:nvmemsixtest.py",
+                # Input event paths in the running VM (lane regresscov2; ~20 s total).
+                "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
+                # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
+                "host:podsmoketest.py",
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
                 # stops this VM, so it must come after every suite that uses it.
                 "host:f2fsnidtest.py",
                 # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
                 "host:f2fscommittest.py",
+                # Space reuse on a small f2fs volume: churn writes N x capacity,
+                # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
+                "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
+                # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
+                "host:blanktest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -232,6 +269,8 @@ SUITES = {
     "nettag2": ["host:nettag2test.py"],
     # Narrow kernel parks: console poll/epoll, empty poll sets, VT_WAITACTIVE.
     "kparks": ["host:kparkstest.py"],
+    # Root `podman run --rm alpine echo hi` (skips without the LEANDROS_IMAGE_ARCHIVE image).
+    "podsmoke": ["host:podsmoketest.py"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # podman pause/unpause freeze and resume a container (needs LEANDROS_IMAGE_ARCHIVE image).
@@ -278,6 +317,27 @@ SUITES = {
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
+    "f2fsgc": ["host:f2fsgctest.py"],
+    "a64acpi": ["host:a64acpitest.py"],
+    "blank": ["host:blanktest.py"],
+    "blkhang": ["host:blkhangtest.py"],
+    "espreset": ["host:espresettest.py"],
+    "evbtn": ["host:evbtntest.py"],
+    "evclock": ["host:evclocktest.py"],
+    "f2fscp": ["host:f2fscptest.py"],
+    "f2fscrash": ["host:f2fscrashtest.py"],
+    "f2fsfull": ["host:f2fsfulltest.py"],
+    "f2fsorphan": ["host:f2fsorphantest.py"],
+    "hidkey": ["host:hidkeytest.py"],
+    "netwatch": ["host:netwatchtest.py"],
+    "nvmemsix": ["host:nvmemsixtest.py"],
+    "pagecache-crash": ["host:pagecache-crashtest.py"],
+    "powerctl": ["host:powerctltest.py"],
+    "reboot": ["host:reboottest.py"],
+    "trialwatch": ["host:trialwatchtest.py"],
+    "uartgap": ["host:uartgaptest.py"],
+    "usbstall": ["host:usbstalltest.py"],
+    "usbunplug": ["host:usbunplugtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -349,6 +409,7 @@ SUITES = {
     # Synthetic sysfs: /sys/class/{drm,input} and the /sys/dev/char node
     # identity libdrm/udev consumers read (lane sysfs).
     "sysfs": [SYSFS_CHECK],
+    "syncfile": [SYNCFILE_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
@@ -361,7 +422,8 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900,
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200}
 
 
 def find_fails(out):
@@ -397,6 +459,29 @@ def host_run(c, timeout, arch=None, scale=1.0):
         return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
 
 
+def boot_and_login(arch, mode, gpu, scale, run):
+    """Start runtests' VM and log in as root (2 attempts). True when it is up."""
+    start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
+    for attempt in range(2):
+        r = subprocess.run(start, capture_output=True, text=True, timeout=900)
+        if r.returncode == 0:
+            lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
+                                 str(int(60 * scale))],
+                                capture_output=True, text=True, timeout=900)
+            if lg.returncode == 0:
+                return True
+            print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
+        else:
+            print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
+            try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
+                with open(driver.QEMU_STDERR_LOG, "rb") as ef:
+                    print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
+            except OSError:
+                pass
+        subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+    return False
+
+
 def self_boots(c):
     """True for a `host:` script that starts (and stops) its own VM under its own
     LEANDROS_RUN_ID. Such a script must not run while runtests' VM is up: both
@@ -405,7 +490,8 @@ def self_boots(c):
         return False
     try:
         with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
-            return '"start"' in f.read()
+            t = f.read()
+            return '"start"' in t or "cmd_start(" in t or "ffsession.py" in t  # ffsession.py boots its own VM
     except OSError:
         return False
 
@@ -498,27 +584,8 @@ def main(argv):
         booted = False
         if cmds and all(self_boots(c) for c in cmds):
             booted = True  # every command boots its own VM: runtests boots none
-        start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
-        for attempt in range(2):
-            if booted:
-                break
-            r = subprocess.run(start, capture_output=True, text=True, timeout=900)
-            if r.returncode == 0:
-                lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
-                                     str(int(60 * scale))],
-                                    capture_output=True, text=True, timeout=900)
-                if lg.returncode == 0:
-                    booted = True
-                    break
-                print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
-            else:
-                print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
-                try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
-                    with open(driver.QEMU_STDERR_LOG, "rb") as ef:
-                        print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
-                except OSError:
-                    pass
-            subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+        if not booted:
+            booted = boot_and_login(arch, mode, gpu, scale, run)
         entry["boot"] = "ok" if booted else "failed"
         if not booted:
             all_ok = False
@@ -529,12 +596,16 @@ def main(argv):
                 try:
                     if self_boots(c) and driver._qemu_pid() is not None:
                         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+                    elif not self_boots(c) and driver._qemu_pid() is None:
+                        # an earlier self-booting script stopped our VM: boot it again
+                        if not boot_and_login(arch, mode, gpu, scale, run):
+                            raise RuntimeError("reboot failed")
                     if c.startswith("host:"):
                         r = host_run(c, timeout, arch, scale)
                     else:
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001
-                    r = {"rc": None, "status": f"error {e}", "output": "", "secs": 0}
+                    r = {"rc": None, "status": str(e) if str(e) == "reboot failed" else f"error {e}", "output": "", "secs": 0}
                 fails = find_fails(r["output"])
                 rc = r["rc"] if r["rc"] is not None else "?"
                 ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file")

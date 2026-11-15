@@ -5,11 +5,17 @@
 //! user (setgroups, setresgid, setresuid, read back) before it execs. See
 //! artifacts/notes/lane-gitssh-2026-10-14.md and docs/userland/programs.md.
 //!
-//! Usage: sshd [-f config] [-e] [-t] [-p port]
+//! The root listener only accepts: it re-execs `sshd -R` once per connection
+//! (socket on fd 3, startup pipe on fd 4), so a crash in one connection kills
+//! only that connection. The listener enforces MaxStartups and kills a child
+//! still unauthenticated after LoginGraceTime.
+//!
+//! Usage: sshd [-f config] [-e] [-t] [-p port] [-R]
 //!   -f  configuration file (default /etc/ssh/sshd_config)
 //!   -e  log to stderr instead of /var/log/sshd.log
 //!   -t  check the configuration and the host key, then exit
 //!   -p  override Port
+//!   -R  (internal) serve the one connection on fd 3; fd 4 is the startup pipe
 
 mod accounts;
 mod cgsession;
@@ -18,6 +24,7 @@ mod utmpx;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
 mod session;
+mod userauth;
 
 use std::fs;
 use std::io::Write;
@@ -67,6 +74,91 @@ pub struct Config {
     /// `start` new ones are dropped with probability `rate`% rising linearly
     /// to 100% at `full`.
     pub max_startups: (usize, usize, usize),
+    /// `AllowTcpForwarding yes|all|no|local|remote` (combined with the per-key `no-port-forwarding`).
+    pub allow_tcp_forwarding: TcpFwd,
+    /// `ForceCommand cmd` (`none` = unset); `internal-sftp` forces the sftp subsystem.
+    pub force_command: Option<String>,
+    /// `TrustedUserCAKeys file`: CA public keys whose user certificates are accepted.
+    pub trusted_user_ca_keys: Option<String>,
+    /// `Match` blocks, in file order; applied per connection once the user is known.
+    pub matches: Vec<MatchBlock>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpFwd { All, Local, Remote, No }
+
+/// One `Match` block: every criterion must match; `lines` are the keywords it sets.
+#[derive(Clone, Debug, Default)]
+pub struct MatchBlock {
+    pub all: bool,
+    /// (criterion, pattern list), criterion lowercase: user, group, address, localport.
+    pub crit: Vec<(String, String)>,
+    pub lines: Vec<(String, String)>,
+}
+
+/// Keywords a Match block may set.
+const MATCH_KEYWORDS: &[&str] = &[
+    "passwordauthentication", "pubkeyauthentication", "permitrootlogin", "allowtcpforwarding",
+    "forcecommand", "permituserenvironment", "authorizedkeysfile", "devpasswordauthentication",
+];
+
+/// OpenSSH pattern list: comma-separated `*`/`?` globs; a matching `!pattern`
+/// vetoes the whole list, otherwise one positive match is needed.
+pub fn pattern_list_match(list: &str, s: &str) -> bool {
+    let mut hit = false;
+    for p in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match p.strip_prefix('!') {
+            Some(n) => {
+                if accounts::glob(n, s) {
+                    return false;
+                }
+            }
+            None => hit |= accounts::glob(p, s),
+        }
+    }
+    hit
+}
+
+impl Config {
+    /// The configuration for one connection: this config plus the Match blocks
+    /// that match. Within the matching blocks the first value of a keyword wins.
+    pub fn effective(&self, user: &str, groups: &[String], peer: SocketAddr, local: Option<SocketAddr>) -> Config {
+        let mut eff = self.clone();
+        eff.matches.clear();
+        let mut seen = std::collections::HashSet::new();
+        for b in &self.matches {
+            let ok = b.all
+                || b.crit.iter().all(|(c, v)| match c.as_str() {
+                    "user" => pattern_list_match(v, user),
+                    "group" => groups.iter().any(|g| pattern_list_match(v, g)),
+                    "address" => accounts::from_matches(v, peer.ip()),
+                    "localport" => local.map_or(false, |l| pattern_list_match(v, &l.port().to_string())),
+                    _ => false,
+                });
+            if !ok {
+                continue;
+            }
+            for (k, v) in &b.lines {
+                if seen.insert(k.clone()) {
+                    let _ = apply_kw(&mut eff, k, v);
+                }
+            }
+        }
+        eff
+    }
+
+    /// Could any Match block (or the global section) turn this on? Decides
+    /// which authentication methods the server advertises.
+    pub fn any(&self, f: impl Fn(&Config) -> bool) -> bool {
+        f(self)
+            || self.matches.iter().any(|b| {
+                let mut c = self.clone();
+                for (k, v) in &b.lines {
+                    let _ = apply_kw(&mut c, k, v);
+                }
+                f(&c)
+            })
+    }
 }
 
 impl Default for Config {
@@ -85,6 +177,10 @@ impl Default for Config {
             permit_user_environment: false,
             login_grace_secs: 120,
             max_startups: (10, 30, 100),
+            allow_tcp_forwarding: TcpFwd::All,
+            force_command: None,
+            trusted_user_ca_keys: None,
+            matches: Vec::new(),
         }
     }
 }
@@ -97,9 +193,105 @@ fn yes_no(v: &str, key: &str) -> Result<bool, String> {
     }
 }
 
+fn apply_kw(cfg: &mut Config, key: &str, val: &str) -> Result<bool, String> {
+    let err = |m: String| m;
+    match key {
+        "port" => cfg.port = val.parse().map_err(|_| err(format!("bad Port {val}")))?,
+        "listenaddress" => cfg.listen.push(val.to_string()),
+        "hostkey" => cfg.host_key = val.to_string(),
+        "permitrootlogin" => {
+            cfg.permit_root_login = match val {
+                "yes" => RootLogin::Yes,
+                "no" => RootLogin::No,
+                "prohibit-password" | "without-password" => RootLogin::ProhibitPassword,
+                _ => return Err(err(format!("bad PermitRootLogin {val}"))),
+            }
+        }
+        "passwordauthentication" => cfg.password_auth = yes_no(val, &key).map_err(err)?,
+        "devpasswordauthentication" => {
+            cfg.dev_password_auth = match val.to_ascii_lowercase().as_str() {
+                "no" => DevPasswords::No,
+                "local" => DevPasswords::Local,
+                "yes" => DevPasswords::Yes,
+                _ => return Err(err(format!("bad DevPasswordAuthentication {val:?}"))),
+            }
+        }
+        "pubkeyauthentication" => cfg.pubkey_auth = yes_no(val, &key).map_err(err)?,
+        "authorizedkeysfile" => {
+            cfg.authorized_keys_file = val.split_whitespace().next().unwrap_or("").to_string()
+        }
+        "subsystem" => {
+            let mut p = val.split_whitespace();
+            match (p.next(), p.next()) {
+                (Some("sftp"), Some(path)) => cfg.sftp_server = Some(path.to_string()),
+                _ => return Err(err(format!("unsupported Subsystem {val}"))),
+            }
+        }
+        "permituserenvironment" => cfg.permit_user_environment = yes_no(val, "PermitUserEnvironment")?,
+        "maxauthtries" => {
+            cfg.max_auth_tries = val.parse().map_err(|_| err(format!("bad MaxAuthTries {val}")))?
+        }
+        "logingracetime" => {
+            cfg.login_grace_secs =
+                val.trim_end_matches('s').parse().map_err(|_| err(format!("bad LoginGraceTime {val}")))?
+        }
+        "maxstartups" => {
+            let n: Vec<usize> = val.split(':').filter_map(|p| p.parse().ok()).collect();
+            cfg.max_startups = match n[..] {
+                [full] if !val.contains(':') => (full, 100, full),
+                [s, r, f] if s <= f && r <= 100 => (s, r, f),
+                _ => return Err(err(format!("bad MaxStartups {val}"))),
+            }
+        }
+        "permitemptypasswords" => {
+            if yes_no(val, &key).map_err(err)? {
+                return Err(err("PermitEmptyPasswords yes is not supported".into()));
+            }
+        }
+        "allowtcpforwarding" => {
+            cfg.allow_tcp_forwarding = match val.to_ascii_lowercase().as_str() {
+                "yes" | "all" => TcpFwd::All,
+                "no" => TcpFwd::No,
+                "local" => TcpFwd::Local,
+                "remote" => TcpFwd::Remote,
+                _ => return Err(err(format!("bad AllowTcpForwarding {val}"))),
+            }
+        }
+        "forcecommand" => {
+            cfg.force_command = if val.is_empty() { return Err(err("ForceCommand needs a command".into())) }
+                else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
+        "trustedusercakeys" => {
+            cfg.trusted_user_ca_keys = if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_match(val: &str) -> Result<MatchBlock, String> {
+    let t: Vec<&str> = val.split_whitespace().collect();
+    if t.len() == 1 && t[0].eq_ignore_ascii_case("all") {
+        return Ok(MatchBlock { all: true, ..Default::default() });
+    }
+    if t.is_empty() || t.len() % 2 != 0 {
+        return Err(format!("bad Match {val:?}"));
+    }
+    let mut b = MatchBlock::default();
+    for p in t.chunks(2) {
+        let c = p[0].to_ascii_lowercase();
+        if !matches!(c.as_str(), "user" | "group" | "address" | "localport") {
+            return Err(format!("unsupported Match criterion {}", p[0]));
+        }
+        b.crit.push((c, p[1].to_string()));
+    }
+    Ok(b)
+}
+
 /// The OpenSSH sshd_config subset this server understands. Keywords are
 /// case-insensitive; unknown keywords are reported and ignored.
 fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
+    let mut cur: Option<MatchBlock> = None;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -109,61 +301,28 @@ fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
         let key = it.next().unwrap_or("").to_ascii_lowercase();
         let val = it.next().unwrap_or("").trim();
         let err = |m: String| format!("line {}: {m}", n + 1);
-        match key.as_str() {
-            "port" => cfg.port = val.parse().map_err(|_| err(format!("bad Port {val}")))?,
-            "listenaddress" => cfg.listen.push(val.to_string()),
-            "hostkey" => cfg.host_key = val.to_string(),
-            "permitrootlogin" => {
-                cfg.permit_root_login = match val {
-                    "yes" => RootLogin::Yes,
-                    "no" => RootLogin::No,
-                    "prohibit-password" | "without-password" => RootLogin::ProhibitPassword,
-                    _ => return Err(err(format!("bad PermitRootLogin {val}"))),
-                }
+        if key == "match" {
+            if let Some(b) = cur.take() {
+                cfg.matches.push(b);
             }
-            "passwordauthentication" => cfg.password_auth = yes_no(val, &key).map_err(err)?,
-            "devpasswordauthentication" => {
-                cfg.dev_password_auth = match val.to_ascii_lowercase().as_str() {
-                    "no" => DevPasswords::No,
-                    "local" => DevPasswords::Local,
-                    "yes" => DevPasswords::Yes,
-                    _ => return Err(err(format!("bad DevPasswordAuthentication {val:?}"))),
-                }
-            }
-            "pubkeyauthentication" => cfg.pubkey_auth = yes_no(val, &key).map_err(err)?,
-            "authorizedkeysfile" => {
-                cfg.authorized_keys_file = val.split_whitespace().next().unwrap_or("").to_string()
-            }
-            "subsystem" => {
-                let mut p = val.split_whitespace();
-                match (p.next(), p.next()) {
-                    (Some("sftp"), Some(path)) => cfg.sftp_server = Some(path.to_string()),
-                    _ => return Err(err(format!("unsupported Subsystem {val}"))),
-                }
-            }
-            "permituserenvironment" => cfg.permit_user_environment = yes_no(val, "PermitUserEnvironment")?,
-            "maxauthtries" => {
-                cfg.max_auth_tries = val.parse().map_err(|_| err(format!("bad MaxAuthTries {val}")))?
-            }
-            "logingracetime" => {
-                cfg.login_grace_secs =
-                    val.trim_end_matches('s').parse().map_err(|_| err(format!("bad LoginGraceTime {val}")))?
-            }
-            "maxstartups" => {
-                let n: Vec<usize> = val.split(':').filter_map(|p| p.parse().ok()).collect();
-                cfg.max_startups = match n[..] {
-                    [full] if !val.contains(':') => (full, 100, full),
-                    [s, r, f] if s <= f && r <= 100 => (s, r, f),
-                    _ => return Err(err(format!("bad MaxStartups {val}"))),
-                }
-            }
-            "permitemptypasswords" => {
-                if yes_no(val, &key).map_err(err)? {
-                    return Err(err("PermitEmptyPasswords yes is not supported".into()));
-                }
-            }
-            _ => log(&format!("config line {}: ignoring unsupported keyword {key}", n + 1)),
+            cur = Some(parse_match(val).map_err(err)?);
+            continue;
         }
+        if let Some(b) = cur.as_mut() {
+            if MATCH_KEYWORDS.contains(&key.as_str()) {
+                apply_kw(&mut cfg.clone(), &key, val).map_err(err)?;
+                b.lines.push((key, val.to_string()));
+            } else {
+                log(&format!("config line {}: ignoring {key} inside Match (not a Match keyword here)", n + 1));
+            }
+            continue;
+        }
+        if !apply_kw(cfg, &key, val).map_err(err)? {
+            log(&format!("config line {}: ignoring unsupported keyword {key}", n + 1));
+        }
+    }
+    if let Some(b) = cur.take() {
+        cfg.matches.push(b);
     }
     Ok(())
 }
@@ -198,6 +357,24 @@ fn admit(max: (usize, usize, usize)) -> Option<StartupSlot> {
         }
     }
     Some(slot)
+}
+
+/// Child side of the startup pipe (fd 4): dropping it (on authentication or
+/// exit) tells the listener this connection no longer counts against MaxStartups.
+pub struct ChildStartup(Option<std::os::fd::OwnedFd>);
+
+impl Drop for ChildStartup {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = self.0.take() {
+            unsafe { libc::write(fd.as_raw_fd(), b"A".as_ptr().cast(), 1) };
+        }
+        set_comm(b"sshd-net\0");
+    }
+}
+
+fn set_comm(name: &[u8]) {
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0) };
 }
 
 static LOG: OnceLock<Mutex<Box<dyn Write + Send>>> = OnceLock::new();
@@ -292,17 +469,22 @@ fn main() {
     let mut to_stderr = false;
     let mut test_only = false;
     let mut port_override = None;
+    let mut child_mode = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-f" => config_path = args.next().unwrap_or_else(|| usage()),
             "-e" => to_stderr = true,
             "-t" => test_only = true,
+            "-R" => child_mode = true,
             "-p" => port_override = Some(args.next().and_then(|p| p.parse().ok()).unwrap_or_else(|| usage())),
             _ => usage(),
         }
     }
 
+    if child_mode {
+        set_comm(b"sshd-preauth\0");
+    }
     if !to_stderr && !test_only {
         let _ = fs::create_dir_all("/var/log");
         match fs::OpenOptions::new().create(true).append(true).mode(0o600).open("/var/log/sshd.log") {
@@ -354,28 +536,73 @@ fn main() {
     // A dead client must not kill the daemon on a write.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 
+    if child_mode {
+        run_child(cfg, host_key);
+        return;
+    }
+    let mut child_args: Vec<String> = vec!["-R".into(), "-f".into(), config_path.clone(), "-p".into(), cfg.port.to_string()];
+    if to_stderr {
+        child_args.push("-e".into());
+    }
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| std::env::args().next().unwrap_or_else(|| "sshd".into()));
+    let _ = CHILD_CMD.set((exe, child_args, to_stderr));
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(serve(cfg, host_key, fp.to_string()));
+    rt.block_on(serve(cfg, fp.to_string()));
 }
 
-async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
+static CHILD_CMD: OnceLock<(String, Vec<String>, bool)> = OnceLock::new();
+
+/// `sshd -R`: serve the connection on fd 3 (startup pipe on fd 4), then exit.
+fn run_child(cfg: Config, host_key: PrivateKey) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // fds 3 and 4 came through exec without CLOEXEC; keep them from leaking
+    // into the shells this process spawns.
+    for fd in [3, 4] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(3) };
+    let startup = ChildStartup(Some(unsafe { OwnedFd::from_raw_fd(4) }));
+    let (Ok(peer), local) = (std_stream.peer_addr(), std_stream.local_addr().ok()) else {
+        std::process::exit(1);
+    };
+    let _ = std_stream.set_nonblocking(true);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    rt.block_on(async move {
+        let stream = match tokio::net::TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                log(&format!("{peer}: {e}"));
+                return;
+            }
+        };
+        let rcfg = russh_config(&cfg, host_key);
+        session::run_connection(rcfg, Arc::new(cfg), stream, peer, local, startup).await;
+    });
+}
+
+fn russh_config(cfg: &Config, host_key: PrivateKey) -> Arc<russh::server::Config> {
     let mut methods = russh::MethodSet::empty();
-    if cfg.pubkey_auth {
+    if cfg.any(|c| c.pubkey_auth) {
         methods.push(MethodKind::PublicKey);
     }
-    if cfg.password_auth {
+    if cfg.any(|c| c.password_auth) {
         methods.push(MethodKind::Password);
         methods.push(MethodKind::KeyboardInteractive);
     }
-    let rcfg = Arc::new(russh::server::Config {
+    Arc::new(russh::server::Config {
         server_id: russh::SshId::Standard("SSH-2.0-LeandrOS_sshd_russh-0.64".into()),
         methods,
         auth_rejection_time: Duration::from_secs(1),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
+        // Privsep P1 hooks: kex signs through `host_key_signer` (which also
+        // records the session id); `keys` only selects the algorithm/public half.
+        host_key_signer: Some(userauth::host_key_signer(vec![host_key.clone()])),
         keys: vec![host_key],
         max_auth_attempts: cfg.max_auth_tries,
         // An idle interactive shell must stay up; dead peers are found by
@@ -385,7 +612,98 @@ async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
         keepalive_max: 3,
         nodelay: true,
         ..Default::default()
-    });
+    })
+}
+
+/// Hand one accepted connection to a fresh `sshd -R`, and watch it: its slot in
+/// MaxStartups is held until it signals authentication (or exits), and a child
+/// still unauthenticated well after LoginGraceTime is killed.
+async fn spawn_child(stream: tokio::net::TcpStream, peer: SocketAddr, grace: u64, slot: StartupSlot) {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::process::CommandExt;
+    use tokio::io::AsyncReadExt;
+    let Some((exe, args, to_stderr)) = CHILD_CMD.get() else { return };
+    let Ok(std_stream) = stream.into_std() else { return };
+    let _ = std_stream.set_nonblocking(false);
+    let mut sv = [0i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sv.as_mut_ptr()) } != 0 {
+        log(&format!("{peer}: socketpair: {}", std::io::Error::last_os_error()));
+        return;
+    }
+    let (mine, theirs) = (unsafe { std::os::fd::OwnedFd::from_raw_fd(sv[0]) }, unsafe { std::os::fd::OwnedFd::from_raw_fd(sv[1]) });
+    // Sources above 4 so the dup2 into 3/4 cannot clobber one another.
+    let sock_fd = unsafe { libc::fcntl(std_stream.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    let pipe_fd = unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+    if sock_fd < 0 || pipe_fd < 0 {
+        log(&format!("{peer}: F_DUPFD_CLOEXEC failed"));
+        return;
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args).stdin(std::process::Stdio::null());
+    if !*to_stderr {
+        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    }
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(sock_fd, 3) < 0 || libc::dup2(pipe_fd, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let spawned = tokio::process::Command::from(cmd).spawn();
+    unsafe {
+        libc::close(sock_fd);
+        libc::close(pipe_fd);
+    }
+    drop(std_stream);
+    drop(theirs);
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            log(&format!("{peer}: cannot start {exe}: {e}"));
+            return;
+        }
+    };
+    let Ok(std_mine) = (|| -> std::io::Result<std::os::unix::net::UnixStream> {
+        let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(mine.into_raw_fd()) };
+        s.set_nonblocking(true)?;
+        Ok(s)
+    })() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return;
+    };
+    let Ok(mut pipe) = tokio::net::UnixStream::from_std(std_mine) else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return;
+    };
+    let mut slot = Some(slot);
+    let backstop = tokio::time::sleep(Duration::from_secs(if grace == 0 { 86400 * 365 } else { grace + 2 }));
+    tokio::pin!(backstop);
+    let mut buf = [0u8; 8];
+    loop {
+        tokio::select! {
+            _ = pipe.read(&mut buf), if slot.is_some() => { slot = None; }
+            _ = &mut backstop, if slot.is_some() => {
+                log(&format!("{peer}: still unauthenticated after LoginGraceTime, killing the connection process"));
+                let _ = child.start_kill();
+                slot = None;
+            }
+            st = child.wait() => {
+                if let Ok(st) = st {
+                    if !st.success() {
+                        log(&format!("{peer}: connection process ended abnormally: {st}"));
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+async fn serve(cfg: Config, fp: String) {
     let cfg = Arc::new(cfg);
 
     let mut listeners = Vec::new();
@@ -423,7 +741,7 @@ async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
 
     let mut tasks = Vec::new();
     for l in listeners {
-        let rcfg = rcfg.clone();
+        unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&l), libc::F_SETFD, libc::FD_CLOEXEC) };
         let cfg = cfg.clone();
         tasks.push(tokio::spawn(async move {
             loop {
@@ -433,12 +751,11 @@ async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
                             log(&format!("{peer}: dropping connection (MaxStartups)"));
                             continue;
                         };
-                        let local = stream.local_addr().ok();
-                        let rcfg = rcfg.clone();
-                        let cfg = cfg.clone();
-                        tokio::spawn(async move {
-                            session::run_connection(rcfg, cfg, stream, peer, local, slot).await;
-                        });
+                        // Not every accept path sets close-on-exec: a connection fd leaked into
+                        // another connection's process would keep this one open after a crash.
+                        unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&stream), libc::F_SETFD, libc::FD_CLOEXEC) };
+                        let grace = cfg.login_grace_secs;
+                        tokio::spawn(spawn_child(stream, peer, grace, slot));
                     }
                     Err(e) => {
                         log(&format!("accept: {e}"));

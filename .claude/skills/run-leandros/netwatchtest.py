@@ -37,7 +37,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 
 
 def main(argv):
-    arch, keep, only = "aarch64", False, None
+    arch, keep, only = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), False, None
     it = iter(argv)
     for a in it:
         if a in ("aarch64", "x86_64"):
@@ -73,9 +73,7 @@ def main(argv):
     tmp = tempfile.mkdtemp(prefix="netwatch-")
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
-    subprocess.run(["cp", "-c", src, img], check=False)
-    if not os.path.exists(img):
-        imgclone.clone_file(src, img)
+    imgclone.clone_file(src, img)
 
     def set_cmdline(cl):
         subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, cl], check=True)

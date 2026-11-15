@@ -29,6 +29,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import driver  # noqa: E402
+import imgclone  # noqa: E402
 import nmsession as nms  # noqa: E402  (key/typ/drv/clone_path helpers)
 import sshsmoke  # noqa: E402
 
@@ -58,7 +59,7 @@ def log_since(mark):
 
 
 def main():
-    arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+    arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     scale = driver.wait_scale(arch)
     REPO = nms.REPO
     for what, src, var in (("boot", f"leandros-limine-{arch}.img", "LEANDROS_DISK_IMAGE"),
@@ -66,8 +67,7 @@ def main():
         img = nms.clone_path(arch, what)
         if os.path.exists(img):
             os.unlink(img)
-        if subprocess.run(["cp", "-c", os.path.join(REPO, src), img], capture_output=True).returncode != 0:
-            subprocess.run(["cp", os.path.join(REPO, src), img], check=True)
+        imgclone.clone_file(os.path.join(REPO, src), img)
         os.environ[var] = img
     try:
         if nms.drv("start", arch, "--virgl", t=900) != 0:

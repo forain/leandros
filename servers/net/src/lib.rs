@@ -4048,7 +4048,7 @@ fn readiness_sig(sock: &smoltcp::socket::Socket<'static>) -> u8 {
             st | (((t.can_recv() || tcp_rx_eof(t)) as u8) << 4) | ((t.can_send() as u8) << 5)
                | ((t.is_active() as u8) << 6) | ((t.may_recv() as u8) << 7)
         }
-        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1) | (((u.error() != 0) as u8) << 2),
+        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1) | ((((u.error() != 0) || u.errq_len() != 0) as u8) << 2),
         Socket::Icmp(i) => (i.can_recv() as u8) | ((i.can_send() as u8) << 1),
         #[allow(unreachable_patterns)]
         _ => 0,
@@ -4965,6 +4965,7 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
         if socket.bind(port).is_err() { return false; }
         socket.set_peer(remote);
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
         s.socket_set.add(socket)
     };
     {
@@ -5016,6 +5017,13 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>, scope: 
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
+        // An address a bridge (or other vif) of the initial netns holds, e.g.
+        // aardvark-dns on 10.89.0.1:53: the socket lives on that stack, not
+        // the default NIC's, or the containers' datagrams never reach it.
+        if let Some(sid) = vif::ns_sids_dyn(0).into_iter().find(|&sid| match *stack_for(sid) {
+            Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == a),
+            None => false,
+        }) { return Ok(sid); }
     }
     if let Some(d) = dest.filter(|d| ip6::needs_scope(*d)) { return ip6::scope_sid(ns, scope); }
     match dest {
@@ -5080,6 +5088,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, scope: u32, s
         if socket.bind(ep).is_err() { return Err(-22); }
         if fam.is_some() { socket.set_family(fam); }
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
         s.socket_set.add(socket)
     };
     tbl.socks[slot].bound_port = port;
@@ -5412,6 +5421,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 if socket.bind(local_port).is_err() { return err_reply(-22); }
                 socket.set_peer(Some(remote_endpoint));
                 socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
                     socket_handle: handle, remote_endpoint: Some(remote_endpoint), sid };
@@ -5884,15 +5894,21 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     // Path-MTU discovery (IP_MTU_DISCOVER): DONT sends without
                     // DF; DO / PROBE refuse a datagram larger than the path.
                     let pd = opts.pmtud_mode();
-                    if pd == 0 { meta.meta.nodf = true; }
+                    if pd <= 1 { meta.meta.nodf = true; } // DONT and WANT: DF clear (ip_sk_ignore_df)
                     if let (IpAddress::Ipv4(d), true) = (endpoint.addr, pd >= 2) {
-                        if data.len() + 28 > path_mtu(sid, d) as usize { return err_reply(-90); } // EMSGSIZE
+                        if data.len() + 28 > path_mtu(sid, d) as usize {
+                            if opts.recv & RECV_ERR != 0 { udp_local_emsgsize(s, socket_handle, endpoint, path_mtu(sid, d)); }
+                            return err_reply(-90); // EMSGSIZE
+                        }
                     }
                     // IPv6 never fragments in the path and this stack does not
                     // fragment at the source: DO / PROBE refuse a datagram
                     // larger than the path (RFC 8201).
                     if let (IpAddress::Ipv6(_), true) = (endpoint.addr, pd >= 2) {
-                        if data.len() + 48 > path_mtu_ip(sid, endpoint.addr) as usize { return err_reply(-90); }
+                        if data.len() + 48 > path_mtu_ip(sid, endpoint.addr) as usize {
+                            if opts.recv6 & RECV6_ERR != 0 { udp_local_emsgsize(s, socket_handle, endpoint, path_mtu_ip(sid, endpoint.addr)); }
+                            return err_reply(-90);
+                        }
                     }
                     // A copy for this host: multicast unless IP_MULTICAST_LOOP
                     // is off, broadcast always (Linux ip_mc_output). Built
@@ -6088,6 +6104,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 }
 
 const MSG_PEEK: usize = 0x02;
+const MSG_ERRQUEUE: usize = 0x2000;
 
 /// What one AF_UNIX stream read took from an end's inbound direction.
 struct StreamRead {
@@ -7202,6 +7219,51 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
             cap += l;
         }
         let (recv, recv6) = fd_ofd(pid, fd).map_or((0, 0), |o| { let so = sock_opts(o); (so.recv, so.recv6) });
+        if flags & MSG_ERRQUEUE != 0 {
+            // The socket error queue (Linux ip_recv_error / ipv6_recv_error):
+            // the quoted payload, the failed destination in msg_name and an
+            // IP_RECVERR cmsg: sock_extended_err + the ICMP sender.
+            let e = match udp_recv_err(pid, fd, flags & MSG_PEEK == 0) { Ok(e) => e, Err(x) => return err_reply(x) };
+            let mut off = 0usize;
+            for &(b, l) in iovs.iter() {
+                if off >= e.payload.len() { break; }
+                let k = l.min(e.payload.len() - off);
+                if !ucopy_out(b, &e.payload[off..off + k]) { return err_reply(-14); }
+                off += k;
+            }
+            if name_ptr != 0 { sa::write(sock_dom(pid, fd), name_ptr, msghdr_ptr + 8, e.dst); }
+            let v6 = sock_dom(pid, fd) == AF_INET6;
+            let mut c = alloc::vec::Vec::new();
+            c.extend_from_slice(&(e.errno as u32).to_ne_bytes());
+            c.extend_from_slice(&[e.origin, e.ty, e.code, 0]);
+            c.extend_from_slice(&e.info.to_ne_bytes());
+            c.extend_from_slice(&0u32.to_ne_bytes());
+            if v6 {
+                let mut sin6 = [0u8; 28];
+                sin6[0..2].copy_from_slice(&10u16.to_ne_bytes());
+                if let IpAddress::Ipv6(a) = e.offender { sin6[8..24].copy_from_slice(&a.0); }
+                else if let IpAddress::Ipv4(a) = e.offender { sin6[18] = 0xff; sin6[19] = 0xff; sin6[20..24].copy_from_slice(&a.0); }
+                c.extend_from_slice(&sin6);
+            } else {
+                let mut sin = [0u8; 16];
+                if let IpAddress::Ipv4(a) = e.offender { sin[0..2].copy_from_slice(&2u16.to_ne_bytes()); sin[4..8].copy_from_slice(&a.0); }
+                c.extend_from_slice(&sin);
+            }
+            let clen = CMSG_HDR_LEN + c.len();
+            let mut m = alloc::vec::Vec::new();
+            m.extend_from_slice(&(clen as u64).to_ne_bytes());
+            m.extend_from_slice(&(if v6 { 41i32 } else { 0i32 }).to_ne_bytes());
+            m.extend_from_slice(&(if v6 { IPV6_RECVERR as i32 } else { IP_RECVERR as i32 }).to_ne_bytes());
+            m.extend_from_slice(&c);
+            let mut ctrunc = false;
+            let mut written = 0usize;
+            if ctrl_ptr == 0 || clen > ctrl_cap { ctrunc = true; }
+            else if !ucopy_out(ctrl_ptr, &m) { return err_reply(-14); }
+            else { written = clen; }
+            let tr = e.payload.len() > off;
+            unsafe { write_msg_tail(msghdr_ptr, written, MSG_ERRQUEUE as i32 | (if ctrunc { MSG_CTRUNC } else { 0 }) | (if tr { MSG_TRUNC } else { 0 })); }
+            return val_reply(off as u64);
+        }
         let (data, full, meta) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0, recv & RECV_GRO != 0) {
             Ok(r) => r,
             // shutdown(SHUT_RD): end of file, as in handle_recv.
@@ -7908,7 +7970,7 @@ fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optle
         IPV6_RECVPKTINFO => flag(&mut o, RECV6_PKTINFO),
         IPV6_RECVHOPLIMIT => flag(&mut o, RECV6_HOPLIMIT),
         IPV6_RECVTCLASS => flag(&mut o, RECV6_TCLASS),
-        IPV6_RECVERR => flag(&mut o, RECV6_ERR),
+        IPV6_RECVERR => { flag(&mut o, RECV6_ERR); udp_set_recverr(pid, fd, o.recv6 & RECV6_ERR != 0); }
         IPV6_MTU_DISCOVER => match v {
             0..=3 => o.pmtud1 = v as u8 + 1,
             _ => return err_reply(-22),
@@ -7964,9 +8026,12 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
             Err(x) => return err_reply(x),
         },
         IP_PKTINFO | IP_RECVTTL | IP_RECVTOS | IP_RECVERR => match int_val() {
-            Ok(v) => flag(&mut o, match optname {
-                IP_PKTINFO => RECV_PKTINFO, IP_RECVTTL => RECV_TTL, IP_RECVTOS => RECV_TOS, _ => RECV_ERR,
-            }, v != 0),
+            Ok(v) => {
+                flag(&mut o, match optname {
+                    IP_PKTINFO => RECV_PKTINFO, IP_RECVTTL => RECV_TTL, IP_RECVTOS => RECV_TOS, _ => RECV_ERR,
+                }, v != 0);
+                if optname == IP_RECVERR { udp_set_recverr(pid, fd, v != 0); }
+            }
             Err(x) => return err_reply(x),
         },
         IP_MULTICAST_TTL => match int_val() {
@@ -8064,6 +8129,38 @@ fn ip_getsockopt(e: &SockEntry, optname: usize) -> Option<u32> {
         IP_MULTICAST_IF => u32::from_ne_bytes(o.mc_addr),
         _ => return None,
     })
+}
+
+/// Linux ip_local_error: a DF datagram larger than the path with IP_RECVERR
+/// fails with EMSGSIZE and leaves an SO_EE_ORIGIN_LOCAL entry (ee_info = MTU).
+fn udp_local_emsgsize(s: &mut NetStack, h: SocketHandle, dst: IpEndpoint, mtu: u32) {
+    let unspec = if matches!(dst.addr, IpAddress::Ipv6(_)) { IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED) }
+                 else { IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED) };
+    s.socket_set.get_mut::<udp::Socket>(h).push_err(udp::ErrEntry {
+        errno: 90, origin: 1, ty: 0, code: 0, info: mtu, offender: unspec, dst, payload: alloc::vec::Vec::new(),
+    });
+}
+
+/// IP_RECVERR / IPV6_RECVERR on a UDP socket: its smoltcp socket queues
+/// ICMP errors for the error queue from now on.
+fn udp_set_recverr(pid: u32, fd: usize, on: bool) {
+    let Some(e) = sock_entry(pid, fd) else { return };
+    if !is_udp_entry(&e) { return; }
+    let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return };
+    if udpany::of(e.ofd).is_some() { return; }
+    let mut stack = stack_for(sid);
+    if let Some(s) = stack.as_mut() { s.socket_set.get_mut::<udp::Socket>(socket_handle).set_recverr(on); }
+}
+
+/// MSG_ERRQUEUE: the oldest entry of the socket error queue of a UDP socket
+/// (EAGAIN when empty); `take` dequeues it (not MSG_PEEK).
+fn udp_recv_err(pid: u32, fd: usize, take: bool) -> Result<udp::ErrEntry, i32> {
+    let e = sock_entry(pid, fd).ok_or(-9i32)?;
+    if !is_udp_entry(&e) { return Err(-11); }
+    let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return Err(-11) };
+    let mut stack = stack_for(sid);
+    let s = stack.as_mut().ok_or(-100i32)?;
+    s.socket_set.get_mut::<udp::Socket>(socket_handle).recv_err(take).ok_or(-11)
 }
 
 /// Read and clear the pending ICMP error of a connected UDP socket (SO_ERROR);
@@ -9047,7 +9144,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     let mut ev = 0;
                     if socket.can_recv() { ev |= POLLIN; }
                     // A pending ICMP error (datagram_poll: sk_err).
-                    if socket.error() != 0 { ev |= POLLERR; }
+                    if socket.error() != 0 || socket.errq_len() != 0 { ev |= POLLERR; }
                     // Writable while the send queue has room: a full one
                     // (EAGAIN) becomes writable again when the daemon drains
                     // it, which is the edge an EPOLLET writer waits for.

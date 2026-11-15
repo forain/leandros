@@ -66,12 +66,25 @@ authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shu
 ### sshd
 
 [userland/sshd](../../userland/sshd/src/main.rs) is the SSH server: russh 0.64 (ring
-crypto) on tokio, one root process for every connection.
+crypto) on tokio. The root listener only accepts: it re-execs `sshd -R` once per
+connection (socket on fd 3, startup pipe on fd 4), so a crash in one connection kills only
+that connection, never the listener or other sessions (and init's restart limit cannot trip).
+The per-connection process is still root and still runs all the russh code, but it already
+uses the two hooks of the vendored russh (`userland/sshd/vendor/russh`, see its
+`LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
+the session id, and every publickey/certificate login has its raw signature re-verified
+against that session id (`src/userauth.rs`) before the authorized_keys check. SHA-1 `ssh-rsa` publickey signatures are refused (as OpenSSH 8.8+ does by default); use `rsa-sha2-256`/`rsa-sha2-512`. This is the
+groundwork for splitting the pre-auth code into an unprivileged child.
 
 - **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
   `/etc/ssh/sshd_not_to_be_run` exists or the kernel command line has `sshd=0`. It runs in
   its own session; init restarts it with a 1, 2, 4, 8, 16 s backoff and gives up after five
   exits within 60 s. It logs to `/var/log/sshd.log`.
+- **Per-connection process.** `ps` shows `sshd-preauth` until the client authenticates and
+  `sshd-net` after. The listener enforces `MaxStartups` (a connection counts until its
+  process writes to the startup pipe or exits) and kills a process still unauthenticated 2 s
+  after `LoginGraceTime`, even if it is hung. Children do not inherit the listener's fds
+  (fds 3/4 are close-on-exec in the child so shells do not get them).
 - **Listening.** `0.0.0.0:22`. It also tries `[::]:22`, which fails with `EAFNOSUPPORT`
   because there is no IPv6 yet; it logs that and goes on.
 - **Host key.** An ed25519 key is generated on first boot into
@@ -80,6 +93,25 @@ crypto) on tokio, one root process for every connection.
   `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
   `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
   `LoginGraceTime`, `PermitUserEnvironment` (default `no`), `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
+  Also `AllowTcpForwarding yes|all|no|local|remote` (`local` = `-L`/`-D`, `remote` = `-R`; combined with
+  the key's `no-port-forwarding`, the most restrictive wins), `ForceCommand` (wins over a key's
+  `command=`; the client's command goes to `SSH_ORIGINAL_COMMAND`; `internal-sftp` allows only the sftp
+  subsystem) and `TrustedUserCAKeys`. **`Match`** blocks (criteria `User`, `Group`, `Address`,
+  `LocalPort`, or `all`; comma pattern lists with `*`/`?` and `!` negation, CIDR for `Address`) are
+  evaluated per connection once the login name is known and may set `PasswordAuthentication`,
+  `PubkeyAuthentication`, `PermitRootLogin`, `AllowTcpForwarding`, `ForceCommand`,
+  `PermitUserEnvironment`, `AuthorizedKeysFile` and `DevPasswordAuthentication` (other keywords
+  inside a block are logged and ignored; `X11Forwarding`/`Banner` do not exist here). A matching
+  block overrides the global section; among matching blocks the first value of a keyword wins.
+- **User certificates.** `ssh-*-cert-v01@openssh.com` user certificates (ed25519, ecdsa, rsa) are accepted
+  when signed by a CA listed in `TrustedUserCAKeys` (principal must include the login name) or by
+  a `cert-authority` key in the user's `authorized_keys` (the line may carry `principals="a,b*"`,
+  `from=`, `command=`, `expiry-time=`). Checked: signature, validity window, user (not host)
+  certificate, principals (a certificate with none is refused), `force-command` (conflicting
+  `command=` refuses) and `source-address` critical options; any other critical option refuses the
+  login; without the `permit-port-forwarding` / `permit-pty` extensions those are denied. A
+  `cert-authority` key itself is never a login key. Not implemented: `AuthorizedPrincipalsFile`,
+  `RevokedKeys`.
 - **Authentication.** Passwords are checked against `/etc/shadow` in the system's
   sha512-crypt `$6$` format (legacy `$sha256$` fields still verify and are rewritten to `$6$rounds=65536` on the next successful login, atomically via `/etc/shadow.sshd-new` + rename), as `/bin/login` checks them. `keyboard-interactive` is offered with one hidden `Password:` prompt and the same checks as `password` (sshd implements the conversation itself; it does not load `pam-leandros`). Public keys come from
   `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks. Key options `from=` (globs, `!`

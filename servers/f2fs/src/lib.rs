@@ -4286,6 +4286,7 @@ fn cp_pos(ms: &MountState) -> [u32; 6] {
 /// remount-ro, shutdown and contexts that may not sleep only.
 fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
     act_code(ACT_CHECKPOINT);
+    vfs_server::F2FS_CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
     let seq = cp_seq_begin(ms.port);
     // An unlocked checkpoint or a roll-forward fsync may still be writing:
     // let it finish first (its commit decides which pack is durable, and an
@@ -4766,6 +4767,7 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
             return Ok(());
         }
     }
+    vfs_server::F2FS_CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
     // Phase 1.
     let (mut job, seq) = {
         let mut mounts = lock_mounts();
@@ -8419,11 +8421,13 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     if buf_ptr == 0 { return err_reply(-14); } // EFAULT
 
     let bps          = ms.sb.blocks_per_seg as u64;
-    let user_blocks  = ms.sb.seg_cnt_main as u64 * bps;
+    // What the allocator can actually fill: the overprovision and the lx
+    // reserve of empty segments (`log_alloc`) never hold user data.
+    let user_blocks  = (ms.sb.seg_cnt_main as u64).saturating_sub(lx_ovp_segs(ms) as u64 + LX_RESERVE_SEGS as u64) * bps;
     let total_blocks = ms.sb.block_count.saturating_sub(ms.sb.segment0_blkaddr as u64);
     // A superblock we failed to make sense of must still not report zero —
     // `df` silently drops any filesystem with f_blocks == 0.
-    let total_blocks = if total_blocks == 0 { user_blocks.max(1) } else { total_blocks };
+    let total_blocks = if total_blocks == 0 { (ms.sb.seg_cnt_main as u64 * bps).max(1) } else { total_blocks };
 
     let valid_blocks = ms.valid_blocks;
     if statfs_check() {
