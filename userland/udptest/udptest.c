@@ -58,6 +58,7 @@
  *   tcp_pmtud_clamp     frag-needed shrinks TCP's segment size (TCP_INFO snd_mss/pmtu)
  *   udp6_pmtud          IPV6_MTU_DISCOVER / IPV6_MTU, ICMPv6 packet-too-big, EMSGSIZE
  *   udp_pmtud           IP_MTU_DISCOVER / IP_MTU, frag-needed shrinks the path, DO sends past it are EMSGSIZE
+ *   udp_recverr_*       IP_RECVERR: MSG_ERRQUEUE sock_extended_err cmsg (ICMP port unreachable, frag-needed MTU, local EMSGSIZE), POLLERR
  *   udp_huge            4000-, 60000- and 65507-byte datagrams round-trip over loopback; 65508 is EMSGSIZE
  *   udp_large           an 8000-byte datagram over loopback arrives whole
  *   udp_gso             UDP_SEGMENT (cmsg and socket option) splits one send
@@ -1034,6 +1035,7 @@ static void udp_wildcard_connect(void) {
 /* Lane udp2: ICMP errors, multicast, broadcast, cmsgs, disconnect. */
 #include "udp2cases.c"
 #include "pmtud2.c"
+#include "recverr.c"
 
 /* Cases against the frame-level peer of udppeertest.py (second NIC). */
 #include "peer.c"
@@ -1084,6 +1086,8 @@ int main(int argc, char **argv) {
     udp_pmtud_netns();
     tcp_pmtud_clamp();
     udp6_pmtud();
+    udp_recverr_refused();
+    udp_recverr_emsgsize();
     udp_gso();
     udp_mmsg();
     udp_dup();

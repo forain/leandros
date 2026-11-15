@@ -3004,6 +3004,69 @@ static void bindbench(void) {
     if (slurp("/proc/mntselftest", buf, sizeof buf) > 0) { char *q = strstr(buf, "bindpin_checks"); if (q) { char *e = strchr(q, '\n'); if (e) *e = 0; printf("%s\n", q); } }
 }
 
+/* ---- procbind: /dev/null bound over EVERY regular /proc file (the OCI masked-
+ * path / lxcfs pattern: crun masks /proc/interrupts, lxcfs covers meminfo,
+ * uptime, stat). Before the fix the bind failed ENOENT for generated files. */
+static int procbind_all(const char *tag, int *nfiles) {
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    static char names[128][64];
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < 128) {
+        struct stat st; char p[128];
+        snprintf(p, sizeof p, "/proc/%s", e->d_name);
+        if (lstat(p, &st) == 0 && S_ISREG(st.st_mode)) { snprintf(names[n], 64, "%s", e->d_name); n++; }
+    }
+    closedir(d);
+    /* Generated files readdir may not list but that open() serves. */
+    static const char *known[] = { "meminfo", "uptime", "stat", "loadavg", "cmdline", "cpuinfo", "version",
+                                   "interrupts", "mounts", "filesystems", NULL };
+    for (int k = 0; known[k] && n < 128; k++) {
+        int have = 0;
+        for (int i = 0; i < n; i++) if (!strcmp(names[i], known[k])) have = 1;
+        char p[128]; snprintf(p, sizeof p, "/proc/%s", known[k]);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) { close(fd); if (!have) snprintf(names[n++], 64, "%s", known[k]); }
+    }
+    printf("procbind[%s]: %d files\n", tag, n);
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        char p[128]; snprintf(p, sizeof p, "/proc/%s", names[i]);
+        if (mount("/dev/null", p, NULL, MS_BIND, NULL) != 0) { printf("procbind[%s] bind %s: errno %d\n", tag, p, errno); bad++; continue; }
+        char b[64]; int fd = open(p, O_RDONLY); long r = fd >= 0 ? read(fd, b, sizeof b) : -1;
+        if (fd >= 0) close(fd);
+        if (r != 0) { printf("procbind[%s] %s not empty after bind (r=%ld)\n", tag, p, r); bad++; }
+        umount2(p, MNT_DETACH);
+    }
+    *nfiles = n;
+    return bad;
+}
+
+static void procbind_suite(void) {
+    /* An open descriptor on a generated /proc file names that file (crun mounts onto /proc/self/fd/N). */
+    {
+        int fd = open("/proc/meminfo", O_RDONLY);
+        char l[64], q[64]; ssize_t r = -1;
+        if (fd >= 0) { snprintf(q, sizeof q, "/proc/self/fd/%d", fd); r = readlink(q, l, sizeof l - 1); if (r > 0) l[r] = 0; close(fd); }
+        report("procbind_fd_names_proc_file", r > 0 && !strcmp(l, "/proc/meminfo"));
+    }
+    int n0 = 0;
+    int bad = procbind_all("ns0", &n0);
+    report("procbind_all_files_ns0", bad == 0 && n0 > 5);
+    int wr[2];
+    if (pipe(wr) != 0) { report("procbind_all_files_newns", 0); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        int n1 = 0, ok = 0;
+        if (unshare(CLONE_NEWNS) == 0) ok = procbind_all("newns", &n1) == 0 && n1 > 5;
+        char r = ok ? 1 : 0; write(wr[1], &r, 1); _exit(0);
+    }
+    char r = 0; read(wr[0], &r, 1); waitpid(c, NULL, 0);
+    close(wr[0]); close(wr[1]);
+    report("procbind_all_files_newns", r == 1);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }
@@ -3013,6 +3076,7 @@ int main(int argc, char **argv) {
     kernel_selftest();
     sb_hidden_ns0();
     ns0_invariants();
+    procbind_suite();
     newns_suite();
     hardening_suite();
     mountinfo_tests();

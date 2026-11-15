@@ -254,7 +254,38 @@ impl InterfaceInner {
 
             // LEANDROS: RFC 8201 -- a "packet too big" teaches the path MTU
             // towards the quoted datagram's destination.
-            Icmpv6Repr::PktTooBig { mtu, header, .. } => {
+            Icmpv6Repr::PktTooBig { mtu, header, data } => {
+                // LEANDROS: IPV6_RECVERR (Linux __udp6_lib_err -> ipv6_icmp_error).
+                #[cfg(feature = "socket-udp")]
+                if header.next_header == IpProtocol::Udp && data.len() >= 8 {
+                    let sport = u16::from_be_bytes([data[0], data[1]]);
+                    let dport = u16::from_be_bytes([data[2], data[3]]);
+                    let local = IpAddress::Ipv6(header.src_addr);
+                    let remote = IpEndpoint::new(IpAddress::Ipv6(header.dst_addr), dport);
+                    for u in _sockets
+                        .items_mut()
+                        .filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket))
+                    {
+                        let ep = u.endpoint();
+                        if u.recverr()
+                            && ep.port == sport
+                            && ep.addr.map_or(true, |a| a == local)
+                            && u.peer().map_or(true, |p| p == remote)
+                        {
+                            u.push_err(crate::socket::udp::ErrEntry {
+                                errno: 90,
+                                origin: 3,
+                                ty: 2,
+                                code: 0,
+                                info: mtu,
+                                offender: ip_repr.src_addr(),
+                                dst: remote,
+                                payload: data[8..].to_vec(),
+                            });
+                            u.set_error(90);
+                        }
+                    }
+                }
                 let m = mtu.min(u16::MAX as u32) as u16;
                 crate::pmtu::update(self.pmtu_scope, header.dst_addr.0, m, crate::pmtu::MIN_PMTU6, self.now.total_millis() as u64);
                 None
