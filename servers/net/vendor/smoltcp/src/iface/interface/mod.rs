@@ -111,6 +111,8 @@ pub struct InterfaceInner {
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     #[cfg(feature = "proto-ipv4")]
     any_ip: bool,
+    /// LEANDROS: the path-MTU cache scope (the stack / network namespace).
+    pmtu_scope: u16,
     routes: Routes,
     #[cfg(feature = "proto-igmp")]
     ipv4_multicast_groups: LinearMap<Ipv4Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
@@ -226,6 +228,7 @@ impl Interface {
                 ip_addrs: Vec::new(),
                 #[cfg(feature = "proto-ipv4")]
                 any_ip: false,
+                pmtu_scope: 0,
                 routes: Routes::new(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
@@ -372,6 +375,11 @@ impl Interface {
     /// This option is not available or required for IPv6 as packets sent to
     /// the interface are not filtered by IPv6 address.
     #[cfg(feature = "proto-ipv4")]
+    /// LEANDROS: tag this interface's path-MTU cache entries.
+    pub fn set_pmtu_scope(&mut self, scope: u16) {
+        self.inner.pmtu_scope = scope;
+    }
+
     pub fn set_any_ip(&mut self, any_ip: bool) {
         self.inner.any_ip = any_ip;
     }
@@ -884,6 +892,23 @@ impl InterfaceInner {
     #[allow(unused)] // unused depending on which sockets are enabled
     pub(crate) fn ip_mtu(&self) -> usize {
         self.caps.ip_mtu()
+    }
+
+    /// LEANDROS: the IP MTU towards `dst`: the link's, or a smaller one an
+    /// ICMP "fragmentation needed" / "packet too big" taught the cache.
+    #[allow(unused)]
+    pub(crate) fn path_ip_mtu(&self, dst: &IpAddress) -> usize {
+        let key = match dst {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(a) => crate::pmtu::v4(a.0),
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(a) => a.0,
+        };
+        let link = self.caps.ip_mtu();
+        match crate::pmtu::lookup(self.pmtu_scope, key, self.now.total_millis() as u64) {
+            Some(m) => link.min(m as usize),
+            None => link,
+        }
     }
 
     #[allow(unused)] // unused depending on which sockets are enabled, and in tests
@@ -1750,7 +1775,8 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                if total_ip_len > self.caps.max_transmission_unit {
+                let path_mtu = self.path_ip_mtu(&IpAddress::Ipv4(repr.dst_addr));
+                if total_ip_len > self.caps.max_transmission_unit - (self.caps.ip_mtu() - path_mtu) {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
                         net_debug!("start fragmentation");
@@ -1760,7 +1786,7 @@ impl InterfaceInner {
                         // multiple of 8 payload bytes (RFC 791); upstream
                         // used the whole IP MTU.
                         let first_frag_ip_len =
-                            ip_header_len + ((self.caps.ip_mtu() - ip_header_len) & !7);
+                            ip_header_len + ((path_mtu - ip_header_len) & !7);
 
                         // Calculate how much we will send now (including the Ethernet header).
                         #[allow(unused_mut)]

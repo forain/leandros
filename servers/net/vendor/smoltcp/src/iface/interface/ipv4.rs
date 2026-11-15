@@ -299,7 +299,7 @@ impl InterfaceInner {
             } => {
                 let code: u8 = reason.into();
                 if code == 4 {
-                    crate::pmtu::update(u32::from_be_bytes(header.dst_addr.0), mtu, self.now.total_millis() as u64);
+                    crate::pmtu::update(self.pmtu_scope, crate::pmtu::v4(header.dst_addr.0), mtu, crate::pmtu::MIN_PMTU, self.now.total_millis() as u64);
                 }
                 // Linux icmp_err_convert: (errno, fatal). Code 4 (fragmentation
                 // needed) is path-MTU discovery, which a socket never sees.
