@@ -50,6 +50,8 @@ pub mod jobctl;
 pub mod keyboard;
 pub mod pty;
 pub mod vt;
+#[path = "../../../drivers/src/wcwidth.rs"]
+pub mod wcwidth;
 
 // ── Protocol tag constants ────────────────────────────────────────────────────
 

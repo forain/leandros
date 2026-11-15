@@ -9443,7 +9443,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/vtstat" {
             // VT / DRM-master / evdev-arbitration counters (`vt::stats_text`).
-            let mut buf = alloc::vec![0u8; 4096];
+            let mut buf = alloc::vec![0u8; 16384];
             let n = tty_server::vt::stats_text(&mut buf);
             match proc_snapshot(b"/tmp/.vtstat", &buf[..n], false) {
                 Some(v) => v,

@@ -158,7 +158,13 @@ struct Screen {
     /// UTF-8 continuation bytes still expected, and the accumulator.
     utf8_left: u8,
     utf8_acc: u32,
+    /// Tab stops (`ESC H`, `CSI g`); every 8 columns until changed.
+    tabs: crate::wcwidth::TabStops,
 }
+
+/// Low half of the second cell of a double-width character. Never a real code
+/// point (above U+10FFFF), so it cannot collide with text.
+pub const WIDE_CONT: u32 = 0x8000_0000;
 
 impl Screen {
     const fn new() -> Self {
@@ -174,6 +180,7 @@ impl Screen {
             params: [0; 32],
             utf8_left: 0,
             utf8_acc: 0,
+            tabs: crate::wcwidth::TabStops::default_stops(),
         }
     }
 
@@ -185,11 +192,27 @@ impl Screen {
         self.esc = ESC_GROUND;
         self.params_len = 0;
         self.utf8_left = 0;
+        self.tabs = crate::wcwidth::TabStops::default_stops();
+    }
+
+    #[inline]
+    fn is_cont(&self, col: usize, row: usize) -> bool {
+        col < VT_COLS && row < VT_ROWS && self.cells[row * VT_COLS + col] as u32 == WIDE_CONT
+    }
+
+    /// About to overwrite `[c0, c1)`: a double-width character that straddles
+    /// either edge loses its other half, which is blanked so no half glyph
+    /// survives.
+    fn split_wide(&mut self, row: usize, c0: usize, c1: usize) {
+        if row >= VT_ROWS { return; }
+        if c0 > 0 && self.is_cont(c0, row) { self.cells[row * VT_COLS + c0 - 1] = BLANK; }
+        if c1 < VT_COLS && self.is_cont(c1, row) { self.cells[row * VT_COLS + c1] = BLANK; }
     }
 
     #[inline]
     fn put_cell(&mut self, col: usize, row: usize, ch: u32) {
         if col >= VT_COLS || row >= VT_ROWS { return; }
+        self.split_wide(row, col, col + 1);
         let fg = self.fg_enc;
         self.cells[row * VT_COLS + col] = cell(ch, fg);
     }
@@ -198,6 +221,7 @@ impl Screen {
     fn blank_span(&mut self, row: usize, c0: usize, c1: usize) {
         if row >= VT_ROWS { return; }
         let c1 = c1.min(VT_COLS);
+        self.split_wide(row, c0.min(c1), c1);
         let base = row * VT_COLS;
         for c in c0.min(c1)..c1 { self.cells[base + c] = BLANK; }
     }
@@ -244,6 +268,8 @@ impl Screen {
                     b'8' => { self.cur_col = self.saved_col; self.cur_row = self.saved_row; ESC_GROUND }
                     // ESC M — reverse index.
                     b'M' => { self.cur_row = self.cur_row.saturating_sub(1); ESC_GROUND }
+                    // ESC H — HTS, set a tab stop at the cursor.
+                    b'H' => { self.tabs.set(self.cur_col as usize); ESC_GROUND }
                     _ => ESC_GROUND,
                 };
                 return;
@@ -280,6 +306,8 @@ impl Screen {
             self.cur_row += 1;
         } else if c == b'\r' {
             self.cur_col = 0;
+        } else if c == b'\t' {
+            self.cur_col = self.tabs.next(self.cur_col as usize, 1, cols) as u32;
         } else if c == 0x08 {
             if self.cur_col > 0 {
                 self.cur_col -= 1;
@@ -310,10 +338,22 @@ impl Screen {
 
             // Zero-width joiners/spaces and variation selectors take no cell
             // (the console drawing side skips them too: drivers::glyphs).
-            let ch = ch.filter(|&u| !matches!(u, 0x200B..=0x200D | 0x2060 | 0xFE00..=0xFE0F));
+            let ch = ch.filter(|&u| crate::wcwidth::width(u) != 0);
             if let Some(ch) = ch {
+                let w = crate::wcwidth::width(ch);
+                // A double-width character that does not fit before the right
+                // margin wraps whole; the stranded last cell stays blank.
+                if w == 2 && self.cur_col as usize + 2 > cols && cols >= 2 {
+                    self.cur_col = 0;
+                    self.cur_row += 1;
+                    if self.cur_row as usize >= rows { self.scroll(rows, scroll_rows); }
+                }
                 let (col, row) = (self.cur_col as usize, self.cur_row as usize);
                 self.put_cell(col, row, ch);
+                if w == 2 && col + 1 < cols {
+                    self.put_cell(col + 1, row, WIDE_CONT);
+                    self.cur_col += 1;
+                }
                 self.cur_col += 1;
                 if self.cur_col as usize >= cols {
                     self.cur_col = 0;
@@ -378,6 +418,13 @@ impl Screen {
             b'm' => self.apply_sgr(&nums[..count], &present[..count]),
             b's' => { self.saved_col = self.cur_col; self.saved_row = self.cur_row; }
             b'u' => { self.cur_col = self.saved_col; self.cur_row = self.saved_row; }
+            b'I' => col = self.tabs.next(col, p(0, 1), cols),
+            b'Z' => col = self.tabs.prev(col, p(0, 1)),
+            b'g' => match p(0, 0) {
+                0 => self.tabs.clear(col),
+                3 => self.tabs.clear_all(),
+                _ => {}
+            },
             _ => {}
         }
 
@@ -2176,6 +2223,20 @@ pub fn stats_text(buf: &mut [u8]) -> usize {
     let _ = writeln!(w, "evdev revokes={} revoked_refusals={} grab_filtered={} vt_filtered={}",
         r(&EV_REVOKES), r(&EV_REVOKED_REFUSALS), r(&EV_GRAB_FILTERED), r(&EV_VT_FILTERED));
     let _ = writeln!(w, "mirror_drops {}", mirror_drops());
+    // Cell-grid readback for tests: cursor and the first rows of every VT with
+    // a session, as hex code points (`WIDE_CONT` shows as 80000000).
+    {
+        let s = SCREENS.lock();
+        for i in 1..VT_COUNT {
+            if session_pair(i).is_none() { continue; }
+            let _ = writeln!(w, "vtcur {} {} {}", i + 1, s[i].cur_col, s[i].cur_row);
+            for r in 0..4 {
+                let _ = write!(w, "vtrow {} {}:", i + 1, r);
+                for c in 0..24 { let _ = write!(w, " {:x}", s[i].cells[r * VT_COLS + c] as u32); }
+                let _ = writeln!(w);
+            }
+        }
+    }
     let hook = STATS_HOOK.load(Ordering::Relaxed);
     if hook != 0 {
         // SAFETY: only `register_stats_hook` stores here, always a valid fn.

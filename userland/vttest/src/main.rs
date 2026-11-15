@@ -1331,6 +1331,196 @@ unsafe fn arg_num(argv: *mut *mut u8, i: isize) -> usize {
     v
 }
 
+// ── Console emulation: tab stops and double-width cells ──────────────────────
+//
+// The per-VT text mirror (`servers/tty/src/vt.rs`) is the only readable copy of
+// what a VT displays, and `/proc/vtstat` dumps its cursor and first rows as hex
+// code points (`vtcur <vt> <col> <row>`, `vtrow <vt> <r>: ...`). A session's
+// bytes go through the same emulator that draws the framebuffer, so asserting
+// on the mirror asserts on where the console put each character.
+
+const WIDE_CONT: u32 = 0x8000_0000;
+static mut VTSTAT_BUF: [u8; 16384] = [0; 16384];
+
+struct Snap { col: u32, row: u32, cells: [[u32; 24]; 4] }
+
+fn parse_num(b: &[u8], i: &mut usize, radix: u32) -> u32 {
+    let mut v = 0u32;
+    while *i < b.len() {
+        let d = match b[*i] { b'0'..=b'9' => b[*i] - b'0', b'a'..=b'f' => b[*i] - b'a' + 10, _ => break };
+        if d as u32 >= radix { break; }
+        v = v.wrapping_mul(radix).wrapping_add(d as u32);
+        *i += 1;
+    }
+    v
+}
+
+/// Read `/proc/vtstat` and extract VT `vt`'s cursor and top rows.
+unsafe fn snap(vt: u32) -> Option<Snap> {
+    let fd = open(b"/proc/vtstat\0".as_ptr(), 0);
+    if fd < 0 { return None; }
+    let buf = &mut *core::ptr::addr_of_mut!(VTSTAT_BUF);
+    let mut n = 0usize;
+    loop {
+        let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+        if r <= 0 { break; }
+        n += r as usize;
+    }
+    close(fd);
+    let mut s = Snap { col: 0, row: 0, cells: [[0; 24]; 4] };
+    let mut seen_cur = false;
+    for line in buf[..n].split(|&b| b == b'\n') {
+        let mut i;
+        if line.starts_with(b"vtcur ") {
+            i = 6;
+            if parse_num(line, &mut i, 10) != vt { continue; }
+            i += 1; s.col = parse_num(line, &mut i, 10);
+            i += 1; s.row = parse_num(line, &mut i, 10);
+            seen_cur = true;
+        } else if line.starts_with(b"vtrow ") {
+            i = 6;
+            if parse_num(line, &mut i, 10) != vt { continue; }
+            i += 1; let r = parse_num(line, &mut i, 10) as usize;
+            i += 1; // ':'
+            if r >= 4 { continue; }
+            for c in 0..24 { i += 1; s.cells[r][c] = parse_num(line, &mut i, 16); }
+        }
+    }
+    if seen_cur { Some(s) } else { None }
+}
+
+/// Clear VT 6 (it is only ever used here), write `bytes`, give the renderer
+/// time to drain them, and return the mirror.
+unsafe fn emu(fd: c_int, bytes: &[u8]) -> Option<Snap> {
+    let pre = b"\x1b[2J\x1b[H";
+    write(fd, pre.as_ptr() as *const c_void, pre.len());
+    write(fd, bytes.as_ptr() as *const c_void, bytes.len());
+    sleep_ms(250);
+    snap(6)
+}
+
+/// Put VT 6's tab stops back to every 8 columns (through col 80).
+unsafe fn reset_tabs(fd: c_int) {
+    let mut seq = [0u8; 160];
+    let mut n = 0;
+    let head = b"\x1b[3g";
+    seq[..head.len()].copy_from_slice(head); n += head.len();
+    let mut c = 9usize; // 1-based column 9 == index 8
+    while c <= 81 {
+        let s = [0x1b, b'[', b'0' + (c / 10) as u8, b'0' + (c % 10) as u8, b'G', 0x1b, b'H'];
+        seq[n..n + 7].copy_from_slice(&s); n += 7;
+        c += 8;
+    }
+    write(fd, seq.as_ptr() as *const c_void, n);
+    sleep_ms(100);
+}
+
+unsafe fn emu2(fd: c_int, a: &[u8], b: &[u8]) -> Option<Snap> {
+    let mut o = [0u8; 48];
+    o[..a.len()].copy_from_slice(a);
+    o[a.len()..a.len() + b.len()].copy_from_slice(b);
+    emu(fd, &o[..a.len() + b.len()])
+}
+
+unsafe fn open_emu_vt() -> c_int { open(b"/dev/tty6\0".as_ptr(), O_RDWR | O_NOCTTY) }
+
+unsafe fn t_emu_tab_default() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_tab_default", false); }
+    let s = emu(fd, b"a\tb\tc\x1b[2;1H12345678\tz");
+    close(fd);
+    let ok = match s {
+        Some(s) => s.cells[0][0] == b'a' as u32 && s.cells[0][8] == b'b' as u32
+            && s.cells[0][16] == b'c' as u32 && s.cells[1][8] == b'z' as u32
+            && s.col == 9 && s.row == 1,
+        None => false,
+    };
+    report(b"emu_tab_default", ok)
+}
+
+unsafe fn t_emu_tab_stops() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_tab_stops", false); }
+    // Clear all, then HTS at columns 4 and 11 (0-based).
+    let s1 = emu(fd, b"\x1b[3g\x1b[5G\x1bH\x1b[12G\x1bH\r\tX\tY");
+    // CHT from col 0 over both stops; CBT back from col 20.
+    let s2 = emu(fd, b"\r\x1b[2I");
+    let s3 = emu(fd, b"\x1b[21G\x1b[Z");
+    let s4 = emu(fd, b"\x1b[21G\x1b[2Z");
+    // TBC at the cursor: clear col 4, then a tab from 0 goes straight to 11.
+    let s5 = emu(fd, b"\x1b[5G\x1b[g\r\tW");
+    reset_tabs(fd);
+    let s6 = emu(fd, b"\r\tq");
+    close(fd);
+    let c = |s: &Option<Snap>| s.as_ref().map(|s| (s.col, s.row));
+    let ok1 = s1.as_ref().map_or(false, |s| s.cells[0][4] == b'X' as u32 && s.cells[0][11] == b'Y' as u32);
+    let ok2 = c(&s2) == Some((11, 0));
+    let ok3 = c(&s3) == Some((11, 0));
+    let ok4 = c(&s4) == Some((4, 0));
+    let ok5 = s5.as_ref().map_or(false, |s| s.cells[0][11] == b'W' as u32 && s.cells[0][4] == 0);
+    let ok6 = s6.as_ref().map_or(false, |s| s.cells[0][8] == b'q' as u32);
+    out(b"  hts="); out_int(ok1 as c_int); out(b" cht="); out_int(ok2 as c_int);
+    out(b" cbt="); out_int((ok3 && ok4) as c_int); out(b" tbc="); out_int(ok5 as c_int);
+    out(b" reset="); out_int(ok6 as c_int); out(b"\n");
+    report(b"emu_tab_stops", ok1 && ok2 && ok3 && ok4 && ok5 && ok6)
+}
+
+unsafe fn t_emu_wide_advance() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_wide_advance", false); }
+    // A, CJK (2 cells), B, emoji, fullwidth 'a', e + combining acute, e-acute.
+    let s = emu(fd, "A\u{4e16}B\u{1F600}\u{ff41}e\u{301}\u{e9}".as_bytes());
+    close(fd);
+    let ok = match s {
+        Some(s) => {
+            let r = &s.cells[0];
+            r[0] == b'A' as u32 && r[1] == 0x4e16 && r[2] == WIDE_CONT && r[3] == b'B' as u32
+                && r[4] == 0x1F600 && r[5] == WIDE_CONT && r[6] == 0xff41 && r[7] == WIDE_CONT
+                && r[8] == b'e' as u32 && r[9] == 0xe9 && s.col == 10 && s.row == 0
+        }
+        None => false,
+    };
+    report(b"emu_wide_advance", ok)
+}
+
+unsafe fn t_emu_wide_overwrite() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_wide_overwrite", false); }
+    let a = "\u{4e16}\u{754c}".as_bytes();
+    // Right half of the first character overwritten: the left half goes.
+    let s1 = emu2(fd, a, b"\x1b[2Gx");
+    // Left half of the second overwritten: its right half goes.
+    let s2 = emu2(fd, a, b"\x1b[3Gz");
+    // EL 0 from the right half of the second: the whole character goes.
+    let s3 = emu2(fd, a, b"\x1b[4G\x1b[K");
+    close(fd);
+    let ok1 = s1.as_ref().map_or(false, |s| {
+        let r = &s.cells[0];
+        r[0] == 0 && r[1] == b'x' as u32 && r[2] == 0x754c && r[3] == WIDE_CONT });
+    let ok2 = s2.as_ref().map_or(false, |s| {
+        let r = &s.cells[0];
+        r[0] == 0x4e16 && r[1] == WIDE_CONT && r[2] == b'z' as u32 && r[3] == 0 });
+    let ok3 = s3.as_ref().map_or(false, |s| {
+        let r = &s.cells[0];
+        r[0] == 0x4e16 && r[1] == WIDE_CONT && r[2] == 0 && r[3] == 0 });
+    out(b"  right_half="); out_int(ok1 as c_int); out(b" left_half="); out_int(ok2 as c_int);
+    out(b" erase="); out_int(ok3 as c_int); out(b"\n");
+    report(b"emu_wide_overwrite", ok1 && ok2 && ok3)
+}
+
+unsafe fn t_emu_wide_wrap() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_wide_wrap", false); }
+    // Last column, then a double-width character: it wraps whole.
+    let s = emu(fd, "\x1b[999C\u{4e16}".as_bytes());
+    close(fd);
+    let ok = match s {
+        Some(s) => s.cells[1][0] == 0x4e16 && s.cells[1][1] == WIDE_CONT && s.col == 2 && s.row == 1,
+        None => false,
+    };
+    report(b"emu_wide_wrap", ok)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let argc = argc_c as isize;
@@ -1377,7 +1567,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 32usize;
+    let total = 37usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1411,6 +1601,11 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_keymap_entries() { passed += 1; }
     if t_kbled() { passed += 1; }
     if t_kbsent() { passed += 1; }
+    if t_emu_tab_default() { passed += 1; }
+    if t_emu_tab_stops() { passed += 1; }
+    if t_emu_wide_advance() { passed += 1; }
+    if t_emu_wide_overwrite() { passed += 1; }
+    if t_emu_wide_wrap() { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, the
     // default keyboard mode. A suite that fails halfway through a KD_GRAPHICS
