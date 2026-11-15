@@ -503,6 +503,11 @@ def main(argv):
                 print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
             else:
                 print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
+                try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
+                    with open(driver.QEMU_STDERR_LOG, "rb") as ef:
+                        print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
+                except OSError:
+                    pass
             subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
         entry["boot"] = "ok" if booted else "failed"
         if not booted:
