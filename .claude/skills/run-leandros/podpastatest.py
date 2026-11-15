@@ -105,8 +105,16 @@ def main():
             gw6 = ":".join(g6.group(1)[i:i + 4] for i in range(0, 32, 4))
             rc, out = run(f"podman run --rm {IMG} sh -c 'ip -6 -o addr show scope global; ip -6 route' 2>&1")
             check("pasta_v6_addr_route", rc == 0 and re.search(r"inet6 [0-9a-f:]+/\d+", out) is not None and "default" in out, f"rc={rc} " + tail(out))
-            rc, out = run(f"podman run --rm {IMG} ping -6 -c3 -W 5 {gw6} 2>&1")
-            check("pasta_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + tail(out))
+            # Target: the IPv6 default gateway learned via RA (read from the guest's own route table), valid on
+            # slirp and vmnet alike and not an address pasta also assigns to the container.
+            rc, rt = run("busybox.static ip -6 route 2>&1")
+            gm = re.search(r"^default via ([0-9a-f:]+)", rt, re.M)
+            if gm:
+                tgt = gm.group(1) + ("%eth0" if gm.group(1).startswith("fe80") else "")
+                rc, out = run(f"podman run --rm {IMG} ping -6 -c3 -W 5 {tgt} 2>&1")
+                check("pasta_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"tgt={tgt} rc={rc} " + tail(out))
+            else:
+                check("pasta_v6_ping", False, "no IPv6 default route in the guest: " + tail(rt))
         else:
             print("pasta_v6: SKIP no global eth0 address (vmnet)")
 
