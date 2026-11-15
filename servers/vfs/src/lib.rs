@@ -9805,9 +9805,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
                 Some(v) => {
                     if let VnodeKind::TmpFile { idx, .. } = v {
+                        // Same lock order as everywhere: TMP_FILES, then PSYS_ORIGIN. Drop the
+                        // entries of snapshots that were closed since (their slot is free or reused).
+                        let tmp = TMP_FILES.lock();
                         let mut o = PSYS_ORIGIN.lock();
-                        o.retain(|e| e.0 != idx);
-                        if o.len() < 64 { o.push((idx, lookup_path.to_vec())); }
+                        o.retain(|e| e.0 != idx && e.0 < tmp.len() && tmp[e.0].in_use() && tmp[e.0].path().starts_with(b"/tmp/.psys_"));
+                        o.push((idx, lookup_path.to_vec()));
                     }
                     v
                 }
