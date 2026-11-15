@@ -44,6 +44,8 @@ const _: () = assert!(drivers::kenv::pm::PHASE_WIFI == ph::WIFI);
 fn console_kexec() -> Vec<String> { drivers::gpu_kms::console_restore(); Vec::new() }
 fn opt(s: Option<String>) -> Vec<String> { s.into_iter().collect() }
 fn r8169_kexec() -> Vec<String> { opt(drivers::r8169::shutdown()) }
+fn ena_shutdown(_: bool) -> ShutOut { ShutOut { line: drivers::ena::shutdown(), bm: None } }
+fn ena_kexec() -> Vec<String> { opt(drivers::ena::shutdown()) }
 fn iwl_kexec() -> Vec<String> { opt(drivers::iwlwifi::kexec_stop()) }
 
 static BUILTIN: &[Dev] = &[
@@ -58,6 +60,7 @@ static BUILTIN: &[Dev] = &[
     Dev { name: "e1000e", phase: ph::NET, suspend: Some(crate::pm::e1000e_suspend), resume: Some(crate::pm::e1000e_resume),
           shutdown: Some(e1000e_shutdown), ..NONE },
     Dev { name: "r8169", phase: ph::NET, kexec: Some(r8169_kexec), ..NONE },
+    Dev { name: "ena", phase: ph::NET, shutdown: Some(ena_shutdown), kexec: Some(ena_kexec), ..NONE },
     Dev { name: "iwlwifi", phase: ph::WIFI, kexec: Some(iwl_kexec), ..NONE },
     Dev { name: "block", phase: ph::BLOCK, suspend: Some(crate::pm::blk_suspend), resume: Some(crate::pm::blk_resume),
           block_shutdown: Some(drivers::nvme::shutdown_all), kexec: Some(drivers::nvme::kexec_disable), ..NONE },
