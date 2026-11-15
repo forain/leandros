@@ -28,18 +28,18 @@ use tokio::sync::mpsc;
 use crate::accounts::{self, User};
 use crate::{log, Config, RootLogin};
 
-enum Input {
+pub(crate) enum Input {
     Data(Vec<u8>),
     Eof,
 }
 
 #[derive(Clone)]
-struct PtyReq {
-    term: String,
-    cols: u16,
-    rows: u16,
-    px: u16,
-    py: u16,
+pub(crate) struct PtyReq {
+    pub(crate) term: String,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) px: u16,
+    pub(crate) py: u16,
 }
 
 #[derive(Default)]
@@ -122,7 +122,7 @@ impl Drop for Conn {
     }
 }
 
-fn sig_number(s: &Sig) -> Option<i32> {
+pub(crate) fn sig_number(s: &Sig) -> Option<i32> {
     Some(match s {
         Sig::ABRT => libc::SIGABRT,
         Sig::ALRM => libc::SIGALRM,
@@ -147,7 +147,7 @@ fn sig_number(s: &Sig) -> Option<i32> {
     })
 }
 
-fn sig_from_number(n: i32) -> Sig {
+pub(crate) fn sig_from_number(n: i32) -> Sig {
     match n {
         libc::SIGABRT => Sig::ABRT,
         libc::SIGALRM => Sig::ALRM,
@@ -168,7 +168,7 @@ fn sig_from_number(n: i32) -> Sig {
 
 /// Variables a client may set with an `env` request (OpenSSH's AcceptEnv in
 /// Debian's default config: the locale).
-fn env_allowed(name: &str) -> bool {
+pub(crate) fn env_allowed(name: &str) -> bool {
     name == "LANG" || name.starts_with("LC_") || name == "COLORTERM" || name == "TZ"
 }
 
@@ -692,7 +692,7 @@ async fn finish(handle: &Handle, id: ChannelId, status: std::io::Result<std::pro
 
 /// An fd shared with the window-change path: AsyncFd needs an owner, and the
 /// master must stay open until both halves are done.
-struct DupFd(Arc<OwnedFd>);
+pub(crate) struct DupFd(pub(crate) Arc<OwnedFd>);
 impl AsRawFd for DupFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
@@ -729,7 +729,7 @@ async fn pump_fd(afd: &AsyncFd<DupFd>, h: &Handle, id: ChannelId) {
     }
 }
 
-async fn write_all_fd(afd: &AsyncFd<DupFd>, mut data: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_all_fd(afd: &AsyncFd<DupFd>, mut data: &[u8]) -> std::io::Result<()> {
     while !data.is_empty() {
         let mut guard = afd.writable().await?;
         match guard.try_io(|inner| {
@@ -749,13 +749,13 @@ async fn write_all_fd(afd: &AsyncFd<DupFd>, mut data: &[u8]) -> std::io::Result<
     Ok(())
 }
 
-fn set_winsize(fd: RawFd, p: &PtyReq) {
+pub(crate) fn set_winsize(fd: RawFd, p: &PtyReq) {
     let ws = libc::winsize { ws_row: p.rows, ws_col: p.cols, ws_xpixel: p.px, ws_ypixel: p.py };
     unsafe { libc::ioctl(fd, libc::TIOCSWINSZ as _, &ws) };
 }
 
 /// A pty pair from /dev/ptmx: (master, nonblocking + close-on-exec; slave; slave path).
-fn open_pty(p: &PtyReq) -> std::io::Result<(OwnedFd, OwnedFd, String)> {
+pub(crate) fn open_pty(p: &PtyReq) -> std::io::Result<(OwnedFd, OwnedFd, String)> {
     unsafe {
         let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
         if m < 0 {
@@ -1153,11 +1153,11 @@ impl Conn {
 
 /// May a dev password (equal to the user name) log in from `peer`? See
 /// `DevPasswordAuthentication` in sshd_config.
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn dev_password_allowed(policy: crate::DevPasswords, peer: SocketAddr) -> bool {
+pub(crate) fn dev_password_allowed(policy: crate::DevPasswords, peer: SocketAddr) -> bool {
     use crate::DevPasswords::*;
     match policy {
         Yes => true,

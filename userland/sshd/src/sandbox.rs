@@ -108,10 +108,12 @@ pub fn build_filter(arch: u32, log_only: bool) -> Vec<SockFilter> {
     f.push(ins(BPF_RET | BPF_K, allow));
     f.push(ins(BPF_RET | BPF_K, deny));
     // ioctl: FIONBIO / FIONREAD on the connection and the channels.
-    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, pick(NR_IOCTL), 0, 5));
+    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, pick(NR_IOCTL), 0, 6));
     f.push(ld_arg(1));
-    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, FIONBIO as u32, 2, 0));
-    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, FIONREAD as u32, 1, 0));
+    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, FIONBIO as u32, 3, 0));
+    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, FIONREAD as u32, 2, 0));
+    // TIOCSWINSZ: window-change on the pty master the monitor handed over.
+    f.push(SockFilter::jump(BPF_JMP | BPF_JEQ | BPF_K, 0x5414, 1, 0));
     f.push(ins(BPF_RET | BPF_K, deny));
     f.push(ins(BPF_RET | BPF_K, allow));
     // mprotect without PROT_EXEC (no JIT, no W^X flips).
@@ -242,6 +244,7 @@ mod tests {
             assert_eq!(run_with(arch, prctl, [38, 1, 0, 0, 0, 0], false), SECCOMP_RET_KILL_PROCESS); // NNP
             assert_eq!(run_with(arch, prctl, [22, 2, 0, 0, 0, 0], false), SECCOMP_RET_KILL_PROCESS); // seccomp
             assert_eq!(run_with(arch, ioctl, [5, 0x5421, 0, 0, 0, 0], false), SECCOMP_RET_ALLOW);
+            assert_eq!(run_with(arch, ioctl, [5, 0x5414, 0, 0, 0, 0], false), SECCOMP_RET_ALLOW);
             assert_eq!(run_with(arch, ioctl, [5, 0x5401, 0, 0, 0, 0], false), SECCOMP_RET_KILL_PROCESS); // TCGETS
             assert_eq!(run_with(arch, mprot, [0, 0, 3, 0, 0, 0], false), SECCOMP_RET_ALLOW);
             assert_eq!(run_with(arch, mprot, [0, 0, 5, 0, 0, 0], false), SECCOMP_RET_KILL_PROCESS); // PROT_EXEC

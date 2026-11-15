@@ -24,6 +24,8 @@ mod utmpx;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
 mod session;
+mod monitor;
+mod netchild;
 mod userauth;
 #[allow(dead_code)] // privsep P3/P4 building blocks, wired in by the monitor/netchild split
 mod rpc;
@@ -373,7 +375,6 @@ impl Drop for ChildStartup {
         if let Some(fd) = self.0.take() {
             unsafe { libc::write(fd.as_raw_fd(), b"A".as_ptr().cast(), 1) };
         }
-        set_comm(b"sshd-net\0");
     }
 }
 
@@ -383,7 +384,18 @@ fn set_comm(name: &[u8]) {
 
 static LOG: OnceLock<Mutex<Box<dyn Write + Send>>> = OnceLock::new();
 
+/// Set in the unprivileged network child: `log` then writes to the monitor's
+/// per-connection pipe instead of the root log file.
+pub static CHILD_LOG_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 pub fn log(msg: &str) {
+    let lfd = CHILD_LOG_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if lfd >= 0 {
+        let clean: String = msg.chars().map(|c| if c.is_control() { ' ' } else { c }).take(400).collect();
+        let line = format!("net[{}]: {}\n", std::process::id(), clean);
+        unsafe { libc::write(lfd, line.as_ptr().cast(), line.len()) };
+        return;
+    }
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     let line = format!("[{}] sshd[{}]: {}\n", ts.tv_sec, std::process::id(), msg);
@@ -486,9 +498,6 @@ fn main() {
         }
     }
 
-    if child_mode {
-        set_comm(b"sshd-preauth\0");
-    }
     if !to_stderr && !test_only {
         let _ = fs::create_dir_all("/var/log");
         match fs::OpenOptions::new().create(true).append(true).mode(0o600).open("/var/log/sshd.log") {
@@ -533,6 +542,10 @@ fn main() {
     };
     let fp = host_key.public_key().fingerprint(Default::default());
     if test_only {
+        if let Err(e) = monitor::check_environment() {
+            eprintln!("sshd: {e}");
+            std::process::exit(1);
+        }
         println!("sshd: configuration OK, host key {fp}");
         return;
     }
@@ -541,8 +554,7 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
 
     if child_mode {
-        run_child(cfg, host_key);
-        return;
+        monitor::run(cfg, host_key);
     }
     let mut child_args: Vec<String> = vec!["-R".into(), "-f".into(), config_path.clone(), "-p".into(), cfg.port.to_string()];
     if to_stderr {
@@ -561,34 +573,6 @@ fn main() {
 }
 
 static CHILD_CMD: OnceLock<(String, Vec<String>, bool)> = OnceLock::new();
-
-/// `sshd -R`: serve the connection on fd 3 (startup pipe on fd 4), then exit.
-fn run_child(cfg: Config, host_key: PrivateKey) {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    // fds 3 and 4 came through exec without CLOEXEC; keep them from leaking
-    // into the shells this process spawns.
-    for fd in [3, 4] {
-        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    }
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(3) };
-    let startup = ChildStartup(Some(unsafe { OwnedFd::from_raw_fd(4) }));
-    let (Ok(peer), local) = (std_stream.peer_addr(), std_stream.local_addr().ok()) else {
-        std::process::exit(1);
-    };
-    let _ = std_stream.set_nonblocking(true);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
-    rt.block_on(async move {
-        let stream = match tokio::net::TcpStream::from_std(std_stream) {
-            Ok(s) => s,
-            Err(e) => {
-                log(&format!("{peer}: {e}"));
-                return;
-            }
-        };
-        let rcfg = russh_config(&cfg, host_key);
-        session::run_connection(rcfg, Arc::new(cfg), stream, peer, local, startup).await;
-    });
-}
 
 fn russh_config(cfg: &Config, host_key: PrivateKey) -> Arc<russh::server::Config> {
     let mut methods = russh::MethodSet::empty();
@@ -684,7 +668,7 @@ async fn spawn_child(stream: tokio::net::TcpStream, peer: SocketAddr, grace: u64
         return;
     };
     let mut slot = Some(slot);
-    let backstop = tokio::time::sleep(Duration::from_secs(if grace == 0 { 86400 * 365 } else { grace + 2 }));
+    let backstop = tokio::time::sleep(Duration::from_secs(if grace == 0 { 86400 * 365 } else { grace + 10 }));
     tokio::pin!(backstop);
     let mut buf = [0u8; 8];
     loop {
