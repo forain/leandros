@@ -195,6 +195,8 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Input event paths in the running VM (lane regresscov2; ~20 s total).
+                "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
                 "host:podsmoketest.py",
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
@@ -205,6 +207,8 @@ SUITES = {
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
+                # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
+                "host:blanktest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -287,6 +291,26 @@ SUITES = {
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
     "f2fsgc": ["host:f2fsgctest.py"],
+    "a64acpi": ["host:a64acpitest.py"],
+    "blank": ["host:blanktest.py"],
+    "blkhang": ["host:blkhangtest.py"],
+    "espreset": ["host:espresettest.py"],
+    "evbtn": ["host:evbtntest.py"],
+    "evclock": ["host:evclocktest.py"],
+    "f2fscp": ["host:f2fscptest.py"],
+    "f2fscrash": ["host:f2fscrashtest.py"],
+    "f2fsfull": ["host:f2fsfulltest.py"],
+    "f2fsorphan": ["host:f2fsorphantest.py"],
+    "hidkey": ["host:hidkeytest.py"],
+    "netwatch": ["host:netwatchtest.py"],
+    "nvmemsix": ["host:nvmemsixtest.py"],
+    "pagecache-crash": ["host:pagecache-crashtest.py"],
+    "powerctl": ["host:powerctltest.py"],
+    "reboot": ["host:reboottest.py"],
+    "trialwatch": ["host:trialwatchtest.py"],
+    "uartgap": ["host:uartgaptest.py"],
+    "usbstall": ["host:usbstalltest.py"],
+    "usbunplug": ["host:usbunplugtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
