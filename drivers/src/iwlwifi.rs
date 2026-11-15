@@ -103,8 +103,11 @@
 //!   iwlwifi.ldpc=0          do not advertise LDPC reception; default 1
 //!   iwlwifi.ht40=0          (ht=1) 20 MHz only; default 1: 40 MHz on 5 GHz
 //!                           when the AP's HT operation allows it and the
-//!                           NVM allows 40 MHz on both 20 MHz halves (2.4 GHz
-//!                           stays 20 MHz: no 20/40 coexistence scanning)
+//!                           NVM allows 40 MHz on both 20 MHz halves
+//!   iwlwifi.ht40_24=0       (ht=1) 2.4 GHz stays 20 MHz; default 1: 40 MHz
+//!                           when the AP's BSS is 40 MHz, the AP is not 40 MHz
+//!                           intolerant and no intolerant BSS in the scan
+//!                           overlaps the 40 MHz span (`wifi_ht::coex_40_24`)
 //!   iwlwifi.txagg=0         (ht=1) no TX aggregation (no ADDBA request from
 //!                           us, one MPDU per channel access); default 1:
 //!                           A-MPDU on TID 0 (`iwl_agg`)
@@ -234,6 +237,9 @@ static SMPS: AtomicU8 = AtomicU8::new(ht::SM_PS_DISABLED);
 static LDPC: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.ht40 (default on): 40 MHz on 5 GHz where allowed.
 static HT40: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.ht40_24 (default on): 40 MHz on 2.4 GHz when the AP runs a 40 MHz
+/// BSS, is not 40 MHz intolerant and no intolerant neighbour overlaps.
+static HT40_24: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vht (default on): VHT at 80 MHz on 5 GHz where allowed.
 static VHT: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vhttx (default off): VHT TX rates on a VHT link.
@@ -1359,6 +1365,7 @@ pub fn init(cmdline: &str) {
     LDPC.store(cmdline_val(cmdline, "iwlwifi.ldpc") != Some("0"), Ordering::Relaxed);
     TXAGG.store(cmdline_val(cmdline, "iwlwifi.txagg") != Some("0"), Ordering::Relaxed);
     HT40.store(cmdline_val(cmdline, "iwlwifi.ht40") != Some("0"), Ordering::Relaxed);
+    HT40_24.store(cmdline_val(cmdline, "iwlwifi.ht40_24") != Some("0"), Ordering::Relaxed);
     VHT.store(cmdline_val(cmdline, "iwlwifi.vht") != Some("0"), Ordering::Relaxed);
     VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") == Some("1"), Ordering::Relaxed);
     ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
@@ -2436,20 +2443,32 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     // 40 MHz (5 GHz only): the AP runs a 40 MHz BSS that stations may use,
     // takes 40 MHz itself, and the NVM allows 40 MHz on both halves.
     let nvm40 = |c: u8| hw.nvm.channels.iter().any(|x| x.ch == c && x.flags & cmd::chan_flags::MHZ40 != 0);
+    let mut coex_why: Option<&'static str> = None;
     let ht40 = if want_ht && !band_24 && HT40.load(Ordering::Relaxed) {
         bht.ht_op.and_then(|o| o.ht40_offset())
             .filter(|_| bht.ht_cap.map_or(false, |c| c.sup_40()))
             .filter(|&o| nvm40(ch) && nvm40(ht::secondary_channel(ch, o)))
+    } else if want_ht && band_24 && HT40.load(Ordering::Relaxed) && HT40_24.load(Ordering::Relaxed) {
+        let others: Vec<ht::Obss> = INFO.lock().as_ref().map(|i| i.bss.iter().filter(|e| e.bss.bssid != bssid).map(|e| {
+            let h = ht::parse_bss_ies(&e.bss.ies);
+            ht::Obss { channel: e.bss.channel, intolerant: h.ht_cap.map_or(false, |c| c.cap & ht::htcap::INTOLERANT_40 != 0) }
+        }).collect()).unwrap_or_default();
+        match ht::coex_40_24(&bht, ch, &others) {
+            Ok(o) if nvm40(ch) && nvm40(ht::secondary_channel(ch, o)) => Some(o),
+            Ok(_) => { coex_why = Some("the NVM does not allow 40 MHz here"); None }
+            Err(w) => { coex_why = Some(w); None }
+        }
     } else {
         None
     };
-    if want_ht && !band_24 {
+    if want_ht {
         if let Some(o) = bht.ht_op {
             ilog!("BSS width: HT operation secondary offset {} STA width {}, AP 40 MHz {}, NVM 40 MHz ch {} {}; using {}",
                   o.ht_param & 3, (o.ht_param >> 2) & 1, bht.ht_cap.map_or(false, |c| c.sup_40()) as u8, ch, nvm40(ch) as u8,
                   match ht40 { Some(off) => format!("40 MHz (secondary ch {})", ht::secondary_channel(ch, off)),
                                None if !HT40.load(Ordering::Relaxed) => String::from("20 MHz (iwlwifi.ht40=0)"),
-                               None => String::from("20 MHz") });
+                               None if band_24 && !HT40_24.load(Ordering::Relaxed) => String::from("20 MHz (iwlwifi.ht40_24=0)"),
+                               None => match coex_why { Some(w) => format!("20 MHz ({})", w), None => String::from("20 MHz") } });
         }
     }
     // 80 MHz VHT: on top of 40 MHz, the AP runs an 80 MHz BSS (VHT

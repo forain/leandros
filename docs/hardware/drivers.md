@@ -254,6 +254,7 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 | `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
 | `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
 | `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
+| `iwlwifi.ht40_24=0` | on | do not use 40 MHz on 2.4 GHz; by default 20/40 is used only when the AP offers it and no 40 MHz-intolerant BSS is seen in the span |
 | `iwlwifi.txagg=0` | on | no TX aggregation (no ADDBA request from us) |
 | `iwlwifi.ht40=0` | on | 20 MHz only, also on 5 GHz |
 | `iwlwifi.txant=a\|b` | automatic | transmit on one antenna only: no comparison, no toggling |
