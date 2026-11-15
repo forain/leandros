@@ -1118,18 +1118,37 @@ static ALIASES: Mutex<Vec<Alias>> = Mutex::new(Vec::new());
 static SELF_BINDS: Mutex<Vec<(Vec<u8>, u8, u32)>> = Mutex::new(Vec::new());
 /// Generation counter for ns-0 mounts; never reused.
 static MNT_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
-/// Flags of recently detached flagged mounts `(id, flags)`, so an fd opened
-/// under them keeps its flags (Linux keeps the detached vfsmount). Bounded; oldest dropped.
-static DETACHED: Mutex<Vec<(u32, u8)>> = Mutex::new(Vec::new());
-const MAX_DETACHED: usize = 256;
+/// Mounts some open file description was opened under: `(id, refs, flags)`.
+/// `flags` is None while the mount is live and holds its flags once it was
+/// removed/replaced, so an fd opened under it keeps them (Linux keeps the
+/// detached vfsmount alive until its last reference drops). An entry exists
+/// exactly while `refs > 0`: the last `mnt_unref` frees it.
+static MREFS: Mutex<Vec<(u32, u32, Option<u8>)>> = Mutex::new(Vec::new());
 
 fn next_id() -> u32 { (MNT_GEN.fetch_add(1, Ordering::Relaxed) & 0x7fff_ffff) | 0x8000_0000 }
+/// Is `id` an ns-0 mount generation id?
+pub fn is_gen(id: u32) -> bool { id & 0x8000_0000 != 0 }
+/// An open file description now holds a reference on ns-0 mount `id`.
+pub fn mnt_ref(id: u32) {
+    if !is_gen(id) { return; }
+    let mut d = MREFS.lock();
+    if let Some(e) = d.iter_mut().find(|e| e.0 == id) { e.1 += 1; } else { d.push((id, 1, None)); }
+}
+/// The reference `mnt_ref` took is gone; the last one frees the record.
+pub fn mnt_unref(id: u32) {
+    if !is_gen(id) { return; }
+    let mut d = MREFS.lock();
+    if let Some(i) = d.iter().position(|e| e.0 == id) {
+        d[i].1 -= 1;
+        if d[i].1 == 0 { d.swap_remove(i); }
+    }
+}
+/// Live records (for the leak check in /proc/mntselftest).
+pub fn mrefs_len() -> usize { MREFS.lock().len() }
 fn detach(id: u32, flags: u8) {
     let flags = flags & ENFORCED;
     if flags == 0 { return; }
-    let mut d = DETACHED.lock();
-    if d.len() >= MAX_DETACHED { d.remove(0); }
-    d.push((id, flags));
+    if let Some(e) = MREFS.lock().iter_mut().find(|e| e.0 == id) { e.2 = Some(flags); }
 }
 /// Number of ns-0 mounts (aliases + self-binds) with nonzero flags.
 static FLAGGED: AtomicUsize = AtomicUsize::new(0);
@@ -1171,7 +1190,7 @@ pub fn mount_at(p: &[u8]) -> Option<(u32, u8)> {
 pub fn flags_by_id(id: u32) -> Option<u8> {
     for a in ALIASES.lock().iter() { if a.gen == id { return Some(a.flags & ENFORCED); } }
     for m in SELF_BINDS.lock().iter() { if m.2 == id { return Some(m.1 & ENFORCED); } }
-    DETACHED.lock().iter().find(|d| d.0 == id).map(|d| d.1)
+    MREFS.lock().iter().find(|d| d.0 == id).and_then(|d| d.2)
 }
 
 /// Replace the flags of the mount at exactly `mountpoint`. False when none is.
