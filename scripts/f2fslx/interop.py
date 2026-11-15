@@ -577,6 +577,92 @@ timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?"
 
 
 
+# ---- direction E: LeandrOS fsync -> crash (QEMU quit, no umount) -> Linux (design f2fsnodelog T2) ----
+# (name, guest ops run in /mnt/h after mounting; they print "EXP <md5>  <path>" lines, files the
+#  chain must carry, min chain nodes marked FSYNC/DENT, chain-only: a no-recovery Linux mount must miss the content)
+ESCEN = [
+    ("append", "dd if=/dev/urandom bs=4k count=20 conv=notrunc,fsync oflag=append of=t/big 2>/dev/null; md5sum t/big", 1, True),
+    ("newfile", "dd if=/dev/urandom of=t/nf bs=1k count=300 conv=fsync 2>/dev/null; md5sum t/nf", 1, True),
+    ("inline", "echo inl > t/ni; sync t/ni; md5sum t/ni", 1, True),
+    ("overwrite", "dd if=/dev/urandom of=t/big bs=4k count=10 seek=5 conv=notrunc,fsync 2>/dev/null; md5sum t/big", 1, True),
+    ("indirect", "dd if=/dev/urandom of=t/huge bs=1M count=40 conv=fsync 2>/dev/null; md5sum t/huge", 1, True),
+    ("xattr", "V=$(printf 'x%.0s' $(seq 1 700)); setfattr -n user.big -v \"$V\" t/k && sync t/k; md5sum t/k", 1, True),
+    ("ab", "dd if=/dev/urandom of=t/A bs=1k count=100 conv=fsync 2>/dev/null; dd if=/dev/urandom of=t/B bs=1k count=100 2>/dev/null; md5sum t/A", 1, True),
+    ("era", "dd if=/dev/urandom of=t/A bs=1k count=100 conv=fsync 2>/dev/null; dd if=/dev/urandom of=t/A bs=1k count=100 conv=notrunc 2>/dev/null; "
+            "sync; dd if=/dev/urandom of=t/B bs=1k count=100 conv=fsync 2>/dev/null; md5sum t/A t/B", 1, False),
+    ("full", "for i in $(seq 1 600); do echo $i > t/f$i; sync t/f$i; done; md5sum t/f*", 1, False),
+    ("rename", "echo m > t/r0; sync; mv t/r0 t/r1; sync t/r1; md5sum t/r1", 0, False),
+]
+
+
+def direction_e(tmp, only=None):
+    for sc in ESCEN:
+        if only and sc[0] not in only:
+            continue
+        e_scenario(tmp, *sc)
+
+
+def e_scenario(tmp, name, ops, minmark, chainonly):
+    v = f"E-{name}"
+    img, snap = os.path.join(tmp, f"e-{name}.img"), os.path.join(tmp, f"e-{name}.crash")
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home.py"), "create", img, "--size", "256M"], capture_output=True, text=True)
+    if not step(v, "E.mkfs", r.returncode == 0, "mkfs-f2fs-home create"):
+        return
+    base = ("mkdir -p t; dd if=/dev/urandom of=t/big bs=4k count=150 2>/dev/null; echo keepme > t/k; sync; cd /; "
+            "umount /mnt/h; echo UMOUNT_RC=$?")
+    outs = guest([img], [MNTH, "cd /mnt/h && " + base], "E1")
+    if outs is None or "MNT_RW" not in outs[0] or "UMOUNT_RC=0" not in outs[1]:
+        step(v, "E.boot1", False, "base volume failed"); return
+    # boot 2: scenario, then the harness stops QEMU without umount (driver.cmd_stop = monitor quit)
+    outs = guest([img], [MNTH, "cd /mnt/h && (" + ops + ") 2>&1 | sed 's/^/EXP /'; echo SCEN_DONE; cd /"], "E2")
+    if outs is None or "MNT_RW" not in outs[0] or "SCEN_DONE" not in outs[1]:
+        step(v, "E.boot2", False, (outs[1].strip()[-100:] if outs else "no guest")); return
+    exp = [l[4:].replace("t/", "") for l in outs[1].splitlines() if l.startswith("EXP ") and len(l) > 40 and l[4:36].strip().isalnum()]
+    if not exp:
+        step(v, "E.boot2", False, "no md5 lines from the scenario: " + outs[1].strip()[-100:]); return
+    shutil.copyfile(img, snap)
+    fl = cp_flags(snap)
+    cd = subprocess.run([sys.executable, os.path.join(HERE, "chaindump.py"), snap, "--quiet"], capture_output=True, text=True)
+    m = [int(x.split("=")[1]) for x in cd.stdout.split() if x.startswith("marked=")]
+    marked = m[0] if m else -1
+    step(v, "E.chain", not fl & 1 and marked >= minmark and (marked >= 1 or minmark == 0) and cd.returncode == 0,
+         f"chain marked={marked} (want >= {minmark}) cp_umount={fl & 1} dump rc={cd.returncode}")
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    mf = os.path.join(tmp, f"e-{name}.md5")
+    open(mf, "w").write("\n".join(exp) + "\n")
+    try:
+        box(f"mkdir -p {rd}")
+        if not push(snap, f"{rd}/c.img") or not push(mf, f"{rd}/MANIFEST"):
+            step(v, "E.ship", False, "push failed"); return
+        rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img ro.img; if sudo mount -o loop,ro,norecovery ro.img m; then (cd m && md5sum -c ../MANIFEST >/tmp/cp.$$ 2>&1; echo CPONLY_RC=$?); sudo umount m; else echo CPONLY_MNTFAIL; fi""")
+        if chainonly:
+            step(v, "E.cponly", "CPONLY_RC=0" not in out and "CPONLY_RC=" in out, "norecovery mount misses the content (only the log holds it)" if "CPONLY_RC=0" not in out else "content already in the checkpoint")
+        rc, out = box(f"""cd {rd}; cp --sparse=always c.img f.img; timeout 180 fsck.f2fs --dry-run -d 1 f.img </dev/null >fk.txt 2>&1; echo FSCK_RC=$?; grep -c 'do_record_fsync_data: \\[node\\]' fk.txt""")
+        nrec = int(out.strip().splitlines()[-1]) if out.strip().splitlines()[-1].isdigit() else -1
+        step(v, "E.fsck0", "FSCK_RC=0" in out and nrec >= max(1, minmark) * (minmark > 0), f"fsck rc0, {nrec} node records (want >= {minmark})")
+        rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img l.img; if sudo mount -o loop l.img m; then (cd m/t && md5sum -c ../../MANIFEST 2>&1 | grep -c FAILED; ); sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+timeout 180 fsck.f2fs --dry-run l.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?""")
+        ok = "LX_UMOUNT_OK" in out and out.strip().splitlines()[0].strip() == "0" and "FSCK2_RC=0" in out
+        step(v, "E.linux", ok, "Linux recovery: content present, fsck rc 0" if ok else out.strip()[-140:].replace("\n", " "))
+        back = os.path.join(tmp, f"e-{name}.back")
+        if ok and fetch(f"{rd}/l.img", back):
+            ok2 = e_guest_check(back, exp, "E3")
+            step(v, "E.back", ok2, "LeandrOS mounts Linux's recovered image, content ok" if ok2 else "guest check failed")
+        else:
+            skip(v, "E.back", "Linux recovery failed")
+    finally:
+        box(f"rm -rf {rd}")
+    ok3 = e_guest_check(snap, exp, "E4")
+    step(v, "E.ours", ok3, "LeandrOS recovers its own crash image (LRF1), content ok" if ok3 else "guest check failed")
+
+
+def e_guest_check(image, exp, tag):
+    """Mount image in the guest, re-create the manifest from the harness's md5 lines, verify."""
+    mf = "; ".join(f"echo '{l}' >> /tmp/MF" for l in exp)
+    outs = guest([image], [MNTH, "rm -f /tmp/MF; " + mf + "; cd /mnt/h/t && md5sum -c /tmp/MF 2>&1 | grep -c ': OK'; echo CHK_DONE; cd /"], tag)
+    return bool(outs) and "MNT_FAIL" not in outs[0] and "CHK_DONE" in outs[1] and outs[1].split("\n")[0].strip().split()[-1:] == [str(len(exp))]
+
+
 def direction_b(tmp):
     v = "home"
     img = os.path.join(tmp, "home.img")
@@ -628,7 +714,7 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
 def main(argv):
     if argv[:1] == ["--guest"]:
         return guest_main(argv[1])
-    allv = list(VARIANTS) + ["home", "orph", "fsync"]
+    allv = list(VARIANTS) + ["home", "orph", "fsync", "fsynce"]
     if not argv or argv[0] in ("-h", "--help", "--list"):
         print(__doc__ if argv[:1] != ["--list"] else " ".join(allv)); return 0
     vs = allv if argv == ["all"] else argv
@@ -646,6 +732,8 @@ def main(argv):
             direction_orph(tmp)
         if "fsync" in vs:
             direction_fsync(tmp)
+        if "fsynce" in vs:
+            direction_e(tmp, os.environ.get("F2FSINTEROP_E", "").split() or None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     bad = sum(1 for r in results if r in ("FAIL", "UNEXPECTED-PASS"))

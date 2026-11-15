@@ -48,3 +48,10 @@ pub fn chain_matches(want: u64, node_ver: u64, flags: u32) -> bool {
         want == node_ver
     }
 }
+
+pub const NODE_FLAG_FSYNC: u32 = 0x2;
+pub const NODE_FLAG_DENT: u32 = 0x4;
+
+/// Linux's `find_fsync_dnodes` records a chain node only when its FSYNC bit is
+/// set; DENT alone (a stray mark) does not make it a recovery candidate.
+pub fn node_is_fsync_mark(node_flag: u32) -> bool { node_flag & NODE_FLAG_FSYNC != 0 }

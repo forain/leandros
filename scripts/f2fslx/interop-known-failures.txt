@@ -1,2 +1,31 @@
 # Known interop gaps: `variant:step` fnmatch patterns. Delete an entry when the
 # lane that closes the gap lands; a listed step that passes is UNEXPECTED-PASS.
+# design f2fsnodelog P0 red baseline: our fsync log (LRF1) is invisible to Linux. P1 (f2fsnlog1) deletes these.
+E-append:E.chain
+E-append:E.fsck0
+E-append:E.linux
+E-newfile:E.chain
+E-newfile:E.fsck0
+E-newfile:E.linux
+E-inline:E.chain
+E-inline:E.fsck0
+E-inline:E.linux
+E-overwrite:E.chain
+E-overwrite:E.fsck0
+E-overwrite:E.linux
+E-indirect:E.chain
+E-indirect:E.fsck0
+E-indirect:E.linux
+E-xattr:E.chain
+E-xattr:E.fsck0
+E-xattr:E.linux
+E-ab:E.chain
+E-ab:E.fsck0
+E-ab:E.linux
+E-era:E.chain
+E-era:E.fsck0
+E-era:E.linux
+E-full:E.chain
+E-full:E.fsck0
+E-full:E.linux
+# E-rename falls back to a checkpoint (Linux parity), so it passes today.

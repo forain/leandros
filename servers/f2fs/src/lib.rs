@@ -3796,7 +3796,7 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
         if !cpflags::chain_matches(want, r64(&b, ft + 12), flags) { break; }
         let (nid, ino, fl) = (r32(&b, ft), r32(&b, ft + 4), r32(&b, ft + 8));
         let ofs = fl >> 3;
-        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, fl & 6 != 0));
+        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, cpflags::node_is_fsync_mark(fl)));
         addr = r32(&b, ft + 20) as u64;
     }
     let mut out = alloc::vec::Vec::new();
@@ -9349,6 +9349,13 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
     let foreign = if pick1 { foreign1 } else { foreign0 };
     let mut lx_chain: alloc::vec::Vec<durable::LxChain> = alloc::vec::Vec::new();
+    // A large NAT bitmap lives outside the commit block's private area: this
+    // server cannot read or write that layout, and such a checkpoint is never
+    // "foreign" (its checksum_offset is the legacy one), so refuse rw here.
+    if cpflags::cp_large_nat_bitmap(cp.flags) && !read_only {
+        dbg_str("[F2FS] checkpoint uses a large NAT bitmap; mounting read-only\n");
+        read_only = true;
+    }
     if foreign || sb.native {
         let fl = cp.flags;
         let why = if cpflags::cp_needs_fsck(fl) {

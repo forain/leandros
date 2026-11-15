@@ -68,4 +68,18 @@ mod tests {
         // without the CRC flag it is exact
         assert!(!chain_matches(0x1_0000_0007, 0x0000_0007, 0));
     }
+
+    #[test]
+    fn only_fsync_bit_marks_a_chain_node() {
+        assert!(node_is_fsync_mark(0x2));
+        assert!(node_is_fsync_mark(0x1 | 0x2 | 0x4 | (7 << 3)));
+        assert!(!node_is_fsync_mark(0x4));
+        assert!(!node_is_fsync_mark(0x1 | 0x4 | (3 << 3)));
+        assert!(!node_is_fsync_mark(0));
+    }
+
+    #[test]
+    fn large_nat_bitmap_detected_with_other_flags() {
+        assert!(cp_large_nat_bitmap(CP_LARGE_NAT_BITMAP_FLAG | CP_UMOUNT_FLAG | CP_CRC_RECOVERY_FLAG));
+    }
 }
