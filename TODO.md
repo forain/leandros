@@ -13,7 +13,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
 
 ### Podman / namespaces / cgroups
-- **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
+- **All namespace kinds share one 256-slot table** (sched/src/ns.rs): one kind (e.g. a container churning uts/ipc namespaces) can exhaust it and make netns/mntns creation fail with ENOSPC; Linux has per-kind limits (/proc/sys/user/max_*_namespaces, per-user ucounts).
 
 ### Network
 - **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. SLAAC/RA (L5: RS x3, RA -> global addr + on-link prefix + default router + lifetimes, /proc/net/ipv6_route) done; no DAD, no DHCPv6/RDNSS, RA MTU ignored; rtnetlink v6 (L6: GETADDR/GETROUTE, NEWADDR/DELADDR/NEWROUTE/DELROUTE, static v6 routes in best(), /proc/net tcp6/udp6/raw6) done, open: RTNLGRP v6 notifications, IFLA_AF_SPEC AF_INET6, busybox `ip -6` output unchecked; own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs yet: design-ipv6 L4+). L8 (v6 on veth/bridge/tap in any netns) done; bridge6 (netns<->netns and netns<->bridge address ping6/TCP) and v6 default/gateway routes inside a netns done (ip6br); L9 phase 1 done (ip6pod: rootful podman bridge NAT66 outbound, TCP/UDP/ICMPv6 echo, v6 conntrack + NDP cache, nft ip6 masquerade; box podbridge v6 ping/dns/tcp green); open L9 phase 2: DNAT66 (-p publish over v6), pasta v6, ICMPv6 errors for forwarded flows, aardvark-dns fails at --rm teardown on DNS-enabled custom networks (DNAT66, Time Exceeded and pasta v6 checks written on lane/ip6dnat, not yet run in a guest); tun6 IFF_TUN 0x86DD + NS proxy, DAD.
@@ -65,6 +65,9 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ### Firefox
 - **Firefox on the laptop iris GPU**; x86 KVM audio verification (?).
 - **Sandbox follow-ups**: secirq, zaplog, credxlate residuals (`lane-secirq/zaplog/credxlate-2026-11-09.md`).
+
+### Cloud
+- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (image boots in QEMU as an NVMe-only UEFI disk, `--dry-run` tested; docs/hardware/aws-ec2.md). Still needed: an ENA (Elastic Network Adapter) network driver, EBS NVMe quirks (no legacy INTx: MSI-X), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
 
 ### Installer
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
