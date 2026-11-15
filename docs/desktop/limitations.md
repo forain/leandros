@@ -14,10 +14,9 @@ this page is the explanation.
   The FileChooser, Screenshot, Settings and Access portals work; applications receive plain
   `file://` URIs, and the portal frontend logs one `unknown destination
   org.freedesktop.portal.Documents` warning per login.
-- **Some system services are absent**: `org.freedesktop.timedate1` (Settings' Date & time
-  page), `net.hadess.SwitcherooControl`, and the accessibility bus `org.a11y.Bus`. Calls to
-  them fail fast with `ServiceUnknown`. `locale -a` does not exist, so Settings' "Add
-  language" list is empty.
+- **No `locale -a`**, so Settings' "Add language" list is empty. timedate1, SwitcherooControl and
+  the a11y bus exist but are minimal ([session.md](session.md#system-services-leandros-sysbus)): no
+  NTP, no tzdata beyond UTC, no PRIME, no at-spi registry.
 - **Services run as the session user.** There is no system bus and no setuid helper, so the
   login1/locale1/UPower implementations cannot do anything that needs root. `SetLocale` as a
   normal user answers `AccessDenied` (`/etc` is root's); power-off is the one root operation

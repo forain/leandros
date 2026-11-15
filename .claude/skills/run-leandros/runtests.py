@@ -166,6 +166,9 @@ SUITES = {
                 # org.bluez shim (COSMIC Bluetooth applet/Settings) over btd on
                 # bttest's scripted controller: scan, pair, connect, remove.
                 "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus bluez-test",
+                # xdg-desktop-portal activation (Screenshot/FileChooser, cosmic
+                # backend), timedate1, SwitcherooControl and the a11y bus.
+                "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus svc-test",
                 # Input on one evdev device wakes no waiter on another (QMP
                 # tablet motion vs a waiter parked on the keyboard).
                 "host:evherdtest.py",
