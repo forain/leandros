@@ -117,7 +117,7 @@ def main(argv):
             rc, out = sh("dd if=/dev/nvme0n1 of=/dev/null bs=64k count=64 2>&1 | tail -n 1; echo done", 60)
             after = lpis()
             grew = [i for (i, c) in after if c > dict(mid).get(i, 0)]
-            verdict("disk_smoke", "done" in out and "rror" not in out and bool(after) and max(i for i, _ in after) in grew, f"{out.strip()[-60:]} grew={grew}")
+            verdict("disk_smoke", "done" in out and "rror" not in out and bool(after) and max(i for i, _ in after) in grew, f"{out.strip()[-60:]} grew={grew} mid={mid} after={after}")
         else:
             for n in ("proc_irq", "net_smoke", "disk_smoke"):
                 verdict(n, False, "no login")
