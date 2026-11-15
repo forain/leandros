@@ -10266,9 +10266,12 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     if let Some(m) = vfs::list_mounts().iter().find(|e| e.in_use && e.prefix == target_str && e.fstype.starts_with("fuse")) {
         let _ = m;
         // MNT_FORCE (1) | MNT_DETACH (2)
-        return fuse_server::unmount(target_str, umount_flags & 3 != 0);
+        let r = fuse_server::unmount(target_str, umount_flags & 3 != 0);
+        if r == 0 && target_str != "/" { vfs::inotify_unmounted(target_str.as_bytes()); }
+        return r;
     }
     if f2fs_server::unmount(target_str) {
+        if target_str != "/" { vfs::inotify_unmounted(target_str.as_bytes()); }
         0
     } else {
         -22 // EINVAL — nothing mounted there
