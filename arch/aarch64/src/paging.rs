@@ -467,9 +467,9 @@ pub unsafe extern "C" fn arch_prune_user_tables(
 #[no_mangle]
 pub unsafe extern "C" fn arch_user_reserved_range(i: usize, out: *mut usize) -> bool {
     let base = match i {
-        0 => crate::uart::BASE,
-        1 => crate::gic::GICD_BASE,
-        2 => crate::gic::GICC_BASE,
+        0 => crate::uart::phys_base(),
+        1 => crate::gic::gicd_base(),
+        2 => crate::gic::gicc_base(),
         _ => return false,
     } & !0xFFF;
     *out = base;
@@ -495,13 +495,13 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
             let device_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR | PageDescFlags::ATTR_DEV;
             
             // 1. UART
-            map_4k(phys as *mut u64, crate::uart::BASE, crate::uart::BASE, device_flags);
+            map_4k(phys as *mut u64, crate::uart::phys_base(), crate::uart::phys_base(), device_flags);
             
             // 2. GIC Distributor
-            map_4k(phys as *mut u64, crate::gic::GICD_BASE, crate::gic::GICD_BASE, device_flags);
+            map_4k(phys as *mut u64, crate::gic::gicd_base(), crate::gic::gicd_base(), device_flags);
             
             // 3. GIC CPU Interface
-            map_4k(phys as *mut u64, crate::gic::GICC_BASE, crate::gic::GICC_BASE, device_flags);
+            map_4k(phys as *mut u64, crate::gic::gicc_base(), crate::gic::gicc_base(), device_flags);
 
             phys
         }
