@@ -63,12 +63,12 @@ struct Lrn { br: Sid, ip: [u8; 4], mac: [u8; 6], port: Sid, t: u64 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
 pub(crate) struct St {
-    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>,
+    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>, pub(crate) l6: crate::fwd6::L6,
     ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>, park: Vec<Park>,
     pub(crate) txq: VecDeque<(u8, Vec<u8>)>, pub(crate) inq: VecDeque<(Sid, Sid, Vec<u8>)>,
     pub(crate) next: u16, pub(crate) swept: u64,
 }
-pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
+pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), l6: crate::fwd6::L6::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
 pub(crate) static USED: AtomicBool = AtomicBool::new(false);
@@ -268,6 +268,7 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
     while let Some((port, mut f)) = work.pop_front() {
         if nft && port != crate::vifsel::NO_PEER && port != br {
             if let Some(ip) = learn(br, port, bmac, &f) { for q in unpark(br, ip).into_iter().rev() { work.push_front(q); } }
+            if let Some(ip) = crate::fwd6::learn_c(br, port, bmac, &f) { for q in crate::fwd6::unpark(br, ip).into_iter().rev() { work.push_front(q); } }
         }
         if on6 && f.len() >= 54 && f[12] == 0x86 && f[13] == 0xdd && f[0..6] == bmac && port != crate::vifsel::NO_PEER && port != br {
             match crate::fwd6::divert(br, port, bmac, f) { Some(back) => keep.push_back(back), None => {} }
