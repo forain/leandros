@@ -19,6 +19,7 @@
 
 /* Send an ICMP frag-needed (mtu) about a UDP/TCP datagram from loopback to
  * `dst`, as the stack sees it on 127.0.0.1. proto 17 or 6. */
+static const char *pmtu_qsrc = "127.0.0.1";
 static int pmtu_inject4(const struct in_addr *dst, uint8_t proto, uint16_t mtu) {
     int raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (raw < 0) return -1;
@@ -27,7 +28,7 @@ static int pmtu_inject4(const struct in_addr *dst, uint8_t proto, uint16_t mtu) 
     m[0] = 3; m[1] = 4; m[6] = mtu >> 8; m[7] = mtu & 255;
     uint8_t *ip = m + 8;
     ip[0] = 0x45; ip[3] = 28 + 1500 - 28; ip[2] = (1500) >> 8; ip[6] = 0x40; ip[8] = 64; ip[9] = proto;
-    uint32_t src = htonl(INADDR_LOOPBACK);
+    uint32_t src; inet_pton(AF_INET, pmtu_qsrc, &src);
     memcpy(ip + 12, &src, 4); memcpy(ip + 16, dst, 4);
     uint16_t c = pmtu_csum(ip, 20); ip[10] = c >> 8; ip[11] = c & 255;
     ip[20] = 0x30; ip[21] = 0x39; ip[22] = 0x30; ip[23] = 0x3a; /* ports, unmatched */
@@ -46,6 +47,12 @@ static void udp_pmtud_notconn(void) {
     errno = 0;
     int r = getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl), e = errno;
     close(s);
+    { static const char *qs[] = {"127.0.0.1","127.0.0.2","127.0.0.1","127.0.0.2"}, *qd[] = {"127.0.0.1","127.0.0.1","127.0.0.4","127.0.0.5"};
+      char o[160] = ""; for (int i = 0; i < 4; i++) { struct in_addr d; inet_pton(AF_INET, qd[i], &d); pmtu_qsrc = qs[i]; pmtu_inject4(&d, 17, 1000);
+        int c = socket(AF_INET, SOCK_DGRAM, 0), v = 0; socklen_t l = sizeof v; struct sockaddr_in a = sin4(qd[i], 9);
+        connect(c, (struct sockaddr *)&a, sizeof a); getsockopt(c, IPPROTO_IP, IP_MTU, &v, &l); close(c);
+        snprintf(o + strlen(o), sizeof o - strlen(o), " %s>%s=%d", qs[i], qd[i], v); }
+      pmtu_qsrc = "127.0.0.1"; printf("DIAG pmtud:%s\n", o); fflush(stdout); }
     if (r == 0 || e != ENOTCONN) fail(N, "IP_MTU on an unconnected socket: r=%d errno=%s, want ENOTCONN", r, strerror(e));
     else pass(N);
 }
