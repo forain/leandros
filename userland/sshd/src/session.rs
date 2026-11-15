@@ -927,6 +927,11 @@ impl russh::server::Handler for Conn {
             log(&format!("{peer}: tcpip-forward {address}:{port} refused (port forwarding disabled: AllowTcpForwarding or the key)"));
             return Ok(false);
         }
+        // Like OpenSSH: only root may bind a privileged port (0 = server picks).
+        if *port != 0 && *port < 1024 && self.user.as_ref().map(|u| u.uid != 0).unwrap_or(true) {
+            log(&format!("{peer}: tcpip-forward {address}:{port} refused (privileged port, not root)"));
+            return Ok(false);
+        }
         let shown = if address.is_empty() { "localhost" } else { address };
         if !accounts::forward_permitted(&self.key_opts.permit_listen, shown, *port) {
             log(&format!("{peer}: tcpip-forward {shown}:{port} refused (permitlisten)"));

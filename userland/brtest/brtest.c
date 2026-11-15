@@ -546,6 +546,8 @@ static int addr6_add(int s, int idx, const char *ip, int plen) {
     struct in6_addr in; inet_pton(AF_INET6, ip, &in);
     struct nlb m; nl_begin(&m, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &a, sizeof a);
     nl_attr(&m, IFA_LOCAL, &in, 16); nl_attr(&m, IFA_ADDRESS, &in, 16);
+    unsigned nodad = 0x02; /* IFA_F_NODAD: these cases test forwarding, not RFC 4862 (tuntest dad_*) */
+    nl_attr(&m, 8 /* IFA_FLAGS */, &nodad, 4);
     return nl_do(s, &m);
 }
 /* ICMPv6 echo through an unprivileged ping socket; 0 on a reply. */
@@ -987,6 +989,13 @@ static int br_client_body(void) {
     if (write(h, "to-host", 7) != 7) return 17;
     memset(b, 0, sizeof b);
     if (read(h, b, sizeof b) != 2 || memcmp(b, "ok", 2)) return 18;
+    /* UDP to a server bound to the bridge address itself (aardvark-dns on 10.89.0.1:53) */
+    int hu = socket(AF_INET, SOCK_DGRAM, 0);
+    hh.sin_port = htons(7779);
+    setsockopt(hu, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (sendto(hu, "q-udp", 5, 0, (struct sockaddr *)&hh, sizeof hh) != 5) return 19;
+    memset(b, 0, sizeof b);
+    if (recv(hu, b, sizeof b, 0) != 5 || memcmp(b, "a-udp", 5)) return 20;
     return 0;
 }
 
@@ -1005,6 +1014,11 @@ static void bridge_l2(void) {
     { int one = 1; setsockopt(hl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one); }
     struct sockaddr_in ha = { .sin_family = AF_INET, .sin_port = htons(7778) };
     CHECK("bridge_l2: host wildcard listener", !bind(hl, (struct sockaddr *)&ha, sizeof ha) && !listen(hl, 4));
+    /* host UDP server bound to the bridge address (not the wildcard) */
+    int hu = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in hua = { .sin_family = AF_INET, .sin_port = htons(7779) };
+    inet_pton(AF_INET, "10.98.0.1", &hua.sin_addr);
+    CHECK("bridge_l2: host UDP bound to the bridge address", !bind(hu, (struct sockaddr *)&hua, sizeof hua));
     /* netns A and B, host ends enslaved at create time */
     g_ip = "10.98.0.2";
     pid_t ca = spawn_ns(br_server_body);
@@ -1041,6 +1055,16 @@ static void bridge_l2(void) {
         if (c >= 0) close(c);
     }
     CHECK("bridge_l2: B reached the host listener at 10.98.0.1", got);
+    {
+        struct pollfd pu = { hu, POLLIN, 0 };
+        char ub[32] = {0};
+        struct sockaddr_in from; socklen_t fl = sizeof from;
+        int ug = 0;
+        if (poll(&pu, 1, 10000) > 0 && recvfrom(hu, ub, sizeof ub, 0, (struct sockaddr *)&from, &fl) == 5
+            && !memcmp(ub, "q-udp", 5)) { sendto(hu, "a-udp", 5, 0, (struct sockaddr *)&from, fl); ug = 1; }
+        CHECK("bridge_l2: B's UDP reached the server bound to 10.98.0.1", ug);
+    }
+    close(hu);
     int rb = wait_child(cb);
     printf("B exit %d\n", rb);
     CHECK("bridge_l2: B: UDP+TCP to A, ping bridge addr, ping A, TCP to host", rb == 0);

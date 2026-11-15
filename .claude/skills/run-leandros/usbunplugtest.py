@@ -590,10 +590,13 @@ def phase_readers(arch, run_id, env):
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     which = sys.argv[2] if len(sys.argv) > 2 else "all"
-    run_id = os.environ.get("LEANDROS_RUN_ID", "x")
+    # Own run id: under runtests.py the caller's id is already claimed (and its VM up).
+    caller = os.environ.get("LEANDROS_RUN_ID", "")
+    run_id = f"{caller}-usbunplug" if caller else "x"
+    os.environ["LEANDROS_RUN_ID"] = run_id
     sys.path.insert(0, HERE)
     import driver  # noqa: E402
-    driver.claim_run_id("usbunplugtest.py " + which, os.environ.get("LEANDROS_RUN_ID", ""))
+    driver.claim_run_id("usbunplugtest.py " + which, run_id)
     env = dict(os.environ)
     ok = True
     if which in ("unplug", "all"):
