@@ -92,6 +92,18 @@ static int rd_timeout(int fd, unsigned char *b, int n, int ms)
     return read(fd, b, n);
 }
 
+/* An up L2 link sends its IPv6 DAD NS (RFC 4862) the moment it has a link-local address:
+ * let it out and discard what the IPv4 cases do not expect. */
+static void tap_settle(int fd)
+{
+    unsigned char b[2048];
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    usleep(300 * 1000);
+    while (read(fd, b, sizeof b) > 0) ;
+    fcntl(fd, F_SETFL, fl);
+}
+
 static uint16_t csum16(const unsigned char *d, int n)
 {
     uint32_t s = 0;
@@ -112,6 +124,7 @@ static int ns_cases(void)
     CHECK("tap_create", fd >= 0 && strcmp(name, "tap0") == 0);
     if (fd < 0) return 1;
     CHECK("tap_addr_up", set_addr("tap0", "10.9.0.1", "255.255.255.0") == 0);
+    tap_settle(fd);
     {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         struct ifreq ifr; memset(&ifr, 0, sizeof ifr); strcpy(ifr.ifr_name, "tap0");
@@ -293,6 +306,7 @@ static int tcp_cases(void)
     if (enter_ns() != 0) { printf("tcp_out: FAIL (unshare errno %d)\n", errno); return 1; }
     fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
     if (fd < 0 || set_addr(name, "10.9.0.1", "255.255.255.0") != 0) { printf("tcp_out: FAIL (tap setup fd %d name %s errno %d)\n", fd, name, errno); return 1; }
+    tap_settle(fd);
 
     /* tcp_out: connect over the tap, SYN on the fd, inject SYN-ACK / data / FIN */
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -375,6 +389,7 @@ static int vec_cases(void)
     CHECK("vec_tap_create", fd >= 0);
     if (fd < 0) return 1;
     CHECK("vec_tap_addr_up", set_addr(name, "10.9.0.1", "255.255.255.0") == 0);
+    tap_settle(fd);
     unsigned char tapmac[6] = { 0 };
     {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -508,6 +523,7 @@ static int selfconn_cases(void)
     if (enter_ns() != 0) { printf("selfconn: unshare failed\n"); return 1; }
     int fd = tun_open("tap%d", F_TAP | F_NO_PI, name);
     CHECK("selfconn_tap", fd >= 0 && set_addr(name, "10.9.0.1", "255.255.255.0") == 0);
+    if (fd >= 0) tap_settle(fd);
     if (fd < 0) return 1;
     int l = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in any = { .sin_family = AF_INET, .sin_port = htons(7777) };
@@ -675,6 +691,14 @@ static int tun6_cases(void)
         CHECK("ns_answered_with_na", next_icmp6(tp, 136, (unsigned char *)&a1, NULL, 3000));
     }
     close(tp);
+    close(nl);
+    printf("tun6_cases: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+static int tun6_l3_cases(void)
+{
+    if (enter_ns() != 0) { printf("tun6_l3: unshare failed\n"); return 1; }
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     /* IFF_TUN (L3): packets carry ethertype 0x86dd in the PI header; v6 on tun answers no DAD (NOARP) */
     {
         char un[IFNAMSIZ];
@@ -696,12 +720,13 @@ static int tun6_cases(void)
             if (n >= 4 + 40 && b[2] == 0x86 && b[3] == 0xdd && b[4] >> 4 == 6 && b[4 + 6] == 17) got = 1;
             if (n >= 4 + 40 && b[4 + 6] == 58 && b[4 + 40] == 135) { CHECK("tun6_no_ns_leak", 0); }
         }
-        CHECK("tun6_pi_ethertype_86dd", got && !memcmp(b + 4 + 8 + 16 - 16, &a1, 0) && memcmp(b + 4 + 24, &d.sin6_addr, 16) == 0 && memcmp(b + 4 + 40 + 8, "v6", 2) == 0);
+        CHECK("tun6_pi_ethertype_86dd", got && memcmp(b + 4 + 24, &d.sin6_addr, 16) == 0 && memcmp(b + 4 + 40 + 8, "v6", 2) == 0);
         /* write a v6 packet back: PI says 86dd, a UDP socket receives it */
         int r = socket(AF_INET6, SOCK_DGRAM, 0);
         struct sockaddr_in6 me = { .sin6_family = AF_INET6, .sin6_port = htons(7778) };
         inet_pton(AF_INET6, "fd00:8::1", &me.sin6_addr);
-        CHECK("tun6_bind", bind(r, (struct sockaddr *)&me, sizeof me) == 0);
+        struct sockaddr_in6 any = me; any.sin6_addr = in6addr_any; /* a fresh netns has lo down: only the wildcard binds */
+        CHECK("tun6_bind", bind(r, (struct sockaddr *)&any, sizeof any) == 0);
         unsigned char pk[4 + 40 + 8 + 2]; memset(pk, 0, sizeof pk);
         pk[2] = 0x86; pk[3] = 0xdd;
         unsigned char *ip = pk + 4; ip[0] = 0x60; ip[5] = 10; ip[6] = 17; ip[7] = 64;
@@ -721,7 +746,7 @@ static int tun6_cases(void)
         CHECK("tun6_udp_delivered", rn == 2 && !memcmp(rbuf, "hi", 2));
         close(r); close(u); close(tf);
     }
-    printf("tun6_cases: %d passed, %d failed\n", npass, nfail);
+    printf("tun6_l3_cases: %d passed, %d failed\n", npass, nfail);
     return nfail != 0;
 }
 
@@ -751,6 +776,11 @@ int main(void)
     if (c == 0) _exit(tun6_cases());
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tun6_cases: FAIL (status %d)\n", st); }
+
+    c = fork();
+    if (c == 0) _exit(tun6_l3_cases());
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tun6_l3_cases: FAIL (status %d)\n", st); }
 
     /* unprivileged, initial namespaces */
     c = fork();

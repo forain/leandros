@@ -240,6 +240,7 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
             if let Some(x) = v[i].as_ref() { if is_tun_kind(x.kind) && x.admin_up { sids.push(i as Sid); } }
         }
     }
+    let mut dad_next: Option<u64> = None;
     for sid in sids {
         // Drain the vif's queue before the stack lock is taken.
         let (rx, rxsrc, mtu, h, l3, mac, peer, kind, master) = {
@@ -256,6 +257,9 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
             if !rx.is_empty() { crate::l2::forward(master, sid, rx.into_iter().collect()); }
             continue;
         }
+        let (dadtx, dad_ch) = dad_step(sid, mac, &rx, sched::monotonic_ns() / 1_000_000, &mut dad_next);
+        if dad_ch { resync(sid); }
+        if let Some(w) = dad_next.take() { let d = smoltcp::time::Duration::from_millis(w); *next = Some(next.map_or(d, |n| n.min(d))); }
         let mut dev = TapDev { rx, tx: Vec::new(), mtu };
         {
             let mut g = stack_for(sid);
@@ -273,6 +277,7 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
         // receive queue instead of waiting on a neighbour that is itself.
         let mut dev = dev;
         loop_own(sid, mac, &mut dev.tx);
+        dev.tx.extend(dadtx);
         // Stack lock released: the bridge's own frames enter the switch.
         if kind == VifKind::Bridge {
             if !dev.tx.is_empty() { crate::l2::forward(sid, sid, dev.tx); }
@@ -302,7 +307,14 @@ pub(crate) fn poll_all(timestamp: Instant, sigs: &mut [Vec<Sig>], keys: &mut sch
             if f.len() < 14 { continue; }
             if !l3 { tundev::deliver(h, f); continue; }
             let et = u16::from_be_bytes([f[12], f[13]]);
-            if et == 0x0806 && f.len() >= 42 && f[20..22] == [0, 1] {
+            if let Some(na) = if et == 0x86dd { tun_ns_proxy(&f, peer_mac(mac)) } else { None } {
+                if !na.is_empty() {
+                    let mut v = VIFS.lock();
+                    if let Some(x) = v[sid as usize].as_mut() { if x.rxq.len() < RXQ_CAP { x.rxq.push_back(na); x.pending = true; } }
+                    drop(v);
+                    drivers::netdev::kick();
+                }
+            } else if et == 0x0806 && f.len() >= 42 && f[20..22] == [0, 1] {
                 // ARP request for the peer: the fd's reader never sees L2.
                 let pm = peer_mac(mac);
                 let mut r = alloc::vec![0u8; 42];
@@ -443,14 +455,117 @@ pub(crate) fn ll_from_mac(m: [u8; 6]) -> [u8; 16] {
     [0xfe, 0x80, 0, 0, 0, 0, 0, 0, m[0] ^ 2, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]
 }
 
-/// Every v6 address a vif's stack holds: link-local while up, then the static ones.
-pub(crate) fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
+/// Every v6 address a vif holds (DAD state not applied): link-local while up, then the static ones.
+fn all6_of(sid: Sid) -> (Vec<([u8; 16], u8)>, bool) {
     let v = VIFS.lock();
-    let Some(x) = v[sid as usize].as_ref() else { return Vec::new() };
+    let Some(x) = v[sid as usize].as_ref() else { return (Vec::new(), false) };
     let mut o = Vec::new();
     if is_tun_kind(x.kind) && x.admin_up && !sched::ns::ipv6_disabled(x.netns, &x.name[..name_len(&x.name)]) { o.push((ll_from_mac(x.mac), 64)); }
     o.extend(x.addrs6.iter().copied());
-    o
+    (o, x.admin_up && x.kind != VifKind::Tun)
+}
+
+// ── Duplicate address detection (RFC 4862) ──────────────────────────────────
+// An L2 vif (tap/veth/bridge) holds a new address out of its stack while it is
+// tentative: one NS from `::` to the solicited-node group, then DAD_MS of
+// silence. A NA for the target, or another node's NS from `::` for it, makes the
+// address DADFAILED. An IFF_TUN link is NOARP: Linux skips DAD there too.
+const DAD_MS: u64 = 1000;
+const IFA_F_TENTATIVE: u32 = 0x40;
+const IFA_F_DADFAILED: u32 = 0x800;
+#[derive(Clone, Copy, PartialEq)]
+enum DadSt { New, Sent(u64), Done, Failed }
+struct Dad { sid: Sid, addr: [u8; 16], st: DadSt }
+static DAD: Mutex<Vec<Dad>> = Mutex::new(Vec::new());
+
+fn dad_state(sid: Sid, addr: &[u8; 16]) -> DadSt {
+    DAD.lock().iter().find(|d| d.sid == sid && d.addr == *addr).map_or(DadSt::Done, |d| d.st)
+}
+/// IFA_F_* for an address of `sid`.
+fn dad_flags(sid: Sid, addr: &[u8; 16]) -> u32 {
+    match dad_state(sid, addr) {
+        DadSt::New | DadSt::Sent(_) => IFA_F_TENTATIVE,
+        DadSt::Failed => IFA_F_TENTATIVE | IFA_F_DADFAILED,
+        DadSt::Done => 0,
+    }
+}
+
+/// The addresses the vif's stack may use: all but the tentative and failed ones.
+pub(crate) fn addrs6_of(sid: Sid) -> Vec<([u8; 16], u8)> {
+    let (all, dad) = all6_of(sid);
+    let mut t = DAD.lock();
+    if !dad { t.retain(|d| d.sid != sid); return all; }
+    for &(a, _) in &all { if !t.iter().any(|d| d.sid == sid && d.addr == a) { t.push(Dad { sid, addr: a, st: DadSt::New }); } }
+    t.retain(|d| d.sid != sid || all.iter().any(|&(a, _)| a == d.addr));
+    all.into_iter().filter(|&(a, _)| t.iter().find(|d| d.sid == sid && d.addr == a).map_or(true, |d| d.st == DadSt::Done)).collect()
+}
+
+fn icmp6_sum(src: &[u8], dst: &[u8], p: &[u8]) -> u16 {
+    let sum = |b: &[u8]| -> u32 { b.chunks(2).map(|c| ((c[0] as u32) << 8) | *c.get(1).unwrap_or(&0) as u32).sum() };
+    let mut s: u32 = sum(src) + sum(dst) + p.len() as u32 + 58 + sum(p);
+    while s >> 16 != 0 { s = (s & 0xffff) + (s >> 16); }
+    !(s as u16)
+}
+
+/// Advance DAD for `sid`: conflicts seen in `rx`, new NS to send, timers. Returns the
+/// NS frames to transmit and whether the stack's address list changed.
+fn dad_step(sid: Sid, mac: [u8; 6], rx: &VecDeque<Vec<u8>>, now_ms: u64, next_ms: &mut Option<u64>) -> (Vec<Vec<u8>>, bool) {
+    let _ = addrs6_of(sid); // registers new addresses
+    let mut t = DAD.lock();
+    let mut out = Vec::new();
+    let mut changed = false;
+    for f in rx.iter() {
+        if f.len() < 14 + 40 + 24 || f[12] != 0x86 || f[13] != 0xdd || f[14 + 6] != 58 { continue; }
+        let ty = f[14 + 40];
+        let unspec_ns = ty == 135 && f[14 + 8..14 + 24].iter().all(|&b| b == 0);
+        if !(ty == 136 || unspec_ns) { continue; }
+        let tgt = &f[14 + 48..14 + 64];
+        for d in t.iter_mut().filter(|d| d.sid == sid && matches!(d.st, DadSt::New | DadSt::Sent(_)) && d.addr == tgt) {
+            d.st = DadSt::Failed; changed = true;
+        }
+    }
+    for d in t.iter_mut().filter(|d| d.sid == sid) {
+        if d.st == DadSt::New {
+            let mut f = alloc::vec![0u8; 14 + 40 + 24];
+            f[0..2].copy_from_slice(&[0x33, 0x33]);
+            f[2] = 0xff; f[3..6].copy_from_slice(&d.addr[13..16]);
+            f[6..12].copy_from_slice(&mac);
+            f[12] = 0x86; f[13] = 0xdd;
+            f[14] = 0x60; f[18] = 0; f[19] = 24; f[20] = 58; f[21] = 255;
+            f[38] = 0xff; f[39] = 0x02; f[49] = 1; f[50] = 0xff; f[51..54].copy_from_slice(&d.addr[13..16]);
+            f[54] = 135;
+            f[62..78].copy_from_slice(&d.addr);
+            let c = icmp6_sum(&f[22..38], &f[38..54], &f[54..78]);
+            f[56..58].copy_from_slice(&c.to_be_bytes());
+            out.push(f);
+            d.st = DadSt::Sent(now_ms + DAD_MS);
+        }
+        if let DadSt::Sent(dl) = d.st {
+            if now_ms >= dl { d.st = DadSt::Done; changed = true; }
+            else { let w = dl - now_ms; *next_ms = Some(next_ms.map_or(w, |n| n.min(w))); }
+        }
+    }
+    (out, changed)
+}
+
+/// IFF_TUN is NOARP, the reader cannot answer neighbour discovery: a NS the stack sent
+/// for the peer is answered here (NA with the peer MAC), as the ARP request is.
+fn tun_ns_proxy(f: &[u8], pm: [u8; 6]) -> Option<Vec<u8>> {
+    if f.len() < 14 + 40 + 24 || f[12] != 0x86 || f[13] != 0xdd || f[14 + 6] != 58 || f[14 + 40] != 135 { return None; }
+    if f[14 + 8..14 + 24].iter().all(|&b| b == 0) { return Some(Vec::new()); } // DAD NS: swallowed
+    let mut r = alloc::vec![0u8; 14 + 40 + 32];
+    r[0..6].copy_from_slice(&f[6..12]);
+    r[6..12].copy_from_slice(&pm);
+    r[12] = 0x86; r[13] = 0xdd;
+    r[14] = 0x60; r[19] = 32; r[20] = 58; r[21] = 255;
+    r[22..38].copy_from_slice(&f[14 + 48..14 + 64]);
+    r[38..54].copy_from_slice(&f[14 + 8..14 + 24]);
+    r[54] = 136; r[58] = 0x60;
+    r[62..78].copy_from_slice(&f[14 + 48..14 + 64]);
+    r[78] = 2; r[79] = 1; r[80..86].copy_from_slice(&pm);
+    let c = icmp6_sum(&r[22..38], &r[38..54], &r[54..86]);
+    r[56..58].copy_from_slice(&c.to_be_bytes());
+    Some(r)
 }
 
 /// Re-push a vif's address list (after link state or address changes).
@@ -468,10 +583,10 @@ pub(crate) fn addrs6(ns: u16) -> Vec<rtnetlink::A6> {
     let idx: Vec<(Sid, u32)> = { let v = VIFS.lock(); sids.iter().filter_map(|&s| v[s as usize].as_ref().filter(|x| is_tun_kind(x.kind)).map(|x| (s, x.ifindex))).collect() };
     drop(nss);
     for (s, i) in idx {
-        for (k, (a, p)) in addrs6_of(s).into_iter().enumerate() {
+        let _ = addrs6_of(s);
+        for (a, p) in all6_of(s).0 {
             let ll = a[0] == 0xfe && a[1] == 0x80;
-            let _ = k;
-            out.push(rtnetlink::A6 { index: i, addr: a, prefix: p, scope: if ll { 253 } else { 0 }, flags: 0x80 });
+            out.push(rtnetlink::A6 { index: i, addr: a, prefix: p, scope: if ll { 253 } else { 0 }, flags: 0x80 | dad_flags(s, &a) });
         }
     }
     out
@@ -586,8 +701,9 @@ pub(crate) fn sid_by_ifindex(ns: u16, index: u32) -> Option<Sid> {
 }
 
 fn rtnl_addr6(ns: u16, op: RtOp) -> Option<i32> {
+    let mut nodad = false;
     let (index, addr, prefix, add, excl) = match op {
-        RtOp::AddAddr6 { index, addr, prefix, excl, .. } => (index, addr, prefix, true, excl),
+        RtOp::AddAddr6 { index, addr, prefix, excl, flags, .. } => { nodad = flags & 0x02 != 0; (index, addr, prefix, true, excl) }
         RtOp::DelAddr6 { index, addr, prefix } => (index, addr, prefix, false, false),
         _ => return None,
     };
@@ -600,9 +716,11 @@ fn rtnl_addr6(ns: u16, op: RtOp) -> Option<i32> {
             if x.addrs6.iter().any(|&(a, _)| a == addr) { return Some(if excl { 17 } else { 0 }); }
             if x.addrs6.len() >= 5 { return Some(105); }
             x.addrs6.push((addr, prefix));
+            if nodad { DAD.lock().push(Dad { sid, addr, st: DadSt::Done }); }
         } else {
             let Some(i) = x.addrs6.iter().position(|&(a, p)| a == addr && (prefix == 0 || p == prefix)) else { return Some(99) };
-            x.addrs6.remove(i);
+            let gone = x.addrs6.remove(i).0;
+            DAD.lock().retain(|d| !(d.sid == sid && d.addr == gone));
         }
     }
     resync(sid);
