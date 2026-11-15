@@ -147,6 +147,21 @@ The block layer has a stable seam and two compile-time shapes:
 - **On `rpi5`/`raspi4b`** `drivers::blkdev` is the SDHCI driver instead, re-exported with the same API;
   runtime registration returns `Unsupported`.
 
+- **virtio-blk completion wait** is hybrid: the waiter polls the used ring for `virtio_blk.spin_us`
+  microseconds (default 50) and only then parks (`wfi`/`hlt`) until the completion interrupt (MSI-X on
+  x86_64, the shared INTx SPI on aarch64). Parking straight away was measured slower on aarch64 HVF
+  (wake latency of about 0.35 ms per request). Page-fault and IRQs-masked callers open their own
+  interrupt window. After 64 consecutive parked waits with no interrupt (line masked by the storm
+  guard, broken routing) the driver goes back to pure polling and logs it.
+  On aarch64 an INTx line has at most 4 sharers; virtio-blk registers one handler per INTID
+  (shared by all its disks), so it costs one slot per line, and a refused registration leaves that
+  disk polling (`line registration refused` in the boot log).
+
+  | Knob | Effect |
+  |---|---|
+  | `virtio_blk.irq=0` | never park: spin on the used ring (pre-IRQ behaviour) |
+  | `virtio_blk.spin_us=N` | spin window before parking, default 50 |
+
 `/dev/root` selection, the `ENODEV`/`ENOTUNIQ` semantics and the boot-disk tie-break are described in
 [pc.md](pc.md#choosing-the-root-devroot). How the VFS mirrors the registry into `/dev` and
 `/sys/class/block` (major 254 for `vd`, 8 for `sd`, minor = ordinal × 16 + partition) is in
@@ -324,7 +339,7 @@ These come from bugs, each of which cost days:
 ## Limitations and open work
 
 - No shared virtio transport; each driver repeats the capability walk.
-- No interrupt-driven block I/O; a slow device holds its CPU while polling (the USB disk lock now sleeps between polls and spins only 300 us, but virtio-blk still polls). Network RX is interrupt-driven on r8169 (MSI) and kick-driven on virtio-net.
+- virtio-blk waits are hybrid (spin, then park on the completion interrupt); a slow USB or NVMe device still holds its CPU while polling (the USB disk lock sleeps between polls and spins only 300 us). Network RX is interrupt-driven on r8169 (MSI) and kick-driven on virtio-net.
 - No MSI on aarch64 (needs a GICv3 ITS); no legacy INTx routing on x86_64.
 - No IOMMU support; DMA addresses are physical addresses.
 - No UAS (bulk-only transport only). USB hubs and mass-storage/HID hot-plug work; xHCI endpoint recovery disables only the failing slot (`quarantine_slot`), and a controller that disappears (Thunderbolt power-down) is guarded by `usb.tbxhci`. See [pc.md](pc.md#usb-c-and-thunderbolt).
