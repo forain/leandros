@@ -66,6 +66,9 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Firefox on the laptop iris GPU**; x86 KVM audio verification (?).
 - **Sandbox follow-ups**: secirq, zaplog, credxlate residuals (`lane-secirq/zaplog/credxlate-2026-11-09.md`).
 
+### Cloud
+- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): needs an ENA (Elastic Network Adapter) network driver, NVMe root/EBS as found on Nitro (admin+IO queues, possibly no legacy INTx: MSI-X), serial console on the EC2 console log, an AMI build/import flow (UEFI, Limine), and first-boot instance metadata (IMDSv2: SSH key, hostname). Design: orch/designs/design-ec2.md (lane ec2).
+
 ### Installer
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
 
