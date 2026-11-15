@@ -1061,6 +1061,168 @@ static void t_fan_einval(void)
     close(ifd); if (ffd >= 0) close(ffd);
 }
 
+/* ---- fanotify permission events + ignored mask ---- */
+#ifndef FAN_MARK_IGNORED_MASK
+#define FAN_MARK_IGNORED_MASK 0x20
+#endif
+#ifndef FAN_MARK_IGNORED_SURV_MODIFY
+#define FAN_MARK_IGNORED_SURV_MODIFY 0x40
+#endif
+
+static int fan_perm_new(int cls) { return fanotify_init(cls | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY); }
+
+/* Wait (<= 5 s) for one event on a nonblocking group. */
+static int fan_wait1(int ffd, struct fev *g)
+{
+    for (int i = 0; i < 500; i++) {
+        int n = fan_drain(ffd, g, 1);
+        if (n > 0) return n;
+        usleep(10000);
+    }
+    return 0;
+}
+
+static void fan_answer(int ffd, int fd, unsigned resp)
+{
+    struct fanotify_response r = { .fd = fd, .response = resp };
+    (void)!write(ffd, &r, sizeof r);
+}
+
+/* The child performs `op` ('o' open, 'r' read) on `p`; the parent answers with `resp`. */
+static int fan_perm_run(const char *p, unsigned mask, char op, unsigned resp, int *evmask, int *child_errno)
+{
+    int ffd = fan_perm_new(FAN_CLASS_CONTENT);
+    if (ffd < 0 || fanotify_mark(ffd, FAN_MARK_ADD, mask, AT_FDCWD, p) != 0) return -1;
+    pid_t c = fork();
+    if (c == 0) {
+        int fd = open(p, O_RDONLY);
+        if (fd < 0) _exit(100 + (errno & 0x3f));
+        if (op == 'r') {
+            char b[4];
+            if (read(fd, b, sizeof b) < 0) _exit(100 + (errno & 0x3f));
+        }
+        _exit(0);
+    }
+    struct fev g[1];
+    /* For 'r' the child's open raises no event (mask is ACCESS_PERM only). */
+    int n = fan_wait1(ffd, g);
+    int ok = n == 1 && g[0].fd >= 0;
+    if (n == 1) *evmask = (int)g[0].mask;
+    if (ok) { fan_answer(ffd, g[0].fd, resp); close(g[0].fd); }
+    int st = 0; waitpid(c, &st, 0);
+    *child_errno = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    close(ffd);
+    return ok ? 0 : -2;
+}
+
+static void t_fanperm_deny(void)
+{
+    wr("fp1", "data");
+    char p[128]; path(p, "fp1");
+    int em = 0, ce = 0;
+    int r = fan_perm_run(p, FAN_OPEN_PERM, 'o', FAN_DENY, &em, &ce);
+    int ok = r == 0 && (em & FAN_OPEN_PERM) && ce == 100 + EPERM;
+    if (!ok) printf("  fanperm_deny: r=%d em=%x ce=%d\n", r, em, ce);
+    report("t_fanperm_deny", ok);
+}
+
+static void t_fanperm_allow(void)
+{
+    wr("fp2", "data");
+    char p[128]; path(p, "fp2");
+    int em = 0, ce = 0;
+    int r = fan_perm_run(p, FAN_OPEN_PERM, 'o', FAN_ALLOW, &em, &ce);
+    int ok = r == 0 && (em & FAN_OPEN_PERM) && ce == 0;
+    if (!ok) printf("  fanperm_allow: r=%d em=%x ce=%d\n", r, em, ce);
+    report("t_fanperm_allow", ok);
+}
+
+static void t_fanperm_access(void)
+{
+    wr("fp3", "data");
+    char p[128]; path(p, "fp3");
+    int em = 0, ce = 0;
+    int r = fan_perm_run(p, FAN_ACCESS_PERM, 'r', FAN_DENY, &em, &ce);
+    int ok = r == 0 && (em & FAN_ACCESS_PERM) && ce == 100 + EPERM;
+    if (!ok) printf("  fanperm_access: r=%d em=%x ce=%d\n", r, em, ce);
+    int em2 = 0, ce2 = 0;
+    int r2 = fan_perm_run(p, FAN_ACCESS_PERM, 'r', FAN_ALLOW, &em2, &ce2);
+    report("t_fanperm_access", ok && r2 == 0 && ce2 == 0);
+}
+
+/* Closing the group while the opener is blocked allows it. */
+static void t_fanperm_close_allows(void)
+{
+    wr("fp4", "data");
+    char p[128]; path(p, "fp4");
+    int ffd = fan_perm_new(FAN_CLASS_CONTENT);
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, p);
+    pid_t c = fork();
+    if (c == 0) { int fd = open(p, O_RDONLY); _exit(fd >= 0 ? 0 : 1); }
+    usleep(300000);
+    int st = 0;
+    int still_blocked = waitpid(c, &st, WNOHANG) == 0;
+    if (ffd >= 0) close(ffd);
+    waitpid(c, &st, 0);
+    report("t_fanperm_close_allows", mr == 0 && still_blocked && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+/* The listener's own opens must not wait on its own group. */
+static void t_fanperm_self(void)
+{
+    wr("fp5", "data");
+    char p[128]; path(p, "fp5");
+    int ffd = fan_perm_new(FAN_CLASS_CONTENT);
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN_PERM | FAN_ACCESS_PERM, AT_FDCWD, p);
+    int fd = open(p, O_RDONLY);
+    char b[4]; ssize_t n = fd >= 0 ? read(fd, b, sizeof b) : -1;
+    struct fev g[2]; int q = ffd < 0 ? 0 : fan_drain(ffd, g, 2);
+    report("t_fanperm_self", mr == 0 && fd >= 0 && n > 0 && q <= 0);
+    if (fd >= 0) close(fd);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fanperm_einval(void)
+{
+    wr("fp6", "x");
+    char p[128]; path(p, "fp6");
+    int n = fan_new();
+    int ok = n >= 0 && fanotify_mark(n, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, p) == -1 && errno == EINVAL;
+    int f = fan_perm_new(FAN_CLASS_CONTENT);
+    struct fanotify_response r = { .fd = 12345, .response = FAN_ALLOW };
+    ok = ok && f >= 0 && write(f, &r, sizeof r) == -1 && errno == ENOENT;
+    ok = ok && fanotify_init(FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT, O_RDONLY) == -1 && errno == EINVAL;
+    report("t_fanperm_einval", ok);
+    if (n >= 0) close(n);
+    if (f >= 0) close(f);
+}
+
+static void t_fan_ignore(void)
+{
+    mkd("fid");
+    touch("fid/a"); touch("fid/b");
+    char d[128], a[128], b[128]; path(d, "fid"); path(a, "fid/a"); path(b, "fid/b");
+    int ffd = fan_new();
+    int m1 = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN | FAN_EVENT_ON_CHILD, AT_FDCWD, d);
+    int m2 = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORED_SURV_MODIFY, FAN_OPEN, AT_FDCWD, a);
+    int fa = open(a, O_RDONLY), fb = open(b, O_RDONLY);
+    close(fa); close(fb);
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int nb = 0, na = 0;
+    for (int i = 0; i < n; i++) { if (ends_with(g[i].link, "/b")) nb++; if (ends_with(g[i].link, "/a")) na++; }
+    fan_closeall(g, n);
+    int rm = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_REMOVE | FAN_MARK_IGNORED_MASK, FAN_OPEN, AT_FDCWD, a);
+    fa = open(a, O_RDONLY); close(fa);
+    n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int na2 = 0;
+    for (int i = 0; i < n; i++) if (ends_with(g[i].link, "/a")) na2++;
+    fan_closeall(g, n);
+    int ok = m1 == 0 && m2 == 0 && nb == 1 && na == 0 && rm == 0 && na2 == 1;
+    if (!ok) printf("  fan_ignore: m1=%d m2=%d nb=%d na=%d rm=%d na2=%d\n", m1, m2, nb, na, rm, na2);
+    report("t_fan_ignore", ok);
+    if (ffd >= 0) close(ffd);
+}
+
 static void t_fan_eperm(void)
 {
     pid_t c = fork();
@@ -1090,6 +1252,7 @@ static void t_hl_cases(void)
 {
     t_hl_self(); t_hl_unlink_one(); t_hl_link_after_watch();
     t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
+    t_fanperm_deny(); t_fanperm_allow(); t_fanperm_access(); t_fanperm_close_allows(); t_fanperm_self(); t_fanperm_einval(); t_fan_ignore();
     t_fan_hardlink();
 }
 
