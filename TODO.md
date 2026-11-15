@@ -44,7 +44,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **utmpx gaps**: no `w`/`users` consumer (Alpine busybox has neither); `/var/log/lastlog` is written but has no reader (busybox `lastlog` absent); su/sudo sessions are not recorded; concurrent writers rely on flock only.
 - **Replace the C `libpam.so.0` shim** with a Rust cdylib or Linux-PAM (decision open; guard must show wrong passwords rejected).
 - **VT console**: TAB advance and double-width glyphs.
-- **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups; password hashes are single-pass salted SHA-256.
+- **sshd**: still open: privilege separation (sessions are forked children, the listener runs as root), keyboard-interactive via pam-leandros, TCP forwarding (-L/-R; `no-port-forwarding`/`restrict` already parse but there is nothing to forbid), `authorized_keys` options `environment=`, `permitopen=`, `expiry-time=`, `cert-authority`; passwords have no `passwd(1)` rehash-on-login of legacy `$sha256$` fields (they verify, are not upgraded).
 
 ### Network / Wi-Fi
 - **iwlwifi**: 40 MHz on 2.4 GHz, finer rate control.
