@@ -52,19 +52,19 @@
 //! Ref: ARM GIC Architecture Specification v2.0; ARM IHI 0069 (GICv3/v4).
 
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
-pub const GICD_BASE: usize = 0x0800_0000;
+pub const GICD_BASE_DEFAULT: usize = 0x0800_0000;
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
-pub const GICC_BASE: usize = 0x0801_0000;
+pub const GICC_BASE_DEFAULT: usize = 0x0801_0000;
 
 #[cfg(feature = "rpi5")]
-pub const GICD_BASE: usize = 0x107F_FF90_00;
+pub const GICD_BASE_DEFAULT: usize = 0x107F_FF90_00;
 #[cfg(feature = "rpi5")]
-pub const GICC_BASE: usize = 0x107F_FFA0_00;
+pub const GICC_BASE_DEFAULT: usize = 0x107F_FFA0_00;
 
 #[cfg(feature = "raspi4b")]
-pub const GICD_BASE: usize = 0xFF84_1000;
+pub const GICD_BASE_DEFAULT: usize = 0xFF84_1000;
 #[cfg(feature = "raspi4b")]
-pub const GICC_BASE: usize = 0xFF84_2000;
+pub const GICC_BASE_DEFAULT: usize = 0xFF84_2000;
 
 /// GICv3 layout on QEMU virt. The distributor is a 64 KiB frame there (GICv2
 /// used 4 KiB): `GICD_IROUTER` starts at 0x6100 and the ID registers sit at
@@ -74,7 +74,7 @@ pub const GICC_BASE: usize = 0xFF84_2000;
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const GICD_SIZE: usize = 0x1_0000;
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
-pub const GICR_BASE: usize = 0x080A_0000;
+pub const GICR_BASE_DEFAULT: usize = 0x080A_0000;
 pub const GICR_STRIDE: usize = 0x2_0000;
 pub const GICR_MAX_FRAMES: usize = sched::MAX_CPUS;
 
@@ -113,14 +113,91 @@ const GICR_ISENABLER0:  usize = 0x100;
 const GICR_ICENABLER0:  usize = 0x180;
 const GICR_IPRIORITYR:  usize = 0x400;
 
+
+// ── Runtime platform values ───────────────────────────────────────────────────
+//
+// The consts above are the QEMU virt / Pi defaults. An ACPI boot (MADT, GTDT)
+// overrides them through `set_platform` before `init` maps and touches the GIC.
+use core::sync::atomic::{AtomicU32, Ordering as RtOrd};
+
+#[cfg(any(feature = "rpi5", feature = "raspi4b"))]
+const GICR_BASE_DEFAULT: usize = 0;
+pub const GICR_MAX_RANGES: usize = 8;
+static GICD_RT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(GICD_BASE_DEFAULT);
+static GICC_RT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(GICC_BASE_DEFAULT);
+static GICR_RT_BASE: [core::sync::atomic::AtomicUsize; GICR_MAX_RANGES] = [const { core::sync::atomic::AtomicUsize::new(0) }; GICR_MAX_RANGES];
+static GICR_RT_LEN: [core::sync::atomic::AtomicUsize; GICR_MAX_RANGES] = [const { core::sync::atomic::AtomicUsize::new(0) }; GICR_MAX_RANGES];
+static PPI_VIRT_RT: AtomicU32 = AtomicU32::new(27);
+static PPI_PHYS_RT: AtomicU32 = AtomicU32::new(30);
+
+#[inline] pub fn gicd_base() -> usize { GICD_RT.load(RtOrd::Relaxed) }
+#[inline] pub fn gicc_base() -> usize { GICC_RT.load(RtOrd::Relaxed) }
+#[inline] pub fn ppi_virt_timer() -> u32 { PPI_VIRT_RT.load(RtOrd::Relaxed) }
+#[inline] pub fn ppi_phys_timer() -> u32 { PPI_PHYS_RT.load(RtOrd::Relaxed) }
+
+/// Discovered GIC / timer values (ACPI MADT + GTDT). Zero fields keep the default.
+pub struct PlatformGic<'a> {
+    pub gicd: usize,
+    pub gicc: usize,
+    /// Redistributor discovery ranges (base, length in bytes).
+    pub gicr: &'a [(usize, usize)],
+    pub ppi_virt: u32,
+    pub ppi_phys: u32,
+}
+
+pub fn set_platform(p: &PlatformGic) {
+    if p.gicd != 0 { GICD_RT.store(p.gicd, RtOrd::Relaxed); }
+    if p.gicc != 0 { GICC_RT.store(p.gicc, RtOrd::Relaxed); }
+    if p.ppi_virt != 0 { PPI_VIRT_RT.store(p.ppi_virt, RtOrd::Relaxed); }
+    if p.ppi_phys != 0 { PPI_PHYS_RT.store(p.ppi_phys, RtOrd::Relaxed); }
+    let mut n = 0;
+    for &(b, l) in p.gicr.iter().take(GICR_MAX_RANGES) {
+        if b == 0 || l == 0 { continue; }
+        GICR_RT_BASE[n].store(b, RtOrd::Relaxed);
+        GICR_RT_LEN[n].store(l, RtOrd::Relaxed);
+        n += 1;
+    }
+}
+
+/// The redistributor ranges in force: discovered ones, else the QEMU virt default.
+pub fn gicr_ranges(i: usize) -> Option<(usize, usize)> {
+    let b = GICR_RT_BASE[i.min(GICR_MAX_RANGES - 1)].load(RtOrd::Relaxed);
+    if i == 0 && b == 0 {
+        return if GICR_BASE_DEFAULT != 0 { Some((GICR_BASE_DEFAULT, GICR_STRIDE * GICR_MAX_FRAMES)) } else { None };
+    }
+    if i >= GICR_MAX_RANGES || b == 0 { None } else { Some((b, GICR_RT_LEN[i].load(RtOrd::Relaxed))) }
+}
+
+/// Number of redistributor frames the kernel may touch (capped at `GICR_MAX_FRAMES`).
+pub fn gicr_frames() -> usize {
+    let mut n = 0;
+    for r in 0..GICR_MAX_RANGES {
+        let Some((_, l)) = gicr_ranges(r) else { break; };
+        n += l / GICR_STRIDE;
+    }
+    n.min(GICR_MAX_FRAMES)
+}
+
+/// HHDM virtual base of the `i`-th redistributor frame across all ranges.
+unsafe fn gicr_virt(i: usize) -> Option<usize> {
+    let mut left = i;
+    for r in 0..GICR_MAX_RANGES {
+        let (b, l) = gicr_ranges(r)?;
+        let frames = l / GICR_STRIDE;
+        if left < frames { return Some(mm::phys_to_virt(b + left * GICR_STRIDE)); }
+        left -= frames;
+    }
+    None
+}
+
 /// SGI used as the cross-CPU reschedule IPI.
 pub const SGI_RESCHED: u32 = 1;
 
 /// PPI carrying the EL1 *virtual* timer (CNTV) — the tick this kernel runs on.
-pub const PPI_VIRT_TIMER: u32 = 27;
+const PPI_VIRT_TIMER_DEFAULT: u32 = 27;
 /// PPI carrying the EL1 *physical* timer (CNTP). Not enabled by us, but
 /// firmware/QEMU can leave it live, so it is dispatched to the same handler.
-pub const PPI_PHYS_TIMER: u32 = 30;
+const PPI_PHYS_TIMER_DEFAULT: u32 = 30;
 /// The console PL011's INTID. QEMU virt: SPI 1 / INTID 33.
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 pub const SPI_PL011: u32 = 33;
@@ -163,23 +240,23 @@ pub const SPURIOUS: u32 = 1023;
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 unsafe fn gicd_r32(off: usize) -> u32 {
-    let base = mm::phys_to_virt(GICD_BASE);
+    let base = mm::phys_to_virt(gicd_base());
     ((base + off) as *const u32).mmio_read()
 }
 unsafe fn gicd_w32(off: usize, v: u32) {
-    let base = mm::phys_to_virt(GICD_BASE);
+    let base = mm::phys_to_virt(gicd_base());
     ((base + off) as *mut u32).mmio_write(v)
 }
 unsafe fn gicc_r32(off: usize) -> u32 {
-    let base = mm::phys_to_virt(GICC_BASE);
+    let base = mm::phys_to_virt(gicc_base());
     ((base + off) as *const u32).mmio_read()
 }
 unsafe fn gicc_w32(off: usize, v: u32) {
-    let base = mm::phys_to_virt(GICC_BASE);
+    let base = mm::phys_to_virt(gicc_base());
     ((base + off) as *mut u32).mmio_write(v)
 }
 unsafe fn gicd_w64(off: usize, v: u64) {
-    let base = mm::phys_to_virt(GICD_BASE);
+    let base = mm::phys_to_virt(gicd_base());
     ((base + off) as *mut u64).mmio_write(v)
 }
 /// `rd` is a redistributor frame's *virtual* base (see `own_redistributor`).
@@ -317,8 +394,8 @@ unsafe fn gicr_wait_rwp(rd: usize) {
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
 unsafe fn own_redistributor() -> Option<usize> {
     let want = mpidr_to_typer_affinity(read_mpidr());
-    for i in 0..GICR_MAX_FRAMES {
-        let rd = mm::phys_to_virt(GICR_BASE + i * GICR_STRIDE);
+    for i in 0..gicr_frames() {
+        let Some(rd) = gicr_virt(i) else { break; };
         let typer = gicr_r64(rd, GICR_TYPER);
         if (typer >> 32) as u32 == want { return Some(rd); }
         if typer & (1 << 4) != 0 { break; } // Last
@@ -352,13 +429,13 @@ unsafe fn init_cpu_v3() {
     gicr_w32(sgi, GICR_ICENABLER0, 0xFFFF_FFFF);
     gicr_wait_rwp(rd);
     gicr_w32(sgi, GICR_IGROUPR0, 0xFFFF_FFFF);
-    for id in [PPI_VIRT_TIMER, SGI_RESCHED] {
+    for id in [ppi_virt_timer(), SGI_RESCHED] {
         let off   = GICR_IPRIORITYR + (id as usize / 4) * 4;
         let shift = (id % 4) * 8;
         let v = (gicr_r32(sgi, off) & !(0xFF << shift)) | (IRQ_PRIORITY << shift);
         gicr_w32(sgi, off, v);
     }
-    gicr_w32(sgi, GICR_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
+    gicr_w32(sgi, GICR_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED));
     dsb_st();
 
     // CPU interface: system registers on (SRE), accept every priority, Group 1
@@ -655,7 +732,7 @@ pub fn init() {
         V3.store(true, Ordering::Release);
         BSP_ROUTE.store(mpidr_to_irouter(read_mpidr()), Ordering::Release);
         unsafe { init_dist_v3(); init_cpu_v3(); }
-        enable_spi(SPI_PL011);
+        enable_spi(uart_intid());
         UART_IRQ_LIVE.store(true, Ordering::Release);
         print_uart_irq_diag("init", &uart_irq_diag());
         return;
@@ -670,9 +747,9 @@ pub fn init() {
         // Enable PPI 27 (Virtual Timer) and SGI 1 (reschedule IPI).
         // This word is banked per CPU for IRQs 0-31 — this enables them for
         // the BSP; each AP does the same in init_cpu_interface().
-        gicd_w32(GICD_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
-        gicd_set_byte_field(GICD_IPRIORITYR, PPI_VIRT_TIMER, IRQ_PRIORITY);
-        gicd_set_byte_field(GICD_ITARGETSR,  PPI_VIRT_TIMER, v2_iface_mask(0));
+        gicd_w32(GICD_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED));
+        gicd_set_byte_field(GICD_IPRIORITYR, ppi_virt_timer(), IRQ_PRIORITY);
+        gicd_set_byte_field(GICD_ITARGETSR,  ppi_virt_timer(), v2_iface_mask(0));
         dsb_st();
 
         // Enable CPU interface.
@@ -684,7 +761,7 @@ pub fn init() {
 
     // SPI 1 / INTID 33: the PL011 UART. Now just the first customer of the
     // generic path rather than a hand-unrolled special case.
-    enable_spi(SPI_PL011);
+    enable_spi(uart_intid());
     #[cfg(any(feature = "rpi5", feature = "raspi4b"))]
     probe_uart_line();
     UART_IRQ_LIVE.store(true, Ordering::Release);
@@ -697,6 +774,8 @@ pub fn init() {
 /// 120 ...> }`, applied by the firmware as overlays/bcm2712d0.dtbo on a D0 board).
 static UART_INTID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(SPI_PL011);
 
+/// Console UART INTID from ACPI SPCR (GSI == INTID on ARM).
+pub fn set_uart_intid(id: u32) { if id != 0 { UART_INTID.store(id, Ordering::Release); } }
 pub fn uart_intid() -> u32 { UART_INTID.load(Ordering::Relaxed) }
 
 /// Bounded busy wait on the generic counter (no timer interrupt needed).
@@ -973,10 +1052,10 @@ pub fn init_cpu_interface() {
     unsafe {
         record_v2_iface();
         // Banked per-CPU enables: virtual timer PPI 27 + reschedule SGI 1.
-        gicd_w32(GICD_ISENABLER0, (1 << PPI_VIRT_TIMER) | (1 << SGI_RESCHED));
+        gicd_w32(GICD_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED));
 
         // Banked per-CPU priority for PPI 27 (match the BSP's).
-        gicd_set_byte_field(GICD_IPRIORITYR, PPI_VIRT_TIMER, IRQ_PRIORITY);
+        gicd_set_byte_field(GICD_IPRIORITYR, ppi_virt_timer(), IRQ_PRIORITY);
 
         gicc_w32(GICC_CTLR, 1);    // enable CPU interface
         gicc_w32(GICC_PMR,  0xFF); // accept all priorities
@@ -1066,8 +1145,8 @@ pub fn kexec_quiesce() {
         let words = (num_irqs_implemented() / 32) as usize;
         if is_v3() {
             #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
-            for i in 0..GICR_MAX_FRAMES {
-                let rd = mm::phys_to_virt(GICR_BASE + i * GICR_STRIDE);
+            for i in 0..gicr_frames() {
+                let Some(rd) = gicr_virt(i) else { break; };
                 let sgi = rd + GICR_SGI_BASE;
                 gicr_w32(sgi, GICR_ICENABLER0, 0xFFFF_FFFF);
                 gicr_w32(sgi, GICR_ICPENDR0, 0xFFFF_FFFF);

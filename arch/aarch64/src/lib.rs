@@ -100,7 +100,7 @@ pub fn init(boot_info: &boot::BootInfo) {
         let device_flags = paging::PageDescFlags::VALID | paging::PageDescFlags::AF | paging::PageDescFlags::INNER_SHR | paging::PageDescFlags::ATTR_DEV;
         
         // Map UART to its HHDM address
-        let uart_phys = uart::BASE;
+        let uart_phys = uart::phys_base();
         let uart_virt = if boot_info.hhdm_offset != 0 {
             uart_phys + boot_info.hhdm_offset as usize
         } else {
@@ -134,8 +134,8 @@ pub fn init(boot_info: &boot::BootInfo) {
         uart::serial_print_str("\n");
 
         // Map GIC Distributor and CPU interface to their HHDM addresses
-        let gicd_phys = gic::GICD_BASE;
-        let gicc_phys = gic::GICC_BASE;
+        let gicd_phys = gic::gicd_base();
+        let gicc_phys = gic::gicc_base();
         let gicd_virt = if boot_info.hhdm_offset != 0 {
             gicd_phys + boot_info.hhdm_offset as usize
         } else {
@@ -162,10 +162,15 @@ pub fn init(boot_info: &boot::BootInfo) {
             for off in (4096..gic::GICD_SIZE).step_by(4096) {
                 paging::map_4k(root_phys as *mut u64, gicd_virt + off, gicd_phys + off, device_flags);
             }
-            let gicr_len = gic::GICR_STRIDE * gic::GICR_MAX_FRAMES;
-            for off in (0..gicr_len).step_by(4096) {
-                let phys = gic::GICR_BASE + off;
-                paging::map_4k(root_phys as *mut u64, phys + hhdm, phys, device_flags);
+            let mut left = gic::GICR_STRIDE * gic::GICR_MAX_FRAMES;
+            for r in 0..gic::GICR_MAX_RANGES {
+                let Some((gb, gl)) = gic::gicr_ranges(r) else { break; };
+                let gl = gl.min(left);
+                left -= gl;
+                for off in (0..gl).step_by(4096) {
+                    let phys = gb + off;
+                    paging::map_4k(root_phys as *mut u64, phys + hhdm, phys, device_flags);
+                }
             }
             // PL031 RTC: one page, the wall-clock epoch (virt only, like the
             // GICv3 frames above — the Pi boards have no battery clock).
