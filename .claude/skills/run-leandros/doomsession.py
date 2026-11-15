@@ -308,6 +308,11 @@ def main():
     analyse("desktop-doom-newgame-vs-menu", kg, km)
     open(f"{OUT}/doom.log", "w").write(sh("cat /tmp/doom.log", 30))
     fps_check(open(f"{OUT}/doom.log").read())
+    # Screendump-free verdicts: DOOM's own fps counter (above) and the captured
+    # audio. The changed_frac photos are informational (a virgl session may not
+    # be photographable by screendump).
+    if AUDIO.get("desktop-doom", {}).get("rms", 0.0) < 500:
+        FPS_FAIL.append(f"desktop DOOM audio rms {AUDIO.get('desktop-doom', {}).get('rms')} < 500")
     vt_doom = vtstat("doom")
     # Quit the desktop DOOM, so whatever plays during the text-VT phase can
     # only be the second DOOM; the gap in between must be silent.
