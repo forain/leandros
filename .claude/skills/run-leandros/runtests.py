@@ -220,6 +220,8 @@ SUITES = {
                 "host:netwatchtest.py",
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
+                # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
+                "host:uartgaptest.py", "host:nvmemsixtest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
@@ -489,7 +491,7 @@ def self_boots(c):
     try:
         with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
             t = f.read()
-            return '"start"' in t or "ffsession.py" in t  # ffsession.py boots its own VM
+            return '"start"' in t or "cmd_start(" in t or "ffsession.py" in t  # ffsession.py boots its own VM
     except OSError:
         return False
 
