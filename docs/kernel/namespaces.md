@@ -74,7 +74,7 @@ Namespace 0 keeps the original alias table (`alias.rs` is now a shim over `mnt::
 
 `/proc/<pid>/ns/{user,pid,mnt,net,uts,ipc,cgroup}` (also under `task/<tid>/ns` and `thread-self/ns`) open as nsfs descriptors and can be `setns`'d, bind-mounted onto a file (how `podman` and `ip netns` pin a netns), and queried with `NS_GET_USERNS`, `NS_GET_PARENT`, `NS_GET_NSTYPE`, `NS_GET_OWNER_UID`. Opening another process's ns file needs the ptrace gate above. `setns(CLONE_NEWNS)` joins a mount namespace by nsfd or pidfd. Binding an ns file keeps the namespace alive (the bind holds a reference; closing the fd drops it) and `statfs` reports `NSFS_MAGIC`.
 
-Internally an ns file is a typed path `/.leandros-ns/<kind>/<id>`. It is **not openable by name**: `resolve_ns` answers `ENOENT` for the prefix, and only the mount translation of a bound nsfs file reaches the VFS's synthetic branch. `hold_checked(kind, id)` rejects out-of-range ids, free or dying slots, and slots of another class before taking a reference, and `put` marks a slot dying by compare-and-swap before clearing parent/owner/level so a recycled slot cannot be stolen through a stale id. (Net, IPC and UTS share one slot class.)
+Internally an ns file is a typed path `/.leandros-ns/<kind>/<id>`. It is **not openable by name**: `resolve_ns` answers `ENOENT` for the prefix, and only the mount translation of a bound nsfs file reaches the VFS's synthetic branch. `hold_checked(kind, id)` rejects out-of-range ids, free or dying slots, and slots of another class before taking a reference, and `put` marks a slot dying by compare-and-swap before clearing parent/owner/level so a recycled slot cannot be stolen through a stale id. (Net, IPC and UTS each have their own slot class: 3, 7 and 8.)
 
 ## UTS, IPC and cgroup namespaces
 
@@ -108,7 +108,6 @@ A mount namespace confines root-run workloads: backing paths are resolved in nam
 
 ## Limitations and open work
 
-- Net, IPC and UTS share one slot class, so `hold_checked` cannot tell them apart.
 - `NPROC` and inotify limits are charged per kuid, not up the user-namespace tree.
 - `fsopen/fsconfig/fsmount/fspick` are `ENOSYS`; overlayfs is not mountable (only the real-layer helper and pseudo-pid credential layer in `servers/vfs/src/ovl` exist), so containers use the `vfs` storage driver.
 - `keyctl` is `ENOSYS`; raising a hard `rlimit` is still euid-0 based.
