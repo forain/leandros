@@ -78,11 +78,13 @@ crypto) on tokio, one root process for every connection.
 - **Configuration.** `/etc/ssh/sshd_config` uses an OpenSSH keyword subset: `Port`,
   `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
   `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
-  `LoginGraceTime`, `Subsystem sftp`. `sshd -t` checks the file and the key.
+  `LoginGraceTime`, `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
 - **Authentication.** Passwords are checked against `/etc/shadow` in the system's
-  `$sha256$salt$hex` format, as `/bin/login` checks them. Public keys come from
-  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks; lines with
-  options are skipped. root may log in with a key but not with a password
+  sha512-crypt `$6$` format (legacy `$sha256$` fields still verify), as `/bin/login` checks them. Public keys come from
+  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks. Key options `from=` (globs, `!`
+  negation, CIDR), `command=` (forced command; the client's command goes to
+  `SSH_ORIGINAL_COMMAND`; sftp is refused), `no-pty`, `no-port-forwarding`, `restrict` are
+  enforced; a line with any other option is skipped, never half-applied. root may log in with a key but not with a password
   (`PermitRootLogin prohibit-password`). Empty passwords, locked (`!`) accounts and
   `false`/`nologin` shells are refused.
 - **Sessions.** Each session is a child process. Between fork and exec the child calls

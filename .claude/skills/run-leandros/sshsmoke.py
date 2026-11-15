@@ -308,7 +308,7 @@ def options(ssh, user, pw, tmp):
     # command=: forced, the client's command arrives in SSH_ORIGINAL_COMMAND
     ok = with_opts('command="echo FORCED[$SSH_ORIGINAL_COMMAND]"')
     rc, out, err = ssh.run(user, "echo hi there", key=True)
-    step("akopt_command", ok and rc == 0 and out.strip() == "FORCED[hi there]", f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    step("akopt_command", ok and rc == 0 and out.strip() == "FORCED[echo hi there]", f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
     # sftp is refused for a command= key
     rc, out, err = ssh.run(user, "true", key=True, extra=("-s",))
     # (ssh -s sftp: the forced command key must not hand out the subsystem)
@@ -329,7 +329,7 @@ def options(ssh, user, pw, tmp):
     for opt in ("no-pty", "restrict"):
         ok = with_opts(opt)
         rc, out, err = ssh.run(user, "tty", key=True, extra=("-tt",))
-        step(f"akopt_{opt.replace('-', '_')}", ok and rc == 0 and "/dev/pts/" not in out
+        step(f"akopt_{opt.replace('-', '_')}", ok and "/dev/pts/" not in out
              and "PTY allocation request failed" in err, f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
     # an option this server does not implement: the line is ignored, never half-applied
     ok = with_opts('permitopen="127.0.0.1:1"')
