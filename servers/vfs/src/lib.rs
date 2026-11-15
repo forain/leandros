@@ -4522,7 +4522,6 @@ static RAMFS: &[RamEntry] = &[
     // user-namespace limit (ns::NS_MAX - 1 usable). Read-only.
     RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
     RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
-    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"32\n" },
     // Highest capability number the caps implementation knows (CAP_LAST,
     // asserted below): podman and crun read it to size capability sets.
     RamEntry { path: b"/proc/sys/kernel/cap_last_cap", data: b"40\n" },
@@ -7764,6 +7763,10 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     // nr_open is the ceiling RLIMIT_NOFILE's hard limit can be raised to;
     // file-max the system-wide count of open file descriptions (`ofd`), and
     // file-nr those in use, Linux's "<allocated> 0 <max>".
+    if let Some(c) = nslimit_sysctl(path) {
+        let p = write_u32(buf, 0, sched::ns::limit_get(c));
+        return Some(write_lit(buf, p, b"\n"));
+    }
     if let Some(k) = inotify_sysctl(path) {
         let p = write_u32(buf, 0, inotify::limit_get(k) as u32);
         return Some(write_lit(buf, p, b"\n"));
@@ -9521,6 +9524,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if let Some(c) = nslimit_sysctl(lookup_path) {
+            // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_proc_nslimit(c, write) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if let Some(k) = inotify_sysctl(lookup_path) {
             // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
             let write = flags & 0o3 != 0;
@@ -10479,6 +10490,25 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let mut b = [0u8; 63];
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let r = sched::ns::netctl_set(ns, k, &b[..n]);
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
+            let nsl_k = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_NSLIM_W) {
+                    Some((e.path()[PROC_NSLIM_W.len()] - b'0') as usize)
+                } else { None }
+            };
+            if let Some(c) = nsl_k {
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                if s.is_empty() || !s.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
+                let mut v = 0u32;
+                for &d in s { v = v.saturating_mul(10).saturating_add((d - b'0') as u32); }
+                let r = sched::ns::limit_set(c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let inot_k = {
@@ -12967,6 +12997,33 @@ fn inotify_chain(pid: u32) -> Vec<inotify::UKey> {
         ns = sched::ns::parent(ns);
     }
     v
+}
+
+/// `/proc/sys/user/max_<kind>_namespaces` -> ns slot class (sched::ns::limit_*).
+fn nslimit_sysctl(path: &[u8]) -> Option<usize> {
+    let n = path.strip_prefix(b"/proc/sys/user/")?;
+    (1..sched::ns::LIMIT_N).find(|&c| sched::ns::LIMIT_NAMES[c] == n)
+}
+const PROC_NSLIM_W: &[u8] = b"/tmp/.proc_nslim_";
+
+fn gen_proc_nslimit(c: usize, write: bool) -> Option<VnodeKind> {
+    let mut data = [0u8; 12];
+    let l = oom_text(sched::ns::limit_get(c) as i32, &mut data);
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    if !write {
+        buf[..l].copy_from_slice(&data[..l]);
+        return gen_proc_system_file(&buf, l);
+    }
+    let mut fake = [0u8; 32];
+    fake[..PROC_NSLIM_W.len()].copy_from_slice(PROC_NSLIM_W);
+    fake[PROC_NSLIM_W.len()] = b'0' + c as u8;
+    let n = PROC_NSLIM_W.len() + 1;
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
 /// `/proc/sys/fs/inotify/<name>` -> limit index.
