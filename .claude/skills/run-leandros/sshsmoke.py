@@ -840,8 +840,11 @@ def sshdcfg(ssh, user, pw, tmp):
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
 
 
-PS_SSHD = r"""for p in /proc/[0-9]*; do n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null);
-case "$n" in sshd*) echo "${p#/proc/} $(sed -n 's/^PPid:[[:space:]]*//p' $p/status) $n";; esac; done"""
+PS_SSHD = r"""for p in /proc/[0-9]*; do
+n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null)
+pp=$(sed -n 's/^PPid:[[:space:]]*//p' $p/status 2>/dev/null)
+if [ "${n#sshd}" != "$n" ]; then echo "${p#/proc/} $pp $n"; fi
+done"""
 
 
 def sshd_procs(ssh, user, pw):
