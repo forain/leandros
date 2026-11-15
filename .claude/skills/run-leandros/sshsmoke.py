@@ -840,15 +840,17 @@ def sshdcfg(ssh, user, pw, tmp):
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
 
 
-PS_SSHD = r"""for p in /proc/[0-9]*; do n=$(sed -n 's/^Name:\t//p' $p/status 2>/dev/null);
-case "$n" in sshd*) echo "${p#/proc/} $(sed -n 's/^PPid:\t//p' $p/status) $n";; esac; done"""
+PS_SSHD = r"""for p in /proc/[0-9]*; do n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null);
+case "$n" in sshd*) echo "${p#/proc/} $(sed -n 's/^PPid:[[:space:]]*//p' $p/status) $n";; esac; done"""
 
 
 def sshd_procs(ssh, user, pw):
     """[(pid, ppid, comm)] of every sshd* process in the guest."""
     sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
-    _, out, _ = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
+    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
     res = []
+    if not out.strip():
+        print(f"sshd_procs: empty listing rc={rc} err={err.strip()[-200:]!r}", flush=True)
     for ln in out.splitlines():
         p = ln.split()
         if len(p) == 3 and p[0].isdigit() and p[1].isdigit():
