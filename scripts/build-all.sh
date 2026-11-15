@@ -499,8 +499,24 @@ build_mame() {
         cd "$mame_dir" || exit 1
         make -f Makefile.leandros ARCH="$arch" \
             LEANDROS_ROOT="$ROOT_DIR" \
-        || echo "⚠️  MAME $arch build failed, skipping"
+        || port_failed mame "$arch" "MAME build"
     )
+}
+
+# A per-port build failure is fatal: exit non-zero naming the port. Ports that
+# may legitimately fail on a given machine are listed explicitly in
+# LEANDROS_OPTIONAL_PORTS (comma separated port names, e.g. "mame,cosmic-apps");
+# those only warn. Nothing is skipped silently.
+port_failed() {
+    local port="$1" arch="$2" why="$3"
+    case ",${LEANDROS_OPTIONAL_PORTS:-}," in
+        *",$port,"*)
+            echo "⚠️  port $port FAILED for $arch ($why); allowed by LEANDROS_OPTIONAL_PORTS"
+            return 0 ;;
+    esac
+    echo "❌❌ build-all: port '$port' FAILED for $arch ($why)." >&2
+    echo "     Fix it, or list it in LEANDROS_OPTIONAL_PORTS=$port to build without it." >&2
+    exit 1
 }
 
 # Shared tail of the container-staged ports (Firefox, the portal, PipeWire):
@@ -519,6 +535,7 @@ stage_container_port() {
     if leandros_pick_alpine; then
         echo "  Alpine backend: $ALPINE_BACKEND ($ALPINE_TOOL)"
         if "$port/build.sh" "$arch"; then
+            leandros_port_record "$port" "$arch"
             return 0
         fi
         echo "⚠️  $label $arch staging failed"
@@ -526,8 +543,22 @@ stage_container_port() {
         echo "⚠️  no usable Alpine backend for $label: $ALPINE_WHY"
     fi
     if leandros_port_reuse "$port" "$arch" "$name"; then
-        echo "⚠️  $label $arch: using the previously packaged tree $port/out/$arch"
-        return 0
+        # Reuse only a PROVABLY current tree (stamp newer than every source and
+        # patch of the port). A stale one is what shipped an old PipeWire sink.
+        local rv="LEANDROS_${var}_REBUILD"
+        if [[ "${!rv:-0}" != 1 ]] && leandros_port_fresh "$port" "$arch"; then
+            echo "  $label $arch: previously packaged tree $port/out/$arch is up to date"
+            return 0
+        fi
+        if [[ "${LEANDROS_ALLOW_STALE_PORTS:-0}" == 1 ]]; then
+            echo "⚠️  $label $arch: reusing a STALE tree $port/out/$arch (LEANDROS_ALLOW_STALE_PORTS=1)"
+            return 0
+        fi
+        echo "❌❌ $label $arch needs a container build but $port/out/$arch is OLDER than"
+        echo "     the port sources/patches, and no working podman/docker could rebuild it."
+        echo "     Start the container tool, or set LEANDROS_ALLOW_STALE_PORTS=1 to ship the"
+        echo "     stale tree knowingly, or LEANDROS_SKIP_$var=1 to build without $label."
+        return 1
     fi
     echo "❌❌ $label $arch cannot be staged: no working podman/docker and no"
     echo "     previously packaged tree (looked in $port/out/$arch, the main"
@@ -643,7 +674,7 @@ build_apk() {
        && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
         echo "  up to date ($port/out/$arch)"
     else
-        "$port/build.sh" "$arch" || echo "⚠️  apk-tools $arch staging failed; the image ships without apk.static"
+        "$port/build.sh" "$arch" || port_failed apk "$arch" "apk-tools staging; the image would ship without apk.static"
     fi
     # LEANDROS_LIBC=alpine (default): the image's libc is the locked Alpine musl
     # .apk; fail the build if its exported ABI drifted from the golden list.
@@ -1017,45 +1048,34 @@ build_input_stack_shims() {
 # 84ec91a's .service activation sat in the repo and in no image for two days,
 # and a boot test that only asked "does the desktop come up" called it green.
 #
-# A failure here is a warning, not a build stop: this needs cargo +nightly and
-# the musl targets, which not every machine has, and there is a hard gate
-# downstream — mkfs-f2fs-populated.py's verify_dbus_staging() refuses to build
+# A failure here stops the build (port_failed; LEANDROS_OPTIONAL_PORTS=busd,...
+# opts a port out explicitly). There is also a hard gate downstream — mkfs-f2fs-populated.py's verify_dbus_staging() refuses to build
 # an image whose staged payload is older than its source. Warn here, refuse
 # there; never silent in either place.
 stage_dbus_session() {
     local arch="$1"
     echo "🚌 Building + staging D-Bus session package ($arch)..."
-    if ! ./ports/busd/build.sh "$arch"; then
-        echo ""
-        echo "⚠️  ================================================================"
-        echo "⚠️  ports/busd/build.sh FAILED for $arch."
-        echo "⚠️  The staged busd/session.conf/dbus-run-session are whatever was"
-        echo "⚠️  there before. mkfs will refuse to build the image if they are"
-        echo "⚠️  older than ports/ — fix the toolchain, do not work around it."
-        echo "⚠️  ================================================================"
-        echo ""
-    fi
+    ./ports/busd/build.sh "$arch" || \
+        port_failed busd "$arch" "the staged busd would be stale"
     # login1/locale1/UPower for the session, activated by busd from the
     # .service files the step above staged (ports/dbus/session-pkg/services).
-    if ! ./ports/sysbus/build.sh "$arch"; then
-        echo "⚠️  ports/sysbus/build.sh FAILED for $arch -- mkfs will refuse the image"
-        echo "⚠️  (a .service file would name a binary that is not there)."
-    fi
+    ./ports/sysbus/build.sh "$arch" || \
+        port_failed sysbus "$arch" "a .service file would name a binary that is not there"
     # The panel's Network applet (talks to `leandros-sysbus networkmanager`).
     # Needs the m6 cross toolchain; without it the panel has no Network entry.
     ./ports/cosmic-applet-network/build.sh "$arch" || \
-        echo "⚠️  ports/cosmic-applet-network/build.sh FAILED for $arch (no Network applet)"
+        port_failed cosmic-applet-network "$arch" "no Network applet"
     # The panel's Bluetooth applet (bluer -> libdbus-1 -> `leandros-sysbus bluez`).
     ./ports/cosmic-applet-bluetooth/build.sh "$arch" || \
-        echo "⚠️  ports/cosmic-applet-bluetooth/build.sh FAILED for $arch (no Bluetooth applet)"
+        port_failed cosmic-applet-bluetooth "$arch" "no Bluetooth applet"
     ./ports/cosmic-applet-power/build.sh "$arch" || \
-        echo "⚠️  ports/cosmic-applet-power/build.sh FAILED for $arch (no Power applet)"
+        port_failed cosmic-applet-power "$arch" "no Power applet"
     ./ports/cosmic-apps/build.sh "$arch" || \
-        echo "⚠️  ports/cosmic-apps/build.sh FAILED for $arch (no Files/Edit/Screenshot apps)"
+        port_failed cosmic-apps "$arch" "no Files/Edit/Screenshot apps"
     ./ports/leandros-installer/build.sh "$arch" || \
-        echo "⚠️  ports/leandros-installer/build.sh FAILED for $arch (no installer GUI)"
+        port_failed leandros-installer "$arch" "no installer GUI"
     ./ports/cosmic-applets-panel/build.sh "$arch" || \
-        echo "⚠️  ports/cosmic-applets-panel/build.sh FAILED for $arch (no Time/Battery/Notifications/... applets)"
+        port_failed cosmic-applets-panel "$arch" "no Time/Battery/Notifications/... applets"
 }
 
 # Main

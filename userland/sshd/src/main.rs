@@ -13,6 +13,8 @@
 
 mod accounts;
 mod cgsession;
+#[path = "../../../lib/utmpx/utmpx.rs"]
+mod utmpx;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
 mod session;

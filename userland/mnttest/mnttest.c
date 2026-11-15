@@ -2647,6 +2647,42 @@ static int e7x_ns0_gen(int m) {
     umount("/tmp/e7x/gn");
     return rc;
 }
+static int e7x_mrefs(void) {
+    char b[8192];
+    int n = slurp("/proc/mntselftest", b, sizeof b);
+    char *l = n > 0 ? strstr(b, "ns0_mrefs=") : NULL;
+    return l ? atoi(l + 10) : -1;
+}
+/* lane mntref: a detached mount's record lives exactly until its last dirfd closes */
+static int e7x_ns0_many(int m) {
+    (void)m;
+    int rc = 0, base = e7x_mrefs();
+    if (base < 0) return 12;
+    mkdir("/tmp/e7x/mn", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/mn", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7x/mn", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount("/tmp/e7x/mn"); return 14; }
+    int d = open("/tmp/e7x/mn", O_RDONLY | O_DIRECTORY);
+    if (d < 0) { umount("/tmp/e7x/mn"); return 15; }
+    if (umount("/tmp/e7x/mn") < 0) { close(d); return 16; }
+    /* well over the old 256-entry cap of removed flagged mounts, each with a dirfd opened and closed */
+    for (int i = 0; i < 300 && !rc; i++) {
+        if (mount("/tmp/e7x/src", "/tmp/e7x/mn", NULL, MS_BIND, NULL) < 0) { rc = 17; break; }
+        if (mount(NULL, "/tmp/e7x/mn", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) rc = 18;
+        int t = open("/tmp/e7x/mn", O_RDONLY | O_DIRECTORY);
+        if (t >= 0) close(t); else rc = 19;
+        umount("/tmp/e7x/mn");
+    }
+    if (!rc && mount("/tmp/e7x/src", "/tmp/e7x/mn", NULL, MS_BIND, NULL) < 0) rc = 20;
+    if (!rc) {
+        errno = 0; int fd = openat(d, "gy", O_CREAT | O_WRONLY, 0644);
+        if (fd >= 0 || errno != EROFS) { printf("  old dirfd after 300 detaches errno=%d\n", errno); rc = 21; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/gy"); } }
+        umount("/tmp/e7x/mn");
+    }
+    if (!rc && e7x_mrefs() != base + 1) { printf("  mrefs held=%d base=%d\n", e7x_mrefs(), base); rc = 22; }
+    close(d);
+    if (!rc && e7x_mrefs() != base) { printf("  mrefs leaked=%d base=%d\n", e7x_mrefs(), base); rc = 23; }
+    return rc;
+}
 static void e7x_suite(void) {
     e7_mk();
     mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
@@ -2657,6 +2693,7 @@ static void e7x_suite(void) {
     report("e7_ns0_mounts_show_flags", nn_in_child(e7x_ns0_view, 0));
     report("e7_ns0_dirfd_flags_live", nn_in_child(e7x_ns0_dirfd, 0));
     report("e7_ns0_dirfd_detached_keeps_flags", nn_in_child(e7x_ns0_gen, 0));
+    report("e7_ns0_mount_refcount_no_cap_no_leak", nn_in_child(e7x_ns0_many, 0));
     system("rm -rf /tmp/e7 /tmp/e7x");
 }
 
