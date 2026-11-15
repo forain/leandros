@@ -299,7 +299,12 @@ unsafe fn do_login(rec: &UserRec) -> ! {
     {
         let mut line = [0u8; 32];
         let n = utmpx::tty_line(0, &mut line);
-        utmpx::login(utmpx::getpid(), &line[..n], &rec.name[..rec.name_len], b"", rec.uid);
+        // A pipe/socket stdin (a scripted login) is no terminal: nothing would
+        // ever close that record, so it would stay in `who` forever.
+        let l = &line[..n];
+        if n > 0 && !l.starts_with(b"pipe:") && !l.starts_with(b"socket:") && !l.starts_with(b"anon_inode:") {
+            utmpx::login(utmpx::getpid(), l, &rec.name[..rec.name_len], b"", rec.uid);
+        }
     }
     leandros_libc::cgsession::join(rec.uid, rec.gid);
     // Supplementary groups first: setgroups needs root, which setresuid
