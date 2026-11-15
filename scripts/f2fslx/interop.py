@@ -667,7 +667,7 @@ def e_scenario(tmp, sc):
     inos = sorted(set(list(sc["pc"]) + sc.get("absent", [])))
     ino_cmd = "; ".join(f"echo INO {f} $(stat -c %i {f})" for f in inos)
     outs = guest([img], [MNTH, "cd /mnt/h && (" + STAT.replace("echo ", "echo STAT0 ", 1) + "; " + ops + ") 2>&1; "
-                         + STAT.replace("echo ", "echo STAT1 ", 1) + "; " + ino_cmd + "; echo SCEN_DONE; cd /"], "E2", ECMD)
+                         + STAT.replace("echo ", "echo STAT1 ", 1) + "; " + (ino_cmd + "; " if ino_cmd else "") + "echo SCEN_DONE; cd /"], "E2", ECMD)
     if outs is None or "MNT_RW" not in outs[0] or "SCEN_DONE" not in outs[1]:
         step(v, "E.boot2", False, (outs[1].strip()[-100:] if outs else "no guest")); return
     out2 = outs[1]
