@@ -135,10 +135,12 @@
 static int npass, nfail, nskip;
 
 static const char *volatile last_case = "(none)";
+static pid_t main_pid; /* forked children fault on purpose (uaccess cases): stay quiet there */
 static void pass(const char *n) { printf("%s: PASS\n", n); npass++; last_case = n; fflush(stdout); }
 /* A fatal signal used to show only as RC=139: name the case it hit in. */
 static void on_fatal(int sig, siginfo_t *si, void *uc) {
     (void)uc;
+    if (getpid() != main_pid) { signal(sig, SIG_DFL); raise(sig); return; }
     char b[200];
     int l = snprintf(b, sizeof b, "syscalltest: FATAL signal %d code %d addr %p pid %d tid %ld after case %s\n",
                      sig, si->si_code, si->si_addr, (int)getpid(), (long)syscall(SYS_gettid), last_case);
@@ -2788,6 +2790,7 @@ int main(int argc, char **argv) {
     signal(SIGALRM, on_alrm);
     {
         struct sigaction fa; memset(&fa, 0, sizeof fa);
+        main_pid = getpid();
         fa.sa_sigaction = on_fatal; fa.sa_flags = SA_SIGINFO | SA_RESETHAND;
         int fsig[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
         for (unsigned i = 0; i < sizeof fsig / sizeof fsig[0]; i++) sigaction(fsig[i], &fa, NULL);
