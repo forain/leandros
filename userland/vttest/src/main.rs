@@ -226,6 +226,7 @@ extern "C" {
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
     pub fn close(fd: c_int) -> c_int;
+    pub fn kill(pid: c_int, sig: c_int) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int;
     pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
@@ -950,6 +951,19 @@ unsafe fn t_grab_dies_on_close() -> bool {
 // Cursor position is observable without a framebuffer: ESC[6n answers from
 // the VT's own text plane, which is what a repaint puts back on screen.
 
+/// Every VT 2..6 runs a login (userland/init), blocked reading the very pty
+/// this suite drives. A reader that wakes first steals bytes of our CPR reply
+/// (the "lost ESC"), so stop the session leader while the test owns the VT.
+/// Returns the stopped pid (0 = none) for [`login_resume`].
+unsafe fn login_pause(fd: c_int) -> c_int {
+    let mut sid: c_int = 0;
+    if ioctl(fd, 0x5429, &mut sid as *mut c_int as *mut c_void) != 0 || sid <= 1 { return 0; }
+    kill(sid, 19); // SIGSTOP
+    sleep_ms(200);
+    sid
+}
+unsafe fn login_resume(sid: c_int) { if sid > 1 { kill(sid, 18); } } // SIGCONT
+
 unsafe fn cpr(fd: c_int, seq: &[u8]) -> (u32, u32) {
     // Drop anything left over from the previous query.
     let mut junk = [0u8; 32];
@@ -970,7 +984,8 @@ unsafe fn cpr(fd: c_int, seq: &[u8]) -> (u32, u32) {
             sleep_ms(5);
         }
     }
-    // ESC [ row ; col R
+    // ESC [ row ; col R — a reply that lost its leading ESC is a failure.
+    if n < 2 || buf[0] != 0x1b || buf[1] != b'[' { return (0, 0); }
     let (mut row, mut col, mut in_col) = (0u32, 0u32, false);
     for &b in &buf[..n] {
         match b {
@@ -982,14 +997,51 @@ unsafe fn cpr(fd: c_int, seq: &[u8]) -> (u32, u32) {
     (row, col)
 }
 
+/// Regression: the CPR reply must always start with ESC. A pty read once
+/// delivered it without the leading 0x1B now and then.
+unsafe fn t_cpr_esc(tty0: c_int) -> bool {
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { out(b"  open failed\n"); return report(b"cpr_esc", false); }
+    let mut tio = [0u8; 64];
+    ioctl(fd, TCGETS, tio.as_mut_ptr() as *mut c_void);
+    for i in 0..4 { if i != 2 { for k in 0..4 { tio[i * 4 + k] = 0; } } }
+    tio[12..16].fill(0);
+    ioctl(fd, TCSETS, tio.as_mut_ptr() as *mut c_void);
+    let sid = login_pause(fd);
+    let (mut bad, mut empty) = (0u32, 0u32);
+    for _ in 0..200 {
+        let mut junk = [0u8; 32];
+        let mut dn = 0usize; loop { let r = read(fd, junk.as_mut_ptr() as *mut c_void, junk.len()); if r <= 0 { break; } dn += r as usize; }
+        write(fd, b"\x1b[6n".as_ptr() as *const c_void, 4);
+        let mut buf = [0u8; 24];
+        let mut n = 0usize;
+        let mut spins = 0; let mut chunks = 0usize; let mut c0 = 0usize;
+        while n < buf.len() && spins < 300 {
+            let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+            if r > 0 { if chunks == 0 { c0 = r as usize; } chunks += 1; n += r as usize; if buf[..n].contains(&b'R') { break; } }
+            else { spins += 1; sleep_ms(5); }
+        }
+        if n == 0 { empty += 1; } else if buf[0] != 0x1b { bad += 1; if bad == 1 { out(b"  drained="); out_num(dn); out(b" chunks="); out_num(chunks); out(b" c0="); out_num(c0); out(b" spins="); out_num(spins as usize); out(b" first byte="); out_num(buf[0] as usize); out(b" n="); out_num(n); out(b"\n"); } }
+    }
+    login_resume(sid);
+    close(fd);
+    out(b"  cpr_esc sid="); out_num(sid as usize); out(b" bad="); out_num(bad as usize); out(b" empty="); out_num(empty as usize); out(b"\n");
+    report(b"cpr_esc", bad == 0 && empty == 0)
+}
+
 unsafe fn t_tabs_wide(tty0: c_int) -> bool {
-    // A VT nobody runs a getty on, or the shell would eat the reply.
+    // The VT's login is stopped below, or it would eat the reply.
     let mut free: c_int = -1;
     ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
     if !(2..=6).contains(&free) { free = 6; }
     let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
     let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if fd < 0 { out(b"  open failed\n"); return report(b"tabs_wide", false); }
+    let sid = login_pause(fd);
     // Raw, so the CPR reply is delivered without a newline.
     let mut tio = [0u8; 64];
     ioctl(fd, TCGETS, tio.as_mut_ptr() as *mut c_void);
@@ -1016,6 +1068,7 @@ unsafe fn t_tabs_wide(tty0: c_int) -> bool {
     write(fd, reset.as_ptr() as *const c_void, reset.len());
     let wrap = cpr(fd, b"\x1b[1;1H\x1b[999C\xe4\xb8\xad") == (2, 3);
     write(fd, reset.as_ptr() as *const c_void, reset.len());
+    login_resume(sid);
     close(fd);
     out(b"  tab1="); out_int(tab1 as c_int); out(b" tab2="); out_int(tab2 as c_int);
     out(b" cht="); out_int(cht as c_int); out(b" cbt="); out_int(cbt as c_int);
@@ -1457,7 +1510,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 33usize;
+    let total = 34usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1483,6 +1536,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_grab_dies_on_close() { passed += 1; }
     if t_session_node(tty0) { passed += 1; }
     if t_tabs_wide(tty0) { passed += 1; }
+    if t_cpr_esc(tty0) { passed += 1; }
     if t_revoke() { passed += 1; }
     if t_revoke_releases_grab() { passed += 1; }
     if t_kd_graphics_owner_death() { passed += 1; }
