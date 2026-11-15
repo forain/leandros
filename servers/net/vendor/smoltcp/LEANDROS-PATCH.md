@@ -207,3 +207,12 @@ never moves left). With the crates.io Cargo.toml: 602/602 pass.
 - `get_source_address_ipv6`: `::1` to `::1` uses `::1`; no candidate returns
   `None` instead of panicking on `unwrap()` (a loopback-only or v4-only
   interface reached by a v6 destination).
+
+## lane lo127 (2026-11-15)
+
+- `has_ip_addr`: an interface holding any IPv4 address in 127.0.0.0/8 owns the
+  whole block (Linux lo); `get_source_address_ipv4` returns a loopback
+  destination as its own source.
+- `raw::Socket::send_pending` / `icmp::Socket::send_pending` (like udp), so the
+  net server keeps a closed raw/ICMP socket as an orphan until its queued
+  packet left.
