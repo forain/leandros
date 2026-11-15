@@ -964,7 +964,7 @@ def privsep_crash(ssh, user, pw):
         rc, out, _ = ssh.run(user, "id -un", pw, timeout=30)
         login = rc == 0 and user in out
         step("privsep_crash_isolated", b_ok and isolated and a_eof and same and b_still and login,
-             f"session_b={b_ok} preauth_child={isolated} probe_eof={a_eof} listener_unchanged={same} b_survives={b_still} new_login={login}")
+             f"procs={after} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof} listener_unchanged={same} b_survives={b_still} new_login={login}")
     finally:
         try:
             os.write(fd, b"\x04")
