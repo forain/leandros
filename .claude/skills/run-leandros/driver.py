@@ -789,6 +789,10 @@ def _netdev_args(arch="aarch64"):
     # LEANDROS_HOSTFWD: more net0 hostfwd rules (comma separated), e.g.
     # "tcp:127.0.0.1:18581-:18081" (podbridgetest: published port reached from the host).
     extra = "".join(f",hostfwd={r}" for r in os.environ.get("LEANDROS_HOSTFWD", "").split(",") if r)
+    # LEANDROS_GUESTFWD: guestfwd rules separated by ';' (their commands may hold
+    # spaces), e.g. "tcp:10.0.2.100:80-cmd:python3 -I scripts/fake-imds.py /tmp/imds"
+    # (ec2inittest: a fake EC2 metadata service behind a slirp address).
+    extra += "".join(f",guestfwd={r}" for r in os.environ.get("LEANDROS_GUESTFWD", "").split(";") if r)
     return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22{extra}"]
 
 

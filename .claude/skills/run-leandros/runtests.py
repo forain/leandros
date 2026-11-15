@@ -33,6 +33,7 @@ Options:
                                       + host:inloadtest.py (hostfwd connects under bulk load and an unpumped held serial)
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
+                             ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
@@ -270,6 +271,8 @@ SUITES = {
                 "host:netflaptest.py",
                 # netctl metric + net.metric.<if>= boot knob (own boot).
                 "host:netmetrictest.py",
+                # EC2 first-boot service vs a fake IMDSv2 (own boot).
+                "host:ec2inittest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
                 # hostfwd connects under bulk load / a held unpumped serial (own boot).
@@ -289,6 +292,7 @@ SUITES = {
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
+    "ec2init": ["host:ec2inittest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
     # linkmontest.py alone.
