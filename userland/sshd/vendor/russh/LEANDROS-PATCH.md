@@ -19,7 +19,7 @@ Vendored unmodified from crates.io (russh 0.64.1), wired in through
    behaviour is unchanged. `signed_data = string(session_id) ||
    USERAUTH_REQUEST up to the signature`, the exact blob that was verified.
 3. **Exports** (`lib_inner.rs`): `PublicKeyOrCertificate` and
-   `sign_with_hash_alg` (doc-hidden), needed by the two hooks' users.
+   `sign_with_hash_alg` (doc-hidden), needed by the two hooks' users. `AlgorithmExt` (doc-hidden) is re-exported too, for the cert algorithm name mapping in `userauth.rs`.
 
 Upgrading: re-vendor the new crate and re-apply the `LEANDROS-PATCH` markers
 (`grep -rn LEANDROS-PATCH src`). Tests: `cd userland/sshd/unit && cargo

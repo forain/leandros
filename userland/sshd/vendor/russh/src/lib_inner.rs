@@ -46,6 +46,9 @@ mod helpers;
 // LEANDROS-PATCH: the host-key signer callback needs the stock signing routine.
 #[doc(hidden)]
 pub use helpers::sign_with_hash_alg;
+// LEANDROS-PATCH: userauth re-verification maps cert algorithm names like russh does.
+#[doc(hidden)]
+pub use helpers::AlgorithmExt;
 
 pub(crate) use helpers::map_err;
 

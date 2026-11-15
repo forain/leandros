@@ -71,6 +71,13 @@ pub fn verify_userauth(
     verify_inner(user, key, signed_data, sig_blob, session_id, recorded).is_some()
 }
 
+/// The signature algorithm a certificate algorithm name stands for, with the
+/// same mapping russh uses for negotiation (so `sk-*-cert-v01@openssh.com`
+/// and `rsa-sha2-*-cert-v01@openssh.com` resolve correctly).
+pub fn cert_algorithm(name: &str) -> Option<Algorithm> {
+    <Algorithm as russh::AlgorithmExt>::new_certificate_ext(name).ok()
+}
+
 fn verify_inner(
     user: &str,
     key: &PublicKeyOrCertificate,
@@ -100,9 +107,13 @@ fn verify_inner(
         PublicKeyOrCertificate::Certificate(c) => (
             PublicKey::new(c.public_key().clone(), ""),
             c.to_bytes().ok()?,
-            Algorithm::new(algo.strip_suffix("-cert-v01@openssh.com")?).ok()?,
+            cert_algorithm(algo)?,
         ),
     };
+    // SHA-1 `ssh-rsa` is refused (OpenSSH >= 8.8 default); rsa-sha2-* only.
+    if matches!(requested, Algorithm::Rsa { hash: None }) {
+        return None;
+    }
     if blob != want_blob.as_slice() {
         return None;
     }

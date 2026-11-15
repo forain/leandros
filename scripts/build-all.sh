@@ -108,6 +108,9 @@ done
 # the toolchain file so the pin stays in one place.
 PINNED_TOOLCHAIN="+$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT_DIR/rust-toolchain.toml" | head -1)"
 
+# Host-side sshd userauth unit tests (fails the build on a test failure).
+"$ROOT_DIR/scripts/sshd-unit.sh" || { echo "sshd-unit tests failed"; exit 1; }
+
 # Emit `.stack_sizes` (exact per-function frame sizes, straight from the
 # backend) into the linked kernel, and refuse to ship one whose frames threaten
 # the kernel stack. A frame larger than the 128 KiB stack does not fault — the
