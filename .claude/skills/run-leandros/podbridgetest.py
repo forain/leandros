@@ -235,7 +235,7 @@ def main():
         if port6 and v6ok:
             rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
-        rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} traceroute6 -n -m 1 -q 1 -w 4 {gw6} 2>&1")
+        rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} traceroute6 -n -m 1 -q 1 -w 4 2001:4860:4860::8888 2>&1")
         check6("podman_v6_time_exceeded", re.search(r"^\s*1\s+[0-9a-f]+:[0-9a-f:]+\s", out, re.M) is not None, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
         # ---- L9 phase 2 (ip6dnat): DNAT66 for a published port -----------------------------
         rc, o6 = run("cat /proc/net/if_inet6")
