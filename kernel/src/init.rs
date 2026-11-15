@@ -25,6 +25,19 @@ fn task_exit_cleanup(pid: u32) {
 }
 
 /// The main entry point for the kernel's init task.
+/// NVMe identity (model, serial, EBS device name, namespace id) of registry
+/// entry `d`, a disk or a partition of one; `None` for every other class.
+fn nvme_ident(d: &drivers::blockdev::DiskDesc) -> Option<vfs_server::block::DiskIdent> {
+    if d.class != "nvme" { return None; }
+    let disk = match d.parent { Some(p) => drivers::blkdev::describe(p)?, None => *d };
+    let name = core::str::from_utf8(&disk.name[..disk.nlen as usize]).ok()?;
+    let (i, nsid) = drivers::nvme::ident(name)?;
+    Some(vfs_server::block::DiskIdent {
+        model: i.model, mlen: i.mlen, serial: i.serial, slen: i.slen,
+        ebs: i.ebs, elen: i.elen, amzn: i.amzn, nsid,
+    })
+}
+
 pub fn init_task_main(boot_info: &boot::BootInfo) {
     serial_print_str("[INIT] Kernel init task starting\n");
 
@@ -225,6 +238,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             ordinal: d.ordinal,
             gone: d.gone,
             special: d.special,
+            ident: nvme_ident(&d),
         }),
         removed_gen: || drivers::blkdev::removed_generation(),
         read_blocks: |i, blk, buf| drivers::blkdev::read_blocks(i, blk, buf),
@@ -310,6 +324,16 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // NVMe SSDs (read-only unless nvme.rw=1): registered before klog::init so
     // the bring-up diagnostics reach the stick's log partition.
     drivers::nvme::init(crate::boot_cmdline().unwrap_or(""));
+    // Amazon (EBS) controller holding the booted root: writable without nvme.rw=1.
+    {
+        let boot = crate::boot_disk();
+        let root_disk = drivers::blkdev::resolve_root(crate::boot_cmdline(), boot).ok()
+            .and_then(|r| drivers::blkdev::describe(r).map(|d| d.parent.unwrap_or(r)));
+        drivers::nvme::amazon_root_writable(&|n| match drivers::blkdev::lookup_name(n) {
+            Some(i) => Some(i) == root_disk || (boot.is_some() && drivers::blkdev::disk_id_of(i) == boot),
+            None => false,
+        });
+    }
     crate::kmod::exports::set_boot_fb(boot_info.framebuffer_base, boot_info.framebuffer_width, boot_info.framebuffer_height, boot_info.framebuffer_pitch_bytes() as u32);
     drivers::i915::run(&drivers::i915::BootEnv { fb_phys: boot_info.framebuffer_base, fb_width: boot_info.framebuffer_width, fb_height: boot_info.framebuffer_height, fb_pitch: boot_info.framebuffer_pitch_bytes() as u32 }); // Intel Gen9 GPU probe (+ `i915.*` bring-up)
     #[cfg(target_arch = "aarch64")] arch_aarch64::exception::SERROR_ERRREC.store(crate::boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "serror.errrec=1")), core::sync::atomic::Ordering::Relaxed);
