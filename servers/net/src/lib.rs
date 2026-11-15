@@ -3245,7 +3245,37 @@ fn local_delivery(from: u8, buf: &[u8]) -> bool {
         inject_frame(from as Sid + 1, r);
         return true;
     }
-    if proto == 0x0800 && buf[0] & 1 == 0 {
+    // IPv6: a neighbour solicitation for an address a local interface holds
+    // is answered here (the same shortcut as ARP above), and a unicast frame
+    // for a local interface's MAC is that interface's own, as for IPv4.
+    if proto == 0x86dd && buf.len() >= 78 && buf[20] == 58 && buf[54] == 135 {
+        let tgt: [u8; 16] = buf[62..78].try_into().unwrap();
+        let src: [u8; 16] = buf[22..38].try_into().unwrap();
+        if src == [0; 16] { return false; }
+        let Some(a) = ip6::addrs6().into_iter().find(|a| a.addr == tgt && a.index >= 2) else { return false };
+        let Some(hmac) = drivers::netdev::get((a.index - 2) as usize).and_then(|n| n.mac()) else { return false };
+        let mut r = alloc::vec![0u8; 14 + 40 + 32];
+        r[0..6].copy_from_slice(&buf[6..12]);
+        r[6..12].copy_from_slice(&hmac);
+        r[12..14].copy_from_slice(&[0x86, 0xdd]);
+        r[14] = 0x60;
+        r[18..20].copy_from_slice(&32u16.to_be_bytes());
+        r[20] = 58;
+        r[21] = 255;
+        r[22..38].copy_from_slice(&tgt);
+        r[38..54].copy_from_slice(&src);
+        r[54] = 136;
+        r[58] = 0x60; // solicited | override
+        r[62..78].copy_from_slice(&tgt);
+        r[78] = 2;
+        r[79] = 1;
+        r[80..86].copy_from_slice(&hmac);
+        let mut ic = smoltcp::wire::Icmpv6Packet::new_unchecked(&mut r[54..]);
+        ic.fill_checksum(&IpAddress::Ipv6(smoltcp::wire::Ipv6Address(tgt)), &IpAddress::Ipv6(smoltcp::wire::Ipv6Address(src)));
+        inject_frame(from as Sid + 1, r);
+        return true;
+    }
+    if (proto == 0x0800 || proto == 0x86dd) && buf[0] & 1 == 0 {
         for i in 0..drivers::netdev::count() {
             if drivers::netdev::get(i).and_then(|n| n.mac()).map_or(false, |m| m[..] == buf[0..6]) {
                 inject_frame(i as Sid + 1, buf.to_vec());

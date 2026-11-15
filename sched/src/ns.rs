@@ -1464,9 +1464,11 @@ pub fn ping_allowed(pid: u32) -> bool {
     let ns = netns_of(pid);
     let k = netctl_find(b"ipv4/ping_group_range").unwrap();
     let (lo, hi) = (netctl_get(ns, k), netctl_get(ns, k + 1));
-    let g = crate::egid_of(pid);
-    if lo <= g && g <= hi { return true; }
-    crate::caps::pid_capable_in(pid, owner_userns(2, ns), 13) // CAP_NET_RAW
+    // The range is written by the namespace's own users (podman: "0 0" = the container's root), so the caller's gid
+    // is compared as the netns owner's user namespace names it (unmapped gids never match).
+    let owner = owner_userns(2, ns);
+    if let Some(g) = from_k(1, owner, crate::egid_of(pid)) { if lo <= g && g <= hi { return true; } }
+    crate::caps::pid_capable_in(pid, owner, 13) // CAP_NET_RAW
 }
 /// net.ipv6.bindv6only of namespace `ns`: the IPV6_V6ONLY a new AF_INET6 socket starts with.
 pub fn bindv6only(ns: NsId) -> bool {
