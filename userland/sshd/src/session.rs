@@ -62,7 +62,7 @@ pub struct Conn {
     /// Options of the authorized_keys line that authenticated this connection.
     key_opts: crate::accounts::KeyOpts,
     /// MaxStartups slot, held until the client authenticates or disconnects.
-    startup: Option<crate::StartupSlot>,
+    startup: Option<crate::ChildStartup>,
     chans: HashMap<ChannelId, Chan>,
     /// Active `-R` listeners, keyed by (requested address, port).
     fwds: HashMap<(String, u32), tokio::task::AbortHandle>,
@@ -74,7 +74,7 @@ pub async fn run_connection(
     stream: TcpStream,
     peer: SocketAddr,
     local: Option<SocketAddr>,
-    startup: crate::StartupSlot,
+    startup: crate::ChildStartup,
 ) {
     log(&format!("connection from {peer}"));
     let authed = Arc::new(AtomicBool::new(false));
