@@ -18,7 +18,7 @@ items and no real EC2 instance has been booted yet. The design is in `orch/desig
 off), the f2fs root, a 1 GiB `/home` and a 64 MiB log partition. The image file is sparse, about
 8.5 GiB apparent. The kernel command line is `root=PARTUUID=... nvme.rw=1 console=ttyS0 ec2=1` on
 x86_64 and `root=PARTUUID=... nvme.rw=1 ec2=1` on aarch64 (`nvme.rw=1` makes the EBS root writable;
-NVMe is read-only by default). Override with `LEANDROS_EC2_CMDLINE`, `LEANDROS_EC2_ROOT_GIB`,
+NVMe is read-only by default; the controller holding the booted root is also made writable automatically on Amazon EBS controllers, `nvme.rw=0` opts out). Amazon EBS NVMe quirks are applied (48-bit DMA, 300 s I/O stall cap); disks appear as `/dev/disk/by-id/nvme-<model>_<serial>[_<nsid>][-part<N>]` (direct opens only, no directory listing) and expose `serial` / `ebs_device` in sysfs. Override with `LEANDROS_EC2_CMDLINE`, `LEANDROS_EC2_ROOT_GIB`,
 `LEANDROS_EC2_HOME_GIB`; `--authorized-keys F` bakes an SSH key into the ESP.
 
 ## Testing without AWS

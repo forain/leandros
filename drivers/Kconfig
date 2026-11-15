@@ -48,6 +48,11 @@ config E1000E
 	depends on PCI
 	default y
 
+config ENA
+	bool "Amazon ENA (AWS EC2 Nitro Ethernet)"
+	depends on PCI
+	default y
+
 config R8169
 	bool "Realtek r8169"
 	depends on PCI

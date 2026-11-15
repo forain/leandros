@@ -262,6 +262,35 @@ pub fn parse_ht_op(d: &[u8]) -> Option<HtOp> {
     Some(HtOp { primary: d[0], ht_param: d[1], op_mode: u16::from_le_bytes([d[2], d[3]]) })
 }
 
+/// A neighbouring BSS seen in the scan, as 20/40 MHz coexistence needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Obss {
+    pub channel: u8,
+    /// Its HT Capabilities carry the "40 MHz intolerant" bit.
+    pub intolerant: bool,
+}
+
+/// 20/40 MHz BSS coexistence for a station on 2.4 GHz (IEEE 802.11 11.16):
+/// the AP decides the BSS width and says so in its HT operation element, so
+/// we follow it, and refuse 40 MHz when the AP is itself 40 MHz intolerant
+/// or an intolerant BSS (other than the AP) sits anywhere in the 40 MHz
+/// span (20 MHz BSSs are 4 channel numbers wide: overlap is < 4 apart).
+/// Ok(secondary offset: +1 above, -1 below) or why it stays 20 MHz.
+pub fn coex_40_24(ap: &BssHt, primary: u8, others: &[Obss]) -> Result<i8, &'static str> {
+    let cap = ap.ht_cap.ok_or("no HT capabilities")?;
+    let op = ap.ht_op.ok_or("no HT operation")?;
+    if !cap.sup_40() { return Err("the AP does not support 40 MHz"); }
+    if cap.cap & htcap::INTOLERANT_40 != 0 { return Err("the AP is 40 MHz intolerant"); }
+    let off = op.ht40_offset().ok_or("the AP's BSS is 20 MHz")?;
+    let sec = secondary_channel(primary, off);
+    if !(1..=13).contains(&sec) { return Err("secondary channel outside the band"); }
+    let (lo, hi) = (primary.min(sec) as i16, primary.max(sec) as i16);
+    if others.iter().any(|o| o.intolerant && o.channel <= 14 && o.channel as i16 >= lo - 3 && o.channel as i16 <= hi + 3) {
+        return Err("a 40 MHz intolerant BSS overlaps the 40 MHz span");
+    }
+    Ok(off)
+}
+
 /// What a BSS's elements say about QoS and HT.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BssHt {

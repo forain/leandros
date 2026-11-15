@@ -56,13 +56,19 @@ unsafe fn device_attr_index() -> Option<u64> {
 pub unsafe fn setup(hhdm: usize, kphys: usize, kvirt: usize) {
     crate::exception::init_early();
 
+    arm_uart(hhdm, kphys, kvirt);
+}
+
+/// (Re)make the console UART at `uart::phys_base()` reachable before `init`.
+/// Called again after an ACPI SPCR retarget moved the console.
+pub unsafe fn arm_uart(hhdm: usize, kphys: usize, kvirt: usize) {
     // Drop stale TLB entries first: on HVF the physical UART "translates"
     // only through a TLB entry left over from the firmware's identity map,
     // which Limine's TTBR0 tables do not contain. The first `tlbi vmalle1is`
     // anywhere later (the HHDM fill) then turns every early print into a
     // translation fault whose report faults again (L8.3, lane hhdmfill).
     core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb");
-    let uart = crate::uart::BASE;
+    let uart = crate::uart::phys_base();
     if translates(uart) {
         crate::uart::set_early_mode(crate::uart::EARLY_IDENT);
         return;
@@ -75,7 +81,7 @@ pub unsafe fn setup(hhdm: usize, kphys: usize, kvirt: usize) {
 }
 
 unsafe fn hook_identity(hhdm: usize, kphys: usize, kvirt: usize) -> bool {
-    if hhdm == 0 || kvirt == 0 || crate::uart::BASE >= 1 << 30 { return false; }
+    if hhdm == 0 || kvirt == 0 || crate::uart::phys_base() >= 1 << 30 { return false; }
     let tcr: u64;
     let ttbr0: u64;
     core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr);

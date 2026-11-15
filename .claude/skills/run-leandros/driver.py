@@ -789,6 +789,10 @@ def _netdev_args(arch="aarch64"):
     # LEANDROS_HOSTFWD: more net0 hostfwd rules (comma separated), e.g.
     # "tcp:127.0.0.1:18581-:18081" (podbridgetest: published port reached from the host).
     extra = "".join(f",hostfwd={r}" for r in os.environ.get("LEANDROS_HOSTFWD", "").split(",") if r)
+    # LEANDROS_GUESTFWD: guestfwd rules separated by ';' (their commands may hold
+    # spaces), e.g. "tcp:10.0.2.100:80-cmd:python3 -I scripts/fake-imds.py /tmp/imds"
+    # (ec2inittest: a fake EC2 metadata service behind a slirp address).
+    extra += "".join(f",guestfwd={r}" for r in os.environ.get("LEANDROS_GUESTFWD", "").split(";") if r)
     return ["-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22{extra}"]
 
 
@@ -1104,7 +1108,8 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         return [
             _qemu_bin("qemu-system-x86_64"),
             # LEANDROS_SMP overrides the topology (e.g. 1 to rule out SMP races).
-            "-machine", "q35,i8042=off" if os.environ.get("LEANDROS_NO_I8042") == "1" else "q35",
+            "-machine", ("q35,i8042=off,pit=off,hpet=off" if os.environ.get("LEANDROS_NITRO") == "1"
+                         else "q35,i8042=off" if os.environ.get("LEANDROS_NO_I8042") == "1" else "q35"),
             "-smp", os.environ.get("LEANDROS_SMP", "4,sockets=1,cores=2,threads=2"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
@@ -1117,7 +1122,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
                 "-drive", f"if=none,id=data1,format=raw,file={data1}",
                 "-device", "virtio-blk-pci,drive=data1",
             ]),
-            *vga_args, *gpu_args,
+            *([] if os.environ.get("LEANDROS_NITRO") == "1" else [*vga_args, *gpu_args]),
             *_input_args(),
             *_audiodev_args(),
             *_sound_device_args(),
@@ -1202,7 +1207,9 @@ def _input_args():
     kbd,mouse) or a comma list of kbd/mouse/tablet - USB HID devices on the
     xHCI controller instead (the sticks' controller when LEANDROS_USB_STICK
     is set, else a new one). Device ids usbkbd/usbmouse/usbtablet.
-    LEANDROS_NO_I8042=1 (x86_64) also removes q35's PS/2 controller."""
+    LEANDROS_NO_I8042=1 (x86_64) also removes q35's PS/2 controller.
+    LEANDROS_NITRO=1 (x86_64) = EC2 Nitro-like platform: no PIT, HPET, i8042
+    and no display device at all (serial console only)."""
     spec = os.environ.get("LEANDROS_USB_INPUT", "")
     if not spec:
         return ["-device", "virtio-keyboard-pci", "-device", "virtio-tablet-pci"]
