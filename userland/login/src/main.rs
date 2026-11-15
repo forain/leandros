@@ -70,14 +70,20 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
         let username = match core::str::from_utf8(&user_buf[..user_len]) {
             Ok(s) => s,
-            Err(_) => { write_str("\nLogin incorrect\n\n"); continue; }
+            Err(_) => { fail_delay(); write_str("\nLogin incorrect\n\n"); continue; }
         };
 
         match authenticate(username, &pass_buf[..pass_len]) {
             Some(rec) => do_login(&rec),
-            None => write_str("\nLogin incorrect\n\n"),
+            None => { fail_delay(); write_str("\nLogin incorrect\n\n") }
         }
     }
+}
+
+/// Stall after a failed attempt (rate limit), matching pam-leandros' default
+/// pam_authenticate failure delay of 1 s (Linux login uses ~3 s FAIL_DELAY).
+unsafe fn fail_delay() {
+    leandros_libc::usleep(1_000_000);
 }
 
 /// Read a line from fd 0, optionally echoing typed characters. Handles

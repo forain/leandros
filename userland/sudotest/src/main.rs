@@ -363,6 +363,7 @@ fn main() {
     }
 
     pam_checks(&mut t);
+    login_checks(&mut t);
     devtty_checks(&mut t);
     su_background(&mut t);
     su_background_pty(&mut t);
@@ -693,4 +694,19 @@ fn pam_checks(t: &mut T) {
         let (rc2, _) = pam_try("greetd", &u, "x");
         t.check(&format!("pam greetd: locked account {u} rejected"), rc != 0 && rc2 != 0, &none);
     }
+}
+
+/// /bin/login (console/VT sessions; no PAM): a failed attempt stalls ~1 s like
+/// pam-leandros, then a second, correct attempt on the same prompt loop works.
+fn login_checks(t: &mut T) {
+    let t0 = Instant::now();
+    let bad = run(As::Root, &["/bin/login"], &[], "leandro\nwrong\n");
+    let ms = t0.elapsed().as_millis();
+    t.check("login: wrong password rejected", bad.all().contains("Login incorrect") && !bad.all().contains("uid="), &bad);
+    t.check(&format!("login: failure is delayed (rate limit), took {ms} ms"), ms >= 900, &bad);
+    let t1 = Instant::now();
+    let ok = run(As::Root, &["/bin/login"], &[], "leandro\nwrong\nleandro\nleandro\nid -un\nexit\n");
+    let ms = t1.elapsed().as_millis();
+    t.check("login: wrong then right password logs in", ok.all().contains("Login incorrect") && ok.stdout.lines().any(|l| l.trim() == "leandro"), &ok);
+    t.check(&format!("login: delay applied before the retry, took {ms} ms"), ms >= 900, &ok);
 }
