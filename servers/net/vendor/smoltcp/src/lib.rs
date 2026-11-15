@@ -161,6 +161,7 @@ pub mod config {
     feature = "medium-ieee802154"
 ))]
 pub mod iface;
+pub mod pmtu;
 
 pub mod phy;
 #[cfg(feature = "socket")]

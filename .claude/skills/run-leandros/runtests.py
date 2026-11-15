@@ -18,11 +18,13 @@ Options:
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              serialxfer host:serialxfertest.py alone (serial push + kexec, scripts/pi-serial-*)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
+                             nitrox86 host:nitrotest.py alone (x86_64 without PIT/HPET/i8042/display, EC2 Nitro-like)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              usbisoch host:usbisochtest.py alone (xHCI isoch OUT: 2 s 1 kHz sine to usb-audio, WAV checked)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
@@ -33,6 +35,7 @@ Options:
                                       + host:inloadtest.py (hostfwd connects under bulk load and an unpumped held serial)
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
+                             ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
@@ -257,6 +260,8 @@ SUITES = {
     "kexecacpi": ["host:kexecacpitest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
+    # lane nitrox86: x86_64 with no PIT/HPET/i8042/display (EC2 Nitro-like): login on serial, TSC stated, clock true (own boot).
+    "nitrox86": ["/bin/timertest", "host:nitrotest.py"],
     "usbisoch": ["host:usbisochtest.py"],
     "blkslow": ["host:blkslowtest.py"],
     # 12 extra virtio-blk data disks all appear in /dev and mount (own boot, openbugs #83).
@@ -271,6 +276,7 @@ SUITES = {
     # NVMe command timeout: the driver resets the controller and the stalled
     # read finishes with intact data (own boot, ~2 min; not in regress).
     "nvmefault": ["host:nvmefaulttest.py"],
+    "nvmeebs": ["host:nvmeebstest.py"],
     # Network management end to end: /dev/netctl conformance, the NM shim on
     # its mock (full, with the snapshot storm, and read-only), then the shim
     # on the REAL stack (nmrealtest.py: its own boot with wifi_sim, nmtest as
@@ -287,6 +293,8 @@ SUITES = {
                 "host:netflaptest.py",
                 # netctl metric + net.metric.<if>= boot knob (own boot).
                 "host:netmetrictest.py",
+                # EC2 first-boot service vs a fake IMDSv2 (own boot).
+                "host:ec2inittest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
                 # hostfwd connects under bulk load / a held unpumped serial (own boot).
@@ -306,6 +314,7 @@ SUITES = {
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
+    "ec2init": ["host:ec2inittest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
     # linkmontest.py alone.
@@ -430,6 +439,8 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "nitrox86" in suites:
+        os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915crtc2" in suites and cmdline is None:
@@ -492,11 +503,17 @@ def main(argv):
                 print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
             else:
                 print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
+                try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
+                    with open(driver.QEMU_STDERR_LOG, "rb") as ef:
+                        print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
+                except OSError:
+                    pass
             subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
         entry["boot"] = "ok" if booted else "failed"
         if not booted:
             all_ok = False
             continue
+        miss_seen = False
         with open(os.path.join(rdir, "results.txt"), "w") as res:
             for c in cmds:
                 try:
@@ -530,6 +547,23 @@ def main(argv):
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
                                          "secs": r["secs"], "fails": fails})
+                # sig_kick guard: any writer of signal state that forgot sig_kick
+                # shows up as `miss` > 0 in /proc/rqhold (cumulative since boot).
+                # Checked after each command that ran on this VM; the first
+                # command after which it is non-zero fails the run.
+                if not miss_seen and not self_boots(c) and driver._qemu_pid() is not None:
+                    try:
+                        q = driver.serial_run("grep '^# sigfast' /proc/rqhold", timeout=60, arch=arch)
+                        m = re.search(r"\bmiss (\d+)\b(?: miss_pid (\S+))?", q["output"])
+                        if m and int(m.group(1)) > 0:
+                            miss_seen = True
+                            all_ok = False
+                            print(f"=== sig_kick guard: FAIL miss={m.group(1)} (after {c}): {q['output'].strip()[-200:]}", flush=True)
+                            res.write(f"=== sig_kick guard: FAIL after {c}\n{q['output']}\n")
+                            entry["results"].append({"cmd": "sig_kick-guard", "rc": 1, "status": "ok",
+                                                     "secs": 0, "fails": ["sig_kick_miss"]})
+                    except Exception:  # noqa: BLE001
+                        pass
         if os.path.exists(driver.SERIAL_LOG):
             subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
         if os.path.exists(driver.SERIAL_FULL_LOG):

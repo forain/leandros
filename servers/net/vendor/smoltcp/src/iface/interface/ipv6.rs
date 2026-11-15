@@ -252,6 +252,14 @@ impl InterfaceInner {
                 _ => unreachable!(),
             },
 
+            // LEANDROS: RFC 8201 -- a "packet too big" teaches the path MTU
+            // towards the quoted datagram's destination.
+            Icmpv6Repr::PktTooBig { mtu, header, .. } => {
+                let m = mtu.min(u16::MAX as u32) as u16;
+                crate::pmtu::update(self.pmtu_scope, header.dst_addr.0, m, crate::pmtu::MIN_PMTU6, self.now.total_millis() as u64);
+                None
+            }
+
             // Don't report an error if a packet with unknown type
             // has been handled by an ICMP socket
             #[cfg(feature = "socket-icmp")]
@@ -274,7 +282,10 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
-                let ip_addr = ip_repr.src_addr.into();
+                // LEANDROS: the resolved address is the NA's target (RFC 4861 7.2.5), not its IP source:
+                // a proxy (pasta) answers for ::2 from its own link-local address.
+                let _ = &ip_repr;
+                let ip_addr = target_addr.into();
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
                     if !lladdr.is_unicast() || !target_addr.is_unicast() {

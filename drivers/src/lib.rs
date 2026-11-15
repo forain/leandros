@@ -127,6 +127,10 @@ pub mod virtio_keyboard;
 #[cfg(feature = "r8169")] pub mod r8169;
 /// Hardware-independent r8169 pieces (host-tested in drivers/r8169-tests).
 #[cfg(feature = "r8169")] pub mod r8169_hw;
+/// Amazon ENA (EC2 Nitro NIC).
+#[cfg(feature = "ena")] pub mod ena;
+/// Hardware-independent ENA core (host-tested in drivers/ena-tests).
+#[cfg(feature = "ena")] pub mod ena_hw;
 /// Intel e1000e family (I219 PCH NICs, QEMU's 82574L).
 #[cfg(feature = "e1000e")] pub mod e1000e;
 /// Hardware-independent e1000e pieces (host-tested in drivers/e1000e-tests).
@@ -161,6 +165,7 @@ pub mod cmdline_secrets;
 pub mod wifi_api;
 /// The Wi-Fi connection manager behind that seam (iwlwifi.mgr=1, wifi_sim).
 #[cfg(feature = "wifi-stack")] pub mod wifi_pure;
+#[cfg(feature = "wifi-stack")] pub mod wifi_sae;
 #[cfg(feature = "wifi-stack")] pub mod wifi_mgr;
 /// The Wi-Fi radio class: `Radio` trait + `repr(C)` table (pure) and the kernel registry.
 #[cfg(feature = "wifi-stack")] pub mod wifi_radio;
@@ -335,6 +340,9 @@ pub mod virtio_net;
 #[cfg(not(feature = "r8169"))]
 #[path = "stubs/r8169.rs"]
 pub mod r8169;
+#[cfg(not(feature = "ena"))]
+#[path = "stubs/ena.rs"]
+pub mod ena;
 #[cfg(not(feature = "e1000e"))]
 #[path = "stubs/e1000e.rs"]
 pub mod e1000e;

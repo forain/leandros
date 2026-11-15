@@ -13,6 +13,9 @@ extern "C" {
 /// Raw serial line (the module build routes this through `kapi_log`).
 pub fn serial_raw(s: &str) { unsafe { serial_print_str_raw(s.as_ptr(), s.len()); } }
 
+/// Interrupt-to-task wake-up: the ISR calls `notify`, the I/O path `wait`s with a timeout.
+pub use crate::netdev::LinkMon as IrqWait;
+
 /// Park until `deadline` (`monotonic_ns`). Task context that may sleep only.
 pub fn sleep_until(deadline: u64) {
     while sched::monotonic_ns() < deadline {

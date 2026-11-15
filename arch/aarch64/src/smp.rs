@@ -415,6 +415,14 @@ pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
     psci_call(PSCI_CPU_ON, mpidr, entry as u64, context_id)
 }
 
+/// PSCI conduit from ACPI FADT: 0 = decide by boot EL, 1 = SMC, 2 = HVC.
+static PSCI_CONDUIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Record the FADT-declared conduit (`hvc` true = HVC).
+pub fn set_psci_conduit(hvc: bool) {
+    PSCI_CONDUIT.store(if hvc { 2 } else { 1 }, Ordering::Relaxed);
+}
+
 /// Issue a PSCI call `fid(a1, a2, a3)` on the platform's conduit; returns x0.
 ///
 /// The conduit (HVC vs SMC) depends on the boot EL: when the kernel entered
@@ -435,8 +443,13 @@ pub unsafe fn psci_call(fid: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     // is reached via the SMC conduit. HVC will fault because there is no EL2 hypervisor.
     #[cfg(feature = "rpi5")]
     let use_smc = true;
+    // An ACPI FADT (ARM_BOOT_ARCH.PSCI_USE_HVC) names the conduit outright.
     #[cfg(not(feature = "rpi5"))]
-    let use_smc = core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) != 0;
+    let use_smc = match PSCI_CONDUIT.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => core::ptr::read_volatile(core::ptr::addr_of!(boot_entered_el2)) != 0,
+    };
 
     if use_smc {
         core::arch::asm!(

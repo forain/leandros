@@ -111,6 +111,8 @@ pub struct InterfaceInner {
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     #[cfg(feature = "proto-ipv4")]
     any_ip: bool,
+    /// LEANDROS: the path-MTU cache scope (the stack / network namespace).
+    pmtu_scope: u16,
     routes: Routes,
     #[cfg(feature = "proto-igmp")]
     ipv4_multicast_groups: LinearMap<Ipv4Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
@@ -226,6 +228,7 @@ impl Interface {
                 ip_addrs: Vec::new(),
                 #[cfg(feature = "proto-ipv4")]
                 any_ip: false,
+                pmtu_scope: 0,
                 routes: Routes::new(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
@@ -372,6 +375,11 @@ impl Interface {
     /// This option is not available or required for IPv6 as packets sent to
     /// the interface are not filtered by IPv6 address.
     #[cfg(feature = "proto-ipv4")]
+    /// LEANDROS: tag this interface's path-MTU cache entries.
+    pub fn set_pmtu_scope(&mut self, scope: u16) {
+        self.inner.pmtu_scope = scope;
+    }
+
     pub fn set_any_ip(&mut self, any_ip: bool) {
         self.inner.any_ip = any_ip;
     }
@@ -886,6 +894,23 @@ impl InterfaceInner {
         self.caps.ip_mtu()
     }
 
+    /// LEANDROS: the IP MTU towards `dst`: the link's, or a smaller one an
+    /// ICMP "fragmentation needed" / "packet too big" taught the cache.
+    #[allow(unused)]
+    pub(crate) fn path_ip_mtu(&self, dst: &IpAddress) -> usize {
+        let key = match dst {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(a) => crate::pmtu::v4(a.0),
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(a) => a.0,
+        };
+        let link = self.caps.ip_mtu();
+        match crate::pmtu::lookup(self.pmtu_scope, key, self.now.total_millis() as u64) {
+            Some(m) => link.min(m as usize),
+            None => link,
+        }
+    }
+
     #[allow(unused)] // unused depending on which sockets are enabled, and in tests
     pub(crate) fn rand(&mut self) -> &mut Rand {
         &mut self.rand
@@ -904,6 +929,10 @@ impl InterfaceInner {
     #[cfg(feature = "proto-ipv4")]
     #[allow(unused)]
     pub(crate) fn get_source_address_ipv4(&self, _dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
+        // LEANDROS: a loopback destination is its own source (Linux lo).
+        if _dst_addr.is_loopback() && self.has_ip_addr(*_dst_addr) {
+            return Some(*_dst_addr);
+        }
         for cidr in self.ip_addrs.iter() {
             #[allow(irrefutable_let_patterns)] // if only ipv4 is enabled
             if let IpCidr::Ipv4(cidr) = cidr {
@@ -1087,6 +1116,16 @@ impl InterfaceInner {
     /// Check whether the interface has the given IP address assigned.
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
+        // LEANDROS: an interface holding an IPv4 address in 127.0.0.0/8 owns
+        // the whole block, as Linux's lo does (127.0.0.3 is local).
+        #[cfg(feature = "proto-ipv4")]
+        if let IpAddress::Ipv4(a) = addr {
+            if a.is_loopback()
+                && self.ip_addrs.iter().any(|p| matches!(p.address(), IpAddress::Ipv4(q) if q.is_loopback()))
+            {
+                return true;
+            }
+        }
         self.ip_addrs.iter().any(|probe| probe.address() == addr)
     }
 
@@ -1337,6 +1376,7 @@ impl InterfaceInner {
                 let payload_len =
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
                 let icmpv4_reply_repr = Icmpv4Repr::DstUnreachable {
+                    mtu: 0,
                     reason: Icmpv4DstUnreachable::PortUnreachable,
                     header: ipv4_repr,
                     data: &ip_payload[0..payload_len],
@@ -1749,7 +1789,8 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                if total_ip_len > self.caps.max_transmission_unit {
+                let path_mtu = self.path_ip_mtu(&IpAddress::Ipv4(repr.dst_addr));
+                if total_ip_len > self.caps.max_transmission_unit - (self.caps.ip_mtu() - path_mtu) {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
                         net_debug!("start fragmentation");
@@ -1759,7 +1800,7 @@ impl InterfaceInner {
                         // multiple of 8 payload bytes (RFC 791); upstream
                         // used the whole IP MTU.
                         let first_frag_ip_len =
-                            ip_header_len + ((self.caps.ip_mtu() - ip_header_len) & !7);
+                            ip_header_len + ((path_mtu - ip_header_len) & !7);
 
                         // Calculate how much we will send now (including the Ethernet header).
                         #[allow(unused_mut)]
@@ -1863,10 +1904,11 @@ impl InterfaceInner {
 
                         emit_ip(&ip_repr, tx_buffer);
                         // LEANDROS: IP_TOS.
-                        if meta.tos != 0 {
+                        if meta.tos != 0 || meta.nodf {
                             let mut p = Ipv4Packet::new_unchecked(&mut tx_buffer[..]);
                             p.set_dscp(meta.tos >> 2);
                             p.set_ecn(meta.tos & 3);
+                            if meta.nodf { p.set_dont_frag(false); }
                             if caps.checksum.ipv4.tx() {
                                 p.fill_checksum();
                             }

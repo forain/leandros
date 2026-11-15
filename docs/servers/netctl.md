@@ -28,7 +28,7 @@ Implementation lanes:
 | Overflow | Lossless. The queue is dropped, then `RESYNC` and a fresh snapshot follow |
 | Profiles | `/etc/leandros/network/profiles.{a,b}`, A/B slots, `seq` + CRC-32, newest valid wins. Userland writes them, the kernel reads them |
 | Interfaces | `lo` = ifindex 1. Wired NICs are `eth0`, `eth1`, …, and Wi-Fi is `wifi0`. Default route metric: wired 100, Wi-Fi 600 |
-| Security | WPA2-PSK now. The AKM field already carries `PSK_SHA256` and `SAE`, so WPA3 needs no ABI change |
+| Security | WPA2-PSK; WPA3-Personal (SAE) and 802.11w management frame protection on radios that report `wifi_caps::SAE` / `PMF` (today the simulated radio `wifi_sim`; the Intel driver reports neither, real-AP WPA3 is unverified) |
 
 ## Permission model
 
@@ -130,8 +130,8 @@ The kernel checks once, at `open(2)`, as Linux does for a device node:
   - Nothing is persisted. To save a network, write the profile first, then `RELOAD_PROFILES`, then `CONNECT` by uuid. That is the NM shim's `AddAndActivateConnection` path.
 - `HIDDEN` probes the SSID directly.
 - Errors and rejections:
-  - An AKM this kernel cannot do (`akm::SAE` before WPA3) answers `EOPNOTSUPP` synchronously.
-  - With `akm::AUTO`, a network that turns out to be SAE-only fails asynchronously with `reason::UNSUPPORTED_SECURITY`.
+  - An AKM the radio cannot do (`akm::SAE` without `wifi_caps::SAE`) answers `EOPNOTSUPP` synchronously.
+  - With `akm::AUTO`, a network whose AKMs the radio lacks (SAE-only without `wifi_caps::SAE`) fails asynchronously with `reason::UNSUPPORTED_SECURITY`.
 - Preemption:
   - A `CONNECT` preempts autoconnect and any attempt in progress. The old attempt ends `FAILED`/`SUPERSEDED`.
   - It also clears the autoconnect block left by `DISCONNECT` and the wrong-key block of that profile.
@@ -347,7 +347,7 @@ Rules a client may rely on:
   - A transition AP falls back to PSK only for protocol reasons (status 77, H2E mismatch).
   - It never falls back on `WRONG_KEY`.
 
-Until WPA3 lands, SAE is reported in `ext` and `rsn_flags` but is never in `wifi_caps`, so those BSSs lack `JOINABLE`.
+WPA3 and roaming (`wifi_sae.rs`, `wifi_sim.rs`): a radio with `wifi_caps::SAE` + `PMF` joins SAE-only and MFPR networks. SAE runs on group 19 with hash-to-element (hunt-and-peck for APs without H2E), anti-clogging tokens and PMKSA caching per (BSS, secret); the 4-way handshake then uses key descriptor version 3 and installs the IGTK, and management frames are BIP-CMAC-128 protected: a deauthentication without a valid MIC or with a replayed packet number is ignored, SA Query requests are answered. A transition-mode AP (`PSK` + `SAE`) is joined with SAE, falling back to PSK if SAE fails for a reason other than the key. A radio with `wifi_caps::ROAM` (+ `SCAN_CONNECTED`) roams: the background scan (signal below -75 dBm, `wifi_pure::ROAM_SCAN_MS`) looks for a joinable BSS of the same SSID at least `ROAM_MARGIN_DB` (10 dB) stronger and reassociates to it, reusing the PMKSA when it has one. Not verified against a real WPA3 AP; the SAE key derivation is checked against RFC 5903/9380 vectors (`drivers/iwlwifi-tests`, `sae_selftest`) and by the simulator, not against a hostapd capture.
 
 ## Profiles file
 

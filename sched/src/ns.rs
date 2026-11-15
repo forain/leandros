@@ -12,7 +12,10 @@
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 
 pub type NsId = u16;
-pub const NS_MAX: usize = 256;
+/// Slots in the shared namespace table (ids are u16). Static, memory-bounded:
+/// ~0.55 KiB per slot (~4.5 MiB of BSS in total). Every per-id array below is
+/// indexed directly by id, so lookups stay O(1) and lock-free.
+pub const NS_MAX: usize = 8192;
 /// Linux `/proc/sys/user/max_user_namespaces` nesting limit.
 pub const MAX_USERNS_LEVEL: u8 = 32;
 /// Clone/unshare flags the namespace layer accepts so far.
@@ -135,10 +138,51 @@ fn put(mut id: NsId) {
         OWNER_EUID[id as usize].store(0, Release);
         OWNER_EGID[id as usize].store(0, Release);
         LEVEL[id as usize].store(0, Release);
+        uncharge(SLOT_KIND[id as usize].load(Acquire));
         REFS[id as usize].store(0, Release);
         id = next;
     }
 }
+
+/// Per-kind namespace budgets (Linux `/proc/sys/user/max_<kind>_namespaces`).
+/// Indexed by slot class: 1 user, 2 mnt, 3 net, 4 pid, 5 time (unsupported,
+/// reserved), 6 cgroup, 7 ipc, 8 uts. The sum of the limits may never exceed
+/// `NS_MAX - 1` (the shared table), so every kind keeps its own reservation and
+/// one kind can never starve another; creation past a kind's limit is ENOSPC.
+pub const LIMIT_N: usize = 9;
+pub const LIMIT_NAMES: [&[u8]; LIMIT_N] =
+    [b"", b"max_user_namespaces", b"max_mnt_namespaces", b"max_net_namespaces", b"max_pid_namespaces",
+     b"max_time_namespaces", b"max_cgroup_namespaces", b"max_ipc_namespaces", b"max_uts_namespaces"];
+const LIMIT_DEFAULT: [u32; LIMIT_N] = [0, 2048, 1024, 2048, 512, 8, 512, 1024, 1000];
+static LIMIT: [AtomicU32; LIMIT_N] = {
+    let mut a = [const { AtomicU32::new(0) }; LIMIT_N];
+    let mut i = 0;
+    while i < LIMIT_N { a[i] = AtomicU32::new(LIMIT_DEFAULT[i]); i += 1; }
+    a
+};
+static USED: [AtomicU32; LIMIT_N] = [ZERO32; LIMIT_N];
+
+pub fn limit_get(class: usize) -> u32 { if class < LIMIT_N { LIMIT[class].load(Acquire) } else { 0 } }
+/// Live namespaces of `class` (including mount namespaces awaiting reap).
+pub fn limit_used(class: usize) -> u32 { if class < LIMIT_N { USED[class].load(Acquire) } else { 0 } }
+/// Set a kind's limit. EINVAL (-22) for a bad class or when the sum of all
+/// limits would exceed the shared table (`NS_MAX - 1`).
+pub fn limit_set(class: usize, v: u32) -> isize {
+    if class == 0 || class >= LIMIT_N { return -22; }
+    loop {
+        let cur = LIMIT[class].load(Acquire);
+        let others: u64 = (1..LIMIT_N).filter(|&c| c != class).map(|c| LIMIT[c].load(Acquire) as u64).sum();
+        if others + v as u64 > (NS_MAX - 1) as u64 { return -22; }
+        if LIMIT[class].compare_exchange(cur, v, AcqRel, Relaxed).is_ok() { return 0; }
+    }
+}
+/// Reserve one namespace of `class`: false (ENOSPC) at the kind's limit.
+fn charge(class: u8) -> bool {
+    let c = class as usize;
+    if USED[c].fetch_add(1, AcqRel) >= LIMIT[c].load(Acquire) { USED[c].fetch_sub(1, AcqRel); return false; }
+    true
+}
+fn uncharge(class: u8) { USED[class as usize].fetch_sub(1, AcqRel); }
 
 /// Per-kuid namespace quota (Linux ucounts; host root exempt): a creator may
 /// own at most `MAX_USERNS_PER_UID` user namespaces and `MAX_NS_PER_UID`
@@ -207,6 +251,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     let level = if parent == 0 { 0 } else { LEVEL[parent as usize].load(Acquire) };
     if level >= MAX_USERNS_LEVEL { return Err(-87); }
     if !quota_chain_ok(Some(euid), parent, true) { return Err(-28); }
+    if !charge(1) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(1, Release);
@@ -224,6 +269,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
             return Ok(NsRef(id as NsId));
         }
     }
+    uncharge(1);
     Err(-28)
 }
 
@@ -255,7 +301,7 @@ pub fn owner_user(id: NsId) -> NsId { if id == 0 { 0 } else { OWNER_USER[id as u
 
 /// Create a mount namespace id owned by user namespace `owner_user`.
 pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
-    if !quota_owner_ok(owner_user) { return Err(-28); }
+    if !quota_owner_ok(owner_user) || !charge(2) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(2, Release);
@@ -271,6 +317,7 @@ pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
             return Ok(NsRef(id as NsId));
         }
     }
+    uncharge(2);
     Err(-28)
 }
 
@@ -300,6 +347,7 @@ pub fn reap(mut free: impl FnMut(NsId)) {
             free(id as NsId);
             IS_MNT[id].store(0, Release);
             let ou = OWNER_USER[id].swap(0, AcqRel);
+            uncharge(2);
             REFS[id].store(0, Release);
             drop(NsRef(ou)); // the owner pin taken by new_mntns
         }
@@ -315,7 +363,7 @@ pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) ==
 /// Create a flat (parentless) namespace id of slot class `class` (3 net, 7 ipc,
 /// 8 uts; see `link_class`). Errors: ENOSPC (28).
 pub fn new_flat(owner: NsId, class: u8) -> Result<NsRef, isize> {
-    if !quota_owner_ok(owner) { return Err(-28); }
+    if !quota_owner_ok(owner) || !charge(class) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(class, Release);
@@ -328,6 +376,7 @@ pub fn new_flat(owner: NsId, class: u8) -> Result<NsRef, isize> {
             return Ok(NsRef(id as NsId));
         }
     }
+    uncharge(class);
     Err(-28)
 }
 
@@ -492,7 +541,7 @@ static PID_FLAGS: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
     let level = level(parent);
     if level >= MAX_PIDNS_LEVEL { return Err(-28); }
-    if !quota_owner_ok(owner) { return Err(-28); }
+    if !quota_owner_ok(owner) || !charge(4) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(4, Release);
@@ -508,6 +557,7 @@ pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
             return Ok(NsRef(id as NsId));
         }
     }
+    uncharge(4);
     Err(-28)
 }
 pub fn pid_init(id: NsId) -> u32 { if id == 0 { 0 } else { PID_INIT[id as usize].load(Acquire) } }
@@ -1045,7 +1095,7 @@ static CGNS_FLAG: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// New cgroup namespace rooted at cgroup `root`, owned by user namespace
 /// `owner`. The returned reference is the caller's. ENOSPC (28) when full.
 pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> {
-    if !quota_owner_ok(owner) { return Err(-28); }
+    if !quota_owner_ok(owner) || !charge(6) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(6, Release);
@@ -1060,6 +1110,7 @@ pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> 
             return Ok(NsRef(id as NsId));
         }
     }
+    uncharge(6);
     Err(-28)
 }
 
@@ -1413,9 +1464,11 @@ pub fn ping_allowed(pid: u32) -> bool {
     let ns = netns_of(pid);
     let k = netctl_find(b"ipv4/ping_group_range").unwrap();
     let (lo, hi) = (netctl_get(ns, k), netctl_get(ns, k + 1));
-    let g = crate::egid_of(pid);
-    if lo <= g && g <= hi { return true; }
-    crate::caps::pid_capable_in(pid, owner_userns(2, ns), 13) // CAP_NET_RAW
+    // The range is written by the namespace's own users (podman: "0 0" = the container's root), so the caller's gid
+    // is compared as the netns owner's user namespace names it (unmapped gids never match).
+    let owner = owner_userns(2, ns);
+    if let Some(g) = from_k(1, owner, crate::egid_of(pid)) { if lo <= g && g <= hi { return true; } }
+    crate::caps::pid_capable_in(pid, owner, 13) // CAP_NET_RAW
 }
 /// net.ipv6.bindv6only of namespace `ns`: the IPV6_V6ONLY a new AF_INET6 socket starts with.
 pub fn bindv6only(ns: NsId) -> bool {

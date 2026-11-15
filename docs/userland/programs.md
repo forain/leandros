@@ -78,13 +78,16 @@ crypto) on tokio, one root process for every connection.
 - **Configuration.** `/etc/ssh/sshd_config` uses an OpenSSH keyword subset: `Port`,
   `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
   `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
-  `LoginGraceTime`, `Subsystem sftp`. `sshd -t` checks the file and the key.
+  `LoginGraceTime`, `PermitUserEnvironment` (default `no`), `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
 - **Authentication.** Passwords are checked against `/etc/shadow` in the system's
-  `$sha256$salt$hex` format, as `/bin/login` checks them. Public keys come from
-  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks; lines with
-  options are skipped. root may log in with a key but not with a password
+  sha512-crypt `$6$` format (legacy `$sha256$` fields still verify and are rewritten to `$6$rounds=65536` on the next successful login, atomically via `/etc/shadow.sshd-new` + rename), as `/bin/login` checks them. `keyboard-interactive` is offered with one hidden `Password:` prompt and the same checks as `password` (sshd implements the conversation itself; it does not load `pam-leandros`). Public keys come from
+  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks. Key options `from=` (globs, `!`
+  negation, CIDR), `command=` (forced command; the client's command goes to
+  `SSH_ORIGINAL_COMMAND`; sftp is refused), `no-pty`, `no-port-forwarding`, `restrict`, `permitopen="host:port"`, `permitlisten="[host:]port"`, `expiry-time="YYYYMMDD[HHMM[SS]][Z]"` (UTC) and `environment="N=v"` (only with `PermitUserEnvironment yes`) are
+  enforced; a line with any other option is skipped, never half-applied. root may log in with a key but not with a password
   (`PermitRootLogin prohibit-password`). Empty passwords, locked (`!`) accounts and
   `false`/`nologin` shells are refused.
+- **TCP forwarding.** `ssh -L` (direct-tcpip) connects from the server; `ssh -R` (tcpip-forward, port 0 allocates) listens on the server's loopback only (GatewayPorts no) and opens forwarded-tcpip channels back. `no-port-forwarding`/`restrict` refuse both; `permitopen`/`permitlisten` limit them to the listed destinations. Streamlocal (unix sockets) and `-D` dynamic forwarding clients work only as far as they use direct-tcpip.
 - **Sessions.** Each session is a child process. Between fork and exec the child calls
   `setsid`, then (with a pty) `TIOCSCTTY`, then `setgroups`, `setresgid` and `setresuid`.
   It reads the ids back and checks that `setuid(0)` fails before it execs.
@@ -233,6 +236,22 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 - [README.md](README.md), [libc.md](libc.md), [ports.md](ports.md)
 - [../getting-started/logging-in.md](../getting-started/logging-in.md)
 - [../development/testing.md](../development/testing.md)
+
+## ec2init (EC2 first boot)
+
+`/bin/ec2init` (`userland/ec2init/ec2init.c`) is started in the background by
+init at every boot and exits at once unless this is EC2: the kernel command
+line has `ec2=1` (or `ec2init.endpoint=HOST:PORT`) or the DMI vendor
+(`/sys/class/dmi/id/sys_vendor`, `bios_vendor`) contains "Amazon". On EC2 it
+waits for the network (`ec2init.wait=N`, default 90 s), asks the instance
+metadata service for an IMDSv2 token (`PUT /latest/api/token`, 6 h TTL; every
+later `GET` carries it) and, once per instance id (`/var/lib/ec2-init/instance-id`),
+appends the instance's `public-keys/0/openssh-key` to `~/.ssh/authorized_keys`
+of `root` and `leandro` (deduplicated, so the russh sshd accepts it), sets the
+hostname from `local-hostname` (first label, also written to `/etc/hostname`)
+and, with `ec2init.userdata=1`, saves and runs `user-data` when it starts with
+`#!`. `ec2init=0` disables it; `ec2init.endpoint=` overrides 169.254.169.254:80.
+It never blocks boot, and a failed step leaves no stamp, so the next boot retries.
 
 ## utmpx
 

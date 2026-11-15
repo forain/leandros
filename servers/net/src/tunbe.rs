@@ -164,7 +164,9 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
     let mut dev = TapDev { rx: VecDeque::new(), tx: Vec::new(), mtu: 1500 };
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = sched::ticks() ^ sched::monotonic_ns();
-    let interface = Interface::new(config, &mut dev, stack_now());
+    let mut interface = Interface::new(config, &mut dev, stack_now());
+    interface.set_pmtu_scope(sid as u16);
+    smoltcp::pmtu::clear_scope(sid as u16);
     *stack_for(sid) = Some(NetStack {
         interface,
         socket_set: SocketSet::new(alloc::vec![]),
@@ -552,7 +554,8 @@ fn rtnl_route6(ns: u16, op: RtOp) -> Option<i32> {
         sid = sd;
         let x = v[sd as usize].as_mut()?;
         if add {
-            let Some(g) = gw else { return Some(95) }; // only gateway routes; connected ones come from addresses
+            // Connected (on-link) routes come from the addresses; pasta/ip re-add them when duplicating a host's table.
+            let Some(g) = gw else { return Some(if plen == 0 { 95 } else { 0 }) };
             if !crate::ip6::is_link_local(&g) && !x.addrs6.iter().any(|&(a, p)| pfx_match(&a, &g, p)) { return Some(101); }
             let m = metric.unwrap_or(1024);
             if let Some(i) = x.routes6.iter().position(|r| r.0 == dst && r.1 == plen && r.3 == m) {
