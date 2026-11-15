@@ -164,6 +164,11 @@ impl<'a> Socket<'a> {
 
     /// Check whether the transmit buffer is full.
     #[inline]
+    /// LEANDROS: packets still queued for transmission.
+    pub fn send_pending(&self) -> bool {
+        !self.tx_buffer.is_empty()
+    }
+
     pub fn can_send(&self) -> bool {
         !self.tx_buffer.is_full()
     }
