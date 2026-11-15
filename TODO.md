@@ -7,55 +7,43 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Known bugs
 
 ### Kernel / VFS
-- **ns-0 detached-mount table is capped at 256** (lane ns0gen): a dirfd whose detached ns-0 mount was evicted (>256 flagged mounts removed while it stays open) falls back to path lookup and may pick up a newer mount's flags; root-only. Full fix = per-mount refcount held by dirfds.
-- **Flakes to root-cause**: `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
+- **ns-0 mount ref race**: a mount detached in the window between open() resolving the path and the open file taking its mount reference is not recorded (lane mntref); that fd falls back to path lookup for flags.
+- **Flakes to root-cause**: `timertest` realtime_is_not_uptime (aarch64 box, once 2026-11-14 in lane sysfs; passed on rerun). (`sigtest` timed_wait_stop_resumes_remainder: not reproduced in ~160 `stoprem` iterations on both arches 2026-11-14; a recurrence now prints a failure-only DETAIL timing line.)
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
-- **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
-- **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
-- **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
 
 ### Podman / namespaces / cgroups
-- **net/ipc/uts namespaces share one slot-kind class** (LOW; fold into per-kind).
+- **All namespace kinds share one 256-slot table** (sched/src/ns.rs): one kind (e.g. a container churning uts/ipc namespaces) can exhaust it and make netns/mntns creation fail with ENOSPC; Linux has per-kind limits (/proc/sys/user/max_*_namespaces, per-user ucounts).
 
 ### Network
-- **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. SLAAC/RA (L5: RS x3, RA -> global addr + on-link prefix + default router + lifetimes, /proc/net/ipv6_route) done; no DAD, no DHCPv6/RDNSS, RA MTU ignored; rtnetlink v6 (L6: GETADDR/GETROUTE, NEWADDR/DELADDR/NEWROUTE/DELROUTE, static v6 routes in best(), /proc/net tcp6/udp6/raw6) done, open: RTNLGRP v6 notifications, IFLA_AF_SPEC AF_INET6, busybox `ip -6` output unchecked; own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs yet: design-ipv6 L4+). L8 (v6 on veth/bridge/tap in any netns) done; bridge6 (netns<->netns and netns<->bridge address ping6/TCP) and v6 default/gateway routes inside a netns done (ip6br); L9 phase 1 done (ip6pod: rootful podman bridge NAT66 outbound, TCP/UDP/ICMPv6 echo, v6 conntrack + NDP cache, nft ip6 masquerade; box podbridge v6 ping/dns/tcp green); open L9 phase 2: DNAT66 (-p publish over v6), pasta v6, ICMPv6 errors for forwarded flows, aardvark-dns fails at --rm teardown on DNS-enabled custom networks (DNAT66, Time Exceeded and pasta v6 checks written on lane/ip6dnat, not yet run in a guest); tun6 IFF_TUN 0x86DD + NS proxy, DAD.
+- **IPv6 beyond loopback** (L1 ::1, L2 dual-stack/V6ONLY/v4-mapped, L7 resolver (musl) and L4 NIC link-local fe80::/64 (EUI-64, disable_ipv6) + sin6_scope_id + /proc/net/if_inet6 + NDP to the slirp router, L3 ICMPv6 ping/raw sockets + ICMP6_FILTER + hop limit/tclass/pktinfo options and cmsgs + `ping -6` done on ::1; sshd listens on `[::]:22`. Known gaps: v4-mapped destination on a v6 ping socket is EINVAL, hop limit 0 reads back as the default, no ICMPv6 cmsgs. SLAAC/RA (L5: RS x3, RA -> global addr + on-link prefix + default router + lifetimes, /proc/net/ipv6_route) done; no DAD, no DHCPv6/RDNSS, RA MTU ignored; rtnetlink v6 (L6: GETADDR/GETROUTE, NEWADDR/DELADDR/NEWROUTE/DELROUTE, static v6 routes in best(), /proc/net tcp6/udp6/raw6) done, open: RTNLGRP v6 notifications, IFLA_AF_SPEC AF_INET6, busybox `ip -6` output unchecked; own-address local delivery of fe80 on the NIC stack, scope id in recvfrom/accept sockaddrs yet: design-ipv6 L4+). L8 (v6 on veth/bridge/tap in any netns) done; bridge6 (netns<->netns and netns<->bridge address ping6/TCP) and v6 default/gateway routes inside a netns done (ip6br); L9 phase 1 done (ip6pod: rootful podman bridge NAT66 outbound, TCP/UDP/ICMPv6 echo, v6 conntrack + NDP cache, nft ip6 masquerade; box podbridge v6 ping/dns/tcp green); L9 phase 2 DNAT66 done (-p publish over v6: [::1], NIC address, container-to-host; podbridge publish_lo/_nicip/_ctr green). Still open on L9: ICMPv6 errors for forwarded flows (podman_v6_time_exceeded is KNOWN-OPEN in podbridgetest: Time Exceeded is not delivered, unknown whether fwd6::divert reaches time_exceeded at fwd6.rs:139 or the container traceroute6 path is at fault; port-unreachable translation untested), rootless pasta v6 (podpastatest v6 checks written, never run), aardvark-dns fails at --rm teardown on DNS-enabled custom networks (podbridgetest uses --disable-dns); tun6 IFF_TUN 0x86DD + NS proxy, DAD.
 - **UDP/IP gaps**: no PMTUD (IP_MTU_DISCOVER/IP_MTU, DF on Frag-Needed), no IGMPv3/SSM. (IP fragmentation/reassembly works: udptest `udp_huge` + peer_frag_echo guard it.)
 - **iwlwifi gaps** (lane iwlgaps 2026-11-11: WMM later-beacon updates, STATISTICS_NOTIFICATION and antenna comparison were already implemented; sparse ping loss 0/300 on LeandrOS vs 4/300 on Linux, same AP; 2.4 GHz is channel noise): still open: TX MIMO/STBC/SGI on 5 GHz unmeasured (the saved 5 GHz profile/passphrase is not on the stick; add the profile and A/B `iwlwifi.rscol`/`txmimo`).
 - **smoltcp "handle does not refer to a valid socket" panic recurred** (net server, during `podman pull`, box x86_64 on lane/ip6dnat 2026-11-14) despite the smolpanic generation-handle fix (artifacts/notes/lane-smolpanic-2026-11-10.md): some path still calls a panicking SocketSet get/get_mut; not yet known whether it is on main or only in the new fwd6 code.
-- **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
 - **Podman published ports**: rootful bridge `-p` works through netavark `firewall_driver = "nftables"` (lane podnft, podbridgetest); open: filter chains only on new flows, no routed forwarding without NAT, rootful `--network=pasta` is rejected by podman itself, `--internal` is the forwarding=0 switch only.
 - **Podman published ports, NIC learn-miss parking**: NIC-side learn-miss parking needs hostfwd (L3). (First-connect latency FIXED lane synlat: the hairpin ARP request was queued without a kick and waited ~450 ms for the next net tick; now 0 ms, brtest gates < 100 ms.)
 - **Unmarked cross-network DNAT (capture g_two_nets_b) unverified**: hair() `!= Masq => return false` should DNAT and route un-NATed (src kept); needs a Ct flag + reverse match.
-- **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
 
 ### Desktop / GPU / COSMIC
 - **Venus/Vulkan**: cross-open dmabuf import LANDED (51d92486, venustest phase 5b 11/11 on x86_64 KVM + aarch64 TCG, box 2026-11-13), aarch64 vkwl measured 2026-08-07 (`artifacts/notes/m9-vkwl-aarch64/`); Mac QEMU has no virtio-gpu-gl so Venus is box-only; venustest `virtgpu_wait_nowait_busy_after_kick` + `phase7_fence_fd_unsignalled_at_return` are SKIP (not fail) on aarch64 TCG: NOWAIT never sees a pending fence even behind a 64-submission burst, i.e. fence retires before the ioctl chain returns (measured box 2026-11-13, lane/venuswait; an in-fence cannot make it pending, it only blocks the kick); x86 KVM still asserts them; Venus submit still synchronous (parks on fence IRQ, no async completion).
 - **i915** (cursors to 256x256, async flips, hardware WAIT_VBLANK and IN_FENCE_FD landed in lane/i915feat): `WAIT_VBLANK` polls PIPE_FRMCOUNT every 500 us, not IRQ-driven; `DRM_VBLANK_EVENT`/`SIGNAL` return EINVAL; `IN_FENCE_FD` is a CPU wait before the commit, so a NONBLOCK commit blocks on an unsignalled in-fence; wide cursors use the capped plane-1A watermark (no own skl_compute_wm); async flips need the on-screen fb's pitch/size.
-- **Laptop**: low FPS under COSMIC; Firefox on iris unproven; Wi-Fi link still weak on 2.4 GHz.
+- **Laptop**: Wi-Fi link still weak on 2.4 GHz. Firefox canvas-2D (CPU raster) runs ~5 FPS for a 1500-gradient-arc + 40-text-line page at 1900x1000 with one content thread at 100% user time; AVX (now enabled) did not change it; no Linux reference was possible (no Firefox on the EndeavourOS install), so whether this is slow is unknown. GPU-bound paths are fine (WebGL 60 FPS, 1080p heavy shader 35 FPS at 100% render-engine busy).
 - **Minimize applet un-hide unverified** (needs a live session with an open window; applet is a 1x1 hidden surface with zero toplevels by upstream design). `cosmic-files-applet` smithay-clipboard OOM panic: no root cause, needs an in-guest repro with RUST_BACKTRACE (triage 2026-11-13: not reproduced, no runtime log kept). `cosmic-notifications` panel-dbus Broken pipe: the p2p zbus socketpair made in `NotificationsSocket::get_fd` (src/subscriptions/applet.rs) breaks when the applet end closes (applet restart / panel respawn); likely benign upstream behaviour, unverified. Greeter's cosmic-comp logs `eglMakeCurrent BadDisplay` on exit (cosmetic, teardown order).
 - **Panel-embedded applets render with tiny-skia** (root cause: cosmic-panel creates zwp_linux_dmabuf_v1 only if its GLES renderer exists at bind_display(); ours comes ~0.3 s later; measured 2026-11-13 aarch64: comp->panel start 0.42 s, no kernel DRM step visible in that window (handoff/klogms.md); needs a cosmic-panel source change, out of bounds - not a kernel bug); aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp. (`EVIOCGRAB` exclusivity, `EVIOCREVOKE` and the Ctrl+Alt+Esc escape hatch are implemented and covered by `vttest`; see artifacts/notes/lane-evdevvt-2026-11-13.md.)
-- **One permanent COSMIC patch** (`ports/cosmic-comp/0001-toplevel-info-weak-window.patch`) until upstream has an equivalent (checked 2026-11-13: pop-os/cosmic-comp#2084 and Smithay#1562 still OPEN, PR #2095 closed unmerged - patch stays).
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
-- **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
-
-### Build / tooling
-- **build-all silently reuses stale container-built ports when Docker is not running** (PipeWire shipped an old sink, lane smallfix 2026-11-11); same class as the buildguard guards: should fail loudly.
-- **A port build failure only warns** (busd link failure → stale busd → misleading staleness error on the box, lane boxbuild); make per-port build failures fatal.
-- **`ports/gstreamer/build.sh` still references the deleted `ports/firefox/build.sh`** (fixed for pipewire in lane smallfix).
 
 ## Missing features
 
 ### Kernel
-- inotify L2/L3 (beyond the default-on L1).
-- **Interrupt paths**: virtio keyboard/blk/net/snd and the aarch64 GPU control queue are still polled (INTx via GIC SPI is the aarch64 step).
-- **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
-- **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
+- inotify: no (dev, ino) identity yet (watches are path-keyed): no self events through a second hard link; fanotify absent.
+- **Interrupt paths**: virtio-input, virtio-net and the virtio-gpu control queue (MSI-X on x86_64, shared INTx SPI on aarch64) are interrupt-driven already. Still polled: virtio-blk (`wait_for_completion` busy-waits the used ring; callers include page faults with IRQs masked, so an IRQ/sleep path needs a masked-context fallback) and virtio-snd TX (reaped by the 100 Hz tick pump, which must run anyway to keep QEMU's stream queue non-empty, so an IRQ gains little).
+- **Synthetic sysfs**: `/sys/class/drm`, `/sys/class/input/event{0,1}` and the `/sys/dev/char` node files are staged on disk (static); hot-plugged evdev nodes (event2+) have no `/sys/class/input` entry (the libudev shim learns them from `/dev/input/hotplug`), and `capabilities/*` for event0/1 are fixed approximations. Everything else outside `/sys/class/block` stays disk-staged.
+- **utmpx gaps**: no `w`/`users` consumer (Alpine busybox has neither); `/var/log/lastlog` is written but has no reader (busybox `lastlog` absent); su/sudo sessions are not recorded; concurrent writers rely on flock only.
 - **Replace the C `libpam.so.0` shim** with a Rust cdylib or Linux-PAM (decision open; guard must show wrong passwords rejected).
 - **VT console**: TAB advance and double-width glyphs.
-- **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups, utmp/lastlog; password hashes are single-pass salted SHA-256.
+- **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups; password hashes are single-pass salted SHA-256.
 
 ### Network / Wi-Fi
 - **iwlwifi**: 40 MHz on 2.4 GHz, finer rate control.
@@ -67,11 +55,13 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **A permanent Vulkan-Wayland test** (needs a dynamic-musl build shape).
 - **VRR** (`VRR_ENABLED` DRM property).
 - **Mesa v3d / Pi 5 acceleration** wiring (`GET_PARAM`+`CREATE_BO` first; single-device design).
-- **XWayland, accountsservice, hotplug, multi-seat** are explicitly out of scope.
 
 ### Firefox
-- **Firefox on the laptop iris GPU**; x86 KVM audio verification (?).
+- x86 KVM audio verification (?).
 - **Sandbox follow-ups**: secirq, zaplog, credxlate residuals (`lane-secirq/zaplog/credxlate-2026-11-09.md`).
+
+### Cloud
+- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (image boots in QEMU as an NVMe-only UEFI disk, `--dry-run` tested; docs/hardware/aws-ec2.md). Still needed: an ENA (Elastic Network Adapter) network driver, EBS NVMe quirks (no legacy INTx: MSI-X), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
 
 ### Installer
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
@@ -80,4 +70,14 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **zig to clang** migration (est. 2-4 days, not started).
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
-- /proc/mounts doesn't print ro for ns-0 mounts; ns-0 dirfd flags recorded at open go stale after a later remount
+
+## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
+
+- **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
+- **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
+- **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.
+- **Laptop SSH came up late on two 2026-10 boots** (not reproduced in ten later boots; watch).
+- **r8169 RX stalls/chip resets on the PC**: ISR-mask fix needs PC confirmation (R8169 as a loadable module also deferred).
+- **One permanent COSMIC patch** (`ports/cosmic-comp/0001-toplevel-info-weak-window.patch`) until upstream has an equivalent (checked 2026-11-13: pop-os/cosmic-comp#2084 and Smithay#1562 still OPEN, PR #2095 closed unmerged - patch stays).
+- **Real-PC (RTX 3070) verification deferred ~1 month** (user, 2026-10-24).
+- **XWayland, accountsservice, hotplug, multi-seat** are explicitly out of scope.

@@ -72,8 +72,23 @@ fi
 # old sources, and the staged binary was byte-identical to the pre-patch one.
 # Re-extraction costs a couple of seconds against a cached .crate; a silently
 # unapplied patch cost a whole session.
-rm -rf "$SRC"
-tar -C "$WORK" -xzf "$WORK/busd-$VERSION.crate"
+# Idempotent and race-free: a concurrent busd build in the same checkout (or a
+# seeded .work clone taken mid-patch) used to patch a half-patched tree and fail
+# with rejected hunks. Serialise on a lock dir, always extract into a fresh
+# private dir, patch there, and only then swap it into place.
+LOCK="$WORK/.build.lock"
+for _i in $(seq 1 600); do
+  mkdir "$LOCK" 2>/dev/null && break
+  # steal the lock when its owner is gone
+  if [ -f "$LOCK/pid" ] && ! kill -0 "$(cat "$LOCK/pid")" 2>/dev/null; then rm -rf "$LOCK"; continue; fi
+  sleep 1
+done
+[ -d "$LOCK" ] || { echo "busd: cannot take $LOCK" >&2; exit 1; }
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK" "$SRC.new"' EXIT
+rm -rf "$SRC.new"
+mkdir -p "$SRC.new"
+tar -C "$SRC.new" -xzf "$WORK/busd-$VERSION.crate"
 # Applied in name order, and the order is load-bearing:
 # start-service-activation.patch extends the `send_msg` that
 # service-unknown-reply.patch introduces, so "st" must sort after "se". It does,
@@ -81,8 +96,11 @@ tar -C "$WORK" -xzf "$WORK/busd-$VERSION.crate"
 # the explicit echo of what was applied.
 for p in "$HERE"/*.patch; do
   echo "applying $(basename "$p")"
-  patch -p1 -d "$SRC" < "$p"
+  patch -p1 --batch -d "$SRC.new/busd-$VERSION" < "$p" || { echo "busd: $(basename "$p") FAILED on a pristine tree" >&2; exit 1; }
 done
+rm -rf "$SRC"
+mv "$SRC.new/busd-$VERSION" "$SRC"
+rmdir "$SRC.new"
 # ports/ lives inside the repo, and the repo root is a cargo workspace that
 # does not list this tree as a member. Cargo refuses to build a package that
 # "believes it's in a workspace when it's not" rather than ignoring the outer

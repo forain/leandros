@@ -309,6 +309,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if !test_sigsys_siginfo_signo() { failures += 1; }
     if !test_signal_delivery_and_return() { failures += 1; }
     if !test_handler_preserves_vector_regs() { failures += 1; }
+    #[cfg(target_arch = "x86_64")]
+    { if !test_avx_enabled() { failures += 1; } if !test_avx_signal_and_switch() { failures += 1; } }
     if !test_two_signals_distinct_handlers() { failures += 1; }
     if !test_sigprocmask_blocks_and_defers() { failures += 1; }
     if !test_sig_ign_default_disposition() { failures += 1; }
@@ -462,6 +464,83 @@ extern "C" fn vreg_clobber_handler(_sig: c_int) {
             out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
         );
     }
+}
+
+// ── 2c. AVX (x86-64): the OS must enable YMM state when the CPU has it, and the
+// upper 128 bits must survive signal delivery and preemptive switches.
+#[cfg(target_arch = "x86_64")]
+fn cpu_has_avx() -> bool {
+    unsafe { core::arch::x86_64::__cpuid(1).ecx & (1 << 28) != 0 }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_avx_enabled() -> bool {
+    let name = b"avx_enabled_when_cpu_has_it\0";
+    if !cpu_has_avx() { puts(b"  (no AVX on this CPU: skipped)\0".as_ptr()); return report(name, true); }
+    let ecx = core::arch::x86_64::__cpuid(1).ecx;
+    if ecx & (1 << 27) == 0 { puts(b"  CPUID OSXSAVE clear: AVX not enabled\0".as_ptr()); return report(name, false); }
+    let (lo, hi): (u32, u32);
+    core::arch::asm!("xgetbv", in("ecx") 0u32, out("eax") lo, out("edx") hi, options(nomem, nostack));
+    let _ = hi;
+    report(name, lo & 7 == 7)
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn avx_clobber_handler(_sig: c_int) {
+    VREG_HANDLER_RAN.fetch_add(1, Ordering::SeqCst);
+    unsafe { core::arch::asm!("vpcmpeqd ymm0, ymm0, ymm0", "vpcmpeqd ymm15, ymm15, ymm15", out("xmm0") _, out("xmm15") _); }
+}
+
+/// Spin with `pat` live in ymm0/ymm15 (so ticks preempt it), then read back.
+#[cfg(target_arch = "x86_64")]
+unsafe fn avx_spin(pat: &[u8; 64], out: &mut [u8; 64], iters: u64, kill_pid: usize) {
+    core::arch::asm!(
+        "vmovdqu ymm0, [{p}]", "vmovdqu ymm15, [{p} + 32]",
+        "test {k}, {k}", "jz 2f",
+        "mov eax, 62", "mov rdi, {k}", "mov esi, 10", "syscall",
+        "2:",
+        "3:", "dec {n}", "jnz 3b",
+        "vmovdqu [{o}], ymm0", "vmovdqu [{o} + 32], ymm15",
+        p = in(reg) pat.as_ptr(), o = in(reg) out.as_mut_ptr(), n = inout(reg) iters => _, k = in(reg) kill_pid,
+        out("rax") _, out("rcx") _, out("r11") _, out("rdi") _, out("rsi") _, out("xmm0") _, out("xmm15") _,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn test_avx_signal_and_switch() -> bool {
+    let name = b"avx_upper_halves_survive_signal_and_switch\0";
+    if !cpu_has_avx() { return report(name, true); }
+    let mut pat = [0u8; 64];
+    // 1. signal handler that clobbers all 256 bits
+    VREG_HANDLER_RAN.store(0, Ordering::SeqCst);
+    let act = zeroed_sigaction(Some(avx_clobber_handler));
+    if sigaction(SIGUSR1, &act, core::ptr::null_mut()) != 0 { return report(name, false); }
+    for i in 0..64 { pat[i] = 0x30 + i as u8; }
+    let mut out = [0u8; 64];
+    avx_spin(&pat, &mut out, 1, getpid() as usize);
+    if VREG_HANDLER_RAN.load(Ordering::SeqCst) != 1 || out != pat {
+        puts(b"  ymm changed across signal handler\0".as_ptr());
+        return report(name, false);
+    }
+    // 2. 12 processes spinning with distinct patterns -> preemptive switches
+    let mut pids = [0 as pid_t; 12];
+    for k in 0..12usize {
+        let pid = fork();
+        if pid == 0 {
+            for i in 0..64 { pat[i] = (k as u8).wrapping_mul(16).wrapping_add(i as u8); }
+            avx_spin(&pat, &mut out, 400_000_000, 0);
+            _exit(if out == pat { 0 } else { 1 });
+        }
+        pids[k] = pid;
+    }
+    let mut bad = 0;
+    for k in 0..12 {
+        let mut st: c_int = 0;
+        waitpid(pids[k], &mut st, 0);
+        if st != 0 { bad += 1; }
+    }
+    if bad != 0 { puts(b"  ymm corrupted across context switches\0".as_ptr()); }
+    report(name, bad == 0)
 }
 
 unsafe fn test_handler_preserves_vector_regs() -> bool {
