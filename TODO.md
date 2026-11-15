@@ -53,7 +53,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Network / Wi-Fi
 - **iwlwifi**: 40 MHz on 2.4 GHz, finer rate control.
-- **WPA3 / MFP-required networks** and Wi-Fi roaming polish.
+- **WPA3 on real hardware**: SAE/PMF/roaming exist in the connection manager and are green against `wifisim`, but the Intel (iwlwifi) and brcmf radios do not report `wifi_caps::SAE`/`PMF`/`ROAM` yet (firmware key install for BIP/IGTK, SAE auth frames), and the SAE exchange is unverified against a real WPA3 AP (no WPA3 network was available to the lane).
 
 ### Desktop / apps
 - **xdg-desktop-portal** (screenshot, file chooser), timedate1, SwitcherooControl and the a11y bus D-Bus services.
