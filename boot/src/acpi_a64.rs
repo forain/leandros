@@ -111,8 +111,8 @@ pub fn parse_spcr(t: &[u8]) -> Option<Spcr> {
     let base = u64_at(t, 44);
     if base == 0 { return None; }
     let kind = match iface {
-        0x00 | 0x01 | 0x03 | 0x12 => UartKind::Ns16550,
-        0x04 | 0x05 | 0x0E => UartKind::Pl011,
+        0x00 | 0x01 | 0x12 => UartKind::Ns16550,
+        0x03 | 0x0D | 0x0E => UartKind::Pl011,
         _ => return None,
     };
     let access_bytes = match access { 1 => 1, 2 => 2, 3 => 4, _ => if bit_width >= 32 { 4 } else { 1 } };

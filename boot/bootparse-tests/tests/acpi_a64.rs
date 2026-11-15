@@ -56,11 +56,11 @@ fn spcr(iface: u8, access: u8, base: u64) -> Vec<u8> {
 
 #[test]
 fn spcr_pl011_and_16550() {
-    let p = parse_spcr(&spcr(0x03, 3, 0x1_0000_0000)).unwrap();
+    let p = parse_spcr(&spcr(0x12, 3, 0x1_0000_0000)).unwrap();
     assert_eq!((p.kind, p.reg_shift, p.access_bytes, p.gsi), (UartKind::Ns16550, 2, 4, 33));
     let b = parse_spcr(&spcr(0x00, 1, 0x2000)).unwrap();
     assert_eq!((b.kind, b.reg_shift, b.access_bytes), (UartKind::Ns16550, 0, 1));
-    let q = parse_spcr(&spcr(0x04, 0, 0x0900_0000)).unwrap();
+    let q = parse_spcr(&spcr(0x03, 0, 0x0900_0000)).unwrap();
     assert_eq!((q.kind, q.base, q.baud_code), (UartKind::Pl011, 0x0900_0000, 7));
     assert!(parse_spcr(&spcr(0x7F, 1, 0x1000)).is_none());
     assert!(parse_spcr(&spcr(0x00, 1, 0)).is_none());
