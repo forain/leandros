@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #include <sched.h>
 #include <sys/inotify.h>
+#include <sys/fanotify.h>
 #include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -885,6 +886,209 @@ static void t_cross_bind(void)
     umount(d);
 }
 
+/* ---- (dev, ino) identity: events reach a watch through any hard link ---- */
+static void t_hl_self(void)
+{
+    touch("hl_a");
+    char a[128], b[128]; path(a, "hl_a"); path(b, "hl_b"); link(a, b);
+    int ifd = inotify_init1(IN_NONBLOCK);
+    uint32_t m = IN_ATTRIB | IN_MODIFY | IN_OPEN | IN_CLOSE_WRITE;
+    int w1 = watch(ifd, "hl_b", m), w2 = watch(ifd, "hl_a", m);
+    chmod(a, 0600);
+    wr("hl_a", "x");
+    struct got g[8]; int n = drain(ifd, g, 8);
+    report("t_hl_self", w1 > 0 && w1 == w2 && n == 4 && g[0].mask == IN_ATTRIB && g[1].mask == IN_OPEN
+           && g[2].mask == IN_MODIFY && g[3].mask == IN_CLOSE_WRITE);
+    close(ifd);
+}
+
+static void t_hl_unlink_one(void)
+{
+    touch("hu_a");
+    char a[128], b[128]; path(a, "hu_a"); path(b, "hu_b"); link(a, b);
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "hu_a", IN_ATTRIB | IN_DELETE_SELF);
+    unlink(a);
+    struct got g[8]; int n0 = drain(ifd, g, 8);
+    int ok0 = n0 == 1 && g[0].mask == IN_ATTRIB;
+    chmod(b, 0600);
+    int n1 = drain(ifd, g, 8);
+    int ok1 = n1 == 1 && g[0].mask == IN_ATTRIB;
+    unlink(b);
+    int n2 = drain(ifd, g, 8);
+    report("t_hl_unlink_one", ok0 && ok1 && n2 == 3 && g[0].mask == IN_ATTRIB && g[1].mask == IN_DELETE_SELF
+           && g[2].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_hl_link_after_watch(void)
+{
+    touch("hw_a");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "hw_a", IN_ATTRIB | IN_MODIFY);
+    char a[128], b[128]; path(a, "hw_a"); path(b, "hw_b"); link(a, b);
+    struct got g[8]; int n0 = drain(ifd, g, 8);
+    wr("hw_b", "y");
+    int n1 = drain(ifd, g, 8);
+    report("t_hl_link_after_watch", n0 == 1 && g[0].mask == IN_ATTRIB && n1 == 1 && g[0].mask == IN_MODIFY);
+    close(ifd);
+}
+
+/* ---- fanotify ---- */
+struct fev { uint64_t mask; int fd; int pid; unsigned char vers; unsigned len; char link[160]; };
+
+static int fan_drain(int ffd, struct fev *g, int max)
+{
+    char buf[4096]; int k = 0;
+    ssize_t n = read(ffd, buf, sizeof buf), off = 0;
+    while (n > 0 && off + (ssize_t)sizeof(struct fanotify_event_metadata) <= n && k < max) {
+        struct fanotify_event_metadata *m = (void *)(buf + off);
+        g[k].mask = m->mask; g[k].fd = m->fd; g[k].pid = m->pid; g[k].vers = m->vers; g[k].len = m->event_len;
+        g[k].link[0] = 0;
+        if (m->fd >= 0) {
+            char l[64]; snprintf(l, sizeof l, "/proc/self/fd/%d", m->fd);
+            ssize_t r = readlink(l, g[k].link, sizeof g[k].link - 1);
+            g[k].link[r > 0 ? r : 0] = 0;
+        }
+        off += m->event_len; k++;
+    }
+    return k;
+}
+static void fan_closeall(struct fev *g, int n) { for (int i = 0; i < n; i++) if (g[i].fd >= 0) close(g[i].fd); }
+static int ends_with(const char *s, const char *suf)
+{
+    size_t a = strlen(s), b = strlen(suf);
+    return a >= b && !strcmp(s + a - b, suf);
+}
+static int fan_new(void) { return fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY); }
+#define FANALL (FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE)
+
+static void t_fan_basic(void)
+{
+    touch("fb");
+    char p[128]; path(p, "fb");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FANALL, AT_FDCWD, p);
+    int fd = open(p, O_RDWR); char c;
+    if (fd >= 0) { if (write(fd, "x", 1)) {} lseek(fd, 0, SEEK_SET); if (read(fd, &c, 1)) {} close(fd); }
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int ok = mr == 0 && n == 4 && g[0].mask == FAN_OPEN && g[1].mask == FAN_MODIFY && g[2].mask == FAN_ACCESS
+          && g[3].mask == FAN_CLOSE_WRITE;
+    for (int i = 0; ok && i < n; i++)
+        ok = g[i].pid == getpid() && g[i].fd >= 0 && g[i].vers == FANOTIFY_METADATA_VERSION
+          && g[i].len == sizeof(struct fanotify_event_metadata) && ends_with(g[i].link, "/fb");
+    fan_closeall(g, n);
+    int n2 = ffd < 0 ? -1 : fan_drain(ffd, g, 8);   /* closing event fds must not recurse */
+    fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
+    int n3 = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    ok = ok && n2 <= 0 && n3 == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_CLOSE_NOWRITE;
+    fan_closeall(g, n3);
+    report("t_fan_basic", ok);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_mount(void)
+{
+    mkd("x"); touch("x/mf0");
+    char d[128]; path(d, "x");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, d);
+    wr("x/mf0", "z");
+    struct fev g[32]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 32);
+    int op = 0, cw = 0;
+    for (int i = 0; i < n; i++) {
+        if (!ends_with(g[i].link, "/x/mf0")) continue;
+        if (g[i].mask & FAN_OPEN) op++;
+        if (g[i].mask & FAN_CLOSE_WRITE) cw++;
+    }
+    fan_closeall(g, n);
+    report("t_fan_mount", mr == 0 && op >= 1 && cw >= 1);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_child(void)
+{
+    mkd("fc");
+    char d[128]; path(d, "fc");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN | FAN_CLOSE_WRITE | FAN_EVENT_ON_CHILD, AT_FDCWD, d);
+    touch("fc/cf");
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int ok = mr == 0 && n == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_CLOSE_WRITE
+          && ends_with(g[0].link, "/fc/cf");
+    fan_closeall(g, n);
+    report("t_fan_child", ok);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_remove_flush(void)
+{
+    touch("fr");
+    char p[128]; path(p, "fr");
+    int ffd = fan_new();
+    int a = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p);
+    int r = fanotify_mark(ffd, FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p);
+    int fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
+    struct fev g[4]; int n0 = fan_drain(ffd, g, 4);
+    int r2 = fanotify_mark(ffd, FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p);
+    int e2 = errno;
+    int a2 = fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p);
+    int f = fanotify_mark(ffd, FAN_MARK_FLUSH, 0, AT_FDCWD, NULL);
+    fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
+    int n1 = fan_drain(ffd, g, 4);
+    report("t_fan_remove_flush", a == 0 && r == 0 && n0 <= 0 && r2 == -1 && e2 == ENOENT && a2 == 0 && f == 0 && n1 <= 0);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_einval(void)
+{
+    touch("fe");
+    char p[128]; path(p, "fe");
+    int ffd = fan_new(), ok = ffd >= 0;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD, 0, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, "/nonexistent/fe") == -1 && errno == ENOENT;
+    ok = ok && fanotify_mark(9999, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p) == -1 && errno == EBADF;
+    int ifd = inotify_init1(0);
+    ok = ok && fanotify_mark(ifd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_init(0x40000000, O_RDONLY) == -1 && errno == EINVAL;
+    report("t_fan_einval", ok);
+    close(ifd); if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_eperm(void)
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(2);
+        int r = fanotify_init(FAN_CLASS_NOTIF, O_RDONLY);
+        _exit(r == -1 && errno == EPERM ? 0 : 1);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    report("t_fan_eperm", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+static void t_fan_hardlink(void)
+{
+    touch("fh_a");
+    char a[128], b[128]; path(a, "fh_a"); path(b, "fh_b"); link(a, b);
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN | FAN_MODIFY, AT_FDCWD, b);
+    wr("fh_a", "q");
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    fan_closeall(g, n);
+    report("t_fan_hardlink", mr == 0 && n == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_MODIFY);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_hl_cases(void)
+{
+    t_hl_self(); t_hl_unlink_one(); t_hl_link_after_watch();
+    t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
+    t_fan_hardlink();
+}
+
 static void l2_l3_cases(void)
 {
     t_create(); t_delete(); t_move_pair(); t_moved_to(); t_silent_unrelated();
@@ -893,6 +1097,7 @@ static void l2_l3_cases(void)
     t_modify_file(); t_modify_in_dir(); t_modify_trunc(); t_close_write(); t_close_dup();
     t_attrib_chmod(); t_access(); t_coalesce(); t_unlink_open(); t_unlink_self(); t_rename_over();
     t_umount(); t_cross_bind();
+    t_hl_cases();
 }
 
 static void run_on(const char *dir, const char *tag)
