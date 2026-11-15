@@ -2562,6 +2562,24 @@ static int t_scm_cred_unmapped(void)
 }
 
 /* Unprivileged: only its own credentials may be claimed. */
+/* An accepted socket inherits SO_PASSCRED from its listener (Linux unix_sock_inherit_flags). */
+static int t_scm_cred_accept_inherit(void)
+{
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    memcpy(a.sun_path + 1, "nst-pcinh", 9);
+    socklen_t al = offsetof(struct sockaddr_un, sun_path) + 1 + 9;
+    int l = socket(AF_UNIX, SOCK_STREAM, 0), c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(l >= 0 && c >= 0 && set_passcred(l) == 0);
+    CHECK(bind(l, (struct sockaddr *)&a, al) == 0 && listen(l, 1) == 0);
+    CHECK(connect(c, (struct sockaddr *)&a, al) == 0);
+    int s = accept(l, 0, 0); CHECK(s >= 0);
+    struct ucred u;
+    CHECK(cred_send(c, 0) == 0 && cred_recv(s, &u) == 0);
+    CHECK(u.pid == getpid());
+    close(s); close(c); close(l);
+    return 0;
+}
+
 static int t_scm_cred_forge(void)
 {
     int sp[2];
@@ -3208,7 +3226,7 @@ static int run_userns_cases(void)
         { "setns_ioctl", t_setns_ioctl }, { "setns_pidfd", t_setns_pidfd }, { "setns_fd_holds", t_setns_fd_holds }, { "setns_uts", t_setns_uts },
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
-        { "scm_cred_forge", t_scm_cred_forge }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
