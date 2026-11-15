@@ -550,7 +550,12 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
             if !ready_within(last, 0) { pending_seen += 1; }
             let (rc, _, f2) = exec(fd, VIRTGPU_EXECBUF_FENCE_FD_IN | VIRTGPU_EXECBUF_FENCE_FD_OUT,
                                    &NOP, 0, last, &[], &[]);
-            if rc != 0 || !ready_within(last, 0) { violations += 1; }
+            let rdy = ready_within(last, 0);
+            if rc != 0 || !rdy {
+                violations += 1;
+                dec(b"  violation: submit rc+1=", (rc + 1) as u64);
+                dec(b"  in-fence ready after submit=", rdy as u64);
+            }
             if rc == 0 && f2 >= 0 { ready_within(f2, 2000); close(f2); }
             close(last);
         }
@@ -602,6 +607,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
             let t0 = now_ns();
             let (rc, _, ffd) = exec(vfd, VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
                                     &junk, 0, 0, &[], &[]);
+            dec(b"  junk submit rc+1=", (rc + 1) as u64);
             let sig = rc == 0 && ffd >= 0 && ready_within(ffd, 5000);
             let dt_ms = (now_ns() - t0) / 1_000_000;
             if ffd >= 0 { close(ffd); }
