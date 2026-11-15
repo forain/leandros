@@ -165,9 +165,22 @@ static RW_FORCED_RO: AtomicBool = AtomicBool::new(false);
 /// `nvme.io_timeout=<seconds>`: I/O command timeout override (0 = default).
 static IO_TIMEOUT_S: AtomicU64 = AtomicU64::new(0);
 
+/// `nvme.msix=1`: give the I/O completion queue an MSI-X vector (aarch64 ITS /
+/// x86_64 MSI). Completion stays polled; the vector only counts deliveries
+/// (`/proc/interrupts`), so a lost or misrouted interrupt cannot hang I/O.
+static MSIX_ON: AtomicBool = AtomicBool::new(false);
+/// Interrupts the I/O CQ vector delivered, all controllers.
+static MSIX_IRQS: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn nvme_msix_irq(_ctx: usize) -> crate::irq::IrqReturn {
+    MSIX_IRQS.fetch_add(1, Ordering::Relaxed);
+    crate::irq::IrqReturn::Handled
+}
+
 fn parse_cmdline(cmdline: &str) {
     for tok in cmdline.split_ascii_whitespace() {
         match tok {
+            "nvme.msix=1" => MSIX_ON.store(true, Ordering::Relaxed),
             "nvme.rw=1" => RW.store(true, Ordering::Relaxed),
             "nvme.rw=0" => { RW.store(false, Ordering::Relaxed); RW_FORCED_RO.store(true, Ordering::Relaxed) }
             "nvme.quirks=amzn" => QUIRK_AMZN.store(true, Ordering::Relaxed),
@@ -1108,8 +1121,23 @@ fn probe(dev: &PciDevice, index: usize) {
         None => { nlog!("nvme{}: out of memory for the I/O queue; skipped", index); disable(&st, to_ms); return; }
     };
     let qsz = ((io_depth as u32 - 1) << 16) | 1;
-    // CQ: physically contiguous, interrupts disabled (IEN = 0).
-    if let Err(e) = st.admin(Cmd::new(ADM_CREATE_CQ, 0).prp(ioq.cq_phys as u64, 0).dw(10, qsz).dw(11, 1)) {
+    // MSI-X vector 0 for the I/O CQ when asked for (`nvme.msix=1`) and the
+    // platform can deliver MSI; otherwise interrupts stay disabled (IEN = 0).
+    let mut cq_dw11 = 1u32;
+    if MSIX_ON.load(Ordering::Relaxed) && crate::irq::msi_supported() {
+        match crate::irq::MsixTable::enable(f) {
+            Ok(tab) => match tab.request(0, nvme_msix_irq, index as usize) {
+                Ok(_h) => {
+                    cq_dw11 = 3; // PC | IEN, IV 0
+                    nlog!("nvme{}: I/O CQ interrupt vector 0 (MSI-X); completion still polled", index);
+                }
+                Err(e) => { nlog!("nvme{}: MSI-X vector refused ({:?}); polled", index, e); tab.disable(); }
+            },
+            Err(e) => nlog!("nvme{}: MSI-X unavailable ({:?}); polled", index, e),
+        }
+    }
+    // CQ: physically contiguous.
+    if let Err(e) = st.admin(Cmd::new(ADM_CREATE_CQ, 0).prp(ioq.cq_phys as u64, 0).dw(10, qsz).dw(11, cq_dw11)) {
         nlog!("nvme{}: Create I/O CQ failed: {}; skipped", index, e);
         disable(&st, to_ms);
         return;
