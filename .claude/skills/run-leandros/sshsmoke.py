@@ -841,10 +841,9 @@ def sshdcfg(ssh, user, pw, tmp):
 
 
 PS_SSHD = r"""for p in /proc/[0-9]*; do
-n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null)
-pp=$(sed -n 's/^PPid:[[:space:]]*//p' $p/status 2>/dev/null)
+read k n < $p/status
 m=${n#sshd}
-if [ x$m != x$n ]; then echo ${p#/proc/} $pp $n; fi
+if [ x$m != x$n ]; then pp=$(grep PPid $p/status); echo ${p#/proc/} $pp $n; fi
 done"""
 
 
@@ -854,11 +853,11 @@ def sshd_procs(ssh, user, pw):
     rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
     res = []
     if not out.strip():
-        print(f"sshd_procs: empty listing rc={rc} err={err.strip()[-200:]!r}", flush=True)
+        print(f"sshd_procs: empty listing rc={rc} out={out[-200:]!r} err={err.strip()[-200:]!r}", flush=True)
     for ln in out.splitlines():
         p = ln.split()
-        if len(p) == 3 and p[0].isdigit() and p[1].isdigit():
-            res.append((int(p[0]), int(p[1]), p[2]))
+        if len(p) == 4 and p[1] == "PPid:" and p[0].isdigit() and p[2].isdigit():
+            res.append((int(p[0]), int(p[2]), p[3]))
     return res
 
 
