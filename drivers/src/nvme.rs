@@ -142,6 +142,13 @@ const ADMIN_TIMEOUT_NS: u64 = 10_000_000_000;
 const IO_TIMEOUT_NS: u64 = 30_000_000_000;
 /// Controller resets one command may trigger before the controller is dead.
 const MAX_RESETS: u32 = 3;
+/// EBS volumes can stall an I/O for minutes; AWS recommends an effectively
+/// infinite `nvme_core.io_timeout`. A stall is logged at `IO_WARN_NS` and the
+/// controller reset only after this long (or at once on CSTS.CFS).
+const AMZN_IO_TIMEOUT_NS: u64 = 300_000_000_000;
+const IO_WARN_NS: u64 = 30_000_000_000;
+/// Linux `NVME_QUIRK_DMA_ADDRESS_BITS_48` for the Amazon controllers.
+const AMZN_DMA_LIMIT: u64 = 1 << 48;
 const MAX_CTRLS: usize = 8;
 
 // ── Command line ─────────────────────────────────────────────────────────────
@@ -150,12 +157,23 @@ static RW: AtomicBool = AtomicBool::new(false);
 static APST_KEEP: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_ON: AtomicBool = AtomicBool::new(true);
 static DISABLED: AtomicBool = AtomicBool::new(false);
+/// `nvme.quirks=amzn`: apply the Amazon quirks to every controller (QEMU
+/// test hook; real Amazon controllers are recognised by PCI id).
+static QUIRK_AMZN: AtomicBool = AtomicBool::new(false);
+/// `nvme.rw=0` was given explicitly: keeps even an Amazon root disk read-only.
+static RW_FORCED_RO: AtomicBool = AtomicBool::new(false);
+/// `nvme.io_timeout=<seconds>`: I/O command timeout override (0 = default).
+static IO_TIMEOUT_S: AtomicU64 = AtomicU64::new(0);
 
 fn parse_cmdline(cmdline: &str) {
     for tok in cmdline.split_ascii_whitespace() {
         match tok {
             "nvme.rw=1" => RW.store(true, Ordering::Relaxed),
-            "nvme.rw=0" => RW.store(false, Ordering::Relaxed),
+            "nvme.rw=0" => { RW.store(false, Ordering::Relaxed); RW_FORCED_RO.store(true, Ordering::Relaxed) }
+            "nvme.quirks=amzn" => QUIRK_AMZN.store(true, Ordering::Relaxed),
+            t if t.starts_with("nvme.io_timeout=") => {
+                if let Ok(v) = t[16..].parse::<u64>() { IO_TIMEOUT_S.store(v, Ordering::Relaxed); }
+            }
             // `blk.rw=` makes the controller writable; the block registry then
             // confines writes to the listed partitions (see blkdev::policy_ro).
             t if t.starts_with("blk.rw=") && t.len() > 7 => RW.store(true, Ordering::Relaxed),
@@ -307,6 +325,7 @@ impl Queue {
         let w = IoWindow::new();
         let t0 = sched::monotonic_ns();
         let mut spins = 0u32;
+        let mut warned = false;
         loop {
             let e = unsafe { self.cq.add(self.cq_head as usize * 4) };
             let dw3 = unsafe { e.add(3).read_volatile() };
@@ -335,6 +354,11 @@ impl Queue {
             }
             let now = sched::monotonic_ns();
             let waited = now.saturating_sub(t0);
+            if !warned && timeout_ns > IO_WARN_NS && waited > IO_WARN_NS {
+                warned = true;
+                nlog!("command opcode {:#04x} cid {} on queue {} still pending after {} s (reset at {} s)",
+                    cmd.0[0] & 0xFF, cid, self.qid, waited / 1_000_000_000, timeout_ns / 1_000_000_000);
+            }
             if waited > timeout_ns {
                 drop(w);
                 let csts = mmio_rd32(regs + REG_CSTS);
@@ -453,6 +477,62 @@ struct CtrlState {
 
 unsafe impl Send for CtrlState {}
 
+/// Controller identity for by-id links and sysfs (`Identify Controller`).
+#[derive(Clone, Copy)]
+pub struct Ident {
+    pub model: [u8; 40],
+    pub mlen: u8,
+    pub serial: [u8; 20],
+    pub slen: u8,
+    /// Amazon vendor-specific device name (`/dev/xvda`), bytes 3072..3103.
+    pub ebs: [u8; 32],
+    pub elen: u8,
+    pub amzn: bool,
+}
+
+/// True for the PCI ids of Amazon's NVMe controllers (EBS, instance store).
+pub fn is_amazon_id(vendor: u16, device: u16) -> bool {
+    vendor == 0x1d0f && matches!(device, 0x0061 | 0x8061 | 0xcd00 | 0xcd01 | 0xcd02)
+}
+
+fn fill(dst: &mut [u8], src: &str) -> u8 {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src.as_bytes()[..n]);
+    n as u8
+}
+
+/// Identity of NVMe disk `name` (`nvme<C>n<NSID>`) and its namespace id.
+pub fn ident(name: &str) -> Option<(Ident, u32)> {
+    let rest = name.strip_prefix("nvme")?;
+    let (c, n) = rest.split_once('n')?;
+    let (c, n) = (c.parse::<usize>().ok()?, n.parse::<u32>().ok()?);
+    let ctrl = CTRLS.lock().iter().find(|k| k.index == c).copied()?;
+    Some((ctrl.ident, n))
+}
+
+/// Writable-root policy for Amazon controllers: the disk holding the booted
+/// root (`is_boot(disk name)`) is made writable without `nvme.rw=1`, unless
+/// `nvme.rw=0` was given. Other NVMe disks and every non-Amazon controller
+/// (the laptop dual-boot case) keep the read-only default.
+pub fn amazon_root_writable(is_boot: &dyn Fn(&str) -> bool) {
+    if RW_FORCED_RO.load(Ordering::Relaxed) { return; }
+    let ctrls: Vec<&'static Ctrl> = CTRLS.lock().clone();
+    for c in ctrls {
+        if !c.amzn || !c.read_only.load(Ordering::Relaxed) { continue; }
+        let mut n = 1u32;
+        while n <= 64 {
+            let mut name = String::new();
+            let _ = write!(name, "nvme{}n{}", c.index, n);
+            if is_boot(&name) {
+                c.read_only.store(false, Ordering::SeqCst);
+                nlog!("nvme{}: Amazon controller holds the booted root; writes enabled (nvme.rw=0 opts out)", c.index);
+                break;
+            }
+            n += 1;
+        }
+    }
+}
+
 struct Ctrl {
     st: KMutex<CtrlState>,
     index: usize,
@@ -462,6 +542,11 @@ struct Ctrl {
     rtd3e_us: u32,
     timeout_ms: u64,
     vwc: bool,
+    /// Amazon (EBS / instance-store) controller.
+    amzn: bool,
+    /// I/O command timeout before a controller reset.
+    io_timeout_ns: u64,
+    ident: Ident,
     read_only: AtomicBool,
     warned_ro: AtomicBool,
     // Statistics, printed at shutdown.
@@ -651,7 +736,7 @@ impl Ns {
                 .dw(11, (slba >> 32) as u32)
                 .dw(12, nlb - 1);
             let t0 = sched::monotonic_ns();
-            let r = st.exec(true, cmd, IO_TIMEOUT_NS);
+            let r = st.exec(true, cmd, c.io_timeout_ns);
             let ns = sched::monotonic_ns().saturating_sub(t0);
             c.max_ns.fetch_max(ns, Ordering::Relaxed);
             match r {
@@ -707,7 +792,7 @@ impl BlockDevice for Ns {
         let mut st = self.ctrl.st.lock();
         if st.shut_down { return Err(BlkErr::Io); }
         self.ctrl.flushes.fetch_add(1, Ordering::Relaxed);
-        match st.exec(true, Cmd::new(IO_FLUSH, self.nsid), IO_TIMEOUT_NS) {
+        match st.exec(true, Cmd::new(IO_FLUSH, self.nsid), self.ctrl.io_timeout_ns) {
             Ok(_) => Ok(()),
             Err(e) => {
                 drop(st);
@@ -808,6 +893,15 @@ fn probe(dev: &PciDevice, index: usize) {
         return;
     }
 
+    let amzn = is_amazon_id(dev.vendor_id, dev.device_id) || QUIRK_AMZN.load(Ordering::Relaxed);
+    let io_override = IO_TIMEOUT_S.load(Ordering::Relaxed);
+    let io_timeout_ns = if io_override != 0 { io_override * 1_000_000_000 }
+        else if amzn { AMZN_IO_TIMEOUT_NS } else { IO_TIMEOUT_NS };
+    if amzn {
+        nlog!("nvme{}: Amazon quirks: DMA addresses limited to 48 bits, I/O timeout {} s (warn at {} s)",
+            index, io_timeout_ns / 1_000_000_000, IO_WARN_NS / 1_000_000_000);
+    }
+
     // DMA memory: admin queues, scratch page, bounce buffer, PRP list.
     let admin_depth = (ADMIN_QDEPTH as u32).min(mqes) as u16;
     let io_depth = (IO_QDEPTH as u32).min(mqes) as u16;
@@ -823,6 +917,15 @@ fn probe(dev: &PciDevice, index: usize) {
         Some(a) => a,
         None => { nlog!("nvme{}: out of memory for queues; skipped", index); return; }
     };
+    if amzn {
+        let end = |p: usize, n: usize| (p + n) as u64;
+        if end(scratch_phys, page) > AMZN_DMA_LIMIT || end(data_phys, DATA_BYTES) > AMZN_DMA_LIMIT
+            || end(prp_list_phys, page) > AMZN_DMA_LIMIT || admin.sq_phys as u64 >= AMZN_DMA_LIMIT
+            || admin.cq_phys as u64 >= AMZN_DMA_LIMIT {
+            nlog!("nvme{}: DMA buffer above the 48-bit limit of Amazon controllers; skipped", index);
+            return;
+        }
+    }
     // PRP list: pages 1..N of the bounce buffer (page 0 is always PRP1).
     unsafe {
         let l = mm::phys_to_virt(prp_list_phys) as *mut u64;
@@ -1075,6 +1178,14 @@ fn probe(dev: &PciDevice, index: usize) {
     }
 
     let read_only = !writes_allowed();
+    let mut ident = Ident { model: [0; 40], mlen: 0, serial: [0; 20], slen: 0, ebs: [0; 32], elen: 0, amzn };
+    ident.mlen = fill(&mut ident.model, &model);
+    ident.slen = fill(&mut ident.serial, &serial);
+    if amzn {
+        let e = id_str(&idc[3072..3104]);
+        ident.elen = fill(&mut ident.ebs, &e);
+        nlog!("nvme{}: Amazon device name \"{}\", volume \"{}\"", index, id_str(&idc[3072..3104]), serial);
+    }
     let ctrl: &'static Ctrl = Box::leak(Box::new(Ctrl {
         st: KMutex::new(st),
         index,
@@ -1083,6 +1194,9 @@ fn probe(dev: &PciDevice, index: usize) {
         rtd3e_us: rtd3e,
         timeout_ms: to_ms,
         vwc,
+        amzn,
+        io_timeout_ns,
+        ident,
         read_only: AtomicBool::new(read_only),
         warned_ro: AtomicBool::new(false),
         rd_cmds: AtomicU64::new(0),

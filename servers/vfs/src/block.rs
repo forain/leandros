@@ -106,6 +106,20 @@ pub struct DiskOps {
     pub set_ro: fn(usize) -> bool,
 }
 
+/// NVMe controller identity (model / serial strings are already trimmed).
+#[derive(Clone, Copy)]
+pub struct DiskIdent {
+    pub model: [u8; 40],
+    pub mlen: u8,
+    pub serial: [u8; 20],
+    pub slen: u8,
+    /// Amazon vendor-specific device name (`sda1`, `/dev/xvda`).
+    pub ebs: [u8; 32],
+    pub elen: u8,
+    pub amzn: bool,
+    pub nsid: u32,
+}
+
 /// One backend entry as `DiskOps::describe` reports it.
 #[derive(Clone, Copy)]
 pub struct DiskInfo {
@@ -135,6 +149,8 @@ pub struct DiskInfo {
     pub gone: bool,
     /// Boot-firmware device: reachable by explicit path, hidden from listings.
     pub special: bool,
+    /// NVMe controller identity (disks and their partitions).
+    pub ident: Option<DiskIdent>,
 }
 
 static DISK_OPS: core::sync::atomic::AtomicUsize =
@@ -180,6 +196,7 @@ struct BDev {
     ro: bool,
     /// Hidden from /dev and /sys/class/block listings (explicit open still works).
     special: bool,
+    ident: Option<DiskIdent>,
 }
 
 impl BDev {
@@ -197,6 +214,7 @@ impl BDev {
             removable: false,
             ro: false,
             special: false,
+            ident: None,
         }
     }
     fn name(&self) -> &[u8] { &self.name[..self.nlen as usize] }
@@ -255,6 +273,7 @@ pub fn init(disk_ops: &'static DiskOps) {
             removable: false,
             ro: false,
             special: false,
+            ident: None,
         };
     }
 }
@@ -320,6 +339,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                 removable: d.removable,
                 ro: d.ro,
                 special: d.special,
+                ident: d.ident,
             }),
             Some(p) => b.iter()
                 .position(|e| e.in_use && e.backing == Backing::Disk(p as u8))
@@ -336,6 +356,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                     removable: d.removable,
                     ro: d.ro,
                     special: d.special,
+                    ident: d.ident,
                 }),
             None => None,
         };
@@ -373,8 +394,50 @@ fn find_name(b: &[BDev; MAX_BDEV], name: &[u8]) -> Option<u16> {
 pub fn lookup_dev_node(path: &[u8]) -> Option<u16> {
     if path == b"/dev/loop-control" { return Some(LOOP_CONTROL); }
     let name = path.strip_prefix(b"/dev/".as_slice())?;
+    if let Some(link) = name.strip_prefix(b"disk/by-id/".as_slice()) {
+        return find_by_id(&synced(), link);
+    }
     if name.is_empty() || name.contains(&b'/') { return None; }
     find_name(&synced(), name)
+}
+
+/// Append `s` with every byte outside `[A-Za-z0-9._-]` turned into `_`
+/// (udev's `ID_MODEL_ENC` flattening of "Amazon Elastic Block Store").
+fn push_id(out: &mut alloc::vec::Vec<u8>, s: &[u8]) {
+    for &c in s { out.push(if c.is_ascii_alphanumeric() || c == b'.' || c == b'-' { c } else { b'_' }); }
+}
+
+/// `nvme-<model>_<serial>[_<nsid>][-part<N>]` of `e` (namespace 1 carries no
+/// suffix, as udev's 60-persistent-storage rules do).
+fn by_id_link(e: &BDev) -> Option<alloc::vec::Vec<u8>> {
+    let i = e.ident?;
+    let mut v = alloc::vec::Vec::from(b"nvme-".as_slice());
+    push_id(&mut v, &i.model[..i.mlen as usize]);
+    v.push(b'_');
+    push_id(&mut v, &i.serial[..i.slen as usize]);
+    if i.nsid > 1 {
+        v.push(b'_');
+        let mut d = [0u8; 10];
+        let mut n = i.nsid;
+        let mut k = 0;
+        while n > 0 { d[k] = b'0' + (n % 10) as u8; k += 1; n /= 10; }
+        while k > 0 { k -= 1; v.push(d[k]); }
+    }
+    if let Backing::Part { pno, .. } = e.backing {
+        v.extend_from_slice(b"-part");
+        let mut d = [0u8; 10];
+        let mut n = pno;
+        let mut k = 0;
+        while n > 0 { d[k] = b'0' + (n % 10) as u8; k += 1; n /= 10; }
+        while k > 0 { k -= 1; v.push(d[k]); }
+    }
+    Some(v)
+}
+
+/// `/dev/disk/by-id/<link>` -> registry slot.
+fn find_by_id(b: &[BDev; MAX_BDEV], link: &[u8]) -> Option<u16> {
+    if !link.starts_with(b"nvme-") { return None; }
+    b.iter().position(|e| e.in_use && !e.special && by_id_link(e).map_or(false, |l| l == link)).map(|i| i as u16)
 }
 
 /// `/dev/<name>` of the block device numbered `major:minor`, appended to `out`.
@@ -942,6 +1005,17 @@ fn sub_attr(e: &BDev, level: u8, leaf: &[u8], out: &mut [u8]) -> Option<usize> {
                 _ => b"VirtIO Block Device\n".as_slice(),
             })),
             b"vendor" => Some(put(out, 0, b"LeandrOS\n")),
+            b"serial" => {
+                let i = e.ident?;
+                let p = put(out, 0, &i.serial[..i.slen as usize]);
+                Some(put(out, p, b"\n"))
+            }
+            // Amazon only: the vendor-specific block-device name (`sda1`).
+            b"ebs_device" => {
+                let i = e.ident.filter(|i| i.amzn && i.elen > 0)?;
+                let p = put(out, 0, &i.ebs[..i.elen as usize]);
+                Some(put(out, p, b"\n"))
+            }
             _ => None,
         },
         LVL_LOOP => {
@@ -1498,6 +1572,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
         removable,
         ro,
         special: false,
+        ident: None,
     };
     0
 }
