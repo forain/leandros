@@ -1374,13 +1374,20 @@ static void t_fanfid_dfid_name(void)
     int r1 = rename(pa, pb);
     int u1 = unlink(pb);
     struct fidev g[8]; int n = ffd < 0 ? 0 : fid_drain(ffd, g, 8);
+    /* Like Linux, unlink also raises FAN_ATTRIB (link count change) before FAN_DELETE: drop it. */
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (i >= 4 && (g[i].mask & FAN_ATTRIB) && !(g[i].mask & FAN_DELETE)) continue;
+        g[m++] = g[i];
+    }
+    int n0 = n; n = m;
     int ok = sr == 0 && mr == 0 && c1 == 0 && r1 == 0 && u1 == 0 && n == 5;
     const unsigned long long want[5] = { FAN_CREATE, FAN_ATTRIB, FAN_MOVED_FROM, FAN_MOVED_TO, FAN_DELETE };
     const char *nm[5] = { "aa", "aa", "aa", "bb", "bb" };
     for (int i = 0; ok && i < 5; i++)
         ok = (g[i].mask & ~(unsigned long long)FAN_ONDIR) == want[i] && g[i].fd == FAN_NOFD && g[i].pid == getpid()
           && g[i].nr == 1 && fid_is(&g[i].r[0], 2, &dst, nm[i]);
-    if (!ok) printf("  fanfid_dfid_name: sr=%d mr=%d n=%d m0=%llx nr0=%d t0=%d name0=%s\n", sr, mr, n, n > 0 ? g[0].mask : 0, n > 0 ? g[0].nr : -1, n > 0 ? g[0].r[0].type : -1, n > 0 ? g[0].r[0].name : "");
+    if (!ok) printf("  fanfid_dfid_name: n0=%d sr=%d mr=%d n=%d m0=%llx nr0=%d t0=%d name0=%s\n", n0, sr, mr, n, n > 0 ? g[0].mask : 0, n > 0 ? g[0].nr : -1, n > 0 ? g[0].r[0].type : -1, n > 0 ? g[0].r[0].name : "");
     report("t_fanfid_dfid_name", ok);
     if (ffd >= 0) close(ffd);
     rmdir(d);
