@@ -101,6 +101,9 @@ def one_mode(arch, run_id, mode, img, want_hash, base, check):
 
 def main():
     arch = "x86_64"
+    if os.environ.get("LEANDROS_TEST_ARCH") == "aarch64":
+        print("SKIP nvmemsix: x86_64-only test (own QEMU x86_64 guest); aarch64 has no MSI-X yet")
+        return 0
     run_id = os.environ.get("LEANDROS_RUN_ID", "x")
     img = os.path.join(REPO, f"nvmemsix-{run_id}.img")
     data = os.urandom(8 * MIB)
