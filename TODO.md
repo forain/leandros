@@ -34,7 +34,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp. (`EVIOCGRAB` exclusivity, `EVIOCREVOKE` and the Ctrl+Alt+Esc escape hatch are implemented and covered by `vttest`; see artifacts/notes/lane-evdevvt-2026-11-13.md.)
 
 - **gpuqtest --venus (x86_64 KVM box) fails 2/12**: `FENCE_FD_IN_WAITS` ("in-fence pending at submit in tries=5") and `DEAD_CTX_FAST` ("fence written off after ms=0 next submit errno=0 dead contexts=0"); the other 10 pass. First venus run of this contract (integx on 91b16768), so pre-existing, not a regression. aarch64 --venus cannot run on the Mac (host virglrenderer has no render server).
-- **Desktop DOOM check fails** (doomsession.py on aarch64/HVF/virgl, 91b16768): desktop frames never change (changed_frac 0.0, fps []) and desktop audio rms 0, while text-VT DOOM is fine (rms 6972). Possibly a harness limit (screendump cannot photograph a virgl session); needs a non-screendump frame probe before calling it a bug.
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
@@ -78,7 +77,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - **Unpushed sibling-repo fix**: `sync FILE` → fsync lives in `../coreutils` commit 24b9372 (main, ahead of origin by 1). Push it together with the next leandros push. The box's `leandros-siblings/coreutils` has the same diff only as an uncommitted change, so a reset there silently reverts `sync FILE` to a whole-system sync (the `syncfile` regress suite catches it).
 
-- **kexecacpi runs an x86_64 VM on aarch64 box runs**: the suite is x86_64-only but runtests launches it with no arch argument, so an aarch64 regress2 run fails it at the first boot step ("cannot connect to serial socket"); runner should skip it by arch. Also no test covers a COSMIC/GLib file monitor (inotify) end to end (inotifydesk.py only samples idle load).
+- **No test covers a COSMIC/GLib file monitor (inotify) end to end** (inotifydesk.py only samples idle load).
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
 
