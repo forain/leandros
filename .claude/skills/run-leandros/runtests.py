@@ -164,6 +164,8 @@ SUITES = {
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/ip6test", "/bin/netlinktest", "/bin/nfttest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
                 "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/tuntest", "/bin/brtest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/inotifytest", "/bin/captest", "/bin/seccomptest", "/bin/bpftest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/utmptest", "/bin/camtest --probe",
+                # A real GLib GFileMonitor (musl, ports/pipewire/gfilemon.c) over inotify on tmpfs + f2fs (lane filemon).
+                "/usr/bin/gfilemon /run /root",
                 # kexec tool: load + unload only (non-destructive).
                 # A blocking pipe write of >PIPE_BUF delivers every byte (lane pipefix).
                 "/bin/sh -c '[ \"$(dd if=/dev/zero bs=1M count=2 2>/dev/null | wc -c)\" = 2097152 ]'",
@@ -292,6 +294,7 @@ SUITES = {
     # inotify (on by default; with --cmdline vfs.inotify=0 only the kill-switch guard runs).
     "inotify": ["/bin/inotifytest"],
     "inotifyforce": ["/bin/inotifytest force"],
+    "gfilemon": ["/usr/bin/gfilemon /run /root"],
     "cgroup": ["/bin/cgtest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
