@@ -1366,7 +1366,13 @@ const BIND_PORT_LOCK: u8 = 2;
 /// "fragmentation needed" / ICMPv6 "packet too big" taught the cache (scoped
 /// to the stack, hence the network namespace), if smaller.
 fn path_mtu_ip(sid: Sid, d: IpAddress) -> u32 {
-    let link: u32 = if sid == iface::LO { 65536 } else { 1500 };
+    let link: u32 = if sid == iface::LO { 65536 } else {
+        // A namespace's own loopback (a dynamic sid) is as big as lo.
+        match vif::VIFS.lock().get(sid as usize).and_then(|x| x.as_ref()) {
+            Some(x) if matches!(x.kind, vif::VifKind::Lo) => x.mtu as u32,
+            _ => 1500,
+        }
+    };
     let now = sched::monotonic_ns() / 1_000_000;
     let key = match d {
         IpAddress::Ipv4(a) => smoltcp::pmtu::v4(a.0),
