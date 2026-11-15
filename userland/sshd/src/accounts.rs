@@ -130,14 +130,152 @@ pub fn authorized_keys_path(user: &User, file: &str) -> PathBuf {
     }
 }
 
-/// Is `key` listed in the user's authorized_keys? Options in front of a key
-/// (`command=`, `from=`, ...) are not supported: such lines are skipped, so a
-/// restricted key never gets an unrestricted login.
-pub fn key_authorized(user: &User, file: &str, key: &PublicKey) -> Result<bool, String> {
+/// Per-key restrictions from the options field of an authorized_keys line.
+#[derive(Clone, Debug, Default)]
+pub struct KeyOpts {
+    /// `from="pattern-list"`: allowed client addresses (`*`/`?` globs, `!` negation, CIDR).
+    pub from: Option<String>,
+    /// `command="..."`: forced command, run instead of whatever the client asked for.
+    pub command: Option<String>,
+    pub no_pty: bool,
+    pub no_port_forwarding: bool,
+}
+
+fn glob(pat: &str, s: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+    fn rec(p: &[char], t: &[char]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some('*') => (0..=t.len()).any(|i| rec(&p[1..], &t[i..])),
+            Some('?') => !t.is_empty() && rec(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && rec(&p[1..], &t[1..]),
+        }
+    }
+    rec(&p, &t)
+}
+
+fn cidr_match(pat: &str, ip: std::net::IpAddr) -> Option<bool> {
+    let (net, bits) = pat.split_once('/')?;
+    let net: std::net::IpAddr = net.parse().ok()?;
+    let bits: u32 = bits.parse().ok()?;
+    match (net, ip) {
+        (std::net::IpAddr::V4(n), std::net::IpAddr::V4(a)) if bits <= 32 => {
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            Some(u32::from(n) & mask == u32::from(a) & mask)
+        }
+        (std::net::IpAddr::V6(n), std::net::IpAddr::V6(a)) if bits <= 128 => {
+            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            Some(u128::from(n) & mask == u128::from(a) & mask)
+        }
+        _ => Some(false),
+    }
+}
+
+/// OpenSSH pattern-list semantics: the address matches when some positive
+/// pattern matches and no negated one does.
+pub fn from_matches(list: &str, ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    let text = ip.to_string();
+    let mut hit = false;
+    for pat in list.split(',') {
+        let (neg, pat) = match pat.strip_prefix('!') {
+            Some(p) => (true, p),
+            None => (false, pat),
+        };
+        let m = cidr_match(pat, ip).unwrap_or_else(|| glob(pat, &text));
+        if m {
+            if neg {
+                return false;
+            }
+            hit = true;
+        }
+    }
+    hit
+}
+
+/// Split `opts key-type base64 comment` into the options text and the key
+/// part, honoring double quotes in the options.
+fn split_options(line: &str) -> (&str, &str) {
+    // A line that starts with a key type has no options.
+    let first = line.split_whitespace().next().unwrap_or("");
+    if first.starts_with("ssh-") || first.starts_with("ecdsa-") || first.starts_with("sk-") {
+        return ("", line);
+    }
+    let mut quoted = false;
+    let mut esc = false;
+    for (i, c) in line.char_indices() {
+        if esc {
+            esc = false;
+        } else if c == '\\' && quoted {
+            esc = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c.is_whitespace() && !quoted {
+            return (&line[..i], line[i..].trim_start());
+        }
+    }
+    (line, "")
+}
+
+/// Parse an options field. An option this server does not implement makes
+/// the whole line unusable (Err): a restricted key must never gain access
+/// by having its restriction ignored.
+fn parse_options(opts: &str) -> Result<KeyOpts, String> {
+    let mut out = KeyOpts::default();
+    let mut items = Vec::new();
+    let (mut cur, mut quoted, mut esc) = (String::new(), false, false);
+    for c in opts.chars() {
+        if esc {
+            cur.push(c);
+            esc = false;
+        } else if c == '\\' && quoted {
+            esc = true;
+        } else if c == '"' {
+            quoted = !quoted;
+            cur.push(c);
+        } else if c == ',' && !quoted {
+            items.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    items.push(cur);
+    let unq = |v: &str| v.trim_matches('"').to_string();
+    for it in items.iter().filter(|s| !s.is_empty()) {
+        let (k, v) = match it.split_once('=') {
+            Some((k, v)) => (k.to_ascii_lowercase(), Some(v)),
+            None => (it.to_ascii_lowercase(), None),
+        };
+        match (k.as_str(), v) {
+            ("from", Some(v)) => out.from = Some(unq(v)),
+            ("command", Some(v)) => out.command = Some(unq(v)),
+            ("no-pty", None) => out.no_pty = true,
+            ("no-port-forwarding", None) => out.no_port_forwarding = true,
+            ("restrict", None) => {
+                out.no_pty = true;
+                out.no_port_forwarding = true;
+            }
+            ("port-forwarding", None) => out.no_port_forwarding = false,
+            ("pty", None) => out.no_pty = false,
+            // Features this server does not have anyway.
+            ("no-agent-forwarding" | "no-x11-forwarding" | "no-user-rc", None) => {}
+            _ => return Err(format!("unsupported option {k}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Is `key` listed in the user's authorized_keys? Returns the matching
+/// line's options. Lines with options this server does not implement are
+/// skipped, so a restricted key never gets an unrestricted login.
+pub fn key_authorized(user: &User, file: &str, key: &PublicKey) -> Result<Option<KeyOpts>, String> {
     let path = authorized_keys_path(user, file);
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
     strict_ok(&path, user)?;
     for line in text.lines() {
@@ -145,10 +283,15 @@ pub fn key_authorized(user: &User, file: &str, key: &PublicKey) -> Result<bool, 
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Ok(cand) = PublicKey::from_openssh(line) else { continue };
-        if cand.key_data() == key.key_data() {
-            return Ok(true);
+        let (opts, rest) = split_options(line);
+        let Ok(cand) = PublicKey::from_openssh(rest) else { continue };
+        if cand.key_data() != key.key_data() {
+            continue;
+        }
+        match parse_options(opts) {
+            Ok(o) => return Ok(Some(o)),
+            Err(why) => crate::log(&format!("authorized_keys of {}: line skipped: {why}", user.name)),
         }
     }
-    Ok(false)
+    Ok(None)
 }
