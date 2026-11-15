@@ -64,6 +64,8 @@ pub struct Conn {
     /// MaxStartups slot, held until the client authenticates or disconnects.
     startup: Option<crate::StartupSlot>,
     chans: HashMap<ChannelId, Chan>,
+    /// Active `-R` listeners, keyed by (requested address, port).
+    fwds: HashMap<(String, u32), tokio::task::AbortHandle>,
 }
 
 pub async fn run_connection(
@@ -77,7 +79,7 @@ pub async fn run_connection(
     log(&format!("connection from {peer}"));
     let authed = Arc::new(AtomicBool::new(false));
     let grace = Duration::from_secs(cfg.login_grace_secs);
-    let conn = Conn { cfg, peer, local, user: None, authed: authed.clone(), key_opts: Default::default(), startup: Some(startup), chans: HashMap::new() };
+    let conn = Conn { cfg, peer, local, user: None, authed: authed.clone(), key_opts: Default::default(), startup: Some(startup), chans: HashMap::new(), fwds: HashMap::new() };
     let running = match russh::server::run_stream(rcfg, stream, conn).await {
         Ok(r) => r,
         Err(e) => {
@@ -106,6 +108,9 @@ pub async fn run_connection(
 
 impl Drop for Conn {
     fn drop(&mut self) {
+        for (_, h) in self.fwds.drain() {
+            h.abort();
+        }
         // The client is gone: hang up whatever its sessions still run, as a
         // pty hangup would.
         for ch in self.chans.values() {
@@ -193,6 +198,36 @@ impl Conn {
         Ok(())
     }
 
+    /// The password check shared by `password` and `keyboard-interactive`.
+    fn check_password(&mut self, user: &str, password: &str, method: &str) -> bool {
+        if !self.cfg.password_auth {
+            return false;
+        }
+        let Some(u) = accounts::lookup_user(user) else {
+            log(&format!("{}: failed {method} for unknown user {user:?}", self.peer));
+            return false;
+        };
+        if let Err(why) = self.may_login(&u, true) {
+            log(&format!("{}: {method} for {user}: {why}", self.peer));
+            return false;
+        }
+        if password == user && !dev_password_allowed(self.cfg.dev_password_auth, self.peer) {
+            log(&format!("{}: {method} for {user}: dev password refused from the network (use a key)", self.peer));
+            return false;
+        }
+        if accounts::verify_password(&u, password) {
+            log(&format!("{}: accepted {method} for {user}", self.peer));
+            accounts::rehash_legacy(&u, password);
+            self.user = Some(u);
+            self.startup = None;
+            self.authed.store(true, Ordering::Release);
+            true
+        } else {
+            log(&format!("{}: failed {method} for {user}", self.peer));
+            false
+        }
+    }
+
     fn pubkey_ok(&self, user: &str, key: &PublicKey) -> Option<(User, crate::accounts::KeyOpts)> {
         if !self.cfg.pubkey_auth {
             return None;
@@ -204,6 +239,13 @@ impl Conn {
         }
         match accounts::key_authorized(&u, &self.cfg.authorized_keys_file, key) {
             Ok(Some(o)) => {
+                if let Some(exp) = o.expiry {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    if now >= exp {
+                        log(&format!("{}: publickey for {user}: expiry-time passed", self.peer));
+                        return None;
+                    }
+                }
                 if let Some(from) = &o.from {
                     if !accounts::from_matches(from, self.peer.ip()) {
                         log(&format!("{}: publickey for {user}: from= does not allow this address", self.peer));
@@ -325,6 +367,12 @@ impl Conn {
             tty_name = None;
         }
         let mut env = self.base_env(&user, pty.as_ref(), tty_name.as_deref());
+        if self.cfg.permit_user_environment {
+            for (k, v) in self.key_opts.environment.clone() {
+                env.retain(|(ek, _)| *ek != k);
+                env.push((k, v));
+            }
+        }
         for (k, v) in extra_env {
             env.retain(|(ek, _)| *ek != k);
             env.push((k, v));
@@ -602,30 +650,31 @@ impl russh::server::Handler for Conn {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        Ok(if self.check_password(user, password, "password") { Auth::Accept } else { Auth::reject() })
+    }
+
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        user: &str,
+        _submethods: &str,
+        response: Option<russh::server::Response<'a>>,
+    ) -> Result<Auth, Self::Error> {
         if !self.cfg.password_auth {
             return Ok(Auth::reject());
         }
-        let Some(u) = accounts::lookup_user(user) else {
-            log(&format!("{}: failed password for unknown user {user:?}", self.peer));
-            return Ok(Auth::reject());
-        };
-        if let Err(why) = self.may_login(&u, true) {
-            log(&format!("{}: password for {user}: {why}", self.peer));
-            return Ok(Auth::reject());
-        }
-        if password == user && !dev_password_allowed(self.cfg.dev_password_auth, self.peer) {
-            log(&format!("{}: password for {user}: dev password refused from the network (use a key)", self.peer));
-            return Ok(Auth::reject());
-        }
-        if accounts::verify_password(&u, password) {
-            log(&format!("{}: accepted password for {user}", self.peer));
-            self.user = Some(u);
-            self.startup = None;
-            self.authed.store(true, Ordering::Release);
-            Ok(Auth::Accept)
-        } else {
-            log(&format!("{}: failed password for {user}", self.peer));
-            Ok(Auth::reject())
+        // One hidden "Password: " prompt, answered through the conversation and
+        // checked as a password login is (unknown users get the prompt too, so
+        // the method does not reveal which accounts exist).
+        match response {
+            None => Ok(Auth::Partial {
+                name: "".into(),
+                instructions: "".into(),
+                prompts: std::borrow::Cow::Owned(vec![("Password: ".into(), false)]),
+            }),
+            Some(mut r) => {
+                let pw = r.next().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+                Ok(if self.check_password(user, &pw, "keyboard-interactive") { Auth::Accept } else { Auth::reject() })
+            }
         }
     }
 
@@ -667,6 +716,109 @@ impl russh::server::Handler for Conn {
         // object is not needed (russh ignores sends to a dropped one).
         drop(channel);
         Ok(())
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host: &str,
+        port: u32,
+        orig_addr: &str,
+        orig_port: u32,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let peer = self.peer;
+        if self.user.is_none() {
+            return Ok(());
+        }
+        if self.key_opts.no_port_forwarding {
+            log(&format!("{peer}: direct-tcpip to {host}:{port} refused (port forwarding disabled for this key)"));
+            return Ok(()); // dropping `reply` rejects
+        }
+        if !accounts::forward_permitted(&self.key_opts.permit_open, host, port) {
+            log(&format!("{peer}: direct-tcpip to {host}:{port} refused (permitopen)"));
+            return Ok(());
+        }
+        let (host, port16) = (host.to_string(), port as u16);
+        let (orig_addr, orig_port) = (orig_addr.to_string(), orig_port);
+        tokio::spawn(async move {
+            let conn = tokio::time::timeout(Duration::from_secs(15), TcpStream::connect((host.as_str(), port16))).await;
+            let mut sock = match conn {
+                Ok(Ok(s)) => s,
+                other => {
+                    log(&format!("{peer}: direct-tcpip to {host}:{port} failed: {other:?}"));
+                    return; // dropping `reply` rejects
+                }
+            };
+            log(&format!("{peer}: direct-tcpip {orig_addr}:{orig_port} -> {host}:{port}"));
+            reply.accept().await;
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+        });
+        Ok(())
+    }
+
+    async fn tcpip_forward(&mut self, address: &str, port: &mut u32, session: &mut Session) -> Result<bool, Self::Error> {
+        let peer = self.peer;
+        if self.user.is_none() {
+            return Ok(false);
+        }
+        if self.key_opts.no_port_forwarding {
+            log(&format!("{peer}: tcpip-forward {address}:{port} refused (port forwarding disabled for this key)"));
+            return Ok(false);
+        }
+        let shown = if address.is_empty() { "localhost" } else { address };
+        if !accounts::forward_permitted(&self.key_opts.permit_listen, shown, *port) {
+            log(&format!("{peer}: tcpip-forward {shown}:{port} refused (permitlisten)"));
+            return Ok(false);
+        }
+        // GatewayPorts no: remote forwards listen on loopback only.
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", *port as u16)).await {
+            Ok(l) => l,
+            Err(e) => {
+                log(&format!("{peer}: tcpip-forward {shown}:{port}: bind failed: {e}"));
+                return Ok(false);
+            }
+        };
+        let bound = listener.local_addr().map(|a| a.port() as u32).unwrap_or(*port);
+        let key = (address.to_string(), bound);
+        if self.fwds.contains_key(&key) {
+            return Ok(false);
+        }
+        *port = bound;
+        log(&format!("{peer}: tcpip-forward listening on 127.0.0.1:{bound} for {shown}"));
+        let handle = session.handle();
+        let addr = address.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, from)) = listener.accept().await else { return };
+                let (handle, addr) = (handle.clone(), addr.clone());
+                tokio::spawn(async move {
+                    let ch = match handle
+                        .channel_open_forwarded_tcpip(addr, bound, from.ip().to_string(), from.port() as u32)
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let mut stream = ch.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                });
+            }
+        });
+        self.fwds.insert(key, task.abort_handle());
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(&mut self, address: &str, port: u32, _session: &mut Session) -> Result<bool, Self::Error> {
+        match self.fwds.remove(&(address.to_string(), port)) {
+            Some(h) => {
+                h.abort();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     async fn channel_close(&mut self, id: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {

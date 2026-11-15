@@ -590,7 +590,7 @@ build_portal() {
     local port="$ROOT_DIR/ports/portal"
     local stamp="$port/out/$arch/.stamp"
     if [[ "${LEANDROS_PORTAL_REBUILD:-0}" != 1 && -f "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+       && leandros_port_fresh "$port" "$arch"; then
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
@@ -610,7 +610,7 @@ build_gstreamer() {
     local port="$ROOT_DIR/ports/gstreamer"
     local stamp="$port/out/$arch/.stamp"
     if [[ "${LEANDROS_GSTREAMER_REBUILD:-0}" != 1 && -f "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+       && leandros_port_fresh "$port" "$arch"; then
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
@@ -635,7 +635,7 @@ build_pipewire() {
     local port="$ROOT_DIR/ports/pipewire"
     local stamp="$port/out/$arch/.stamp"
     if [[ "${LEANDROS_PIPEWIRE_REBUILD:-0}" != 1 && -f "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+       && leandros_port_fresh "$port" "$arch"; then
         echo "  up to date ($port/out/$arch)"
         return 0
     fi
@@ -671,7 +671,7 @@ build_apk() {
     local port="$ROOT_DIR/ports/apk"
     local stamp="$port/out/$arch/.stamp"
     if [[ -f "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+       && leandros_port_fresh "$port" "$arch"; then
         echo "  up to date ($port/out/$arch)"
     else
         "$port/build.sh" "$arch" || port_failed apk "$arch" "apk-tools staging; the image would ship without apk.static"
@@ -980,7 +980,7 @@ build_e2fsprogs() {
     local port="$ROOT_DIR/ports/e2fsprogs"
     local stamp="$port/out/$arch/.stamp"
     if [[ "${LEANDROS_E2FSPROGS_REBUILD:-0}" != 1 && -f "$stamp" ]] \
-       && [[ -z "$(find "$port" -path "$port/out" -prune -o -type f -newer "$stamp" -print)" ]]; then
+       && leandros_port_fresh "$port" "$arch"; then
         echo "  up to date ($port/out/$arch)"
         return 0
     fi

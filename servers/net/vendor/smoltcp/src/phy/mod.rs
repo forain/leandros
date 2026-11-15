@@ -165,6 +165,8 @@ pub struct PacketMeta {
     /// LEANDROS: the IPv4 TOS byte (DSCP and ECN) of a packet sent with
     /// this meta (IP_TOS); 0 leaves the header's as emitted.
     pub tos: u8,
+    /// LEANDROS: send without the DF bit (IP_PMTUDISC_DONT); emitted packets carry it otherwise.
+    pub nodf: bool,
 }
 
 /// A description of checksum behavior for a particular protocol.
