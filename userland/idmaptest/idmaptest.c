@@ -2041,11 +2041,26 @@ static int quota_run(int uid, int *made, int *err)
     while (waitpid(-1, NULL, 0) > 0) {}
     return 0;
 }
+static int set_userns_limit(const char *v, char *old, size_t osz)
+{
+    int f = open("/proc/sys/user/max_user_namespaces", O_RDWR);
+    if (f < 0) return -1;
+    if (old) { int k = read(f, old, osz - 1); old[k > 0 ? k : 0] = 0; }
+    int r = pwrite(f, v, strlen(v), 0) == (ssize_t)strlen(v) ? 0 : -1;
+    close(f);
+    return r;
+}
 static int userns_quota_enospc(void)
 {
     int made, err;
-    CHECK(quota_run(1000, &made, &err) == 0);
-    CHECK(err == ENOSPC && made >= 8 && made <= 32);
+    char old[32] = "2048";
+    /* per-uid limit is max_user_namespaces (Linux ucounts): pin it to 40 for the ENOSPC run */
+    CHECK(set_userns_limit("40", old, sizeof old) == 0);
+    int qr = quota_run(1000, &made, &err);
+    for (size_t l = strlen(old); l && old[l - 1] == '\n'; ) old[--l] = 0;
+    CHECK(set_userns_limit(old, NULL, 0) == 0);
+    CHECK(qr == 0);
+    CHECK(err == ENOSPC && made >= 8 && made <= 40);
     CHECK(quota_run(-1, &made, &err) == 0);
     CHECK(err == 0 && made == 48);
     return 0;

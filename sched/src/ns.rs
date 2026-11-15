@@ -185,10 +185,8 @@ fn charge(class: u8) -> bool {
 fn uncharge(class: u8) { USED[class as usize].fetch_sub(1, AcqRel); }
 
 /// Per-kuid namespace quota (Linux ucounts; host root exempt): a creator may
-/// own at most `MAX_USERNS_PER_UID` user namespaces and `MAX_NS_PER_UID`
-/// namespaces of all kinds, so one uid cannot exhaust the shared table.
-pub const MAX_USERNS_PER_UID: usize = 32;
-pub const MAX_NS_PER_UID: usize = 64;
+/// own at most `limit_get(kind)` namespaces of each kind, i.e. the per-kind
+/// `/proc/sys/user/max_<kind>_namespaces` value applies per uid, as in Linux.
 static SLOT_USER: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 
 /// Userns whose owner chain a live slot is charged to (0 = host-created, uncharged).
@@ -212,33 +210,30 @@ fn chain_has(first: Option<u32>, mut o: NsId, kuid: u32) -> bool {
 }
 
 /// ENOSPC when any kuid in the charge chain already owns its share.
-fn quota_chain_ok(first: Option<u32>, start: NsId, want_user: bool) -> bool {
-    if let Some(k) = first { if k != 0 && !quota_one(k, want_user) { return false; } }
+fn quota_chain_ok(first: Option<u32>, start: NsId, class: u8) -> bool {
+    if let Some(k) = first { if k != 0 && !quota_one(k, class) { return false; } }
     let mut o = start;
     while o != 0 {
         let k = OWNER_EUID[o as usize].load(Acquire);
-        if k != 0 && !quota_one(k, want_user) { return false; }
+        if k != 0 && !quota_one(k, class) { return false; }
         o = PARENT[o as usize].load(Acquire);
     }
     true
 }
 
-fn quota_one(kuid: u32, want_user: bool) -> bool {
-    let (mut all, mut users) = (0usize, 0usize);
+fn quota_one(kuid: u32, class: u8) -> bool {
+    let mut n = 0u32;
     for id in 1..NS_MAX {
         let r = REFS[id].load(Relaxed);
-        if r == 0 || r == DYING { continue; }
-        if chain_has(None, slot_charge_start(id) as NsId, kuid) {
-            all += 1;
-            if SLOT_USER[id].load(Acquire) != 0 { users += 1; }
-        }
+        if r == 0 || r == DYING || SLOT_KIND[id].load(Acquire) != class { continue; }
+        if chain_has(None, slot_charge_start(id) as NsId, kuid) { n += 1; }
     }
-    all < MAX_NS_PER_UID && !(want_user && users >= MAX_USERNS_PER_UID)
+    n < limit_get(class as usize)
 }
 
 /// Quota check for a non-user namespace created under owner user namespace `owner`.
-fn quota_owner_ok(owner: NsId) -> bool {
-    owner == 0 || quota_chain_ok(None, owner, false)
+fn quota_owner_ok(owner: NsId, class: u8) -> bool {
+    owner == 0 || quota_chain_ok(None, owner, class)
 }
 
 /// Create a user namespace owned by (`euid`, `egid`) as a child of `parent`.
@@ -250,7 +245,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
     if from_k(0, parent, euid).is_none() || from_k(1, parent, egid).is_none() { return Err(-1); }
     let level = if parent == 0 { 0 } else { LEVEL[parent as usize].load(Acquire) };
     if level >= MAX_USERNS_LEVEL { return Err(-87); }
-    if !quota_chain_ok(Some(euid), parent, true) { return Err(-28); }
+    if !quota_chain_ok(Some(euid), parent, 1) { return Err(-28); }
     if !charge(1) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
@@ -301,7 +296,7 @@ pub fn owner_user(id: NsId) -> NsId { if id == 0 { 0 } else { OWNER_USER[id as u
 
 /// Create a mount namespace id owned by user namespace `owner_user`.
 pub fn new_mntns(owner_user: NsId) -> Result<NsRef, isize> {
-    if !quota_owner_ok(owner_user) || !charge(2) { return Err(-28); }
+    if !quota_owner_ok(owner_user, 2) || !charge(2) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(2, Release);
@@ -363,7 +358,7 @@ pub fn dying_count() -> usize { (1..NS_MAX).filter(|&i| REFS[i].load(Relaxed) ==
 /// Create a flat (parentless) namespace id of slot class `class` (3 net, 7 ipc,
 /// 8 uts; see `link_class`). Errors: ENOSPC (28).
 pub fn new_flat(owner: NsId, class: u8) -> Result<NsRef, isize> {
-    if !quota_owner_ok(owner) || !charge(class) { return Err(-28); }
+    if !quota_owner_ok(owner, class) || !charge(class) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(class, Release);
@@ -541,7 +536,7 @@ static PID_FLAGS: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 pub fn new_pidns(parent: NsId, owner: NsId) -> Result<NsRef, isize> {
     let level = level(parent);
     if level >= MAX_PIDNS_LEVEL { return Err(-28); }
-    if !quota_owner_ok(owner) || !charge(4) { return Err(-28); }
+    if !quota_owner_ok(owner, 4) || !charge(4) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(4, Release);
@@ -1095,7 +1090,7 @@ static CGNS_FLAG: [AtomicU8; NS_MAX] = [ZERO8; NS_MAX];
 /// New cgroup namespace rooted at cgroup `root`, owned by user namespace
 /// `owner`. The returned reference is the caller's. ENOSPC (28) when full.
 pub fn new_cgns(root: crate::cgroup::CgId, owner: NsId) -> Result<NsRef, isize> {
-    if !quota_owner_ok(owner) || !charge(6) { return Err(-28); }
+    if !quota_owner_ok(owner, 6) || !charge(6) { return Err(-28); }
     for id in 1..NS_MAX {
         if REFS[id].compare_exchange(0, 1, AcqRel, Relaxed).is_ok() {
             SLOT_KIND[id].store(6, Release);
