@@ -70,14 +70,20 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
 
         let username = match core::str::from_utf8(&user_buf[..user_len]) {
             Ok(s) => s,
-            Err(_) => { write_str("\nLogin incorrect\n\n"); continue; }
+            Err(_) => { fail_delay(); write_str("\nLogin incorrect\n\n"); continue; }
         };
 
         match authenticate(username, &pass_buf[..pass_len]) {
             Some(rec) => do_login(&rec),
-            None => write_str("\nLogin incorrect\n\n"),
+            None => { fail_delay(); write_str("\nLogin incorrect\n\n") }
         }
     }
+}
+
+/// Stall after a failed attempt (rate limit), matching pam-leandros' default
+/// pam_authenticate failure delay of 1 s (Linux login uses ~3 s FAIL_DELAY).
+unsafe fn fail_delay() {
+    leandros_libc::usleep(1_000_000);
 }
 
 /// Read a line from fd 0, optionally echoing typed characters. Handles
@@ -87,6 +93,15 @@ unsafe fn read_line(buf: &mut [u8], echo: bool) -> usize {
     loop {
         let mut ch = [0u8; 1];
         let n = read(STDIN_FILENO, ch.as_mut_ptr(), 1);
+        if n == 0 {
+            // EOF on a scripted (pipe/socket) stdin: no one can answer, quit
+            // instead of spinning on the prompt. A terminal never reports it.
+            let mut line = [0u8; 32];
+            let l = utmpx::tty_line(0, &mut line);
+            if l == 0 || line.starts_with(b"pipe:") || line.starts_with(b"socket:") {
+                exit(1);
+            }
+        }
         if n <= 0 {
             continue;
         }
@@ -293,7 +308,12 @@ unsafe fn do_login(rec: &UserRec) -> ! {
     {
         let mut line = [0u8; 32];
         let n = utmpx::tty_line(0, &mut line);
-        utmpx::login(utmpx::getpid(), &line[..n], &rec.name[..rec.name_len], b"", rec.uid);
+        // A pipe/socket stdin (a scripted login) is no terminal: nothing would
+        // ever close that record, so it would stay in `who` forever.
+        let l = &line[..n];
+        if n > 0 && !l.starts_with(b"pipe:") && !l.starts_with(b"socket:") && !l.starts_with(b"anon_inode:") {
+            utmpx::login(utmpx::getpid(), l, &rec.name[..rec.name_len], b"", rec.uid);
+        }
     }
     leandros_libc::cgsession::join(rec.uid, rec.gid);
     // Supplementary groups first: setgroups needs root, which setresuid

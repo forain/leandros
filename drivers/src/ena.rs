@@ -2,10 +2,13 @@
 //! (PCI 1d0f:ec20). The driver core (admin queue, AENQ, readless MMIO, TX/RX
 //! rings, watchdog) is `ena_hw.rs`, host-tested against a mock device in
 //! `drivers/ena-tests`; this file is the PCI probe, the BAR/DMA glue and the
-//! netdev entry points. Everything is polled (no MSI-X yet), host-placement
-//! queues only. Inert when no ENA function exists: `init` logs one line.
+//! netdev entry points. Everything is polled (no MSI-X yet). TX uses LLQ
+//! (device placement, descriptors + header written to BAR2 mapped
+//! write-combining: x86_64 PAT WC, aarch64 Normal-NC) when the device offers
+//! it, host placement otherwise. Inert when no ENA function exists: `init`
+//! logs one line.
 //!
-//! Cmdline: `ena.disable=1` skips the probe.
+//! Cmdline: `ena.disable=1` skips the probe; `ena.llq=0` forces host placement.
 use alloc::format;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -30,6 +33,9 @@ macro_rules! elog { ($($a:tt)*) => { log(&format!($($a)*)) }; }
 /// BAR0 and the kernel's DMA memory.
 struct KBus {
     base: usize,
+    /// BAR2 (LLQ) write-combining mapping, 0 when absent.
+    llq_base: usize,
+    llq_len: usize,
 }
 
 impl EnaBus for KBus {
@@ -44,6 +50,25 @@ impl EnaBus for KBus {
     }
     fn udelay(&self, us: u64) { sched::kthread::udelay(us) }
     fn now_ms(&self) -> u64 { sched::monotonic_ns() / 1_000_000 }
+    fn llq_bar_len(&self) -> usize { if self.llq_base != 0 { self.llq_len } else { 0 } }
+    fn llq_write(&self, off: usize, data: &[u8]) {
+        if self.llq_base == 0 || off + data.len() > self.llq_len { return; }
+        // 8-byte stores: write-combining memory merges them into bursts.
+        let dst = (self.llq_base + off) as *mut u64;
+        for i in 0..data.len() / 8 {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(&data[i * 8..i * 8 + 8]);
+            unsafe { core::ptr::write_volatile(dst.add(i), u64::from_le_bytes(w)) }
+        }
+    }
+    fn wmb(&self) {
+        // Drain the write-combining buffers so the entry is visible before the doorbell.
+        #[cfg(target_arch = "x86_64")]
+        unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { core::arch::asm!("dsb st", options(nostack, preserves_flags)) }
+        core::sync::atomic::fence(Ordering::SeqCst);
+    }
 }
 
 static DEV: Mutex<Option<Ena<KBus>>> = Mutex::new(None);
@@ -87,10 +112,18 @@ pub fn init(cmdline: &str) {
         Some(x) => x,
         None => { log("BAR0 not mappable; giving up"); return; }
     };
-    let mut ena = match Ena::new(KBus { base: va }, readless) {
+    let llq_off = cmdline_val(cmdline, "ena.llq") == Some("0");
+    let (llq_base, llq_len) = if llq_off { (0, 0) } else {
+        match func.map_bar(2, mm::kva::CacheMode::WriteCombining) {
+            Some((v, sz)) => (v, sz as usize),
+            None => (0, 0),
+        }
+    };
+    let mut ena = match Ena::new(KBus { base: va, llq_base, llq_len }, readless) {
         Ok(e) => e,
         Err(e) => { elog!("out of DMA memory ({:?}); giving up", e); return; }
     };
+    ena.set_llq_allowed(!llq_off);
     if let Err(e) = ena.init() {
         elog!("bring-up failed: {:?}", e);
         return;
@@ -100,9 +133,12 @@ pub fn init(cmdline: &str) {
     elog!("BAR0 {} KiB; device v{}.{} ctrl {:08x}, DMA {} bit, max MTU {}, TX/RX depth {}/{}, AENQ groups {:#x}",
           size / 1024, (i.version >> 8) & 0xff, i.version & 0xff, i.controller_version, i.dma_width, i.max_mtu,
           i.tx_depth, i.rx_depth, i.enabled_groups);
-    match i.llq {
-        Some(l) => elog!("LLQ offered (caps {:08x} {:08x} {:08x} {:08x}); using host placement", l[0], l[1], l[2], l[3]),
-        None => log("LLQ not offered; host placement"),
+    match (i.llq, i.llq_cfg) {
+        (_, Some(c)) => elog!("LLQ active: {} B entries, {} descs before header, {} stride, BAR2 {} KiB write-combining",
+                              c.entry_size, c.before, if c.stride_multi { "multi" } else { "single" }, llq_len / 1024),
+        (Some(l), None) => elog!("LLQ offered (caps {:08x} {:08x} {:08x} {:08x}) but not used ({}); host placement", l[0], l[1], l[2], l[3],
+                                 if llq_off { "ena.llq=0" } else if llq_len == 0 { "no BAR2" } else { "no usable layout or refused" }),
+        (None, _) => log("LLQ not offered; host placement"),
     }
     elog!("MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
     *MAC.lock() = m;
@@ -173,7 +209,9 @@ pub fn info_lines(out: &mut String) {
     let _ = writeln!(out, "link: {}", if e.link_up() { "up" } else { "down" });
     let _ = writeln!(out, "readless_mmio: {}", if e.readless() { "yes" } else { "no" });
     let _ = writeln!(out, "device_version: {}.{}", (i.version >> 8) & 0xff, i.version & 0xff);
-    let _ = writeln!(out, "queues: tx {} rx {} (host placement, polled)", i.tx_depth, i.rx_depth);
+    let _ = writeln!(out, "queues: tx {} rx {} ({} placement, polled)", i.tx_depth, i.rx_depth,
+                      if i.llq_cfg.is_some() { "TX device (LLQ)" } else { "host" });
+    if let Some(c) = i.llq_cfg { let _ = writeln!(out, "llq: {} B entries, {} descs before header", c.entry_size, c.before); }
     let _ = writeln!(out, "llq_offered: {}", if i.llq.is_some() { "yes" } else { "no" });
     let _ = writeln!(out, "tx_pkts: {}\ntx_bytes: {}\ntx_full: {}", s.tx_pkts, s.tx_bytes, s.tx_full);
     let _ = writeln!(out, "rx_pkts: {}\nrx_bytes: {}\nrx_drops: {}", s.rx_pkts, s.rx_bytes, s.rx_drops);

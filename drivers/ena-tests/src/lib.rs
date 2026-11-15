@@ -46,6 +46,8 @@ mod mock {
         pub cq_phase: bool,
         pub created: bool,
         pub cq_head_db: u32,
+        /// LLQ: entry size in bytes when the SQ was created with DEV placement.
+        pub llq_entry: usize,
     }
 
     pub struct State {
@@ -82,7 +84,28 @@ mod mock {
         pub fail_feature: Option<u8>,
         pub swallow_admin: bool,
         pub mem: Vec<(*mut u8, std::alloc::Layout)>,
+        // ── LLQ (BAR2) ──
+        pub llq_offered: bool,
+        pub llq_max_queues: u32,
+        pub llq_max_depth: u32,
+        pub llq_loc: u16,
+        pub llq_entry_sup: u16,
+        pub llq_before_sup: u16,
+        pub llq_stride_sup: u16,
+        /// Enabled words the driver set: [loc, entry, before, stride].
+        pub llq_set: Option<[u16; 4]>,
+        pub llq_fail_create: bool,
+        pub bar2: Vec<u8>,
+        pub bar2_present: bool,
+        /// BAR2 written since the last write barrier.
+        pub unfenced: bool,
+        pub llq_frames: usize,
+        pub host_sq_frames: usize,
+        pub sq_placements: Vec<(u8, u8)>,
+        pub last_llq_off: usize,
     }
+
+    pub const LLQ_DESC_OFF: usize = 0x2000;
 
     impl State {
         fn new(readless: bool) -> State {
@@ -96,6 +119,10 @@ mod mock {
                 resets: 0, enabled_groups: 0, mtu: 0, tx: Q::default(), rx: Q::default(), frames: vec![],
                 loopback: true, stall_tx: false, rx_dropped: 0, readless_served: 0, fail_feature: None, swallow_admin: false,
                 mem: vec![],
+                llq_offered: true, llq_max_queues: 4, llq_max_depth: 1024, llq_loc: 1, llq_entry_sup: 0x7,
+                llq_before_sup: 0x3, llq_stride_sup: 0x2, llq_set: None, llq_fail_create: false,
+                bar2: vec![0u8; 0x2000 + 256 * 1024], bar2_present: true, unfenced: false, llq_frames: 0,
+                host_sq_frames: 0, sq_placements: vec![], last_llq_off: 0,
             }
         }
 
@@ -136,6 +163,7 @@ mod mock {
             self.enabled_groups = 0;
             self.tx = Q::default();
             self.rx = Q::default();
+            self.llq_set = None;
         }
 
         pub fn write(&mut self, off: usize, v: u32) {
@@ -165,7 +193,12 @@ mod mock {
                 reg::AENQ_HEAD_DB => self.aenq_head_db = v,
                 reg::INTR_MASK => self.intr_mask = v,
                 reg::AQ_DB => { if self.swallow_admin { self.aq_proc = v as u16; } else { self.process_admin(v as u16); } }
-                TX_SQ_DB => { self.tx.posted = v as u16; if !self.stall_tx { self.process_tx(); } }
+                TX_SQ_DB => {
+                    if self.tx.llq_entry != 0 && self.unfenced {
+                        self.violation("LLQ doorbell without a write barrier after the BAR2 stores".into());
+                    }
+                    self.tx.posted = v as u16; if !self.stall_tx { self.process_tx(); }
+                }
                 RX_SQ_DB => self.rx.posted = v as u16,
                 TX_CQ_DB => self.tx.cq_head_db = v,
                 RX_CQ_DB => self.rx.cq_head_db = v,
@@ -202,12 +235,22 @@ mod mock {
                         } else if feat == feat::AENQ_CONFIG {
                             unsafe { w32(ctrl, 0, 0x1f); }
                         } else if feat == feat::LLQ {
-                            unsafe { w32(ctrl, 0, 1); w32(ctrl, 4, 0x20); }
+                            if !self.llq_offered { status = 4; } else {
+                                unsafe {
+                                    w32(ctrl, 0, self.llq_max_queues); w32(ctrl, 4, self.llq_max_depth);
+                                    w16(ctrl, 8, self.llq_loc); w16(ctrl, 12, self.llq_entry_sup);
+                                    w16(ctrl, 16, self.llq_before_sup); w16(ctrl, 20, self.llq_stride_sup);
+                                }
+                            }
                         } else if feat != feat::MAX_QUEUES_NUM { status = 4; }
                     }
                     op::SET_FEATURE => {
                         let v = unsafe { r32(b, slot + 24) };
                         if feat == feat::AENQ_CONFIG { self.enabled_groups = v; }
+                        if feat == feat::LLQ {
+                            let h = |o: usize| unsafe { r16(b, slot + 20 + o) };
+                            self.llq_set = Some([h(10), h(14), h(18), h(22)]);
+                        }
                         if feat == feat::MTU { self.mtu = unsafe { r32(b, slot + 20) }; }
                     }
                     op::CREATE_CQ => {
@@ -228,8 +271,17 @@ mod mock {
                     op::CREATE_SQ => {
                         let dir = unsafe { *p8(b, slot + 4) } >> 5;
                         let placement = unsafe { *p8(b, slot + 6) } & 0xf;
-                        if placement != 1 { status = 3; }
+                        self.sq_placements.push((dir, placement));
+                        let llq_en = self.llq_set;
+                        if placement == 3 {
+                            if dir != 1 || self.llq_fail_create || llq_en.is_none() || !self.bar2_present { status = 3; }
+                        } else if placement != 1 { status = 3; }
                         let q = if dir == 1 { &mut self.tx } else { &mut self.rx };
+                        if placement == 3 && status == 0 {
+                            q.llq_entry = match llq_en.unwrap()[1] { 1 => 128, 2 => 192, 4 => 256, _ => 0 };
+                            if q.llq_entry == 0 { status = 3; }
+                            resp[16..20].copy_from_slice(&(LLQ_DESC_OFF as u32).to_le_bytes());
+                        }
                         unsafe {
                             q.sq_ba = r32(b, slot + 12) as u64 | (r16(b, slot + 16) as u64) << 32;
                             let d = r16(b, slot + 10);
@@ -260,6 +312,8 @@ mod mock {
 
         fn process_tx(&mut self) {
             while self.tx.proc != self.tx.posted {
+                if self.tx.llq_entry != 0 { self.process_tx_llq(); continue; }
+                self.host_sq_frames += 1;
                 let q = &mut self.tx;
                 let d = (q.proc & (q.depth - 1)) as usize * 16;
                 let (w0, w1, lo, hi) = unsafe { (r32(q.sq_ba, d), r32(q.sq_ba, d + 4), r32(q.sq_ba, d + 8), r32(q.sq_ba, d + 12)) };
@@ -283,6 +337,55 @@ mod mock {
                 if self.loopback { self.inject_rx(&f); }
                 self.frames.push(f);
             }
+        }
+
+        /// Decode one LLQ entry from BAR2: descriptors, then the pushed header;
+        /// the rest of the frame is read from the host buffer the packet
+        /// descriptor points at (after the pushed header).
+        fn process_tx_llq(&mut self) {
+            let q = &mut self.tx;
+            let esz = q.llq_entry;
+            let before = (self.llq_set.unwrap()[2]) as usize;
+            let off = LLQ_DESC_OFF + (q.proc & (q.depth - 1)) as usize * esz;
+            self.last_llq_off = off;
+            let e: Vec<u8> = self.bar2[off..off + esz].to_vec();
+            let w = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+            let mut pkt = None;
+            let mut metas = 0;
+            for k in 0..before {
+                let w0 = w(k * 16);
+                if (w0 >> 23) & 1 != 0 { metas += 1; continue; }
+                if (w0 >> 26) & 1 != 0 { pkt = Some(k); break; }
+            }
+            let k = match pkt { Some(k) => k, None => { self.violations.push(format!("no packet descriptor in LLQ entry {}", q.proc)); q.proc = q.proc.wrapping_add(1); return; } };
+            let _ = metas;
+            let w0 = w(k * 16);
+            if ((w0 >> 24) & 1 != 0) != q.sq_phase { self.violations.push(format!("LLQ phase wrong at {}", q.proc)); }
+            if w0 >> 26 & 1 == 0 || w0 >> 27 & 1 == 0 { self.violations.push("LLQ pkt desc not first+last".into()); }
+            let len = (w0 & 0xffff) as usize;
+            let w1 = w(k * 16 + 4);
+            let (lo, hi3) = (w(k * 16 + 8), w(k * 16 + 12));
+            let hl = (hi3 >> 24) as usize;
+            let pa = lo as u64 | ((hi3 & 0xffff) as u64) << 32;
+            let req = ((w0 >> 16) & 0x3f) << 10 | (w1 >> 22);
+            if hl > len || before * 16 + hl > esz { self.violations.push(format!("LLQ header_length {} bad (len {})", hl, len)); }
+            let mut f = vec![0u8; len];
+            f[..hl.min(len)].copy_from_slice(&e[before * 16..before * 16 + hl.min(len)]);
+            if len > hl { unsafe { std::ptr::copy_nonoverlapping(pa as *const u8, f.as_mut_ptr().add(hl), len - hl); } }
+            q.proc = q.proc.wrapping_add(1);
+            if q.proc & (q.depth - 1) == 0 { q.sq_phase = !q.sq_phase; }
+            let c = (q.cq_tail & (q.depth - 1)) as usize * 8;
+            unsafe {
+                w16(q.cq_ba, c, req as u16);
+                w8(q.cq_ba, c + 2, 0);
+                w16(q.cq_ba, c + 6, q.proc);
+                w8(q.cq_ba, c + 3, q.cq_phase as u8);
+            }
+            q.cq_tail = q.cq_tail.wrapping_add(1);
+            if q.cq_tail & (q.depth - 1) == 0 { q.cq_phase = !q.cq_phase; }
+            self.llq_frames += 1;
+            if self.loopback { self.inject_rx(&f); }
+            self.frames.push(f);
         }
 
         /// Deliver a frame into the next posted RX buffer.
@@ -347,6 +450,13 @@ mod mock {
         }
         fn udelay(&self, us: u64) { self.0.borrow_mut().time_us += us; }
         fn now_ms(&self) -> u64 { self.0.borrow().time_us / 1000 }
+        fn llq_bar_len(&self) -> usize { let s = self.0.borrow(); if s.bar2_present { s.bar2.len() } else { 0 } }
+        fn llq_write(&self, off: usize, data: &[u8]) {
+            let mut s = self.0.borrow_mut();
+            s.bar2[off..off + data.len()].copy_from_slice(data);
+            s.unfenced = true;
+        }
+        fn wmb(&self) { self.0.borrow_mut().unfenced = false; }
     }
 }
 
@@ -388,7 +498,7 @@ mod tests {
         let ops: Vec<(u8, u8)> = st.cmds.clone();
         let expect = [
             (op::GET_FEATURE, feat::DEVICE_ATTRIBUTES), (op::GET_FEATURE, feat::MAX_QUEUES_EXT),
-            (op::GET_FEATURE, feat::LLQ), (op::GET_FEATURE, feat::AENQ_CONFIG),
+            (op::GET_FEATURE, feat::LLQ), (op::SET_FEATURE, feat::LLQ), (op::GET_FEATURE, feat::AENQ_CONFIG),
             (op::SET_FEATURE, feat::AENQ_CONFIG), (op::SET_FEATURE, feat::MTU),
             (op::CREATE_CQ, 0), (op::CREATE_SQ, 0), (op::CREATE_CQ, 0), (op::CREATE_SQ, 0),
         ];
@@ -402,7 +512,7 @@ mod tests {
         assert_eq!(ena.mac, MAC);
         assert_eq!(ena.info.max_mtu, 9001);
         assert_eq!(ena.info.dma_width, 48);
-        assert_eq!(ena.info.llq.unwrap()[1], 0x20);
+        assert_eq!(ena.info.llq.unwrap()[1], 1024);
         assert!(ena.link_up());
         assert_eq!(ena.link_gen(), 1);
     }
@@ -667,6 +777,262 @@ mod tests {
         let last = bus.st().dev_ctl_log.iter().rev().find(|v| *v & CTL_RESET != 0).copied().unwrap();
         assert_eq!(last >> CTL_RESET_REASON_SHIFT, reset_reason::SHUTDOWN);
         assert!(!ena.send(&frame(0, 0)));
+    }
+
+
+    // ── LLQ ─────────────────────────────────────────────────────────────────
+
+    fn caps(entry: u16, before: u16, stride: u16, loc: u16) -> LlqCaps {
+        LlqCaps { max_queues: 4, max_depth: 1024, loc, entry, before, stride }
+    }
+
+    #[test]
+    fn llq_negotiation_matrix() {
+        // Everything offered: 128 B, 2 descs before the header, multi-desc stride.
+        let c = llq_negotiate(&caps(7, 0xf, 3, 1)).unwrap();
+        assert_eq!((c.entry_size, c.before, c.stride_multi), (128, 2, true));
+        assert_eq!(c.header_space(), 128 - 2 * 16);
+        // 128 B missing: 256 preferred over 192.
+        assert_eq!(llq_negotiate(&caps(6, 2, 2, 1)).unwrap().entry_size, 256);
+        assert_eq!(llq_negotiate(&caps(2, 2, 2, 1)).unwrap().entry_size, 192);
+        assert_eq!(llq_negotiate(&caps(4, 2, 2, 1)).unwrap().entry_size, 256);
+        // descs-before-header: 2 preferred, then 1, 4, 8.
+        assert_eq!(llq_negotiate(&caps(1, 1, 2, 1)).unwrap().before, 1);
+        assert_eq!(llq_negotiate(&caps(1, 0xc, 2, 1)).unwrap().before, 4);
+        assert_eq!(llq_negotiate(&caps(4, 8, 2, 1)).unwrap().before, 8);
+        // Stride: single only is accepted.
+        assert!(!llq_negotiate(&caps(1, 2, 1, 1)).unwrap().stride_multi);
+        // No usable option in a mandatory dimension: no LLQ.
+        assert!(llq_negotiate(&caps(0, 2, 2, 1)).is_none(), "no entry size");
+        assert!(llq_negotiate(&caps(1, 0, 2, 1)).is_none(), "no descs-before-header");
+        assert!(llq_negotiate(&caps(1, 2, 0, 1)).is_none(), "no stride mode");
+        assert!(llq_negotiate(&caps(1, 2, 2, 2)).is_none(), "separate-buffer header only");
+        assert!(llq_negotiate(&caps(1, 2, 2, 0)).is_none(), "no header location");
+        let mut z = caps(1, 2, 2, 1);
+        z.max_queues = 0;
+        assert!(llq_negotiate(&z).is_none());
+        z = caps(1, 2, 2, 1);
+        z.max_depth = 0;
+        assert!(llq_negotiate(&z).is_none());
+        // 256 B entry: bigger header window.
+        assert_eq!(llq_negotiate(&caps(4, 2, 2, 1)).unwrap().header_space(), 256 - 32);
+    }
+
+    #[test]
+    fn llq_bringup_uses_device_placement() {
+        let (bus, ena) = up(false);
+        let st = bus.st();
+        assert!(st.violations.is_empty(), "{:?}", st.violations);
+        assert!(ena.llq_active());
+        // TX SQ device placement (3), RX SQ stays host (1).
+        assert_eq!(st.sq_placements, vec![(1, 3), (2, 1)]);
+        let en = st.llq_set.unwrap();
+        assert_eq!(en, [1, 1, 2, 2], "inline header, 128 B, 2 descs before header, multi-desc stride");
+        assert_eq!(st.tx.llq_entry, 128);
+        let c = ena.info.llq_cfg.unwrap();
+        assert_eq!((c.entry_size, c.before), (128, 2));
+    }
+
+    #[test]
+    fn llq_entry_layout() {
+        let (bus, mut ena) = up(false);
+        let f: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+        assert!(ena.send(&f));
+        let st = bus.st();
+        assert!(st.violations.is_empty(), "{:?}", st.violations);
+        assert_eq!(st.last_llq_off, LLQ_DESC_OFF, "first entry at the descriptors offset");
+        let e = &st.bar2[LLQ_DESC_OFF..LLQ_DESC_OFF + 128];
+        let w = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+        // desc 0: meta descriptor (meta bit 23, phase 24).
+        assert_eq!((w(0) >> 23) & 1, 1);
+        assert_eq!((w(0) >> 24) & 1, 1);
+        // desc 1: the packet: total length, phase, first+last+comp_req.
+        assert_eq!(w(16) & 0xffff, 300);
+        assert_eq!((w(16) >> 23) & 1, 0);
+        assert_eq!((w(16) >> 24) & 7, 1 | 1 << 2);
+        assert_eq!((w(16) >> 26) & 7, 7);
+        // header_length = 96 bytes pushed after the two descriptors.
+        assert_eq!(w(28) >> 24, 96);
+        assert_eq!(&e[32..128], &f[..96]);
+        // The remainder comes from the host buffer.
+        let pa = w(24) as u64 | ((w(28) & 0xffff) as u64) << 32;
+        let rest = unsafe { std::slice::from_raw_parts(pa as *const u8, 300 - 96) };
+        assert_eq!(rest, &f[96..]);
+        assert_eq!(st.tx.posted, 1);
+        assert_eq!(st.frames[0], f);
+    }
+
+    #[test]
+    fn llq_short_frame_is_fully_pushed() {
+        let (bus, mut ena) = up(false);
+        assert!(ena.send(&[0xab; 40]));
+        let st = bus.st();
+        assert!(st.violations.is_empty(), "{:?}", st.violations);
+        let e = &st.bar2[LLQ_DESC_OFF..LLQ_DESC_OFF + 128];
+        let w = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
+        assert_eq!(w(16) & 0xffff, 60, "padded to the minimum frame");
+        assert_eq!(w(28) >> 24, 60);
+        assert_eq!(st.frames[0].len(), 60);
+        assert_eq!(&st.frames[0][..40], &[0xab; 40]);
+    }
+
+    #[test]
+    fn llq_256_byte_entries() {
+        let bus = MockBus::new(false);
+        bus.st().llq_entry_sup = 4;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.init().unwrap();
+        assert!(ena.llq_active());
+        assert_eq!(bus.st().tx.llq_entry, 256);
+        let f = frame(5, 5);
+        assert!(ena.send(&f));
+        let mut buf = vec![0u8; 2048];
+        assert_eq!(ena.recv(&mut buf).unwrap(), f.len());
+        assert_eq!(&buf[..f.len()], &f[..]);
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
+    }
+
+    #[test]
+    fn llq_loopback_10k_frames_with_ring_wrap() {
+        let (bus, mut ena) = up(false);
+        assert!(ena.llq_active());
+        let mut buf = vec![0u8; 2048];
+        for n in 0..10_000usize {
+            let f = frame(n, 11);
+            assert!(ena.send(&f), "send {} failed", n);
+            let got = ena.recv(&mut buf).unwrap_or_else(|| panic!("no frame {}", n));
+            assert_eq!(got, f.len().max(MIN_FRAME));
+            assert_eq!(&buf[..f.len()], &f[..], "frame {} corrupt", n);
+        }
+        let st = bus.st();
+        assert!(st.violations.is_empty(), "{:?}", st.violations);
+        assert_eq!(st.llq_frames, 10_000);
+        assert_eq!(st.host_sq_frames, 0);
+        assert!(st.frames.len() == 10_000 && st.rx_dropped == 0);
+    }
+
+    #[test]
+    fn llq_burst_fills_ring_then_drains() {
+        let (bus, mut ena) = up(false);
+        bus.st().stall_tx = true;
+        bus.st().loopback = false;
+        let f = frame(1, 1);
+        let mut n = 0;
+        while ena.send(&f) { n += 1; assert!(n <= TX_DEPTH as usize); }
+        assert_eq!(n, TX_DEPTH as usize);
+        bus.st().release_tx();
+        assert!(ena.tx_ready());
+        // Wrap the LLQ ring several times in bursts.
+        bus.st().loopback = true;
+        let mut buf = vec![0u8; 2048];
+        for round in 0..100usize {
+            let mut sent = 0;
+            for k in 0..100usize { if ena.send(&frame(round * 100 + k, 2)) { sent += 1; } }
+            let mut got = 0;
+            while ena.recv(&mut buf).is_some() { got += 1; }
+            assert_eq!(sent, got);
+        }
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
+    }
+
+    #[test]
+    fn llq_writes_are_fenced_before_the_doorbell() {
+        let (bus, mut ena) = up(false);
+        for n in 0..50 { assert!(ena.send(&frame(n, 1))); }
+        assert!(!bus.st().unfenced);
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
+    }
+
+    #[test]
+    fn llq_survives_reset() {
+        let (bus, mut ena) = up(false);
+        bus.advance_ms(7000);
+        assert_eq!(ena.watchdog(), Watchdog::Reset("keep-alive timeout"));
+        assert!(ena.llq_active());
+        let mut buf = vec![0u8; 2048];
+        for n in 0..400 { let f = frame(n, 4); assert!(ena.send(&f)); assert_eq!(ena.recv(&mut buf).unwrap(), f.len().max(60)); }
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
+    }
+
+    #[test]
+    fn llq_depth_is_clamped_to_device_max() {
+        let bus = MockBus::new(false);
+        bus.st().llq_max_depth = 64;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.init().unwrap();
+        assert!(ena.llq_active());
+        assert_eq!(bus.st().tx.depth, 64);
+        let mut buf = vec![0u8; 2048];
+        for n in 0..500 { let f = frame(n, 8); assert!(ena.send(&f)); assert!(ena.recv(&mut buf).is_some()); }
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
+    }
+
+    fn host_mode_works(bus: &MockBus, ena: &mut Ena<MockBus>) {
+        assert!(!ena.llq_active());
+        assert_eq!(bus.st().sq_placements.last().copied(), Some((2, 1)));
+        assert!(bus.st().sq_placements.iter().all(|p| p.1 == 1));
+        let mut buf = vec![0u8; 2048];
+        for n in 0..10_000usize {
+            let f = frame(n, 13);
+            assert!(ena.send(&f));
+            assert_eq!(ena.recv(&mut buf).unwrap(), f.len().max(MIN_FRAME));
+            assert_eq!(&buf[..f.len()], &f[..]);
+        }
+        let st = bus.st();
+        assert!(st.violations.is_empty(), "{:?}", st.violations);
+        assert_eq!((st.llq_frames, st.host_sq_frames), (0, 10_000));
+    }
+
+    #[test]
+    fn fallback_device_without_llq() {
+        let bus = MockBus::new(false);
+        bus.st().llq_offered = false;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.init().unwrap();
+        assert!(ena.info.llq.is_none());
+        host_mode_works(&bus, &mut ena);
+    }
+
+    #[test]
+    fn fallback_llq_disabled_by_knob() {
+        let bus = MockBus::new(false);
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.set_llq_allowed(false);
+        ena.init().unwrap();
+        assert!(!bus.st().cmds.contains(&(op::SET_FEATURE, feat::LLQ)));
+        host_mode_works(&bus, &mut ena);
+    }
+
+    #[test]
+    fn fallback_no_bar2() {
+        let bus = MockBus::new(false);
+        bus.st().bar2_present = false;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.init().unwrap();
+        host_mode_works(&bus, &mut ena);
+    }
+
+    #[test]
+    fn fallback_unusable_caps() {
+        let bus = MockBus::new(false);
+        bus.st().llq_loc = 2; // header in a separate buffer only
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.init().unwrap();
+        host_mode_works(&bus, &mut ena);
+    }
+
+    #[test]
+    fn fallback_when_device_refuses_dev_sq() {
+        let bus = MockBus::new(false);
+        bus.st().llq_fail_create = true;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.init().expect("falls back to host placement after the refusal");
+        assert!(bus.st().sq_placements.contains(&(1, 3)), "LLQ was attempted first");
+        assert!(!ena.llq_active());
+        let mut buf = vec![0u8; 2048];
+        for n in 0..300 { let f = frame(n, 2); assert!(ena.send(&f)); assert!(ena.recv(&mut buf).is_some()); }
+        assert_eq!(bus.st().llq_frames, 0);
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
     }
 
     #[test]

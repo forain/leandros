@@ -878,6 +878,7 @@ mod test_ipv4 {
         let data = &*packet.into_inner();
 
         let icmp_repr = Icmpv4Repr::DstUnreachable {
+            mtu: 0,
             reason: Icmpv4DstUnreachable::PortUnreachable,
             header: Ipv4Repr {
                 src_addr: LOCAL_IPV4,

@@ -208,6 +208,8 @@ const ICMP6_FILTER: usize = 1;
 const IPV6_UNICAST_HOPS: usize = 16;
 const IPV6_MULTICAST_HOPS: usize = 18;
 const IPV6_RECVERR: usize = 25;
+const IPV6_MTU_DISCOVER: usize = 23;
+const IPV6_MTU: usize = 24;
 const IPV6_RECVPKTINFO: usize = 49;
 const IPV6_PKTINFO: usize = 50;
 const IPV6_RECVHOPLIMIT: usize = 51;
@@ -240,7 +242,9 @@ const IPV6_V6ONLY:   usize = 26;
 const IP_TOS:        usize = 1;
 const IP_TTL:        usize = 2;
 const IP_PKTINFO:    usize = 8;
+const IP_MTU_DISCOVER: usize = 10;
 const IP_RECVERR:    usize = 11;
+const IP_MTU:        usize = 14;
 const IP_RECVTTL:    usize = 12;
 const IP_RECVTOS:    usize = 13;
 const IP_MULTICAST_IF:   usize = 32;
@@ -1306,6 +1310,8 @@ struct SockOpts {
     /// IP_TTL (0 = default, 64) and IP_TOS (recorded and read back).
     ttl:       u8,
     tos:       u8,
+    /// IP_MTU_DISCOVER + 1 (0 = never set: Linux's default, IP_PMTUDISC_WANT).
+    pmtud1:    u8,
     /// Ancillary data recvmsg adds (`RECV_*`): IP_PKTINFO, IP_RECVTOS,
     /// IP_RECVTTL, UDP_GRO; and IP_RECVERR (accepted, read back).
     recv:      u8,
@@ -1356,10 +1362,36 @@ const RECV6_ERR: u8 = 8;
 const BIND_ADDR_LOCK: u8 = 1;
 const BIND_PORT_LOCK: u8 = 2;
 
+/// The path MTU towards `d` over stack `sid`: the link's, or what an ICMP
+/// "fragmentation needed" / ICMPv6 "packet too big" taught the cache (scoped
+/// to the stack, hence the network namespace), if smaller.
+fn path_mtu_ip(sid: Sid, d: IpAddress) -> u32 {
+    let link: u32 = if sid == iface::LO { 65536 } else {
+        // A namespace's own loopback (a dynamic sid) is as big as lo.
+        match vif::VIFS.lock().get(sid as usize).and_then(|x| x.as_ref()) {
+            Some(x) if matches!(x.kind, vif::VifKind::Lo) => x.mtu as u32,
+            _ => 1500,
+        }
+    };
+    let now = sched::monotonic_ns() / 1_000_000;
+    let key = match d {
+        IpAddress::Ipv4(a) => smoltcp::pmtu::v4(a.0),
+        IpAddress::Ipv6(a) => a.0,
+    };
+    match smoltcp::pmtu::lookup(sid as u16, key, now) {
+        Some(m) => link.min(m as u32),
+        None => link,
+    }
+}
+
+fn path_mtu(sid: Sid, d: smoltcp::wire::Ipv4Address) -> u32 { path_mtu_ip(sid, IpAddress::Ipv4(d)) }
+
 impl SockOpts {
+    /// IP_MTU_DISCOVER as Linux reports it (default IP_PMTUDISC_WANT).
+    fn pmtud_mode(&self) -> u8 { if self.pmtud1 == 0 { 1 } else { self.pmtud1 - 1 } }
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
-                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
+                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0,
                                  recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
@@ -3415,6 +3447,9 @@ fn init_nic(nif: drivers::netdev::Netif) {
         inet_seq: alloc::collections::BTreeMap::new(),
     };
     let sid = iface::sid_of(nif.id);
+    let mut stack = stack;
+    stack.interface.set_pmtu_scope(sid as u16);
+    smoltcp::pmtu::clear_scope(sid as u16);
     *stack_for(sid) = Some(stack);
     // A stack built after sockets that belong on every stack (wifi0: the
     // MAC comes late) takes them over; at boot there are none yet.
@@ -3431,7 +3466,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
 /// to work on a guest with no network device at all.
 fn init_loopback() {
-    *stack_for(LO) = Some(make_loopback_stack());
+    { let mut st = make_loopback_stack(); st.interface.set_pmtu_scope(LO as u16); *stack_for(LO) = Some(st); }
     extern "C" { fn arch_serial_putc(b: u8); }
     let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
     for &b in msg { unsafe { arch_serial_putc(b); } }
@@ -5804,6 +5839,19 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     meta.hop_limit = if mcast { Some(opts.mc_ttl) }
                                      else if opts.ttl != 0 { Some(opts.ttl) } else { None };
                     meta.meta.tos = opts.tos;
+                    // Path-MTU discovery (IP_MTU_DISCOVER): DONT sends without
+                    // DF; DO / PROBE refuse a datagram larger than the path.
+                    let pd = opts.pmtud_mode();
+                    if pd == 0 { meta.meta.nodf = true; }
+                    if let (IpAddress::Ipv4(d), true) = (endpoint.addr, pd >= 2) {
+                        if data.len() + 28 > path_mtu(sid, d) as usize { return err_reply(-90); } // EMSGSIZE
+                    }
+                    // IPv6 never fragments in the path and this stack does not
+                    // fragment at the source: DO / PROBE refuse a datagram
+                    // larger than the path (RFC 8201).
+                    if let (IpAddress::Ipv6(_), true) = (endpoint.addr, pd >= 2) {
+                        if data.len() + 48 > path_mtu_ip(sid, endpoint.addr) as usize { return err_reply(-90); }
+                    }
                     // A copy for this host: multicast unless IP_MULTICAST_LOOP
                     // is off, broadcast always (Linux ip_mc_output). Built
                     // before the send, while the socket's port and the
@@ -7777,6 +7825,10 @@ fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optle
         IPV6_RECVHOPLIMIT => flag(&mut o, RECV6_HOPLIMIT),
         IPV6_RECVTCLASS => flag(&mut o, RECV6_TCLASS),
         IPV6_RECVERR => flag(&mut o, RECV6_ERR),
+        IPV6_MTU_DISCOVER => match v {
+            0..=3 => o.pmtud1 = v as u8 + 1,
+            _ => return err_reply(-22),
+        },
         // Sticky pktinfo (source address / interface choice) is accepted, not used.
         IPV6_PKTINFO => if optlen < 20 { return err_reply(-22) },
         _ => return ok_reply(),
@@ -7819,6 +7871,11 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
         IP_TTL => match int_val() {
             Ok(-1) => o.ttl = 0,
             Ok(v) if (1..=255).contains(&v) => o.ttl = v as u8,
+            Ok(_) => return err_reply(-22),
+            Err(x) => return err_reply(x),
+        },
+        IP_MTU_DISCOVER => match int_val() {
+            Ok(v) if (0..=3).contains(&v) => o.pmtud1 = v as u8 + 1,
             Ok(_) => return err_reply(-22),
             Err(x) => return err_reply(x),
         },
@@ -7900,6 +7957,18 @@ fn ip_getsockopt(e: &SockEntry, optname: usize) -> Option<u32> {
     Some(match optname {
         IP_TOS => o.tos as u32,
         IP_TTL => if o.ttl == 0 { 64 } else { o.ttl as u32 },
+        IP_MTU_DISCOVER => o.pmtud_mode() as u32,
+        // Connected sockets only (Linux: ENOTCONN, which this reports as ENOPROTOOPT).
+        IP_MTU => match e.state {
+            SockState::InetConnected { socket_handle, sid, .. } if is_udp_entry(e) => {
+                let peer = stack_for(sid).as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).peer());
+                match peer {
+                    Some(IpEndpoint { addr: IpAddress::Ipv4(d), .. }) => path_mtu(sid, d),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
         IP_PKTINFO => (o.recv & RECV_PKTINFO != 0) as u32,
         IP_RECVTTL => (o.recv & RECV_TTL != 0) as u32,
         IP_RECVTOS => (o.recv & RECV_TOS != 0) as u32,
@@ -8044,6 +8113,17 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                     IPV6_RECVHOPLIMIT => Some((o.recv6 & RECV6_HOPLIMIT != 0) as u32),
                     IPV6_RECVTCLASS => Some((o.recv6 & RECV6_TCLASS != 0) as u32),
                     IPV6_RECVERR => Some((o.recv6 & RECV6_ERR != 0) as u32),
+                    IPV6_MTU_DISCOVER => Some(o.pmtud_mode() as u32),
+                    IPV6_MTU => match e.state {
+                        SockState::InetConnected { socket_handle, sid, .. } if is_udp_entry(&e) => {
+                            let peer = stack_for(sid).as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).peer());
+                            match peer {
+                                Some(IpEndpoint { addr: a @ IpAddress::Ipv6(_), .. }) => Some(path_mtu_ip(sid, a)),
+                                _ => None,
+                            }
+                        }
+                        _ => return err_reply(-107), // ENOTCONN
+                    },
                     _ => None,
                 }
             }
@@ -8084,6 +8164,11 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             if !wr_user(optlen_ptr, n as u32) { return err_reply(-14); }
             return ok_reply();
         }
+        // IP_MTU on a socket with no peer: ENOTCONN, as Linux.
+        if level == IPPROTO_IP && optname == IP_MTU && is_inet(e.domain)
+            && !matches!(e.state, SockState::InetConnected { .. }) {
+            return err_reply(-107);
+        }
         // IP_MULTICAST_IF answers a struct in_addr.
         if level == IPPROTO_IP && optname == IP_MULTICAST_IF && is_inet(e.domain) {
             let a = sock_opts(e.ofd).mc_addr;
@@ -8118,9 +8203,17 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             b[0] = st;
             let put = |b: &mut [u8; TCP_INFO_LEN], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_ne_bytes());
             put(&mut b, 8, 200_000);   // rto (us)
-            put(&mut b, 16, 1448);     // snd_mss
+            // The path MTU the cache knows (ICMP frag-needed / packet-too-big)
+            // clamps the sender's segment size, as tcp_sync_mss does.
+            let pmtu = match e.state {
+                SockState::InetConnected { sid, remote_endpoint: Some(r), .. } =>
+                    path_mtu_ip(sid, r.addr).min(1500),
+                _ => 1500,
+            };
+            let hdr = if matches!(e.state, SockState::InetConnected { remote_endpoint: Some(IpEndpoint { addr: IpAddress::Ipv6(_), .. }), .. }) { 72 } else { 52 };
+            put(&mut b, 16, (pmtu - hdr).min(1448)); // snd_mss
             put(&mut b, 20, 1448);     // rcv_mss
-            put(&mut b, 60, 1500);     // pmtu
+            put(&mut b, 60, pmtu);     // pmtu
             put(&mut b, 68, 1000);     // rtt (us)
             put(&mut b, 80, 10);       // snd_cwnd
             put(&mut b, 84, 1460);     // advmss

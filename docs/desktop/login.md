@@ -178,6 +178,11 @@ application ABI in Rust, backed by the same `$sha256$<salt>$<hex>` `/etc/shadow`
   both, which made it a link failure for greetd rather than a runtime one.
 - **`open_session` / `setcred` are stubs, correctly.** Those were predicted to be the
   most likely to matter and were neither.
+- **A failed `pam_authenticate` is rate limited.** It stalls 1 s by default (Linux-PAM's
+  `pam_unix` uses about 2 s, `login` about 3 s); `pam_fail_delay` is honoured (the longest
+  request wins, capped at 10 s). `/bin/login` does not use PAM but applies the same 1 s
+  stall after each wrong attempt. `sudotest` drives the ABI directly and `/bin/login`
+  (wrong, then right) to guard both.
 - **An rlib, not a staticlib.** A Rust `staticlib` embeds its own `std`; linking one into
   greetd duplicates every `std` symbol. As an rlib, its `#[no_mangle] extern "C"`
   definitions resolve `pam-sys`'s references exactly as `libpam.a` would; `build.sh` puts

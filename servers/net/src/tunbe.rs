@@ -164,7 +164,9 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
     let mut dev = TapDev { rx: VecDeque::new(), tx: Vec::new(), mtu: 1500 };
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = sched::ticks() ^ sched::monotonic_ns();
-    let interface = Interface::new(config, &mut dev, stack_now());
+    let mut interface = Interface::new(config, &mut dev, stack_now());
+    interface.set_pmtu_scope(sid as u16);
+    smoltcp::pmtu::clear_scope(sid as u16);
     *stack_for(sid) = Some(NetStack {
         interface,
         socket_set: SocketSet::new(alloc::vec![]),

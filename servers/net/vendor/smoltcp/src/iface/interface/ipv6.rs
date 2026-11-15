@@ -252,6 +252,14 @@ impl InterfaceInner {
                 _ => unreachable!(),
             },
 
+            // LEANDROS: RFC 8201 -- a "packet too big" teaches the path MTU
+            // towards the quoted datagram's destination.
+            Icmpv6Repr::PktTooBig { mtu, header, .. } => {
+                let m = mtu.min(u16::MAX as u32) as u16;
+                crate::pmtu::update(self.pmtu_scope, header.dst_addr.0, m, crate::pmtu::MIN_PMTU6, self.now.total_millis() as u64);
+                None
+            }
+
             // Don't report an error if a packet with unknown type
             // has been handled by an ICMP socket
             #[cfg(feature = "socket-icmp")]

@@ -93,6 +93,9 @@ pub mod wifi_caps {
     pub const SCAN_CONNECTED: u32 = 1 << 8;
     /// Directed (hidden-SSID) probes.
     pub const DIRECTED_SCAN: u32 = 1 << 9;
+    /// Can reassociate to another BSS of the same ESS without leaving first
+    /// (the connection manager then roams on its own).
+    pub const ROAM: u32 = 1 << 10;
 }
 
 /// Authentication and key management, as an enumeration (profiles, connect,
