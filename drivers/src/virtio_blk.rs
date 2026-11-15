@@ -268,6 +268,22 @@ impl VirtQueue {
         let last = self.last_used_idx;
         let armed = armed && !BLK_IRQ_DEAD.load(core::sync::atomic::Ordering::Relaxed);
         let irq0 = BLK_IRQS.load(core::sync::atomic::Ordering::Relaxed);
+        let mut armed = armed;
+        if armed {
+            // Hybrid wait: most requests finish within microseconds, and a
+            // wfi/IPI wake costs far more than that. Spin first; park only
+            // when the device is slower than the window.
+            let win = spin_window_ns();
+            let s0 = sched::monotonic_ns();
+            let mut n = 0u32;
+            while self.last_used_idx == used_idx.read_volatile() {
+                core::hint::spin_loop();
+                n = n.wrapping_add(1);
+                if n % 16 == 0 && sched::monotonic_ns().saturating_sub(s0) >= win { break; }
+            }
+            if self.last_used_idx != used_idx.read_volatile() { armed = false; }
+        }
+        let parked = armed;
         let _w = if armed { Some(WaitingCpu::enter()) } else { None };
         let mut warn_at = slow_ns;
         let mut slow = false;
@@ -297,7 +313,7 @@ impl VirtQueue {
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        if armed { irq_health(BLK_IRQS.load(core::sync::atomic::Ordering::Relaxed) != irq0); }
+        if parked { irq_health(BLK_IRQS.load(core::sync::atomic::Ordering::Relaxed) != irq0); }
         Ok(slow)
     }
 }
@@ -331,19 +347,8 @@ static BLK_IRQ_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 const IRQ_MISS_LIMIT: u32 = 64;
 
 /// Record whether a parked wait saw its completion interrupt.
-static DBG_W: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static DBG_M: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 fn irq_health(saw_irq: bool) {
     use core::sync::atomic::Ordering::Relaxed;
-    let w = DBG_W.fetch_add(1, Relaxed) + 1;
-    if !saw_irq { DBG_M.fetch_add(1, Relaxed); }
-    if w % 256 == 0 {
-        crate::kenv::pci::serial_debug("[VIRTIO-BLK] DBG waits ");
-        crate::kenv::pci::serial_debug_hex(w);
-        crate::kenv::pci::serial_debug(" no-irq ");
-        crate::kenv::pci::serial_debug_hex(DBG_M.load(Relaxed));
-        crate::kenv::pci::serial_debug("\n");
-    }
     if saw_irq { BLK_IRQ_MISSES.store(0, Relaxed); return; }
     if BLK_IRQ_MISSES.fetch_add(1, Relaxed) + 1 == IRQ_MISS_LIMIT {
         BLK_IRQ_DEAD.store(true, Relaxed);
@@ -366,6 +371,19 @@ fn irq_knob_on() -> bool {
             on
         }
     }
+}
+
+/// `virtio_blk.spin_us=N`: a waiter polls the used ring this long before it
+/// parks on the completion interrupt (default 50). Read lazily like `irq`.
+fn spin_window_ns() -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    static NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+    let v = NS.load(Relaxed);
+    if v != u64::MAX { return v; }
+    let us = crate::kenv::cmdline_word("virtio_blk.spin_us")
+        .and_then(|w| w.parse::<u64>().ok()).unwrap_or(50).min(100_000);
+    NS.store(us * 1000, Relaxed);
+    us * 1000
 }
 
 /// Registers this CPU as a parked waiter for the guard's lifetime.
