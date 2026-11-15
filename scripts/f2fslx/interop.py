@@ -731,7 +731,7 @@ timeout 180 fsck.f2fs --dry-run l.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?;
                 if kind == "data" and not re.search(rf"recover_data: ino = {h}\b.*recovered = [1-9]", out): bad.append(f"{f}: no recover_data")
             for f in sc.get("absent", []):
                 if re.search(rf"recover_(inode|data): ino = {'%x' % ino_of.get(f, -1)}\b", out): bad.append(f"{f}: replayed")
-            step(v, "E.replay", not bad, "dmesg shows the chain replayed per file" if not bad else "; ".join(bad) + " | " + " / ".join(l for l in out.splitlines() if "recover_" in l)[-160:])
+            step(v, "E.replay", not bad, "dmesg shows the chain replayed per file" if not bad else "; ".join(bad) + " | want " + str(ino_of) + " got " + " ".join(sorted(set(re.findall(r"recover_(?:inode|data): ino = (\w+)", out)))) + " " + " / ".join(l[-60:] for l in out.splitlines() if "recover_" in l)[-120:])
         back = os.path.join(tmp, f"e-{name}.back")
         if ok and fetch(f"{rd}/l.img", back):
             ok2 = e_guest_check(back, exp, "E3")
