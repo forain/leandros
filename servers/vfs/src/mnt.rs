@@ -1106,6 +1106,8 @@ pub struct Alias {
     pub device: Vec<u8>,
     /// Per-mount `MNT_RDONLY | MNT_NODEV | MNT_NOEXEC` (enforced like a non-zero namespace's mount).
     pub flags: u8,
+    /// Unique, monotonically increasing mount generation (what fds record).
+    pub gen: u32,
 }
 
 /// The per-mount flags ns-0 mounts can carry and the VFS/exec paths enforce.
@@ -1113,7 +1115,22 @@ pub const ENFORCED: u8 = super::MNT_RDONLY | super::MNT_NODEV | super::MNT_NOEXE
 
 static ALIASES: Mutex<Vec<Alias>> = Mutex::new(Vec::new());
 /// Mount points created by binding a path onto itself, with their flags.
-static SELF_BINDS: Mutex<Vec<(Vec<u8>, u8)>> = Mutex::new(Vec::new());
+static SELF_BINDS: Mutex<Vec<(Vec<u8>, u8, u32)>> = Mutex::new(Vec::new());
+/// Generation counter for ns-0 mounts; never reused.
+static MNT_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+/// Flags of recently detached flagged mounts `(id, flags)`, so an fd opened
+/// under them keeps its flags (Linux keeps the detached vfsmount). Bounded; oldest dropped.
+static DETACHED: Mutex<Vec<(u32, u8)>> = Mutex::new(Vec::new());
+const MAX_DETACHED: usize = 256;
+
+fn next_id() -> u32 { (MNT_GEN.fetch_add(1, Ordering::Relaxed) & 0x7fff_ffff) | 0x8000_0000 }
+fn detach(id: u32, flags: u8) {
+    let flags = flags & ENFORCED;
+    if flags == 0 { return; }
+    let mut d = DETACHED.lock();
+    if d.len() >= MAX_DETACHED { d.remove(0); }
+    d.push((id, flags));
+}
 /// Number of ns-0 mounts (aliases + self-binds) with nonzero flags.
 static FLAGGED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1137,31 +1154,24 @@ pub fn flags_at(p: &[u8]) -> u8 {
     best.map_or(0, |b| b.1 & ENFORCED)
 }
 
-/// Identity of the ns-0 mount at `mountpoint` (what an fd records; nonzero).
-pub fn id_of(mountpoint: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in mountpoint { h ^= b as u32; h = h.wrapping_mul(0x0100_0193); }
-    h | 0x8000_0000
-}
-
 /// `(identity, flags)` of the ns-0 mount whose mount point is the longest
 /// prefix of namespace path `p`; None when `p` lies in no alias/bind mount.
 pub fn mount_at(p: &[u8]) -> Option<(u32, u8)> {
     let mut best: Option<(usize, u32, u8)> = None;
     for a in ALIASES.lock().iter() {
-        if under(p, &a.mountpoint) && best.map_or(true, |b| a.mountpoint.len() >= b.0) { best = Some((a.mountpoint.len(), id_of(&a.mountpoint), a.flags)); }
+        if under(p, &a.mountpoint) && best.map_or(true, |b| a.mountpoint.len() >= b.0) { best = Some((a.mountpoint.len(), a.gen, a.flags)); }
     }
     for m in SELF_BINDS.lock().iter() {
-        if under(p, &m.0) && best.map_or(true, |b| m.0.len() >= b.0) { best = Some((m.0.len(), id_of(&m.0), m.1)); }
+        if under(p, &m.0) && best.map_or(true, |b| m.0.len() >= b.0) { best = Some((m.0.len(), m.2, m.1)); }
     }
     best.map(|b| (b.1, b.2 & ENFORCED))
 }
 
 /// Live flags of the ns-0 mount with identity `id`; None once it is gone.
 pub fn flags_by_id(id: u32) -> Option<u8> {
-    for a in ALIASES.lock().iter() { if id_of(&a.mountpoint) == id { return Some(a.flags & ENFORCED); } }
-    for m in SELF_BINDS.lock().iter() { if id_of(&m.0) == id { return Some(m.1 & ENFORCED); } }
-    None
+    for a in ALIASES.lock().iter() { if a.gen == id { return Some(a.flags & ENFORCED); } }
+    for m in SELF_BINDS.lock().iter() { if m.2 == id { return Some(m.1 & ENFORCED); } }
+    DETACHED.lock().iter().find(|d| d.0 == id).map(|d| d.1)
 }
 
 /// Replace the flags of the mount at exactly `mountpoint`. False when none is.
@@ -1222,7 +1232,7 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
         let mut sb = SELF_BINDS.lock();
         if !sb.iter().any(|m| m.0.as_slice() == mountpoint) {
             if sb.len() >= MAX_ALIASES { return Err(-28); }
-            sb.push((mountpoint.to_vec(), 0));
+            sb.push((mountpoint.to_vec(), 0, next_id()));
         }
         return Ok(());
     }
@@ -1235,6 +1245,8 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
         a.source = source.to_vec();
         a.fstype = fstype;
         a.device = device.to_vec();
+        detach(a.gen, a.flags);
+        a.gen = next_id();
         a.flags = 0;
         if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
         if let Some(n) = crate::devpts::inst_of_backing(source) { crate::devpts::get(n); }
@@ -1245,7 +1257,7 @@ pub fn add(mountpoint: &[u8], source: &[u8], fstype: &'static str, device: &[u8]
     }
     if t.len() >= MAX_ALIASES { return Err(-28); }
     t.push(Alias { mountpoint: mountpoint.to_vec(), source: source.to_vec(), fstype,
-                   device: device.to_vec(), flags: 0 });
+                   device: device.to_vec(), flags: 0, gen: next_id() });
     ACTIVE.store(t.len(), Ordering::Release);
     // A mount holds a reference on the tmpfs instance it exposes.
     if let Some(n) = tmpfs_inst_of(source) { super::sb_get(n); }
@@ -1265,13 +1277,14 @@ pub fn tmpfs_inst_of(p: &[u8]) -> Option<u32> {
 pub fn remove(mountpoint: &[u8]) -> bool {
     {
         let mut sb = SELF_BINDS.lock();
-        if let Some(i) = sb.iter().position(|m| m.0.as_slice() == mountpoint) { sb.remove(i); drop(sb); recount(); return true; }
+        if let Some(i) = sb.iter().position(|m| m.0.as_slice() == mountpoint) { let m = sb.remove(i); drop(sb); detach(m.2, m.1); recount(); return true; }
     }
     let mut t = ALIASES.lock();
     let nsid = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| ns_src(&a.source));
     let before = t.len();
     let gone = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| crate::devpts::inst_of_backing(&a.source));
     let tmp_inst = t.iter().find(|a| a.mountpoint == mountpoint).and_then(|a| tmpfs_inst_of(&a.source));
+    if let Some(a) = t.iter().find(|a| a.mountpoint == mountpoint) { detach(a.gen, a.flags); }
     t.retain(|a| a.mountpoint != mountpoint);
     ACTIVE.store(t.len(), Ordering::Release);
     let removed = t.len() != before;

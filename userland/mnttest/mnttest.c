@@ -2631,6 +2631,22 @@ static int e7x_ns0_dirfd(int m) {
     umount("/tmp/e7x/dv");
     return rc;
 }
+static int e7x_ns0_gen(int m) {
+    (void)m;
+    int rc = 0;
+    mkdir("/tmp/e7x/gn", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/gn", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7x/gn", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount("/tmp/e7x/gn"); return 14; }
+    int d = open("/tmp/e7x/gn", O_RDONLY | O_DIRECTORY);
+    if (d < 0) { umount("/tmp/e7x/gn"); return 15; }
+    if (umount("/tmp/e7x/gn") < 0) { close(d); return 16; }
+    if (mount("/tmp/e7x/src", "/tmp/e7x/gn", NULL, MS_BIND, NULL) < 0) { close(d); return 17; }
+    errno = 0; int fd = openat(d, "gx", O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0 || errno != EROFS) { printf("  detached ro dirfd errno=%d\n", errno); rc = 18; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/gx"); } }
+    close(d);
+    umount("/tmp/e7x/gn");
+    return rc;
+}
 static void e7x_suite(void) {
     e7_mk();
     mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
@@ -2640,6 +2656,7 @@ static void e7x_suite(void) {
     report("e7_ns0_permount_flags_enforced", nn_in_child(e7x_ns0, 0));
     report("e7_ns0_mounts_show_flags", nn_in_child(e7x_ns0_view, 0));
     report("e7_ns0_dirfd_flags_live", nn_in_child(e7x_ns0_dirfd, 0));
+    report("e7_ns0_dirfd_detached_keeps_flags", nn_in_child(e7x_ns0_gen, 0));
     system("rm -rf /tmp/e7 /tmp/e7x");
 }
 
