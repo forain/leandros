@@ -68,7 +68,7 @@ if [[ -z "${LEANDROS_M5_SHIP:-}" ]]; then
     _gc="$(git -C "$ROOT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || _gc=""
     if [[ -n "$_gc" && "$(cd "$ROOT_DIR" && pwd -P)" != "$(cd "$(dirname "$_gc")" && pwd -P)" && -d "$_m5_main" ]]; then
         _m5_wt="$_m5_main-$(basename "$ROOT_DIR")"
-        [[ -d "$_m5_wt" ]] || cp -cpR "$_m5_main" "$_m5_wt"
+        [[ -d "$_m5_wt" ]] || { cp -cpR "$_m5_main" "$_m5_wt" 2>/dev/null || cp -a "$_m5_main" "$_m5_wt"; }
         export LEANDROS_M5_SHIP="$_m5_wt"
         echo "m5 ship tree (per-worktree): $LEANDROS_M5_SHIP"
     fi
