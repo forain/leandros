@@ -57,10 +57,13 @@
 //!
 //! Completion is polled: spin for the first 200 us, then — when the caller
 //! may sleep — park in short slices, else keep spinning with interrupt
-//! windows (the `usb_storage` contract). MSI/MSI-X are deliberately unused
-//! (aarch64 has no ITS yet, and polling cannot lose a wake-up on hardware we
-//! have never booted); the log names the capabilities so a later boot can
-//! switch.
+//! windows (the `usb_storage` contract). MSI-X (x86_64 only; aarch64 waits for
+//! the ITS) is opt-in (`nvme.msix=1`): on QEMU it measured no CPU win over
+//! the polled slices (see the lane note), so it stays off by default on
+//! hardware we have never booted; `nvme.msix=0` forces polling. One MSI-X vector serves the admin queue and
+//! the I/O CQ (IV 0); the ISR only counts and wakes the waiter, and a sleeping
+//! waiter still re-checks the CQ every 2 ms, so a lost interrupt costs 2 ms,
+//! never a hang. The spin phase (first 200 us) is unchanged.
 //!
 //! A command that times out (30 s I/O, 10 s admin), or a controller fatal
 //! status (CSTS.CFS) while waiting, triggers a controller reset like Linux's
@@ -83,10 +86,12 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use crate::kenv::{mm, sched};
 use crate::kenv::sched::ksync::KMutex;
+use crate::kenv::irq::{IrqHandler, IrqReturn, MsixTable};
+use crate::kenv::IrqWait;
 
 use crate::blkdev::{self, BlkErr, BlockDevice};
 use crate::partscan;
@@ -162,6 +167,8 @@ static DISABLED: AtomicBool = AtomicBool::new(false);
 static QUIRK_AMZN: AtomicBool = AtomicBool::new(false);
 /// `nvme.rw=0` was given explicitly: keeps even an Amazon root disk read-only.
 static RW_FORCED_RO: AtomicBool = AtomicBool::new(false);
+/// `nvme.msix=`: 0 = polled, 1 = MSI-X, 2 (unset) = polled (opt-in).
+static MSIX_MODE: AtomicU8 = AtomicU8::new(2);
 /// `nvme.io_timeout=<seconds>`: I/O command timeout override (0 = default).
 static IO_TIMEOUT_S: AtomicU64 = AtomicU64::new(0);
 
@@ -177,6 +184,8 @@ fn parse_cmdline(cmdline: &str) {
             // `blk.rw=` makes the controller writable; the block registry then
             // confines writes to the listed partitions (see blkdev::policy_ro).
             t if t.starts_with("blk.rw=") && t.len() > 7 => RW.store(true, Ordering::Relaxed),
+            "nvme.msix=0" => MSIX_MODE.store(0, Ordering::Relaxed),
+            "nvme.msix=1" => MSIX_MODE.store(1, Ordering::Relaxed),
             "nvme.apst=keep" => APST_KEEP.store(true, Ordering::Relaxed),
             "nvme.shutdown=0" => SHUTDOWN_ON.store(false, Ordering::Relaxed),
             "nvme.disable=1" | "nvme=off" => DISABLED.store(true, Ordering::Relaxed),
@@ -268,6 +277,20 @@ fn mmio_wr32(a: usize, v: u32) {
 
 // ── Queues ───────────────────────────────────────────────────────────────────
 
+// ── MSI-X wake-up (one vector per controller, shared by admin and I/O CQ) ──
+
+static IRQ_WAIT: [IrqWait; MAX_CTRLS] = [const { IrqWait::new() }; MAX_CTRLS];
+static IRQ_COUNT: [AtomicU64; MAX_CTRLS] = [const { AtomicU64::new(0) }; MAX_CTRLS];
+/// Longest a sleeping waiter goes without re-checking the CQ.
+const IRQ_SLICE_MS: u64 = 2;
+
+extern "C" fn nvme_irq(ctx: usize) -> IrqReturn {
+    if ctx >= MAX_CTRLS { return IrqReturn::None; }
+    if IRQ_COUNT[ctx].fetch_add(1, Ordering::Relaxed) == 0 { serial_debug("[NVME] first MSI-X interrupt\n"); }
+    IRQ_WAIT[ctx].notify();
+    IrqReturn::Handled
+}
+
 struct Queue {
     qid: u16,
     depth: u16,
@@ -313,7 +336,7 @@ impl Queue {
 
     /// Place `cmd` in the next SQ slot, ring the doorbell and poll the CQ
     /// for completion `cid`.
-    fn run(&mut self, regs: usize, sq_db: usize, cq_db: usize, cmd: &Cmd, cid: u16, timeout_ns: u64) -> Result<u32, CmdErr> {
+    fn run(&mut self, regs: usize, sq_db: usize, cq_db: usize, cmd: &Cmd, cid: u16, timeout_ns: u64, irq: Option<usize>) -> Result<u32, CmdErr> {
         unsafe {
             let slot = self.sq.add(self.sq_tail as usize * 16);
             for (i, &d) in cmd.0.iter().enumerate() { slot.add(i).write_volatile(d); }
@@ -326,6 +349,7 @@ impl Queue {
         let t0 = sched::monotonic_ns();
         let mut spins = 0u32;
         let mut warned = false;
+        let mut seen = 0u64;
         loop {
             let e = unsafe { self.cq.add(self.cq_head as usize * 4) };
             let dw3 = unsafe { e.add(3).read_volatile() };
@@ -367,6 +391,11 @@ impl Queue {
                 return Err(CmdErr::Timeout);
             }
             if w.sleepable && waited > 200_000 {
+                if let Some(ix) = irq {
+                    // Interrupt-driven: park until the CQ interrupt (or the safety slice).
+                    IRQ_WAIT[ix].wait(&mut seen, IRQ_SLICE_MS);
+                    continue;
+                }
                 crate::kenv::sleep_until(now + (waited / 8).clamp(50_000, 1_000_000));
                 continue;
             }
@@ -473,6 +502,8 @@ struct CtrlState {
     /// APST was turned off at bring-up; a reset restores the firmware
     /// default, so it is turned off again.
     apst_off: bool,
+    /// Index into `IRQ_WAIT` when the controller runs on MSI-X.
+    irq: Option<usize>,
 }
 
 unsafe impl Send for CtrlState {}
@@ -557,6 +588,8 @@ struct Ctrl {
     flushes: AtomicU64,
     max_ns: AtomicU64,
     errors: AtomicU64,
+    /// The controller runs on MSI-X (statistics line).
+    msix_on: AtomicBool,
 }
 
 impl CtrlState {
@@ -630,7 +663,7 @@ impl CtrlState {
         }
         let _ = self.submit(false, Cmd::new(ADM_SET_FEATURES, 0).dw(10, FEAT_NUM_QUEUES).dw(11, 0), ADMIN_TIMEOUT_NS);
         let qsz = ((depth as u32 - 1) << 16) | 1;
-        let r = self.submit(false, Cmd::new(ADM_CREATE_CQ, 0).prp(cq_phys as u64, 0).dw(10, qsz).dw(11, 1), ADMIN_TIMEOUT_NS)
+        let r = self.submit(false, Cmd::new(ADM_CREATE_CQ, 0).prp(cq_phys as u64, 0).dw(10, qsz).dw(11, if self.irq.is_some() { 3 } else { 1 }), ADMIN_TIMEOUT_NS)
             .and_then(|_| self.submit(false, Cmd::new(ADM_CREATE_SQ, 0).prp(sq_phys as u64, 0).dw(10, qsz).dw(11, (1 << 16) | 1), ADMIN_TIMEOUT_NS));
         if r.is_err() { self.dead = true; return Err("re-creating I/O queue pair 1 failed"); }
         Ok(())
@@ -646,8 +679,9 @@ impl CtrlState {
         cmd.0[0] = (cmd.0[0] & 0xFFFF) | (cid as u32) << 16;
         let qid = if io { 1 } else { 0 };
         let (regs, sq_db, cq_db) = (self.regs, self.sq_doorbell(qid), self.cq_doorbell(qid));
+        let irq = self.irq;
         let q = if io { self.io.as_mut().unwrap() } else { &mut self.admin };
-        let r = q.run(regs, sq_db, cq_db, &cmd, cid, timeout_ns);
+        let r = q.run(regs, sq_db, cq_db, &cmd, cid, timeout_ns, irq);
         if matches!(r, Err(CmdErr::Timeout) | Err(CmdErr::Dead)) { self.dead = true; }
         r
     }
@@ -951,6 +985,7 @@ fn probe(dev: &PciDevice, index: usize) {
         can_reset: false,
         resets: 0,
         apst_off: false,
+        irq: None,
     };
 
     // Mask every vector (pin-based / single MSI): we poll.
@@ -1108,8 +1143,24 @@ fn probe(dev: &PciDevice, index: usize) {
         None => { nlog!("nvme{}: out of memory for the I/O queue; skipped", index); disable(&st, to_ms); return; }
     };
     let qsz = ((io_depth as u32 - 1) << 16) | 1;
-    // CQ: physically contiguous, interrupts disabled (IEN = 0).
-    if let Err(e) = st.admin(Cmd::new(ADM_CREATE_CQ, 0).prp(ioq.cq_phys as u64, 0).dw(10, qsz).dw(11, 1)) {
+    // MSI-X (x86_64): one vector for the admin CQ and the I/O CQ.
+    let want_msix = match MSIX_MODE.load(Ordering::Relaxed) { 0 => false, 1 => true, _ => false };
+    if want_msix && cfg!(target_arch = "x86_64") && index < MAX_CTRLS && msix.is_some() {
+        match MsixTable::enable(f) {
+            Ok(tab) => match tab.request(0, nvme_irq as IrqHandler, index) {
+                Ok(h) => {
+                    nlog!("nvme{}: MSI-X vector 0 -> IDT vector {:#x} (admin + I/O CQ)", index, h.vector().unwrap_or(0));
+                    st.irq = Some(index);
+                }
+                Err(_) => nlog!("nvme{}: MSI-X vector request refused; polled", index),
+            },
+            Err(_) => nlog!("nvme{}: MSI-X enable failed; polled", index),
+        }
+    } else if want_msix {
+        nlog!("nvme{}: MSI-X not available here; polled", index);
+    }
+    // CQ: physically contiguous; IEN set only in MSI-X mode (IV 0).
+    if let Err(e) = st.admin(Cmd::new(ADM_CREATE_CQ, 0).prp(ioq.cq_phys as u64, 0).dw(10, qsz).dw(11, if st.irq.is_some() { 3 } else { 1 })) {
         nlog!("nvme{}: Create I/O CQ failed: {}; skipped", index, e);
         disable(&st, to_ms);
         return;
@@ -1121,7 +1172,7 @@ fn probe(dev: &PciDevice, index: usize) {
     }
     st.io = Some(ioq);
     st.can_reset = true;
-    nlog!("nvme{}: I/O queue pair 1 created (depth {}, polled) in {} us", index, io_depth, us_since(t));
+    nlog!("nvme{}: I/O queue pair 1 created (depth {}, {}) in {} us", index, io_depth, if st.irq.is_some() { "MSI-X" } else { "polled" }, us_since(t));
 
     // ── Namespaces.
     let mut nsids: Vec<u32> = Vec::new();
@@ -1186,6 +1237,7 @@ fn probe(dev: &PciDevice, index: usize) {
         ident.elen = fill(&mut ident.ebs, &e);
         nlog!("nvme{}: Amazon device name \"{}\", volume \"{}\"", index, id_str(&idc[3072..3104]), serial);
     }
+    let msix_on = st.irq.is_some();
     let ctrl: &'static Ctrl = Box::leak(Box::new(Ctrl {
         st: KMutex::new(st),
         index,
@@ -1199,6 +1251,7 @@ fn probe(dev: &PciDevice, index: usize) {
         ident,
         read_only: AtomicBool::new(read_only),
         warned_ro: AtomicBool::new(false),
+        msix_on: AtomicBool::new(msix_on),
         rd_cmds: AtomicU64::new(0),
         rd_bytes: AtomicU64::new(0),
         wr_cmds: AtomicU64::new(0),
@@ -1393,6 +1446,7 @@ pub fn shutdown_all() {
     let ctrls: Vec<&'static Ctrl> = match CTRLS.try_lock() { Some(c) => c.clone(), None => return };
     for c in ctrls {
         let mib = |b: u64| b / (1024 * 1024);
+        if c.msix_on.load(Ordering::Relaxed) { nlog!("nvme{}: MSI-X interrupts since boot: {}", c.index, IRQ_COUNT[c.index].load(Ordering::Relaxed)); }
         nlog!("nvme{}: I/O since boot: {} reads ({} MiB), {} writes ({} MiB), {} flushes, {} errors, slowest command {} us",
             c.index, c.rd_cmds.load(Ordering::Relaxed), mib(c.rd_bytes.load(Ordering::Relaxed)),
             c.wr_cmds.load(Ordering::Relaxed), mib(c.wr_bytes.load(Ordering::Relaxed)),
