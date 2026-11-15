@@ -14,4 +14,9 @@ sleep 1; touch "$P/out/aarch64/.stamp"
 (LEANDROS_ALLOW_STALE_PORTS=1 stage_container_port "$P" aarch64 zz Zz ZZ >/dev/null 2>&1) || { echo "FAIL: override"; rc=1; }
 (port_failed busd aarch64 x >/dev/null 2>&1) && { echo "FAIL: port failure not fatal"; rc=1; }
 (LEANDROS_OPTIONAL_PORTS=a,busd port_failed busd aarch64 x >/dev/null 2>&1) || { echo "FAIL: optional port fatal"; rc=1; }
+# hash-proven freshness survives a checkout that touches every source file
+echo x > "$P/a"; leandros_port_record "$P" aarch64; sleep 1; touch "$P/a" "$P/build.sh"
+(stage_container_port "$P" aarch64 zz Zz ZZ >/dev/null 2>&1) || { echo "FAIL: hash-fresh tree rejected after touch"; rc=1; }
+echo y > "$P/a"
+(stage_container_port "$P" aarch64 zz Zz ZZ >/dev/null 2>&1) && { echo "FAIL: changed source accepted"; rc=1; }
 rm -rf "$T"; [ $rc = 0 ] && echo "build guards OK"; exit $rc

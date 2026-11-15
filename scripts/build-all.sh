@@ -535,6 +535,7 @@ stage_container_port() {
     if leandros_pick_alpine; then
         echo "  Alpine backend: $ALPINE_BACKEND ($ALPINE_TOOL)"
         if "$port/build.sh" "$arch"; then
+            leandros_port_record "$port" "$arch"
             return 0
         fi
         echo "⚠️  $label $arch staging failed"

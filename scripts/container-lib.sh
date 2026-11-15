@@ -84,10 +84,30 @@ leandros_pick_container() {
   return 1
 }
 
-# leandros_port_fresh PORTDIR ARCH: true iff PORTDIR/out/ARCH/.stamp exists and no
-# file of the port (outside out/) is newer than it.
+# leandros_port_srchash PORTDIR: content hash of every file of the port outside
+# out/ (paths + bytes, mtime-independent: a fresh git checkout touches every file).
+leandros_port_srchash() {
+  ( cd "$1" && find . -path ./out -prune -o -type f -print | LC_ALL=C sort \
+      | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done \
+      | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1 )
+}
+
+# leandros_port_record PORTDIR ARCH: after a successful build, record the source
+# hash the tree was built from, so any machine can prove the tree is current.
+leandros_port_record() {
+  [ -d "$1/out/$2" ] && leandros_port_srchash "$1" > "$1/out/$2/.srchash"
+}
+
+# leandros_port_fresh PORTDIR ARCH: true iff out/ARCH is provably current: its
+# .srchash equals the port's current source hash (works across checkouts and
+# machines, e.g. trees shipped to the box); a tree without .srchash falls back to
+# "stamp newer than every file of the port" (valid only inside one checkout).
 leandros_port_fresh() {
   [ -f "$1/out/$2/.stamp" ] || return 1
+  if [ -f "$1/out/$2/.srchash" ]; then
+    [ "$(cat "$1/out/$2/.srchash")" = "$(leandros_port_srchash "$1")" ]
+    return
+  fi
   [ -z "$(find "$1" -path "$1/out" -prune -o -type f -newer "$1/out/$2/.stamp" -print 2>/dev/null | head -n 1)" ]
 }
 
