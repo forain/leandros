@@ -56,6 +56,23 @@ pub mod input {
     pub fn vt_handoff_stats() -> (u64, u64) { crate::drm_device_interface::vt_handoff_stats() }
 }
 
+/// CPU identity and reschedule IPIs, for interrupt handlers that must wake a parked waiter on
+/// another CPU (the module build calls `kapi_cpu_id` / `kapi_kick_cpus`).
+pub mod ipi {
+    extern "C" { fn arch_send_resched_ipi(cpu: usize); }
+    pub fn cpu_id() -> usize { unsafe { ::sched::cpu_id() } }
+    /// Reschedule-IPI every CPU in `mask` except the caller's.
+    pub fn kick_cpus(mut mask: u64) {
+        let me = cpu_id();
+        if me < 64 { mask &= !(1u64 << me); }
+        while mask != 0 {
+            let c = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            unsafe { arch_send_resched_ipi(c); }
+        }
+    }
+}
+
 /// Hand a radio table to the kernel's Wi-Fi class (the module build calls `kapi_wifi_register`).
 #[cfg(feature = "wifi-stack")]
 pub fn wifi_register(ops: &crate::wifi_radio::KWifiRadioOps, ctx: usize, legacy: *const crate::wifi_radio::KLegacy) -> i32 {

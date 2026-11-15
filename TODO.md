@@ -43,7 +43,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Kernel
 - inotify L2/L3 (beyond the default-on L1).
-- **Interrupt paths**: virtio-input, virtio-net and the virtio-gpu control queue (MSI-X on x86_64, shared INTx SPI on aarch64) are interrupt-driven already. Still polled: virtio-blk (`wait_for_completion` busy-waits the used ring; callers include page faults with IRQs masked, so an IRQ/sleep path needs a masked-context fallback) and virtio-snd TX (reaped by the 100 Hz tick pump, which must run anyway to keep QEMU's stream queue non-empty, so an IRQ gains little).
 - **Synthetic sysfs**: only `/sys/class/block` (+ cgroup/kernel paths); `/sys/dev/char`, `/sys/class/drm`, `/sys/class/input` per `docs/design/k4-drm-design.md` deferred.
 - **utmpx/wtmp/lastlog**: unimplemented; establish a consumer (`who`, `w`, `last`) first.
 - **Replace the C `libpam.so.0` shim** with a Rust cdylib or Linux-PAM (decision open; guard must show wrong passwords rejected).
@@ -76,6 +75,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
 
+- **virtio-snd TX is reaped by the 100 Hz tick pump, not an interrupt** (by design): the pump must run anyway to top the queue up with silence (QEMU 11.x loses the refill wakeup for good on an empty stream queue), so an IRQ would add nothing.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
 - **fd-limit fence loss**: EMFILE in a virgl client's submit kills its context (as Linux); fd headroom is the defence.
 - **Host-refused `RING_IDX` submit is never completed by QEMU** (descriptors lost); Mesa cannot reach it. Do not rewrite RING_IDX kernel-side.

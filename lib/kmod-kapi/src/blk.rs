@@ -91,6 +91,14 @@ pub mod env {
         pub fn serial_debug_dec(v: u64) { serial_debug(&alloc::format!("{}", v)); }
     }
 
+    pub use crate::irq;
+
+    /// CPU identity and reschedule IPIs for completion handlers.
+    pub mod ipi {
+        pub fn cpu_id() -> usize { unsafe { kmod_abi::blk::sys_blk::kapi_cpu_id() } }
+        pub fn kick_cpus(mask: u64) { unsafe { kmod_abi::blk::sys_blk::kapi_kick_cpus(mask) } }
+    }
+
     pub mod sched {
         pub use crate::sched::*;
         pub fn irqs_masked() -> bool { crate::sys_common::irqs_masked() }

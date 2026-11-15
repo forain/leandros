@@ -17,6 +17,7 @@ const VIRTIO_PCI_DEVICE_BLK_LEGACY: u16 = 0x1001;
 
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
 const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
@@ -261,13 +262,19 @@ impl VirtQueue {
     /// slow. On failure the request is still owned by the device, so the
     /// caller must not touch the ring or DMA pages again.
     unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, t0: u64, slow_ns: u64,
-                                  type_: u32, sector: u64) -> Result<bool, WaitErr> {
+                                  type_: u32, sector: u64, armed: bool) -> Result<bool, WaitErr> {
         let mut spins: u32 = 0;
+        let used_idx = core::ptr::addr_of!((*self.used).idx);
+        let last = self.last_used_idx;
+        let _w = if armed { Some(WaitingCpu::enter()) } else { None };
         let mut warn_at = slow_ns;
         let mut slow = false;
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
             spins = spins.wrapping_add(1);
-            if spins % 256 == 0 {
+            if armed {
+                park_until_irq(|| used_idx.read_volatile() != last);
+            }
+            if armed || spins % 256 == 0 {
                 // A syscall (aarch64 reads run IRQ-masked with preemption
                 // enabled) or a page fault: take the tick.
                 irq_window_if_masked();
@@ -284,11 +291,167 @@ impl VirtQueue {
                         type_, sector, el / 1_000_000, st));
                 }
             }
-            core::hint::spin_loop();
+            if !armed { core::hint::spin_loop(); }
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         Ok(slow)
+    }
+}
+
+// ── Completion interrupt ─────────────────────────────────────────────────────
+//
+// A request waiter parks its CPU (`wfi` / `hlt`) instead of spinning on the
+// used ring; the completion interrupt (MSI-X on x86_64, the shared INTx SPI on
+// aarch64) wakes it. The interrupt may land on another CPU, so the handler
+// sends a reschedule IPI to every CPU with a parked waiter. The 100 Hz tick
+// still wakes a parked CPU, so a lost interrupt costs one tick, never a hang.
+// Callers that cannot sleep (page faults, IRQs masked) park the same way: the
+// sequence opens its own interrupt window. Boot-time requests (pid 0) spin.
+
+/// CPUs with a parked request waiter (bit per CPU id).
+static WAITING_CPUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Completion interrupts taken (diagnostic).
+static BLK_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Per-disk ISR status byte and INTx INTID (0 = none), for the shared-line
+/// handler; slot = arming order.
+static BLK_ISR: [core::sync::atomic::AtomicUsize; MAX_BLK_DEVICES] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_BLK_DEVICES];
+static BLK_INTID: [core::sync::atomic::AtomicU32; MAX_BLK_DEVICES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_BLK_DEVICES];
+static BLK_ARMED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Registers this CPU as a parked waiter for the guard's lifetime.
+struct WaitingCpu(u64);
+impl WaitingCpu {
+    fn enter() -> Self {
+        let cpu = crate::kenv::ipi::cpu_id();
+        let bit = if cpu < 64 { 1u64 << cpu } else { 0 };
+        WAITING_CPUS.fetch_or(bit, core::sync::atomic::Ordering::SeqCst);
+        WaitingCpu(bit)
+    }
+}
+impl Drop for WaitingCpu {
+    fn drop(&mut self) { WAITING_CPUS.fetch_and(!self.0, core::sync::atomic::Ordering::SeqCst); }
+}
+
+/// Park the CPU until an interrupt arrives unless `done()` already holds. The
+/// check and the park are atomic against the completion interrupt (aarch64
+/// `wfi` wakes on a pending masked interrupt; x86_64 `sti; hlt` recognises it
+/// at the `hlt`). IRQ state is preserved: a masked caller gets an explicit
+/// window (preemption off, so the tick cannot switch tasks under the device
+/// lock); an unmasked one has IRQs re-enabled on return.
+fn park_until_irq(done: impl Fn() -> bool) {
+    unsafe {
+        if sched::irqs_masked() {
+            sched::preempt_disable();
+            if !done() {
+                #[cfg(target_arch = "aarch64")]
+                core::arch::asm!("wfi", options(nomem, nostack));
+                #[cfg(target_arch = "x86_64")]
+                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
+            sched::irq_window();
+            sched::preempt_enable_no_resched();
+        } else {
+            #[cfg(target_arch = "aarch64")]
+            {
+                core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+                if !done() { core::arch::asm!("wfi", options(nomem, nostack)); }
+                core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                core::arch::asm!("cli", options(nomem, nostack));
+                if !done() { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+                else { core::arch::asm!("sti", options(nomem, nostack)); }
+            }
+        }
+    }
+}
+
+/// Completion handler. `ctx` is 0 for a private MSI-X vector, else the INTID of
+/// a shared INTx line (aarch64): every disk on that line has its ISR status
+/// byte read, which deasserts the level line; a line none of them owns is
+/// `None` for the other sharers.
+extern "C" fn virtio_blk_irq(ctx: usize) -> crate::kenv::irq::IrqReturn {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, SeqCst};
+    if ctx != 0 {
+        let mut ours = false;
+        for i in 0..MAX_BLK_DEVICES {
+            if BLK_INTID[i].load(Acquire) as usize != ctx { continue; }
+            let p = BLK_ISR[i].load(Acquire) as *const u8;
+            if !p.is_null() && unsafe { p.mmio_read() } & 1 != 0 { ours = true; }
+        }
+        if !ours { return crate::kenv::irq::IrqReturn::None; }
+    }
+    if BLK_IRQS.fetch_add(1, Relaxed) == 0 {
+        crate::kenv::pci::serial_debug("[VIRTIO-BLK] first completion interrupt\n");
+    }
+    let m = WAITING_CPUS.load(SeqCst);
+    if m != 0 { crate::kenv::ipi::kick_cpus(m); }
+    crate::kenv::irq::IrqReturn::Handled
+}
+
+impl VirtioBlkDevice {
+    /// Arm the queue's completion interrupt; any failure leaves the disk on the
+    /// spin path (the pre-existing, always-working fallback).
+    unsafe fn arm_irq(&mut self) {
+        #[allow(unused_imports)]
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        let pci = &self._pci;
+        #[allow(unused_variables)]
+        let func = pci.function();
+        #[cfg(target_arch = "x86_64")]
+        if let Ok(tab) = crate::kenv::irq::MsixTable::enable(func) {
+            const NO_VECTOR: u16 = 0xFFFF;
+            if let Ok(h) = tab.request(0, virtio_blk_irq, 0) {
+                let cfg = self.common_cfg;
+                core::ptr::addr_of_mut!((*cfg).config_msix_vector).mmio_write(NO_VECTOR);
+                core::ptr::addr_of_mut!((*cfg).queue_select).mmio_write(0);
+                core::ptr::addr_of_mut!((*cfg).queue_msix_vector).mmio_write(0);
+                if core::ptr::addr_of!((*cfg).queue_msix_vector).mmio_read() == 0 {
+                    self.irq_armed = true;
+                    crate::kenv::pci::serial_debug("[VIRTIO-BLK] MSI-X armed: vector ");
+                    crate::kenv::pci::serial_debug_hex(h.vector().unwrap_or(0) as u32);
+                    crate::kenv::pci::serial_debug("\n");
+                }
+            }
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let Some(isr) = self.isr_cfg else { return };
+            let Some(intid) = func.intx_line() else { return };
+            let slot = BLK_ARMED.load(Acquire);
+            if slot >= MAX_BLK_DEVICES { return; }
+            // Publish the ISR pointer, drain stale state, make sure the line has
+            // a handler (one per INTID, shared by all disks on it), only then lift
+            // INTx Disable.
+            let _ = isr.mmio_read();
+            BLK_ISR[slot].store(isr as usize, Release);
+            BLK_INTID[slot].store(intid, Release);
+            let have = (0..slot).any(|i| BLK_INTID[i].load(Acquire) == intid);
+            if !have {
+                match crate::kenv::irq::request_irq(crate::kenv::irq::IrqSource::Line(intid), virtio_blk_irq, intid as usize) {
+                    Ok(h) => core::mem::forget(h),
+                    Err(_) => {
+                        BLK_INTID[slot].store(0, Release);
+                        BLK_ISR[slot].store(0, Release);
+                        crate::kenv::pci::serial_debug("[VIRTIO-BLK] INTx: line registration refused; polling only\n");
+                        return;
+                    }
+                }
+            }
+            BLK_ARMED.store(slot + 1, Release);
+            let cmd = pci_read_config_16(pci.bus, pci.dev, pci.func, 0x04);
+            pci_write_config_16(pci.bus, pci.dev, pci.func, 0x04, cmd & !crate::kenv::pci::PCI_CMD_INTX_DISABLE);
+            let _ = isr.mmio_read();
+            self.irq_armed = true;
+            crate::kenv::pci::serial_debug("[VIRTIO-BLK] INTx armed: INTID ");
+            crate::kenv::pci::serial_debug_hex(intid);
+            crate::kenv::pci::serial_debug("\n");
+        }
     }
 }
 
@@ -314,6 +477,10 @@ struct VirtioBlkDevice {
     /// Set when a request failed to complete (timeout or device failure);
     /// every later request fails fast with `BlkErr::Io`.
     dead: bool,
+    /// A completion interrupt is armed (MSI-X on x86_64, shared INTx SPI on
+    /// aarch64): a waiter parks the CPU instead of spinning the used ring.
+    irq_armed: bool,
+    isr_cfg: Option<*const u8>,
 }
 
 unsafe impl Send for VirtioBlkDevice {}
@@ -351,11 +518,12 @@ fn bar64(pci: &PciDevice, bar_idx: usize) -> u64 {
 /// COMMON_CFG and NOTIFY_CFG together with the notify_off_multiplier.
 unsafe fn walk_caps(
     pci: &PciDevice,
-) -> (Option<*mut VirtioPciCommonCfg>, Option<*mut u32>, u32, Option<*const u64>) {
+) -> (Option<*mut VirtioPciCommonCfg>, Option<*mut u32>, u32, Option<*const u64>, Option<*const u8>) {
     let mut common_cfg: Option<*mut VirtioPciCommonCfg> = None;
     let mut notify_cfg: Option<*mut u32> = None;
     let mut notify_off_multiplier = 0u32;
     let mut device_cfg: Option<*const u64> = None;
+    let mut isr_cfg: Option<*const u8> = None;
 
     let mut cap_ptr = pci_read_config_8(pci.bus, pci.dev, pci.func, 0x34);
     while cap_ptr != 0 {
@@ -391,6 +559,7 @@ unsafe fn walk_caps(
                             // (u64, in 512-byte sectors) at offset 0.
                             device_cfg = Some(virt as *const u64);
                         }
+                        VIRTIO_PCI_CAP_ISR_CFG => { isr_cfg = Some(virt as *const u8); }
                         _ => {}
                     }
                 }
@@ -399,7 +568,7 @@ unsafe fn walk_caps(
         cap_ptr = pci_read_config_8(pci.bus, pci.dev, pci.func, cap_ptr + 1);
     }
 
-    (common_cfg, notify_cfg, notify_off_multiplier, device_cfg)
+    (common_cfg, notify_cfg, notify_off_multiplier, device_cfg, isr_cfg)
 }
 
 /// Write device_status=0 to reset `pci` without touching its virtqueues.
@@ -424,7 +593,7 @@ impl VirtioBlkDevice {
     /// pass and this function starts from ACKNOWLEDGE.
     unsafe fn new(pci: PciDevice, reset_done: bool) -> Option<Self> {
         enable_pci_mmio(&pci);
-        let (common_cfg, notify_cfg, notify_off_multiplier, device_cfg) = walk_caps(&pci);
+        let (common_cfg, notify_cfg, notify_off_multiplier, device_cfg, isr_cfg) = walk_caps(&pci);
         let common_cfg = common_cfg?;
         let notify_cfg = notify_cfg?;
         let capacity_sectors = device_cfg.map_or(0, |p| p.mmio_read());
@@ -489,6 +658,8 @@ impl VirtioBlkDevice {
             data_phys,
             capacity_sectors,
             dead: false,
+            irq_armed: false,
+            isr_cfg,
         })
     }
 
@@ -565,7 +736,8 @@ impl VirtioBlkDevice {
                 }
             }
             self.notify();
-            match self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns, type_, sector) {
+            match self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns, type_, sector,
+                self.irq_armed && sched::current_pid() != 0) {
                 Ok(false) => {}
                 Ok(true) => crate::kenv::pci::serial_debug(&alloc::format!(
                     "[VIRTIO-BLK] slow request: type {} sector {} completed after {} ms (status {})\n",
@@ -681,7 +853,10 @@ pub fn probe_all() -> alloc::vec::Vec<&'static VirtioDisk> {
                 crate::kenv::pci::serial_debug("); skipping a virtio-blk PCI function\n");
                 continue;
             }
-            if let Some(d) = unsafe { VirtioBlkDevice::new(pci, true) } {
+            if let Some(mut d) = unsafe { VirtioBlkDevice::new(pci, true) } {
+                if crate::kenv::cmdline_word("virtio_blk.irq") != Some("0") {
+                    unsafe { d.arm_irq(); }
+                }
                 let capacity_sectors = d.capacity_sectors;
                 let disk: &'static VirtioDisk = alloc::boxed::Box::leak(alloc::boxed::Box::new(
                     VirtioDisk { dev: Mutex::new(d), capacity_sectors },
