@@ -525,8 +525,15 @@ def forwarding(ssh, user, pw, tmp):
     set_keys(ssh, user, pw, pub)
 
 
-def sudo_sh(ssh, user, pw, script, stdin=b""):
-    return ssh.run(user, f"sudo -S -p '' sh -c '{script}'", password=pw, stdin=(pw + "\n").encode() + stdin)
+def sudo_sh(ssh, user, pw, script):
+    # key login: a password login would itself trigger the rehash being tested
+    return ssh.run(user, f"sudo -S -p '' sh -c \"{script}\"", key=True, stdin=(pw + "\n").encode())
+
+
+def sudo_write(ssh, user, pw, path, text):
+    """Replace `path` with `text` as root (single-quoted printf args; '$' escaped for the outer double quotes)."""
+    args = " ".join("'" + l.replace("'", "'\\''") + "'" for l in text.splitlines())
+    return sudo_sh(ssh, user, pw, ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$"))
 
 
 def accounts_extra(ssh, user, pw, tmp):
@@ -566,7 +573,7 @@ def accounts_extra(ssh, user, pw, tmp):
         return
     legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
     lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
-    rc, _, err = sudo_sh(ssh, user, pw, "cat > /etc/shadow", ("\n".join(lines) + "\n").encode())
+    rc, wout, err = sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
     rc2, mid, _ = sudo_sh(ssh, user, pw, "cat /etc/shadow")
     primed = rc == 0 and f"{user}:$sha256$" in mid
     rc, out, err = ssh.run(user, "id -un", password=pw)
@@ -580,7 +587,7 @@ def accounts_extra(ssh, user, pw, tmp):
          f"primed={primed} login={login_ok} field={(new[0][:30] if new else None)!r} others_same={others_same}")
     rc, out, err = ssh.run(user, "id -un", password=pw)
     step("rehash_login_again", rc == 0 and out.strip() == user, f"rc={rc}")
-    sudo_sh(ssh, user, pw, "cat > /etc/shadow", orig.encode())
+    sudo_write(ssh, user, pw, "/etc/shadow", orig)
 
 
 def main(argv):
