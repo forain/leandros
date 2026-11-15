@@ -482,6 +482,7 @@ impl Mon {
 
     fn main_loop(&mut self) -> ! {
         loop {
+            let nh = self.helpers.len();
             let mut fds = vec![pfd(self.sign), pfd(self.ctl), pfd(self.logr)];
             for h in &self.helpers {
                 fds.push(pfd(h.sock.as_raw_fd()));
@@ -496,7 +497,7 @@ impl Mon {
             if fds[1].revents != 0 {
                 self.read_sock(false);
             }
-            let ready: Vec<usize> = (0..self.helpers.len()).filter(|i| fds[3 + i].revents != 0).collect();
+            let ready: Vec<usize> = (0..nh).filter(|i| fds[3 + i].revents != 0).collect();
             self.finish_helpers(&ready);
             self.housekeeping();
         }

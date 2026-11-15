@@ -909,9 +909,9 @@ def new_preauth(ssh, user, pw, before):
 
 
 PS_DETAIL = r"""for p in /proc/[0-9]*; do
-n=$(sed -n 's/^Name:\t//p' $p/status 2>/dev/null)
+n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null)
 case "$n" in sshd*)
-echo "${p#/proc/}|$(sed -n 's/^PPid:\t//p' $p/status)|$n|$(sed -n 's/^Uid:\t//p' $p/status | tr '\t' ,)|$(sed -n 's/^NoNewPrivs:\t//p' $p/status)|$(sed -n 's/^Seccomp:\t//p' $p/status)|$(readlink $p/root)|$(for f in $p/fd/*; do readlink $f; done 2>/dev/null | grep -c -e '/etc/ssh' -e '/etc/shadow')";;
+echo "${p#/proc/}|$(sed -n 's/^PPid:[[:space:]]*//p' $p/status)|$n|$(sed -n 's/^Uid:[[:space:]]*//p' $p/status | tr -s '[:space:]' ,)|$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' $p/status)|$(sed -n 's/^Seccomp:[[:space:]]*//p' $p/status)|$(readlink $p/root)|$(for f in $p/fd/*; do readlink $f; done 2>/dev/null | grep -c -e '/etc/ssh' -e '/etc/shadow')";;
 esac
 done"""
 
@@ -988,7 +988,7 @@ def privsep_hooks(ssh, user, pw, tmp):
                            capture_output=True, text=True, timeout=60)
         _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log")
         procs = sshd_procs(ssh, user, pw)
-        listener_up = any(n == "sshd" and pp == 1 for _, pp, n in procs)
+        listener_up = listener_pid(procs) is not None
         if hook == "badsyscall":
             ok = r.returncode != 0 and "uid=" not in r.stdout and listener_up and ssh.run(user, "id -un", pw, timeout=30)[0] == 0
         else:

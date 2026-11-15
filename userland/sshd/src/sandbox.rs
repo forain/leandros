@@ -67,6 +67,10 @@ const COMMON: &[(&str, i32, i32)] = &[
     ("exit", 60, 93),
     ("exit_group", 231, 94),
     ("fcntl", 72, 25),
+    // russh-cryptovec locks key material pages; the tokio waker uses a socketpair.
+    ("mlock", 149, 228),
+    ("munlock", 150, 229),
+    ("socketpair", 53, 199),
 ];
 // x86_64 only (aarch64 has no poll): the legacy poll.
 const X86_ONLY: &[i32] = &[7];
