@@ -599,7 +599,7 @@ timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?"
 # ---- direction E: LeandrOS fsync -> crash (QEMU quit, no umount) -> Linux (design f2fsnodelog T2) ----
 # (name, guest ops run in /mnt/h after mounting; they print "EXP <md5>  <path>" lines, files the
 #  chain must carry, min chain nodes marked FSYNC/DENT, chain-only: a no-recovery Linux mount must miss the content)
-XV = "XV $(xattr -p user.big t/k 2>/dev/null | tr -d '\n' | md5sum | cut -c1-32)"
+XV = "XV $(xattr -p user.big t/k 2>/dev/null | tr -d '\\n' | md5sum | cut -c1-32)"
 # name, ops (all fsyncs are real fsync(2): `f2fstest fsync` or dd conv=fsync, never `sync FILE`), minmark (chain nodes
 # chaindump must see), cponly (P-b: what a norecovery mount of the CP shows), cpd (P-a: cp_total delta, None = any),
 # chained (P-a: minimum lx_chained delta), files (inode numbers printed, P-c), pc (per file: "inode" | "data" = also recover_data),
@@ -626,7 +626,7 @@ ESCEN = [
          "sync; dd if=/dev/urandom of=t/B bs=1k count=100 conv=fsync 2>/dev/null; md5sum t/A t/B",
          minmark=1, cponly="MISS", cpd=None, chained=2, pc={"t/B": "data"}, absent=["t/A"]),
     dict(name="full", ops="for i in $(seq 1 600); do echo $i > t/f$i; f2fstest fsync t/f$i >/dev/null; done; md5sum t/f*",
-         minmark=1, cponly=None, cpd=None, chained=1, pc={}, fallback=1),
+         minmark=1, cponly=None, cpd=None, chained=1, pc={}, cpmin=1),
     dict(name="rename", ops="echo m > t/r0; sync; mv t/r0 t/r1; sync t/r1; md5sum t/r1",
          minmark=0, cponly=None, cpd=None, chained=0, pc={}),
     dict(name="trunc", ops="dd if=/dev/urandom of=t/tr bs=1M count=2 2>/dev/null; sync; truncate -s 100K t/tr; f2fstest fsync t/tr >/dev/null; md5sum t/tr",
@@ -669,7 +669,7 @@ def e_scenario(tmp, sc):
     outs = guest([img], [MNTH, "cd /mnt/h && (" + STAT.replace("echo ", "echo STAT0 ", 1) + "; " + ops + ") 2>&1; "
                          + STAT.replace("echo ", "echo STAT1 ", 1) + "; " + (ino_cmd + "; " if ino_cmd else "") + "echo SCEN_DONE; cd /"], "E2", ECMD)
     if outs is None or "MNT_RW" not in outs[0] or "SCEN_DONE" not in outs[1]:
-        step(v, "E.boot2", False, (outs[1].strip()[-100:] if outs else "no guest")); return
+        step(v, "E.boot2", False, (outs[1].strip()[-500:].replace("\n", " | ") if outs else "no guest")); return
     out2 = outs[1]
     exp = [l.strip().replace("t/", "") for l in out2.splitlines()
            if len(l.strip()) > 36 and l.strip()[32:34] == "  " and l.strip()[:32].isalnum() and l.strip()[34:36] == "t/"]
@@ -681,7 +681,7 @@ def e_scenario(tmp, sc):
     if s0 and s1 and ECMD:
         d = {k: s1.get(k, 0) - s0.get(k, 0) for k in s0}
         ok = d.get("lx_chained", 0) >= sc["chained"] and (sc["cpd"] is None or d.get("cp_total", -1) == sc["cpd"]) \
-            and d.get("lx_fallback", 0) >= sc.get("fallback", 0)
+            and d.get("cp_total", 0) >= sc.get("cpmin", 0)
         step(v, "E.stat", ok, f"cp_total +{d.get('cp_total')} (want {sc['cpd']}), lx_chained +{d.get('lx_chained')} (want >= {sc['chained']}), lx_fallback +{d.get('lx_fallback')}")
     elif ECMD:
         step(v, "E.stat", False, "no /proc/f2fsstat lines")
@@ -693,7 +693,8 @@ def e_scenario(tmp, sc):
     m = [int(x.split("=")[1]) for x in cd.stdout.split() if x.startswith("marked=")]
     marked = m[0] if m else -1
     step(v, "E.chain", not fl & 1 and marked >= minmark and (marked >= 1 or minmark == 0) and cd.returncode == 0,
-         f"chain marked={marked} (want >= {minmark}) cp_umount={fl & 1} dump rc={cd.returncode}")
+         f"chain marked={marked} (want >= {minmark}) cp_umount={fl & 1} dump rc={cd.returncode}"
+         + ("" if cd.returncode == 0 else " " + "; ".join(l.strip() for l in (cd.stderr + cd.stdout).splitlines() if "chaindump:" in l or ": " in l)[:300]))
     rd = f"/tmp/f2fsinterop-{os.getpid()}"
     mf = os.path.join(tmp, f"e-{name}.md5")
     open(mf, "w").write("\n".join(exp) + "\n")
@@ -796,7 +797,7 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
     if outs is None or "MNT_FAIL" in outs[0]:
         step(v, "B.back-verify", False, "LeandrOS cannot mount the Linux-written volume"); return
     ok = outs is not None and "fromlinux" in outs[1] and "FAILED" not in outs[1] and "WARNING" not in outs[1] and outs[1].count(": OK") >= 4
-    step(v, "B.back-verify", ok, "LeandrOS reads Linux's files" if ok else "verify failed: " + (outs[1].strip()[-100:] if outs else "no guest"))
+    step(v, "B.back-verify", ok, "LeandrOS reads Linux's files" if ok else "verify failed: " + (outs[1].strip()[-500:].replace("\n", " | ") if outs else "no guest"))
 
 
 def main(argv):

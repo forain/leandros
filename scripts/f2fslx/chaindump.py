@@ -128,6 +128,8 @@ def ofs_kind(ofs, nid, ino):
     """inode | dnode | xattr | indirect (node offsets per Linux fs/f2fs/node.h, 4 KiB / NIDS_PER_BLOCK 1018)."""
     if ofs == 0:
         return "inode"
+    if ofs == 0x1FFFFFFF:  # XATTR_NODE_OFFSET (29-bit all ones)
+        return "xattr"
     if ofs == 1:  # NODE_DIR1_BLOCK region begins; offsets 1,2 are direct (ADDRS_PER_INODE area)
         return "dnode"
     if ofs == 2:
