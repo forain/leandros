@@ -846,7 +846,8 @@ case "$n" in sshd*) echo "${p#/proc/} $(sed -n 's/^PPid:\t//p' $p/status) $n";; 
 
 def sshd_procs(ssh, user, pw):
     """[(pid, ppid, comm)] of every sshd* process in the guest."""
-    _, out, _ = sudo_sh(ssh, user, pw, PS_SSHD)
+    sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
+    _, out, _ = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
     res = []
     for ln in out.splitlines():
         p = ln.split()
