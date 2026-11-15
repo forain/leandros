@@ -75,7 +75,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ### Toolchain / dev experience
 - **zig to clang** migration (est. 2-4 days, not started).
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
-- **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - /proc/mounts doesn't print ro for ns-0 mounts; ns-0 dirfd flags recorded at open go stale after a later remount
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)

@@ -542,3 +542,8 @@ Build time: ~3–5 minutes clean, ~30s incremental.
 | Shell prompt never appears | Run `driver.py log` to check for kernel panics |
 | `screendump` produces 0-byte file | VirtIO GPU not initialized; check boot log for `[GPU] VirtIO GPU initialized` |
 | `cmd` returns empty output | Shell may have exited; run `start` again |
+
+## Harness footguns handled in code
+- stdout/stderr are line-buffered by `driver.py` itself: no `python3 -u` needed, piping no longer hides progress.
+- Host tracing (`-d`, `-trace` via `LEANDROS_QEMU_EXTRA`) automatically gets `-D /tmp/leandros<tag>-qemu-trace.log` (path printed) unless you set `-D` or `-trace ...,file=`.
+- `box/regress.sh` shell-quotes runtests args, so `regress.sh <ref> x86_64 "/bin/sh -c 'echo a b'"` is ONE command. Guard: `runtests.py <arch> t harness`.

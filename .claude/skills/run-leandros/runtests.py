@@ -23,6 +23,7 @@ Options:
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             harness   host:harnesstest.py (line-buffering, auto -D on host tracing, quoted-command survival)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
@@ -246,6 +247,7 @@ SUITES = {
     "blkmany": ["host:blkmanytest.py"],
     # --features rpi5 kernel compile-check (cargo check, no boot; integ lanes run it).
     "rpi5check": ["host:rpi5checktest.py"],
+    "harness": ["host:harnesstest.py"],
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "rootpick": ["host:rootpicktest.py"],
