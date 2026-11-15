@@ -195,6 +195,8 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Link flap/watch (own boot, ~110 s on both arches; lane suiteharness).
+                "host:netwatchtest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
@@ -394,7 +396,8 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900,
+                 "netwatchtest.py": 1200, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200}
 
 
 def find_fails(out):

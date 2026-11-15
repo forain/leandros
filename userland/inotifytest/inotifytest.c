@@ -292,6 +292,22 @@ static void t_dir_follow(void)
     close(ifd);
 }
 
+/* Generated files (/etc/resolv.conf, /proc/interrupts) can be watched:
+ * aardvark-dns watches /etc/resolv.conf and aborts if the add fails. */
+static void t_generated(void)
+{
+    const char *gen[] = { "/etc/resolv.conf", "/proc/interrupts" };
+    for (int i = 0; i < 2; i++) {
+        int ifd = inotify_init1(IN_NONBLOCK);
+        int wd = inotify_add_watch(ifd, gen[i], IN_MODIFY | IN_CLOSE_WRITE);
+        char name[64];
+        snprintf(name, sizeof name, "t_generated_%s", gen[i] + 1);
+        report(name, wd >= 0);
+        if (wd < 0) printf("  %s: errno=%d\n", gen[i], errno);
+        close(ifd);
+    }
+}
+
 static void t_eacces(void)
 {
     char p[128]; path(p, "secret");
@@ -1349,7 +1365,7 @@ int main(int argc, char **argv)
         t_create(); t_delete(); t_move_pair(); t_moved_to(); t_create_waitfile();
         t_layout(); t_einval_small(); t_fionread(); t_rmwatch_ignored();
         t_block_read(); t_silent_unrelated(); t_dir_events(); t_dir_follow();
-        t_eacces();
+        t_eacces(); t_generated();
         t_oneshot(); t_mask_add(); t_mask_create_eexist(); t_onlydir(); t_excl_unlink();
         t_dont_follow(); t_overflow(); t_proc_limits(); t_limit_instances(); t_limit_watches();
         t_limit_perkuid(); t_limit_userns(); t_userns_mntns();

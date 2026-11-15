@@ -486,6 +486,15 @@ def forwarding(ssh, user, pw, tmp):
     err = p.stderr.read().decode(errors="replace")
     step("fwd_remote_dynamic_port", alive and "Allocated port" in err, f"alive={alive} err={err.strip()[-120:]!r}")
 
+    # -R on a privileged port as a non-root user: refused (OpenSSH rule); a high port still works
+    p = fwd_client(ssh, user, "-R", f"127.0.0.1:1023:127.0.0.1:{echo_port}")
+    try:
+        rc = p.wait(timeout=25)
+    except subprocess.TimeoutExpired:
+        rc = None
+    stop(p)
+    step("fwd_remote_privport_refused", rc not in (None, 0), f"rc={rc}")
+
     # no-port-forwarding / restrict: both directions refused
     for opt in ("no-port-forwarding", "restrict"):
         with_opts(opt)

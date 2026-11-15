@@ -15994,7 +15994,10 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Messag
     // would ask the root filesystem, which answers ENOENT, so `[ -r
     // /proc/meminfo ]` failed while `cat` worked. The kernel's stat-based
     // fallback answers from the mode stat reports.
-    if raw == b"/proc" || raw.starts_with(b"/proc/") {
+    if raw == b"/proc" || raw.starts_with(b"/proc/")
+        // /etc/resolv.conf is generated too (DHCP lease), absent on the root
+        // mount: inotify_add_watch (aardvark-dns) needs access to say yes.
+        || raw == b"/etc/resolv.conf" {
         return err_reply(-38);
     }
     if let Some(port) = find_mount_port(raw) {
