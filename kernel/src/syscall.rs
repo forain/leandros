@@ -6584,6 +6584,8 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
 
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
+    // FAN_OPEN_EXEC_PERM listeners may veto the exec (FAN_DENY / FAN_DENY_ERRNO).
+    { let fr = vfs::fan_exec_perm(kpath.bytes()); if fr != 0 { return fr as isize; } }
 
     // ── `#!` scripts ─────────────────────────────────────────────────────────
     // A file starting with `#!` names its interpreter; exec that instead, with
