@@ -298,7 +298,9 @@ impl InterfaceInner {
                 data,
             } => {
                 let code: u8 = reason.into();
+                let src = ip_repr.src_addr();
                 if code == 4 {
+                    self.icmpv4_error_q(_sockets, 90, 3, 4, mtu as u32, src, &header, data);
                     crate::pmtu::update(self.pmtu_scope, crate::pmtu::v4(header.dst_addr.0), mtu, crate::pmtu::MIN_PMTU, self.now.total_millis() as u64);
                 }
                 // Linux icmp_err_convert: (errno, fatal). Code 4 (fragmentation
@@ -323,12 +325,14 @@ impl InterfaceInner {
                 ];
                 if let Some(&(errno, fatal)) = TABLE.get(code as usize) {
                     if code != 4 {
+                        self.icmpv4_error_q(_sockets, errno, 3, code, 0, src, &header, data);
                         self.icmpv4_error(_sockets, errno, fatal, &header, data);
                     }
                 }
                 None
             }
-            Icmpv4Repr::TimeExceeded { header, data, .. } => {
+            Icmpv4Repr::TimeExceeded { header, data, reason, .. } => {
+                self.icmpv4_error_q(_sockets, 113, 11, reason.into(), 0, ip_repr.src_addr(), &header, data);
                 // EHOSTUNREACH, not fatal (Linux): only a connection attempt
                 // ends on it.
                 self.icmpv4_error(_sockets, 113, false, &header, data);
@@ -402,6 +406,55 @@ impl InterfaceInner {
             _ => {}
         }
     }
+
+    /// LEANDROS: IP_RECVERR: queue the ICMP error on every UDP socket with
+    /// the flag whose flow it quotes (Linux __udp4_lib_err -> ip_icmp_error)
+    /// and arm its pending error (sk_err) for any ICMP error, fatal or not.
+    #[cfg(feature = "socket-udp")]
+    fn icmpv4_error_q(
+        &mut self,
+        sockets: &mut SocketSet,
+        errno: u8,
+        ty: u8,
+        code: u8,
+        info: u32,
+        offender: IpAddress,
+        header: &Ipv4Repr,
+        data: &[u8],
+    ) {
+        if data.len() < 8 || header.next_header != IpProtocol::Udp {
+            return;
+        }
+        let sport = u16::from_be_bytes([data[0], data[1]]);
+        let dport = u16::from_be_bytes([data[2], data[3]]);
+        let local = IpAddress::Ipv4(header.src_addr);
+        let remote = IpEndpoint::new(IpAddress::Ipv4(header.dst_addr), dport);
+        for u in sockets
+            .items_mut()
+            .filter_map(|i| udp::Socket::downcast_mut(&mut i.socket))
+        {
+            let ep = u.endpoint();
+            if u.recverr()
+                && ep.port == sport
+                && ep.addr.map_or(true, |a| a == local)
+                && u.peer().map_or(true, |p| p == remote)
+            {
+                u.push_err(udp::ErrEntry {
+                    errno,
+                    origin: 2,
+                    ty,
+                    code,
+                    info,
+                    offender,
+                    dst: remote,
+                    payload: data[8..].to_vec(),
+                });
+                u.set_error(errno);
+            }
+        }
+    }
+    #[cfg(not(feature = "socket-udp"))]
+    fn icmpv4_error_q(&mut self, _: &mut SocketSet, _: u8, _: u8, _: u8, _: u32, _: IpAddress, _: &Ipv4Repr, _: &[u8]) {}
 
     pub(super) fn icmpv4_reply<'frame, 'icmp: 'frame>(
         &self,
