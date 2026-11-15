@@ -580,7 +580,7 @@ unsafe fn walk_caps(
 /// Resetting all devices first means blk_drain() sees no pending I/O.
 unsafe fn pre_reset_device(pci: &PciDevice) {
     enable_pci_mmio(pci);
-    let (common_cfg, _, _, _) = walk_caps(pci);
+    let (common_cfg, _, _, _, _) = walk_caps(pci);
     if let Some(cfg) = common_cfg {
         core::ptr::addr_of_mut!((*cfg).device_status).mmio_write(0u8);
     }
