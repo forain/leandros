@@ -1592,6 +1592,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // readable RTC, CLOCK_REALTIME counts from the boot instant.
     time_init();
     kfacil_init(hhdm_offset);
+    #[cfg(all(target_arch = "aarch64", not(any(feature = "rpi5", feature = "raspi4b"))))]
+    a64_its_init();
     early_mark(13);
 
     // aarch64: SIMD and UART are now available. Run DTB fallback search if Limine
@@ -2848,6 +2850,30 @@ static EARLY_RAM_DTB: spin::Mutex<Option<(usize, u64, u64)>> = spin::Mutex::new(
 #[cfg(target_arch = "aarch64")]
 fn acpi_forced() -> bool { cmdline_knob("acpi") == Some("force") }
 
+/// GICv3 ITS bring-up (MSI / MSI-X for PCI). The ITS frame comes from the
+/// MADT (ACPI path) or the DTB's `arm,gic-v3-its` node. `gic.its=0` leaves
+/// it off; any failure leaves every driver on INTx / polling.
+#[cfg(all(target_arch = "aarch64", not(any(feature = "rpi5", feature = "raspi4b"))))]
+fn a64_its_init() {
+    if cmdline_knob("gic.its") == Some("0") {
+        serial_print_str("[ITS] disabled by gic.its=0\n");
+        return;
+    }
+    if !arch_aarch64::gic::is_v3() { return; }
+    let mut base = arch_aarch64::its::acpi_base(0);
+    if base == 0 {
+        unsafe {
+            boot::device_tree::for_each_compatible(&mut |n| {
+                if base == 0 && n.compat.split(|&c| c == 0).any(|c| c == b"arm,gic-v3-its") {
+                    if let Some((a, _)) = n.reg { base = a; }
+                }
+            });
+        }
+    }
+    if base == 0 { return; }
+    arch_aarch64::its::init(base);
+}
+
 /// aarch64 ACPI platform layer (Limine boot). When the firmware gave no DTB,
 /// or `acpi=force`, read MADT / SPCR / GTDT / MCFG / FADT and turn the GIC,
 /// console UART, timer PPIs, ECAM and PSCI conduit into runtime values instead
@@ -2896,6 +2922,8 @@ fn a64_platform_init(hhdm: u64) {
             serial_print_str("\n");
         }
         arch_aarch64::gic::set_platform(&gic);
+        if let Some(m) = p.madt { arch_aarch64::its::set_acpi_bases(&m.its[..m.its_n]); }
+        for m in &p.iort[..p.iort_n] { arch_aarch64::its::set_rid_map(m.input, m.count, m.output); }
         if let Some(u) = p.spcr {
             let ns = u.kind == UartKind::Ns16550;
             let moved = arch_aarch64::uart::phys_base() != u.base as usize;

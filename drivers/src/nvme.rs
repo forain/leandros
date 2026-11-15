@@ -1143,13 +1143,13 @@ fn probe(dev: &PciDevice, index: usize) {
         None => { nlog!("nvme{}: out of memory for the I/O queue; skipped", index); disable(&st, to_ms); return; }
     };
     let qsz = ((io_depth as u32 - 1) << 16) | 1;
-    // MSI-X (x86_64): one vector for the admin CQ and the I/O CQ.
+    // MSI-X (x86_64 IDT vector / aarch64 ITS LPI): one vector for the admin CQ and the I/O CQ.
     let want_msix = match MSIX_MODE.load(Ordering::Relaxed) { 0 => false, 1 => true, _ => false };
-    if want_msix && cfg!(target_arch = "x86_64") && index < MAX_CTRLS && msix.is_some() {
+    if want_msix && crate::irq::msi_supported() && index < MAX_CTRLS && msix.is_some() {
         match MsixTable::enable(f) {
             Ok(tab) => match tab.request(0, nvme_irq as IrqHandler, index) {
                 Ok(h) => {
-                    nlog!("nvme{}: MSI-X vector 0 -> IDT vector {:#x} (admin + I/O CQ)", index, h.vector().unwrap_or(0));
+                    nlog!("nvme{}: MSI-X vector 0 -> {} {:#x} (admin + I/O CQ)", index, if h.lpi().is_some() { "LPI" } else { "IDT vector" }, h.vector().map(|v| v as u32).or(h.lpi()).unwrap_or(0));
                     st.irq = Some(index);
                 }
                 Err(_) => nlog!("nvme{}: MSI-X vector request refused; polled", index),

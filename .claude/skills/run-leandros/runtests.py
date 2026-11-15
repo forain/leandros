@@ -36,6 +36,7 @@ Options:
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
                              ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
+                             a64its   host:a64itstest.py alone (aarch64 GICv3 ITS: virtio-net + NVMe on MSI-X LPIs, /proc/interrupts, gic.its=0 fallback)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
@@ -315,6 +316,8 @@ SUITES = {
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
     "ec2init": ["host:ec2inittest.py"],
+    # GICv3 ITS MSI/MSI-X on aarch64 (own boots, ~6 min TCG; aarch64 only, x86_64 skips).
+    "a64its": ["host:a64itstest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
     # linkmontest.py alone.
