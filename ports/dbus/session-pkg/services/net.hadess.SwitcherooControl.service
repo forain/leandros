@@ -1,0 +1,4 @@
+# net.hadess.SwitcherooControl for the COSMIC session: ports/sysbus (leandros-sysbus switcheroo), activated by busd.
+[D-BUS Service]
+Name=net.hadess.SwitcherooControl
+Exec=/usr/libexec/leandros-sysbus switcheroo
