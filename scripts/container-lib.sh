@@ -109,7 +109,10 @@ leandros_port_fresh() {
     [ "$(cat "$1/out/$2/.srchash")" = "$(leandros_port_srchash "$1")" ]
     return
   fi
-  [ -z "$(find "$1" -path "$1/out" -prune -o -type f -newer "$1/out/$2/.stamp" -print 2>/dev/null | head -n 1)" ]
+  [ -z "$(find "$1" -path "$1/out" -prune -o -type f -newer "$1/out/$2/.stamp" -print 2>/dev/null | head -n 1)" ] || return 1
+  # Fresh by mtime inside this checkout: record the content hash now, so the tree
+  # can be shipped to another checkout/machine (box regress) and still be proven current.
+  leandros_port_record "$1" "$2"
 }
 
 leandros_port_reuse() {
