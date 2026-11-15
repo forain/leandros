@@ -22,6 +22,8 @@ mod mock {
     pub const RX_SQ_DB: usize = 0x1004;
     pub const TX_CQ_DB: usize = 0x1100;
     pub const RX_CQ_DB: usize = 0x1104;
+    pub const TX_CQ_UNMASK: usize = 0x1200;
+    pub const RX_CQ_UNMASK: usize = 0x1204;
     pub const MAC: [u8; 6] = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
 
     unsafe fn p8(pa: u64, o: usize) -> *mut u8 { (pa as *mut u8).add(o) }
@@ -46,8 +48,25 @@ mod mock {
         pub cq_phase: bool,
         pub created: bool,
         pub cq_head_db: u32,
+        /// MSI-X mode: the CQ was created with interrupt_mode_enabled and this table entry.
+        pub irq_mode: bool,
+        pub msix_vector: u32,
+        /// The CQ's interrupt is masked (the device masks after firing; the driver unmasks).
+        pub irq_masked: bool,
+        /// CQ entries the interrupt logic has already signalled.
+        pub cq_seen: u16,
+        /// Interrupts fired for this CQ.
+        pub irqs: u32,
         /// LLQ: entry size in bytes when the SQ was created with DEV placement.
         pub llq_entry: usize,
+    }
+
+    impl Q {
+        /// A completion became visible: raise the CQ's interrupt unless it is masked,
+        /// then mask it (the device auto-masks after firing).
+        pub fn fire(&mut self) {
+            if self.irq_mode && !self.irq_masked { self.cq_seen = self.cq_tail; self.irqs += 1; self.irq_masked = true; }
+        }
     }
 
     pub struct State {
@@ -103,6 +122,12 @@ mod mock {
         pub host_sq_frames: usize,
         pub sq_placements: Vec<(u8, u8)>,
         pub last_llq_off: usize,
+        // ── MSI-X ──
+        pub fail_irq_cq: bool,
+        pub no_unmask_reg: bool,
+        /// Interrupts delivered on table entry 0 (AENQ / admin).
+        pub mgmt_irqs: u32,
+        pub unmask_writes: u32,
     }
 
     pub const LLQ_DESC_OFF: usize = 0x2000;
@@ -123,6 +148,7 @@ mod mock {
                 llq_before_sup: 0x3, llq_stride_sup: 0x2, llq_set: None, llq_fail_create: false,
                 bar2: vec![0u8; 0x2000 + 256 * 1024], bar2_present: true, unfenced: false, llq_frames: 0,
                 host_sq_frames: 0, sq_placements: vec![], last_llq_off: 0,
+                fail_irq_cq: false, no_unmask_reg: false, mgmt_irqs: 0, unmask_writes: 0,
             }
         }
 
@@ -202,6 +228,15 @@ mod mock {
                 RX_SQ_DB => self.rx.posted = v as u16,
                 TX_CQ_DB => self.tx.cq_head_db = v,
                 RX_CQ_DB => self.rx.cq_head_db = v,
+                TX_CQ_UNMASK | RX_CQ_UNMASK => {
+                    self.unmask_writes += 1;
+                    let q = if off == TX_CQ_UNMASK { &mut self.tx } else { &mut self.rx };
+                    if v & INTR_UNMASK != 0 {
+                        q.irq_masked = false;
+                        // Work already queued fires at once (level of the real device's behaviour).
+                        if q.cq_tail != q.cq_seen { q.fire(); }
+                    }
+                }
                 _ => {}
             }
         }
@@ -254,6 +289,7 @@ mod mock {
                         if feat == feat::MTU { self.mtu = unsafe { r32(b, slot + 20) }; }
                     }
                     op::CREATE_CQ => {
+                        let (fail_irq, no_unm) = (self.fail_irq_cq, self.no_unmask_reg);
                         let idx = if self.tx.created { 1u16 } else { 0 };
                         let q = if idx == 0 { &mut self.tx } else { &mut self.rx };
                         unsafe {
@@ -261,12 +297,18 @@ mod mock {
                             q.depth = r16(b, slot + 6);
                             q.cq_ba = r32(b, slot + 12) as u64 | (r16(b, slot + 16) as u64) << 32;
                         }
+                        q.irq_mode = unsafe { *p8(b, slot + 4) } & (1 << 5) != 0;
+                        q.msix_vector = unsafe { r32(b, slot + 8) };
+                        q.irq_masked = true;
                         q.created = true;
                         q.cq_phase = true;
                         resp[8..10].copy_from_slice(&idx.to_le_bytes());
                         resp[10..12].copy_from_slice(&q.depth.to_le_bytes());
                         let db = if idx == 0 { TX_CQ_DB } else { RX_CQ_DB } as u32;
                         resp[16..20].copy_from_slice(&db.to_le_bytes());
+                        if fail_irq && q.irq_mode { status = 3; q.created = false; }
+                        let ub = if idx == 0 { TX_CQ_UNMASK } else { RX_CQ_UNMASK } as u32;
+                        if !no_unm { resp[20..24].copy_from_slice(&ub.to_le_bytes()); }
                     }
                     op::CREATE_SQ => {
                         let dir = unsafe { *p8(b, slot + 4) } >> 5;
@@ -334,6 +376,7 @@ mod mock {
                 }
                 q.cq_tail = q.cq_tail.wrapping_add(1);
                 if q.cq_tail & (q.depth - 1) == 0 { q.cq_phase = !q.cq_phase; }
+                q.fire();
                 if self.loopback { self.inject_rx(&f); }
                 self.frames.push(f);
             }
@@ -383,6 +426,7 @@ mod mock {
             }
             q.cq_tail = q.cq_tail.wrapping_add(1);
             if q.cq_tail & (q.depth - 1) == 0 { q.cq_phase = !q.cq_phase; }
+            q.fire();
             self.llq_frames += 1;
             if self.loopback { self.inject_rx(&f); }
             self.frames.push(f);
@@ -407,6 +451,7 @@ mod mock {
             }
             q.cq_tail = q.cq_tail.wrapping_add(1);
             if q.cq_tail & (q.depth - 1) == 0 { q.cq_phase = !q.cq_phase; }
+            q.fire();
             true
         }
 
@@ -420,6 +465,7 @@ mod mock {
             }
             self.aenq_tail = self.aenq_tail.wrapping_add(1);
             if self.aenq_tail & 31 == 0 { self.aenq_phase = !self.aenq_phase; }
+            if self.intr_mask & INTR_MASK_ADMIN == 0 { self.mgmt_irqs += 1; }
         }
 
         pub fn release_tx(&mut self) { self.stall_tx = false; self.process_tx(); }
@@ -1039,5 +1085,157 @@ mod tests {
     fn device_ids() {
         assert_eq!(VENDOR, 0x1d0f);
         assert!(DEVICE_IDS.contains(&0xec20));
+    }
+
+    // ── MSI-X (interrupt-driven completions) ──
+
+    fn up_msix() -> (MockBus, Ena<MockBus>) {
+        let bus = MockBus::new(false);
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.set_msix_allowed(true);
+        ena.init().expect("init");
+        (bus, ena)
+    }
+
+    #[test]
+    fn msix_off_by_default_keeps_polled_queues() {
+        let (bus, ena) = up(false);
+        let st = bus.st();
+        assert!(!ena.msix_active());
+        assert!(!st.tx.irq_mode && !st.rx.irq_mode, "CQs must be created polled");
+        assert_eq!(st.intr_mask, INTR_MASK_ADMIN, "admin interrupt stays masked");
+        assert_eq!(st.unmask_writes, 0);
+    }
+
+    #[test]
+    fn msix_cqs_use_vector_one_and_admin_is_unmasked() {
+        let (bus, ena) = up_msix();
+        let st = bus.st();
+        assert!(ena.msix_active());
+        assert!(st.tx.irq_mode && st.rx.irq_mode, "both IO CQs are interrupt-mode");
+        assert_eq!((st.tx.msix_vector, st.rx.msix_vector), (MSIX_IO0 as u32, MSIX_IO0 as u32));
+        assert_eq!(MSIX_MGMT, 0);
+        assert_eq!(st.intr_mask, 0, "vector 0 (AENQ) unmasked");
+        assert!(st.violations.is_empty(), "{:?}", st.violations);
+    }
+
+    #[test]
+    fn msix_unmask_doorbells_are_written_with_bit_30() {
+        let (bus, _ena) = up_msix();
+        let st = bus.st();
+        let w: Vec<(usize, u32)> = st.reg_writes.iter().copied().filter(|(o, _)| *o == TX_CQ_UNMASK || *o == RX_CQ_UNMASK).collect();
+        assert!(w.contains(&(TX_CQ_UNMASK, INTR_UNMASK)) && w.contains(&(RX_CQ_UNMASK, INTR_UNMASK)), "{:?}", w);
+        assert!(!st.tx.irq_masked && !st.rx.irq_masked);
+        assert_eq!(INTR_UNMASK, 1 << 30);
+    }
+
+    #[test]
+    fn msix_completion_raises_one_interrupt_until_rearmed() {
+        let (bus, mut ena) = up_msix();
+        let mut buf = vec![0u8; 2048];
+        let (rx0, tx0) = { let s = bus.st(); (s.rx.irqs, s.tx.irqs) };
+        // A frame loops back: TX completion and RX frame each fire their CQ once.
+        assert!(ena.send(&frame(1, 3)));
+        { let s = bus.st(); assert_eq!(s.rx.irqs, rx0 + 1); assert_eq!(s.tx.irqs, tx0 + 1); assert!(s.rx.irq_masked); }
+        // More traffic while masked: no further interrupts, frames wait in the ring.
+        assert!(ena.send(&frame(2, 3)));
+        assert!(ena.send(&frame(3, 3)));
+        assert_eq!(bus.st().rx.irqs, rx0 + 1, "masked CQ must not fire again");
+        assert!(ena.recv(&mut buf).is_some());
+        assert!(ena.recv(&mut buf).is_some());
+        // Work is still queued: re-arming reports it and the unmask itself fires the interrupt.
+        assert!(ena.recv(&mut buf).is_some());
+        let before = bus.st().unmask_writes;
+        assert!(!ena.irq_rearm(), "drained ring: nothing pending");
+        assert!(bus.st().unmask_writes > before, "rearm writes the unmask doorbell");
+        // The mock re-signals completions queued while masked (spurious here: already drained);
+        // a second re-arm finds nothing new and leaves the vector open.
+        assert!(!ena.irq_rearm());
+        assert!(!bus.st().rx.irq_masked);
+        let irqs = bus.st().rx.irqs;
+        // The next frame wakes us again.
+        assert!(ena.send(&frame(4, 3)));
+        assert_eq!(bus.st().rx.irqs, irqs + 1);
+        assert!(ena.recv(&mut buf).is_some());
+    }
+
+    #[test]
+    fn msix_rearm_with_pending_work_fires_immediately() {
+        let (bus, mut ena) = up_msix();
+        assert!(ena.send(&frame(1, 5)));          // fires, masks
+        assert!(ena.send(&frame(2, 5)));          // pending behind the mask
+        let irqs = bus.st().rx.irqs;
+        assert!(ena.irq_rearm(), "frames are waiting");
+        assert_eq!(bus.st().rx.irqs, irqs + 1, "unmasking with queued completions fires at once");
+    }
+
+    #[test]
+    fn msix_loopback_10k_frames_never_loses_a_wakeup() {
+        let (bus, mut ena) = up_msix();
+        let mut buf = vec![0u8; 2048];
+        let mut woke = 0u32;
+        for n in 0..10_000usize {
+            let f = frame(n, 11);
+            let irqs = bus.st().rx.irqs;
+            assert!(ena.send(&f), "send {}", n);
+            if bus.st().rx.irqs != irqs { woke += 1; }
+            let got = ena.recv(&mut buf).unwrap_or_else(|| panic!("no frame {}", n));
+            assert_eq!(&buf[..f.len()], &f[..]);
+            assert!(got >= f.len());
+            assert!(!ena.irq_rearm());
+        }
+        assert_eq!(woke, 10_000, "every frame was announced by an interrupt after the re-arm");
+        assert!(bus.st().violations.is_empty(), "{:?}", bus.st().violations);
+    }
+
+    #[test]
+    fn msix_aenq_event_fires_vector_zero_only_when_unmasked() {
+        let (bus, mut ena) = up_msix();
+        bus.st().push_aenq(aenq::KEEP_ALIVE, 0);
+        assert_eq!(bus.st().mgmt_irqs, 1);
+        assert_eq!(ena.poll_aenq(), 1);
+        let (pbus, _p) = up(false);
+        pbus.st().push_aenq(aenq::KEEP_ALIVE, 0);
+        assert_eq!(pbus.st().mgmt_irqs, 0, "polled: admin interrupt masked");
+    }
+
+    #[test]
+    fn msix_refused_cq_falls_back_to_polled() {
+        let bus = MockBus::new(false);
+        bus.st().fail_irq_cq = true;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.set_msix_allowed(true);
+        ena.init().expect("init must retry polled");
+        assert!(!ena.msix_active());
+        { let s = bus.st(); assert!(!s.tx.irq_mode && !s.rx.irq_mode); assert_eq!(s.intr_mask, INTR_MASK_ADMIN); }
+        let mut buf = vec![0u8; 2048];
+        for n in 0..300 { let f = frame(n, 1); assert!(ena.send(&f)); assert!(ena.recv(&mut buf).is_some()); }
+        assert!(!ena.irq_rearm());
+        assert_eq!(bus.st().unmask_writes, 0);
+    }
+
+    #[test]
+    fn msix_without_unmask_register_falls_back_to_polled() {
+        let bus = MockBus::new(false);
+        bus.st().no_unmask_reg = true;
+        let mut ena = Ena::new(bus.clone(), false).unwrap();
+        ena.set_msix_allowed(true);
+        ena.init().expect("init must retry polled");
+        assert!(!ena.msix_active());
+        assert!(!bus.st().rx.irq_mode);
+    }
+
+    #[test]
+    fn msix_survives_a_watchdog_reset() {
+        let (bus, mut ena) = up_msix();
+        bus.advance_ms(7000);
+        assert_eq!(ena.watchdog(), Watchdog::Reset("keep-alive timeout"));
+        assert!(ena.msix_active());
+        { let s = bus.st(); assert!(s.rx.irq_mode && s.tx.irq_mode && !s.rx.irq_masked); assert_eq!(s.intr_mask, 0); }
+        let irqs = bus.st().rx.irqs;
+        let mut buf = vec![0u8; 2048];
+        assert!(ena.send(&frame(1, 2)));
+        assert_eq!(bus.st().rx.irqs, irqs + 1);
+        assert!(ena.recv(&mut buf).is_some());
     }
 }
