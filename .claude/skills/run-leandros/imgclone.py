@@ -20,3 +20,19 @@ def clone_file(src, dst):
         if subprocess.run(cmd, stderr=subprocess.DEVNULL).returncode == 0:
             return
     shutil.copyfile(src, dst)
+
+
+def ensure_remote_key(img):
+    """Make root key login work in a cloned image. build-all only embeds
+    ~/.ssh/leandros_remote.pub when it exists at build time; a build host
+    without the key (the regress box) yields an image sshd refuses
+    ("Permission denied (publickey,password)"). Create the key if missing and
+    copy its public half into the clone's ESP (::/leandros/authorized_keys)."""
+    key = os.path.expanduser(os.environ.get("LEANDROS_REMOTE_KEY", "~/.ssh/leandros_remote"))
+    if not os.path.exists(key + ".pub"):
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "leandros-remote", "-f", key],
+                       check=True, stdout=subprocess.DEVNULL)
+    esp = f"{img}@@{2048 * 512}"
+    subprocess.run(["mmd", "-i", esp, "::/leandros"], stderr=subprocess.DEVNULL)
+    subprocess.run(["mcopy", "-o", "-i", esp, key + ".pub", "::/leandros/authorized_keys"], check=True)
