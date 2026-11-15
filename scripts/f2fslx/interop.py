@@ -599,7 +599,7 @@ timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?"
 # ---- direction E: LeandrOS fsync -> crash (QEMU quit, no umount) -> Linux (design f2fsnodelog T2) ----
 # (name, guest ops run in /mnt/h after mounting; they print "EXP <md5>  <path>" lines, files the
 #  chain must carry, min chain nodes marked FSYNC/DENT, chain-only: a no-recovery Linux mount must miss the content)
-XV = "XV $(getfattr --only-values -n user.big t/k 2>/dev/null | md5sum | cut -c1-32)"
+XV = "XV $(xattr -p user.big t/k 2>/dev/null | md5sum | cut -c1-32)"
 # name, ops (all fsyncs are real fsync(2): `f2fstest fsync` or dd conv=fsync, never `sync FILE`), minmark (chain nodes
 # chaindump must see), cponly (P-b: what a norecovery mount of the CP shows), cpd (P-a: cp_total delta, None = any),
 # chained (P-a: minimum lx_chained delta), files (inode numbers printed, P-c), pc (per file: "inode" | "data" = also recover_data),
@@ -618,8 +618,8 @@ ESCEN = [
          minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/big": "data"}),
     dict(name="indirect", ops="dd if=/dev/urandom of=t/huge bs=1M count=40 conv=fsync 2>/dev/null; md5sum t/huge",
          minmark=1, cponly="MISS", cpd=None, chained=1, pc={"t/huge": "data"}),
-    dict(name="xattr", ops="V=$(printf 'x%.0s' $(seq 1 700)); setfattr -n user.big -v \"$V\" t/k && f2fstest fsync t/k >/dev/null; md5sum t/k; echo " + XV,
-         minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/k": "inode"}, xv=True),
+    dict(name="xattr", ops="V=$(printf 'x%.0s' $(seq 1 700)); xattr -w user.big \"$V\" t/k && f2fstest fsync t/k >/dev/null; md5sum t/k; echo " + XV,
+         minmark=1, cponly=None, cpd=0, chained=1, pc={"t/k": "inode"}, xv=True),
     dict(name="ab", ops="dd if=/dev/urandom of=t/A bs=1k count=100 conv=fsync 2>/dev/null; dd if=/dev/urandom of=t/B bs=1k count=100 2>/dev/null; md5sum t/A",
          minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/A": "data"}, absent=["t/B"]),
     dict(name="era", ops="dd if=/dev/urandom of=t/A bs=1k count=100 conv=fsync 2>/dev/null; dd if=/dev/urandom of=t/A bs=1k count=100 conv=notrunc 2>/dev/null; "
@@ -631,7 +631,7 @@ ESCEN = [
          minmark=0, cponly=None, cpd=None, chained=0, pc={}),
     dict(name="trunc", ops="dd if=/dev/urandom of=t/tr bs=1M count=2 2>/dev/null; sync; truncate -s 100K t/tr; f2fstest fsync t/tr >/dev/null; md5sum t/tr",
          minmark=0, cponly=None, cpd=None, chained=0, pc={}),
-    dict(name="xattrrm", ops="V=$(printf 'x%.0s' $(seq 1 700)); setfattr -n user.big -v \"$V\" t/k; sync; setfattr -x user.big t/k; f2fstest fsync t/k >/dev/null; md5sum t/k; echo " + XV,
+    dict(name="xattrrm", ops="V=$(printf 'x%.0s' $(seq 1 700)); xattr -w user.big \"$V\" t/k; sync; xattr -d user.big t/k; f2fstest fsync t/k >/dev/null; md5sum t/k; echo " + XV,
          minmark=0, cponly=None, cpd=None, chained=0, pc={}, xv=True),
 ]
 
