@@ -187,7 +187,7 @@ def utmp(ssh, user, pw):
     who = [l.split() for l in out.replace("\r", "").splitlines() if l.strip()]
     step("utmp_who_ssh", any(w[0] == user and w[1].startswith("pts/") for w in who),
          f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
-    step("utmp_who_console_login", any(w[0] == "root" and w[1].startswith("tty") for w in who),
+    step("utmp_who_console_login", any(w[0] == "root" and (w[1].startswith("tty") or w[1] == "console") for w in who),
          f"out={out.strip()!r}")
     # The first session has ended: DEAD_PROCESS, so a plain exec (no pty, never
     # recorded) sees only the current console and ssh-less state.
@@ -196,8 +196,11 @@ def utmp(ssh, user, pw):
     step("utmp_dead_after_exit", rc == 0 and not any(w[0] == user for w in lines),
          f"rc={rc} out={out.strip()!r}")
     rc, out, err = ssh.run(user, f"{bb} last", password=pw)
+    # busybox `last` lists logins only (no boot rows); the BOOT_TIME record
+    # (type 2, first word of wtmp) is checked on the raw file.
+    rc2, wt, _ = ssh.run(user, f"{bb} od -An -tx2 -N2 /var/log/wtmp", password=pw)
     step("utmp_last_history", rc == 0 and any(l.split()[:1] == [user] and "pts/" in l for l in out.splitlines())
-         and ("system boot" in out or "reboot" in out), f"rc={rc} out={out.strip()[-300:]!r}")
+         and wt.split() == ["0002"], f"rc={rc} out={out.strip()[-300:]!r} wtmp0={wt.strip()!r}")
     rc, out, err = ssh.run(user, "ls -l /var/log/lastlog /var/log/wtmp /run/utmps/utmp", password=pw)
     step("utmp_files", rc == 0 and out.count("/var/log/") == 2, f"rc={rc} out={out.strip()!r}")
 

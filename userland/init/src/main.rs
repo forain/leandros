@@ -601,6 +601,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // also reaps any orphan reparented to init, which is simply ignored.
     // Fresh utmp, BOOT_TIME and RUN_LVL records (wtmp keeps the history).
     utmpx::boot();
+    if daemon_wanted(3) { daemon_start(3); }
     write_str("Starting getty loop...\n");
     autorun();
     net_autorun();
@@ -945,7 +946,7 @@ unsafe fn start_bthid_early() {
 /// sshd backoff when they exit.
 #[derive(Clone, Copy)]
 struct Daemon { pid: i32, started: u64, quick: u32, respawn_at: u64 }
-const DAEMON_NAMES: [&str; 3] = ["btd", "bthid", "netctl watch"];
+const DAEMON_NAMES: [&str; 4] = ["btd", "bthid", "netctl watch", "utmpd"];
 static mut DAEMONS: [Daemon; 4] = [Daemon { pid: 0, started: 0, quick: 0, respawn_at: 0 }; 4];
 
 unsafe fn daemon_wanted(k: usize) -> bool {
