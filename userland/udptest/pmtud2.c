@@ -6,6 +6,8 @@
 #include <sys/wait.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 
 #ifndef IPV6_MTU_DISCOVER
 #define IPV6_MTU_DISCOVER 23
@@ -47,12 +49,6 @@ static void udp_pmtud_notconn(void) {
     errno = 0;
     int r = getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl), e = errno;
     close(s);
-    { static const char *qs[] = {"127.0.0.1","127.0.0.2","127.0.0.1","127.0.0.2"}, *qd[] = {"127.0.0.1","127.0.0.1","127.0.0.4","127.0.0.5"};
-      char o[160] = ""; for (int i = 0; i < 4; i++) { struct in_addr d; inet_pton(AF_INET, qd[i], &d); pmtu_qsrc = qs[i]; pmtu_inject4(&d, 17, 1000);
-        int c = socket(AF_INET, SOCK_DGRAM, 0), v = 0; socklen_t l = sizeof v; struct sockaddr_in a = sin4(qd[i], 9);
-        connect(c, (struct sockaddr *)&a, sizeof a); getsockopt(c, IPPROTO_IP, IP_MTU, &v, &l); close(c);
-        snprintf(o + strlen(o), sizeof o - strlen(o), " %s>%s=%d", qs[i], qd[i], v); }
-      pmtu_qsrc = "127.0.0.1"; printf("DIAG pmtud:%s\n", o); fflush(stdout); }
     if (r == 0 || e != ENOTCONN) fail(N, "IP_MTU on an unconnected socket: r=%d errno=%s, want ENOTCONN", r, strerror(e));
     else pass(N);
 }
@@ -62,35 +58,37 @@ static void udp_pmtud_netns(void) {
     const char *N = "udp_pmtud_netns";
     if (skipped(N)) return;
     struct in_addr dst; inet_pton(AF_INET, "127.0.0.1", &dst);
-    int p[2]; if (pipe(p)) { fail(N, "pipe"); return; }
+    int up[2], dn[2]; if (pipe(up) || pipe(dn)) { fail(N, "pipe"); return; }
     pid_t c = fork();
     if (c == 0) {
-        int out = -1;
+        int out = -1; char go = 0;
         if (unshare(CLONE_NEWNET) == 0) {
+            /* a new namespace's lo starts down, as on Linux */
+            int u = socket(AF_INET, SOCK_DGRAM, 0); struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+            strcpy(ifr.ifr_name, "lo"); ifr.ifr_flags = IFF_UP | IFF_RUNNING;
+            ioctl(u, SIOCSIFFLAGS, &ifr); close(u);
+            write(up[1], &go, 1);          /* namespace exists */
+            read(dn[0], &go, 1);           /* parent has learned its path */
             int s = socket(AF_INET, SOCK_DGRAM, 0), v = 0; socklen_t vl = sizeof v;
             struct sockaddr_in a = sin4("127.0.0.1", 9);
             if (connect(s, (struct sockaddr *)&a, sizeof a) == 0 && getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl) == 0) out = v;
             else out = -errno;
-        } else out = -1000 - errno;
-        write(p[1], &out, sizeof out);
+        } else { char g = 0; write(up[1], &g, 1); out = -1000 - errno; }
+        write(up[1], &out, sizeof out);
         _exit(0);
     }
-    /* the parent namespace learns 1000 towards 127.0.0.1 after the child's
+    char g; read(up[0], &g, 1);
+    /* the parent namespace learns 1000 towards 127.0.0.1 while the child's
      * namespace exists (a global cache would hand it to the child) */
-    msleep(300);
     pmtu_inject4(&dst, 17, 1000);
-    int child = 0; read(p[0], &child, sizeof child); waitpid(c, NULL, 0);
-    /* the parent sees 1000 */
     int s = socket(AF_INET, SOCK_DGRAM, 0), v = 0; socklen_t vl = sizeof v;
     struct sockaddr_in a = sin4("127.0.0.1", 9);
     connect(s, (struct sockaddr *)&a, sizeof a);
     getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl);
     close(s);
-    int v2 = 0; { struct in_addr d2; inet_pton(AF_INET, "127.0.0.2", &d2);
-        pmtu_inject4(&d2, 17, 1000);
-        int s2 = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in a2 = sin4("127.0.0.2", 9); socklen_t l2 = sizeof v2;
-        connect(s2, (struct sockaddr *)&a2, sizeof a2); getsockopt(s2, IPPROTO_IP, IP_MTU, &v2, &l2); close(s2); }
-    if (v != 1000) fail(N, "parent namespace IP_MTU %d, want 1000 (127.0.0.2: %d, child %d)", v, v2, child);
+    write(dn[1], &g, 1);
+    int child = 0; read(up[0], &child, sizeof child); waitpid(c, NULL, 0);
+    if (v != 1000) fail(N, "parent namespace IP_MTU %d, want 1000 (child %d)", v, child);
     else if (child != 65536) fail(N, "child namespace IP_MTU %d, want 65536 (cache leaked across namespaces)", child);
     else pass(N);
 }
@@ -113,11 +111,11 @@ static void tcp_pmtud_clamp(void) {
     if (!why[0]) {
         memset(info, 0, sizeof info);
         getsockopt(c, IPPROTO_TCP, 11, info, &il); memcpy(&mss0, info + 16, 4);
-        pmtu_inject4(&la.sin_addr, 6, 1000);
+        pmtu_inject4(&la.sin_addr, 6, 900);
         il = sizeof info; getsockopt(c, IPPROTO_TCP, 11, info, &il);
         memcpy(&mss1, info + 16, 4); memcpy(&pm1, info + 60, 4);
-        if (pm1 != 1000) snprintf(why, sizeof why, "TCP_INFO pmtu %u, want 1000", pm1);
-        else if (mss1 > 948 || mss1 >= mss0) snprintf(why, sizeof why, "snd_mss %u (was %u), want <= 948", mss1, mss0);
+        if (pm1 != 900) snprintf(why, sizeof why, "TCP_INFO pmtu %u, want 900", pm1);
+        else if (mss1 > 848 || mss1 >= mss0) snprintf(why, sizeof why, "snd_mss %u (was %u), want <= 848", mss1, mss0);
     }
     if (!why[0]) {
         static char d[30000], g[30000];
