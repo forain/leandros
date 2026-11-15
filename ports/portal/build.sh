@@ -37,7 +37,8 @@ stage_alpine() {
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/portal-port-src.XXXXXX")
   cp "$HERE/build-in-alpine.sh" "$HERE/pw-stub-symbols.txt" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
   # sonames the image packs itself (keep in sync with ports/firefox/build.sh)
-  sed -n '/^cat > "\$SNAP\/image-sonames.txt"/,/^EOF/p' "$ROOT/ports/firefox/build.sh" \
+  : > "$SNAP/image-sonames.txt"
+  [ -f "$ROOT/ports/firefox/build.sh" ] && sed -n '/^cat > "\$SNAP\/image-sonames.txt"/,/^EOF/p' "$ROOT/ports/firefox/build.sh" \
     | sed '1d;$d' > "$SNAP/image-sonames.txt"
   MNT=""
   LIBC_DIR="$ART/musl-dynamic/sysroot/$ARCH/usr/lib"
