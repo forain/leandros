@@ -37,8 +37,8 @@ static int pmtu_inject4(const struct in_addr *dst, uint8_t proto, uint16_t mtu) 
     c = pmtu_csum(m, sizeof m); m[2] = c >> 8; m[3] = c & 255;
     struct sockaddr_in to = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
     int r = sendto(raw, m, sizeof m, 0, (struct sockaddr *)&to, sizeof to) == (ssize_t)sizeof m ? 0 : -1;
+    msleep(200); /* the stack sends on its next poll; closing first drops the queued packet */
     close(raw);
-    msleep(200);
     return r;
 }
 
