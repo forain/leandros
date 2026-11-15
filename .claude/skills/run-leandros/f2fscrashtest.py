@@ -84,6 +84,23 @@ def keep_failed(out, img, tag, seed, params, arch):
     print(f"    kept {base}.img (+ .txt)", flush=True)
 
 
+def unsplice(s):
+    """Drop kernel log lines ("[IRQ] ...", "[F2FS] ...") from guest output; the
+    console is shared, so one can land inside a claim line ("U 6" + log + "99")
+    and the line used to be lost, giving a false "fsynced but missing"."""
+    tag = r"\[[A-Z][A-Z0-9_]*\][^\n]*\n"
+    junk = r"(?:\x1b\[[0-9;?]*[A-Za-z]|[ \t\r\[\]0-9.])*"
+    s = re.sub(r"(?m)^" + junk + tag, "", s)
+    return re.sub(r"(?:\[ *[0-9.]+\] ?)?" + tag, "", s)
+
+
+def selftest():
+    for a, b in (("U 6[F2FS] x\n99\n", "U 699"), ("N 6[   31.2] [IRQ] y\n99 4096\n", "N 699 4096"),
+                 ("[IRQ] z\nN 5 7\n", "N 5 7")):
+        assert b in unsplice(a), (a, unsplice(a))
+    print("selftest: PASS")
+
+
 class Claims:
     def __init__(self):
         self.a = {}            # k -> last fsynced size
@@ -190,6 +207,8 @@ class Claims:
 
 
 def main(argv):
+    if "--selftest" in argv:
+        return selftest()
     arch, iters, mode, seed, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 6, "mix", None, False
     extra_cmd = ""
     fixed_cp = fixed_ws = None
@@ -336,7 +355,7 @@ def main(argv):
             else:
                 ser.pump(180, until=lambda b: b"FSYNC_FAIL" in b[start:] or b"WRITE_FAIL" in b[start:]
                          or b"CRASH " in b[start:])
-            text = driver._lrc_clean(ser.buf[start:], True)
+            text = unsplice(driver._lrc_clean(ser.buf[start:], True))
             if os.environ.get("F2FSCR_OUT"):
                 with open(os.path.join(os.environ["F2FSCR_OUT"], f"raw-{it}.bin"), "wb") as f:
                     f.write(bytes(ser.buf[max(0, start - 400):]))
