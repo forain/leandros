@@ -966,8 +966,8 @@ static int fan_new(void) { return fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK |
 
 static void t_fan_basic(void)
 {
-    touch("fb");
-    char p[128]; path(p, "fb");
+    touch("fbasic");
+    char p[128]; path(p, "fbasic");
     int ffd = fan_new();
     int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FANALL, AT_FDCWD, p);
     int fd = open(p, O_RDWR); char c;
@@ -977,7 +977,7 @@ static void t_fan_basic(void)
           && g[3].mask == FAN_CLOSE_WRITE;
     for (int i = 0; ok && i < n; i++)
         ok = g[i].pid == getpid() && g[i].fd >= 0 && g[i].vers == FANOTIFY_METADATA_VERSION
-          && g[i].len == sizeof(struct fanotify_event_metadata) && ends_with(g[i].link, "/fb");
+          && g[i].len == sizeof(struct fanotify_event_metadata) && ends_with(g[i].link, "/fbasic");
     fan_closeall(g, n);
     int n2 = ffd < 0 ? -1 : fan_drain(ffd, g, 8);   /* closing event fds must not recurse */
     fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
