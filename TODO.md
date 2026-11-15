@@ -38,7 +38,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ## Missing features
 
 ### Kernel
-- inotify: no (dev, ino) identity yet (watches are path-keyed): no self events through a second hard link; fanotify absent.
+- fanotify: permission events (`FAN_CLASS_CONTENT`/`PRE_CONTENT`, `FAN_OPEN_PERM`/`FAN_ACCESS_PERM` with a verdict `write`), `FAN_MARK_IGNORED_MASK`, `FAN_REPORT_FID`/`DFID_NAME` (`FAN_CREATE`/`DELETE`/`ATTRIB`/`MOVED_*`) and a real mount-root lookup for `FAN_MARK_MOUNT` (today it covers the marked path's subtree) are not implemented; they return `EINVAL`.
 - **Interrupt paths**: virtio-input, virtio-net and the virtio-gpu control queue (MSI-X on x86_64, shared INTx SPI on aarch64) are interrupt-driven already. Still polled: virtio-blk (`wait_for_completion` busy-waits the used ring; callers include page faults with IRQs masked, so an IRQ/sleep path needs a masked-context fallback) and virtio-snd TX (reaped by the 100 Hz tick pump, which must run anyway to keep QEMU's stream queue non-empty, so an IRQ gains little).
 - **Synthetic sysfs**: `/sys/class/drm`, `/sys/class/input/event{0,1}` and the `/sys/dev/char` node files are staged on disk (static); hot-plugged evdev nodes (event2+) have no `/sys/class/input` entry (the libudev shim learns them from `/dev/input/hotplug`), and `capabilities/*` for event0/1 are fixed approximations. Everything else outside `/sys/class/block` stays disk-staged.
 - **utmpx gaps**: no `w`/`users` consumer (Alpine busybox has neither); `/var/log/lastlog` is written but has no reader (busybox `lastlog` absent); su/sudo sessions are not recorded; concurrent writers rely on flock only.
