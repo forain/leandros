@@ -34,7 +34,7 @@ if [[ ! -f "$tarball" ]]; then
   curl -fsSL -o "$tarball.part" "https://dbus.freedesktop.org/releases/dbus/dbus-$VER.tar.xz"
   mv "$tarball.part" "$tarball"
 fi
-got=$(shasum -a 256 "$tarball" | cut -d' ' -f1)
+got=$({ sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball"; } | cut -d" " -f1)
 if [[ "$got" != "$SHA256" ]]; then
   echo "libdbus: $tarball sha256 $got != $SHA256" >&2
   exit 1

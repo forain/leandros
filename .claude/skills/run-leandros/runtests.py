@@ -24,6 +24,7 @@ Options:
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
@@ -94,10 +95,27 @@ sys.path.insert(0, HERE)
 os.chdir(REPO)
 import driver  # noqa: E402
 
+SYSFS_CHECK = (
+    "__f=0; "
+    "t() { eval \"$2\" >/dev/null 2>&1 && echo \"sysfs: $1: PASS\" || { echo \"sysfs: $1: FAIL\"; __f=1; }; }; "
+    "t drm_class_card0 'test -L /sys/class/drm/card0 && grep -q DEVNAME=dri/card0 /sys/class/drm/card0/uevent'; "
+    "t drm_class_render 'test -L /sys/class/drm/renderD128 && grep -q MINOR=128 /sys/class/drm/renderD128/uevent'; "
+    "t drm_class_list 'ls /sys/class/drm | grep -q card0'; "
+    "t drm_dev_char 'grep -q MAJOR=226 /sys/dev/char/226:0/uevent && test -d /sys/dev/char/226:0/device/drm'; "
+    "t drm_device_vendor 'grep -q 0x /sys/class/drm/card0/device/vendor && grep -q 0x /sys/class/drm/card0/device/device'; "
+    "t drm_subsystem 'test -L /sys/dev/char/226:0/device/subsystem'; "
+    "t input_class 'test -L /sys/class/input/event0 && test -L /sys/class/input/event1'; "
+    "t input_uevent 'grep -q DEVNAME=input/event1 /sys/class/input/event1/uevent && grep -q MAJOR=13 /sys/class/input/event0/uevent'; "
+    "t input_name 'grep -q Keyboard /sys/class/input/event0/device/name && grep -q Tablet /sys/class/input/event1/device/name'; "
+    "t input_caps 'test -s /sys/class/input/event0/device/capabilities/ev && test -s /sys/class/input/event1/device/capabilities/abs'; "
+    "t input_dev_char 'test -d /sys/dev/char/13:65/device/id'; "
+    "test $__f = 0"
+)
+
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
-                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
+                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", SYSFS_CHECK,
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
@@ -257,6 +275,7 @@ SUITES = {
     # NVMe command timeout: the driver resets the controller and the stalled
     # read finishes with intact data (own boot, ~2 min; not in regress).
     "nvmefault": ["host:nvmefaulttest.py"],
+    "nvmeebs": ["host:nvmeebstest.py"],
     # Network management end to end: /dev/netctl conformance, the NM shim on
     # its mock (full, with the snapshot storm, and read-only), then the shim
     # on the REAL stack (nmrealtest.py: its own boot with wifi_sim, nmtest as
@@ -313,6 +332,9 @@ SUITES = {
     # CPU fence waits really wait: the fence-wait spin bound (lane rddsys).
     "i915fence": ["/bin/i915test"],
     "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
+    # Synthetic sysfs: /sys/class/{drm,input} and the /sys/dev/char node
+    # identity libdrm/udev consumers read (lane sysfs).
+    "sysfs": [SYSFS_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git

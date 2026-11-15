@@ -37,6 +37,7 @@ drv-virtio-keyboard = []
 # Off: the module is replaced by a small stub under src/stubs/ or compiled out.
 e1000e = []
 r8169 = []
+ena = []
 macb = []
 virtio-net = []
 virtio-snd = []

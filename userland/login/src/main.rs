@@ -12,6 +12,9 @@ extern crate leandros_libc;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
 
+#[path = "../../../lib/utmpx/utmpx.rs"]
+mod utmpx;
+
 use leandros_libc::{
     write, read, STDOUT_FILENO, STDIN_FILENO,
     open, close, O_RDONLY,
@@ -285,6 +288,13 @@ unsafe fn lookup_groups(username: &str, out: &mut [u32; 32]) -> usize {
 
 /// Drop privileges to the matched user and exec their shell. Never returns.
 unsafe fn do_login(rec: &UserRec) -> ! {
+    // utmp/wtmp/lastlog while still root; the shell keeps this pid, so init
+    // closes the record when it reaps the session.
+    {
+        let mut line = [0u8; 32];
+        let n = utmpx::tty_line(0, &mut line);
+        utmpx::login(utmpx::getpid(), &line[..n], &rec.name[..rec.name_len], b"", rec.uid);
+    }
     leandros_libc::cgsession::join(rec.uid, rec.gid);
     // Supplementary groups first: setgroups needs root, which setresuid
     // below gives up.

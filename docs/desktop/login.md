@@ -221,9 +221,10 @@ greetd is staged by a hash of the `pam-leandros` source: `greetd-lane/<arch>/<sr
 - **cosmic-comp still runs as root in the greeter session.** libseat is a shim with no
   seatd behind it, so the compositor cannot be handed a revocable device fd by a broker.
   The user session's compositor runs as the user, but the greeter's does not.
-- **No real PAM, no utmpx.** Whether to extend the shim or port Linux-PAM (which `dlopen`s
-  its modules) is undecided. Nothing that is shipped reads utmpx — upstream greetd has no
-  utmpx code at all — so that item waits on a consumer.
+- **No real PAM.** Whether to extend the shim or port Linux-PAM (which `dlopen`s
+  its modules) is undecided. The shim's `pam_open_session`/`pam_close_session` for the `greetd`
+  service write the utmpx/wtmp/lastlog records (line `greetd`); the greeter's own
+  `greetd-greeter` session is not recorded.
 - **Landmines recorded in the port** ([ports/greetd/README.md](../../ports/greetd/README.md#landmines)):
   greetd's parent-to-worker channel is a `UnixDatagram` socketpair (a message up to
   212960 bytes goes through, a larger one is `EMSGSIZE`, as on Linux); `prctl(PR_SET_PDEATHSIG)` is accepted and does nothing; cosmic-comp's
