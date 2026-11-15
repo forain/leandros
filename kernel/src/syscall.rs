@@ -871,6 +871,8 @@ mod nr {
     pub const INOTIFY_INIT1:       usize = 26;
     pub const FANOTIFY_INIT:       usize = 262;
     pub const FANOTIFY_MARK:       usize = 263;
+    pub const NAME_TO_HANDLE_AT:   usize = 264;
+    pub const OPEN_BY_HANDLE_AT:   usize = 265;
     pub const INOTIFY_ADD_WATCH:   usize = 27;
     pub const INOTIFY_RM_WATCH:    usize = 28;
     pub const POSIX_FADVISE:       usize = 223;
@@ -1162,6 +1164,8 @@ mod nr {
     pub const INOTIFY_INIT1:       usize = 294;
     pub const FANOTIFY_INIT:       usize = 300;
     pub const FANOTIFY_MARK:       usize = 301;
+    pub const NAME_TO_HANDLE_AT:   usize = 303;
+    pub const OPEN_BY_HANDLE_AT:   usize = 304;
     pub const INOTIFY_ADD_WATCH:   usize = 254;
     pub const INOTIFY_RM_WATCH:    usize = 255;
     pub const POSIX_FADVISE:       usize = 221;
@@ -2648,6 +2652,8 @@ fn dispatch_inner(
         INOTIFY_RM_WATCH  => sys_inotify_rm_watch(a0, a1),
         FANOTIFY_INIT     => sys_fanotify_init(a0, a1),
         FANOTIFY_MARK     => sys_fanotify_mark(a0, a1, a2, a3, a4),
+        NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0, a1, a2, a3, a4),
+        OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0, a1, a2),
 
         // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
         // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
@@ -16924,6 +16930,56 @@ fn sys_fanotify_mark(fd: usize, flags: usize, mask: usize, dirfd: usize, path_pt
     } else { path };
     let msg = make_vfs_msg(vfs::VFS_FANOTIFY_MARK, &[fd as u64, path.ptr() as u64, flags as u32 as u64, mask as u64, dirfd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// name_to_handle_at(dirfd, path, handle, mount_id, flags): the same
+/// FILEID_LEANDROS handle fanotify FID records carry (type 0x4c, 12 bytes:
+/// st_ino u64 + generation 0). Filesystems that cannot be watched: EOPNOTSUPP.
+fn sys_name_to_handle_at(dirfd: usize, path_ptr: usize, fh_ptr: usize, mnt_ptr: usize, flags: usize) -> isize {
+    const AT_SYMLINK_FOLLOW: usize = 0x400;
+    const AT_HANDLE_FID: usize = 0x200;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID) != 0 { return -22; }
+    if !validate_user_buf(fh_ptr, 8) { return -14; }
+    let cap: u32 = ur(fh_ptr);
+    if cap > 128 { return -22; }
+    let raw = match copy_user_path(path_ptr) { Ok(r) => r, Err(e) => return e };
+    let host: Vec<u8> = if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 { return -2; }
+        let d = dirfd as u32 as i32 as isize as usize;
+        if d == AT_FDCWD { match resolve_ns(b".").and_then(KPath::from_ns) { Ok(k) => k.buf[..k.buf.len() - 1].to_vec(), Err(e) => return e } }
+        else { match fd_host_path(d) { Some(h) => h, None => return -9 } }
+    } else {
+        let kp = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+        let kp = if flags & AT_SYMLINK_FOLLOW != 0 { match follow_magic_final(kp) { Ok(p) => p, Err(e) => return e } } else { kp };
+        kp.buf[..kp.buf.len() - 1].to_vec()
+    };
+    let id = match vfs::fh_ident(&host) { Some(i) => i, None => return -95 };
+    if cap < 12 { uw::<u32>(fh_ptr, 12); return -75; }
+    vfs::fh_remember(id, &host);
+    uw::<u32>(fh_ptr, 12);
+    uw::<i32>(fh_ptr + 4, 0x4c);
+    uw::<u64>(fh_ptr + 8, id.1);
+    uw::<u32>(fh_ptr + 16, 0);
+    if mnt_ptr != 0 { uw::<u32>(mnt_ptr, (id.0 as u32) ^ ((id.0 >> 32) as u32)); }
+    0
+}
+
+/// open_by_handle_at(mount_fd, handle, flags): CAP_DAC_READ_SEARCH; the
+/// handle must have been issued by this boot (ESTALE otherwise or when the
+/// inode is gone). `mount_fd` names the filesystem (its st_dev).
+fn sys_open_by_handle_at(mount_fd: usize, fh_ptr: usize, flags: usize) -> isize {
+    if !sched::caps::host_capable_of(current_pid(), 2 /*CAP_DAC_READ_SEARCH*/) { return -1; }
+    if !validate_user_buf(fh_ptr, 20) { return -14; }
+    let (nb, ty): (u32, i32) = (ur(fh_ptr), ur(fh_ptr + 4));
+    if nb != 12 || ty != 0x4c { return -22; }
+    let ino: u64 = ur(fh_ptr + 8);
+    let d = mount_fd as u32 as i32 as isize as usize;
+    let mp = if d == AT_FDCWD { match resolve_ns(b".").and_then(KPath::from_ns) { Ok(k) => k.buf[..k.buf.len() - 1].to_vec(), Err(e) => return e } }
+             else { match fd_host_path(d) { Some(h) => h, None => return -9 } };
+    match vfs::fh_lookup(vfs::fh_dev(&mp), ino) {
+        Some(p) => { let kp = KPath::raw(&p); vfs_open_resolved(kp.ptr(), open_flags_from_user(flags), 0) }
+        None => -116,
+    }
 }
 
 /// inotify_rm_watch(fd, wd): a no-op with the silent stub, a real removal

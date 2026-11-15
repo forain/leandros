@@ -13418,9 +13418,45 @@ fn handle_fanotify_mark(pid: u32, fd: usize, path_ptr: usize, flags: u32, mask: 
     }
 }
 
+
+/// Handles issued so far (name_to_handle_at, fanotify FID records): (dev, ino)
+/// -> the path it was issued for. open_by_handle_at reopens through it and
+/// answers ESTALE when the path no longer names the same inode. Supported on
+/// every filesystem `inotify::may_watch` accepts (tmpfs, f2fs, ...).
+static FH_TABLE: Mutex<alloc::vec::Vec<((u64, u64), alloc::vec::Vec<u8>)>> = Mutex::new(alloc::vec::Vec::new());
+
+pub fn fh_remember(id: (u64, u64), path: &[u8]) {
+    let mut t = FH_TABLE.lock();
+    if let Some(e) = t.iter_mut().find(|e| e.0 == id) { e.1 = path.to_vec(); return; }
+    if t.len() >= 4096 { t.remove(0); }
+    t.push((id, path.to_vec()));
+}
+
+/// (dev, ino) of `path` and the path recorded for the handle; `None` when the
+/// filesystem cannot be watched (EOPNOTSUPP).
+pub fn fh_ident(path: &[u8]) -> Option<(u64, u64)> {
+    if !inotify::may_watch(path) && tmpfs_path(path).is_none() { return None; }
+    let p = tmpfs_path(path).unwrap_or(path);
+    inotify_ident(p).map(|i| i.id)
+}
+
+/// Path recorded for `id` provided it still names the same inode.
+/// `Err(true)` = unknown or gone (ESTALE).
+pub fn fh_lookup(dev: Option<u64>, ino: u64) -> Option<alloc::vec::Vec<u8>> {
+    let (id, p) = FH_TABLE.lock().iter().find(|e| e.0 .1 == ino && dev.map_or(true, |d| d == e.0 .0)).map(|e| (e.0, e.1.clone()))?;
+    if fh_ident(&p) == Some(id) { Some(p) } else { None }
+}
+
+/// st_dev of the object `path` names (no watchability gate).
+pub fn fh_dev(path: &[u8]) -> Option<u64> {
+    inotify_ident(tmpfs_path(path).unwrap_or(path)).map(|i| i.id.0)
+}
+
+pub fn fh_known(id: (u64, u64)) -> bool { FH_TABLE.lock().iter().any(|e| e.0 == id) }
+
 /// One `struct fanotify_event_info_fid` record: header, fsid, `struct
-/// file_handle`. There is no name_to_handle_at / open_by_handle_at here, so
-/// the handle is the stable LeandrOS object identity: handle_type
+/// file_handle`. The handle is the LeandrOS object identity that
+/// name_to_handle_at also returns (reopened through open_by_handle_at): handle_type
 /// FILEID_LEANDROS (0x4c), 12 bytes = st_ino (u64) + generation (u32, 0);
 /// fsid = the st_dev halves. Pushes nothing when `id` is unknown.
 fn fan_fid_record(out: &mut Vec<u8>, ty: u8, id: (u64, u64), name: Option<&[u8]>) {
@@ -13449,10 +13485,12 @@ fn fan_fid_records(out: &mut Vec<u8>, gfid: u32, path: &[u8], eino: (u64, u64), 
         None => (&path[..0], path),
     };
     let obj: Option<(u64, u64)> = if named { inotify_ident(path).map(|i| i.id) } else { Some(eino) };
+    if let Some(o) = obj { fh_remember(o, path); }
     if gfid & inotify::FAN_REPORT_DIR_FID != 0 {
         let (did, nm): (Option<(u64, u64)>, &[u8]) = if named { (Some(eino), base) }
             else if isdir { (Some(eino), b".") } else { (inotify_ident(dir).map(|i| i.id), base) };
         if let Some(d) = did {
+            fh_remember(d, if named || !isdir { dir } else { path });
             if gfid & inotify::FAN_REPORT_NAME != 0 { fan_fid_record(out, 2, d, Some(nm)); } else { fan_fid_record(out, 3, d, None); }
         }
     }
