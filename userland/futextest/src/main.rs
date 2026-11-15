@@ -707,6 +707,34 @@ fn kwake_scan_indexed() -> bool {
     static PARKED: AtomicU32 = AtomicU32::new(0);
     PARKED.store(0, SeqCst);
     let stop = unsafe { eventfd(0, 0x800) };
+    let (e, ep2) = unsafe { (eventfd(0, 0x800), epoll_create1(0)) };
+    let one = 1u64.to_ne_bytes();
+    let mut buf = [0u8; 8];
+    let mut measure = || {
+        let kb = rq_row("# kwake ");
+        for _ in 0..N { unsafe { c_write(e, one.as_ptr(), 8); c_read(e, buf.as_mut_ptr(), 8); } }
+        let ka = rq_row("# kwake ");
+        let wb = rq_row("# widen ");
+        for _ in 0..N {
+            let mut ev = EpEvent { events: 1, data: 0 };
+            unsafe { epoll_ctl(ep2, 1, e, &mut ev); epoll_ctl(ep2, 2, e, &mut ev); }
+        }
+        (kb, ka, wb, rq_row("# widen "))
+    };
+    let rates = |m: &(Option<Vec<u64>>, Option<Vec<u64>>, Option<Vec<u64>>, Option<Vec<u64>>)| -> Option<(u64, f64, u64, u64, f64, u64, u64)> {
+        let (b, a, wb, wa) = (m.0.as_ref()?, m.1.as_ref()?, m.2.as_ref()?, m.3.as_ref()?);
+        if b.len() != 4 || a.len() != 4 || wb.len() != 3 || wa.len() != 3 { return None; }
+        let (c, sl, d, f) = (a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]);
+        let (wc, ws, wf) = (wa[0] - wb[0], wa[1] - wb[1], wa[2] - wb[2]);
+        let kp = if c > 0 { sl as f64 / c as f64 } else { f64::MAX };
+        let wp = if wc > 0 { ws as f64 / wc as f64 } else { 0.0 };
+        Some((c, kp, d, f, wp, wc, wf))
+    };
+    // The kernel counters are system-wide: other processes' parkers (broadcast
+    // masks, bloom collisions) add slots per wake. Measure that background
+    // first with none of our own parkers, and assert only what the 32x16
+    // parkers ADD on top of it.
+    let base = rates(&measure());
     let hs: Vec<_> = (0..T).map(|_| thread::spawn(move || unsafe {
         let ep = epoll_create1(0);
         let mut fds = vec![stop];
@@ -723,32 +751,19 @@ fn kwake_scan_indexed() -> bool {
     })).collect();
     while PARKED.load(SeqCst) < T as u32 { thread::yield_now(); }
     thread::sleep(Duration::from_millis(100));
-    let (e, ep2) = unsafe { (eventfd(0, 0x800), epoll_create1(0)) };
-    let one = 1u64.to_ne_bytes();
-    let mut buf = [0u8; 8];
-    let kb = rq_row("# kwake ");
-    for _ in 0..N { unsafe { c_write(e, one.as_ptr(), 8); c_read(e, buf.as_mut_ptr(), 8); } }
-    let ka = rq_row("# kwake ");
-    let wb = rq_row("# widen ");
-    for _ in 0..N {
-        let mut ev = EpEvent { events: 1, data: 0 };
-        unsafe { epoll_ctl(ep2, 1, e, &mut ev); epoll_ctl(ep2, 2, e, &mut ev); }
-    }
-    let wa = rq_row("# widen ");
+    let m = measure();
     unsafe { c_write(stop, one.as_ptr(), 8); }
     for h in hs { let _ = h.join(); }
     unsafe { close(e); close(ep2); close(stop); }
-    let (ok, detail) = match (kb, ka, wb, wa) {
-        (Some(b), Some(a), Some(wb), Some(wa)) if b.len() == 4 && a.len() == 4 && wb.len() == 3 && wa.len() == 3 => {
-            let (c, sl, d, f) = (a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]);
-            let (wc, ws, wf) = (wa[0] - wb[0], wa[1] - wb[1], wa[2] - wb[2]);
-            let kp = if c > 0 { sl as f64 / c as f64 } else { f64::MAX };
-            let wp = if wc > 0 { ws as f64 / wc as f64 } else { 0.0 };
-            (c >= N && kp <= 2.0 && f == 0 && wp <= 2.0 && wf == 0,
-             format!("{} keyed wakes, {:.2} slots/wake ({} deref, {} unindexed); {} widens, {:.2} slots/widen ({} unindexed); {}x{} parked",
-                     c, kp, d, f, wc, wp, wf, T, K))
+    let (bkp, bwp) = base.map(|b| (b.1, b.4)).unwrap_or((0.0, 0.0));
+    let (bkp, bwp) = (if bkp == f64::MAX { 0.0 } else { bkp }, bwp);
+    let (ok, detail) = match rates(&m) {
+        Some((c, kp, d, f, wp, wc, wf)) => {
+            (c >= N && kp - bkp <= 2.0 && f == 0 && wp - bwp <= 2.0 && wf == 0,
+             format!("{} keyed wakes, {:.2} slots/wake (background {:.2}; {} deref, {} unindexed); {} widens, {:.2} slots/widen (background {:.2}; {} unindexed); {}x{} parked",
+                     c, kp, bkp, d, f, wc, wp, bwp, wf, T, K))
         }
-        _ => (false, "no # kwake / # widen row in /proc/rqhold".into()),
+        None => (false, "no # kwake / # widen row in /proc/rqhold".into()),
     };
     println!("kwake_scan_indexed: {}", detail);
     report("kwake_scan_indexed", ok, detail)
