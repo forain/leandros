@@ -10,6 +10,10 @@
 //!                                    net.hadess.PowerProfiles (ppd, placeholder driver)
 //!   leandros-sysbus polkit   org.freedesktop.PolicyKit1 (agent registry; only root is authorized)
 //!   leandros-sysbus rtkit    org.freedesktop.RealtimeKit1 (grants nothing; NotSupported)
+//!   leandros-sysbus timedate1  org.freedesktop.timedate1 (Timezone, SetTimezone, no NTP)
+//!   leandros-sysbus switcheroo net.hadess.SwitcherooControl (GPUs from /sys/class/drm)
+//!   leandros-sysbus a11y     org.a11y.Bus (GetAddress -> the session bus)
+//!   leandros-sysbus svc-test client: portal/timedate1/switcheroo/a11y activation checks
 //!   leandros-sysbus networkmanager  org.freedesktop.NetworkManager over /dev/netctl
 //!                            (or a scripted mock: LEANDROS_NM_MOCK, see nm/mock.rs)
 //!   leandros-sysbus probe    client: exercises all of them, prints PASS/FAIL
@@ -31,6 +35,7 @@
 //! anything that needs root (powering off, writing /etc as uid 1000) is
 //! reported as an error instead of pretending to succeed. See each module.
 
+mod a11y;
 mod bluez;
 mod locale1;
 mod login1;
@@ -40,6 +45,9 @@ mod power_profiles;
 mod portal_probe;
 mod probe;
 mod rtkit;
+mod svc_test;
+mod switcheroo;
+mod timedate1;
 mod upower;
 
 use std::process::ExitCode;
@@ -62,10 +70,10 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 /// shared by every worktree, so a sysbus rebuilt by a lane on an older tree
 /// would otherwise silently drop e.g. `bluez` or `power`. Add every new
 /// subcommand here.
-const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez,bluez-test,probe,power,portal;";
+const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez,bluez-test,probe,power,portal,timedate1,switcheroo,a11y,svc-test;";
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|networkmanager|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|timedate1|switcheroo|a11y|svc-test|networkmanager|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
     eprintln!("{SERVICES}");
     ExitCode::from(2)
 }
@@ -127,6 +135,10 @@ fn main() -> ExitCode {
             let (_pass, fail) = bluez::test::run(builder.build().await?).await;
             return Ok(Some(fail == 0));
         }
+        if which == "svc-test" {
+            let (_pass, fail) = svc_test::run(builder.build().await?).await;
+            return Ok(Some(fail == 0));
+        }
         if which == "probe" {
             let (_pass, fail) = probe::run(builder.build().await?).await;
             return Ok(Some(fail == 0));
@@ -138,6 +150,9 @@ fn main() -> ExitCode {
             "power-profiles" => power_profiles::serve(builder).await?,
             "polkit" => polkit::serve(builder).await?,
             "rtkit" => rtkit::serve(builder).await?,
+            "timedate1" => timedate1::serve(builder).await?,
+            "switcheroo" => switcheroo::serve(builder).await?,
+            "a11y" => a11y::serve(builder, &address).await?,
             "networkmanager" => nm::serve(builder).await?,
             "bluez" => bluez::serve(builder).await?,
             _ => return Ok::<_, zbus::Error>(None),
