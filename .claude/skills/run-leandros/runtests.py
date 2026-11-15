@@ -464,7 +464,8 @@ def self_boots(c):
         return False
     try:
         with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
-            return '"start"' in f.read()
+            t = f.read()
+            return '"start"' in t or "ffsession.py" in t  # ffsession.py boots its own VM
     except OSError:
         return False
 
