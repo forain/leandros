@@ -1,0 +1,4 @@
+# org.a11y.Bus for the COSMIC session: ports/sysbus (leandros-sysbus a11y), activated by busd.
+[D-BUS Service]
+Name=org.a11y.Bus
+Exec=/usr/libexec/leandros-sysbus a11y
