@@ -140,6 +140,7 @@ impl TimeDate {
         Ok(())
     }
 
+    #[zbus(name = "SetLocalRTC")]
     fn set_local_rtc(&self, local: bool, _fix_system: bool, _interactive: bool) -> zbus::fdo::Result<()> {
         if local {
             return Err(zbus::fdo::Error::NotSupported("the RTC is kept in UTC".into()));
@@ -147,6 +148,7 @@ impl TimeDate {
         Ok(())
     }
 
+    #[zbus(name = "SetNTP")]
     fn set_ntp(&self, use_ntp: bool, _interactive: bool) -> zbus::fdo::Result<()> {
         if use_ntp {
             return Err(zbus::fdo::Error::NotSupported("LeandrOS has no time synchronisation service".into()));

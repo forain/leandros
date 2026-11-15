@@ -363,7 +363,7 @@ def verify_dbus_staging(arch):
     Loud, not silent: this raises SystemExit rather than warning, because a
     warning in a build that then prints a green image is the thing that failed.
     """
-    ship = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
+    ship = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), arch)
     if not os.path.isdir(ship):
         return                      # no D-Bus payload staged at all; nothing to check
     repo = os.path.normpath(os.path.join(
@@ -1500,8 +1500,8 @@ def main():
     # and the fonts are plain data (0644) and ride the shared /usr tree walk
     # (m4_share_files/m4_share_dirs, generalized here beyond /usr/share).
     verify_dbus_staging(arch)
-    m5_arch_root = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
-    m5_fonts_src = os.path.expanduser("~/code/leandros-artifacts/m5-session-ship/share/fonts")
+    m5_arch_root = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), arch)
+    m5_fonts_src = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), "share/fonts")
     # cosmic-comp: LEANDROS_COSMIC_COMP=<file> wins; else the m6 rebuild that
     # carries ports/cosmic-comp's patches (ports/cosmic-comp/build.sh);
     # else the original M5 probe build.
@@ -3014,6 +3014,15 @@ def main():
         _cc = dict(_stor)
         _cc.update(path="/etc/containers/containers.conf", host=_podcc, size=os.path.getsize(_podcc))
         _ap_entries.append(_cc)
+    # at-spi2-core ships org.a11y.Bus.service running at-spi-bus-launcher, which
+    # spawns /usr/bin/dbus-daemon (absent: busd is our broker) and fails every
+    # GetAddress. ours (ports/dbus/session-pkg, leandros-sysbus a11y) wins.
+    _a11y = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "dbus", "session-pkg", "services", "org.a11y.Bus.service")
+    if os.path.isfile(_a11y):
+        for e in _ap_entries:
+            if e["path"] == "/usr/share/dbus-1/services/org.a11y.Bus.service" and e["kind"] == "file":
+                e["host"] = _a11y
+                e["size"] = os.path.getsize(_a11y)
     # Alpine gives newuidmap/newgidmap file capabilities (security.capability xattr), which the image does not
     # carry; setuid root is the equivalent until file caps exist (see podtrace-findings).
     for e in _ap_entries:

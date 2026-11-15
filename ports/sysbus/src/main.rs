@@ -136,7 +136,7 @@ fn main() -> ExitCode {
             return Ok(Some(fail == 0));
         }
         if which == "svc-test" {
-            let (_pass, fail) = svc_test::run(builder.build().await?).await;
+            let (_pass, fail) = svc_test::run(builder.build().await?, std::env::args().nth(2).as_deref() == Some("portal")).await;
             return Ok(Some(fail == 0));
         }
         if which == "probe" {

@@ -44,7 +44,7 @@ fn error_name(r: &R<()>) -> String {
     }
 }
 
-pub async fn run(c: zbus::Connection) -> (u32, u32) {
+pub async fn run(c: zbus::Connection, with_portal: bool) -> (u32, u32) {
     let (mut pass, mut fail_n) = (0u32, 0u32);
     macro_rules! check {
         ($name:expr, $fut:expr) => {{
@@ -63,6 +63,9 @@ pub async fn run(c: zbus::Connection) -> (u32, u32) {
     let c = &c;
 
     // --- xdg-desktop-portal (ports/portal) ---
+    // The frontend waits for its cosmic backend (a Wayland client) at start-up,
+    // so this only works inside a COSMIC session: `svc-test portal`.
+    if with_portal {
     const P: &str = "org.freedesktop.portal.Desktop";
     const PP: &str = "/org/freedesktop/portal/desktop";
     check!("portal Screenshot interface", async {
@@ -84,6 +87,8 @@ pub async fn run(c: zbus::Connection) -> (u32, u32) {
             Err(fail("org.freedesktop.impl.portal.desktop.cosmic not activatable"))
         }
     });
+
+    }
 
     // --- timedate1 ---
     const T: &str = "org.freedesktop.timedate1";
