@@ -2,6 +2,7 @@
 import os
 import shutil
 import subprocess
+import sys
 
 
 def clone_file(src, dst):
@@ -11,7 +12,10 @@ def clone_file(src, dst):
         os.unlink(dst)
     except OSError:
         pass
-    for cmd in (["cp", "-c", src, dst], ["cp", "--reflink=always", src, dst],
+    # GNU cp accepts -c (= --preserve=context) and would make a full dense copy, so
+    # only use it on macOS.
+    clone = ["cp", "-c", src, dst] if sys.platform == "darwin" else ["cp", "--reflink=always", src, dst]
+    for cmd in (clone, ["cp", "--reflink=always", src, dst],
                 ["cp", "--sparse=always", src, dst]):
         if subprocess.run(cmd, stderr=subprocess.DEVNULL).returncode == 0:
             return

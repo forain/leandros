@@ -60,9 +60,7 @@ def main(argv):
     tmp = tempfile.mkdtemp(prefix="espreset-")
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
-    subprocess.run(["cp", "-c", src, img], check=False)
-    if not os.path.exists(img):
-        imgclone.clone_file(src, img)
+    imgclone.clone_file(src, img)
     env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}")
     os.environ["LEANDROS_DISK_IMAGE"] = img
 
