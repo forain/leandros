@@ -12,7 +12,10 @@
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 
 pub type NsId = u16;
-pub const NS_MAX: usize = 256;
+/// Slots in the shared namespace table (ids are u16). Static, memory-bounded:
+/// ~0.55 KiB per slot (~4.5 MiB of BSS in total). Every per-id array below is
+/// indexed directly by id, so lookups stay O(1) and lock-free.
+pub const NS_MAX: usize = 8192;
 /// Linux `/proc/sys/user/max_user_namespaces` nesting limit.
 pub const MAX_USERNS_LEVEL: u8 = 32;
 /// Clone/unshare flags the namespace layer accepts so far.
@@ -150,7 +153,7 @@ pub const LIMIT_N: usize = 9;
 pub const LIMIT_NAMES: [&[u8]; LIMIT_N] =
     [b"", b"max_user_namespaces", b"max_mnt_namespaces", b"max_net_namespaces", b"max_pid_namespaces",
      b"max_time_namespaces", b"max_cgroup_namespaces", b"max_ipc_namespaces", b"max_uts_namespaces"];
-const LIMIT_DEFAULT: [u32; LIMIT_N] = [0, 72, 48, 32, 20, 8, 24, 24, 24];
+const LIMIT_DEFAULT: [u32; LIMIT_N] = [0, 2048, 1024, 2048, 512, 8, 512, 1024, 1000];
 static LIMIT: [AtomicU32; LIMIT_N] = {
     let mut a = [const { AtomicU32::new(0) }; LIMIT_N];
     let mut i = 0;
@@ -1461,9 +1464,11 @@ pub fn ping_allowed(pid: u32) -> bool {
     let ns = netns_of(pid);
     let k = netctl_find(b"ipv4/ping_group_range").unwrap();
     let (lo, hi) = (netctl_get(ns, k), netctl_get(ns, k + 1));
-    let g = crate::egid_of(pid);
-    if lo <= g && g <= hi { return true; }
-    crate::caps::pid_capable_in(pid, owner_userns(2, ns), 13) // CAP_NET_RAW
+    // The range is written by the namespace's own users (podman: "0 0" = the container's root), so the caller's gid
+    // is compared as the netns owner's user namespace names it (unmapped gids never match).
+    let owner = owner_userns(2, ns);
+    if let Some(g) = from_k(1, owner, crate::egid_of(pid)) { if lo <= g && g <= hi { return true; } }
+    crate::caps::pid_capable_in(pid, owner, 13) // CAP_NET_RAW
 }
 /// net.ipv6.bindv6only of namespace `ns`: the IPV6_V6ONLY a new AF_INET6 socket starts with.
 pub fn bindv6only(ns: NsId) -> bool {

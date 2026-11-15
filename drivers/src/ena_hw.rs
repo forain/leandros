@@ -75,6 +75,12 @@ pub const CTL_RESET: u32 = 1 << 0;
 pub const CTL_RESET_REASON_SHIFT: u32 = 28;
 /// `ENA_REGS_ADMIN_INTR_MASK`: mask the admin interrupt (polled).
 pub const INTR_MASK_ADMIN: u32 = 1;
+/// `ENA_ETH_IO_INTR_REG_INTR_UNMASK`: bit 30 of a CQ's interrupt-unmask register
+/// (delays 0). The device masks the vector again after each interrupt.
+pub const INTR_UNMASK: u32 = 1 << 30;
+/// MSI-X table entry of the management / AENQ interrupt; IO queue pair `n` uses `1 + n`.
+pub const MSIX_MGMT: u16 = 0;
+pub const MSIX_IO0: u16 = 1;
 
 /// Reset reasons (DEV_CTL bits 31:28).
 pub mod reset_reason {
@@ -309,6 +315,8 @@ struct IoQ {
     cq_phase: bool,
     sq_db: usize,
     cq_db: usize,
+    /// Interrupt-unmask register of the CQ (MSI-X mode), BAR0 offset; 0 when polled.
+    cq_unmask: usize,
     free: Vec<u16>,
 }
 
@@ -377,6 +385,12 @@ pub struct Ena<B: EnaBus> {
     llq_refused: bool,
     llq: Option<LlqCfg>,
     llq_off: usize,
+    /// Interrupt-driven completions requested (MSI-X vectors are set up by the glue).
+    msix_allowed: bool,
+    /// The device refused an interrupt-mode CQ (or gave no unmask register): polled.
+    msix_refused: bool,
+    /// The queues were created in interrupt mode.
+    msix: bool,
 }
 
 fn page_bytes(p: &DmaBuf, off: usize, n: usize) -> Vec<u8> {
@@ -397,7 +411,7 @@ fn mk_q<B: EnaBus>(bus: &B, depth: u16, sq_entry: usize, cq_entry: usize) -> Opt
     let pages = alloc_pages(bus, depth as usize * SLOT / 4096)?;
     Some(IoQ {
         sq, cq, pages, depth, sq_tail: 0, sq_phase: true, cq_head: 0, cq_phase: true,
-        sq_db: 0, cq_db: 0, free: Vec::new(),
+        sq_db: 0, cq_db: 0, cq_unmask: 0, free: Vec::new(),
     })
 }
 
@@ -421,12 +435,31 @@ impl<B: EnaBus> Ena<B> {
             stats: Stats::default(), link_up: false, link_gen: 0, keepalive_ms: 0,
             admin_failed: false, fatal_event: false, running: false, down_since: 0,
             next_reason: reset_reason::NORMAL, llq_allowed: true, llq_refused: false, llq: None, llq_off: 0,
+            msix_allowed: false, msix_refused: false, msix: false,
         })
     }
 
     /// `ena.llq=0`: never use LLQ.
     pub fn set_llq_allowed(&mut self, on: bool) { self.llq_allowed = on; }
     pub fn llq_active(&self) -> bool { self.llq.is_some() }
+    /// Create the IO CQs in interrupt mode (the caller has MSI-X vectors 0 and 1
+    /// programmed). The device refusing falls back to polling on its own.
+    pub fn set_msix_allowed(&mut self, on: bool) { self.msix_allowed = on; }
+    /// The IO queues run in interrupt mode (CQ interrupts, admin interrupt unmasked).
+    pub fn msix_active(&self) -> bool { self.msix }
+    fn msix_wanted(&self) -> bool { self.msix_allowed && !self.msix_refused }
+    /// Unmask the IO queue pair's interrupt (the device masks it after firing). Any
+    /// context that holds the device; a no-op when polled.
+    pub fn irq_unmask(&self) {
+        if !self.msix { return; }
+        self.wr(self.rx.cq_unmask, INTR_UNMASK);
+        if self.tx.cq_unmask != self.rx.cq_unmask { self.wr(self.tx.cq_unmask, INTR_UNMASK); }
+    }
+    /// NAPI-style re-arm after draining: unmask, then report work that slipped in.
+    pub fn irq_rearm(&mut self) -> bool {
+        self.irq_unmask();
+        self.rx_pending()
+    }
     pub fn readless(&self) -> bool { self.readless }
     pub fn running(&self) -> bool { self.running }
     pub fn link_up(&self) -> bool { self.running && self.link_up }
@@ -515,8 +548,9 @@ impl<B: EnaBus> Ena<B> {
         self.wr(reg::AENQ_BASE_LO, self.aenq.pa as u32);
         self.wr(reg::AENQ_BASE_HI, (self.aenq.pa >> 32) as u32);
         self.wr(reg::AENQ_CAPS, AENQ_DEPTH as u32 | (AENQ_ENTRY as u32) << 16);
-        // Polled: mask the admin interrupt, hand the device the whole AENQ.
-        self.wr(reg::INTR_MASK, INTR_MASK_ADMIN);
+        // Polled: mask the admin interrupt; MSI-X: vector 0 carries AENQ events.
+        self.wr(reg::INTR_MASK, if self.msix_wanted() { 0 } else { INTR_MASK_ADMIN });
+        // Hand the device the whole AENQ.
         self.wr(reg::AENQ_HEAD_DB, AENQ_DEPTH as u32);
     }
 
@@ -616,9 +650,13 @@ impl<B: EnaBus> Ena<B> {
     /// left reset.
     pub fn init(&mut self) -> Result<(), Error> {
         self.running = false;
+        let (mut l0, mut m0) = (self.llq_refused, self.msix_refused);
         let mut r = self.init_inner();
-        if r.is_err() && self.llq_refused {
-            // The device refused the device-placement queue: redo it on host memory.
+        // The device refused the device-placement queue or an interrupt-mode CQ:
+        // redo the bring-up on host memory / polled.
+        for _ in 0..2 {
+            if r.is_ok() || !((self.llq_refused && !l0) || (self.msix_refused && !m0)) { break; }
+            l0 = self.llq_refused; m0 = self.msix_refused;
             r = self.init_inner();
         }
         if r.is_err() {
@@ -728,6 +766,7 @@ impl<B: EnaBus> Ena<B> {
     }
 
     fn create_queues(&mut self) -> Result<(), Error> {
+        self.msix = false;
         let (tx_n, rx_n) = (self.info.tx_depth, self.info.rx_depth);
         self.tx.depth = tx_n;
         self.rx.depth = rx_n;
@@ -739,16 +778,24 @@ impl<B: EnaBus> Ena<B> {
             } else {
                 ((RX_CDESC / 4) as u8, rx_n, self.rx.cq.pa, self.rx.sq.pa)
             };
-            // CREATE_CQ: polled (interrupt_mode_enabled = 0).
+            // CREATE_CQ: polled (interrupt_mode_enabled = 0), or interrupt mode
+            // (bit 5 of cq_caps_1) with the MSI-X table entry of the queue pair.
+            let irq = self.msix_wanted();
             let mut cmd = [0u8; ADMIN_ENTRY];
-            cmd[4] = 0;
+            cmd[4] = if irq { 1 << 5 } else { 0 };
             cmd[5] = words & 0x1f;
             cmd[6..8].copy_from_slice(&n.to_le_bytes());
+            if irq { cmd[8..12].copy_from_slice(&(MSIX_IO0 as u32).to_le_bytes()); }
             cmd[12..16].copy_from_slice(&(cq_pa as u32).to_le_bytes());
             cmd[16..18].copy_from_slice(&((cq_pa >> 32) as u16).to_le_bytes());
-            let r = self.admin(op::CREATE_CQ, 0, cmd)?;
+            let r = match self.admin(op::CREATE_CQ, 0, cmd) {
+                Err(Error::Admin { .. }) if irq => { self.msix_refused = true; return Err(Error::Unsupported("MSI-X CQ refused")); }
+                r => r?,
+            };
             let cq_idx = u16::from_le_bytes([r[8], r[9]]);
             let cq_head_db = u32::from_le_bytes([r[16], r[17], r[18], r[19]]) as usize;
+            let cq_unmask = u32::from_le_bytes([r[20], r[21], r[22], r[23]]) as usize;
+            if irq && cq_unmask == 0 { self.msix_refused = true; return Err(Error::Unsupported("no CQ interrupt-unmask register")); }
             // CREATE_SQ: direction in bits 7:5, host placement (1), descriptor
             // completion policy (0), physically contiguous.
             // Device placement (3) for the LLQ TX queue: the ring lives in BAR2,
@@ -773,7 +820,10 @@ impl<B: EnaBus> Ena<B> {
             let q = if dir == 0 { &mut self.tx } else { &mut self.rx };
             q.cq_db = cq_head_db;
             q.sq_db = sq_db;
+            q.cq_unmask = if irq { cq_unmask } else { 0 };
         }
+        self.msix = self.msix_wanted();
+        self.irq_unmask();
         Ok(())
     }
 

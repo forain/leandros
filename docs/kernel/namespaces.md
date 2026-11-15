@@ -18,20 +18,20 @@ LeandrOS implements the Linux namespace and sandboxing surface that Firefox's co
 
 ### Per-kind limits
 
-The 256-slot table is divided into per-kind budgets so one kind cannot starve another (a container runtime churning uts/ipc namespaces used to be able to fill the table and make netns/mntns creation fail). Each kind has a limit exposed and writable at `/proc/sys/user/max_<kind>_namespaces`; creating a namespace of a kind that already holds its limit is `ENOSPC`.
+The 8192-slot table (`NS_MAX`, static, ~4.5 MiB BSS, every per-id array indexed directly by the u16 id so lookups stay O(1) and lock-free) is divided into per-kind budgets so one kind cannot starve another (a container runtime churning uts/ipc namespaces used to be able to fill the table and make netns/mntns creation fail). Each kind has a limit exposed and writable at `/proc/sys/user/max_<kind>_namespaces`; creating a namespace of a kind that already holds its limit is `ENOSPC`.
 
 | Kind | File | Default |
 |------|------|---------|
-| user | `max_user_namespaces` | 72 |
-| mnt | `max_mnt_namespaces` | 48 |
-| net | `max_net_namespaces` | 32 |
-| pid | `max_pid_namespaces` | 20 |
-| cgroup | `max_cgroup_namespaces` | 24 |
-| ipc | `max_ipc_namespaces` | 24 |
-| uts | `max_uts_namespaces` | 24 |
+| user | `max_user_namespaces` | 2048 |
+| mnt | `max_mnt_namespaces` | 1024 |
+| net | `max_net_namespaces` | 2048 |
+| pid | `max_pid_namespaces` | 512 |
+| cgroup | `max_cgroup_namespaces` | 512 |
+| ipc | `max_ipc_namespaces` | 1024 |
+| uts | `max_uts_namespaces` | 1000 |
 | time | `max_time_namespaces` | 8 (reserved: time namespaces are not supported) |
 
-The invariant is that the sum of all limits never exceeds `NS_MAX - 1` = 255, so each kind owns a reservation in the shared table; a write that would break it is `EINVAL` (lower another kind first). Writes need `CAP_SYS_ADMIN` in the initial user namespace; lowering a limit below current use is allowed and only blocks new creations. Counters are atomic reservations released when the slot is freed (mount namespaces when reaped). The limit is a global per-kind budget rather than Linux's per-user ucount value; the per-uid caps below still apply in addition. Test: `nstest` `nslimit_*`.
+The invariant is that the sum of all limits never exceeds `NS_MAX - 1` = 8191 (defaults sum to 8176; Linux's default is threads-max/2, here bounded by memory), so each kind owns a reservation in the shared table; a write that would break it is `EINVAL` (lower another kind first). Writes need `CAP_SYS_ADMIN` in the initial user namespace; lowering a limit below current use is allowed and only blocks new creations. Counters are atomic reservations released when the slot is freed (mount namespaces when reaped). The limit is a global per-kind budget rather than Linux's per-user ucount value; the per-uid caps below still apply in addition. Test: `nstest` `nslimit_*`.
 
 A fixed table is the same design choice as everywhere else in the servers: a namespace id is a small integer that can be stored in a task, a socket or a mount without allocation, and a leak shows up as a full table (`ENOSPC`) in a test instead of as unbounded memory.
 

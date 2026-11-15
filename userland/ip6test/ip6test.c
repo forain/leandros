@@ -785,6 +785,31 @@ static void test_ping6_global(void) {
     CHECK("ping6_global", good == 4);
 }
 
+/* ICMPv6 echo to this host's OWN global address is delivered locally (it
+ * used to go out the NIC and never come back); the v4 twin pings eth0's
+ * own IPv4 address. */
+static void test_ping6_own_global(void) {
+    char g[40] = "";
+    if (!find_global(g)) { CHECK("ping6_own_global", 0); return; }
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_own_global", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    for (int i = 0; i < 16; i++) sscanf(g + 2 * i, "%2hhx", &a.sin6_addr.s6_addr[i]);
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4323, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping own global: %d/4\n", good);
+    CHECK("ping6_own_global", good == 4);
+}
+
 static void test_ll_noscope(void) {
     struct sockaddr_in6 a = router_ll();
     a.sin6_port = htons(53);
@@ -871,6 +896,7 @@ int main(int argc, char **argv) {
     test_ping6_ll_router();
     test_slaac_addr();
     test_ping6_global();
+    test_ping6_own_global();
     test_ll_noscope();
     test_ll_bind_scope();
     test_disable_ipv6();

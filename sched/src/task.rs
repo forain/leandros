@@ -783,6 +783,8 @@ impl Task {
 
     /// Mark this thread as possibly having signal work (see `sig_hint`).
     /// Call under RUN_QUEUE, in the hold that made the work appear.
+    /// Every new writer of signal state (pending/mask/stop/saved mask/group
+    /// exit) must call this; runtests fails a run when /proc/rqhold `miss` > 0.
     #[inline]
     pub fn sig_kick(&self) {
         self.sig_hint.store(1, core::sync::atomic::Ordering::Release);
