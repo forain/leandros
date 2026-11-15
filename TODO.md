@@ -9,7 +9,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 ### Kernel / VFS
 - **ns-0 mount ref race**: a mount detached in the window between open() resolving the path and the open file taking its mount reference is not recorded (lane mntref); that fd falls back to path lookup for flags.
 - **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
-- **Flakes to root-cause**: `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
+- **Flakes to root-cause**: `syscalltest` pidfd_wake_conmon (aarch64 box, once 2026-11-14 in lane lapwifi; passed alone on rerun); `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
 
 ### Podman / namespaces / cgroups
@@ -47,7 +47,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **sshd**: still open: privilege separation (sessions are forked children, the listener runs as root), keyboard-interactive via pam-leandros, TCP forwarding (-L/-R; `no-port-forwarding`/`restrict` already parse but there is nothing to forbid), `authorized_keys` options `environment=`, `permitopen=`, `expiry-time=`, `cert-authority`; passwords have no `passwd(1)` rehash-on-login of legacy `$sha256$` fields (they verify, are not upgraded).
 
 ### Network / Wi-Fi
-- **iwlwifi**: 40 MHz on 2.4 GHz, finer rate control.
+- **iwlwifi**: HT40 on 2.4 GHz (`iwlwifi.ht40_24`, coexistence check in `wifi_ht::coex_40_24`) is implemented but unverified on hardware (no 40 MHz 2.4 GHz AP seen; the only reachable AP advertises 20 MHz). 5 GHz is untested (needs the user's 5 GHz SSID/passphrase on the stick). Throughput vs Linux not measured. Rate-control idea: column re-entry hysteresis / stay-in-column timer in `iwl_rs.rs`.
 - **WPA3 / MFP-required networks** and Wi-Fi roaming polish.
 
 ### Desktop / apps
@@ -62,7 +62,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Sandbox follow-ups**: secirq, zaplog, credxlate residuals (`lane-secirq/zaplog/credxlate-2026-11-09.md`).
 
 ### Cloud
-- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (image boots in QEMU as an NVMe-only UEFI disk, `--dry-run` tested; docs/hardware/aws-ec2.md). Still needed: an ENA (Elastic Network Adapter) network driver, EBS NVMe quirks (no legacy INTx: MSI-X), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
+- **Boot on AWS EC2** (Nitro instances, x86_64 and Graviton aarch64): DONE: `scripts/ec2-image.sh` + `scripts/ec2-ami.sh` (docs/hardware/aws-ec2.md), L2 Amazon EBS NVMe quirks / by-id links / auto-writable root / 300 s stall cap (QEMU-verified by the `nvmeebs` suite; real EBS verification still open: QEMU cannot set the EBS model string). ENA driver core DONE and mock-tested (`drivers/src/ena.rs`/`ena_hw.rs`, `drivers/ena-tests`: polled admin/AENQ, readless MMIO, host-placement queues, watchdog; unproven on real EC2: field layouts follow the public ENA headers and the mock encodes the same reading). Still needed: ENA LLQ (L5) and MSI-X (L8), NVMe MSI-X (optional, driver polls), Nitro platform quirks (no PIT/i8042/VGA), ACPI-only aarch64 boot, first-boot instance metadata (IMDSv2: SSH key, hostname), then the gated real-EC2 runs (needs the user's OK and AWS credentials). Design: orch/designs/design-ec2.md (lane ec2).
 
 ### Installer
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.

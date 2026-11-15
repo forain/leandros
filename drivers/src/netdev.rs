@@ -39,7 +39,7 @@
 //!
 //! Every device is its own netif, registered by [`init`] in this order:
 //! every virtio-net device (QEMU), a Realtek RTL8168-family NIC (real PCs),
-//! an Intel e1000e (I219 laptops, QEMU's `-device e1000e`) — the wired ones,
+//! an Intel e1000e (I219 laptops, QEMU's `-device e1000e`), an Amazon ENA (EC2) — the wired ones,
 //! named `eth0`, `eth1`, ... — then Intel Wi-Fi (`iwlwifi`) as `wifi0`, or on the Raspberry Pi 5 the
 //! CYW43455 (`brcmf`).
 //! Wi-Fi registers at probe time, before its firmware loads, so its stack
@@ -213,6 +213,7 @@ pub fn init(cmdline: &str) {
     crate::virtio_net::init();
     #[cfg(feature = "r8169")] crate::r8169::init(cmdline);
     #[cfg(feature = "e1000e")] crate::e1000e::init(cmdline);
+    #[cfg(feature = "ena")] crate::ena::init(cmdline);
     #[cfg(feature = "macb")] crate::macb::init(cmdline);
     #[cfg(feature = "iwlwifi")] crate::iwlwifi::init(cmdline);
     // The simulated Wi-Fi (QEMU only, opt-in) may claim a virtio-net device
@@ -226,6 +227,7 @@ pub fn init(cmdline: &str) {
     }
     #[cfg(feature = "r8169")] if crate::r8169::present() { register(Kind::Wired, "eth", &R8169_OPS, 0); }
     #[cfg(feature = "e1000e")] if crate::e1000e::present() { register(Kind::Wired, "eth", &E1000E_OPS, 0); }
+    #[cfg(feature = "ena")] if crate::ena::present() { register(Kind::Wired, "eth", &ENA_OPS, 0); }
     #[cfg(feature = "macb")] if crate::macb::present() { register(Kind::Wired, "eth", &crate::macb::MACB_OPS, 0); }
     // Wi-Fi netifs, then their control side on the /dev/netctl seam
     // (iwlwifi serves it only with iwlwifi.mgr=1).
@@ -305,6 +307,19 @@ static VIRTIO_OPS: NetifOps = NetifOps {
     link: |_| crate::e1000e::link(),
     link_gen: |_| crate::e1000e::link_generation(),
     info: |_, out| crate::e1000e::info_lines(out),
+};
+
+#[cfg(feature = "ena")] static ENA_OPS: NetifOps = NetifOps {
+    driver: |_| "ena",
+    send: |_, b| crate::ena::send_packet(b),
+    tx_ready: |_| crate::ena::tx_ready(),
+    recv: |_, b| crate::ena::poll_receive(b),
+    rx_rearm: |_| crate::ena::rx_rearm(),
+    rx_irq_driven: |_| crate::ena::rx_irq_driven(),
+    mac: |_| crate::ena::mac_address(),
+    link: |_| crate::ena::link(),
+    link_gen: |_| crate::ena::link_generation(),
+    info: |_, out| crate::ena::info_lines(out),
 };
 
 #[cfg(feature = "wifi-sim")] static WIFISIM_OPS: NetifOps = NetifOps {
