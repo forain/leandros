@@ -1123,6 +1123,7 @@ static void fwd_gateway(char *out) {
     }
     fclose(f);
 }
+static long mono_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000L + t.tv_nsec / 1000000L; }
 static int dns_query(const char *srv) {
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct timeval tv = { 4, 0 };
@@ -1133,11 +1134,16 @@ static int dns_query(const char *srv) {
                           7, 'e','x','a','m','p','l','e', 3, 'c','o','m', 0, 0, 1, 0, 1 };
     unsigned char rb[512];
     int ok = 0;
+    long t0 = mono_ms();
     for (int tries = 0; tries < 3 && !ok; tries++) {
-        if (sendto(u, q, sizeof q, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof q) break;
+        long ts = mono_ms();
+        if (sendto(u, q, sizeof q, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof q) { printf("DETAIL dns try %d sendto errno %d\n", tries, errno); break; }
         ssize_t n = recv(u, rb, sizeof rb, 0);
+        int e = errno;
         ok = n >= 12 && rb[0] == 0x4c && rb[1] == 0x45 && (rb[2] & 0x80);
+        if (!ok) printf("DETAIL dns %s try %d: recv=%zd errno=%d after %ld ms (rcode/flags %02x%02x)\n", srv, tries, n, n < 0 ? e : 0, mono_ms() - ts, n >= 4 ? rb[2] : 0, n >= 4 ? rb[3] : 0);
     }
+    if (ok) printf("DETAIL dns %s answered after %ld ms\n", srv, mono_ms() - t0);
     close(u);
     return ok;
 }
@@ -1216,7 +1222,21 @@ static void nat_dump(void) {
     if (!f) return;
     char line[1024];
     while (fgets(line, sizeof line, f))
-        if (!strncmp(line, "fwd_nat_ent:", 12) || !strncmp(line, "fwd:", 4)) printf("DIAG %s", line);
+        if (!strncmp(line, "fwd_nat_ent:", 12) || !strncmp(line, "fwd:", 4) || !strncmp(line, "fwd_stats:", 10)
+            || !strncmp(line, "fwd_arp:", 8) || !strncmp(line, "fwd_pend:", 9) || !strncmp(line, "fwd_ct:", 7)) printf("DIAG %s", line);
+    fclose(f);
+}
+/* The same lines as nat_dump(), collected into buf (only the fwd_stats line when it is long). */
+static void nat_snap(char *buf, size_t n) {
+    FILE *f = fopen("/proc/net/nic", "r");
+    size_t o = 0;
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "fwd_stats:", 10) || !strncmp(line, "fwd:", 4)) {
+            size_t l = strlen(line);
+            if (o + l + 1 < n) { memcpy(buf + o, line, l + 1); o += l; }
+        }
     fclose(f);
 }
 /* A host bind() to `p` must fail with EADDRINUSE. */
@@ -1272,8 +1292,12 @@ static int fwd_body(void) {
         if (u >= 0 && !connect(u, (struct sockaddr *)&a, sizeof a)) {
             char b[8];
             for (int k = 0; k < 3 && !ok; k++) {
-                send(u, "x", 1, 0);
-                if (recv(u, b, sizeof b, 0) < 0 && errno == ECONNREFUSED) ok = 1;
+                long ts = mono_ms();
+                ssize_t sn = send(u, "x", 1, 0), se = errno;
+                ssize_t rn = recv(u, b, sizeof b, 0);
+                int e = errno;
+                if (rn < 0 && e == ECONNREFUSED) ok = 1;
+                else printf("DETAIL icmperr %s:9 try %d: send=%zd(errno %zd) recv=%zd errno=%d after %ld ms\n", gw, k, sn, sn < 0 ? se : 0, rn, rn < 0 ? e : 0, mono_ms() - ts);
             }
         }
         if (u >= 0) close(u);
@@ -1362,6 +1386,8 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         snprintf(msg, sizeof msg, "%s: precondition: no NAT port is held yet", name);
         { int held = nat_scan(); if (held) nat_dump(); CHECK(msg, held == 0); }
     }
+    char pre[1536]; pre[0] = 0;
+    if (mode < 4) nat_snap(pre, sizeof pre); /* counters before the flow, printed with the failure dump to diff against */
     if (rd == 1) write(cc[1], &ch, 1); /* go */
     int natp = 0;
     if (mode >= 4 && mode != 6) {
@@ -1422,6 +1448,11 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     else if (mode == 3 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP port-unreachable for a NATed UDP flow reaches the container (ECONNREFUSED)", name);
     else if (mode == 1 && ipfwd) snprintf(msg, sizeof msg, "%s: ICMP echo to the default gateway is answered through NAT", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means no reply (nothing forwarded)", name);
+    if (rc != 0 && mode < 4) {
+        printf("DIAG %s failed (child rc %d); counters BEFORE the flow:\n%s", name, rc, pre[0] ? pre : "(none)\n");
+        printf("DIAG counters AFTER (conntrack/ARP/pending live now):\n");
+        nat_dump();
+    }
     CHECK(msg, rc == 0);
     ip_forward_set(0);
     if (g_fwd_nft) system("nft delete table inet netavark");

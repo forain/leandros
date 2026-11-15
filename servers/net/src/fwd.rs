@@ -75,6 +75,50 @@ pub(crate) static USED: AtomicBool = AtomicBool::new(false);
 pub(crate) static TXQ_N: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static INQ_N: AtomicUsize = AtomicUsize::new(0);
 
+/// Diagnostic counters (/proc/net/nic "fwd_stats:"): where a forwarded UDP/ICMP flow is lost.
+/// Order: ing_udp ing_ttl ing_noroute ing_nft_drop ing_nopick emit arp_hit arp_miss pend_exp
+/// arp_learn arp_flush nicrx_udp nicrx_udp_hit nicrx_udp_miss icmperr_rx
+pub(crate) static STAT: [AtomicUsize; 15] = [const { AtomicUsize::new(0) }; 15];
+pub(crate) const S_ING_UDP: usize = 0;
+pub(crate) const S_ING_TTL: usize = 1;
+pub(crate) const S_ING_NOROUTE: usize = 2;
+pub(crate) const S_ING_NFT: usize = 3;
+pub(crate) const S_ING_NOPICK: usize = 4;
+pub(crate) const S_EMIT: usize = 5;
+pub(crate) const S_ARP_HIT: usize = 6;
+pub(crate) const S_ARP_MISS: usize = 7;
+pub(crate) const S_PEND_EXP: usize = 8;
+pub(crate) const S_ARP_LEARN: usize = 9;
+pub(crate) const S_ARP_FLUSH: usize = 10;
+pub(crate) const S_NICRX_UDP: usize = 11;
+pub(crate) const S_NICRX_HIT: usize = 12;
+pub(crate) const S_NICRX_MISS: usize = 13;
+pub(crate) const S_ICMPERR_RX: usize = 14;
+#[inline] fn stat(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }
+
+pub(crate) fn dump_stats(w: &mut dyn core::fmt::Write) {
+    let _ = write!(w, "fwd_stats:");
+    for (n, i) in ["ing_udp", "ing_ttl", "ing_noroute", "ing_nft_drop", "ing_nopick", "emit", "arp_hit", "arp_miss", "pend_exp",
+                   "arp_learn", "arp_flush", "nicrx_udp", "nicrx_hit", "nicrx_miss", "icmperr_rx"].iter().zip(STAT.iter()) {
+        let _ = write!(w, " {}={}", n, i.load(Ordering::Relaxed));
+    }
+    let _ = writeln!(w);
+    let now = sched::monotonic_ns();
+    let g = FWD.lock();
+    for a in g.arp.iter() {
+        let _ = writeln!(w, "fwd_arp: nic {} {}.{}.{}.{} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} age_ms {}", a.nic, a.ip[0], a.ip[1], a.ip[2], a.ip[3],
+            a.mac[0], a.mac[1], a.mac[2], a.mac[3], a.mac[4], a.mac[5], now.saturating_sub(a.t) / 1_000_000);
+    }
+    for q in g.pend.iter() {
+        let _ = writeln!(w, "fwd_pend: nic {} {}.{}.{}.{} frames {} age_ms {}", q.nic, q.ip[0], q.ip[1], q.ip[2], q.ip[3], q.frames.len(), now.saturating_sub(q.t) / 1_000_000);
+    }
+    for e in g.ct.iter().filter(|e| e.proto != PROTO_TCP) {
+        let _ = writeln!(w, "fwd_ct: proto {} nat {} {}.{}.{}.{}:{}->{}.{}.{}.{}:{} kind {} replied {} age_ms {} br {} port {}",
+            e.proto, e.nat, e.cip[0], e.cip[1], e.cip[2], e.cip[3], e.cport, e.rip[0], e.rip[1], e.rip[2], e.rip[3], e.rport,
+            e.kind, e.replied as u8, now.saturating_sub(e.last) / 1_000_000, e.br, e.port);
+    }
+}
+
 fn ct_ttl(e: &Ct) -> u64 {
     match e.proto {
         PROTO_UDP => if e.replied { UDP_REPLIED_NS } else { UDP_NS },
@@ -302,8 +346,9 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
 }
 
 fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
-    if f[22] <= 1 { return; } // TTL exhausted
-    let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { return };
+    if p.proto == PROTO_UDP { stat(S_ING_UDP); }
+    if f[22] <= 1 { stat(S_ING_TTL); return; } // TTL exhausted
+    let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { stat(S_ING_NOROUTE); return };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return };
     let now = sched::monotonic_ns();
     let cmac: [u8; 6] = f[6..12].try_into().unwrap();
@@ -324,8 +369,8 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
             if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
                 let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
-                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return; }
-                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return; }
+                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
+                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { stat(S_ING_NFT); return; }
             }
             let mut pick = None;
             let claimed = if crate::nfnl::has_tables(0) { crate::nfnl::dnat_ports(0) } else { Vec::new() };
@@ -349,7 +394,7 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
                 let mut g = FWD.lock();
                 if let Some(i) = g.ct.iter().position(|e| e.nat == c && e.proto == p.proto && e.cip == p.src && e.cport == p.sport) { g.ct.swap_remove(i); }
             }
-            let Some(n) = pick else { return };
+            let Some(n) = pick else { stat(S_ING_NOPICK); return };
             st = FWD.lock();
             n
         }
@@ -371,9 +416,11 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
 }
 
 fn emit_nic(st: &mut St, now: u64, nic: u8, nh: [u8; 4], nicip: [u8; 4], nicmac: [u8; 6], mut f: Vec<u8>) {
+    stat(S_EMIT);
     match st.arp.iter().find(|a| a.nic == nic && a.ip == nh && now.saturating_sub(a.t) < ARP_NS).map(|a| a.mac) {
-        Some(m) => { f[0..6].copy_from_slice(&m); push_tx(st, nic, f); }
+        Some(m) => { stat(S_ARP_HIT); f[0..6].copy_from_slice(&m); push_tx(st, nic, f); }
         None => {
+            stat(S_ARP_MISS);
             let first = match st.pend.iter_mut().find(|q| q.nic == nic && q.ip == nh) {
                 Some(q) => { if q.frames.len() < PEND_FRAMES { q.frames.push(f); } false }
                 None => { st.pend.push(Pend { nic, ip: nh, t: now, frames: alloc::vec![f] }); true }
@@ -409,6 +456,8 @@ fn sweep(st: &mut St, now: u64) {
     if now.saturating_sub(st.swept) < 1_000_000_000 { return; }
     st.swept = now;
     st.ct.retain(|e| now.saturating_sub(e.last) < ct_ttl(e));
+    let pn = st.pend.iter().filter(|q| now.saturating_sub(q.t) >= PEND_NS).count();
+    if pn > 0 { STAT[S_PEND_EXP].fetch_add(pn, Ordering::Relaxed); }
     st.pend.retain(|q| now.saturating_sub(q.t) < PEND_NS);
     st.arp.retain(|a| now.saturating_sub(a.t) < ARP_NS);
     st.lrn.retain(|l| now.saturating_sub(l.t) < ARP_NS);
@@ -424,9 +473,11 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if !USED.load(Ordering::Relaxed) || buf.len() < 34 { return false; }
     if buf[12] == 0x08 && buf[13] == 0x06 { arp_learn(nic, buf); return false; }
     if buf[12] == 0x08 && buf[13] == 0x00 && buf[23] == PROTO_ICMP && icmp_error_type(buf) {
+        stat(S_ICMPERR_RX);
         return icmp_error_rx(nic, buf);
     }
     if buf[12] != 0x08 || buf[13] != 0x00 || (buf[23] != PROTO_UDP && buf[23] != PROTO_ICMP && buf[23] != PROTO_TCP) { return false; }
+    if buf[23] == PROTO_UDP { stat(S_NICRX_UDP); }
     let mut st = FWD.lock();
     let any_nft = st.ct.is_empty() && crate::nfnl::has_tables(0);
     if st.ct.is_empty() && !any_nft { return false; }
@@ -438,7 +489,8 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if !st.ct.iter().any(|e| key(e)) {
         match new_in(&mut st, nic, &p, now) { 0 => return false, 1 => return true, _ => {} }
     }
-    let Some(e) = st.ct.iter_mut().find(|e| key(e)) else { return false };
+    let Some(e) = st.ct.iter_mut().find(|e| key(e)) else { if p.proto == PROTO_UDP { stat(S_NICRX_MISS); } return false };
+    if p.proto == PROTO_UDP { stat(S_NICRX_HIT); }
     e.last = now; e.replied = true;
     if p.proto == PROTO_TCP { tcp_step(e, p.flags, e.kind == 1); }
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
@@ -525,6 +577,7 @@ fn arp_learn(nic: u8, b: &[u8]) {
     let Some(cfg) = crate::iface::rt(nic).cfg else { return };
     if !cfg.on_link(ip) { return; }
     let now = sched::monotonic_ns();
+    stat(S_ARP_LEARN);
     let mut st = FWD.lock();
     if let Some(a) = st.arp.iter_mut().find(|a| a.nic == nic && a.ip == ip) { a.mac = mac; a.t = now; }
     else {
@@ -533,6 +586,7 @@ fn arp_learn(nic: u8, b: &[u8]) {
     }
     if let Some(i) = st.pend.iter().position(|q| q.nic == nic && q.ip == ip) {
         let q = st.pend.remove(i);
+        STAT[S_ARP_FLUSH].fetch_add(q.frames.len(), Ordering::Relaxed);
         for mut f in q.frames { f[0..6].copy_from_slice(&mac); push_tx(&mut st, nic, f); }
         drop(st);
         drivers::netdev::kick();
