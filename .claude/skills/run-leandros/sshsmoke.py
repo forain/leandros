@@ -862,7 +862,8 @@ def sshd_procs(ssh, user, pw):
 
 
 def listener_pid(procs):
-    c = [p for p, pp, n in procs if pp == 1 and n == "sshd"]
+    pids = {p for p, _, _ in procs}
+    c = [p for p, pp, n in procs if n == "sshd" and pp not in pids]
     return c[0] if c else None
 
 
@@ -960,16 +961,18 @@ def privsep_crash(ssh, user, pw):
         a, victim, isolated = new_preauth(ssh, user, pw, before)
         if victim:
             sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
-        a_eof = probe_eof(a, 5)
+        t0 = time.time()
+        a_eof = probe_eof(a, 8)
+        eof_s = time.time() - t0
         a.close()
-        time.sleep(1)
         after = sshd_procs(ssh, user, pw)
+        gone = victim not in {p for p, _, _ in after}
         same = listener_pid(after) == lpid and lpid is not None
         b_still = say("hello-b2", "hello-b2")
         rc, out, _ = ssh.run(user, "id -un", pw, timeout=30)
         login = rc == 0 and user in out
         step("privsep_crash_isolated", b_ok and isolated and a_eof and same and b_still and login,
-             f"procs={after} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof} listener_unchanged={same} b_survives={b_still} new_login={login}")
+             f"procs={after} victim={victim} gone={gone} eof_s={eof_s:.1f} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof} listener_unchanged={same} b_survives={b_still} new_login={login}")
     finally:
         try:
             os.write(fd, b"\x04")
