@@ -244,10 +244,10 @@ def main():
             rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} traceroute6 -n -m 1 -q 1 -w 4 2001:4860:4860::8888 2>&1")
-        # KNOWN-OPEN (TODO.md IPv6 item): Time Exceeded for forwarded v6 flows is not delivered yet; non-gating.
+        # Time Exceeded for a forwarded flow (fwd6::time_exceeded) reaches traceroute6's raw ICMPv6 socket,
+        # which never sent anything itself: the first hop prints an address.
         te_ok = re.search(r"^\s*1\s+[0-9a-f]+:[0-9a-f:]+\s", out, re.M) is not None
-        if v6ok:
-            print(f"podman_v6_time_exceeded: {'PASS' if te_ok else 'KNOWN-OPEN'} rc={rc} " + out.strip()[-120:].replace("\n", " | "), flush=True)
+        check6("podman_v6_time_exceeded", te_ok, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         # ---- L9 phase 2 (ip6dnat): DNAT66 for a published port -----------------------------
         rc, o6 = run("cat /proc/net/if_inet6")
         m6 = re.search(r"^([0-9a-f]{32}) 02 40 00 \w+\s+eth0", o6, re.M)

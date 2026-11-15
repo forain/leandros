@@ -87,12 +87,14 @@ pub enum Endpoint {
     Unspecified,
     Ident(u16),
     Udp(IpListenEndpoint),
+    /// LEANDROS: a raw ICMPv6 socket takes every echo and error message (Linux raw(7)).
+    Raw,
 }
 
 impl Endpoint {
     pub fn is_specified(&self) -> bool {
         match *self {
-            Endpoint::Ident(_) => true,
+            Endpoint::Ident(_) | Endpoint::Raw => true,
             Endpoint::Udp(endpoint) => endpoint.port != 0,
             Endpoint::Unspecified => false,
         }
@@ -479,6 +481,19 @@ impl<'a> Socket<'a> {
                 &Endpoint::Ident(bound_ident),
                 &IcmpRepr::Ipv6(Icmpv6Repr::EchoReply { ident, .. }),
             ) => ident == bound_ident,
+            // LEANDROS: a raw socket sees echo and every error (traceroute reads Time Exceeded here).
+            #[cfg(feature = "proto-ipv6")]
+            (
+                &Endpoint::Raw,
+                &IcmpRepr::Ipv6(
+                    Icmpv6Repr::EchoRequest { .. }
+                    | Icmpv6Repr::EchoReply { .. }
+                    | Icmpv6Repr::DstUnreachable { .. }
+                    | Icmpv6Repr::TimeExceeded { .. }
+                    | Icmpv6Repr::PktTooBig { .. }
+                    | Icmpv6Repr::ParamProblem { .. },
+                ),
+            ) => true,
             _ => false,
         }
     }

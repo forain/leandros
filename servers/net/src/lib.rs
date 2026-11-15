@@ -4331,6 +4331,36 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         set_sock_opts(ofd, o);
     }
     if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid), protocol); }
+    // A raw ICMPv6 socket receives every echo and error message without having sent first (traceroute6 reads
+    // Time Exceeded from one it never wrote to): bind a wildcard socket on the stack of the default route.
+    if domain == AF_INET6 && sock_type & 0xf == SOCK_RAW && protocol == IPPROTO_ICMPV6 {
+        drop(tbls);
+        let ns = sched::ns::netns_of(pid);
+        let dflt = IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0x2000, 0, 0, 0, 0, 0, 0, 1));
+        if let Some(sid) = iface::route_select(ns, dflt) {
+            let mut stack = stack_for(sid);
+            let mut made = None;
+            if let Some(s) = stack.as_mut() {
+                let rx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 16], alloc::vec![0; 16384]);
+                let tx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
+                let mut socket = icmp::Socket::new(rx_buffer, tx_buffer);
+                if socket.bind(icmp::Endpoint::Raw).is_ok() { made = Some(s.socket_set.add(socket)); }
+            }
+            drop(stack);
+            if let Some(socket_handle) = made {
+                let mut tbls = SOCK_TABLES.lock();
+                let mut ok = false;
+                if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+                    if slot < tbl.socks.len() && tbl.socks[slot].in_use && matches!(tbl.socks[slot].state, SockState::IcmpUnbound) {
+                        tbl.socks[slot].state = SockState::IcmpBound { socket_handle, sid };
+                        ok = true;
+                    }
+                }
+                drop(tbls);
+                if !ok { let mut stack = stack_for(sid); if let Some(ref mut s) = *stack { release_inet_socket(s, socket_handle); } }
+            }
+        }
+    }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 
@@ -5611,6 +5641,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     let sock_domain = tbl.socks[slot].domain as usize;
+    let sock_is_raw = tbl.socks[slot].sock_type & 0xf == SOCK_RAW as u8;
     let ofd = tbl.socks[slot].ofd;
 
     match state {
@@ -5933,7 +5964,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let mut socket = icmp::Socket::new(rx_buffer, tx_buffer);
             let ttl = sock_opts(ofd).ttl;
             if ttl != 0 { socket.set_hop_limit(Some(ttl)); }
-            if socket.bind(icmp::Endpoint::Ident(ident)).is_err() { return err_reply(-22); }
+            let raw6 = sock_domain == AF_INET6 && sock_is_raw;
+            if socket.bind(if raw6 { icmp::Endpoint::Raw } else { icmp::Endpoint::Ident(ident) }).is_err() { return err_reply(-22); }
             let socket_handle = s.socket_set.add(socket);
             let result = s.socket_set.get_mut::<icmp::Socket>(socket_handle).send_slice(&data, dest_ip);
             drop(stack);
@@ -5983,6 +6015,47 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                 }
             };
             drop(tbls);
+
+            // A raw ICMPv6 socket was bound on the default route's stack at socket(); a destination on another
+            // stack (::1, a scoped link-local) moves it there.
+            let (mut sid, mut socket_handle) = (sid, socket_handle);
+            if sock_domain == AF_INET6 && sock_is_raw {
+                if let Some(sid2) = iface::route_select(sock_netns(pid, slot), dest_ip) {
+                    if sid2 != sid {
+                        let mut st2 = stack_for(sid2);
+                        let mut made = None;
+                        if let Some(s2) = st2.as_mut() {
+                            let rx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 16], alloc::vec![0; 16384]);
+                            let tx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
+                            let mut ns2 = icmp::Socket::new(rx_buffer, tx_buffer);
+                            if ns2.bind(icmp::Endpoint::Raw).is_ok() { made = Some(s2.socket_set.add(ns2)); }
+                        }
+                        drop(st2);
+                        if let Some(h2) = made {
+                            let mut t3 = SOCK_TABLES.lock();
+                            let mut ok = false;
+                            if let Some(tb) = find_tbl(pid, &mut *t3) {
+                                if slot < tb.socks.len() && tb.socks[slot].in_use && matches!(tb.socks[slot].state, SockState::IcmpBound { .. }) {
+                                    tb.socks[slot].state = SockState::IcmpBound { socket_handle: h2, sid: sid2 };
+                                    share_state(&mut *t3, pid, slot);
+                                    ok = true;
+                                }
+                            }
+                            drop(t3);
+                            if ok {
+                                sock_state_moved(&[sock_state_key(ofd)]);
+                                let mut old = stack_for(sid);
+                                if let Some(ref mut so) = *old { release_inet_socket(so, socket_handle); }
+                                drop(old);
+                                sid = sid2; socket_handle = h2;
+                            } else {
+                                let mut st4 = stack_for(sid2);
+                                if let Some(ref mut s4) = *st4 { release_inet_socket(s4, h2); }
+                            }
+                        }
+                    }
+                }
+            }
 
             let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
