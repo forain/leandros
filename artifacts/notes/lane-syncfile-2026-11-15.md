@@ -1,0 +1,2 @@
+# lane syncfile 2026-11-15
+`sync FILE` fsyncs each file (GNU) instead of sync(2). Fix lives in the sibling ../coreutils (src/uu/sync/src/sync.rs), local commit 24b9372 on its main (no leandros patch dir exists; never pushed). The box sibling /run/media/forain/samsung970pro512/leandros-siblings/coreutils was patched with the same diff (git apply). New: /proc/f2fsstat cp_total, runtests suite `syncfile` (also in regress). Box regress: x86_64 PASS, aarch64 only known host QMP failures.

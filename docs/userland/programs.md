@@ -69,7 +69,12 @@ authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shu
 crypto) on tokio. The root listener only accepts: it re-execs `sshd -R` once per
 connection (socket on fd 3, startup pipe on fd 4), so a crash in one connection kills only
 that connection, never the listener or other sessions (and init's restart limit cannot trip).
-The per-connection process is still root and still runs all the russh code.
+The per-connection process is still root and still runs all the russh code, but it already
+uses the two hooks of the vendored russh (`userland/sshd/vendor/russh`, see its
+`LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
+the session id, and every publickey/certificate login has its raw signature re-verified
+against that session id (`src/userauth.rs`) before the authorized_keys check. This is the
+groundwork for splitting the pre-auth code into an unprivileged child.
 
 - **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
   `/etc/ssh/sshd_not_to_be_run` exists or the kernel command line has `sshd=0`. It runs in
