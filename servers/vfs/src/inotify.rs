@@ -100,17 +100,28 @@ pub const FAN_ONDIR: u32 = 0x4000_0000;
 pub const FAN_ON_CHILD: u32 = 0x0800_0000;
 /// Events a fanotify (notification class) group can ask for.
 pub const FAN_EVENTS: u32 = IN_ACCESS | IN_MODIFY | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_OPEN;
+pub const FAN_OPEN_PERM: u32 = 0x1_0000;
+pub const FAN_ACCESS_PERM: u32 = 0x2_0000;
+pub const FAN_PERM: u32 = FAN_OPEN_PERM | FAN_ACCESS_PERM;
+pub const FAN_MARK_IGNORED_MASK: u32 = 0x20;
+pub const FAN_MARK_IGNORED_SURV_MODIFY: u32 = 0x40;
+/// Permission-class fanotify groups alive (gates every permission check).
+static PERMG: AtomicU32 = AtomicU32::new(0);
+static PERM_ID: AtomicU32 = AtomicU32::new(1);
+/// An unanswered permission event is allowed after this long.
+const PERM_TIMEOUT_NS: u64 = 30_000_000_000;
 static COOKIE: AtomicU32 = AtomicU32::new(1);
 /// Counting bloom over the hash of each watch's directory path.
 static DIR_BLOOM: [AtomicU16; BLOOM] = [const { AtomicU16::new(0) }; BLOOM];
 
-struct Watch { wd: i32, mask: u32, ino: Id, isdir: bool, multi: bool, mount: bool, path: Vec<u8>, hash: u64 }
+struct Watch { wd: i32, mask: u32, ignore: u32, surv: bool, ino: Id, isdir: bool, multi: bool, mount: bool, path: Vec<u8>, hash: u64 }
 /// What the indexes (and the MULTI/FANM counters) need to forget a watch.
 #[derive(Clone, Copy)]
 struct Wk { hash: u64, ino: Id, multi: bool, mount: bool }
 impl Watch { fn k(&self) -> Wk { Wk { hash: self.hash, ino: self.ino, multi: self.multi, mount: self.mount } } }
 struct Ev { wd: i32, mask: u32, cookie: u32, name: Vec<u8> }
-struct Instance { fan: bool, evflags: u32, next_wd: i32, queue: VecDeque<Ev>, bytes: usize, seq: u64, watches: Vec<Watch>, charge: Vec<UKey> }
+struct Pend { id: u32, fd: i32, verdict: u32 }
+struct Instance { fan: bool, perm: bool, owner: u32, pend: Vec<Pend>, evflags: u32, next_wd: i32, queue: VecDeque<Ev>, bytes: usize, seq: u64, watches: Vec<Watch>, charge: Vec<UKey> }
 struct State {
     insts: BTreeMap<u32, Instance>,
     by_path: BTreeMap<u64, Vec<(u32, i32)>>,
@@ -196,7 +207,7 @@ fn wake(keys: &[u64]) {
 /// Append `ev` to `i`'s queue (tail coalescing, overflow cap). True if the
 /// queue changed.
 fn push(i: &mut Instance, ev: Ev) -> bool {
-    if i.fan && ev.mask & (FAN_EVENTS | IN_Q_OVERFLOW) == 0 { return false; }
+    if i.fan && ev.mask & (FAN_EVENTS | FAN_PERM | IN_Q_OVERFLOW) == 0 { return false; }
     let unit = if i.fan { 24 } else { 16 };
     if let Some(t) = i.queue.back() {
         if t.wd == ev.wd && t.mask == ev.mask && t.cookie == ev.cookie && t.name == ev.name { EV_COALESCED.fetch_add(1, Relaxed); return false; }
@@ -228,7 +239,7 @@ pub fn create(inst: u32, chain: &[UKey]) -> bool {
     let max = MAX_USER_INST.load(Relaxed);
     if chain.iter().any(|k| st.uc.get(k).map_or(0, |e| e.0) >= max) { return false; }
     uc_adj(&mut st.uc, chain, 1, 0);
-    st.insts.insert(inst, Instance { fan: false, evflags: 0, next_wd: 1, queue: VecDeque::new(), bytes: 0, seq: 0, watches: Vec::new(), charge: chain.to_vec() });
+    st.insts.insert(inst, Instance { fan: false, perm: false, owner: 0, pend: Vec::new(), evflags: 0, next_wd: 1, queue: VecDeque::new(), bytes: 0, seq: 0, watches: Vec::new(), charge: chain.to_vec() });
     true
 }
 
@@ -237,6 +248,7 @@ pub fn released(inst: u32) {
     if files_watched() || !NOTES.lock().is_empty() { note_closed(inst); }
     let mut st = STATE.lock();
     if let Some(i) = st.insts.remove(&inst) {
+        if i.perm { PERMG.fetch_sub(1, Relaxed); sched::wake_poll_key(pkey(inst)); }
         let n = i.watches.len();
         for w in &i.watches { track(w.mask, 0); index_del(&mut st, inst, w.wd, w.k()); }
         st.nwatches -= n;
@@ -269,7 +281,7 @@ pub fn add(inst: u32, path: &[u8], mask: u32, id: Id, nlink: u64, isdir: bool) -
     while i.watches.iter().any(|w| w.wd == wd) { wd = if wd == i32::MAX { 1 } else { wd + 1 }; }
     i.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
     let h = fnv(path);
-    let w = Watch { wd, mask: ev_mask, ino: id, isdir, multi: nlink > 1 && !isdir, mount: false, path: path.to_vec(), hash: h };
+    let w = Watch { wd, mask: ev_mask, ignore: 0, surv: false, ino: id, isdir, multi: nlink > 1 && !isdir, mount: false, path: path.to_vec(), hash: h };
     let k = w.k();
     i.watches.push(w);
     st.nwatches += 1;
@@ -287,9 +299,11 @@ pub const FAN_MARK_MOUNT: u32 = 0x10;
 pub const FAN_MARK_FLUSH: u32 = 0x80;
 
 /// Turn the fresh instance `inst` into a fanotify group.
-pub fn fan_set(inst: u32, evflags: u32) {
-    if let Some(i) = STATE.lock().insts.get_mut(&inst) { i.fan = true; i.evflags = evflags; }
+pub fn fan_set(inst: u32, evflags: u32, perm: bool, owner: u32) {
+    if let Some(i) = STATE.lock().insts.get_mut(&inst) { i.fan = true; i.evflags = evflags; i.perm = perm; i.owner = owner; if perm { PERMG.fetch_add(1, Relaxed); } }
 }
+pub fn is_perm_group(inst: u32) -> bool { STATE.lock().insts.get(&inst).map_or(false, |i| i.perm) }
+pub fn perm_watched() -> bool { PERMG.load(Relaxed) != 0 }
 pub fn is_fan(inst: u32) -> bool { STATE.lock().insts.get(&inst).map_or(false, |i| i.fan) }
 pub fn fan_evflags(inst: u32) -> u32 { STATE.lock().insts.get(&inst).map_or(0, |i| i.evflags) }
 
@@ -306,7 +320,7 @@ fn wdrop(st: &mut State, inst: u32, p: usize) {
 
 /// fanotify_mark ADD/REMOVE on an inode (`mount == false`) or on the mount
 /// rooted at `path`. `mask` is the fanotify mask (events | ONDIR | ON_CHILD).
-pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: u64, isdir: bool, mount: bool) -> Result<(), i32> {
+pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: u64, isdir: bool, mount: bool, ignore: bool, surv: bool) -> Result<(), i32> {
     let mut st = STATE.lock();
     let st = &mut *st;
     let i = match st.insts.get_mut(&inst) { Some(i) if i.fan => i, _ => return Err(-22) };
@@ -314,15 +328,21 @@ pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: 
     if remove {
         let p = found.ok_or(-2)?;
         let w = &mut i.watches[p];
-        let nm = w.mask & !mask;
-        if nm & FAN_EVENTS == 0 { wdrop(st, inst, p); } else { track(w.mask, nm); w.mask = nm; }
+        if ignore { w.ignore &= !mask; } else { let nm = w.mask & !mask; track(w.mask, nm); w.mask = nm; }
+        if w.mask & (FAN_EVENTS | FAN_PERM) == 0 && w.ignore == 0 { wdrop(st, inst, p); }
         return Ok(());
     }
     if let Some(p) = found {
         let w = &mut i.watches[p];
-        let nm = w.mask | mask;
-        track(w.mask, nm);
-        w.mask = nm;
+        if ignore {
+            w.ignore |= mask & (FAN_EVENTS | FAN_PERM);
+            w.mask |= mask & (FAN_ONDIR | FAN_ON_CHILD);
+            w.surv = surv;
+        } else {
+            let nm = w.mask | mask;
+            track(w.mask, nm);
+            w.mask = nm;
+        }
         return Ok(());
     }
     let maxw = MAX_USER_WATCH.load(Relaxed);
@@ -331,12 +351,12 @@ pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: 
     let mut wd = i.next_wd;
     while i.watches.iter().any(|w| w.wd == wd) { wd = if wd == i32::MAX { 1 } else { wd + 1 }; }
     i.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
-    let w = Watch { wd, mask, ino: if mount { (0, 0) } else { id }, isdir, multi: !mount && nlink > 1 && !isdir, mount, path: path.to_vec(), hash: fnv(path) };
+    let w = Watch { wd, mask: if ignore { mask & (FAN_ONDIR | FAN_ON_CHILD) } else { mask }, ignore: if ignore { mask & (FAN_EVENTS | FAN_PERM) } else { 0 }, surv: ignore && surv, ino: if mount { (0, 0) } else { id }, isdir, multi: !mount && nlink > 1 && !isdir, mount, path: path.to_vec(), hash: fnv(path) };
     let k = w.k();
     i.watches.push(w);
     st.nwatches += 1;
     ARMED.fetch_add(1, Relaxed);
-    track(0, mask);
+    track(0, if ignore { 0 } else { mask });
     index_add(st, inst, wd, k);
     Ok(())
 }
@@ -352,7 +372,7 @@ pub fn fan_flush(inst: u32, mount: bool) {
 }
 
 /// Pop up to `max` events: (mask, path, pid). Err(-11) when empty.
-pub fn fan_read(inst: u32, max: usize) -> Result<Vec<(u32, Vec<u8>, u32)>, i32> {
+pub fn fan_read(inst: u32, max: usize) -> Result<Vec<(u32, Vec<u8>, u32, u32)>, i32> {
     let mut st = STATE.lock();
     let i = match st.insts.get_mut(&inst) { Some(i) => i, None => return Err(-22) };
     if i.queue.is_empty() { return Err(-11); }
@@ -360,7 +380,8 @@ pub fn fan_read(inst: u32, max: usize) -> Result<Vec<(u32, Vec<u8>, u32)>, i32> 
     while v.len() < max {
         let Some(e) = i.queue.pop_front() else { break };
         i.bytes = i.bytes.saturating_sub(24);
-        v.push((e.mask, e.name, e.cookie));
+        let permid = if e.mask & FAN_PERM != 0 { (-e.wd) as u32 } else { 0 };
+        v.push((e.mask, e.name, e.cookie, permid));
     }
     Ok(v)
 }
@@ -376,7 +397,9 @@ fn fan_mount(path: &[u8], mask: u32) {
             let mut hit = false;
             let pid = sched::tgid_of(sched::current_pid());
             let mut evs: Vec<Ev> = Vec::new();
+            if i.watches.iter().any(|w| !w.mount && w.path == path && w.ignore & mask != 0) { continue; }
             for w in i.watches.iter() {
+                if w.mount && w.ignore & mask != 0 && w.path == path { break; }
                 if !w.mount || w.mask & mask & FAN_EVENTS == 0 { continue; }
                 if mask & IN_ISDIR != 0 && w.mask & FAN_ONDIR == 0 { continue; }
                 let under = w.path == path || w.path == b"/" || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/');
@@ -498,11 +521,21 @@ pub fn dirent_id(parent: &[u8], name: &[u8], mask: u32, cookie: u32, id: Option<
         let mut gone: Vec<(u32, i32, Wk, Vec<UKey>)> = Vec::new();
         for (inst, wd) in list {
             let i = match st.insts.get_mut(&inst) { Some(i) => i, None => continue };
+            if mask & IN_MODIFY != 0 {
+                if let Some(w) = i.watches.iter_mut().find(|w| w.wd == wd && w.ignore != 0 && !w.surv) { w.ignore = 0; }
+            }
             let w = match i.watches.iter().find(|w| w.wd == wd) { Some(w) => w, None => continue };
             if w.mount { continue; }
             let hit = if is_self { (by_i && id == Some(w.ino) && w.ino != (0, 0)) || (!w.multi && w.path == parent) } else { w.isdir && w.path == parent };
             if !hit || w.mask & mask & IN_ALL_EVENTS == 0 { continue; }
             if i.fan {
+                if w.ignore & mask != 0 { continue; }
+                if !is_self {
+                    let mut full = parent.to_vec();
+                    if full != b"/" { full.push(b'/'); }
+                    full.extend_from_slice(name);
+                    if i.watches.iter().any(|x| !x.mount && x.path == full && x.ignore & mask != 0) { continue; }
+                }
                 if mask & IN_ISDIR != 0 && w.mask & FAN_ONDIR == 0 { continue; }
                 if !is_self && w.mask & FAN_ON_CHILD == 0 { continue; }
             }
@@ -721,4 +754,109 @@ fn note_closed(ofd: u32) {
     let id = if note.id != (0, 0) { Some(note.id) } else { None };
     inode_id(&note.path, id, d | if note.writable { IN_CLOSE_WRITE } else { IN_CLOSE_NOWRITE });
     if note.unlinked && !still { removed_id(&note.path, note.isdir, id); }
+}
+
+
+// ── fanotify permission events ───────────────────────────────────────────────
+
+/// Wait key of the opener blocked on a verdict of group `inst`.
+fn pkey(inst: u32) -> u64 { sched::poll_key(sched::poll_class::INOTIFY, inst | 0x8000_0000) }
+
+/// Ask every permission group marking `path` (an inode mark on it, a
+/// directory mark with ON_CHILD on its parent, or a covering mount mark)
+/// whether the access `mask` (FAN_OPEN_PERM / FAN_ACCESS_PERM) may proceed.
+/// Blocks the caller until each verdict arrives; a group that closes, or
+/// stays silent for `PERM_TIMEOUT_NS`, allows. The group's own thread group
+/// never waits on it (Linux gives the listener's event fds FMODE_NONOTIFY;
+/// here the whole listener process is exempt, which can never deadlock).
+pub fn fan_perm(path: &[u8], mask: u32, isdir: bool) -> bool {
+    if !perm_watched() { return true; }
+    let pid = sched::tgid_of(sched::current_pid()) as u32;
+    let parent = split(path).map(|(p, _)| p);
+    let mut waits: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut st = STATE.lock();
+        for (&inst, i) in st.insts.iter_mut() {
+            if !i.perm || i.owner == pid { continue; }
+            if i.watches.iter().any(|w| w.path == path && w.ignore & mask != 0) { continue; }
+            let hit = i.watches.iter().any(|w| {
+                if w.mask & mask == 0 || w.ignore & mask != 0 { return false; }
+                if isdir && w.mask & FAN_ONDIR == 0 { return false; }
+                if w.mount { return w.path == b"/" || w.path == path || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/'); }
+                w.path == path || (w.isdir && w.mask & FAN_ON_CHILD != 0 && parent == Some(&w.path[..]))
+            });
+            if !hit { continue; }
+            let id = loop { let c = PERM_ID.fetch_add(1, Relaxed) & 0x7fff_ffff; if c != 0 { break c; } };
+            i.pend.push(Pend { id, fd: -1, verdict: 0 });
+            i.queue.push_back(Ev { wd: -(id as i32), mask: (mask & FAN_PERM) | if isdir { IN_ISDIR } else { 0 }, cookie: pid, name: path.to_vec() });
+            i.bytes += 24;
+            i.seq += 1;
+            waits.push((inst, id));
+        }
+    }
+    if waits.is_empty() { return true; }
+    for &(inst, _) in &waits { sched::wake_poll_key(key(inst)); }
+    let mut allow = true;
+    for (inst, id) in waits { if !perm_wait(inst, id) { allow = false; } }
+    allow
+}
+
+/// Verdict of one pending event: Some(allow) once decided, the group gone
+/// or the event dropped.
+fn perm_poll(inst: u32, id: u32) -> Option<bool> {
+    let mut st = STATE.lock();
+    let Some(i) = st.insts.get_mut(&inst) else { return Some(true) };
+    let Some(p) = i.pend.iter().position(|e| e.id == id) else { return Some(true) };
+    if i.pend[p].verdict == 0 { return None; }
+    let v = i.pend.remove(p).verdict;
+    Some(v == 1)
+}
+
+fn perm_drop(inst: u32, id: u32) {
+    let mut st = STATE.lock();
+    if let Some(i) = st.insts.get_mut(&inst) {
+        i.pend.retain(|e| e.id != id);
+        if let Some(p) = i.queue.iter().position(|e| e.wd == -(id as i32) && e.mask & FAN_PERM != 0) { i.queue.remove(p); i.bytes = i.bytes.saturating_sub(24); }
+    }
+}
+
+fn perm_wait(inst: u32, id: u32) -> bool {
+    let deadline = sched::monotonic_ns() + PERM_TIMEOUT_NS;
+    let k = pkey(inst);
+    loop {
+        if let Some(v) = perm_poll(inst, id) { return v; }
+        let now = sched::monotonic_ns();
+        if now >= deadline { perm_drop(inst, id); return true; }
+        sched::block_on_poll_prepare_tag(deadline, &sched::PollTag::keyed(&[k], 0));
+        if let Some(v) = perm_poll(inst, id) { sched::block_on_poll_cancel(); return v; }
+        sched::block_on_poll_commit();
+    }
+}
+
+/// The reader opened event fd `fd` for permission event `id`; an event with
+/// no fd cannot be answered, so it is allowed.
+pub fn fan_bind(inst: u32, id: u32, fd: i32) {
+    let mut wake_it = false;
+    {
+        let mut st = STATE.lock();
+        if let Some(e) = st.insts.get_mut(&inst).and_then(|i| i.pend.iter_mut().find(|e| e.id == id)) {
+            e.fd = fd;
+            if fd < 0 { e.verdict = 1; wake_it = true; }
+        }
+    }
+    if wake_it { sched::wake_poll_key(pkey(inst)); }
+}
+
+/// write(group, struct fanotify_response { s32 fd; u32 response }).
+pub fn fan_verdict(inst: u32, fd: i32, response: u32) -> Result<(), i32> {
+    let v = match response & !0x10 { 1 => 1, 2 => 2, _ => return Err(-22) };
+    {
+        let mut st = STATE.lock();
+        let i = st.insts.get_mut(&inst).ok_or(-22)?;
+        if !i.perm { return Err(-22); }
+        let e = i.pend.iter_mut().find(|e| e.fd == fd && fd >= 0 && e.verdict == 0).ok_or(-2)?;
+        e.verdict = v;
+    }
+    sched::wake_poll_key(pkey(inst));
+    Ok(())
 }
