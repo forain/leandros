@@ -226,11 +226,8 @@ pub(crate) fn lx_enabled() -> bool {
         }
     }
 }
-pub(crate) static LX_CHAINED: atomic::AtomicU32 = atomic::AtomicU32::new(0);
-pub(crate) static LX_FALLBACK: atomic::AtomicU32 = atomic::AtomicU32::new(0);
-pub(crate) static LX_NODES: atomic::AtomicU32 = atomic::AtomicU32::new(0);
-/// Checkpoints committed since boot (never reset, unlike `CP_COUNT`).
-pub(crate) static CP_TOTAL: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+pub(crate) use vfs_server::{F2FS_CP_TOTAL as CP_TOTAL, F2FS_LX_CHAINED as LX_CHAINED,
+                      F2FS_LX_FALLBACK as LX_FALLBACK, F2FS_LX_NODES as LX_NODES};
 
 /// `f2fs.crashpt=N` (crash-consistency test only): on the volume mounted
 /// under /mnt, every device write after the N-th block is dropped, as if the
@@ -249,8 +246,9 @@ pub(crate) static RF_KICK: atomic::AtomicBool = atomic::AtomicBool::new(false);
 static RF_KICKS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 pub(crate) fn rf_high(ms: &MountState) -> bool {
     let d = &ms.dur;
-    d.rf_end > d.rf_start && d.rf_next >= d.rf_start
-        && (d.rf_next - d.rf_start) as u64 * 4 >= (d.rf_end - d.rf_start) as u64 * 3
+    (d.rf_end > d.rf_start && d.rf_next >= d.rf_start
+        && (d.rf_next - d.rf_start) as u64 * 4 >= (d.rf_end - d.rf_start) as u64 * 3)
+        || (d.lx_open && d.lx_next as u64 * 4 >= (ms.sb.blocks_per_seg as u64 - 1) * 3)
 }
 static RF_FULL: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 fn rf_full_note() {
@@ -557,6 +555,14 @@ pub(crate) fn ns_note(ms: &mut MountState, ino: u32, created: bool) {
 /// Clear `nid`'s NAT entry (the node is gone) and queue the id for reuse.
 pub(crate) fn node_freed(ms: &mut MountState, nid: u32) {
     if nid == 0 || nid <= ms.sb.root_ino { return; }
+    if lx_enabled() {
+        // M4: remember whose node this was (footer ino) before the NAT entry goes.
+        let a = nat_lookup(ms, nid);
+        if a != 0 {
+            let ino = footer_ino(ms.cache.read(ms.dev, a as u64));
+            if ino != 0 && !ms.cache.poisoned() { ms.dur.lx_freed_pending.insert(ino); }
+        }
+    }
     nat_clear(ms, nid);
     if !ms.cache.poisoned() { ms.dur.nid_pending.insert(nid); }
 }
@@ -1169,13 +1175,88 @@ fn tree(ms: &mut MountState, ino: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32, u16)>
     (nodes, data)
 }
 
+/// lxchain: report a violated invariant once and close the era (fail closed).
+fn lx_viol(ms: &mut MountState, id: &str) {
+    static N: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+    if N.fetch_add(1, atomic::Ordering::Relaxed) < 8 {
+        dbg_str("[F2FS] lxchain invariant "); dbg_str(id); dbg_str(" violated\n");
+    }
+    ms.dur.lx_open = false;
+}
+
+/// lxchain (design-f2fsnodelog-p1 step 8): build the Linux warm-node chain
+/// for `node_idx`, the dirty nodes of regular file `ino`. None: the fsync must
+/// take a checkpoint. Returns (chain blocks, device block of the first, count).
+/// Nothing is changed except on a violation (which closes the era).
+fn lx_build_chain(ms: &mut MountState, ino: u32, dentry: bool, ia: u32, pino: u32,
+                  node_idx: &[(usize, u32)]) -> Option<(Vec<u8>, u64, u32)> {
+    use crate::lxchain::*;
+    if !ms.dur.lx_open { return None; }
+    if ms.dur.lx_freed_pending.contains(&ino) || ms.dur.lx_freed_inflight.contains(&ino) { return None; }
+    if dentry {
+        if !is_fresh(ms, ia as u64) { return None; }
+        let pa = nat_lookup(ms, pino);
+        if pa == 0 || is_fresh(ms, pa as u64) { return None; }
+    }
+    let bps = ms.sb.blocks_per_seg;
+    let seg = ms.dur.lx_seg;
+    if seg >= ms.sb.seg_cnt_main || seg != ms.dur.lx_heads[4].0 || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno {
+        lx_viol(ms, "I6a"); return None;
+    }
+    let (blkno, off) = sit_entry_loc(ms, seg);
+    if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK != 0 { lx_viol(ms, "I6b"); return None; }
+    // (ofs, slot, nid) of every non-indirect node, inode last.
+    let mut set: Vec<(u32, usize, u32)> = Vec::new();
+    set.try_reserve_exact(node_idx.len()).ok()?;
+    for &(i, nid) in node_idx {
+        let d = ms.cache.data(i);
+        let ofs = r32(d, FT_FLAG) >> 3;
+        if footer_nid(d) != nid || footer_ino(d) != ino || (ofs == 0) != (nid == ino) { lx_viol(ms, "I1"); return None; }
+        if lx_ofs_indirect(ofs) { continue; }
+        set.push((ofs, i, nid));
+    }
+    let key = |e: &(u32, usize, u32)| if e.0 == 0 { (2u32, 0u32) } else if e.0 == crate::NODE_OFS_XATTR { (1, 0) } else { (0, e.0) };
+    set.sort_unstable_by_key(key);
+    let n = set.len() as u32;
+    if n == 0 { return None; }
+    if ms.dur.lx_next + n > bps - 1 { rf_full_note(); return None; }
+    let mut chain: Vec<u8> = Vec::new();
+    chain.try_reserve_exact(n as usize * BLOCK_SIZE).ok()?;
+    let base = ms.sb.main_blkaddr as u64 + seg as u64 * bps as u64;
+    for (k, &(ofs, i, nid)) in set.iter().enumerate() {
+        let mut buf = [0u8; BLOCK_SIZE];
+        buf.copy_from_slice(ms.cache.data(i));
+        let is_inode = nid == ino;
+        if is_inode { buf[crate::I_EXT_OFF..crate::I_EXT_OFF + 12].fill(0); }
+        let next = (base + ms.dur.lx_next as u64 + k as u64 + 1) as u32;
+        stamp_copy(&mut buf, ms.dur.lx_stamp, next, footer_flag(ofs, is_inode, dentry));
+        if is_inode {
+            if let Some(seed) = ms.cache.icsum_is_inode(ms.dev, i) {
+                let c = crate::icsum_calc(seed, &buf);
+                w32(&mut buf, crate::ICSUM_OFF, c);
+            }
+        }
+        chain.extend_from_slice(&buf);
+    }
+    Some((chain, base + ms.dur.lx_next as u64, n))
+}
+
+/// `f2fs.lxtorn=K` (test only): the K-th chained fsync writes its chain, then
+/// stops before the LRF1 record (a torn fsync).
+fn lx_torn_hit() -> bool {
+    static N: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+    let k = drivers::nvidia_probe::cmdline_opt("f2fs.lxtorn").unwrap_or(0) as u32;
+    k != 0 && N.fetch_add(1, atomic::Ordering::Relaxed) + 1 == k
+}
+
 /// fsync of regular file `ino` by roll-forward record. None: not possible
 /// here (directory, namespace change, no room, I/O error): the caller takes
 /// a checkpoint. Call without the filesystem lock, in task context.
 pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
     if !rf_enabled() { return None; }
     let _cp = CP_MUTEX.lock();
-    struct P1 { dev: usize, runs: Vec<(u64, Vec<u8>)>, rec: Vec<u8>, at: u64, era: u64, pos: u32 }
+    struct P1 { dev: usize, runs: Vec<(u64, Vec<u8>)>, rec: Vec<u8>, at: u64, era: u64, pos: u32,
+                chain: Vec<u8>, chain_at: u64, chain_n: u32, first: bool }
     let p1 = {
         let mut mounts = lock_mounts();
         let ms = mounts.iter_mut().flatten().find(|m| m.port == port)?;
@@ -1214,6 +1295,13 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
         if node_idx.is_empty() && data_idx.is_empty() && !dentry { return Some(Ok(())); }
         if dentry && node_idx.is_empty() { return None; }
         if node_idx.len() > RF_MAX_NODES { return None; }
+        // lxchain: the chain for the non-indirect nodes; any refusal means a checkpoint.
+        let (chain, chain_at, chain_n) = if lx_enabled() && !node_idx.is_empty() {
+            match lx_build_chain(ms, ino, dentry, ia, pino, &node_idx) {
+                Some(c) => c,
+                None => { LX_FALLBACK.fetch_add(1, atomic::Ordering::Relaxed); return None; }
+            }
+        } else { (Vec::new(), 0, 0) };
         let need = if node_idx.is_empty() { 0 } else { 1 + node_idx.len() as u32 };
         if ms.dur.rf_next + need > ms.dur.rf_end { rf_full_note(); return None; }
         // The record.
@@ -1257,6 +1345,8 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
         for &i in &data_idx { ms.cache.set_flags(i, false, true); }
         let pos = ms.dur.rf_next;
         ms.dur.rf_next += need;
+        let first = !ms.dur.lx_flushed;
+        ms.dur.lx_next += chain_n;
         if rf_high(ms) && !RF_KICK.swap(true, atomic::Ordering::Relaxed) {
             let n = RF_KICKS.fetch_add(1, atomic::Ordering::Relaxed);
             if n == 0 || n.is_power_of_two() {
@@ -1268,17 +1358,30 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
         if need > 0 { ms.dur.rf_seq += 1; }
         let at = pack_base(ms, ms.dur.durable_pack) + pos as u64;
         WB_INFLIGHT.store(true, atomic::Ordering::Release);
-        P1 { dev: ms.dev, runs, rec, at, era: ms.dur.durable_ver, pos }
+        P1 { dev: ms.dev, runs, rec, at, era: ms.dur.durable_ver, pos, chain, chain_at, chain_n, first }
     };
     // Phase 2: data, flush, record, flush.
     let mut ok = true;
     let mut cmds = 0u32;
     for (start, data) in &p1.runs { ok &= dws(p1.dev, *start, data, &mut cmds); }
-    if !p1.runs.is_empty() || EVICT_UNFLUSHED.swap(false, atomic::Ordering::AcqRel) { ok &= dflush(p1.dev); }
+    let has_chain = !p1.chain.is_empty();
+    let ev = EVICT_UNFLUSHED.swap(false, atomic::Ordering::AcqRel);
+    // M6: the first chain write of an era is preceded by a flush, even with no data runs.
+    if !p1.runs.is_empty() || ev || (has_chain && p1.first) { ok &= dflush(p1.dev); }
+    let mut torn = false;
+    if ok && has_chain {
+        ok &= dws(p1.dev, p1.chain_at, &p1.chain, &mut cmds);
+        if ok && lx_torn_hit() {
+            ok &= dflush(p1.dev);
+            dbg_str("[F2FS] lxtorn hit\n");
+            torn = true;
+            ok = false;
+        }
+    }
     if ok && !p1.rec.is_empty() {
         ok &= dws(p1.dev, p1.at, &p1.rec, &mut cmds);
-        ok &= dflush(p1.dev);
     }
+    if ok && (has_chain || !p1.rec.is_empty()) { ok &= dflush(p1.dev); }
     WB_INFLIGHT.store(false, atomic::Ordering::Release);
     // Phase 3.
     let mut mounts = lock_mounts();
@@ -1298,9 +1401,21 @@ pub(crate) fn fsync_rf(port: u32, ino: u32) -> Option<Result<(), ()>> {
             ms.dur.rf_end = 0;
             let _ = p1.pos;
         }
+        if ms.dur.durable_ver == p1.era && has_chain {
+            if ok { ms.dur.lx_flushed = true; } else { ms.dur.lx_open = false; }
+        }
     }
     drop(mounts);
-    if ok { RF_COUNT.fetch_add(1, atomic::Ordering::Relaxed); Some(Ok(())) } else { None }
+    if torn { return Some(Err(())); }
+    if ok {
+        RF_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+        vfs_server::F2FS_RF_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+        if has_chain {
+            LX_CHAINED.fetch_add(1, atomic::Ordering::Relaxed);
+            LX_NODES.fetch_add(p1.chain_n as u64, atomic::Ordering::Relaxed);
+        }
+        Some(Ok(()))
+    } else { None }
 }
 
 // ── Mount: roll-forward recovery ─────────────────────────────────────────────
