@@ -457,6 +457,29 @@ def host_run(c, timeout, arch=None, scale=1.0):
         return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
 
 
+def boot_and_login(arch, mode, gpu, scale, run):
+    """Start runtests' VM and log in as root (2 attempts). True when it is up."""
+    start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
+    for attempt in range(2):
+        r = subprocess.run(start, capture_output=True, text=True, timeout=900)
+        if r.returncode == 0:
+            lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
+                                 str(int(60 * scale))],
+                                capture_output=True, text=True, timeout=900)
+            if lg.returncode == 0:
+                return True
+            print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
+        else:
+            print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
+            try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
+                with open(driver.QEMU_STDERR_LOG, "rb") as ef:
+                    print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
+            except OSError:
+                pass
+        subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+    return False
+
+
 def self_boots(c):
     """True for a `host:` script that starts (and stops) its own VM under its own
     LEANDROS_RUN_ID. Such a script must not run while runtests' VM is up: both
@@ -465,7 +488,8 @@ def self_boots(c):
         return False
     try:
         with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
-            return '"start"' in f.read()
+            t = f.read()
+            return '"start"' in t or "ffsession.py" in t  # ffsession.py boots its own VM
     except OSError:
         return False
 
@@ -558,27 +582,8 @@ def main(argv):
         booted = False
         if cmds and all(self_boots(c) for c in cmds):
             booted = True  # every command boots its own VM: runtests boots none
-        start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
-        for attempt in range(2):
-            if booted:
-                break
-            r = subprocess.run(start, capture_output=True, text=True, timeout=900)
-            if r.returncode == 0:
-                lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
-                                     str(int(60 * scale))],
-                                    capture_output=True, text=True, timeout=900)
-                if lg.returncode == 0:
-                    booted = True
-                    break
-                print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
-            else:
-                print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
-                try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
-                    with open(driver.QEMU_STDERR_LOG, "rb") as ef:
-                        print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
-                except OSError:
-                    pass
-            subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+        if not booted:
+            booted = boot_and_login(arch, mode, gpu, scale, run)
         entry["boot"] = "ok" if booted else "failed"
         if not booted:
             all_ok = False
@@ -589,12 +594,16 @@ def main(argv):
                 try:
                     if self_boots(c) and driver._qemu_pid() is not None:
                         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+                    elif not self_boots(c) and driver._qemu_pid() is None:
+                        # an earlier self-booting script stopped our VM: boot it again
+                        if not boot_and_login(arch, mode, gpu, scale, run):
+                            raise RuntimeError("reboot failed")
                     if c.startswith("host:"):
                         r = host_run(c, timeout, arch, scale)
                     else:
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001
-                    r = {"rc": None, "status": f"error {e}", "output": "", "secs": 0}
+                    r = {"rc": None, "status": str(e) if str(e) == "reboot failed" else f"error {e}", "output": "", "secs": 0}
                 fails = find_fails(r["output"])
                 rc = r["rc"] if r["rc"] is not None else "?"
                 ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file")
