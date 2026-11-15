@@ -737,6 +737,7 @@ async fn serve(cfg: Config, fp: String) {
 
     let mut tasks = Vec::new();
     for l in listeners {
+        unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&l), libc::F_SETFD, libc::FD_CLOEXEC) };
         let cfg = cfg.clone();
         tasks.push(tokio::spawn(async move {
             loop {
@@ -746,6 +747,9 @@ async fn serve(cfg: Config, fp: String) {
                             log(&format!("{peer}: dropping connection (MaxStartups)"));
                             continue;
                         };
+                        // Not every accept path sets close-on-exec: a connection fd leaked into
+                        // another connection's process would keep this one open after a crash.
+                        unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&stream), libc::F_SETFD, libc::FD_CLOEXEC) };
                         let grace = cfg.login_grace_secs;
                         tokio::spawn(spawn_child(stream, peer, grace, slot));
                     }
