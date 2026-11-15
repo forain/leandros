@@ -614,14 +614,14 @@ SSHD2_PORT = 2222
 SSHD2_BIN = os.environ.get("SSHDCFG_BIN", "/usr/sbin/sshd")
 
 
-def sshd2_start(ssh, user, pw, conf):
+def sshd2_start(ssh, user, pw, conf, env=""):
     """(Re)start a second sshd (root, port 2222, config `conf`) in the guest; True when it listens."""
     sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", conf)
     sudo_write(ssh, user, pw, "/tmp/sshdcfg-start.sh", "\n".join([
         "trap '' HUP",  # the ssh session's hangup must not take the daemon down (no setsid in the guest)
         "kill $(cat /tmp/sshdcfg.pid 2>/dev/null) 2>/dev/null; sleep 1",
         ": > /tmp/sshdcfg.log",
-        f"{SSHD2_BIN} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
+        f"{env} {SSHD2_BIN} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
         "echo $! > /tmp/sshdcfg.pid",
         "for i in 1 2 3 4 5 6 7 8 9 10; do grep -q ready /tmp/sshdcfg.log && exit 0; sleep 1; done; exit 1",
     ]))
@@ -908,6 +908,96 @@ def new_preauth(ssh, user, pw, before):
     return s, (pre[0] if pre else listener_pid(procs)), bool(pre)
 
 
+PS_DETAIL = r"""for p in /proc/[0-9]*; do
+n=$(sed -n 's/^Name:\t//p' $p/status 2>/dev/null)
+case "$n" in sshd*)
+echo "${p#/proc/}|$(sed -n 's/^PPid:\t//p' $p/status)|$n|$(sed -n 's/^Uid:\t//p' $p/status | tr '\t' ,)|$(sed -n 's/^NoNewPrivs:\t//p' $p/status)|$(sed -n 's/^Seccomp:\t//p' $p/status)|$(readlink $p/root)|$(for f in $p/fd/*; do readlink $f; done 2>/dev/null | grep -c -e '/etc/ssh' -e '/etc/shadow')";;
+esac
+done"""
+
+
+def sshd_detail(ssh, user, pw):
+    """[dict(pid, ppid, comm, uid, nnp, seccomp, root, keyfds)] for every sshd* process."""
+    sudo_write(ssh, user, pw, "/tmp/sshdet.sh", PS_DETAIL)
+    _, out, _ = sudo_sh(ssh, user, pw, "sh /tmp/sshdet.sh")
+    res = []
+    for ln in out.splitlines():
+        f = ln.split("|")
+        if len(f) == 8 and f[0].isdigit():
+            res.append(dict(pid=int(f[0]), ppid=int(f[1] or 0), comm=f[2], uid=f[3], nnp=f[4], seccomp=f[5],
+                            root=f[6], keyfds=int(f[7] or 0)))
+    return res
+
+
+def privsep_isolation(ssh, user, pw):
+    """The pre-auth network child is unprivileged, jailed, NNP and seccomp'd, and holds no host-key fd."""
+    s, ok = probe_open(ssh)
+    time.sleep(1)
+    d = sshd_detail(ssh, user, pw)
+    pre = [p for p in d if p["comm"] == "sshd-preauth"]
+    det = f"preauth={[(p['pid'], p['uid']) for p in pre]} all={[(p['pid'], p['comm'], p['uid']) for p in d]}"
+    step("privsep_preauth_uid", ok and bool(pre) and all(
+        all(u != "0" for u in p["uid"].split(",")) for p in pre), det)
+    step("privsep_preauth_chroot_nnp", bool(pre) and all(p["nnp"] == "1" and p["root"] == "/var/empty" for p in pre),
+         str([(p["nnp"], p["root"]) for p in pre]))
+    step("privsep_preauth_seccomp", bool(pre) and all(p["seccomp"] == "2" for p in pre),
+         str([p["seccomp"] for p in pre]))
+    step("privsep_no_hostkey_fd", bool(pre) and all(p["keyfds"] == 0 for p in d if p["comm"].startswith("sshd-")),
+         str([(p["comm"], p["keyfds"]) for p in d]))
+    s.close()
+    # Post-auth: the network process stays uid 22; a root monitor (not the listener) is its parent.
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("ssh", ["ssh", *ssh.pw_opts(), "-tt", "-p", str(ssh.port), f"{user}@{ssh.host}", "cat"], ssh.env(pw))
+    try:
+        time.sleep(4)
+        d = sshd_detail(ssh, user, pw)
+        byp = {p["pid"]: p for p in d}
+        nets = [p for p in d if p["comm"] == "sshd-net"]
+        good = [p for p in nets if p["uid"].split(",")[0] == "22" and byp.get(p["ppid"], {}).get("uid", "x").split(",")[0] == "0"
+                and byp.get(p["ppid"], {}).get("comm") == "sshd" and byp[p["ppid"]]["ppid"] in byp]
+        step("privsep_postauth_uid", bool(good), f"nets={[(p['pid'], p['uid'], p['ppid']) for p in nets]}")
+    finally:
+        try:
+            os.write(fd, b"\x04")
+            os.close(fd)
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+def privsep_hooks(ssh, user, pw, tmp):
+    """Test-only hooks (env SSHD_TEST_HOOK, honoured by the net child): a forbidden syscall kills only that
+    connection, and a forged 'auth OK' from the child is refused by the monitor."""
+    conf = "PasswordAuthentication yes\nPubkeyAuthentication yes\n"
+    for hook, name in (("badsyscall", "privsep_forbidden_syscall_kills_conn"), ("forgeauth", "privsep_forged_auth_refused")):
+        if not sshd2_start(ssh, user, pw, conf, env=f"SSHD_TEST_HOOK={hook}"):
+            step(name, False, "second sshd did not start")
+            continue
+        lp = free_port()
+        tun = subprocess.Popen(["ssh", *ssh.pw_opts(), "-N", "-L", f"{lp}:127.0.0.1:{SSHD2_PORT}", "-p", str(ssh.port),
+                                f"{user}@{ssh.host}"], env=ssh.env(pw), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3)
+        key = os.path.join(tmp, "hookkey")
+        if not os.path.exists(key):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        r = subprocess.run(["ssh", "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=20", "-p", str(lp), "root@127.0.0.1", "id -u"],
+                           capture_output=True, text=True, timeout=60)
+        _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log")
+        procs = sshd_procs(ssh, user, pw)
+        listener_up = any(n == "sshd" and pp == 1 for _, pp, n in procs)
+        if hook == "badsyscall":
+            ok = r.returncode != 0 and "uid=" not in r.stdout and listener_up and ssh.run(user, "id -un", pw, timeout=30)[0] == 0
+        else:
+            ok = r.returncode != 0 and r.stdout.strip() != "0" and "forged" in lg
+        step(name, ok, f"rc={r.returncode} out={r.stdout.strip()!r} listener={listener_up} log={lg[-200:]!r}")
+        stop(tun)
+        sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+
+
 def privsep_grace(ssh, user, pw, tmp):
     """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
     conf = "LoginGraceTime 4\nPasswordAuthentication yes\n"
@@ -1041,6 +1131,8 @@ def main(argv):
     sshdcfg(ssh, user, pw, tmp)
     if full_mode:
         full(ssh, user, pw, tmp)
+    privsep_isolation(ssh, user, pw)
+    privsep_hooks(ssh, user, pw, tmp)
     privsep_grace(ssh, user, pw, tmp)
     privsep_crash(ssh, user, pw)
     privsep_count(ssh, user, pw)  # last: on a tree without per-connection processes it leaves the guest without sshd
