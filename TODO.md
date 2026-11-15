@@ -33,7 +33,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Panel-embedded applets render with tiny-skia** (root cause: cosmic-panel creates zwp_linux_dmabuf_v1 only if its GLES renderer exists at bind_display(); ours comes ~0.3 s later; measured 2026-11-13 aarch64: comp->panel start 0.42 s, no kernel DRM step visible in that window (handoff/klogms.md); needs a cosmic-panel source change, out of bounds - not a kernel bug); aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp. (`EVIOCGRAB` exclusivity, `EVIOCREVOKE` and the Ctrl+Alt+Esc escape hatch are implemented and covered by `vttest`; see artifacts/notes/lane-evdevvt-2026-11-13.md.)
 
-- **gpuqtest --venus (x86_64 KVM box) fails 2/12**: `FENCE_FD_IN_WAITS` ("in-fence pending at submit in tries=5") and `DEAD_CTX_FAST` ("fence written off after ms=0 next submit errno=0 dead contexts=0"); the other 10 pass. First venus run of this contract (integx on 91b16768), so pre-existing, not a regression. aarch64 --venus cannot run on the Mac (host virglrenderer has no render server).
+- **gpuqtest DEAD_CTX_FAST is unreachable on QEMU Venus**: QEMU discards the renderer's verdict and retires a junk-stream fence at once, so a dead render worker is invisible to the guest; the case now SKIPs in that situation and only the unanswered-fence watchdog path (docs/graphics/virtio-gpu.md) covers dead hosts. aarch64 --venus cannot run on the Mac (host virglrenderer has no render server).
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).

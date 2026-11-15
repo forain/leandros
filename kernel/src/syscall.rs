@@ -13109,7 +13109,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
                     drivers::drm_device_interface::EXEC_IN_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
                     drivers::drm_device_interface::wait_fence_obj(&f, u64::MAX)
                 } {
-                    Ok(()) => 0,
+                    Ok(()) => { drivers::drm_device_interface::out_fence_flush(); 0 }
                     Err(drivers::DriverError::Busy) => -62,
                     Err(_) => -4,
                 },
