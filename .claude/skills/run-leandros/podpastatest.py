@@ -97,11 +97,12 @@ def main():
         check("pasta_portfwd", "hello-from-container-httpd" in out, f"rc={rc} " + tail(out))
         run("podman stop -t 1 pphttpd 2>&1")
 
-        # ---- L9 phase 2 (ip6dnat): pasta v6 (QEMU slirp: gateway <prefix>::2) ----
+        # ---- L9 phase 2 (ip6dnat): pasta v6 (container pings the host's global address) ----
         rc, o6 = run("cat /proc/net/if_inet6")
-        g6 = re.search(r"^([0-9a-f]{16})[0-9a-f]{16} 02 40 00 \w+\s+eth0", o6, re.M)
+        g6 = re.search(r"^([0-9a-f]{32}) 02 40 00 \w+\s+eth0", o6, re.M)
         if g6:
-            gw6 = ":".join(g6.group(1)[i:i + 4] for i in range(0, 16, 4)) + "::2"
+            # The host's own global address: reachable on any link (slirp, vmnet), unlike a guessed <prefix>::2.
+            gw6 = ":".join(g6.group(1)[i:i + 4] for i in range(0, 32, 4))
             rc, out = run(f"podman run --rm {IMG} sh -c 'ip -6 -o addr show scope global; ip -6 route' 2>&1")
             check("pasta_v6_addr_route", rc == 0 and re.search(r"inet6 [0-9a-f:]+/\d+", out) is not None and "default" in out, f"rc={rc} " + tail(out))
             rc, out = run(f"podman run --rm {IMG} ping -6 -c3 -W 5 {gw6} 2>&1")
