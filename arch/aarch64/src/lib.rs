@@ -5,6 +5,7 @@
 pub mod early;
 pub mod exception;
 pub mod gic;
+pub mod its;
 pub mod mmu;
 pub mod paging;
 pub mod power;
