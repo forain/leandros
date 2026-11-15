@@ -924,7 +924,7 @@ pub fn sb_put(id: SbId) -> bool {
         let Some(i) = t.iter().position(|e| e.id == id) else { return false };
         if t[i].refs > 1 { t[i].refs -= 1; None } else { Some(t.remove(i)) }
     };
-    match dead { Some(e) => { if let Some(f) = e.destroy { f(&e.root); } true } None => false }
+    match dead { Some(e) => { crate::inotify_unmounted(&e.root); if let Some(f) = e.destroy { f(&e.root); } true } None => false }
 }
 
 pub fn sb_root(id: SbId) -> Option<Vec<u8>> { SB.lock().iter().find(|e| e.id == id).map(|e| e.root.clone()) }
