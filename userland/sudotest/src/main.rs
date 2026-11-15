@@ -18,6 +18,7 @@
 //! (gid 10) = {leandro}, and /etc/sudoers with `root ALL` and `%wheel ALL`.
 
 use std::ffi::CString;
+use pam_leandros as _;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -361,6 +362,8 @@ fn main() {
         t.check(&format!("{path} is root-owned, mode {mode:o} (is {:o})", st.st_mode), ok, &o);
     }
 
+    pam_checks(&mut t);
+    login_checks(&mut t);
     devtty_checks(&mut t);
     su_background(&mut t);
     su_background_pty(&mut t);
@@ -596,4 +599,114 @@ fn su_background_pty(t: &mut T) {
         }
         wait_gone(bg, 2000);
     }
+}
+
+// ── libpam ABI (pam-leandros), driven directly ──────────────────────────────
+//
+// The same functions greetd (login screen), su and sudo-rs call. A wrong
+// password must be rejected on every service name, accepted when right, and a
+// failure must be delayed (rate limiting).
+
+use std::os::raw::{c_char, c_int, c_void};
+
+#[repr(C)]
+struct PamMsg {
+    style: c_int,
+    msg: *const c_char,
+}
+#[repr(C)]
+struct PamResp {
+    resp: *mut c_char,
+    code: c_int,
+}
+#[repr(C)]
+struct PamConvT {
+    conv: Option<extern "C" fn(c_int, *mut *const PamMsg, *mut *mut PamResp, *mut c_void) -> c_int>,
+    data: *mut c_void,
+}
+
+extern "C" {
+    fn pam_start(svc: *const c_char, user: *const c_char, conv: *const PamConvT, h: *mut *mut c_void) -> c_int;
+    fn pam_authenticate(h: *mut c_void, flags: c_int) -> c_int;
+    fn pam_acct_mgmt(h: *mut c_void, flags: c_int) -> c_int;
+    fn pam_setcred(h: *mut c_void, flags: c_int) -> c_int;
+    fn pam_end(h: *mut c_void, status: c_int) -> c_int;
+    fn pam_strerror(h: *mut c_void, e: c_int) -> *const c_char;
+}
+
+extern "C" fn pam_conv_cb(n: c_int, _m: *mut *const PamMsg, r: *mut *mut PamResp, data: *mut c_void) -> c_int {
+    unsafe {
+        let pw = &*(data as *const CString);
+        let resp = libc::calloc(n as usize, std::mem::size_of::<PamResp>()) as *mut PamResp;
+        (*resp).resp = libc::strdup(pw.as_ptr());
+        *r = resp;
+    }
+    0
+}
+
+/// (rc of pam_authenticate, milliseconds it took) for `svc`/`user`/`pw`.
+fn pam_try(svc: &str, user: &str, pw: &str) -> (c_int, u128) {
+    let (svc, user, pw) = (CString::new(svc).unwrap(), CString::new(user).unwrap(), CString::new(pw).unwrap());
+    let conv = PamConvT { conv: Some(pam_conv_cb), data: &pw as *const CString as *mut c_void };
+    let mut h: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(pam_start(svc.as_ptr(), user.as_ptr(), &conv, &mut h), 0);
+        let t0 = Instant::now();
+        let rc = pam_authenticate(h, 0);
+        let ms = t0.elapsed().as_millis();
+        if rc == 0 {
+            assert_eq!(pam_acct_mgmt(h, 0), 0);
+            assert_eq!(pam_setcred(h, 2), 0);
+        }
+        let _ = pam_strerror(h, rc);
+        pam_end(h, rc);
+        (rc, ms)
+    }
+}
+
+fn pam_checks(t: &mut T) {
+    let none = Out { code: 0, stdout: String::new(), stderr: String::new() };
+    // As root, so the su/su-l pam_rootok shortcut would fire for those names;
+    // the login-style services must still demand the password.
+    for svc in ["greetd", "login", "sshd", "sudo"] {
+        let (rc, _) = pam_try(svc, "leandro", "leandro");
+        t.check(&format!("pam {svc}: right password accepted"), rc == 0, &none);
+        let (rc, ms) = pam_try(svc, "leandro", "wrong");
+        t.check(&format!("pam {svc}: wrong password rejected (rc={rc})"), rc == 7, &none);
+        t.check(&format!("pam {svc}: failure is delayed (rate limit), took {ms} ms"), ms >= 900, &none);
+        let (rc, _) = pam_try(svc, "leandro", "");
+        t.check(&format!("pam {svc}: empty password rejected"), rc != 0, &none);
+        let (rc, _) = pam_try(svc, "nosuchuser", "leandro");
+        t.check(&format!("pam {svc}: unknown user rejected"), rc != 0, &none);
+        let (rc, _) = pam_try(svc, "leandro", "leandro ");
+        t.check(&format!("pam {svc}: password with trailing byte rejected"), rc != 0, &none);
+    }
+    // Locked accounts (`!`/`*` hash) never authenticate.
+    let sh = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
+    let locked = sh.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let u = f.next()?;
+        let h = f.next()?;
+        (h.starts_with('!') || h == "*").then(|| u.to_string())
+    });
+    if let Some(u) = locked {
+        let (rc, _) = pam_try("greetd", &u, "");
+        let (rc2, _) = pam_try("greetd", &u, "x");
+        t.check(&format!("pam greetd: locked account {u} rejected"), rc != 0 && rc2 != 0, &none);
+    }
+}
+
+/// /bin/login (console/VT sessions; no PAM): a failed attempt stalls ~1 s like
+/// pam-leandros, then a second, correct attempt on the same prompt loop works.
+fn login_checks(t: &mut T) {
+    let t0 = Instant::now();
+    let bad = run(As::Root, &["/bin/login"], &[], "leandro\nwrong\n");
+    let ms = t0.elapsed().as_millis();
+    t.check("login: wrong password rejected", bad.all().contains("Login incorrect") && !bad.all().contains("uid="), &bad);
+    t.check(&format!("login: failure is delayed (rate limit), took {ms} ms"), ms >= 900, &bad);
+    let t1 = Instant::now();
+    let ok = run(As::Root, &["/bin/login"], &[], "leandro\nwrong\nleandro\nleandro\nid -un\nexit\n");
+    let ms = t1.elapsed().as_millis();
+    t.check("login: wrong then right password logs in", ok.all().contains("Login incorrect") && ok.stdout.lines().any(|l| l.trim() == "leandro"), &ok);
+    t.check(&format!("login: delay applied before the retry, took {ms} ms"), ms >= 900, &ok);
 }

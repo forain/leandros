@@ -18,7 +18,7 @@ These are development credentials, well known by design. `cosmic-greeter` is a s
 
 ### /etc/shadow
 
-The hash format is `$sha256$<salt>$<hex>`, where `<hex>` is the lowercase SHA-256 of the salt bytes followed by the password bytes. It is verified by `/bin/login`'s embedded SHA-256 ([`userland/login`](../../userland/login), no libc `crypt`) and by `pam-leandros` for the graphical login, and produced by Python's `hashlib` in the image builder with a fixed per-user salt. The three must stay byte-for-byte in sync; `pam-leandros` has a host test asserting root's field is identical to what `shadow_hash` writes. `/etc/shadow` is mode `0600`. There is no `passwd(1)`.
+The hash format is sha512-crypt `$6$[rounds=N$]<salt>$<hash>` (the image builder writes `rounds=65536` with a fixed per-user salt); legacy `$sha256$<salt>$<hex>` fields still verify. It is verified by `/bin/login`, sshd and `pam-leandros` through one shared source, [`lib/shadowhash`](../../lib/shadowhash/shadowhash.rs) (no libc `crypt`), and produced by `shadow_hash` in the image builder. `/etc/shadow` is mode `0600`. There is no `passwd(1)`.
 
 ## Logging in
 

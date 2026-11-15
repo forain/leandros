@@ -59,6 +59,10 @@ pub struct Conn {
     local: Option<SocketAddr>,
     user: Option<User>,
     authed: Arc<AtomicBool>,
+    /// Options of the authorized_keys line that authenticated this connection.
+    key_opts: crate::accounts::KeyOpts,
+    /// MaxStartups slot, held until the client authenticates or disconnects.
+    startup: Option<crate::StartupSlot>,
     chans: HashMap<ChannelId, Chan>,
 }
 
@@ -68,11 +72,12 @@ pub async fn run_connection(
     stream: TcpStream,
     peer: SocketAddr,
     local: Option<SocketAddr>,
+    startup: crate::StartupSlot,
 ) {
     log(&format!("connection from {peer}"));
     let authed = Arc::new(AtomicBool::new(false));
     let grace = Duration::from_secs(cfg.login_grace_secs);
-    let conn = Conn { cfg, peer, local, user: None, authed: authed.clone(), chans: HashMap::new() };
+    let conn = Conn { cfg, peer, local, user: None, authed: authed.clone(), key_opts: Default::default(), startup: Some(startup), chans: HashMap::new() };
     let running = match russh::server::run_stream(rcfg, stream, conn).await {
         Ok(r) => r,
         Err(e) => {
@@ -188,7 +193,7 @@ impl Conn {
         Ok(())
     }
 
-    fn pubkey_ok(&self, user: &str, key: &PublicKey) -> Option<User> {
+    fn pubkey_ok(&self, user: &str, key: &PublicKey) -> Option<(User, crate::accounts::KeyOpts)> {
         if !self.cfg.pubkey_auth {
             return None;
         }
@@ -198,8 +203,16 @@ impl Conn {
             return None;
         }
         match accounts::key_authorized(&u, &self.cfg.authorized_keys_file, key) {
-            Ok(true) => Some(u),
-            Ok(false) => None,
+            Ok(Some(o)) => {
+                if let Some(from) = &o.from {
+                    if !accounts::from_matches(from, self.peer.ip()) {
+                        log(&format!("{}: publickey for {user}: from= does not allow this address", self.peer));
+                        return None;
+                    }
+                }
+                Some((u, o))
+            }
+            Ok(None) => None,
             Err(why) => {
                 log(&format!("{}: authorized_keys of {user} ignored: {why}", self.peer));
                 None
@@ -252,6 +265,19 @@ impl Conn {
         // Subsystems never get a pty, whatever the client asked.
         let pty = if matches!(kind, Kind::Subsystem(_)) { None } else { pty };
 
+        // authorized_keys command=: run it whatever the client asked for; the
+        // client's own command line is passed in SSH_ORIGINAL_COMMAND.
+        let mut kind = kind;
+        let mut forced_env: Option<String> = None;
+        if let Some(fc) = self.key_opts.command.clone() {
+            match &kind {
+                Kind::Subsystem(_) => return Err("subsystems are refused for a command= key".into()),
+                Kind::Exec(orig) => forced_env = Some(orig.clone()),
+                Kind::Shell => {}
+            }
+            kind = Kind::Exec(fc);
+        }
+
         let shell_base = std::path::Path::new(&user.shell)
             .file_name()
             .and_then(|s| s.to_str())
@@ -302,6 +328,9 @@ impl Conn {
         for (k, v) in extra_env {
             env.retain(|(ek, _)| *ek != k);
             env.push((k, v));
+        }
+        if let Some(orig) = forced_env {
+            env.push(("SSH_ORIGINAL_COMMAND".into(), orig));
         }
         cmd.envs(env);
         let with_tty = pty.is_some();
@@ -591,6 +620,7 @@ impl russh::server::Handler for Conn {
         if accounts::verify_password(&u, password) {
             log(&format!("{}: accepted password for {user}", self.peer));
             self.user = Some(u);
+            self.startup = None;
             self.authed.store(true, Ordering::Release);
             Ok(Auth::Accept)
         } else {
@@ -605,7 +635,7 @@ impl russh::server::Handler for Conn {
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         match self.pubkey_ok(user, key) {
-            Some(u) => {
+            Some((u, opts)) => {
                 log(&format!(
                     "{}: accepted publickey for {user}: {} {}",
                     self.peer,
@@ -613,6 +643,8 @@ impl russh::server::Handler for Conn {
                     key.fingerprint(Default::default())
                 ));
                 self.user = Some(u);
+                self.key_opts = opts;
+                self.startup = None;
                 self.authed.store(true, Ordering::Release);
                 Ok(Auth::Accept)
             }
@@ -672,8 +704,9 @@ impl russh::server::Handler for Conn {
         _modes: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        let no_pty = self.key_opts.no_pty;
         match self.chans.get_mut(&id) {
-            Some(ch) if !ch.started => {
+            Some(ch) if !ch.started && !no_pty => {
                 ch.pty = Some(PtyReq {
                     term: term.to_string(),
                     cols: col_width.min(u16::MAX as u32) as u16,
