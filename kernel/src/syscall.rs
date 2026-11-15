@@ -869,6 +869,8 @@ mod nr {
     // AArch64 asm-generic: inotify_init1 = 26 (was mistakenly 360, which only
     // ever mattered once inotify stopped being ENOSYS in K2).
     pub const INOTIFY_INIT1:       usize = 26;
+    pub const FANOTIFY_INIT:       usize = 262;
+    pub const FANOTIFY_MARK:       usize = 263;
     pub const INOTIFY_ADD_WATCH:   usize = 27;
     pub const INOTIFY_RM_WATCH:    usize = 28;
     pub const POSIX_FADVISE:       usize = 223;
@@ -1158,6 +1160,8 @@ mod nr {
     pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 128;
     pub const INOTIFY_INIT1:       usize = 294;
+    pub const FANOTIFY_INIT:       usize = 300;
+    pub const FANOTIFY_MARK:       usize = 301;
     pub const INOTIFY_ADD_WATCH:   usize = 254;
     pub const INOTIFY_RM_WATCH:    usize = 255;
     pub const POSIX_FADVISE:       usize = 221;
@@ -2642,6 +2646,8 @@ fn dispatch_inner(
         INOTIFY_INIT1     => sys_inotify_init1(a0),
         INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0, a1, a2),
         INOTIFY_RM_WATCH  => sys_inotify_rm_watch(a0, a1),
+        FANOTIFY_INIT     => sys_fanotify_init(a0, a1),
+        FANOTIFY_MARK     => sys_fanotify_mark(a0, a1, a2, a3, a4),
 
         // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
         // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
@@ -10266,9 +10272,12 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     if let Some(m) = vfs::list_mounts().iter().find(|e| e.in_use && e.prefix == target_str && e.fstype.starts_with("fuse")) {
         let _ = m;
         // MNT_FORCE (1) | MNT_DETACH (2)
-        return fuse_server::unmount(target_str, umount_flags & 3 != 0);
+        let r = fuse_server::unmount(target_str, umount_flags & 3 != 0);
+        if r == 0 && target_str != "/" { vfs::inotify_unmounted(target_str.as_bytes()); }
+        return r;
     }
     if f2fs_server::unmount(target_str) {
+        if target_str != "/" { vfs::inotify_unmounted(target_str.as_bytes()); }
         0
     } else {
         -22 // EINVAL — nothing mounted there
@@ -16888,6 +16897,30 @@ fn sys_inotify_add_watch(fd: usize, path_ptr: usize, mask: usize) -> isize {
         match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
     } else { path };
     let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64, path.ptr() as u64, mask as u64 & 0xFFFF_FFFF]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// fanotify_init(flags, event_f_flags) → fd (FAN_CLASS_NOTIF groups; CAP_SYS_ADMIN).
+fn sys_fanotify_init(flags: usize, event_f_flags: usize) -> isize {
+    let msg = make_vfs_msg(vfs::VFS_FANOTIFY_INIT, &[flags as u32 as u64, event_f_flags as u32 as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, pathname). The path is resolved like
+/// any path syscall (symlinks followed unless FAN_MARK_DONT_FOLLOW); a NULL
+/// pathname marks the object `dirfd` names.
+fn sys_fanotify_mark(fd: usize, flags: usize, mask: usize, dirfd: usize, path_ptr: usize) -> isize {
+    const FAN_MARK_DONT_FOLLOW: usize = 4;
+    let pid = current_pid();
+    if path_ptr == 0 {
+        let msg = make_vfs_msg(vfs::VFS_FANOTIFY_MARK, &[fd as u64, 0, flags as u32 as u64, mask as u64, dirfd as u64]);
+        return vfs_reply_val(&vfs::handle(&msg, pid));
+    }
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = if flags & FAN_MARK_DONT_FOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
+    let msg = make_vfs_msg(vfs::VFS_FANOTIFY_MARK, &[fd as u64, path.ptr() as u64, flags as u32 as u64, mask as u64, dirfd as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
 }
 

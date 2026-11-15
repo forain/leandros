@@ -16,6 +16,8 @@ use leandros_libc::{
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
     fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec, unlink,
 };
+#[path = "../../../lib/utmpx/utmpx.rs"]
+mod utmpx;
 use leandros_libc::syscall::{nr, syscall0, syscall2, syscall3, syscall4, syscall5};
 
 const O_CLOEXEC: usize = 0x8_0000;
@@ -597,6 +599,9 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // session rather than leaving init with no controlling tty; the graphical
     // login is respawned the same way, with spacing and a ceiling. wait4(-1)
     // also reaps any orphan reparented to init, which is simply ignored.
+    // Fresh utmp, BOOT_TIME and RUN_LVL records (wtmp keeps the history).
+    utmpx::boot();
+    if daemon_wanted(3) { daemon_start(3); }
     write_str("Starting getty loop...\n");
     autorun();
     net_autorun();
@@ -637,6 +642,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
             usleep(250_000);
             continue;
         }
+        utmpx::logout_pid(pid);
         if pid == dm_logger {
             dm_logger = 0;
             continue;
@@ -941,13 +947,14 @@ unsafe fn start_bthid_early() {
 /// sshd backoff when they exit.
 #[derive(Clone, Copy)]
 struct Daemon { pid: i32, started: u64, quick: u32, respawn_at: u64 }
-const DAEMON_NAMES: [&str; 3] = ["btd", "bthid", "netctl watch"];
-static mut DAEMONS: [Daemon; 3] = [Daemon { pid: 0, started: 0, quick: 0, respawn_at: 0 }; 3];
+const DAEMON_NAMES: [&str; 4] = ["btd", "bthid", "netctl watch", "utmpd"];
+static mut DAEMONS: [Daemon; 4] = [Daemon { pid: 0, started: 0, quick: 0, respawn_at: 0 }; 4];
 
 unsafe fn daemon_wanted(k: usize) -> bool {
     match k {
         0 => exists(BTD_PATH) && exists(b"/dev/hci0\0") && !cmdline_has(b"bt=0"),
         1 => exists(BTHID_PATH) && !cmdline_has(b"bt=0") && !cmdline_has(b"bthid=0"),
+        3 => exists(b"/bin/utmpd\0"),
         _ => exists(b"/dev/netctl\0"),
     }
 }
@@ -956,6 +963,7 @@ unsafe fn daemon_start(k: usize) {
     let pid = match k {
         0 => spawn_daemon(BTD_PATH),
         1 => spawn_daemon(BTHID_PATH),
+        3 => spawn_daemon(b"/bin/utmpd\0"),
         _ => spawn_netctl_watch(),
     };
     DAEMONS[k].pid = if pid > 0 { pid } else { 0 };

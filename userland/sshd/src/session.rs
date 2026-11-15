@@ -347,6 +347,11 @@ impl Conn {
             pid,
             tty_name.as_deref().map(|t| format!(" on {t}")).unwrap_or_default()
         ));
+        // utmp/wtmp/lastlog for pty sessions (the session leader's exit ends it).
+        if let Some(t) = tty_name.as_deref() {
+            let line = t.strip_prefix("/dev/").unwrap_or(t);
+            crate::utmpx::login(pid, line.as_bytes(), user.name.as_bytes(), self.peer.ip().to_string().as_bytes(), uid as u32);
+        }
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Input>();
         let ch = self.chans.get_mut(&id).ok_or("no such channel")?;
@@ -381,6 +386,7 @@ impl Conn {
             let mut reader = tokio::spawn(async move { pump_fd(&rfd, &h, id).await });
             tokio::spawn(async move {
                 let status = child.wait().await;
+                crate::utmpx::logout_pid(pid);
                 drop(scope);
                 pid_slot.store(0, Ordering::Release);
                 // Drain what the shell wrote before it exited; a background
