@@ -62,7 +62,7 @@ pub struct Conn {
     /// Options of the authorized_keys line that authenticated this connection.
     key_opts: crate::accounts::KeyOpts,
     /// MaxStartups slot, held until the client authenticates or disconnects.
-    startup: Option<crate::StartupSlot>,
+    startup: Option<crate::ChildStartup>,
     chans: HashMap<ChannelId, Chan>,
     /// Active `-R` listeners, keyed by (requested address, port).
     fwds: HashMap<(String, u32), tokio::task::AbortHandle>,
@@ -74,7 +74,7 @@ pub async fn run_connection(
     stream: TcpStream,
     peer: SocketAddr,
     local: Option<SocketAddr>,
-    startup: crate::StartupSlot,
+    startup: crate::ChildStartup,
 ) {
     log(&format!("connection from {peer}"));
     let authed = Arc::new(AtomicBool::new(false));
@@ -835,6 +835,26 @@ impl russh::server::Handler for Conn {
                 Ok(Auth::Accept)
             }
             None => Ok(Auth::reject()),
+        }
+    }
+
+    async fn auth_publickey_signed(
+        &mut self,
+        user: &str,
+        key: &russh::PublicKeyOrCertificate,
+        signed_data: &[u8],
+        signature: &[u8],
+        session_id: &[u8],
+    ) -> Result<Auth, Self::Error> {
+        // Re-verify the raw signature against the session id the host-key
+        // signer recorded (the check a separate monitor will do, phase P3).
+        if !crate::userauth::verify_userauth(user, key, signed_data, signature, session_id, crate::userauth::recorded_session_id()) {
+            log(&format!("{}: publickey signature check failed for {user}", self.peer));
+            return Ok(Auth::reject());
+        }
+        match key {
+            russh::PublicKeyOrCertificate::PublicKey { key, .. } => self.auth_publickey(user, key).await,
+            russh::PublicKeyOrCertificate::Certificate(cert) => self.auth_openssh_certificate(user, cert).await,
         }
     }
 

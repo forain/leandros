@@ -66,12 +66,25 @@ authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shu
 ### sshd
 
 [userland/sshd](../../userland/sshd/src/main.rs) is the SSH server: russh 0.64 (ring
-crypto) on tokio, one root process for every connection.
+crypto) on tokio. The root listener only accepts: it re-execs `sshd -R` once per
+connection (socket on fd 3, startup pipe on fd 4), so a crash in one connection kills only
+that connection, never the listener or other sessions (and init's restart limit cannot trip).
+The per-connection process is still root and still runs all the russh code, but it already
+uses the two hooks of the vendored russh (`userland/sshd/vendor/russh`, see its
+`LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
+the session id, and every publickey/certificate login has its raw signature re-verified
+against that session id (`src/userauth.rs`) before the authorized_keys check. This is the
+groundwork for splitting the pre-auth code into an unprivileged child.
 
 - **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
   `/etc/ssh/sshd_not_to_be_run` exists or the kernel command line has `sshd=0`. It runs in
   its own session; init restarts it with a 1, 2, 4, 8, 16 s backoff and gives up after five
   exits within 60 s. It logs to `/var/log/sshd.log`.
+- **Per-connection process.** `ps` shows `sshd-preauth` until the client authenticates and
+  `sshd-net` after. The listener enforces `MaxStartups` (a connection counts until its
+  process writes to the startup pipe or exits) and kills a process still unauthenticated 2 s
+  after `LoginGraceTime`, even if it is hung. Children do not inherit the listener's fds
+  (fds 3/4 are close-on-exec in the child so shells do not get them).
 - **Listening.** `0.0.0.0:22`. It also tries `[::]:22`, which fails with `EAFNOSUPPORT`
   because there is no IPv6 yet; it logs that and goes on.
 - **Host key.** An ed25519 key is generated on first boot into

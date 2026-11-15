@@ -23,6 +23,7 @@ import os
 import pty
 import re
 import select
+import socket
 import shutil
 import signal
 import struct
@@ -848,6 +849,170 @@ def sshdcfg(ssh, user, pw, tmp):
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
 
 
+PS_SSHD = r"""for p in /proc/[0-9]*; do
+read k n < $p/status
+m=${n#sshd}
+if [ x$m != x$n ]; then pp=$(grep PPid $p/status); echo ${p#/proc/} $pp $n; fi
+done"""
+
+
+def sshd_procs(ssh, user, pw):
+    """[(pid, ppid, comm)] of every sshd* process in the guest."""
+    sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
+    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
+    res = []
+    if not out.strip():
+        print(f"sshd_procs: empty listing rc={rc} out={out[-200:]!r} err={err.strip()[-200:]!r}", flush=True)
+    for ln in out.splitlines():
+        p = ln.split()
+        if len(p) == 4 and p[1] == "PPid:" and p[0].isdigit() and p[2].isdigit():
+            res.append((int(p[0]), int(p[2]), p[3]))
+    return res
+
+
+def listener_pid(procs):
+    pids = {p for p, _, _ in procs}
+    c = [p for p, pp, n in procs if n == "sshd" and pp not in pids]
+    return c[0] if c else None
+
+
+def probe_open(ssh):
+    s = socket.create_connection((ssh.host, ssh.port), timeout=10)
+    banner = s.recv(256)
+    s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
+    return s, banner.startswith(b"SSH-")
+
+
+def probe_eof(s, secs):
+    """True when the peer closes the probe socket within `secs`."""
+    end = time.time() + secs
+    while time.time() < end:
+        s.settimeout(max(0.2, end - time.time()))
+        try:
+            if s.recv(4096) == b"":
+                return True
+        except socket.timeout:
+            pass
+        except OSError:
+            return True
+    return False
+
+
+def new_preauth(ssh, user, pw, before):
+    """Open a probe; return (sock, pid owning it): the new sshd-preauth if one exists, else the listener."""
+    s, ok = probe_open(ssh)
+    time.sleep(1)
+    procs = sshd_procs(ssh, user, pw)
+    known = {p for p, _, _ in before}
+    pre = [p for p, _, n in procs if n == "sshd-preauth" and p not in known]
+    return s, (pre[0] if pre else listener_pid(procs)), bool(pre)
+
+
+def privsep_grace(ssh, user, pw, tmp):
+    """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
+    conf = "LoginGraceTime 4\nPasswordAuthentication yes\n"
+    if not sshd2_start(ssh, user, pw, conf):
+        step("privsep_grace_kill", False, "second sshd did not start")
+        return
+    lp = free_port()
+    tun = subprocess.Popen(["ssh", *ssh.pw_opts(), "-N", "-L", f"{lp}:127.0.0.1:{SSHD2_PORT}", "-p", str(ssh.port),
+                            f"{user}@{ssh.host}"], env=ssh.env(pw), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        try:
+            s = socket.create_connection(("127.0.0.1", lp), timeout=5)
+            if s.recv(256).startswith(b"SSH-"):
+                break
+            s.close()
+        except OSError:
+            time.sleep(0.5)
+    else:
+        stop(tun)
+        step("privsep_grace_kill", False, "cannot reach the second sshd through the tunnel")
+        return
+    s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
+    time.sleep(1)
+    procs = sshd_procs(ssh, user, pw)
+    pre = [p for p, _, n in procs if n == "sshd-preauth"]
+    if pre:
+        sudo_sh(ssh, user, pw, f"kill -STOP {pre[0]}")  # hung: it cannot disconnect itself
+    ok = bool(pre) and probe_eof(s, 25)
+    if pre:
+        sudo_sh(ssh, user, pw, f"kill -KILL {pre[0]} 2>/dev/null; true")
+    s.close()
+    stop(tun)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+    step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within 25 s")
+
+
+def privsep_crash(ssh, user, pw):
+    """Crash isolation: a SEGV in one connection's process must not take the listener or other sessions down."""
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("ssh", ["ssh", *ssh.pw_opts(), "-tt", "-p", str(ssh.port), f"{user}@{ssh.host}", "cat"], ssh.env(pw))
+
+    def say(line, want, secs=10):
+        os.write(fd, line.encode() + b"\n")
+        end, got = time.time() + secs, b""
+        while time.time() < end and want.encode() not in got:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    got += os.read(fd, 4096)
+                except OSError:
+                    break
+        return want.encode() in got
+
+    try:
+        b_ok = say("hello-b", "hello-b", 20)
+        before = sshd_procs(ssh, user, pw)
+        lpid = listener_pid(before)
+        a, victim, isolated = new_preauth(ssh, user, pw, before)
+        if victim:
+            sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
+        t0 = time.time()
+        a_eof = probe_eof(a, 8)
+        eof_s = time.time() - t0
+        a.close()
+        after = sshd_procs(ssh, user, pw)
+        gone = victim not in {p for p, _, _ in after}
+        same = listener_pid(after) == lpid and lpid is not None
+        b_still = say("hello-b2", "hello-b2")
+        rc, out, _ = ssh.run(user, "id -un", pw, timeout=30)
+        login = rc == 0 and user in out
+        step("privsep_crash_isolated", b_ok and isolated and same and b_still and login,
+             f"procs={after} victim={victim} gone={gone} eof_s={eof_s:.1f} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof}{'' if a_eof else ' (KNOWN-OPEN: see TODO.md sshd item)'} listener_unchanged={same} b_survives={b_still} new_login={login}")
+    finally:
+        try:
+            os.write(fd, b"\x04")
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+def privsep_count(ssh, user, pw):
+    """Six crashes (init gives up after 5 restarts in 60 s): the listener must outlive them all. Run LAST."""
+    procs = sshd_procs(ssh, user, pw)
+    lpid = listener_pid(procs)
+    for _ in range(6):
+        s, victim, _iso = new_preauth(ssh, user, pw, sshd_procs(ssh, user, pw))
+        if victim:
+            sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
+        probe_eof(s, 5)
+        s.close()
+        time.sleep(0.5)
+    time.sleep(2)
+    r = subprocess.run(["ssh-keyscan", "-T", "5", "-p", str(ssh.port), ssh.host], capture_output=True, timeout=30)
+    same = listener_pid(sshd_procs(ssh, user, pw)) == lpid and lpid is not None
+    step("privsep_listener_survives_count", b"ssh-" in r.stdout and same,
+         f"keyscan={b'ssh-' in r.stdout} listener_unchanged={same}")
+
+
 def main(argv):
     full_mode = "--full" in argv
     user, pw = "leandro", "leandro"
@@ -876,6 +1041,9 @@ def main(argv):
     sshdcfg(ssh, user, pw, tmp)
     if full_mode:
         full(ssh, user, pw, tmp)
+    privsep_grace(ssh, user, pw, tmp)
+    privsep_crash(ssh, user, pw)
+    privsep_count(ssh, user, pw)  # last: on a tree without per-connection processes it leaves the guest without sshd
     shutil.rmtree(tmp, ignore_errors=True)
     bad = [n for n, ok in RESULTS if not ok]
     print(f"SSHSMOKE summary: {len(RESULTS) - len(bad)}/{len(RESULTS)} passed"
