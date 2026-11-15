@@ -78,15 +78,16 @@ crypto) on tokio, one root process for every connection.
 - **Configuration.** `/etc/ssh/sshd_config` uses an OpenSSH keyword subset: `Port`,
   `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
   `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
-  `LoginGraceTime`, `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
+  `LoginGraceTime`, `PermitUserEnvironment` (default `no`), `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
 - **Authentication.** Passwords are checked against `/etc/shadow` in the system's
-  sha512-crypt `$6$` format (legacy `$sha256$` fields still verify), as `/bin/login` checks them. Public keys come from
+  sha512-crypt `$6$` format (legacy `$sha256$` fields still verify and are rewritten to `$6$rounds=65536` on the next successful login, atomically via `/etc/shadow.sshd-new` + rename), as `/bin/login` checks them. `keyboard-interactive` is offered with one hidden `Password:` prompt and the same checks as `password` (sshd implements the conversation itself; it does not load `pam-leandros`). Public keys come from
   `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks. Key options `from=` (globs, `!`
   negation, CIDR), `command=` (forced command; the client's command goes to
-  `SSH_ORIGINAL_COMMAND`; sftp is refused), `no-pty`, `no-port-forwarding`, `restrict` are
+  `SSH_ORIGINAL_COMMAND`; sftp is refused), `no-pty`, `no-port-forwarding`, `restrict`, `permitopen="host:port"`, `permitlisten="[host:]port"`, `expiry-time="YYYYMMDD[HHMM[SS]][Z]"` (UTC) and `environment="N=v"` (only with `PermitUserEnvironment yes`) are
   enforced; a line with any other option is skipped, never half-applied. root may log in with a key but not with a password
   (`PermitRootLogin prohibit-password`). Empty passwords, locked (`!`) accounts and
   `false`/`nologin` shells are refused.
+- **TCP forwarding.** `ssh -L` (direct-tcpip) connects from the server; `ssh -R` (tcpip-forward, port 0 allocates) listens on the server's loopback only (GatewayPorts no) and opens forwarded-tcpip channels back. `no-port-forwarding`/`restrict` refuse both; `permitopen`/`permitlisten` limit them to the listed destinations. Streamlocal (unix sockets) and `-D` dynamic forwarding clients work only as far as they use direct-tcpip.
 - **Sessions.** Each session is a child process. Between fork and exec the child calls
   `setsid`, then (with a pty) `TIOCSCTTY`, then `setgroups`, `setresgid` and `setresuid`.
   It reads the ids back and checks that `setuid(0)` fails before it execs.
