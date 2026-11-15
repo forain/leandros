@@ -898,7 +898,7 @@ static void l2_l3_cases(void)
 static void run_on(const char *dir, const char *tag)
 {
     char saved[64]; snprintf(saved, sizeof saved, "%s", base);
-    snprintf(base, sizeof base, "%s/inot-%d", dir, getpid());
+    snprintf(base, sizeof base, "%s/inot2-%d", dir, getpid());
     mkdir(base, 0755); mkd("x"); mkd("y");
     tg = tag;
     l2_l3_cases();
