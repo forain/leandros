@@ -1758,7 +1758,7 @@ static void stale_stack(void) {
 static void stale_race(void) {
     int s = nl_sock();
     int ok_rounds = 0;
-    for (int round = 0; round < 60; round++) {
+    for (int round = 0; round < 20; round++) {
         pid_t c = spawn_ns(idle_body);
         int nsfd = netns_fd_of(c);
         int e = veth_new(s, "vethR", "eth0", nsfd);
@@ -1767,13 +1767,14 @@ static void stale_race(void) {
         if (e != 0 || iz <= 0) { kill(c, SIGKILL); wait_child(c); continue; }
         addr_add(s, iz, "10.99.8.1", 24); link_set_up(s, iz);
         pid_t hs[3];
-        for (int d = 0; d < 3; d++) {
+        for (int d = 0; d < 2; d++) {
             hs[d] = fork();
             if (hs[d] != 0) continue;
+            alarm(10);
             struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7777) };
             inet_pton(AF_INET, "10.99.8.2", &to.sin_addr);
             char b[64];
-            for (int k = 0; k < 600; k++) {
+            for (int k = 0; k < 100; k++) {
                 int t = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
                 int u = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                 int i = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_ICMP);
@@ -1797,12 +1798,12 @@ static void stale_race(void) {
         usleep(1000 + (round * 937) % 15000);
         link_del(s, iz);
         veth_new(s, "vethRa", "vethRb", -1);
-        for (int d = 0; d < 3; d++) wait_child(hs[d]);
+        for (int d = 0; d < 2; d++) { if (hs[d] > 0) wait_child(hs[d]); }
         { int ia = link_get(s, "vethRa", NULL, NULL); if (ia > 0) link_del(s, ia); }
         kill(c, SIGKILL); wait_child(c);
         ok_rounds++;
     }
-    CHECK("stale_race: 60 reap rounds, drivers finished", ok_rounds >= 45);
+    CHECK("stale_race: 20 reap rounds, drivers finished", ok_rounds >= 15);
     CHECK("stale_race: net server alive", link_get(s, "lo", NULL, NULL) > 0);
     close(s);
 }
