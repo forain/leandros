@@ -67,6 +67,91 @@ pub struct Config {
     /// `start` new ones are dropped with probability `rate`% rising linearly
     /// to 100% at `full`.
     pub max_startups: (usize, usize, usize),
+    /// `AllowTcpForwarding yes|all|no|local|remote` (combined with the per-key `no-port-forwarding`).
+    pub allow_tcp_forwarding: TcpFwd,
+    /// `ForceCommand cmd` (`none` = unset); `internal-sftp` forces the sftp subsystem.
+    pub force_command: Option<String>,
+    /// `TrustedUserCAKeys file`: CA public keys whose user certificates are accepted.
+    pub trusted_user_ca_keys: Option<String>,
+    /// `Match` blocks, in file order; applied per connection once the user is known.
+    pub matches: Vec<MatchBlock>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpFwd { All, Local, Remote, No }
+
+/// One `Match` block: every criterion must match; `lines` are the keywords it sets.
+#[derive(Clone, Debug, Default)]
+pub struct MatchBlock {
+    pub all: bool,
+    /// (criterion, pattern list), criterion lowercase: user, group, address, localport.
+    pub crit: Vec<(String, String)>,
+    pub lines: Vec<(String, String)>,
+}
+
+/// Keywords a Match block may set.
+const MATCH_KEYWORDS: &[&str] = &[
+    "passwordauthentication", "pubkeyauthentication", "permitrootlogin", "allowtcpforwarding",
+    "forcecommand", "permituserenvironment", "authorizedkeysfile", "devpasswordauthentication",
+];
+
+/// OpenSSH pattern list: comma-separated `*`/`?` globs; a matching `!pattern`
+/// vetoes the whole list, otherwise one positive match is needed.
+pub fn pattern_list_match(list: &str, s: &str) -> bool {
+    let mut hit = false;
+    for p in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match p.strip_prefix('!') {
+            Some(n) => {
+                if accounts::glob(n, s) {
+                    return false;
+                }
+            }
+            None => hit |= accounts::glob(p, s),
+        }
+    }
+    hit
+}
+
+impl Config {
+    /// The configuration for one connection: this config plus the Match blocks
+    /// that match. Within the matching blocks the first value of a keyword wins.
+    pub fn effective(&self, user: &str, groups: &[String], peer: SocketAddr, local: Option<SocketAddr>) -> Config {
+        let mut eff = self.clone();
+        eff.matches.clear();
+        let mut seen = std::collections::HashSet::new();
+        for b in &self.matches {
+            let ok = b.all
+                || b.crit.iter().all(|(c, v)| match c.as_str() {
+                    "user" => pattern_list_match(v, user),
+                    "group" => groups.iter().any(|g| pattern_list_match(v, g)),
+                    "address" => accounts::from_matches(v, peer.ip()),
+                    "localport" => local.map_or(false, |l| pattern_list_match(v, &l.port().to_string())),
+                    _ => false,
+                });
+            if !ok {
+                continue;
+            }
+            for (k, v) in &b.lines {
+                if seen.insert(k.clone()) {
+                    let _ = apply_kw(&mut eff, k, v);
+                }
+            }
+        }
+        eff
+    }
+
+    /// Could any Match block (or the global section) turn this on? Decides
+    /// which authentication methods the server advertises.
+    pub fn any(&self, f: impl Fn(&Config) -> bool) -> bool {
+        f(self)
+            || self.matches.iter().any(|b| {
+                let mut c = self.clone();
+                for (k, v) in &b.lines {
+                    let _ = apply_kw(&mut c, k, v);
+                }
+                f(&c)
+            })
+    }
 }
 
 impl Default for Config {
@@ -85,6 +170,10 @@ impl Default for Config {
             permit_user_environment: false,
             login_grace_secs: 120,
             max_startups: (10, 30, 100),
+            allow_tcp_forwarding: TcpFwd::All,
+            force_command: None,
+            trusted_user_ca_keys: None,
+            matches: Vec::new(),
         }
     }
 }
@@ -97,9 +186,105 @@ fn yes_no(v: &str, key: &str) -> Result<bool, String> {
     }
 }
 
+fn apply_kw(cfg: &mut Config, key: &str, val: &str) -> Result<bool, String> {
+    let err = |m: String| m;
+    match key {
+        "port" => cfg.port = val.parse().map_err(|_| err(format!("bad Port {val}")))?,
+        "listenaddress" => cfg.listen.push(val.to_string()),
+        "hostkey" => cfg.host_key = val.to_string(),
+        "permitrootlogin" => {
+            cfg.permit_root_login = match val {
+                "yes" => RootLogin::Yes,
+                "no" => RootLogin::No,
+                "prohibit-password" | "without-password" => RootLogin::ProhibitPassword,
+                _ => return Err(err(format!("bad PermitRootLogin {val}"))),
+            }
+        }
+        "passwordauthentication" => cfg.password_auth = yes_no(val, &key).map_err(err)?,
+        "devpasswordauthentication" => {
+            cfg.dev_password_auth = match val.to_ascii_lowercase().as_str() {
+                "no" => DevPasswords::No,
+                "local" => DevPasswords::Local,
+                "yes" => DevPasswords::Yes,
+                _ => return Err(err(format!("bad DevPasswordAuthentication {val:?}"))),
+            }
+        }
+        "pubkeyauthentication" => cfg.pubkey_auth = yes_no(val, &key).map_err(err)?,
+        "authorizedkeysfile" => {
+            cfg.authorized_keys_file = val.split_whitespace().next().unwrap_or("").to_string()
+        }
+        "subsystem" => {
+            let mut p = val.split_whitespace();
+            match (p.next(), p.next()) {
+                (Some("sftp"), Some(path)) => cfg.sftp_server = Some(path.to_string()),
+                _ => return Err(err(format!("unsupported Subsystem {val}"))),
+            }
+        }
+        "permituserenvironment" => cfg.permit_user_environment = yes_no(val, "PermitUserEnvironment")?,
+        "maxauthtries" => {
+            cfg.max_auth_tries = val.parse().map_err(|_| err(format!("bad MaxAuthTries {val}")))?
+        }
+        "logingracetime" => {
+            cfg.login_grace_secs =
+                val.trim_end_matches('s').parse().map_err(|_| err(format!("bad LoginGraceTime {val}")))?
+        }
+        "maxstartups" => {
+            let n: Vec<usize> = val.split(':').filter_map(|p| p.parse().ok()).collect();
+            cfg.max_startups = match n[..] {
+                [full] if !val.contains(':') => (full, 100, full),
+                [s, r, f] if s <= f && r <= 100 => (s, r, f),
+                _ => return Err(err(format!("bad MaxStartups {val}"))),
+            }
+        }
+        "permitemptypasswords" => {
+            if yes_no(val, &key).map_err(err)? {
+                return Err(err("PermitEmptyPasswords yes is not supported".into()));
+            }
+        }
+        "allowtcpforwarding" => {
+            cfg.allow_tcp_forwarding = match val.to_ascii_lowercase().as_str() {
+                "yes" | "all" => TcpFwd::All,
+                "no" => TcpFwd::No,
+                "local" => TcpFwd::Local,
+                "remote" => TcpFwd::Remote,
+                _ => return Err(err(format!("bad AllowTcpForwarding {val}"))),
+            }
+        }
+        "forcecommand" => {
+            cfg.force_command = if val.is_empty() { return Err(err("ForceCommand needs a command".into())) }
+                else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
+        "trustedusercakeys" => {
+            cfg.trusted_user_ca_keys = if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_match(val: &str) -> Result<MatchBlock, String> {
+    let t: Vec<&str> = val.split_whitespace().collect();
+    if t.len() == 1 && t[0].eq_ignore_ascii_case("all") {
+        return Ok(MatchBlock { all: true, ..Default::default() });
+    }
+    if t.is_empty() || t.len() % 2 != 0 {
+        return Err(format!("bad Match {val:?}"));
+    }
+    let mut b = MatchBlock::default();
+    for p in t.chunks(2) {
+        let c = p[0].to_ascii_lowercase();
+        if !matches!(c.as_str(), "user" | "group" | "address" | "localport") {
+            return Err(format!("unsupported Match criterion {}", p[0]));
+        }
+        b.crit.push((c, p[1].to_string()));
+    }
+    Ok(b)
+}
+
 /// The OpenSSH sshd_config subset this server understands. Keywords are
 /// case-insensitive; unknown keywords are reported and ignored.
 fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
+    let mut cur: Option<MatchBlock> = None;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -109,61 +294,28 @@ fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
         let key = it.next().unwrap_or("").to_ascii_lowercase();
         let val = it.next().unwrap_or("").trim();
         let err = |m: String| format!("line {}: {m}", n + 1);
-        match key.as_str() {
-            "port" => cfg.port = val.parse().map_err(|_| err(format!("bad Port {val}")))?,
-            "listenaddress" => cfg.listen.push(val.to_string()),
-            "hostkey" => cfg.host_key = val.to_string(),
-            "permitrootlogin" => {
-                cfg.permit_root_login = match val {
-                    "yes" => RootLogin::Yes,
-                    "no" => RootLogin::No,
-                    "prohibit-password" | "without-password" => RootLogin::ProhibitPassword,
-                    _ => return Err(err(format!("bad PermitRootLogin {val}"))),
-                }
+        if key == "match" {
+            if let Some(b) = cur.take() {
+                cfg.matches.push(b);
             }
-            "passwordauthentication" => cfg.password_auth = yes_no(val, &key).map_err(err)?,
-            "devpasswordauthentication" => {
-                cfg.dev_password_auth = match val.to_ascii_lowercase().as_str() {
-                    "no" => DevPasswords::No,
-                    "local" => DevPasswords::Local,
-                    "yes" => DevPasswords::Yes,
-                    _ => return Err(err(format!("bad DevPasswordAuthentication {val:?}"))),
-                }
-            }
-            "pubkeyauthentication" => cfg.pubkey_auth = yes_no(val, &key).map_err(err)?,
-            "authorizedkeysfile" => {
-                cfg.authorized_keys_file = val.split_whitespace().next().unwrap_or("").to_string()
-            }
-            "subsystem" => {
-                let mut p = val.split_whitespace();
-                match (p.next(), p.next()) {
-                    (Some("sftp"), Some(path)) => cfg.sftp_server = Some(path.to_string()),
-                    _ => return Err(err(format!("unsupported Subsystem {val}"))),
-                }
-            }
-            "permituserenvironment" => cfg.permit_user_environment = yes_no(val, "PermitUserEnvironment")?,
-            "maxauthtries" => {
-                cfg.max_auth_tries = val.parse().map_err(|_| err(format!("bad MaxAuthTries {val}")))?
-            }
-            "logingracetime" => {
-                cfg.login_grace_secs =
-                    val.trim_end_matches('s').parse().map_err(|_| err(format!("bad LoginGraceTime {val}")))?
-            }
-            "maxstartups" => {
-                let n: Vec<usize> = val.split(':').filter_map(|p| p.parse().ok()).collect();
-                cfg.max_startups = match n[..] {
-                    [full] if !val.contains(':') => (full, 100, full),
-                    [s, r, f] if s <= f && r <= 100 => (s, r, f),
-                    _ => return Err(err(format!("bad MaxStartups {val}"))),
-                }
-            }
-            "permitemptypasswords" => {
-                if yes_no(val, &key).map_err(err)? {
-                    return Err(err("PermitEmptyPasswords yes is not supported".into()));
-                }
-            }
-            _ => log(&format!("config line {}: ignoring unsupported keyword {key}", n + 1)),
+            cur = Some(parse_match(val).map_err(err)?);
+            continue;
         }
+        if let Some(b) = cur.as_mut() {
+            if MATCH_KEYWORDS.contains(&key.as_str()) {
+                apply_kw(&mut cfg.clone(), &key, val).map_err(err)?;
+                b.lines.push((key, val.to_string()));
+            } else {
+                log(&format!("config line {}: ignoring {key} inside Match (not a Match keyword here)", n + 1));
+            }
+            continue;
+        }
+        if !apply_kw(cfg, &key, val).map_err(err)? {
+            log(&format!("config line {}: ignoring unsupported keyword {key}", n + 1));
+        }
+    }
+    if let Some(b) = cur.take() {
+        cfg.matches.push(b);
     }
     Ok(())
 }
@@ -364,10 +516,10 @@ fn main() {
 
 async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
     let mut methods = russh::MethodSet::empty();
-    if cfg.pubkey_auth {
+    if cfg.any(|c| c.pubkey_auth) {
         methods.push(MethodKind::PublicKey);
     }
-    if cfg.password_auth {
+    if cfg.any(|c| c.password_auth) {
         methods.push(MethodKind::Password);
         methods.push(MethodKind::KeyboardInteractive);
     }

@@ -63,6 +63,21 @@ pub fn groups_of(user: &User) -> Vec<u32> {
     out
 }
 
+/// Names of the groups `groups_of` lists, for Match Group.
+pub fn group_names(user: &User) -> Vec<String> {
+    let gids = groups_of(user);
+    let mut out = Vec::new();
+    if let Ok(text) = fs::read_to_string("/etc/group") {
+        for line in text.lines() {
+            let f: Vec<&str> = line.splitn(4, ':').collect();
+            if f.len() >= 3 && f[2].parse::<u32>().map_or(false, |g| gids.contains(&g)) {
+                out.push(f[0].to_string());
+            }
+        }
+    }
+    out
+}
+
 /// A login shell that refuses logins (`/bin/false`, `nologin`) or does not exist.
 pub fn shell_usable(user: &User) -> bool {
     let base = Path::new(&user.shell).file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -147,6 +162,10 @@ pub struct KeyOpts {
     pub environment: Vec<(String, String)>,
     /// `expiry-time="YYYYMMDD[HHMM[SS]][Z]"` as a unix time; the key is refused from then on.
     pub expiry: Option<u64>,
+    /// `cert-authority`: the line's key is a user CA, not a login key.
+    pub cert_authority: bool,
+    /// `principals="a,b"` on a cert-authority line: certificate principals accepted instead of the user name.
+    pub principals: Option<String>,
 }
 
 /// `YYYYMMDD`, `YYYYMMDDHHMM` or `YYYYMMDDHHMMSS`, optional `Z`, as unix seconds.
@@ -237,7 +256,7 @@ pub fn forward_permitted(list: &Option<Vec<String>>, host: &str, port: u32) -> b
     })
 }
 
-fn glob(pat: &str, s: &str) -> bool {
+pub fn glob(pat: &str, s: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
     fn rec(p: &[char], t: &[char]) -> bool {
         match p.first() {
@@ -348,6 +367,8 @@ fn parse_options(opts: &str) -> Result<KeyOpts, String> {
         match (k.as_str(), v) {
             ("from", Some(v)) => out.from = Some(unq(v)),
             ("command", Some(v)) => out.command = Some(unq(v)),
+            ("cert-authority", None) => out.cert_authority = true,
+            ("principals", Some(v)) => out.principals = Some(unq(v)),
             ("no-pty", None) => out.no_pty = true,
             ("no-port-forwarding", None) => out.no_port_forwarding = true,
             ("restrict", None) => {
@@ -415,9 +436,40 @@ pub fn key_authorized(user: &User, file: &str, key: &PublicKey) -> Result<Option
             continue;
         }
         match parse_options(opts) {
+            Ok(o) if o.cert_authority => continue,
             Ok(o) => return Ok(Some(o)),
             Err(why) => crate::log(&format!("authorized_keys of {}: line skipped: {why}", user.name)),
         }
     }
     Ok(None)
+}
+
+/// The `cert-authority` lines of the user's authorized_keys: (CA key, line options).
+pub fn cert_authorities(user: &User, file: &str) -> Vec<(PublicKey, KeyOpts)> {
+    let path = authorized_keys_path(user, file);
+    let Ok(text) = fs::read_to_string(&path) else { return Vec::new() };
+    if strict_ok(&path, user).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (opts, rest) = split_options(line);
+        let Ok(ca) = PublicKey::from_openssh(rest) else { continue };
+        match parse_options(opts) {
+            Ok(o) if o.cert_authority => out.push((ca, o)),
+            Ok(_) => {}
+            Err(why) => crate::log(&format!("authorized_keys of {}: line skipped: {why}", user.name)),
+        }
+    }
+    out
+}
+
+/// CA keys of a `TrustedUserCAKeys` file (one OpenSSH public key per line).
+pub fn trusted_cas(file: &str) -> Vec<PublicKey> {
+    let Ok(text) = fs::read_to_string(file) else { return Vec::new() };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| PublicKey::from_openssh(l).ok())
+        .collect()
 }
