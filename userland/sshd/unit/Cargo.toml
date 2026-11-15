@@ -9,4 +9,5 @@ description = "Host-side unit tests for sshd modules that do not need Linux (use
 [dependencies]
 russh = { path = "../vendor/russh", default-features = false, features = ["ring", "flate2", "rsa"] }
 signature = "3"
+libc = "0.2"
 ssh-encoding = "0.3"

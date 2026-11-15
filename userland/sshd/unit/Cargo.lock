@@ -1519,6 +1519,7 @@ dependencies = [
 name = "sshd-unit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "russh",
  "signature",
  "ssh-encoding",
