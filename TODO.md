@@ -8,8 +8,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Kernel / VFS
 - **ns-0 mount ref race**: a mount detached in the window between open() resolving the path and the open file taking its mount reference is not recorded (lane mntref); that fd falls back to path lookup for flags.
-- **New writers of signal state must call `sig_kick`**; a miss shows as `miss` > 0 in `/proc/rqhold` (invariant, no known violation).
-- **Flakes to root-cause**: `syscalltest` pidfd_wake_conmon (twice: aarch64 box 2026-11-14 lane lapwifi, x86_64 box 2026-11-15 lane pamrs; passed alone on rerun both times); `sigtest` timed_wait_stop_resumes_remainder (not captured; waitpid(WUNTRACED) 1 s lateness fixed 2026-11-11, re-watch).
+- **Flakes to root-cause**: `syscalltest` pidfd_wake_conmon (twice in a full box regress: aarch64 2026-11-14, x86_64 2026-11-15; passes alone; NOT reproduced by `syscalltest --pidfd-wake-loop <runs> <hogs>`: 15x4x10 aarch64 TCG + 40x4x10 x86_64 KVM with 6 CPU hogs, all clean; so it needs full-regress context; next failure prints a "| recheck ..." DETAIL (revents/waitid after the failure) to tell a transient race from a wrong state). (`sigtest` timed_wait_stop_resumes_remainder: not reproduced in ~160 `stoprem` iterations on both arches 2026-11-14; a recurrence now prints a failure-only DETAIL timing line.)
 - **F2FS fsync log is private-format, not Linux's**: fsync of a regular file is already durable without a checkpoint (roll-forward records in the checkpoint pack, lanes f2fsync/f2fsrf; fsync p50 4.7 ms -> 0.3 ms) and the mount rolls Linux-written fsync chains forward, but Linux itself cannot recover a file fsynced by this server after a crash (it ignores the LRF1 records). Needs a warm/hot node-log write side with FSYNC/DENT marks (curseg-sequential node allocation + SSA/summary updates). See artifacts/notes/lane-f2fsfsync-2026-11-11.md.
 
 ### Podman / namespaces / cgroups
