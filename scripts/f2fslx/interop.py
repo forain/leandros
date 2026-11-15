@@ -689,7 +689,7 @@ def e_scenario(tmp, sc):
     xv = re.search(r"XV ([0-9a-f]{32})", out2)
     shutil.copyfile(img, snap)
     fl = cp_flags(snap)
-    cd = subprocess.run([sys.executable, os.path.join(HERE, "chaindump.py"), snap, "--quiet"], capture_output=True, text=True)
+    cd = subprocess.run([sys.executable, os.path.join(HERE, "chaindump.py"), snap, "--quiet"] + (["--strict"] if ECMD else []), capture_output=True, text=True)
     m = [int(x.split("=")[1]) for x in cd.stdout.split() if x.startswith("marked=")]
     marked = m[0] if m else -1
     step(v, "E.chain", not fl & 1 and marked >= minmark and (marked >= 1 or minmark == 0) and cd.returncode == 0,
@@ -698,12 +698,13 @@ def e_scenario(tmp, sc):
     mf = os.path.join(tmp, f"e-{name}.md5")
     open(mf, "w").write("\n".join(exp) + "\n")
     xchk = f"; echo XVL $(getfattr --only-values -n user.big {{m}}/t/k 2>/dev/null | md5sum | cut -c1-32)" if sc.get("xv") else ""
+    xsh = (xchk.replace('{m}', 'm').lstrip('; ') + "; ") if xchk else ""
     try:
         box(f"mkdir -p {rd}")
         if not push(snap, f"{rd}/c.img") or not push(mf, f"{rd}/MANIFEST"):
             step(v, "E.ship", False, "push failed"); return
         # P-b: the checkpoint alone (norecovery) must lack what only the chain holds.
-        rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img ro.img; if sudo mount -o loop,ro,norecovery ro.img m; then (cd m/t && md5sum -c ../../MANIFEST >/tmp/cp.$$ 2>&1; echo CPONLY_RC=$?); {xchk.replace('{m}', 'm').lstrip('; ')}; sudo umount m; else echo CPONLY_MNTFAIL; fi""")
+        rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img ro.img; if sudo mount -o loop,ro,norecovery ro.img m; then (cd m/t && md5sum -c ../../MANIFEST >/tmp/cp.$$ 2>&1; echo CPONLY_RC=$?); {xsh}sudo umount m; else echo CPONLY_MNTFAIL; fi""")
         if sc["cponly"]:
             miss = "CPONLY_RC=" in out and "CPONLY_RC=0" not in out
             if sc.get("xv") and xv:
@@ -715,7 +716,7 @@ def e_scenario(tmp, sc):
         step(v, "E.fsck0", "FSCK_RC=0" in out and nrec >= max(1, minmark) * (minmark > 0), f"fsck rc0, {nrec} node records (want >= {minmark})")
         # P-c / P-d: Linux rw mount replays the chain (marker in dmesg), then content + fsck
         rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img l.img; echo LXMARK_{os.getpid()} | sudo tee /dev/kmsg >/dev/null
-if sudo mount -o loop l.img m; then (cd m/t && md5sum -c ../../MANIFEST 2>&1 | grep -c FAILED; ); {xchk.replace('{m}', 'm').lstrip('; ')}; sudo dmesg | sed -n '/LXMARK_{os.getpid()}/,$p' > dm.txt; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+if sudo mount -o loop l.img m; then (cd m/t && md5sum -c ../../MANIFEST 2>&1 | grep -c FAILED; ); {xsh}sudo dmesg | sed -n '/LXMARK_{os.getpid()}/,$p' > dm.txt; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
 timeout 180 fsck.f2fs --dry-run l.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?; grep -E 'recover_(inode|data)' dm.txt | head -40""")
         ok = "LX_UMOUNT_OK" in out and out.strip().splitlines()[0].strip() == "0" and "FSCK2_RC=0" in out
         if ok and sc.get("xv") and xv:
@@ -727,10 +728,10 @@ timeout 180 fsck.f2fs --dry-run l.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?;
             for f, kind in sc["pc"].items():
                 h = "%x" % ino_of.get(f, -1)
                 if not re.search(rf"recover_inode: ino = {h}\b", out): bad.append(f"{f}: no recover_inode")
-                if kind == "data" and not re.search(rf"recover_data: ino = {h} .*recovered = [1-9]", out): bad.append(f"{f}: no recover_data")
+                if kind == "data" and not re.search(rf"recover_data: ino = {h}\b.*recovered = [1-9]", out): bad.append(f"{f}: no recover_data")
             for f in sc.get("absent", []):
                 if re.search(rf"recover_(inode|data): ino = {'%x' % ino_of.get(f, -1)}\b", out): bad.append(f"{f}: replayed")
-            step(v, "E.replay", not bad, "dmesg shows the chain replayed per file" if not bad else "; ".join(bad))
+            step(v, "E.replay", not bad, "dmesg shows the chain replayed per file" if not bad else "; ".join(bad) + " | " + " / ".join(l for l in out.splitlines() if "recover_" in l)[-160:])
         back = os.path.join(tmp, f"e-{name}.back")
         if ok and fetch(f"{rd}/l.img", back):
             ok2 = e_guest_check(back, exp, "E3")
