@@ -13,6 +13,7 @@
 #
 # Usage: build.sh [aarch64|x86_64|both]   (default: both)
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
@@ -40,7 +41,7 @@ for arch in "${ARCHES[@]}"; do
     exit 1
   fi
   for a in "${APPLETS[@]}"; do
-    install -m 0755 "$SRC/target/$arch-unknown-linux-musl/release/$a" "$M6/out/$a-$arch"
+    stage_file 0755 "$SRC/target/$arch-unknown-linux-musl/release/$a" "$M6/out/$a-$arch"
     echo "staged $arch: $M6/out/$a-$arch"
   done
 done
