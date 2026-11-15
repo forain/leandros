@@ -947,6 +947,13 @@ static void *pw_watcher(void *arg) {
             int running = wr == 0 && si.si_pid == 0;
             if (n < 0 || pf.revents != POLLIN || alive || running || dt < 480) {
                 snprintf(pw_msg[idx], sizeof pw_msg[idx], "iter %d n=%d errno=%d revents=%#x dt=%lld proc_state=%c waitid=%d si_pid=%d", it, n, errno, pf.revents, dt, st, wr, (int)si.si_pid);
+                /* Failure-only DETAIL: is the early readiness transient? */
+                struct pollfd p2 = { fd, POLLIN, 0 }; struct timespec z = { 0, 0 };
+                int n2 = ppoll(&p2, 1, &z, NULL);
+                siginfo_t s2; memset(&s2, 0, sizeof s2);
+                int w2 = (int)syscall(SYS_waitid, P_PIDFD, fd, &s2, WEXITED | WNOHANG | WNOWAIT, NULL);
+                size_t l = strlen(pw_msg[idx]);
+                snprintf(pw_msg[idx] + l, sizeof pw_msg[idx] - l, " | recheck n=%d revents=%#x waitid=%d si_pid=%d", n2, p2.revents, w2, (int)s2.si_pid);
                 pw_bad = 1;
             }
             break;
@@ -2696,6 +2703,15 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--comm-check")) return comm_check();
+    if (argc > 1 && !strcmp(argv[1], "--pidfd-wake-loop")) {
+        /* Flake hunter: --pidfd-wake-loop <runs> [cpu-hogs] */
+        int runs = argc > 2 ? atoi(argv[2]) : 10, hogs = argc > 3 ? atoi(argv[3]) : 0;
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        for (int i = 0; i < hogs; i++) if (fork() == 0) { for (;;) __asm__ volatile(""); }
+        for (int i = 0; i < runs; i++) pidfd_wake_conmon();
+        signal(SIGTERM, SIG_IGN); kill(0, SIGTERM);
+        return 0;
+    }
     const char *dirs[8];
     int ndirs = 0;
     int o;

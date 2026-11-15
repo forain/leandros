@@ -7,7 +7,7 @@ a virtio-net NIC and an extra NVMe disk:
   boot 1 (ITS on, `nvme.msix=1`):
     its_ready    `[ITS] ready` in the serial log
     net_msix     `[NET] MSI-X armed` (virtio-net RX queue on an LPI)
-    nvme_msix    `I/O CQ interrupt vector 0 (MSI-X)` (NVMe CQ on an LPI)
+    nvme_msix    `MSI-X vector 0 -> LPI` (NVMe admin + I/O CQ on an LPI)
     proc_irq     /proc/interrupts lists >= 2 `ITS-MSI` LPIs (INTID >= 8192)
     net_smoke    ping to the slirp gateway works and the net LPI count rises
     disk_smoke   a read from /dev/nvme0n1 works and the NVMe LPI was delivered (count > 0:
@@ -103,7 +103,7 @@ def main(argv):
         lg = log()
         verdict("its_ready", re.search(r"\[ITS\] ready", lg) is not None)
         verdict("net_msix", re.search(r"\[NET\] MSI-X armed", lg) is not None)
-        verdict("nvme_msix", re.search(r"I/O CQ interrupt vector 0 \(MSI-X\)", lg) is not None)
+        verdict("nvme_msix", re.search(r"MSI-X vector 0 -> LPI", lg) is not None)
 
         def lpis():
             _, out = sh("cat /proc/interrupts", 30)
