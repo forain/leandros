@@ -1427,7 +1427,7 @@ unsafe fn open_emu_vt() -> c_int { open(b"/dev/tty6\0".as_ptr(), O_RDWR | O_NOCT
 unsafe fn t_emu_tab_default() -> bool {
     let fd = open_emu_vt();
     if fd < 0 { return report(b"emu_tab_default", false); }
-    let s = emu(fd, b"a\tb\tc\x1b[2;1H12345678\tz");
+    let s = emu(fd, b"a\tb\tc\x1b[2;1H1234567\tz");
     close(fd);
     let ok = match s {
         Some(s) => s.cells[0][0] == b'a' as u32 && s.cells[0][8] == b'b' as u32

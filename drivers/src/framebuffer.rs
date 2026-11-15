@@ -81,6 +81,9 @@ enum EscState {
     Discard1,
 }
 
+/// Text rows the double-width bitmap tracks.
+const WIDE_ROWS: usize = 128;
+
 pub struct Framebuffer {
     base:   *mut u32,
     /// Write-back copy of the surface that all drawing goes to, blitted to
@@ -128,6 +131,12 @@ pub struct Framebuffer {
     fg: u32,
     /// Cursor saved by `ESC 7` / `CSI s`, restored by `ESC 8` / `CSI u`.
     saved_cursor: (usize, usize),
+    /// Tab stops (`ESC H`, `CSI g`); every 8 columns until changed.
+    tabs: crate::wcwidth::TabStops,
+    /// One bit per cell, set where a double-width character starts: the pixel
+    /// surface cannot say which cells are halves of one, and overwriting or
+    /// erasing half must blank the other.
+    wide: [[u64; 4]; WIDE_ROWS],
     /// Bounding box of pixels modified since the last flush, as
     /// `(min_x, min_y, max_x, max_y)` with the maxima exclusive.  Lets
     /// `fb_flush` transfer only the changed region to the GPU instead of the
@@ -165,6 +174,8 @@ impl Framebuffer {
             params_len: 0,
             fg: 0xFFFFFF,
             saved_cursor: (0, 0),
+            tabs: crate::wcwidth::TabStops::default_stops(),
+            wide: [[0; 4]; WIDE_ROWS],
             dirty: None,
         }
     }
@@ -283,6 +294,7 @@ impl Framebuffer {
         }
         self.cursor_x = 0;
         self.cursor_y = 0;
+        self.wide = [[0; 4]; WIDE_ROWS];
         let (w, h) = (self.width, self.height);
         self.mark_dirty(0, 0, w, h);
     }
@@ -312,6 +324,8 @@ impl Framebuffer {
                     b'8' => { let (x, y) = self.saved_cursor;
                               self.cursor_x = x; self.cursor_y = y; EscState::Ground }
                     b'M' => { self.reverse_index(); EscState::Ground }
+                    // ESC H — HTS, set a tab stop at the cursor.
+                    b'H' => { let c = self.col(); self.tabs.set(c); EscState::Ground }
                     // ESC =, ESC >, ESC c, … — nothing we need to render.
                     _ => EscState::Ground,
                 };
@@ -359,6 +373,12 @@ impl Framebuffer {
             self.cursor_y += self.char_height;
         } else if c == b'\r' {
             self.cursor_x = 0;
+        } else if c == b'\t' {
+            let cols = self.cols();
+            if cols > 0 {
+                let col = self.tabs.next(self.col(), 1, cols);
+                self.cursor_x = col * self.char_width;
+            }
         } else if c == b'\x08' {  // Backspace (ASCII 8)
             self.handle_backspace();
         } else {
@@ -367,6 +387,8 @@ impl Framebuffer {
                 if c < 0x80 {
                     // ASCII character
                     UTF8_STATE = (0, 0);
+                    let (col, row) = (self.col(), self.row());
+                    self.split_wide(row, col, col + 1);
                     self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, self.fg);
                     self.cursor_x += self.char_width;
                 } else if c & 0xE0 == 0xC0 {
@@ -386,10 +408,7 @@ impl Framebuffer {
                     if UTF8_STATE.0 == 0 {
                         // Complete UTF-8 character
                         let unicode_char = UTF8_STATE.1;
-                        if !crate::glyphs::zero_width(unicode_char) {
-                            self.draw_unicode(self.cursor_x, self.cursor_y, unicode_char, self.fg);
-                            self.cursor_x += self.char_width;
-                        }
+                        self.put_unicode(unicode_char);
                         UTF8_STATE = (0, 0);
                     }
                 } else {
@@ -414,6 +433,8 @@ impl Framebuffer {
         if self.cursor_x >= self.char_width {
             // Move cursor back one character
             self.cursor_x -= self.char_width;
+            let (col, row) = (self.col(), self.row());
+            self.split_wide(row, col, col + 1);
 
             // Clear the character at the cursor position by drawing a space (background color)
             for y in 0..self.char_height {
@@ -427,6 +448,8 @@ impl Framebuffer {
             // Find the rightmost position on the previous line by scanning backwards
             // For simplicity, just move to the end of the line
             self.cursor_x = (self.width / self.char_width - 1) * self.char_width;
+            let (col, row) = (self.col(), self.row());
+            self.split_wide(row, col, col + 1);
 
             // Clear the character at the cursor position
             for y in 0..self.char_height {
@@ -542,6 +565,13 @@ impl Framebuffer {
             b'm' => self.apply_sgr(&nums[..count], &present[..count]),       // SGR
             b's' => self.saved_cursor = (self.cursor_x, self.cursor_y),
             b'u' => { let (x, y) = self.saved_cursor; self.cursor_x = x; self.cursor_y = y; }
+            b'I' => col = self.tabs.next(col, p(0, 1), cols),                // CHT
+            b'Z' => col = self.tabs.prev(col, p(0, 1)),                      // CBT
+            b'g' => match p(0, 0) {                                          // TBC
+                0 => self.tabs.clear(col),
+                3 => self.tabs.clear_all(),
+                _ => {}
+            },
             _ => {}                                              // unimplemented — drop
         }
 
@@ -554,16 +584,24 @@ impl Framebuffer {
     fn erase_in_display(&mut self, mode: usize) {
         let (w, h, ch) = (self.width, self.height, self.char_height);
         let (x, y) = (self.cursor_x, self.cursor_y);
+        let (col, row, cols) = (self.col(), self.row(), self.cols());
         match mode {
             0 => {
                 self.fill_rect(x, y, w - x.min(w), ch, 0x000000);
                 self.fill_rect(0, y + ch, w, h.saturating_sub(y + ch), 0x000000);
+                self.split_wide(row, col, cols);
+                for r in row + 1..WIDE_ROWS { self.wide[r] = [0; 4]; }
             }
             1 => {
                 self.fill_rect(0, 0, w, y, 0x000000);
                 self.fill_rect(0, y, x, ch, 0x000000);
+                self.split_wide(row, 0, col);
+                for r in 0..row.min(WIDE_ROWS) { self.wide[r] = [0; 4]; }
             }
-            _ => self.fill_rect(0, 0, w, h, 0x000000),
+            _ => {
+                self.fill_rect(0, 0, w, h, 0x000000);
+                self.wide = [[0; 4]; WIDE_ROWS];
+            }
         }
     }
 
@@ -572,10 +610,11 @@ impl Framebuffer {
     fn erase_in_line(&mut self, mode: usize) {
         let (w, ch) = (self.width, self.char_height);
         let (x, y) = (self.cursor_x, self.cursor_y);
+        let (col, row, cols) = (self.col(), self.row(), self.cols());
         match mode {
-            0 => self.fill_rect(x, y, w - x.min(w), ch, 0x000000),
-            1 => self.fill_rect(0, y, x, ch, 0x000000),
-            _ => self.fill_rect(0, y, w, ch, 0x000000),
+            0 => { self.fill_rect(x, y, w - x.min(w), ch, 0x000000); self.split_wide(row, col, cols); }
+            1 => { self.fill_rect(0, y, x, ch, 0x000000); self.split_wide(row, 0, col); }
+            _ => { self.fill_rect(0, y, w, ch, 0x000000); self.split_wide(row, 0, cols); }
         }
     }
 
@@ -646,6 +685,79 @@ impl Framebuffer {
             0x2563 => 10 as char, // ╣ -> ASCII 10 (custom T junction left)
             0x2588 => 11 as char, // █ -> ASCII 11 (custom full block)
             _ => '?',              // Unknown Unicode -> question mark
+        }
+    }
+
+    fn wide_bit(&self, row: usize, col: usize) -> bool {
+        row < WIDE_ROWS && col < 256 && (self.wide[row][col / 64] >> (col % 64)) & 1 != 0
+    }
+
+    fn wide_set(&mut self, row: usize, col: usize, on: bool) {
+        if row >= WIDE_ROWS || col >= 256 { return; }
+        let m = 1u64 << (col % 64);
+        if on { self.wide[row][col / 64] |= m } else { self.wide[row][col / 64] &= !m }
+    }
+
+    /// About to overwrite or erase cells `[c0, c1)` of `row`: a double-width
+    /// character straddling either edge loses its other half, which is blanked
+    /// so no half glyph survives; wide starts inside the range are forgotten.
+    fn split_wide(&mut self, row: usize, c0: usize, c1: usize) {
+        if row >= WIDE_ROWS { return; }
+        let (cw, chh) = (self.char_width, self.char_height);
+        if c0 > 0 && self.wide_bit(row, c0 - 1) {
+            self.fill_rect((c0 - 1) * cw, row * chh, cw, chh, 0x000000);
+            self.wide_set(row, c0 - 1, false);
+        }
+        for k in c0..c1.min(256) {
+            if self.wide_bit(row, k) {
+                if k + 1 >= c1 { self.fill_rect((k + 1) * cw, row * chh, cw, chh, 0x000000); }
+                self.wide_set(row, k, false);
+            }
+        }
+    }
+
+    /// Draw a double-width cell pair at `(x, y)`. Fullwidth ASCII (U+FF01..)
+    /// gets its ASCII glyph centred; everything else the console font has no
+    /// glyph for (CJK, emoji) gets a placeholder box two cells wide.
+    fn draw_wide(&mut self, x: usize, y: usize, u: u32, color: u32) {
+        let (cw, ch) = (self.char_width, self.char_height);
+        self.fill_rect(x, y, 2 * cw, ch, 0x000000);
+        if (0xFF01..=0xFF5E).contains(&u) {
+            self.draw_char_vector(x + cw / 2, y, (u - 0xFEE0) as u8 as char, color);
+            return;
+        }
+        if cw < 3 || ch < 3 { return; }
+        for dx in 1..2 * cw - 1 {
+            self.set_pixel(x + dx, y + 1, color);
+            self.set_pixel(x + dx, y + ch - 2, color);
+        }
+        for dy in 1..ch - 1 {
+            self.set_pixel(x + 1, y + dy, color);
+            self.set_pixel(x + 2 * cw - 2, y + dy, color);
+        }
+    }
+
+    /// Place a decoded code point at the cursor and advance by its width.
+    fn put_unicode(&mut self, u: u32) {
+        let mut w = crate::wcwidth::width(u);
+        if w == 0 { return; }
+        let cols = self.cols();
+        if w == 2 && cols < 2 { w = 1; }
+        if w == 2 && self.col() + 2 > cols {
+            // Does not fit before the right margin: wrap whole.
+            self.cursor_x = 0;
+            self.cursor_y += self.char_height;
+            if self.cursor_y + self.char_height > self.height { self.scroll_vector(); }
+        }
+        let (col, row) = (self.col(), self.row());
+        self.split_wide(row, col, col + w);
+        if w == 2 {
+            self.draw_wide(self.cursor_x, self.cursor_y, u, self.fg);
+            self.wide_set(row, col, true);
+            self.cursor_x += 2 * self.char_width;
+        } else {
+            self.draw_unicode(self.cursor_x, self.cursor_y, u, self.fg);
+            self.cursor_x += self.char_width;
         }
     }
 
@@ -767,6 +879,11 @@ impl Framebuffer {
             );
         }
         self.cursor_y = self.cursor_y.saturating_sub(shift_px);
+        if self.char_height > 0 {
+            let n = (shift_px / self.char_height).min(WIDE_ROWS);
+            self.wide.copy_within(n.., 0);
+            for r in WIDE_ROWS - n..WIDE_ROWS { self.wide[r] = [0; 4]; }
+        }
         // The scroll rewrote the whole surface via raw memory ops (bypassing
         // set_pixel), so the entire screen must be re-transmitted.
         let (w, h) = (self.width, self.height);
@@ -988,9 +1105,12 @@ pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
         if x + cw > w { break; }
         let packed = unsafe { cells.add(i).read() };
         let ch = packed as u32;
-        if ch == 0 || ch == 0x20 { continue; }
+        if ch == 0 || ch == 0x20 || ch == 0x8000_0000 { continue; }
         let fg = ((packed >> 32) as u32) ^ 0x00FF_FFFF;
-        if ch < 0x80 {
+        if ch >= 0x80 && crate::wcwidth::width(ch) == 2 && x + 2 * cw <= w {
+            fb.draw_wide(x, y, ch, fg);
+            fb.wide_set(row as usize, i, true);
+        } else if ch < 0x80 {
             fb.draw_char_vector(x, y, ch as u8 as char, fg);
         } else {
             fb.draw_unicode(x, y, ch, fg);
