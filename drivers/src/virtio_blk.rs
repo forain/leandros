@@ -340,6 +340,23 @@ fn irq_health(saw_irq: bool) {
     }
 }
 
+/// `virtio_blk.irq=0` on the kernel command line forces the spin wait. Read on
+/// the first task-context wait: the command line is not available at probe time.
+fn irq_knob_on() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    static KNOB: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    match KNOB.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = crate::kenv::cmdline_word("virtio_blk.irq") != Some("0");
+            KNOB.store(if on { 1 } else { 2 }, Relaxed);
+            if !on { crate::kenv::pci::serial_debug("[VIRTIO-BLK] virtio_blk.irq=0: completion interrupt off, spinning\n"); }
+            on
+        }
+    }
+}
+
 /// Registers this CPU as a parked waiter for the guard's lifetime.
 struct WaitingCpu(u64);
 impl WaitingCpu {
@@ -756,7 +773,7 @@ impl VirtioBlkDevice {
             }
             self.notify();
             match self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns, type_, sector,
-                self.irq_armed && sched::current_pid() != 0) {
+                self.irq_armed && sched::current_pid() != 0 && irq_knob_on()) {
                 Ok(false) => {}
                 Ok(true) => crate::kenv::pci::serial_debug(&alloc::format!(
                     "[VIRTIO-BLK] slow request: type {} sector {} completed after {} ms (status {})\n",
@@ -873,9 +890,9 @@ pub fn probe_all() -> alloc::vec::Vec<&'static VirtioDisk> {
                 continue;
             }
             if let Some(mut d) = unsafe { VirtioBlkDevice::new(pci, true) } {
-                if crate::kenv::cmdline_word("virtio_blk.irq") != Some("0") {
-                    unsafe { d.arm_irq(); }
-                }
+                // The kernel command line is not handed over yet at probe time,
+                // so `virtio_blk.irq=0` is checked per wait (`irq_knob_on`).
+                unsafe { d.arm_irq(); }
                 let capacity_sectors = d.capacity_sectors;
                 let disk: &'static VirtioDisk = alloc::boxed::Box::leak(alloc::boxed::Box::new(
                     VirtioDisk { dev: Mutex::new(d), capacity_sectors },
