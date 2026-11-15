@@ -412,6 +412,8 @@ class Peer:
                 self.logline("WARN", "bad UDP checksum")
         data = p[8:]
         dst = ip["dst"]
+        if dport == 7 and dst == PEER_IP:
+            self.__dict__.setdefault("df_by_sport", {})[sport] = ip["df"]
         bcast = dst in (BCAST_IP, "255.255.255.255")
         if dport == 67 and sport == 68:
             self.on_dhcp(data)
@@ -485,6 +487,9 @@ class Peer:
             elif verb == "WEAK" and len(words) == 3:
                 reply("OK WEAK")
                 self.send_udp(PEER_IP, words[1], 7002, int(words[2]), b"weak", self.guest_mac)
+            elif verb == "DFQ" and len(words) == 2:
+                d = self.__dict__.get("df_by_sport", {}).get(int(words[1]))
+                reply("NONE" if d is None else f"DF {int(d)}")
             elif verb == "TOS" and len(words) == 4:
                 port, tos, ttl = int(words[1]), int(words[2]), int(words[3])
                 reply("OK TOS")
