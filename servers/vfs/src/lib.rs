@@ -4478,6 +4478,11 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/cpuinfo",
                data: b"processor\t: 0\nmodel name\t: Leandros Virtual CPU\ncpu MHz\t\t: 1000.000\n\
                        cache size\t: 4096 KB\nflags\t\t: fpu vme de pse tsc msr pae mce\n" },
+    // /proc/interrupts is generated on open (gen_proc_system); this entry is
+    // what mount(2) targets see, so crun can bind /dev/null over it as a
+    // masked path (a purely generated file was ENOENT there and broke every
+    // `podman run`).
+    RamEntry { path: b"/proc/interrupts", data: b"" },
     RamEntry { path: b"/proc/filesystems",
                data: b"nodev\ttmpfs\nnodev\tramfs\nnodev\tprocfs\nnodev\tcgroup\nnodev\tcgroup2\n\text2\n" },
     // /proc/mounts is generated from list_mounts() by gen_proc_system_content
