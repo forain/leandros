@@ -49,3 +49,4 @@ artifacts/remote-logs/
 # GStreamer port output (ports/gstreamer/build.sh)
 ports/gstreamer/out/
 *_vars.bootdisk.fd
+/build/
