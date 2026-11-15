@@ -207,3 +207,11 @@ never moves left). With the crates.io Cargo.toml: 602/602 pass.
 - `get_source_address_ipv6`: `::1` to `::1` uses `::1`; no candidate returns
   `None` instead of panicking on `unwrap()` (a loopback-only or v4-only
   interface reached by a v6 destination).
+
+## Neighbor Advertisement cache key (lane ip6rest, 2026-11-15)
+
+`process_ndisc` filled the neighbor cache under the NA's IPv6 *source* address.
+RFC 4861 keys it by the NA *target*; the two differ when a proxy answers for
+another address (pasta replies to every NS from its own link-local address),
+so the solicited address never resolved. `src/iface/interface/ipv6.rs` now
+uses `target_addr`.
