@@ -29,11 +29,23 @@ def unsplice(s):
     + "[IRQ] line 0x23 fired ...\n" + " OK"): a line split like that used to
     be counted as an fsynced file that recovery lost."""
     tag = r"\[[A-Z][A-Z0-9_]*\][^\n]*\n"
-    s = re.sub(r"(?m)^[^\nP]*" + tag, "", s)   # whole kernel lines (after any escape junk)
-    return re.sub(tag, "", s)                  # a kernel line spliced into a test line
+    junk = r"(?:\x1b\[[0-9;?]*[A-Za-z]|[ \t\r\[\]0-9.])*"
+    s = re.sub(r"(?m)^" + junk + tag, "", s)   # whole kernel lines (after terminal junk only)
+    return re.sub(r"(?:\[ *[0-9.]+\] ?)?" + tag, "", s)                  # a kernel line spliced into a test line
+
+
+def selftest():
+    """A kernel line spliced into a DEL/ACK line must not eat the line."""
+    for a, b in (("ACK 826\nDEL 8[F2FS] x\n27\n", "DEL 827"),
+                 ("DEL 8[   31.2] [IRQ] y\n27\n", "DEL 827"),
+                 ("[IRQ] z\nDEL 5\n", "DEL 5")):
+        assert b in unsplice(a), (a, unsplice(a))
+    print("selftest: PASS")
 
 
 def main(argv):
+    if "--selftest" in argv:
+        return selftest()
     arch, iters, seed = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 4, int(time.time())
     i = 0
     while i < len(argv):
@@ -163,6 +175,11 @@ def main(argv):
             subprocess.run(["cp", "-c", img, os.path.join(out, f"crashed-iter{it}.img")])
         acked = {int(x) for x in re.findall(r"^ACK (\d+)", text, re.M)}
         dels = {int(x) for x in re.findall(r"^DEL (\d+)", text, re.M)}
+        if dels:  # fullchurn deletes 0..D-1 in order: a later DEL proves the earlier keys were unlinked
+            gaps = sorted(set(range(max(dels) + 1)) - dels)
+            if gaps:
+                print(f"iter {it}: WARNING lost {len(gaps)} DEL console line(s), e.g. {gaps[:5]}", flush=True)
+            dels = set(range(max(dels) + 1))
         kmax = max(acked | {0})
         print(f"iter {it}: {cmdline}: {len(acked)} acked, {len(dels)} deleted, "
               f"{'full' if 'FILLED' in text else 'still filling'}", flush=True)
