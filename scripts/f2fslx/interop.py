@@ -614,10 +614,11 @@ def e_scenario(tmp, name, ops, minmark, chainonly):
     if outs is None or "MNT_RW" not in outs[0] or "UMOUNT_RC=0" not in outs[1]:
         step(v, "E.boot1", False, "base volume failed"); return
     # boot 2: scenario, then the harness stops QEMU without umount (driver.cmd_stop = monitor quit)
-    outs = guest([img], [MNTH, "cd /mnt/h && (" + ops + ") 2>&1 | sed 's/^/EXP /'; echo SCEN_DONE; cd /"], "E2")
+    outs = guest([img], [MNTH, "cd /mnt/h && (" + ops + ") 2>&1; echo SCEN_DONE; cd /"], "E2")
     if outs is None or "MNT_RW" not in outs[0] or "SCEN_DONE" not in outs[1]:
         step(v, "E.boot2", False, (outs[1].strip()[-100:] if outs else "no guest")); return
-    exp = [l[4:].replace("t/", "") for l in outs[1].splitlines() if l.startswith("EXP ") and len(l) > 40 and l[4:36].strip().isalnum()]
+    exp = [l.strip().replace("t/", "") for l in outs[1].splitlines()
+           if len(l.strip()) > 36 and l.strip()[32:34] == "  " and l.strip()[:32].isalnum() and l.strip()[34:36] == "t/"]
     if not exp:
         step(v, "E.boot2", False, "no md5 lines from the scenario: " + outs[1].strip()[-100:]); return
     shutil.copyfile(img, snap)
