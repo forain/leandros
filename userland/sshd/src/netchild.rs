@@ -194,7 +194,7 @@ pub fn run(cfg: Config, public: PublicKey, tcp: RawFd, sign: RawFd, ctl: RawFd, 
         unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     }
     let blob = public.to_bytes().unwrap_or_default();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap_or_else(|_| die(1));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build().unwrap_or_else(|_| die(1));
     rt.block_on(async move {
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(tcp) };
         let Ok(stream) = TcpStream::from_std(std_stream) else { die(1) };
