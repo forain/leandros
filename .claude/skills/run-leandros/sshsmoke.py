@@ -843,7 +843,8 @@ def sshdcfg(ssh, user, pw, tmp):
 PS_SSHD = r"""for p in /proc/[0-9]*; do
 n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null)
 pp=$(sed -n 's/^PPid:[[:space:]]*//p' $p/status 2>/dev/null)
-if [ "${n#sshd}" != "$n" ]; then echo "${p#/proc/} $pp $n"; fi
+m=${n#sshd}
+if [ x$m != x$n ]; then echo ${p#/proc/} $pp $n; fi
 done"""
 
 
