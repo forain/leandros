@@ -9,16 +9,13 @@ E-newfile:E.fsck0
 E-newfile:E.linux
 E-inline:E.chain
 E-inline:E.fsck0
-E-inline:E.linux
 E-overwrite:E.chain
 E-overwrite:E.fsck0
-E-overwrite:E.linux
 E-indirect:E.chain
 E-indirect:E.fsck0
 E-indirect:E.linux
 E-xattr:E.chain
 E-xattr:E.fsck0
-E-xattr:E.linux
 E-ab:E.chain
 E-ab:E.fsck0
 E-ab:E.linux
@@ -27,5 +24,5 @@ E-era:E.fsck0
 E-era:E.linux
 E-full:E.chain
 E-full:E.fsck0
-E-full:E.linux
 # E-rename falls back to a checkpoint (Linux parity), so it passes today.
+# E-inline/overwrite/xattr/full:E.linux already pass on main (2026-11-15 baseline); P1 must explain why (checkpoint fallback or in-place data?) and re-check E.cponly there.
