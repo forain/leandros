@@ -99,14 +99,14 @@ The i8042 is probed (and ruled out when the FADT says there is none) before IRQ 
 
 Limine can start the APs itself. The kernel does not request that: Limine's AP stacks and info structures live in bootloader-reclaimable memory, and the MADT path also serves the multiboot2/PVH entry. No MADT means uniprocessor, never a broadcast INIT/SIPI.
 
-### FXSAVE, no XSAVE
+### FXSAVE plus AVX upper halves
 
-Context switches save the 512-byte `FXSAVE64` area. `CR4.OSXSAVE` is never set, so CPUID reports no OS support for AVX state and userspace libraries stay on SSE code paths; enabling AVX would require XSAVE-area management in the context switch and signal frames.
+Context switches save the 512-byte `FXSAVE64` area. When CPUID reports XSAVE, AVX and XCR0 support for x87|SSE|AVX, `enable_sse` (BSP, every AP, S3 resume) sets `CR4.OSXSAVE` and `XCR0 = 7` and the BSP sets `sched::context::AVX_ON`. The upper 128 bits of YMM0-15 do not go through XSAVE: `cpu_switch_to` stores them in `CpuContext::ymmh` with `vextractf128` and restores them with `vinsertf128` after the `fxrstor64`; signal frames carry them at offset 1480 (after the FXSAVE area). AVX-512 and XSAVE-managed extended state are never enabled (XCR0 stays 7). Guards: sigtest `avx_enabled_when_cpu_has_it`, `avx_upper_halves_survive_signal_and_switch`.
 
 ## Limitations and open work
 
 - **SMEP and SMAP are on** (since 2026-10-23, lane smapx86): `CR4` bits 20/21 are set on the BSP and every AP when CPUID reports them, `stac`/`clac` bracket every `sched::uaccess` copy and `UserAccess` window, and `pan=strict|audit|off` (default strict) picks panic, log-and-allow, or off. See [memory.md](memory.md#smepsmap-and-pan-are-on-uaccess-is-the-only-way-in). `CR0.WP` is on.
-- No AVX/AVX-512 state management (above).
+- No AVX-512 / XSAVE-managed state (above); ptrace and core dumps expose only the FXSAVE area.
 - MSI always targets the BSP; no interrupt affinity, no multi-vector MSI (MSI-X has per-entry vectors). Legacy INTx (`IrqSource::Line`) returns `Unsupported`: there is no ACPI `_PRT` parser.
 - More than 64 CPUs would need a wider shootdown acknowledgement mask; firmware-enabled x2APIC on the *BSP* is handled by code but has not been exercised (OVMF hands the BSP over in xAPIC mode even with 288 vCPUs).
 - KVM pvclock would give the host's exact TSC frequency without a PIT window; at 0.02 % error it has not been needed. Bare-metal CPUID `0x15`/`0x16` paths are unverified on real hardware.
