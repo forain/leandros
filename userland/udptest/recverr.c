@@ -157,11 +157,12 @@ static void udp6_recverr_one(const char *N, int ty, int code, int want_errno, in
     struct iovec iov = { data, sizeof data };
     struct msghdr m = { .msg_name = &nm, .msg_namelen = sizeof nm, .msg_iov = &iov, .msg_iovlen = 1,
                         .msg_control = cbuf, .msg_controllen = sizeof cbuf };
+    /* plain recv first: reading the queue clears the pending error */
+    ssize_t r0 = recv(s, b, sizeof b, MSG_DONTWAIT); int e0 = errno;
     ssize_t n = recvmsg(s, &m, MSG_ERRQUEUE | MSG_DONTWAIT);
     int have = 0; struct sock_extended_err ee; memset(&ee, 0, sizeof ee);
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); n >= 0 && c; c = CMSG_NXTHDR(&m, c))
         if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_RECVERR) { have = 1; memcpy(&ee, CMSG_DATA(c), sizeof ee); }
-    ssize_t r0 = recv(s, b, sizeof b, MSG_DONTWAIT); int e0 = errno;
     close(s); close(r);
     if (!(ev & POLLERR)) fail(N, "poll %#x, want POLLERR", ev);
     else if (n < 0 || !have) fail(N, "no IPV6_RECVERR entry: %zd %s", n, strerror(errno));
