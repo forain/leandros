@@ -199,6 +199,9 @@ SUITES = {
                 "host:f2fsnidtest.py",
                 # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
                 "host:f2fscommittest.py",
+                # Space reuse on a small f2fs volume: churn writes N x capacity,
+                # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
+                "host:f2fsgctest.py --factor 3",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -278,6 +281,7 @@ SUITES = {
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
+    "f2fsgc": ["host:f2fsgctest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
