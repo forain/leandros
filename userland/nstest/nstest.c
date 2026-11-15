@@ -3533,6 +3533,132 @@ static void nsforge_bind_regression(void)
     check("nsforge_bound_nsfs_open_and_setns", ok);
 }
 
+
+/* --- per-kind namespace limits (/proc/sys/user/max_<kind>_namespaces) --- */
+#define NSLIM_MAXKIDS 300
+static pid_t nslim_kid[NSLIM_MAXKIDS];
+static int nslim_nkid;
+
+static long nslim_get(const char *kind)
+{
+    char p[96], b[32];
+    snprintf(p, sizeof p, "/proc/sys/user/max_%s_namespaces", kind);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    return atol(b);
+}
+static int nslim_put(const char *kind, long v)
+{
+    char p[96], b[32];
+    snprintf(p, sizeof p, "/proc/sys/user/max_%s_namespaces", kind);
+    int fd = open(p, O_WRONLY);
+    if (fd < 0) return -1;
+    int n = snprintf(b, sizeof b, "%ld\n", v);
+    int r = write(fd, b, n);
+    int e = errno;
+    close(fd);
+    errno = e;
+    return r == n ? 0 : -1;
+}
+/* Fork a child that unshares `flag` and keeps the namespace alive. 0 = held,
+ * else the errno of the failed unshare (or -1 on fork failure). */
+static int nslim_hold(unsigned long flag)
+{
+    int pp[2];
+    if (nslim_nkid >= NSLIM_MAXKIDS || pipe(pp)) return -1;
+    pid_t c = fork();
+    if (c < 0) { close(pp[0]); close(pp[1]); return -1; }
+    if (c == 0) {
+        close(pp[0]);
+        char r = unshare((int)flag) == 0 ? 0 : (char)errno;
+        write(pp[1], &r, 1);
+        if (r) _exit(0);
+        for (;;) pause();
+    }
+    close(pp[1]);
+    char r = -1;
+    if (read(pp[0], &r, 1) != 1) r = -1;
+    close(pp[0]);
+    if (r) { waitpid(c, 0, 0); return r; }
+    nslim_kid[nslim_nkid++] = c;
+    return 0;
+}
+static void nslim_release(void)
+{
+    for (int i = 0; i < nslim_nkid; i++) { kill(nslim_kid[i], SIGKILL); waitpid(nslim_kid[i], 0, 0); }
+    nslim_nkid = 0;
+}
+/* Hold namespaces of `flag` until the kernel refuses; returns how many were
+ * taken and the refusing errno in *err (0 if the safety cap was hit). */
+static int nslim_fill(unsigned long flag, int *err)
+{
+    int n = 0, r;
+    *err = 0;
+    while (n < 280) {
+        r = nslim_hold(flag);
+        if (r) { *err = r; break; }
+        n++;
+    }
+    return n;
+}
+
+static void nslimit_cases(void)
+{
+    static const char *kinds[] = { "user", "mnt", "net", "pid", "time", "cgroup", "ipc", "uts" };
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+        long v = nslim_get(kinds[i]);
+        if (v < 0) { printf("  max_%s_namespaces unreadable\n", kinds[i]); ok = 0; }
+    }
+    check("nslimit_sysctl_readable", ok);
+
+    /* Writable, and the sum of the budgets is bounded by the shared table. */
+    long old_net = nslim_get("net");
+    ok = nslim_put("net", 5) == 0 && nslim_get("net") == 5;
+    check("nslimit_sysctl_write_readback", ok);
+    errno = 0;
+    ok = nslim_put("net", 100000) == -1 && errno == EINVAL;
+    check("nslimit_sysctl_sum_overflow_einval", ok);
+    ok = nslim_put("net", old_net) == 0 && nslim_get("net") == old_net;
+    check("nslimit_sysctl_restore", ok);
+
+    /* The limit is enforced: ENOSPC exactly at the kind's budget. */
+    long old_ipc = nslim_get("ipc");
+    int err, n, base;
+    nslim_put("ipc", 3);
+    n = nslim_fill(CLONE_NEWIPC, &err);
+    ok = err == ENOSPC && n >= 1 && n <= 3;
+    if (!ok) printf("  ipc fill n=%d err=%d\n", n, err);
+    check("nslimit_enospc_at_limit", ok);
+    /* Other kinds are unaffected by a full ipc budget. */
+    ok = nslim_hold(CLONE_NEWUTS) == 0;
+    check("nslimit_other_kind_unaffected", ok);
+    nslim_release();
+    ok = nslim_hold(CLONE_NEWIPC) == 0;
+    check("nslimit_freed_slot_reusable", ok);
+    nslim_release();
+    nslim_put("ipc", old_ipc);
+
+    /* No starvation: exhausting uts leaves netns, ipc and mount creation working. */
+    n = nslim_fill(CLONE_NEWUTS, &err);
+    base = n;
+    ok = err == ENOSPC && n <= nslim_get("uts");
+    if (!ok) printf("  uts fill n=%d err=%d limit=%ld\n", n, err, nslim_get("uts"));
+    check("nslimit_uts_exhausted_enospc", ok);
+    int rn = nslim_hold(CLONE_NEWNET), ri = nslim_hold(CLONE_NEWIPC), rm = nslim_hold(CLONE_NEWNS);
+    ok = rn == 0 && ri == 0 && rm == 0;
+    if (!ok) printf("  after uts exhaustion (%d held): net=%d ipc=%d mnt=%d\n", base, rn, ri, rm);
+    check("nslimit_uts_exhaustion_does_not_starve_net", ok);
+    nslim_release();
+    ok = nslim_hold(CLONE_NEWUTS) == 0;
+    check("nslimit_uts_reusable_after_release", ok);
+    nslim_release();
+}
+
 static void nsforge_cases(void)
 {
     nsforge_detached_theft();
@@ -3567,7 +3693,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) { nsforge_cases(); run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { nslimit_cases(); nsforge_cases(); run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;
