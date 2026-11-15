@@ -376,6 +376,25 @@ def portal(step):
     return r
 
 
+def svcportal(step):
+    """Bus-level desktop service checks inside the live COSMIC session: the
+    portal frontend + cosmic backend (Screenshot returns a PNG), then
+    svc-test portal (Screenshot/FileChooser interfaces, timedate1,
+    SwitcherooControl, a11y). Verified from the serial shell, no pixels."""
+    global BUS
+    settle_quiet(20)
+    if BUS is None:
+        BUS = "unix:path=/run/user/1000/bus"
+    env = f"DBUS_SESSION_BUS_ADDRESS={BUS} DBUS_SYSTEM_BUS_ADDRESS={BUS}"
+    r = {}
+    # As the session user: the portal reads the caller's /proc/<pid>/root.
+    for name, args in (("screenshot", "portal screenshot 90"), ("svctest", "svc-test portal")):
+        SER.cmd(f"su leandro -c '{env} XDG_RUNTIME_DIR=/run/user/1000 /usr/libexec/leandros-sysbus {args}' > /tmp/{name}.out 2>&1", 220)
+        r[name] = SER.cmd(f"grep -E '^(PASS|FAIL|PORTAL_PROBE|SVC_TEST)' /tmp/{name}.out", 20)[-1500:]
+    log(step, json.dumps(r))
+    return r
+
+
 QPID = None      # this run's QEMU, once started
 STARTED = False  # a start was attempted (it may have timed out with QEMU up)
 SER = None
@@ -483,6 +502,8 @@ def _main():
                 res[st] = launch(st, "settings")
             elif st.startswith("wallpaper"):
                 res[st] = wallpaper(st)
+            elif st.startswith("svcportal"):
+                res[st] = svcportal(st)
             elif st.startswith("portal"):
                 res[st] = portal(st)
         except Exception as e:

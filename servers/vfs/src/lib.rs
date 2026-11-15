@@ -8112,6 +8112,13 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         return Some(p);
     }
 
+    if path == b"/proc/interrupts" {
+        // One line per registered interrupt source (GIC SPI, ITS MSI LPI,
+        // x86_64 IDT MSI vector): `INTID: count kind`.
+        extern "C" { fn drivers_irq_report(buf: *mut u8, cap: usize) -> usize; }
+        return Some(unsafe { drivers_irq_report(buf.as_mut_ptr(), buf.len()) });
+    }
+
     if path == b"/proc/cpuinfo" {
         // One block per online CPU — Linux tools (nproc, lscpu, and
         // anything that counts "processor :" lines) derive the CPU count
@@ -9756,7 +9763,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/cmdline" || lookup_path == b"/proc/nvrm_state"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
-               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
+               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/proc/interrupts" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
                || lookup_path == b"/proc/sys/fs/file-nr"
                || lookup_path == b"/proc/sys/fs/ovl_selftest" {

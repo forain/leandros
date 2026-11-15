@@ -168,6 +168,48 @@ pub fn parse_fadt_psci(t: &[u8]) -> Psci {
     if f & 1 == 0 { Psci::None } else if f & 2 != 0 { Psci::Hvc } else { Psci::Smc }
 }
 
+// ── IORT (PCI requester ID -> ITS DeviceID) ──────────────────────────────────
+
+pub const MAX_IORT_MAP: usize = 8;
+
+/// One IORT ID mapping: RIDs `[input, input+count)` -> DeviceIDs from `output`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IortMap { pub input: u32, pub count: u32, pub output: u32 }
+
+/// Collect the ID mappings of the first PCI root complex (segment 0) whose
+/// target is an ITS group node (type 0). Mappings that go through an SMMU
+/// (type 3/4) are skipped: the SMMU stream-ID chain is not followed.
+/// Returns how many were stored in `out`.
+pub fn parse_iort(t: &[u8], out: &mut [IortMap]) -> usize {
+    if t.len() < 48 || &t[0..4] != b"IORT" { return 0; }
+    let nodes = u32_at(t, 36) as usize;
+    let mut off = u32_at(t, 40) as usize;
+    let mut n = 0;
+    for _ in 0..nodes {
+        if off + 16 > t.len() { break; }
+        let ty = t[off];
+        let len = u16_at(t, off + 1) as usize;
+        if len < 16 || off + len > t.len() { break; }
+        if ty == 2 && off + 32 <= t.len() && u32_at(t, off + 28) == 0 {
+            let cnt = u32_at(t, off + 8) as usize;
+            let moff = u32_at(t, off + 12) as usize;
+            for i in 0..cnt {
+                let e = off + moff + i * 20;
+                if e + 20 > t.len() || n >= out.len() { break; }
+                let target = u32_at(t, e + 12) as usize;
+                if target >= t.len() || t[target] != 0 { continue; }
+                let single = u32_at(t, e + 16) & 1 != 0;
+                let count = if single { 1 } else { u32_at(t, e + 4).saturating_add(1) };
+                out[n] = IortMap { input: u32_at(t, e), count, output: u32_at(t, e + 8) };
+                n += 1;
+            }
+            break;
+        }
+        off += len;
+    }
+    n
+}
+
 // ── Whole platform ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
@@ -178,6 +220,8 @@ pub struct Platform {
     pub ecam: [EcamRegion; MAX_ECAM],
     pub ecam_n: usize,
     pub psci: Psci,
+    pub iort: [IortMap; MAX_IORT_MAP],
+    pub iort_n: usize,
 }
 
 unsafe fn table<'a>(rsdp: u64, hhdm: u64, sig: &[u8; 4]) -> Option<&'a [u8]> {
@@ -194,6 +238,8 @@ unsafe fn table<'a>(rsdp: u64, hhdm: u64, sig: &[u8; 4]) -> Option<&'a [u8]> {
 pub unsafe fn discover(rsdp: u64, hhdm: u64) -> Platform {
     let mut ecam = [EcamRegion::default(); MAX_ECAM];
     let ecam_n = table(rsdp, hhdm, b"MCFG").map_or(0, |t| parse_mcfg(t, &mut ecam));
+    let mut iort = [IortMap::default(); MAX_IORT_MAP];
+    let iort_n = table(rsdp, hhdm, b"IORT").map_or(0, |t| parse_iort(t, &mut iort));
     Platform {
         madt: table(rsdp, hhdm, b"APIC").and_then(parse_madt),
         spcr: table(rsdp, hhdm, b"SPCR").and_then(parse_spcr),
@@ -201,6 +247,8 @@ pub unsafe fn discover(rsdp: u64, hhdm: u64) -> Platform {
         ecam,
         ecam_n,
         psci: table(rsdp, hhdm, b"FACP").map_or(Psci::None, parse_fadt_psci),
+        iort,
+        iort_n,
     }
 }
 
