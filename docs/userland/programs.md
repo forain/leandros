@@ -73,7 +73,7 @@ The per-connection process is still root and still runs all the russh code, but 
 uses the two hooks of the vendored russh (`userland/sshd/vendor/russh`, see its
 `LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
 the session id, and every publickey/certificate login has its raw signature re-verified
-against that session id (`src/userauth.rs`) before the authorized_keys check. This is the
+against that session id (`src/userauth.rs`) before the authorized_keys check. SHA-1 `ssh-rsa` publickey signatures are refused (as OpenSSH 8.8+ does by default); use `rsa-sha2-256`/`rsa-sha2-512`. This is the
 groundwork for splitting the pre-auth code into an unprivileged child.
 
 - **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
