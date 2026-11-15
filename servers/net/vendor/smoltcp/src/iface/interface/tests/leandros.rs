@@ -162,6 +162,7 @@ fn icmp_error(
         hop_limit: 64,
     };
     let repr = Icmpv4Repr::DstUnreachable {
+        mtu: 0,
         reason,
         header: quoted,
         data: head,

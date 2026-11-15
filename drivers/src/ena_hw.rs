@@ -6,7 +6,8 @@
 //! Rust mock device in `drivers/ena-tests`. There is no QEMU ENA model; the
 //! mock is the test vehicle until real EC2.
 //!
-//! What it implements (host placement only; LLQ is a separate lane):
+//! What it implements (host placement, plus LLQ "device placement" when the
+//! device offers it and BAR2 is mapped write-combining):
 //!
 //! * **Register access**, including *readless MMIO*: EC2 ENA VFs set PCI
 //!   revision bit 0, which forbids plain BAR0 reads. Reads then go through
@@ -20,6 +21,11 @@
 //! * **Admin queue and AENQ**, both polled by phase bit.
 //! * **Data path**: copy-in TX and copy-out RX through 2 KiB slots (one
 //!   descriptor per frame), SQ tail doorbells, CQ head doorbells.
+//! * **LLQ** (low-latency queue): TX descriptors and the first bytes of the
+//!   frame are written as one 128/192/256-byte entry into BAR2, then the SQ
+//!   doorbell; the rest of the frame is fetched from the host slot. Caps come
+//!   from `GET_FEATURE LLQ`; the choice is [`llq_negotiate`]. Any refusal falls
+//!   back to host placement.
 //! * **Watchdog**: missing keep-alive for 6 s, a fatal DEV_STS, or an admin
 //!   timeout resets the device and re-initialises (Linux `ena_fw_reset_device`).
 //!
@@ -165,6 +171,77 @@ pub trait EnaBus {
     fn dma_alloc(&self, len: usize) -> Option<DmaBuf>;
     fn udelay(&self, us: u64);
     fn now_ms(&self) -> u64;
+    /// Length of the write-combining BAR2 mapping (LLQ device memory); 0 when
+    /// there is none, which keeps the driver in host placement.
+    fn llq_bar_len(&self) -> usize { 0 }
+    /// Store `data` into BAR2 at `off` (write-combining memory).
+    fn llq_write(&self, _off: usize, _data: &[u8]) {}
+    /// Write barrier: drain write-combining buffers before a doorbell.
+    fn wmb(&self) { fence(Ordering::SeqCst) }
+}
+
+// ── LLQ negotiation ─────────────────────────────────────────────────────────
+
+/// `ena_admin_feature_llq_desc`: what the device supports (bit masks).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LlqCaps {
+    pub max_queues: u32,
+    pub max_depth: u32,
+    /// Header location: bit 0 inline in the entry, bit 1 separate buffer.
+    pub loc: u16,
+    /// Entry size: bit 0 128 B, bit 1 192 B, bit 2 256 B.
+    pub entry: u16,
+    /// Descriptors before the header: bit n = 1<<n descs (1, 2, 4, 8 -> bits 0..3 as values 1,2,4,8).
+    pub before: u16,
+    /// Stride: bit 0 single descriptor per entry, bit 1 multiple.
+    pub stride: u16,
+}
+
+pub const LLQ_LOC_INLINE: u16 = 1;
+const LLQ_FEATURE_BYTES: usize = 24;
+/// Smallest pushed-header window worth using.
+const LLQ_MIN_HEADER: usize = 64;
+
+impl LlqCaps {
+    /// Parse the feature body (`w16(o)`/`w32(o)` read the control buffer).
+    pub fn parse(r32: impl Fn(usize) -> u32, r16: impl Fn(usize) -> u16) -> LlqCaps {
+        LlqCaps { max_queues: r32(0), max_depth: r32(4), loc: r16(8), entry: r16(12), before: r16(16), stride: r16(20) }
+    }
+}
+
+/// The LLQ layout the driver picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LlqCfg {
+    /// Bytes per ring entry: 128, 192 or 256.
+    pub entry_size: usize,
+    /// Descriptor slots before the pushed header: 1, 2, 4 or 8.
+    pub before: usize,
+    /// Descriptors-stride control: multiple descriptors per entry.
+    pub stride_multi: bool,
+}
+
+impl LlqCfg {
+    /// Bytes of an entry left for the pushed header.
+    pub fn header_space(&self) -> usize { self.entry_size - self.before * 16 }
+    fn entry_bit(&self) -> u16 { match self.entry_size { 128 => 1, 192 => 2, _ => 4 } }
+}
+
+/// Choose the entry layout from the device caps: inline header (the only
+/// location implemented), 128 B entries preferred, then 256, then 192;
+/// 2 descriptors before the header preferred (Linux's default), then 1, 4, 8;
+/// multiple-descriptor stride preferred. `None` when any dimension has no
+/// usable option (the caller then uses host placement).
+pub fn llq_negotiate(c: &LlqCaps) -> Option<LlqCfg> {
+    if c.max_queues == 0 || c.max_depth == 0 || c.loc & LLQ_LOC_INLINE == 0 { return None; }
+    let stride_multi = if c.stride & 2 != 0 { true } else if c.stride & 1 != 0 { false } else { return None };
+    for (bit, size) in [(1u16, 128usize), (4, 256), (2, 192)] {
+        if c.entry & bit == 0 { continue; }
+        for before in [2usize, 1, 4, 8] {
+            if c.before & before as u16 == 0 || size < before * 16 + LLQ_MIN_HEADER { continue; }
+            return Some(LlqCfg { entry_size: size, before, stride_multi });
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +289,8 @@ pub struct DevInfo {
     pub enabled_groups: u32,
     /// First words of the LLQ feature, when the device answered it.
     pub llq: Option<[u32; 4]>,
+    /// The LLQ layout in use (None = host placement).
+    pub llq_cfg: Option<LlqCfg>,
 }
 
 // ── queue state ─────────────────────────────────────────────────────────────
@@ -293,6 +372,17 @@ pub struct Ena<B: EnaBus> {
     down_since: u64,
     /// DEV_CTL reason for the reset the next `init` performs.
     next_reason: u32,
+    llq_allowed: bool,
+    /// The device refused a DEV-placement SQ: stay on host placement.
+    llq_refused: bool,
+    llq: Option<LlqCfg>,
+    llq_off: usize,
+}
+
+fn page_bytes(p: &DmaBuf, off: usize, n: usize) -> Vec<u8> {
+    let mut v = alloc::vec![0u8; n];
+    p.copy_out(off, &mut v);
+    v
 }
 
 fn alloc_pages(bus: &impl EnaBus, n: usize) -> Option<Vec<DmaBuf>> {
@@ -330,10 +420,13 @@ impl<B: EnaBus> Ena<B> {
             rx_acc_buf: alloc::vec![0u8; SLOT * 2], mac: [0; 6], info: DevInfo::default(),
             stats: Stats::default(), link_up: false, link_gen: 0, keepalive_ms: 0,
             admin_failed: false, fatal_event: false, running: false, down_since: 0,
-            next_reason: reset_reason::NORMAL,
+            next_reason: reset_reason::NORMAL, llq_allowed: true, llq_refused: false, llq: None, llq_off: 0,
         })
     }
 
+    /// `ena.llq=0`: never use LLQ.
+    pub fn set_llq_allowed(&mut self, on: bool) { self.llq_allowed = on; }
+    pub fn llq_active(&self) -> bool { self.llq.is_some() }
     pub fn readless(&self) -> bool { self.readless }
     pub fn running(&self) -> bool { self.running }
     pub fn link_up(&self) -> bool { self.running && self.link_up }
@@ -489,6 +582,23 @@ impl<B: EnaBus> Ena<B> {
         Ok(())
     }
 
+    /// SET_FEATURE LLQ: the same structure with the `*_enabled` words filled.
+    fn set_llq(&mut self, c: &LlqCaps, cfg: LlqCfg) -> Result<(), Error> {
+        let mut p = [0u8; LLQ_FEATURE_BYTES];
+        p[0..4].copy_from_slice(&c.max_queues.to_le_bytes());
+        p[4..8].copy_from_slice(&c.max_depth.to_le_bytes());
+        let w = |p: &mut [u8; LLQ_FEATURE_BYTES], o: usize, v: u16| p[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        w(&mut p, 8, c.loc);
+        w(&mut p, 10, LLQ_LOC_INLINE);
+        w(&mut p, 12, c.entry);
+        w(&mut p, 14, cfg.entry_bit());
+        w(&mut p, 16, c.before);
+        w(&mut p, 18, cfg.before as u16);
+        w(&mut p, 20, c.stride);
+        w(&mut p, 22, if cfg.stride_multi { 2 } else { 1 });
+        self.set_feature(feat::LLQ, &p)
+    }
+
     fn set_feature(&mut self, id: u8, payload: &[u8]) -> Result<(), Error> {
         let mut cmd = [0u8; ADMIN_ENTRY];
         cmd[17] = id;
@@ -506,7 +616,11 @@ impl<B: EnaBus> Ena<B> {
     /// left reset.
     pub fn init(&mut self) -> Result<(), Error> {
         self.running = false;
-        let r = self.init_inner();
+        let mut r = self.init_inner();
+        if r.is_err() && self.llq_refused {
+            // The device refused the device-placement queue: redo it on host memory.
+            r = self.init_inner();
+        }
         if r.is_err() {
             let _ = self.dev_reset(reset_reason::GENERIC);
         } else {
@@ -561,11 +675,27 @@ impl<B: EnaBus> Ena<B> {
         self.info.tx_depth = pow2(TX_DEPTH, txd.max(2));
         self.info.rx_depth = pow2(RX_DEPTH, rxd.max(2));
 
-        // LLQ caps: only logged here (placement is host).
+        // LLQ: parse the caps; use device placement when a layout fits, BAR2
+        // is mapped and neither the knob nor an earlier refusal says no.
+        self.llq = None;
+        self.info.llq_cfg = None;
+        let mut llq_caps = None;
         self.info.llq = match self.get_feature(feat::LLQ, 0) {
-            Ok(()) => Some([self.ctrl.r32(0), self.ctrl.r32(4), self.ctrl.r32(8), self.ctrl.r32(12)]),
+            Ok(()) => {
+                let (c, d) = (&self.ctrl, &self.ctrl);
+                llq_caps = Some(LlqCaps::parse(|o| c.r32(o), |o| d.r16(o)));
+                Some([self.ctrl.r32(0), self.ctrl.r32(4), self.ctrl.r32(8), self.ctrl.r32(12)])
+            }
             Err(_) => None,
         };
+        if let (Some(caps), true) = (llq_caps, self.llq_allowed && !self.llq_refused && self.bus.llq_bar_len() > 0) {
+            if let Some(cfg) = llq_negotiate(&caps) {
+                self.set_llq(&caps, cfg)?;
+                self.llq = Some(cfg);
+                self.info.llq_cfg = Some(cfg);
+                self.info.tx_depth = pow2(self.info.tx_depth, caps.max_depth);
+            }
+        }
 
         // AENQ groups: everything the device offers that we understand.
         self.get_feature(feat::AENQ_CONFIG, 0)?;
@@ -621,16 +751,25 @@ impl<B: EnaBus> Ena<B> {
             let cq_head_db = u32::from_le_bytes([r[16], r[17], r[18], r[19]]) as usize;
             // CREATE_SQ: direction in bits 7:5, host placement (1), descriptor
             // completion policy (0), physically contiguous.
+            // Device placement (3) for the LLQ TX queue: the ring lives in BAR2,
+            // no host SQ address.
+            let dev = dir == 0 && self.llq.is_some();
             let mut cmd = [0u8; ADMIN_ENTRY];
             cmd[4] = (if dir == 0 { 1 } else { 2 }) << 5;
-            cmd[6] = 1;
+            cmd[6] = if dev { 3 } else { 1 };
             cmd[7] = 1;
             cmd[8..10].copy_from_slice(&cq_idx.to_le_bytes());
             cmd[10..12].copy_from_slice(&n.to_le_bytes());
-            cmd[12..16].copy_from_slice(&(sq_pa as u32).to_le_bytes());
-            cmd[16..18].copy_from_slice(&((sq_pa >> 32) as u16).to_le_bytes());
-            let r = self.admin(op::CREATE_SQ, 0, cmd)?;
+            if !dev {
+                cmd[12..16].copy_from_slice(&(sq_pa as u32).to_le_bytes());
+                cmd[16..18].copy_from_slice(&((sq_pa >> 32) as u16).to_le_bytes());
+            }
+            let r = match self.admin(op::CREATE_SQ, 0, cmd) {
+                Err(Error::Admin { .. }) if dev => { self.llq_refused = true; return Err(Error::Unsupported("LLQ SQ refused")); }
+                r => r?,
+            };
             let sq_db = u32::from_le_bytes([r[12], r[13], r[14], r[15]]) as usize;
+            if dev { self.llq_off = u32::from_le_bytes([r[16], r[17], r[18], r[19]]) as usize; }
             let q = if dir == 0 { &mut self.tx } else { &mut self.rx };
             q.cq_db = cq_head_db;
             q.sq_db = sq_db;
@@ -704,6 +843,7 @@ impl<B: EnaBus> Ena<B> {
             None => { self.stats.tx_full += 1; return false; }
         };
         let len = frame.len().max(MIN_FRAME);
+        if let Some(cfg) = self.llq { return self.send_llq(cfg, id, frame, len); }
         let (page, off) = self.tx.slot(id);
         page.copy_in(off, frame);
         if frame.len() < len { for i in frame.len()..len { page.w8(off + i, 0); } }
@@ -721,6 +861,47 @@ impl<B: EnaBus> Ena<B> {
         q.sq_tail = q.sq_tail.wrapping_add(1);
         if q.sq_tail & q.mask() == 0 { q.sq_phase = !q.sq_phase; }
         fence(Ordering::SeqCst);
+        let (db, tail) = (q.sq_db, q.sq_tail);
+        self.wr(db, tail as u32);
+        self.stats.tx_pkts += 1;
+        self.stats.tx_bytes += len as u64;
+        true
+    }
+
+    /// LLQ transmit: one entry = [meta desc][packet desc][pad descs] followed by
+    /// the first bytes of the frame (the pushed header); the remainder is read
+    /// by the device from the host slot, right after the pushed bytes.
+    fn send_llq(&mut self, cfg: LlqCfg, id: u16, frame: &[u8], len: usize) -> bool {
+        let (page, off) = self.tx.slot(id);
+        page.copy_in(off, frame);
+        for i in frame.len()..len { page.w8(off + i, 0); }
+        let mut hs = cfg.header_space();
+        if self.info.max_header != 0 { hs = hs.min(self.info.max_header as usize); }
+        let hl = len.min(hs);
+        let pa = self.tx.slot_pa(id) + hl as u64;
+        let phase = self.tx.sq_phase as u32;
+        let mut e = [0u8; 256];
+        let mut pkt = 0;
+        if cfg.before >= 2 {
+            // Meta descriptor, no offloads: meta bit 23, phase bit 24.
+            e[0..4].copy_from_slice(&(1u32 << 23 | phase << 24).to_le_bytes());
+            pkt = 1;
+        }
+        let d = pkt * 16;
+        let w0 = len as u32 | ((id as u32 >> 10) & 0x3f) << 16 | phase << 24 | 1 << 26 | 1 << 27 | 1 << 28;
+        e[d..d + 4].copy_from_slice(&w0.to_le_bytes());
+        e[d + 4..d + 8].copy_from_slice(&((id as u32 & 0x3ff) << 22).to_le_bytes());
+        e[d + 8..d + 12].copy_from_slice(&(pa as u32).to_le_bytes());
+        e[d + 12..d + 16].copy_from_slice(&(((pa >> 32) as u32 & 0xffff) | (hl as u32) << 24).to_le_bytes());
+        let h0 = cfg.before * 16;
+        e[h0..h0 + hl].copy_from_slice(&page_bytes(&page, off, hl));
+        let q = &mut self.tx;
+        let at = self.llq_off + (q.sq_tail & q.mask()) as usize * cfg.entry_size;
+        self.bus.llq_write(at, &e[..cfg.entry_size]);
+        q.sq_tail = q.sq_tail.wrapping_add(1);
+        if q.sq_tail & q.mask() == 0 { q.sq_phase = !q.sq_phase; }
+        // Flush the write-combining buffers before the device is told.
+        self.bus.wmb();
         let (db, tail) = (q.sq_db, q.sq_tail);
         self.wr(db, tail as u32);
         self.stats.tx_pkts += 1;
