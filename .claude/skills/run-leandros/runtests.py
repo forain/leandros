@@ -49,6 +49,7 @@ Options:
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
                              podpasta host:podpastatest.py alone (rootless podman on pasta: echo, host wget, -p port-forward, dns, churn, no leaks)
+                             podsmoke host:podsmoketest.py alone (root podman run --rm alpine echo hi; skips without the alpine image)
                              podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks)
                              podpause host:podpausetest.py alone (podman pause/unpause freezes and resumes a container)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
@@ -215,6 +216,14 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Link flap/watch (own boot, ~110 s on both arches; lane suiteharness).
+                "host:netwatchtest.py",
+                # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
+                "host:blkhangtest.py",
+                # Input event paths in the running VM (lane regresscov2; ~20 s total).
+                "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
+                # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
+                "host:podsmoketest.py",
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
                 # stops this VM, so it must come after every suite that uses it.
                 "host:f2fsnidtest.py",
@@ -223,6 +232,8 @@ SUITES = {
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
+                # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
+                "host:blanktest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -256,6 +267,8 @@ SUITES = {
     "nettag2": ["host:nettag2test.py"],
     # Narrow kernel parks: console poll/epoll, empty poll sets, VT_WAITACTIVE.
     "kparks": ["host:kparkstest.py"],
+    # Root `podman run --rm alpine echo hi` (skips without the LEANDROS_IMAGE_ARCHIVE image).
+    "podsmoke": ["host:podsmoketest.py"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # podman pause/unpause freeze and resume a container (needs LEANDROS_IMAGE_ARCHIVE image).
@@ -303,6 +316,26 @@ SUITES = {
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
     "f2fsgc": ["host:f2fsgctest.py"],
+    "a64acpi": ["host:a64acpitest.py"],
+    "blank": ["host:blanktest.py"],
+    "blkhang": ["host:blkhangtest.py"],
+    "espreset": ["host:espresettest.py"],
+    "evbtn": ["host:evbtntest.py"],
+    "evclock": ["host:evclocktest.py"],
+    "f2fscp": ["host:f2fscptest.py"],
+    "f2fscrash": ["host:f2fscrashtest.py"],
+    "f2fsfull": ["host:f2fsfulltest.py"],
+    "f2fsorphan": ["host:f2fsorphantest.py"],
+    "hidkey": ["host:hidkeytest.py"],
+    "netwatch": ["host:netwatchtest.py"],
+    "nvmemsix": ["host:nvmemsixtest.py"],
+    "pagecache-crash": ["host:pagecache-crashtest.py"],
+    "powerctl": ["host:powerctltest.py"],
+    "reboot": ["host:reboottest.py"],
+    "trialwatch": ["host:trialwatchtest.py"],
+    "uartgap": ["host:uartgaptest.py"],
+    "usbstall": ["host:usbstalltest.py"],
+    "usbunplug": ["host:usbunplugtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -387,7 +420,8 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900,
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200}
 
 
 def find_fails(out):

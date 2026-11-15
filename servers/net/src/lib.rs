@@ -5017,6 +5017,13 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>, scope: 
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
+        // An address a bridge (or other vif) of the initial netns holds, e.g.
+        // aardvark-dns on 10.89.0.1:53: the socket lives on that stack, not
+        // the default NIC's, or the containers' datagrams never reach it.
+        if let Some(sid) = vif::ns_sids_dyn(0).into_iter().find(|&sid| match *stack_for(sid) {
+            Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == a),
+            None => false,
+        }) { return Ok(sid); }
     }
     if let Some(d) = dest.filter(|d| ip6::needs_scope(*d)) { return ip6::scope_sid(ns, scope); }
     match dest {
