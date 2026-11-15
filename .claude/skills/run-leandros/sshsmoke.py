@@ -909,10 +909,18 @@ def new_preauth(ssh, user, pw, before):
 
 
 PS_DETAIL = r"""for p in /proc/[0-9]*; do
-n=$(sed -n 's/^Name:[[:space:]]*//p' $p/status 2>/dev/null)
-case "$n" in sshd*)
-echo "${p#/proc/}|$(sed -n 's/^PPid:[[:space:]]*//p' $p/status)|$n|$(sed -n 's/^Uid:[[:space:]]*//p' $p/status | tr -s '[:space:]' ,)|$(sed -n 's/^NoNewPrivs:[[:space:]]*//p' $p/status)|$(sed -n 's/^Seccomp:[[:space:]]*//p' $p/status)|$(readlink $p/root)|$(for f in $p/fd/*; do readlink $f; done 2>/dev/null | grep -c -e '/etc/ssh' -e '/etc/shadow')";;
-esac
+read k n < $p/status
+m=${n#sshd}
+if [ x$m != x$n ]; then
+pp=; uid=; nnp=; sc=
+while read k v w; do
+case $k in PPid:) pp=$v;; Uid:) uid=$v,$w;; NoNewPrivs:) nnp=$v;; Seccomp:) sc=$v;; esac
+done < $p/status
+rt=$(readlink $p/root)
+kf=0
+for f in $p/fd/*; do case $(readlink $f) in /etc/ssh*|/etc/shadow*) kf=$((kf+1));; esac; done
+echo ${p#/proc/}\\|$pp\\|$n\\|$uid\\|$nnp\\|$sc\\|$rt\\|$kf
+fi
 done"""
 
 
@@ -983,8 +991,10 @@ def privsep_hooks(ssh, user, pw, tmp):
         key = os.path.join(tmp, "hookkey")
         if not os.path.exists(key):
             subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        # The key must be authorized so the child reaches the signature step (where forgeauth tampers).
+        set_keys(ssh, user, pw, open(key + ".pub").read().strip() + "\n" + open(ssh.key + ".pub").read().strip())
         r = subprocess.run(["ssh", "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
-                            "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=20", "-p", str(lp), "root@127.0.0.1", "id -u"],
+                            "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=20", "-p", str(lp), f"{user}@127.0.0.1", "id -u"],
                            capture_output=True, text=True, timeout=60)
         _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log")
         procs = sshd_procs(ssh, user, pw)
@@ -996,6 +1006,8 @@ def privsep_hooks(ssh, user, pw, tmp):
         step(name, ok, f"rc={r.returncode} out={r.stdout.strip()!r} listener={listener_up} log={lg[-200:]!r}")
         stop(tun)
         sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+    if os.path.exists(ssh.key + ".pub"):
+        set_keys(ssh, user, pw, open(ssh.key + ".pub").read().strip())
 
 
 def privsep_grace(ssh, user, pw, tmp):
