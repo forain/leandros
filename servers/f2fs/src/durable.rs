@@ -347,9 +347,7 @@ fn commit_pack(dev: usize, big: bool, cp_blkno: u64, payload: u32, cp_buf: &[u8;
         if !dws(dev, cp_blkno + 1, &z, cmds) { return (false, false); }
     }
     if !(write_tail(dev, tail_at, cp_buf, zero, sums, cmds) && dflush(dev)) { return (false, false); }
-    let mut real = *cp_buf;
-    real[crate::CP_OWN_VER..CP_CRC_OFF].fill(0);
-    cp_seal(&mut real);
+    let real = crate::lxchain::head_block(cp_buf, true);
     (dw(dev, cp_blkno, &real), true)
 }
 

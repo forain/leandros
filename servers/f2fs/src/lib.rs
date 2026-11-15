@@ -20,6 +20,7 @@ use spin::Mutex;
 use drivers::blkdev as virtio_blk;
 
 mod cpflags;
+mod lxchain;
 mod durable;
 
 // ── VFS protocol constants ────────────────────────────────────────────────────
@@ -259,6 +260,8 @@ const NODE_OFS_IND2: u32 = 4 + LX_N;
 const NODE_OFS_DIND: u32 = 5 + 2 * LX_N;
 /// `XATTR_NODE_OFFSET`.
 const NODE_OFS_XATTR: u32 = 0x1FFF_FFFF;
+const _: () = assert!(lxchain::LX_N == LX_N && lxchain::OFS_IND1 == NODE_OFS_IND1 && lxchain::OFS_IND2 == NODE_OFS_IND2
+                      && lxchain::OFS_DIND == NODE_OFS_DIND && lxchain::CP_OWN_VER == CP_OWN_VER);
 /// Offset of the direct node at `i_nid[slot]` (slot 0/1 = dnode1/2).
 fn node_ofs_dnode(slot: usize) -> u32 { 1 + slot as u32 }
 /// Offset of the indirect node at `i_nid[slot]` (slot 2/3).
@@ -3810,8 +3813,7 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
 }
 
 fn ofs_bad(e: &durable::LxChain) -> bool {
-    let dn = |o: u32| o != NODE_OFS_IND1 && o != NODE_OFS_IND2 && o != NODE_OFS_DIND
-        && !(o > NODE_OFS_DIND && (o - NODE_OFS_DIND - 1) % (LX_N + 1) == 0);
+    let dn = |o: u32| !lxchain::lx_ofs_indirect(o);
     e.nid == 0 || (e.ofs == 0) != (e.nid == e.ino)
         || (e.ofs != 0 && e.ofs != NODE_OFS_XATTR && !dn(e.ofs))
 }
