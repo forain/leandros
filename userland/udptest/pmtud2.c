@@ -190,8 +190,8 @@ static void udp6_pmtud(void) {
             int on2 = 2; setsockopt(raw, IPPROTO_IPV6, IPV6_CHECKSUM, &on2, sizeof on2);
             if (sendto(raw, m, sizeof m, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof m)
                 snprintf(why, sizeof why, "inject packet-too-big: %s", strerror(errno));
+            msleep(200); /* send before close: a closed socket drops its queued packet */
             close(raw);
-            msleep(200);
         }
     }
     if (!why[0]) {
