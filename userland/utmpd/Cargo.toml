@@ -1,0 +1,11 @@
+[package]
+name = "leandros-utmpd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "utmpd"
+path = "src/main.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

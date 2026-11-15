@@ -120,7 +120,7 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 | Gap | Notes |
 |---|---|
 | No real PAM stack | `pam-leandros` implements the application ABI greetd needs (including the environment table, which *is* greetd's session `envp`); `open_session`/`setcred` are stubs, which is correct for greetd. Whether to keep extending it or port Linux-PAM (which `dlopen`s its modules) is undecided. |
-| No utmpx | Nothing writes `utmp`/`wtmp`; no shipped program is known to read them. |
+| utmpx is plain files | `/run/utmps/utmp`, `/var/log/wtmp` and `/var/log/lastlog` are written directly by `login`, init, sshd and the PAM shim (all root) with no locking beyond `flock`; the `utmpd` socket accepts `putline` only from uid 0. See [../userland/programs.md](../userland/programs.md#utmpx). |
 | Private IPC syscalls unchecked | `SYS_IPC_SEND` to any port id, `SYS_SPAWN` and the debug serial-write syscall carry no credential checks. |
 | Coarse host privilege | Capabilities and user namespaces exist ([../kernel/namespaces.md](../kernel/namespaces.md)), but most host-wide checks (module load, device nodes, raw sockets, rlimit raises) test euid 0 in the initial namespace rather than an individual capability. |
 | rlimits stored, mostly not enforced | Only `RLIMIT_NICE` and `RLIMIT_RTPRIO` act; all others default to unlimited. |
