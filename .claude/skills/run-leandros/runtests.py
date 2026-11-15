@@ -107,7 +107,7 @@ SYSFS_CHECK = (
     "t input_name 'grep -q Keyboard /sys/class/input/event0/device/name && grep -q Tablet /sys/class/input/event1/device/name'; "
     "t input_caps 'test -s /sys/class/input/event0/device/capabilities/ev && test -s /sys/class/input/event1/device/capabilities/abs'; "
     "t input_dev_char 'test -d /sys/dev/char/13:65/device/id'; "
-    "exit $__f"
+    "test $__f = 0"
 )
 
 SUITES = {
