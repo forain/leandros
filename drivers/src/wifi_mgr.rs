@@ -1334,7 +1334,20 @@ fn attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: Req) -> After {
     let raw = KConnCtx { ctx: &back as *const CxBack as usize, step: cx_step, aborted: cx_aborted, left_ms: cx_left_ms, sleep: cx_sleep };
     let cx = ConnCtx::from_raw(&raw);
     mgr.set_state(wifi_state::AUTHENTICATING, reason::NONE);
-    let res = r.connect(&hit, &req.ssid, a, req.secret.as_bytes(), &cx);
+    let mut a = a;
+    let mut res = r.connect(&hit, &req.ssid, a, req.secret.as_bytes(), &cx);
+    // WPA3 transition mode: SAE is preferred, the passphrase also works as a
+    // PSK, so an AP whose SAE does not work is joined the old way. A wrong
+    // key, a newer command or the deadline are not SAE problems.
+    if let Err(f) = &res {
+        if a == akm::SAE && req.akm == akm::AUTO && nc.ext & bss_ext::TRANSITION != 0 && caps & wifi_caps::PSK != 0
+            && !matches!(f.reason, reason::WRONG_KEY | reason::SUPERSEDED | reason::TIMEOUT) && !mgr.preempt_pending() {
+            mgr.log(&alloc::format!("SAE with {} failed ({}); the network is in WPA3 transition mode, falling back to WPA2-PSK", fmt_mac(&nc.bssid), f.msg));
+            a = akm::PSK;
+            mgr.set_state(wifi_state::AUTHENTICATING, reason::NONE);
+            res = r.connect(&hit, &req.ssid, a, req.secret.as_bytes(), &cx);
+        }
+    }
     if let Err(f) = res {
         let f = if f.reason == reason::SUPERSEDED && !mgr.preempt_pending() && cx.left_ms() == 0 {
             Fail::new(reason::TIMEOUT, "connect deadline passed")
@@ -1356,6 +1369,23 @@ fn attempt<R: Radio>(mgr: &Mgr, r: &mut R, req: Req) -> After {
     mgr.set_state(wifi_state::CONNECTED, reason::NONE);
     mgr.log(&alloc::format!("connected to '{}' in {} ms", wf::ssid_display(&req.ssid), now_ms() - t0));
     connected(mgr, r, &req, nc.bssid)
+}
+
+/// A BSS of the connected ESS that is worth roaming to: joinable, fresh in
+/// the cache and `ROAM_MARGIN_DB` stronger than the current one.
+fn roam_target(mgr: &Mgr, req: &Req, cur: [u8; 6]) -> Option<[u8; 6]> {
+    let st = mgr.st.lock();
+    let now = now_ms();
+    let cur_dbm = st.ws.signal_dbm as i32;
+    let mut best: Option<(i32, [u8; 6])> = None;
+    for e in st.bss.iter() {
+        if e.hit.bss.ssid != req.ssid || e.nc.bssid == cur || now - e.seen_ms > st.age_out_ms { continue; }
+        if e.nc.ext & bss_ext::JOINABLE == 0 { continue; }
+        if st.bss_rejected.iter().any(|(b, t)| *b == e.nc.bssid && now - *t < 60_000) { continue; }
+        let s = e.hit.rssi as i32;
+        if crate::wifi_pure::roam_better(cur_dbm, s) && best.map_or(true, |(bs, _)| s > bs) { best = Some((s, e.nc.bssid)); }
+    }
+    best.map(|(_, b)| b)
 }
 
 fn akm_name(a: u8) -> &'static str {
@@ -1414,6 +1444,13 @@ fn connected<R: Radio>(mgr: &Mgr, r: &mut R, req: &Req, bssid: [u8; 6]) -> After
                 if r.caps() & wifi_caps::SCAN_CONNECTED != 0 && connected_bg_scan_due(now - last_bg, dbm) {
                     last_bg = now;
                     do_scan(mgr, r, &[], true, true, Some(bssid));
+                    if r.caps() & wifi_caps::ROAM != 0 {
+                        if let Some(t) = roam_target(mgr, req, bssid) {
+                            mgr.log(&alloc::format!("roaming '{}' {} -> {} (stronger BSS of the same network)", wf::ssid_display(&req.ssid), fmt_mac(&bssid), fmt_mac(&t)));
+                            return After::Next(Req { attempt: req.attempt, uuid: req.uuid, ssid: req.ssid.clone(), bssid: Some(t), akm: req.akm,
+                                                     hidden: req.hidden, secret: req.secret.clone(), auto: req.auto });
+                        }
+                    }
                 }
                 continue;
             }

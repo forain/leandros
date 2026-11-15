@@ -1499,3 +1499,94 @@ pub fn tkip_frame_mic_ok(rx_mic: &[u8; 8], frame: &[u8], hdr_len: usize, icv_len
     let mic_at = end - 8;
     michael(rx_mic, da, sa, prio, &frame[hdr_len + 8..mic_at])[..] == frame[mic_at..end]
 }
+
+// ---------------------------------------------------------------------------
+// WPA3 / PMF: RSN IE with PMKID, BIP-CMAC-128, SA Query
+// ---------------------------------------------------------------------------
+
+/// RSN IE (CCMP pairwise, `group_suite` group cipher, one AKM suite type)
+/// with capabilities, an optional PMKID and, when `caps` has MFPC, the
+/// BIP-CMAC-128 group management cipher (so the PMKID list is present, empty
+/// if need be, as 802.11 requires).
+pub fn rsn_ie_build(group_suite: u32, akm: u8, caps: u16, pmkid: Option<&[u8; 16]>) -> Vec<u8> {
+    let mut ie = Vec::new();
+    ie.extend_from_slice(&[0x30, 0x00, 0x01, 0x00]);
+    ie.extend_from_slice(&group_suite.to_be_bytes());
+    ie.extend_from_slice(&[0x01, 0x00, 0x00, 0x0f, 0xac, 0x04]);
+    ie.extend_from_slice(&[0x01, 0x00, 0x00, 0x0f, 0xac, akm]);
+    ie.extend_from_slice(&caps.to_le_bytes());
+    let mgmt = caps & RSN_CAP_MFPC != 0;
+    if pmkid.is_some() || mgmt {
+        match pmkid {
+            Some(p) => { ie.extend_from_slice(&[0x01, 0x00]); ie.extend_from_slice(p); }
+            None => ie.extend_from_slice(&[0x00, 0x00]),
+        }
+    }
+    if mgmt { ie.extend_from_slice(&[0x00, 0x0f, 0xac, 0x06]); }
+    ie[1] = (ie.len() - 2) as u8;
+    ie
+}
+
+/// Management Frame MIC element: id 76, length 16 (BIP-CMAC-128: KeyID(2),
+/// IPN(6), MIC(8)).
+pub const MMIE_LEN: usize = 18;
+
+/// MIC of a BIP-protected group-addressed management frame (802.11-2020
+/// 12.5.4.3): AES-CMAC over the AAD (frame control without Retry / PwrMgt /
+/// MoreData, A1, A2, A3) and the frame body whose MMIE MIC field is zero,
+/// truncated to 8 bytes.
+pub fn bip_mic(igtk: &[u8; 16], fc: u16, a1: &[u8; 6], a2: &[u8; 6], a3: &[u8; 6], body_zero_mic: &[u8]) -> [u8; 8] {
+    let fc = fc & !((1 << 11) | (1 << 12) | (1 << 13));
+    let fcb = fc.to_le_bytes();
+    let m = aes_cmac(igtk, &[&fcb, a1, a2, a3, body_zero_mic]);
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&m[..8]);
+    o
+}
+
+/// Append an MMIE to `body` and fill its MIC (the sender side, used by the
+/// simulated AP).
+pub fn bip_protect(igtk: &[u8; 16], key_id: u16, ipn: u64, fc: u16, a1: &[u8; 6], a2: &[u8; 6], a3: &[u8; 6], body: &[u8]) -> Vec<u8> {
+    let mut b = body.to_vec();
+    b.extend_from_slice(&[76, 16]);
+    b.extend_from_slice(&key_id.to_le_bytes());
+    b.extend_from_slice(&ipn.to_le_bytes()[..6]);
+    b.extend_from_slice(&[0u8; 8]);
+    let mic = bip_mic(igtk, fc, a1, a2, a3, &b);
+    let n = b.len();
+    b[n - 8..].copy_from_slice(&mic);
+    b
+}
+
+/// Verify a BIP-protected management frame body (MMIE last): the MIC, the key
+/// id and the replay counter (`last_ipn` is advanced on success).
+pub fn bip_verify(igtk: &[u8; 16], key_id: u16, last_ipn: &mut u64, fc: u16, a1: &[u8; 6], a2: &[u8; 6], a3: &[u8; 6], body: &[u8]) -> bool {
+    if body.len() < MMIE_LEN { return false; }
+    let m = body.len() - MMIE_LEN;
+    if body[m] != 76 || body[m + 1] != 16 { return false; }
+    if u16::from_le_bytes([body[m + 2], body[m + 3]]) != key_id { return false; }
+    let mut ib = [0u8; 8];
+    ib[..6].copy_from_slice(&body[m + 4..m + 10]);
+    let ipn = u64::from_le_bytes(ib);
+    if ipn <= *last_ipn { return false; }
+    let mut z = body.to_vec();
+    let n = z.len();
+    for x in z[n - 8..].iter_mut() { *x = 0; }
+    let want = bip_mic(igtk, fc, a1, a2, a3, &z);
+    let mut d = 0u8;
+    for i in 0..8 { d |= want[i] ^ body[n - 8 + i]; }
+    if d != 0 { return false; }
+    *last_ipn = ipn;
+    true
+}
+
+/// SA Query action frame body (category 8): request (0) or response (1).
+pub fn sa_query_frame(response: bool, transaction: u16) -> [u8; 4] {
+    let t = transaction.to_le_bytes();
+    [8, response as u8, t[0], t[1]]
+}
+
+/// The response a station sends to an SA Query request body, if it is one.
+pub fn sa_query_response(req: &[u8]) -> Option<[u8; 4]> {
+    if req.len() >= 4 && req[0] == 8 && req[1] == 0 { Some([8, 1, req[2], req[3]]) } else { None }
+}

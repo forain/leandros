@@ -47,8 +47,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **sshd**: privilege separation, `authorized_keys` options, keyboard-interactive, forwarding, MaxStartups; password hashes are single-pass salted SHA-256.
 
 ### Network / Wi-Fi
+- **WPA3 on real hardware**: SAE/PMF/roaming exist in the connection manager and are green against `wifisim`, but the Intel (iwlwifi) and brcmf radios do not report `wifi_caps::SAE`/`PMF`/`ROAM` yet (firmware key install for BIP/IGTK, SAE auth frames), and the SAE exchange is unverified against a real WPA3 AP (no WPA3 network was available to the lane).
 - **iwlwifi**: HT40 on 2.4 GHz (`iwlwifi.ht40_24`, coexistence check in `wifi_ht::coex_40_24`) is implemented but unverified on hardware (no 40 MHz 2.4 GHz AP seen; the only reachable AP advertises 20 MHz). 5 GHz is untested (needs the user's 5 GHz SSID/passphrase on the stick). Throughput vs Linux not measured. Rate-control idea: column re-entry hysteresis / stay-in-column timer in `iwl_rs.rs`.
-- **WPA3 / MFP-required networks** and Wi-Fi roaming polish.
 
 ### Desktop / apps
 - **xdg-desktop-portal** (screenshot, file chooser), timedate1, SwitcherooControl and the a11y bus D-Bus services.
