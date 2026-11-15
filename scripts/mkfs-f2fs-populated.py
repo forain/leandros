@@ -720,7 +720,7 @@ def main():
     shadow_lines = (
         f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
         f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
-        "sshd:!:::::::\n"
+        "sshd:!:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
