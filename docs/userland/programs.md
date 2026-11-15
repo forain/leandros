@@ -69,7 +69,7 @@ authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shu
 crypto) on tokio. The root listener only accepts: it re-execs `sshd -R` once per
 connection (socket on fd 3, startup pipe on fd 4), so a crash in one connection kills only
 that connection, never the listener or other sessions (and init's restart limit cannot trip).
-Each connection is then split into a root monitor and an unprivileged, chrooted, seccomp'd net child (see [../design/sshd-privsep.md](../design/sshd-privsep.md)). The vendored russh provides the two hooks of the vendored russh (`userland/sshd/vendor/russh`, see its
+Each connection is then split into a root monitor and an unprivileged, chrooted, seccomp'd net child (see [../design/sshd-privsep.md](../design/sshd-privsep.md)). The vendored russh (`userland/sshd/vendor/russh`, see its
 `LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
 the session id, and every publickey/certificate login has its raw signature re-verified
 against that session id (`src/userauth.rs`) before the authorized_keys check. SHA-1 `ssh-rsa` publickey signatures are refused (as OpenSSH 8.8+ does by default); use `rsa-sha2-256`/`rsa-sha2-512`. This is the
