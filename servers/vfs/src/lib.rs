@@ -7785,9 +7785,14 @@ fn gen_kmod_initrd() -> Option<VnodeKind> {
 /// `name value` per line; counters are cumulative pages since boot.
 /// f2fs no-I/O request reruns / requests that gave up (cumulative), and the
 /// request to drop the clean block cache (`/proc/f2fsdropcache`, test knob).
+/// /proc/f2fsstat counters of the f2fs server's checkpoint and fsync paths (lane f2fsnlog1).
+pub static F2FS_CP_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_RF_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_LX_CHAINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_LX_FALLBACK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_LX_NODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_NOIO_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_NOIO_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static F2FS_CP_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_DROP_CLEAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// `/proc/f2fsstat`: `noio_rounds N` and `noio_gave_up N`. Reading
@@ -7808,6 +7813,10 @@ fn gen_f2fsstat(drop: bool) -> Option<VnodeKind> {
     put("noio_rounds", F2FS_NOIO_ROUNDS.load(Relaxed));
     put("noio_gave_up", F2FS_NOIO_GAVE_UP.load(Relaxed));
     put("cp_total", F2FS_CP_TOTAL.load(Relaxed));
+    put("rf_count", F2FS_RF_COUNT.load(Relaxed));
+    put("lx_chained", F2FS_LX_CHAINED.load(Relaxed));
+    put("lx_fallback", F2FS_LX_FALLBACK.load(Relaxed));
+    put("lx_nodes", F2FS_LX_NODES.load(Relaxed));
     proc_snapshot(b"/tmp/.f2fsstat", &out, false)
 }
 

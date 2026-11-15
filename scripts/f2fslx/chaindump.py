@@ -128,6 +128,8 @@ def ofs_kind(ofs, nid, ino):
     """inode | dnode | xattr | indirect (node offsets per Linux fs/f2fs/node.h, 4 KiB / NIDS_PER_BLOCK 1018)."""
     if ofs == 0:
         return "inode"
+    if ofs == 0x1FFFFFFF:  # XATTR_NODE_OFFSET (29-bit all ones)
+        return "xattr"
     if ofs == 1:  # NODE_DIR1_BLOCK region begins; offsets 1,2 are direct (ADDRS_PER_INODE area)
         return "dnode"
     if ofs == 2:
@@ -214,6 +216,12 @@ def main(argv):
         if kind == "?": bad.append(f"I4: node {a} has unknown ofs {ofs}")
         if strict and not fs: bad.append(f"I3: node {a} lacks FSYNC")
         if dent and nid != ino: bad.append(f"I3: DENT on non-inode {a}")
+        # M3 (Linux-fatal): a DENT inode must be new this era, its parent must be in the CP NAT.
+        if dent and nid == ino:
+            if sit.nat_addr(ino): bad.append(f"M3: DENT inode {ino} is already in the CP NAT")
+            pino = struct.unpack_from("<I", b, 84)[0]
+            if not sit.nat_addr(pino): bad.append(f"M3: DENT inode {ino}: parent {pino} is not in the CP NAT")
+        if kind == "inode" and struct.unpack_from("<I", b, 88)[0] > 255: bad.append(f"M3: inode {ino} namelen > 255")
         # I7: Linux f2fs_inode_chksum over the whole block (footer included) with the field zeroed
         if kind == "inode" and im.feat & 0x800 and b[3] & 0x20:
             o = 368
