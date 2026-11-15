@@ -1,0 +1,26 @@
+[package]
+name = "utmptools"
+version.workspace = true
+edition.workspace = true
+
+# `w`, `users`, `lastlog`: readers for /run/utmps/utmp and /var/log/lastlog
+# (Linux formats). `utmptest`: their conformance test plus the 20-concurrent-
+# writers corruption test (regress suite).
+[[bin]]
+name = "w"
+path = "src/w.rs"
+
+[[bin]]
+name = "users"
+path = "src/users.rs"
+
+[[bin]]
+name = "lastlog"
+path = "src/lastlog.rs"
+
+[[bin]]
+name = "utmptest"
+path = "src/test.rs"
+
+[dependencies]
+leandros-libc = { path = "../libc" }

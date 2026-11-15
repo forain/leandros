@@ -19,6 +19,7 @@ use ipc::{Message, port};
 use spin::Mutex;
 use drivers::blkdev as virtio_blk;
 
+mod cpflags;
 mod durable;
 
 // ── VFS protocol constants ────────────────────────────────────────────────────
@@ -145,10 +146,6 @@ const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x800;
 /// Flip once linux_import preserves Linux's current-segment summaries.
 const NATIVE_IMPORT_SAFE: bool = true;
 const FEAT_BLKZONED: u32 = 0x2;
-const CP_ERROR_FLAG:     u32 = 0x0000_0008;
-const CP_FSCK_FLAG:      u32 = 0x0000_0010;
-const CP_QUOTA_NEED_FSCK: u32 = 0x0000_0400;
-const CP_DISABLED_FLAG:  u32 = 0x0000_1000;
 const LX_TAG: &[u8] = b"LeandrOS lxnode";
 
 // Checkpoint offsets (within a checkpoint block)
@@ -195,7 +192,6 @@ const CP_OWN_VER:        usize = 2048;
 const CP_VER_BITMAP:     usize = 192;
 const CP_ORPHAN_PRESENT: u32   = 0x0000_0002;
 const CP_COMPACT_SUM:    u32   = 0x0000_0004;
-const CP_LARGE_NAT_BM:   u32   = 0x0000_0200;
 const CP_UMOUNT_FLAG:    u32   = 0x0000_0001;
 
 // Inode (node block) field offsets
@@ -3781,12 +3777,13 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
     let off = r16(cp, CP_CUR_NODE_BLKOFF + 2) as u64;
     let bps = sb.blocks_per_seg as u64;
     if seg >= sb.seg_cnt_main as u64 || off >= bps { return None; }
-    let mut want = r64(cp, CP_VER);
-    if flags & 0x40 != 0 {
+    let ver = r64(cp, CP_VER);
+    let crc = if cpflags::cp_crc_recovery(flags) {
         let co = r32(cp, durable::CP_CHKSUM_FIELD) as usize;
         if co + 4 > BLOCK_SIZE { return None; }
-        want |= (r32(cp, co) as u64) << 32;
-    }
+        Some(r32(cp, co))
+    } else { None };
+    let want = cpflags::chain_want(ver, crc, flags)?;
     let main = sb.main_blkaddr as u64;
     let end = main + sb.seg_cnt_main as u64 * bps;
     let ft = NODE_FOOTER;
@@ -3796,10 +3793,10 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
     while addr >= main && addr < end {
         if all.len() > 100_000 { return None; }
         if !virtio_blk::read_block(dev, addr, &mut b) { return None; }
-        if r64(&b, ft + 12) != want { break; }
+        if !cpflags::chain_matches(want, r64(&b, ft + 12), flags) { break; }
         let (nid, ino, fl) = (r32(&b, ft), r32(&b, ft + 4), r32(&b, ft + 8));
         let ofs = fl >> 3;
-        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, fl & 6 != 0));
+        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, cpflags::node_is_fsync_mark(fl)));
         addr = r32(&b, ft + 20) as u64;
     }
     let mut out = alloc::vec::Vec::new();
@@ -3885,7 +3882,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     // cp_payload > 0: the NAT bitmap stays in the commit block, the SIT bitmap
     // moves to the payload blocks after it (Linux `__bitmap_ptr`).
     let payload = sb.cp_payload as usize;
-    if flags & CP_LARGE_NAT_BM != 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
+    if cpflags::cp_large_nat_bitmap(flags) || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
     if payload > 0 {
         if CP_VER_BITMAP + nat_sz > durable::CP_CRC_OFF || sit_sz > payload * BLOCK_SIZE { bail!("bitmap-layout"); }
     } else if CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF { bail!("bitmap-layout"); }
@@ -9352,9 +9349,16 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
     let foreign = if pick1 { foreign1 } else { foreign0 };
     let mut lx_chain: alloc::vec::Vec<durable::LxChain> = alloc::vec::Vec::new();
+    // A large NAT bitmap lives outside the commit block's private area: this
+    // server cannot read or write that layout, and such a checkpoint is never
+    // "foreign" (its checksum_offset is the legacy one), so refuse rw here.
+    if cpflags::cp_large_nat_bitmap(cp.flags) && !read_only {
+        dbg_str("[F2FS] checkpoint uses a large NAT bitmap; mounting read-only\n");
+        read_only = true;
+    }
     if foreign || sb.native {
         let fl = cp.flags;
-        let why = if fl & (CP_FSCK_FLAG | CP_ERROR_FLAG | CP_DISABLED_FLAG | CP_QUOTA_NEED_FSCK) != 0 {
+        let why = if cpflags::cp_needs_fsck(fl) {
             Some("checkpoint flags ask for fsck or report an error")
         } else if foreign && fl & CP_UMOUNT_FLAG == 0 && !{
             // Unclean Linux shutdown: fine when the fsync chain (if any) can

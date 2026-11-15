@@ -389,6 +389,13 @@ name = "uptrtest"
 version = "0.1.0"
 
 [[package]]
+name = "utmptools"
+version = "0.1.0"
+dependencies = [
+ "leandros-libc",
+]
+
+[[package]]
 name = "venustest"
 version = "0.1.0"
 
