@@ -10,6 +10,7 @@ extern crate leandros_libc;
 use leandros_libc::*;
 
 mod churn;
+mod commit;
 mod crash;
 mod full;
 mod orphan;
@@ -41,6 +42,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return crash::crash(dir, seed);
             }
             b"crashscan" => return crash::crashscan(dir),
+            b"commitunk" => return commit::commitunk(dir),
+            b"commitscan" => return commit::commitscan(dir),
             b"fullchurn" | b"fullscan" => {
                 let num = |i: usize, d: u64| if argc as usize > i {
                     arg(argv, i).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)

@@ -254,6 +254,11 @@ pub(crate) fn crash_arm(dev: usize, mount_point: &str) {
         CPFAIL_DEV.store(dev, atomic::Ordering::SeqCst);
         dbg_str("[F2FS] cpfail test armed: every 3rd checkpoint snapshot fails\n");
     }
+    if let Some(k) = drivers::nvidia_probe::cmdline_opt("f2fs.cpunk") {
+        CPUNK_LEFT.store(k, atomic::Ordering::SeqCst);
+        CPUNK_DEV.store(dev, atomic::Ordering::SeqCst);
+        dbg_str("[F2FS] cpunk test armed: the K-th commit is reported failed after it landed\n");
+    }
     // `f2fs.crashpt_mount=K`: arm at the K-th such mount of this boot
     // (default 1), so the harness can check the previous crash first.
     static MOUNTS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
@@ -268,6 +273,22 @@ pub(crate) fn crash_arm(dev: usize, mount_point: &str) {
         CRASH_HIT.store(false, atomic::Ordering::SeqCst);
         dbg_str("[F2FS] crash test armed: writes stop after f2fs.crashpt device writes\n");
     }
+}
+
+/// `f2fs.cpunk=K` (test only): the K-th commit block written after the mount
+/// lands on the medium but is reported as failed, the "unknown outcome" of a
+/// commit write or its flush (a timeout, a link reset): see `CpIo::commit_sent`.
+static CPUNK_DEV: atomic::AtomicUsize = atomic::AtomicUsize::new(usize::MAX);
+static CPUNK_LEFT: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+fn cpunk_hit(dev: usize) -> bool {
+    if CPUNK_DEV.load(atomic::Ordering::Relaxed) != dev { return false; }
+    let n = CPUNK_LEFT.load(atomic::Ordering::SeqCst);
+    if n == 0 { return false; }
+    CPUNK_LEFT.store(n - 1, atomic::Ordering::SeqCst);
+    if n > 1 { return false; }
+    dbg_str("[F2FS] cpunk: commit block written, reported failed (unknown outcome)\n");
+    true
 }
 
 /// False: the write must be dropped and fail (the simulated power cut).
@@ -383,6 +404,12 @@ pub(crate) struct Durable {
     /// checkpoints).
     pub rf_next: u32,
     pub rf_end: u32,
+    /// A commit block was sent and its outcome is unknown (the write or the
+    /// flush after it failed): the device may hold the next era in the other
+    /// pack, so no record may go to this era's pack. Every fsync then takes a
+    /// full checkpoint until a later commit succeeds (`settle`).
+    /// Hook for the Linux node chain (`lx_open` must be false while set).
+    pub commit_unknown: bool,
     /// First block of the roll-forward area (for the 75% background trigger).
     pub rf_start: u32,
     pub rf_seq: u32,
@@ -406,7 +433,7 @@ impl Durable {
             tail_dirty: [true; 2],
             fresh_pending: BTreeMap::new(), fresh_inflight: BTreeMap::new(), nid_pending: BTreeSet::new(), nid_inflight: Vec::new(),
             nid_pool: Vec::new(), inflight_ver: 0, inflight_pack: 0, inflight_rf_start: 0,
-            durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, rf_start: 0, rf_seq: 0,
+            durable_ver: ver, durable_pack: pack, rf_next: 0, rf_end: 0, commit_unknown: false, rf_start: 0, rf_seq: 0,
             ns: BTreeMap::new(), rf_last: BTreeMap::new(),
             ext_free: 0, emerg_a: Vec::new(), emerg_b: Vec::new(),
         }
@@ -617,10 +644,17 @@ pub(crate) fn settle(ms: &mut MountState) {
         ms.dur.rf_end = if st == 0 { 0 } else { pack_room(ms) };
         ms.dur.rf_seq = 0;
         ms.dur.rf_last.clear();
+        ms.dur.commit_unknown = false;
         let done = cp_seq(ms.port).map_or(0, |s| s.done.load(atomic::Ordering::SeqCst));
         ms.dur.ns.retain(|_, e| e.0 > done);
         ms.dur.ext_free = count_ext_free(ms);
     } else {
+        if ms.dur.commit_unknown {
+            // The commit may be on the medium although we were told it failed:
+            // pack B can hold era N+1 while pack A is the one we know. A record
+            // appended to A would be lost behind B at the next mount.
+            ms.dur.rf_end = 0;
+        }
         prot_committed(ms, false);
         let ids = core::mem::take(&mut ms.dur.nid_inflight);
         ms.dur.nid_pending.extend(ids);
@@ -819,13 +853,13 @@ fn jwrite(job: &CpJob, k0: u32, data: &[u8], cmds: &mut u32) -> bool {
     ok
 }
 
-pub(crate) struct CpIo { pub ok: bool, pub home_ok: bool, pub reg_ns: [u64; REGS], pub reg_cmds: [u32; REGS], pub flush_ns: u64 }
+pub(crate) struct CpIo { pub ok: bool, pub home_ok: bool, pub commit_sent: bool, pub reg_ns: [u64; REGS], pub reg_cmds: [u32; REGS], pub flush_ns: u64 }
 
 /// Phase 2 (no filesystem lock needed): direct blocks and the journal, flush,
 /// the commit block, flush, then the journaled blocks home.
 pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     let dev = job.dev;
-    let mut io = CpIo { ok: true, home_ok: true, reg_ns: [0; REGS], reg_cmds: [0; REGS], flush_ns: 0 };
+    let mut io = CpIo { ok: true, home_ok: true, commit_sent: false, reg_ns: [0; REGS], reg_cmds: [0; REGS], flush_ns: 0 };
     for (r, (start, data)) in job.direct.iter().enumerate() {
         let reg = job.direct_reg.get(r).map_or(REG_DATA, |&g| g as usize);
         let t = sched::monotonic_ns();
@@ -860,6 +894,7 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     cp_seal(&mut job.cp_buf);
     let t = sched::monotonic_ns();
     io.reg_cmds[REG_CP] += 1;
+    io.commit_sent = true;
     // Linux's view of the pack, in the same flush as the commit block. Only a
     // big_cp volume reads it back, so elsewhere a failed write does not fail the commit.
     let (c_ok, t_ok) = commit_pack(dev, job.big, job.cp_blkno, job.payload, &job.cp_buf, job.pack_base + 1 + job.pack_cap as u64,
@@ -869,6 +904,7 @@ pub(crate) fn cp_write(job: &mut CpJob, port: u32) -> CpIo {
     let tf = sched::monotonic_ns();
     io.reg_ns[REG_CP] += tf.saturating_sub(t);
     io.ok &= dflush(dev);
+    if cpunk_hit(dev) { io.ok = false; }
     io.flush_ns += sched::monotonic_ns().saturating_sub(tf);
     if !io.ok { io.home_ok = false; return io; }
     if let Some(c) = committed_slot(port) { c.fetch_max(job.ver, atomic::Ordering::SeqCst); }
@@ -917,6 +953,7 @@ pub(crate) fn cp_finish(ms: &mut MountState, job: &CpJob, io: &CpIo) {
         }
     }
     if !io.ok { ms.dirty_writes = ms.dirty_writes.max(1); }
+    if io.commit_sent && !io.ok { ms.dur.commit_unknown = true; ms.dur.rf_end = 0; }
     settle(ms);
 }
 
@@ -1607,8 +1644,10 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         }
     }
     ok &= dflush(dev);
+    let mut sent = false;
     if ok {
         // Phase 2: the commit block.
+        sent = true;
         w32(&mut cp_buf, CPJ_CRC_OFF, crc);
         cp_seal(&mut cp_buf);
         let zero = core::mem::replace(&mut ms.dur.tail_dirty[pack as usize], false);
@@ -1618,6 +1657,7 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         ok &= c_ok;
         if !t_ok { ms.dur.tail_dirty[pack as usize] = true; }
         ok &= dflush(dev);
+        if cpunk_hit(dev) { ok = false; }
     }
     if ok {
         if let Some(c) = committed_slot(ms.port) { c.fetch_max(ver, atomic::Ordering::SeqCst); }
@@ -1630,6 +1670,8 @@ fn cp_emergency_in(ms: &mut MountState, umount: bool, a: &mut Vec<u32>, b: &mut 
         home_ok &= dflush(dev);
         if home_ok { for &i in b.iter() { ms.cache.set_flags(i as usize, false, false); } }
     }
+    // Same rule as `cp_finish`: a commit block sent whose outcome is unknown.
+    if sent && !ok { ms.dur.commit_unknown = true; ms.dur.rf_end = 0; }
     settle(ms);
     ok
 }
