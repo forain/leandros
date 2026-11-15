@@ -804,7 +804,7 @@ pub fn inject_deauth(kind: Spoof, reason: u16) -> bool {
     let mut g = HS.lock();
     let h = match g.as_mut() { Some(h) => h, None => return false };
     let b = match (h.igtk, kind) {
-        (Some((k, id)), Spoof::Valid) => { h.ap_ipn += 1; wc::bip_protect(&k, id, h.ap_ipn, 0x00c0, &bc, &bssid, &bssid, &body) }
+        (Some((k, id)), Spoof::Valid) => { h.ap_ipn = h.ap_ipn.max(h.bip_rx) + 1; wc::bip_protect(&k, id, h.ap_ipn, 0x00c0, &bc, &bssid, &bssid, &body) }
         (Some((k, id)), Spoof::Replay) => {
             h.bip_rx = h.bip_rx.max(1000);
             let n = h.bip_rx;
@@ -1777,6 +1777,7 @@ fn add_aps(list: &[(usize, &str, Sec, &str, i8, u8, &str)]) {
 /// WPA3-Personal, PMF and roaming against extra simulated APs.
 fn wpa3_selftest(t: &mut T) {
     let mut rng = |b: &mut [u8]| sched::random::fill(b);
+    PMKSA.lock().clear();
     let kat = sae::selftest(&mut rng);
     t.check("sae-known-answers", kat.is_ok(), alloc::format!("{:?}", kat));
     add_aps(&[(20, "SimHnP", Sec::Sae, "hnp-pass-12", -52, 6, "p"), (21, "SimClog", Sec::Sae, "clog-pass-12", -53, 6, "c"),
