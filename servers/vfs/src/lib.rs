@@ -7818,8 +7818,6 @@ fn gen_f2fsstat(drop: bool) -> Option<VnodeKind> {
     put("lx_chained", F2FS_LX_CHAINED.load(Relaxed));
     put("lx_fallback", F2FS_LX_FALLBACK.load(Relaxed));
     put("lx_nodes", F2FS_LX_NODES.load(Relaxed));
-=======
->>>>>>> main
     proc_snapshot(b"/tmp/.f2fsstat", &out, false)
 }
 
