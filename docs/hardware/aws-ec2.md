@@ -57,5 +57,23 @@ You provide:
   only (`EC2_SG_ID`).
 * A time cap (`EC2_MAX_MINUTES`) for any instance launch.
 
-Until the ENA driver lands, an instance has no network: use `get-console-output` or the EC2 Serial
+## ENA network driver and LLQ
+
+The ENA driver (`drivers/src/ena.rs`, core in `ena_hw.rs`) is polled and brings up one TX and one RX
+queue pair. If the device offers the **low-latency queue** (`GET_FEATURE LLQ`) and BAR2 maps, TX
+uses device placement: each frame is one 128-byte entry (two descriptors, then up to 96 bytes of
+header) written to BAR2, mapped write-combining (x86_64 PAT WC, aarch64 Normal-NC), followed by a
+write barrier (`sfence` / `dsb st`) and the SQ doorbell; the rest of the frame is read from host
+memory. Entry size falls back to 256 or 192 bytes per the caps. If the device has no LLQ caps, no
+usable layout, no BAR2, refuses the device-placement queue, or the cmdline has `ena.llq=0`, TX uses
+host placement. The boot log prints `[ena] LLQ active: ...` or the reason it is not used; the same
+facts are in `/proc/net/nic`.
+
+**Caveat: unproven on real hardware.** There is no QEMU ENA model. The register, admin command,
+descriptor and LLQ entry layouts (including the meta descriptor, the header-length field and the
+SET_FEATURE LLQ body) were written from memory of the public Linux/DPDK ENA headers, and the mock
+device in `drivers/ena-tests` encodes the same reading, so a misreading passes the tests. A real EC2
+instance (gate G1) is the only proof.
+
+Without a working ENA an instance has no network: use `get-console-output` or the EC2 Serial
 Console to observe it.
