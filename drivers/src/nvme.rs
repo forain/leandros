@@ -58,9 +58,9 @@
 //! Completion is polled: spin for the first 200 us, then — when the caller
 //! may sleep — park in short slices, else keep spinning with interrupt
 //! windows (the `usb_storage` contract). MSI-X (x86_64 only; aarch64 waits for
-//! the ITS) is opt-in on hardware we have never booted: on by default for the
-//! Amazon controllers (EBS, instance store), `nvme.msix=1` forces it,
-//! `nvme.msix=0` forces polling. One MSI-X vector serves the admin queue and
+//! the ITS) is opt-in (`nvme.msix=1`): on QEMU it measured no CPU win over
+//! the polled slices (see the lane note), so it stays off by default on
+//! hardware we have never booted; `nvme.msix=0` forces polling. One MSI-X vector serves the admin queue and
 //! the I/O CQ (IV 0); the ISR only counts and wakes the waiter, and a sleeping
 //! waiter still re-checks the CQ every 2 ms, so a lost interrupt costs 2 ms,
 //! never a hang. The spin phase (first 200 us) is unchanged.
@@ -167,7 +167,7 @@ static DISABLED: AtomicBool = AtomicBool::new(false);
 static QUIRK_AMZN: AtomicBool = AtomicBool::new(false);
 /// `nvme.rw=0` was given explicitly: keeps even an Amazon root disk read-only.
 static RW_FORCED_RO: AtomicBool = AtomicBool::new(false);
-/// `nvme.msix=`: 0 = polled, 1 = force MSI-X, 2 (unset) = auto (Amazon controllers only).
+/// `nvme.msix=`: 0 = polled, 1 = MSI-X, 2 (unset) = polled (opt-in).
 static MSIX_MODE: AtomicU8 = AtomicU8::new(2);
 /// `nvme.io_timeout=<seconds>`: I/O command timeout override (0 = default).
 static IO_TIMEOUT_S: AtomicU64 = AtomicU64::new(0);
@@ -1144,7 +1144,7 @@ fn probe(dev: &PciDevice, index: usize) {
     };
     let qsz = ((io_depth as u32 - 1) << 16) | 1;
     // MSI-X (x86_64): one vector for the admin CQ and the I/O CQ.
-    let want_msix = match MSIX_MODE.load(Ordering::Relaxed) { 0 => false, 1 => true, _ => amzn };
+    let want_msix = match MSIX_MODE.load(Ordering::Relaxed) { 0 => false, 1 => true, _ => false };
     if want_msix && cfg!(target_arch = "x86_64") && index < MAX_CTRLS && msix.is_some() {
         match MsixTable::enable(f) {
             Ok(tab) => match tab.request(0, nvme_irq as IrqHandler, index) {

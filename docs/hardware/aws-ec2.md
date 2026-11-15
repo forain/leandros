@@ -83,8 +83,8 @@ of the driver (`drivers/ena-tests`: vector assignment, unmask doorbells, complet
 10k-frame loopback without a lost wakeup, both fallbacks, reset recovery).
 
 **NVMe interrupts.** The NVMe driver also supports one MSI-X vector (admin + I/O CQ) on x86_64. It
-is on by default for Amazon EBS / instance-store controllers; `nvme.msix=1` forces it on any
-controller and `nvme.msix=0` forces polling. The first 200 us of a command still spin; after that a
+is opt-in with `nvme.msix=1` (polling stays the default: on QEMU, with and without an IOPS
+throttle, the interrupt path used no less CPU than the polled slices; real EBS latency is unmeasured). The first 200 us of a command still spin; after that a
 sleeping waiter parks until the interrupt, with a 2 ms safety wake that re-checks the CQ so a lost
 interrupt cannot hang I/O. The boot log shows `MSI-X vector 0 -> IDT vector ...` and the power-off
 statistics print `MSI-X interrupts since boot`. Test: `python3 .claude/skills/run-leandros/nvmemsixtest.py`
