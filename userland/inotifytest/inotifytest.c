@@ -15,6 +15,7 @@
 #include <sys/epoll.h>
 #include <sched.h>
 #include <sys/inotify.h>
+#include <sys/fanotify.h>
 #include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -34,9 +35,11 @@
 static int npass, nfail;
 static char base[64];
 
+static const char *tg = "";   /* suffix naming the filesystem under test */
+
 static void report(const char *name, int ok)
 {
-    printf("%s: %s\n", name, ok ? "PASS" : "FAIL");
+    printf("%s%s: %s\n", name, tg, ok ? "PASS" : "FAIL");
     if (ok) npass++; else nfail++;
 }
 
@@ -611,6 +614,509 @@ static void t_killswitch(void)
     rm("x/ks");
 }
 
+/* ---- L2 (mounted-volume dirent events, self events, UNMOUNT) and L3 (inode
+ * events). Everything below runs once on tmpfs (/run) and once on the f2fs
+ * root (/root); `base` selects the filesystem. ---- */
+#ifndef IN_UNMOUNT
+#define IN_UNMOUNT 0x2000
+#endif
+
+struct got { uint32_t mask; int wd; char name[32]; };
+
+/* Drain the (non-blocking) inotify fd into g[]; returns the event count. */
+static int drain(int ifd, struct got *g, int max)
+{
+    char buf[4096]; int k = 0;
+    ssize_t n = read(ifd, buf, sizeof buf), off = 0;
+    const struct inotify_event *e;
+    while (n > 0 && k < max && (e = next_ev(buf, n, &off))) {
+        g[k].mask = e->mask; g[k].wd = e->wd;
+        snprintf(g[k].name, sizeof g[k].name, "%s", e->len ? e->name : "");
+        k++;
+    }
+    return k;
+}
+
+static int wr(const char *rel, const char *data)
+{
+    char p[128]; path(p, rel);
+    int fd = open(p, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) return -1;
+    ssize_t r = write(fd, data, strlen(data)); close(fd);
+    return (int)r;
+}
+
+static void t_rmdir_self(void)
+{
+    mkd("rs");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    int wd = watch(ifd, "rs", IN_DELETE_SELF);
+    char p[128]; path(p, "rs"); rmdir(p);
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_rmdir_self", wd > 0 && n == 2 && g[0].mask == (IN_DELETE_SELF | IN_ISDIR) && g[0].wd == wd && g[1].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_move_self(void)
+{
+    touch("ms1"); mkd("msd");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    int w1 = watch(ifd, "ms1", IN_MOVE_SELF), w2 = watch(ifd, "msd", IN_MOVE_SELF);
+    ren("ms1", "ms2"); ren("msd", "mse");
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_move_self", w1 > 0 && w2 > 0 && n == 2 && g[0].mask == IN_MOVE_SELF && g[0].wd == w1
+           && g[1].mask == (IN_MOVE_SELF | IN_ISDIR) && g[1].wd == w2);
+    close(ifd);
+}
+
+static void t_dir_rename_then_create(void)
+{
+    mkd("drc"); mkd("drc/sub");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    int wd = watch(ifd, "drc/sub", IN_CREATE);
+    ren("drc", "drc2");
+    touch("drc2/sub/n");
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_dir_rename_then_create", wd > 0 && n == 1 && g[0].mask == IN_CREATE && !strcmp(g[0].name, "n"));
+    close(ifd);
+}
+
+static void t_symlink_link_mknod(void)
+{
+    touch("x/sl_t");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "x", IN_CREATE | IN_DELETE);
+    char a[128], b[128]; path(a, "x/sl_t"); path(b, "x/sl_l");
+    symlink(a, b); unlink(b);
+    path(b, "x/hl"); link(a, b); unlink(b);
+    path(b, "x/ff"); mkfifo(b, 0644); unlink(b);
+    struct got g[8]; int n = drain(ifd, g, 8);
+    int ok = n == 6;
+    const char *nm[] = { "sl_l", "sl_l", "hl", "hl", "ff", "ff" };
+    for (int i = 0; ok && i < 6; i++)
+        ok = g[i].mask == ((i & 1) ? IN_DELETE : IN_CREATE) && !strcmp(g[i].name, nm[i]);
+    report("t_symlink_link_mknod", ok);
+    close(ifd);
+}
+
+static void t_modify_file(void)
+{
+    touch("mf");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    int wd = watch(ifd, "mf", IN_MODIFY);
+    wr("mf", "hello");
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_modify_file", wd > 0 && n == 1 && g[0].mask == IN_MODIFY && g[0].wd == wd && g[0].name[0] == 0);
+    close(ifd);
+}
+
+static void t_modify_in_dir(void)
+{
+    touch("x/mid");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "x", IN_MODIFY);
+    wr("x/mid", "hello");
+    char p[128]; path(p, "x/mid"); truncate(p, 0);
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_modify_in_dir", n >= 1 && g[0].mask == IN_MODIFY && !strcmp(g[0].name, "mid"));
+    close(ifd);
+}
+
+static void t_modify_trunc(void)
+{
+    wr("mt", "data");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "mt", IN_MODIFY);
+    char p[128]; path(p, "mt");
+    int fd = open(p, O_WRONLY | O_TRUNC); close(fd);
+    struct got g[4]; int a = drain(ifd, g, 4);
+    fd = open(p, O_WRONLY); int r = ftruncate(fd, 100); close(fd);
+    int b = drain(ifd, g, 4);
+    report("t_modify_trunc", a >= 1 && r == 0 && b >= 1 && g[0].mask == IN_MODIFY);
+    close(ifd);
+}
+
+static void t_close_write(void)
+{
+    touch("cw");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "cw", IN_CLOSE_WRITE | IN_CLOSE_NOWRITE | IN_OPEN);
+    char p[128]; path(p, "cw");
+    int fd = open(p, O_WRONLY); close(fd);
+    struct got g[4]; int n = drain(ifd, g, 4);
+    int ok = n == 2 && g[0].mask == IN_OPEN && g[1].mask == IN_CLOSE_WRITE;
+    fd = open(p, O_RDONLY); close(fd);
+    n = drain(ifd, g, 4);
+    report("t_close_write", ok && n == 2 && g[0].mask == IN_OPEN && g[1].mask == IN_CLOSE_NOWRITE);
+    close(ifd);
+}
+
+static void t_close_dup(void)
+{
+    touch("cd");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "cd", IN_CLOSE_WRITE);
+    char p[128]; path(p, "cd");
+    int fd = open(p, O_WRONLY), fd2 = dup(fd);
+    pid_t c = fork();
+    if (c == 0) { close(fd2); _exit(0); }
+    waitpid(c, NULL, 0);
+    close(fd);
+    struct got g[4]; int n0 = drain(ifd, g, 4);
+    close(fd2);
+    int n1 = drain(ifd, g, 4);
+    report("t_close_dup", n0 == 0 && n1 == 1 && g[0].mask == IN_CLOSE_WRITE);
+    close(ifd);
+}
+
+static void t_attrib_chmod(void)
+{
+    touch("at");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "at", IN_ATTRIB);
+    watch(ifd, "x", IN_ATTRIB);
+    char p[128]; path(p, "at"); chmod(p, 0600);
+    struct got g[4]; int n = drain(ifd, g, 4);
+    int ok = n == 1 && g[0].mask == IN_ATTRIB && g[0].name[0] == 0;
+    path(p, "x/atc"); int fd = open(p, O_CREAT | O_WRONLY, 0644); fchmod(fd, 0600); close(fd);
+    n = drain(ifd, g, 4);
+    report("t_attrib_chmod", ok && n == 1 && g[0].mask == IN_ATTRIB && !strcmp(g[0].name, "atc"));
+    close(ifd);
+}
+
+static void t_access(void)
+{
+    wr("ac", "0123456789");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "ac", IN_ACCESS);
+    char p[128], b[16]; path(p, "ac");
+    int fd = open(p, O_RDONLY); ssize_t r = read(fd, b, sizeof b); close(fd);
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_access", r > 0 && n == 1 && g[0].mask == IN_ACCESS);
+    close(ifd);
+}
+
+static void t_coalesce(void)
+{
+    touch("co");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "co", IN_MODIFY);
+    char p[128]; path(p, "co");
+    int fd = open(p, O_WRONLY);
+    write(fd, "a", 1); write(fd, "b", 1); write(fd, "c", 1);
+    struct got g[8]; int n0 = drain(ifd, g, 8);
+    write(fd, "d", 1);
+    int n1 = drain(ifd, g, 8);
+    write(fd, "e", 1); write(fd, "f", 1);
+    int n2 = drain(ifd, g, 8);
+    close(fd);
+    report("t_coalesce", n0 == 1 && n1 == 1 && n2 == 1);
+    close(ifd);
+}
+
+static void t_unlink_open(void)
+{
+    touch("uo");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "uo", IN_DELETE_SELF | IN_ATTRIB);
+    char p[128]; path(p, "uo");
+    int fd = open(p, O_RDONLY);
+    unlink(p);
+    struct got g[4]; int n0 = drain(ifd, g, 4);
+    int ok0 = n0 == 1 && g[0].mask == IN_ATTRIB;
+    close(fd);
+    int n1 = drain(ifd, g, 4);
+    report("t_unlink_open", ok0 && n1 == 2 && g[0].mask == IN_DELETE_SELF && g[1].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_unlink_self(void)
+{
+    touch("us");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "us", IN_DELETE_SELF);
+    rm("us");
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_unlink_self", n == 2 && g[0].mask == IN_DELETE_SELF && g[1].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_rename_over(void)
+{
+    touch("ro_a"); touch("ro_b");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "ro_b", IN_DELETE_SELF);
+    ren("ro_a", "ro_b");
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_rename_over", n == 2 && g[0].mask == IN_DELETE_SELF && g[1].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_umount(void)
+{
+    mkd("um");
+    char p[128]; path(p, "um");
+    if (mount("tmpfs", p, "tmpfs", 0, "") != 0) { printf("t_umount%s: SKIP (mount: %d)\n", tg, errno); return; }
+    int ifd = inotify_init1(IN_NONBLOCK);
+    int wd = inotify_add_watch(ifd, p, IN_CREATE);
+    struct got g[4];
+    int ok = wd > 0;
+    char q[160]; snprintf(q, sizeof q, "%s/f", p);
+    close(open(q, O_CREAT | O_WRONLY, 0644));
+    int n0 = drain(ifd, g, 4);
+    ok = ok && n0 == 1 && g[0].mask == IN_CREATE;
+    unlink(q);
+    int r = umount(p);
+    int n = drain(ifd, g, 4);
+    report("t_umount", ok && r == 0 && n == 2 && g[0].mask == IN_UNMOUNT && g[1].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_cross_bind(void)
+{
+    mkd("cb_src"); mkd("cb_dst");
+    char s[128], d[128]; path(s, "cb_src"); path(d, "cb_dst");
+    if (mount(s, d, NULL, MS_BIND, NULL) != 0) { printf("t_cross_bind%s: SKIP (bind: %d)\n", tg, errno); return; }
+    int ifd = inotify_init1(IN_NONBLOCK);
+    int wd = inotify_add_watch(ifd, d, IN_CREATE);
+    touch("cb_src/n");
+    struct got g[4]; int n = drain(ifd, g, 4);
+    report("t_cross_bind", wd > 0 && n == 1 && g[0].mask == IN_CREATE && !strcmp(g[0].name, "n"));
+    close(ifd);
+    umount(d);
+}
+
+/* ---- (dev, ino) identity: events reach a watch through any hard link ---- */
+static void t_hl_self(void)
+{
+    touch("hl_a");
+    char a[128], b[128]; path(a, "hl_a"); path(b, "hl_b"); link(a, b);
+    int ifd = inotify_init1(IN_NONBLOCK);
+    uint32_t m = IN_ATTRIB | IN_MODIFY | IN_OPEN | IN_CLOSE_WRITE;
+    int w1 = watch(ifd, "hl_b", m), w2 = watch(ifd, "hl_a", m);
+    chmod(a, 0600);
+    wr("hl_a", "x");
+    struct got g[8]; int n = drain(ifd, g, 8);
+    report("t_hl_self", w1 > 0 && w1 == w2 && n == 4 && g[0].mask == IN_ATTRIB && g[1].mask == IN_OPEN
+           && g[2].mask == IN_MODIFY && g[3].mask == IN_CLOSE_WRITE);
+    close(ifd);
+}
+
+static void t_hl_unlink_one(void)
+{
+    touch("hu_a");
+    char a[128], b[128]; path(a, "hu_a"); path(b, "hu_b"); link(a, b);
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "hu_a", IN_ATTRIB | IN_DELETE_SELF);
+    unlink(a);
+    struct got g[8]; int n0 = drain(ifd, g, 8);
+    int ok0 = n0 == 1 && g[0].mask == IN_ATTRIB;
+    chmod(b, 0600);
+    int n1 = drain(ifd, g, 8);
+    int ok1 = n1 == 1 && g[0].mask == IN_ATTRIB;
+    unlink(b);
+    int n2 = drain(ifd, g, 8);
+    report("t_hl_unlink_one", ok0 && ok1 && n2 == 3 && g[0].mask == IN_ATTRIB && g[1].mask == IN_DELETE_SELF
+           && g[2].mask == IN_IGNORED);
+    close(ifd);
+}
+
+static void t_hl_link_after_watch(void)
+{
+    touch("hw_a");
+    int ifd = inotify_init1(IN_NONBLOCK);
+    watch(ifd, "hw_a", IN_ATTRIB | IN_MODIFY);
+    char a[128], b[128]; path(a, "hw_a"); path(b, "hw_b"); link(a, b);
+    struct got g[8]; int n0 = drain(ifd, g, 8);
+    int ok0 = n0 == 1 && g[0].mask == IN_ATTRIB;
+    wr("hw_b", "y");
+    int n1 = drain(ifd, g, 8);
+    report("t_hl_link_after_watch", ok0 && n1 == 1 && g[0].mask == IN_MODIFY);
+    close(ifd);
+}
+
+/* ---- fanotify ---- */
+struct fev { uint64_t mask; int fd; int pid; unsigned char vers; unsigned len; char link[160]; };
+
+static int fan_drain(int ffd, struct fev *g, int max)
+{
+    char buf[4096]; int k = 0;
+    ssize_t n = read(ffd, buf, sizeof buf), off = 0;
+    while (n > 0 && off + (ssize_t)sizeof(struct fanotify_event_metadata) <= n && k < max) {
+        struct fanotify_event_metadata *m = (void *)(buf + off);
+        g[k].mask = m->mask; g[k].fd = m->fd; g[k].pid = m->pid; g[k].vers = m->vers; g[k].len = m->event_len;
+        g[k].link[0] = 0;
+        if (m->fd >= 0) {
+            char l[64]; snprintf(l, sizeof l, "/proc/self/fd/%d", m->fd);
+            ssize_t r = readlink(l, g[k].link, sizeof g[k].link - 1);
+            g[k].link[r > 0 ? r : 0] = 0;
+        }
+        off += m->event_len; k++;
+    }
+    return k;
+}
+static void fan_closeall(struct fev *g, int n) { for (int i = 0; i < n; i++) if (g[i].fd >= 0) close(g[i].fd); }
+static int ends_with(const char *s, const char *suf)
+{
+    size_t a = strlen(s), b = strlen(suf);
+    return a >= b && !strcmp(s + a - b, suf);
+}
+static int fan_new(void) { return fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY); }
+#define FANALL (FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE)
+
+static void t_fan_basic(void)
+{
+    touch("fbasic");
+    char p[128]; path(p, "fbasic");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FANALL, AT_FDCWD, p);
+    int fd = open(p, O_RDWR); char c;
+    if (fd >= 0) { if (write(fd, "x", 1)) {} lseek(fd, 0, SEEK_SET); if (read(fd, &c, 1)) {} close(fd); }
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int ok = mr == 0 && n == 4 && g[0].mask == FAN_OPEN && g[1].mask == FAN_MODIFY && g[2].mask == FAN_ACCESS
+          && g[3].mask == FAN_CLOSE_WRITE;
+    for (int i = 0; ok && i < n; i++)
+        ok = g[i].pid == getpid() && g[i].fd >= 0 && g[i].vers == FANOTIFY_METADATA_VERSION
+          && g[i].len == sizeof(struct fanotify_event_metadata) && ends_with(g[i].link, "/fbasic");
+    fan_closeall(g, n);
+    int n2 = ffd < 0 ? -1 : fan_drain(ffd, g, 8);   /* closing event fds must not recurse */
+    fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
+    int n3 = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    ok = ok && n2 <= 0 && n3 == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_CLOSE_NOWRITE;
+    fan_closeall(g, n3);
+    if (!ok) printf("  fan_basic: mr=%d n=%d n2=%d n3=%d first=%llx,%llx,%llx,%llx pid=%d/%d link=%s\n", mr, n, n2, n3,
+                    (unsigned long long)g[0].mask, (unsigned long long)g[1].mask, (unsigned long long)g[2].mask,
+                    (unsigned long long)g[3].mask, g[0].pid, getpid(), g[0].link);
+    report("t_fan_basic", ok);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_mount(void)
+{
+    mkd("x"); touch("x/mf0");
+    char d[128]; path(d, "x");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, d);
+    wr("x/mf0", "z");
+    struct fev g[32]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 32);
+    int op = 0, cw = 0;
+    for (int i = 0; i < n; i++) {
+        if (!ends_with(g[i].link, "/x/mf0")) continue;
+        if (g[i].mask & FAN_OPEN) op++;
+        if (g[i].mask & FAN_CLOSE_WRITE) cw++;
+    }
+    fan_closeall(g, n);
+    report("t_fan_mount", mr == 0 && op >= 1 && cw >= 1);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_child(void)
+{
+    mkd("fc");
+    char d[128]; path(d, "fc");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN | FAN_CLOSE_WRITE | FAN_EVENT_ON_CHILD, AT_FDCWD, d);
+    touch("fc/cf");
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int ok = mr == 0 && n == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_CLOSE_WRITE
+          && ends_with(g[0].link, "/fc/cf");
+    fan_closeall(g, n);
+    report("t_fan_child", ok);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_remove_flush(void)
+{
+    touch("fr");
+    char p[128]; path(p, "fr");
+    int ffd = fan_new();
+    int a = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p);
+    int r = fanotify_mark(ffd, FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p);
+    int fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
+    struct fev g[4]; int n0 = fan_drain(ffd, g, 4);
+    int r2 = fanotify_mark(ffd, FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p);
+    int e2 = errno;
+    int a2 = fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p);
+    int f = fanotify_mark(ffd, FAN_MARK_FLUSH, 0, AT_FDCWD, NULL);
+    fd = open(p, O_RDONLY); if (fd >= 0) close(fd);
+    int n1 = fan_drain(ffd, g, 4);
+    report("t_fan_remove_flush", a == 0 && r == 0 && n0 <= 0 && r2 == -1 && e2 == ENOENT && a2 == 0 && f == 0 && n1 <= 0);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_einval(void)
+{
+    touch("fe");
+    char p[128]; path(p, "fe");
+    int ffd = fan_new(), ok = ffd >= 0;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD, 0, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_REMOVE, FAN_OPEN, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, "/nonexistent/fe") == -1 && errno == ENOENT;
+    ok = ok && fanotify_mark(9999, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p) == -1 && errno == EBADF;
+    int ifd = inotify_init1(0);
+    ok = ok && fanotify_mark(ifd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, p) == -1 && errno == EINVAL;
+    ok = ok && fanotify_init(0x40000000, O_RDONLY) == -1 && errno == EINVAL;
+    report("t_fan_einval", ok);
+    close(ifd); if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_eperm(void)
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(2);
+        int r = fanotify_init(FAN_CLASS_NOTIF, O_RDONLY);
+        _exit(r == -1 && errno == EPERM ? 0 : 1);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    report("t_fan_eperm", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+static void t_fan_hardlink(void)
+{
+    touch("fh_a");
+    char a[128], b[128]; path(a, "fh_a"); path(b, "fh_b"); link(a, b);
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN | FAN_MODIFY, AT_FDCWD, b);
+    wr("fh_a", "q");
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    fan_closeall(g, n);
+    report("t_fan_hardlink", mr == 0 && n == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_MODIFY);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_hl_cases(void)
+{
+    t_hl_self(); t_hl_unlink_one(); t_hl_link_after_watch();
+    t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
+    t_fan_hardlink();
+}
+
+static void l2_l3_cases(void)
+{
+    t_create(); t_delete(); t_move_pair(); t_moved_to(); t_silent_unrelated();
+    t_dir_events(); t_dir_follow();
+    t_rmdir_self(); t_move_self(); t_dir_rename_then_create(); t_symlink_link_mknod();
+    t_modify_file(); t_modify_in_dir(); t_modify_trunc(); t_close_write(); t_close_dup();
+    t_attrib_chmod(); t_access(); t_coalesce(); t_unlink_open(); t_unlink_self(); t_rename_over();
+    t_umount(); t_cross_bind();
+    t_hl_cases();
+}
+
+static void run_on(const char *dir, const char *tag)
+{
+    char saved[64]; snprintf(saved, sizeof saved, "%s", base);
+    snprintf(base, sizeof base, "%s/inot2-%d", dir, getpid());
+    mkdir(base, 0755); mkd("x"); mkd("y");
+    tg = tag;
+    l2_l3_cases();
+    char cmd[128]; snprintf(cmd, sizeof cmd, "rm -rf %s", base);
+    if (system(cmd)) {}
+    tg = "";
+    snprintf(base, sizeof base, "%s", saved);
+}
+
 static int knob_on(void)
 {
     char b[4096]; int fd = open("/proc/cmdline", O_RDONLY);
@@ -684,6 +1190,8 @@ int main(int argc, char **argv)
         t_oneshot(); t_mask_add(); t_mask_create_eexist(); t_onlydir(); t_excl_unlink();
         t_dont_follow(); t_overflow(); t_proc_limits(); t_limit_instances(); t_limit_watches();
         t_limit_perkuid(); t_limit_userns(); t_userns_mntns();
+        run_on("/run", "@tmpfs");
+        run_on("/root", "@f2fs");
     } else {
         printf("real cases: SKIP (kernel booted with vfs.inotify=0)\n");
     }
