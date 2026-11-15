@@ -140,6 +140,7 @@ fn nic(w: &mut Out) {
     });
     let _ = writeln!(w);
     let _ = writeln!(w, "fwd: conntrack {}", super::fwd::ct_len());
+    super::fwd::dump_stats(w);
     {
         let mut ports = alloc::vec::Vec::new();
         super::fwd::live_tcp_nat_ports(&mut ports);
