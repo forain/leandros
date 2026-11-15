@@ -87,7 +87,8 @@ leandros_pick_container() {
 # leandros_port_srchash PORTDIR: content hash of every file of the port outside
 # out/ (paths + bytes, mtime-independent: a fresh git checkout touches every file).
 leandros_port_srchash() {
-  ( cd "$1" && find . -path ./out -prune -o -type f -print | LC_ALL=C sort \
+  ( cd "$1" && { if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && [ -n "$(git ls-files . | head -n 1)" ]; then
+        git ls-files . | grep -v '^out/' | sed 's|^|./|'; else find . -path ./out -prune -o -type f -print; fi; } | LC_ALL=C sort \
       | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done \
       | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1 )
 }
