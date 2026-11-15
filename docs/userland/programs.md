@@ -12,6 +12,7 @@ this page.
 |---|---|
 | `init` | PID 1; mounts the root filesystem, supervises the graphical login, the serial getty and the VT 2..6 logins, and handles power-off ([below](#init)) |
 | `login` | Authenticates against `/etc/shadow`, sets supplementary groups, drops privilege via `setresgid`/`setresuid`, sets `XDG_RUNTIME_DIR`, execs the account's shell |
+| `utmpd` | Serves `/run/utmps/utmp` on `/run/utmps/.utmpd-socket` using the skarnet `utmps` protocol, which is what Alpine's busybox `who` speaks; started and respawned by init ([below](#utmpx)) |
 | `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter ([../desktop/login.md](../desktop/login.md)) |
 | `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable. As a non-root user with a D-Bus session in the environment it execs `leandros-sysbus power`, so the request goes through login1 like `systemctl poweroff` on Linux |
 | `ps` | Process status from `/proc`, procps-compatible ([below](#ps)) |
@@ -232,3 +233,37 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 - [README.md](README.md), [libc.md](libc.md), [ports.md](ports.md)
 - [../getting-started/logging-in.md](../getting-started/logging-in.md)
 - [../development/testing.md](../development/testing.md)
+
+## ec2init (EC2 first boot)
+
+`/bin/ec2init` (`userland/ec2init/ec2init.c`) is started in the background by
+init at every boot and exits at once unless this is EC2: the kernel command
+line has `ec2=1` (or `ec2init.endpoint=HOST:PORT`) or the DMI vendor
+(`/sys/class/dmi/id/sys_vendor`, `bios_vendor`) contains "Amazon". On EC2 it
+waits for the network (`ec2init.wait=N`, default 90 s), asks the instance
+metadata service for an IMDSv2 token (`PUT /latest/api/token`, 6 h TTL; every
+later `GET` carries it) and, once per instance id (`/var/lib/ec2-init/instance-id`),
+appends the instance's `public-keys/0/openssh-key` to `~/.ssh/authorized_keys`
+of `root` and `leandro` (deduplicated, so the russh sshd accepts it), sets the
+hostname from `local-hostname` (first label, also written to `/etc/hostname`)
+and, with `ec2init.userdata=1`, saves and runs `user-data` when it starts with
+`#!`. `ec2init=0` disables it; `ec2init.endpoint=` overrides 169.254.169.254:80.
+It never blocks boot, and a failed step leaves no stamp, so the next boot retries.
+
+## utmpx
+
+Login records follow the Alpine/musl `struct utmpx` (400 bytes) so Alpine's busybox
+(`/bin/busybox.static who`, `... last`) reads them unmodified. The shared writer is
+`lib/utmpx/utmpx.rs` (`core` only, raw syscalls; `#[path]`-included by init, login, utmpd,
+sshd and `pam-leandros`).
+
+| File | Content | Reader |
+|---|---|---|
+| `/run/utmps/utmp` | current sessions; truncated at boot | `who` through `utmpd` |
+| `/var/log/wtmp` | append-only history (BOOT_TIME, RUN_LVL, USER_PROCESS, DEAD_PROCESS) | `last` |
+| `/var/log/lastlog` | `struct lastlog` (292 bytes) at `uid * 292` | none shipped |
+
+Writers: init writes BOOT_TIME and RUN_LVL and closes a session (DEAD_PROCESS) when it reaps
+the session leader; `login` records the console/VT login (the shell keeps login's pid);
+sshd records pty sessions with the client address as `ut_host`; the PAM shim records greetd
+sessions. `su` and `sudo` write nothing. Busybox has no `w` applet here.

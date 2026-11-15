@@ -16,6 +16,23 @@ LeandrOS implements the Linux namespace and sandboxing surface that Firefox's co
 | seccomp | [`sched/src/seccomp.rs`](../../sched/src/seccomp.rs) storage, [`lib/seccomp-bpf`](../../lib/seccomp-bpf) checker and interpreter. |
 | cgroups | [`sched/src/cgroup.rs`](../../sched/src/cgroup.rs) core, [`servers/vfs/src/cgroupfs.rs`](../../servers/vfs/src/cgroupfs.rs) filesystem, [`sched/src/bpfcg.rs`](../../sched/src/bpfcg.rs) device programs. |
 
+### Per-kind limits
+
+The 256-slot table is divided into per-kind budgets so one kind cannot starve another (a container runtime churning uts/ipc namespaces used to be able to fill the table and make netns/mntns creation fail). Each kind has a limit exposed and writable at `/proc/sys/user/max_<kind>_namespaces`; creating a namespace of a kind that already holds its limit is `ENOSPC`.
+
+| Kind | File | Default |
+|------|------|---------|
+| user | `max_user_namespaces` | 72 |
+| mnt | `max_mnt_namespaces` | 48 |
+| net | `max_net_namespaces` | 32 |
+| pid | `max_pid_namespaces` | 20 |
+| cgroup | `max_cgroup_namespaces` | 24 |
+| ipc | `max_ipc_namespaces` | 24 |
+| uts | `max_uts_namespaces` | 24 |
+| time | `max_time_namespaces` | 8 (reserved: time namespaces are not supported) |
+
+The invariant is that the sum of all limits never exceeds `NS_MAX - 1` = 255, so each kind owns a reservation in the shared table; a write that would break it is `EINVAL` (lower another kind first). Writes need `CAP_SYS_ADMIN` in the initial user namespace; lowering a limit below current use is allowed and only blocks new creations. Counters are atomic reservations released when the slot is freed (mount namespaces when reaped). The limit is a global per-kind budget rather than Linux's per-user ucount value; the per-uid caps below still apply in addition. Test: `nstest` `nslimit_*`.
+
 A fixed table is the same design choice as everywhere else in the servers: a namespace id is a small integer that can be stored in a task, a socket or a mount without allocation, and a leak shows up as a full table (`ENOSPC`) in a test instead of as unbounded memory.
 
 ## Capabilities and "host root"
@@ -29,7 +46,7 @@ Capability transitions follow Linux: `capget`/`capset` subset rules, `PR_CAPBSET
 
 ## User namespaces
 
-- `clone(CLONE_NEWUSER)` and `unshare(CLONE_NEWUSER)`. `NEWUSER` with `CLONE_THREAD`, `CLONE_FS` or `CLONE_VM` is `EINVAL`; `unshare` needs a single-threaded caller; nesting deeper than 32 is `EUSERS`; a full table is `ENOSPC`. The child starts with a full capability set *inside* the new namespace only.
+- `clone(CLONE_NEWUSER)` and `unshare(CLONE_NEWUSER)`. `NEWUSER` with `CLONE_THREAD`, `CLONE_FS` or `CLONE_VM` is `EINVAL`; `unshare` needs a single-threaded caller; nesting deeper than 32 is `EUSERS`; a full table or the kind's limit is `ENOSPC`. The child starts with a full capability set *inside* the new namespace only.
 - **Quota.** A new namespace is charged against the creator's kuid **and the owner kuid of every ancestor user namespace** (Linux `inc_ucount`), each checked against 32 per user and 64 in total. Counts are derived by scanning live slots, so release paths need no decrement and cannot drift. Without the hierarchy, a user could exhaust the 256-slot table by nesting.
 - **`CLONE_NEWUSER` for sandboxes.** An unprivileged process may create a user namespace and then, inside it, further namespaces: `CLONE_NEWNS`, `CLONE_NEWNET`, `CLONE_NEWIPC` and the rest are allowed without `CAP_SYS_ADMIN` when combined with `CLONE_NEWUSER` (the check is made in the new namespace).
 

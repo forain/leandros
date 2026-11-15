@@ -49,7 +49,12 @@ pub struct SocketSet<'a> {
     /// Unique per set (process-wide counter): a handle minted by a freed
     /// set never validates against a new set that reuses its owner's id.
     set_gen: u16,
+    /// Inert stand-ins handed out for a stale handle (see `get_mut`).
+    tomb: alloc::vec::Vec<Socket<'a>>,
 }
+
+/// How many times a stale handle was resolved to a stand-in (diagnostics).
+pub static STALE_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 static SET_GEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
@@ -65,7 +70,7 @@ impl<'a> SocketSet<'a> {
     {
         let sockets = sockets.into();
         let set_gen = SET_GEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u16;
-        SocketSet { sockets, set_gen }
+        SocketSet { sockets, set_gen, tomb: Self::make_tombs() }
     }
 
     /// Slot index of `handle` if it names a live socket of this set.
@@ -136,43 +141,70 @@ impl<'a> SocketSet<'a> {
         }
     }
 
-    /// Get a socket from the set by its handle, as mutable.
+    /// Fresh inert sockets, one per variant: closed, unbound, zero-capacity
+    /// buffers. Handed out for a stale handle so a racing teardown (stack
+    /// reaped between a caller's check and use) yields the errors of a dead
+    /// link instead of a panic.
+    fn make_tombs() -> alloc::vec::Vec<Socket<'a>> {
+        use crate::storage::{PacketBuffer, RingBuffer};
+        use alloc::vec::Vec;
+        let mut v: Vec<Socket<'a>> = Vec::new();
+        #[cfg(feature = "socket-tcp")]
+        v.push(Socket::Tcp(crate::socket::tcp::Socket::new(RingBuffer::new(Vec::new()), RingBuffer::new(Vec::new()))));
+        #[cfg(feature = "socket-udp")]
+        v.push(Socket::Udp(crate::socket::udp::Socket::new(PacketBuffer::new(Vec::new(), Vec::new()), PacketBuffer::new(Vec::new(), Vec::new()))));
+        #[cfg(feature = "socket-icmp")]
+        v.push(Socket::Icmp(crate::socket::icmp::Socket::new(PacketBuffer::new(Vec::new(), Vec::new()), PacketBuffer::new(Vec::new(), Vec::new()))));
+        #[cfg(feature = "socket-raw")]
+        v.push(Socket::Raw(crate::socket::raw::Socket::new(crate::wire::IpVersion::Ipv4, crate::wire::IpProtocol::Unknown(0), PacketBuffer::new(Vec::new(), Vec::new()), PacketBuffer::new(Vec::new(), Vec::new()))));
+        #[cfg(feature = "socket-dhcpv4")]
+        v.push(Socket::Dhcpv4(crate::socket::dhcpv4::Socket::new()));
+        v
+    }
+
+    fn tombstone<T: AnySocket<'a>>(&mut self) -> &mut T {
+        core::sync::atomic::AtomicU32::fetch_add(&STALE_HITS, 1, core::sync::atomic::Ordering::Relaxed);
+        let fresh = Self::make_tombs();
+        // Reset every stand-in so state written through a previous stale
+        // access never leaks into the next one.
+        self.tomb = fresh;
+        let i = self.tomb.iter().position(|t| T::downcast(t).is_some()).expect("tombstone type");
+        T::downcast_mut(&mut self.tomb[i]).expect("tombstone type")
+    }
+
+    /// Get a socket from the set by its handle.
     ///
-    /// # Panics
-    /// This function may panic if the handle does not belong to this socket set
-    /// or the socket has the wrong type.
+    /// A stale handle (socket removed, slot reused, set gone) never panics:
+    /// it resolves to an inert stand-in, so every operation fails like one on
+    /// a dead link. Panics only on a live socket of the wrong type.
     pub fn get<T: AnySocket<'a>>(&self, handle: SocketHandle) -> &T {
         match self.sockets.get(self.live_index(handle).unwrap_or(usize::MAX)).and_then(|s| s.inner.as_ref()) {
             Some(item) => {
                 T::downcast(&item.socket).expect("handle refers to a socket of a wrong type")
             }
-            None => panic!("handle does not refer to a valid socket"),
+            None => {
+                core::sync::atomic::AtomicU32::fetch_add(&STALE_HITS, 1, core::sync::atomic::Ordering::Relaxed);
+                let t = self.tomb.iter().find_map(|t| T::downcast(t));
+                t.expect("tombstone type")
+            }
         }
     }
 
-    /// Get a mutable socket from the set by its handle, as mutable.
-    ///
-    /// # Panics
-    /// This function may panic if the handle does not belong to this socket set
-    /// or the socket has the wrong type.
+    /// Get a mutable socket from the set by its handle; a stale handle
+    /// resolves to an inert stand-in (see `get`).
     pub fn get_mut<T: AnySocket<'a>>(&mut self, handle: SocketHandle) -> &mut T {
-        match self.live_index(handle).and_then(|i| self.sockets[i].inner.as_mut()) {
-            Some(item) => T::downcast_mut(&mut item.socket)
+        match self.live_index(handle) {
+            Some(i) => T::downcast_mut(&mut self.sockets[i].inner.as_mut().expect("live").socket)
                 .expect("handle refers to a socket of a wrong type"),
-            None => panic!("handle does not refer to a valid socket"),
+            None => self.tombstone::<T>(),
         }
     }
 
-    /// Remove a socket from the set, without changing its state.
-    ///
-    /// # Panics
-    /// This function may panic if the handle does not belong to this socket set.
-    pub fn remove(&mut self, handle: SocketHandle) -> Socket<'a> {
+    /// Remove a socket from the set, without changing its state. A stale
+    /// handle is a no-op (returns None).
+    pub fn remove(&mut self, handle: SocketHandle) -> Option<Socket<'a>> {
         net_trace!("[{}]: removing", handle.0);
-        match self.live_index(handle).and_then(|i| self.sockets[i].inner.take()) {
-            Some(item) => item.socket,
-            None => panic!("handle does not refer to a valid socket"),
-        }
+        self.try_remove(handle)
     }
 
     /// Get an iterator to the inner sockets.

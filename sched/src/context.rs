@@ -30,6 +30,10 @@ pub struct CpuContext {
     /// a `uaccess::UserAccess` window gets it back open, and no other task
     /// inherits it. Zero (window closed) for a fresh context.
     pub rflags: u64,
+    /// Upper 128 bits of YMM0-15 (AVX state the FXSAVE area lacks), at offset
+    /// 584. Saved/restored with vextractf128/vinsertf128 only while `AVX_ON`
+    /// (CR4.OSXSAVE + XCR0 enabled by `arch::enable_sse`); zero otherwise.
+    pub ymmh: [u8; 256],
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -113,6 +117,15 @@ impl UserFrame {
 
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!(core::mem::offset_of!(CpuContext, rflags) == 576);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::offset_of!(CpuContext, ymmh) == 584);
+
+/// Non-zero once AVX state is enabled on this machine (set by the BSP in
+/// `arch::enable_sse` before any task switch that matters). Read by the
+/// context-switch assembly.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub static AVX_ON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 impl CpuContext {
     pub const fn zeroed() -> Self {
@@ -126,7 +139,7 @@ impl CpuContext {
             let mut fpu = [0u8; 512];
             fpu[0] = 0x7F; fpu[1] = 0x03;   // FCW
             fpu[24] = 0x80; fpu[25] = 0x1F; // MXCSR
-            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, fs_base: 0, fpu, rflags: 0 }
+            Self { rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, rsp: 0, fs_base: 0, fpu, rflags: 0, ymmh: [0; 256] }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -465,7 +478,45 @@ cpu_switch_to:
     mov   [rdi + 576], rax
 
     fxsave64  [rdi + 64]
+    cmp   byte ptr [rip + AVX_ON], 0
+    je    2f
+    vextractf128 xmmword ptr [rdi + 584], ymm0, 1
+    vextractf128 xmmword ptr [rdi + 600], ymm1, 1
+    vextractf128 xmmword ptr [rdi + 616], ymm2, 1
+    vextractf128 xmmword ptr [rdi + 632], ymm3, 1
+    vextractf128 xmmword ptr [rdi + 648], ymm4, 1
+    vextractf128 xmmword ptr [rdi + 664], ymm5, 1
+    vextractf128 xmmword ptr [rdi + 680], ymm6, 1
+    vextractf128 xmmword ptr [rdi + 696], ymm7, 1
+    vextractf128 xmmword ptr [rdi + 712], ymm8, 1
+    vextractf128 xmmword ptr [rdi + 728], ymm9, 1
+    vextractf128 xmmword ptr [rdi + 744], ymm10, 1
+    vextractf128 xmmword ptr [rdi + 760], ymm11, 1
+    vextractf128 xmmword ptr [rdi + 776], ymm12, 1
+    vextractf128 xmmword ptr [rdi + 792], ymm13, 1
+    vextractf128 xmmword ptr [rdi + 808], ymm14, 1
+    vextractf128 xmmword ptr [rdi + 824], ymm15, 1
+2:
     fxrstor64 [rsi + 64]
+    cmp   byte ptr [rip + AVX_ON], 0
+    je    3f
+    vinsertf128 ymm0, ymm0, xmmword ptr [rsi + 584], 1
+    vinsertf128 ymm1, ymm1, xmmword ptr [rsi + 600], 1
+    vinsertf128 ymm2, ymm2, xmmword ptr [rsi + 616], 1
+    vinsertf128 ymm3, ymm3, xmmword ptr [rsi + 632], 1
+    vinsertf128 ymm4, ymm4, xmmword ptr [rsi + 648], 1
+    vinsertf128 ymm5, ymm5, xmmword ptr [rsi + 664], 1
+    vinsertf128 ymm6, ymm6, xmmword ptr [rsi + 680], 1
+    vinsertf128 ymm7, ymm7, xmmword ptr [rsi + 696], 1
+    vinsertf128 ymm8, ymm8, xmmword ptr [rsi + 712], 1
+    vinsertf128 ymm9, ymm9, xmmword ptr [rsi + 728], 1
+    vinsertf128 ymm10, ymm10, xmmword ptr [rsi + 744], 1
+    vinsertf128 ymm11, ymm11, xmmword ptr [rsi + 760], 1
+    vinsertf128 ymm12, ymm12, xmmword ptr [rsi + 776], 1
+    vinsertf128 ymm13, ymm13, xmmword ptr [rsi + 792], 1
+    vinsertf128 ymm14, ymm14, xmmword ptr [rsi + 808], 1
+    vinsertf128 ymm15, ymm15, xmmword ptr [rsi + 824], 1
+3:
 
     mov   rbx, [rsi + 0]
     mov   rbp, [rsi + 8]
@@ -511,6 +562,57 @@ fpu_load_live:
     fxrstor64 [rdi]
     ret
 .size fpu_load_live, .-fpu_load_live
+
+// rdi = 256-byte buffer (any alignment): upper YMM halves. No-ops without AVX.
+.global ymmh_save_live
+.type   ymmh_save_live, @function
+ymmh_save_live:
+    cmp   byte ptr [rip + AVX_ON], 0
+    je    4f
+    vextractf128 xmmword ptr [rdi + 0], ymm0, 1
+    vextractf128 xmmword ptr [rdi + 16], ymm1, 1
+    vextractf128 xmmword ptr [rdi + 32], ymm2, 1
+    vextractf128 xmmword ptr [rdi + 48], ymm3, 1
+    vextractf128 xmmword ptr [rdi + 64], ymm4, 1
+    vextractf128 xmmword ptr [rdi + 80], ymm5, 1
+    vextractf128 xmmword ptr [rdi + 96], ymm6, 1
+    vextractf128 xmmword ptr [rdi + 112], ymm7, 1
+    vextractf128 xmmword ptr [rdi + 128], ymm8, 1
+    vextractf128 xmmword ptr [rdi + 144], ymm9, 1
+    vextractf128 xmmword ptr [rdi + 160], ymm10, 1
+    vextractf128 xmmword ptr [rdi + 176], ymm11, 1
+    vextractf128 xmmword ptr [rdi + 192], ymm12, 1
+    vextractf128 xmmword ptr [rdi + 208], ymm13, 1
+    vextractf128 xmmword ptr [rdi + 224], ymm14, 1
+    vextractf128 xmmword ptr [rdi + 240], ymm15, 1
+4:
+    ret
+.size ymmh_save_live, .-ymmh_save_live
+
+.global ymmh_load_live
+.type   ymmh_load_live, @function
+ymmh_load_live:
+    cmp   byte ptr [rip + AVX_ON], 0
+    je    5f
+    vinsertf128 ymm0, ymm0, xmmword ptr [rdi + 0], 1
+    vinsertf128 ymm1, ymm1, xmmword ptr [rdi + 16], 1
+    vinsertf128 ymm2, ymm2, xmmword ptr [rdi + 32], 1
+    vinsertf128 ymm3, ymm3, xmmword ptr [rdi + 48], 1
+    vinsertf128 ymm4, ymm4, xmmword ptr [rdi + 64], 1
+    vinsertf128 ymm5, ymm5, xmmword ptr [rdi + 80], 1
+    vinsertf128 ymm6, ymm6, xmmword ptr [rdi + 96], 1
+    vinsertf128 ymm7, ymm7, xmmword ptr [rdi + 112], 1
+    vinsertf128 ymm8, ymm8, xmmword ptr [rdi + 128], 1
+    vinsertf128 ymm9, ymm9, xmmword ptr [rdi + 144], 1
+    vinsertf128 ymm10, ymm10, xmmword ptr [rdi + 160], 1
+    vinsertf128 ymm11, ymm11, xmmword ptr [rdi + 176], 1
+    vinsertf128 ymm12, ymm12, xmmword ptr [rdi + 192], 1
+    vinsertf128 ymm13, ymm13, xmmword ptr [rdi + 208], 1
+    vinsertf128 ymm14, ymm14, xmmword ptr [rdi + 224], 1
+    vinsertf128 ymm15, ymm15, xmmword ptr [rdi + 240], 1
+5:
+    ret
+.size ymmh_load_live, .-ymmh_load_live
 
 .section .text
 .global iret_to_user

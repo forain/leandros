@@ -206,7 +206,25 @@ pub(crate) unsafe fn enable_sse(bsp: bool) {
         else if bsp { sched::uaccess::PAN_MODE.store(0, core::sync::atomic::Ordering::Relaxed); }
         else { panic!("AP without SMAP on a BSP with SMAP (boot with pan=off)"); }
     }
+    // AVX: needs CPUID.1:ECX XSAVE(26)+AVX(28) and XCR0 support for x87|SSE|AVX.
+    // Only XCR0 = 7 is ever enabled (no AVX-512); the context switch then
+    // preserves the upper YMM halves itself (sched::context::AVX_ON).
+    // `avx=off` is not parsed here; AVX_ON is decided per CPU and the BSP's
+    // answer is what the switch code sees.
+    let avx = {
+        use core::arch::x86_64::{__cpuid, __cpuid_count};
+        let l1 = __cpuid(1).ecx;
+        __cpuid(0).eax >= 0xD && (l1 & (1 << 26)) != 0 && (l1 & (1 << 28)) != 0
+            && (__cpuid_count(0xD, 0).eax & 7) == 7
+    };
+    if avx { cr4 |= 1u64 << 18; } // OSXSAVE
     asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+    if avx {
+        asm!("xsetbv", in("ecx") 0u32, in("eax") 7u32, in("edx") 0u32, options(nomem, nostack));
+        if bsp { sched::context::AVX_ON.store(1, core::sync::atomic::Ordering::Release); }
+    } else if !bsp && sched::context::AVX_ON.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        panic!("AP without AVX on a BSP with AVX");
+    }
 }
 
 /// CPUID.(EAX=7,ECX=0):EBX bit 7 (SMEP) and bit 20 (SMAP).

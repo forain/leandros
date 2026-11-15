@@ -53,7 +53,7 @@ struct Ct {
     nic: u8, nicip: [u8; 4], last: u64, replied: bool,
     /// TCP lite FSM: 0 SYN sent, 1 SYN-ACK seen, 2 established, 3 one side sent FIN, 4 closing (both FINs or RST: TIME_WAIT-lite).
     tst: u8, fins: u8,
-    /// 0 = outbound SNAT flow, 1 = inbound DNAT flow (peer -> published port), 2 = hairpin (container -> local address, DNAT + masquerade).
+    /// 0 = outbound SNAT flow, 1 = inbound DNAT flow (peer -> published port), 2 = hairpin (container -> local address, DNAT + masquerade), 3 = the same without masquerade (cross-network, source kept).
     kind: u8,
     /// Hairpin target: container ip/port, its bridge and port, its MAC and the bridge MAC.
     tip: [u8; 4], tport: u16, tbr: Sid, tps: Sid, tmac: [u8; 6], tbmac: [u8; 6],
@@ -63,12 +63,12 @@ struct Lrn { br: Sid, ip: [u8; 4], mac: [u8; 6], port: Sid, t: u64 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
 pub(crate) struct St {
-    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>,
+    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>, pub(crate) l6: crate::fwd6::L6,
     ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>, park: Vec<Park>,
     pub(crate) txq: VecDeque<(u8, Vec<u8>)>, pub(crate) inq: VecDeque<(Sid, Sid, Vec<u8>)>,
     pub(crate) next: u16, pub(crate) swept: u64,
 }
-pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
+pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), l6: crate::fwd6::L6::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
 pub(crate) static USED: AtomicBool = AtomicBool::new(false);
@@ -268,6 +268,7 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
     while let Some((port, mut f)) = work.pop_front() {
         if nft && port != crate::vifsel::NO_PEER && port != br {
             if let Some(ip) = learn(br, port, bmac, &f) { for q in unpark(br, ip).into_iter().rev() { work.push_front(q); } }
+            if let Some(ip) = crate::fwd6::learn_c(br, port, bmac, &f) { for q in crate::fwd6::unpark(br, ip).into_iter().rev() { work.push_front(q); } }
         }
         if on6 && f.len() >= 54 && f[12] == 0x86 && f[13] == 0xdd && f[0..6] == bmac && port != crate::vifsel::NO_PEER && port != br {
             match crate::fwd6::divert(br, port, bmac, f) { Some(back) => keep.push_back(back), None => {} }
@@ -673,12 +674,12 @@ fn reply_in(br: Sid, port: Sid, f: &mut Vec<u8>, p: &Pkt) -> bool {
 fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
     let now = sched::monotonic_ns();
     let mut st = FWD.lock();
-    let mut hit = st.ct.iter().position(|e| e.kind == 2 && e.proto == p.proto && e.br == br && e.port == port
+    let mut hit = st.ct.iter().position(|e| (e.kind == 2 || e.kind == 3) && e.proto == p.proto && e.br == br && e.port == port
         && e.cip == p.src && e.cport == p.sport && e.rip == p.dst && e.rport == p.dport);
     let mut rev = false;
     if hit.is_none() {
-        hit = st.ct.iter().position(|e| e.kind == 2 && e.proto == p.proto && e.tbr == br && e.tip == p.src && e.tport == p.sport
-            && e.nicip == p.dst && e.nat == p.dport);
+        hit = st.ct.iter().position(|e| e.proto == p.proto && e.tbr == br && e.tip == p.src && e.tport == p.sport
+            && ((e.kind == 2 && e.nicip == p.dst && e.nat == p.dport) || (e.kind == 3 && e.cip == p.dst && e.cport == p.dport)));
         rev = hit.is_some();
     }
     if hit.is_none() {
@@ -690,7 +691,9 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
         let Some(t) = bridge_for(cip) else { return false };
         m.dst = cip; m.dport = cport; m.oif = t.name;
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return true; }
-        if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return false; }
+        // Masquerade (netavark SETMARK: same-network clients) rewrites the source; an unmarked
+        // cross-network flow is DNATed and routed with the client's own address (kind 3).
+        let masq = crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 == crate::nfnl::Nat::Masq;
         let Some((tmac, tps)) = st.lrn.iter().find(|l| l.br == t.br && l.ip == cip).map(|l| (l.mac, l.port)) else {
             if t.br == br && st.park.len() < 16 {
                 // Hold the SYN until the ARP reply teaches us the MAC; `divert` replays it.
@@ -705,16 +708,17 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
         };
         let claimed = crate::nfnl::dnat_ports(0);
         let mut cand = None;
+        if !masq { cand = Some(0); } else {
         for _ in 0..NAT_SPAN {
             let c = NAT_BASE + st.next % NAT_SPAN;
             st.next = st.next.wrapping_add(1);
             if !st.ct.iter().any(|e| e.nat == c && e.proto == p.proto) && !claimed.iter().any(|&(a, b)| c >= a && c <= b) { cand = Some(c); break; }
-        }
+        } }
         let Some(nat) = cand else { return true };
         let cmac: [u8; 6] = f[6..12].try_into().unwrap();
         st.ct.push(Ct { proto: p.proto, nat, cip: p.src, cport: p.sport, cmac, br, port, bmac, rip: p.dst, rport: p.dport,
             nic: 0, nicip: t.addr, last: now, replied: false, tst: 0, fins: 0,
-            kind: 2, tip: cip, tport: cport, tbr: t.br, tps, tmac, tbmac: t.mac });
+            kind: if masq { 2 } else { 3 }, tip: cip, tport: cport, tbr: t.br, tps, tmac, tbmac: t.mac });
         hit = Some(st.ct.len() - 1);
     }
     USED.store(true, Ordering::Relaxed);
@@ -727,8 +731,10 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
     if p.proto == PROTO_TCP { tcp_step(e, p.flags, !rev); }
     let (dbr, dport_sid);
     if !rev {
-        f[26..30].copy_from_slice(&e.nicip);
-        f[o..o + 2].copy_from_slice(&e.nat.to_be_bytes());
+        if e.kind == 2 {
+            f[26..30].copy_from_slice(&e.nicip);
+            f[o..o + 2].copy_from_slice(&e.nat.to_be_bytes());
+        }
         rewrite_dst(f, p, e.tip, e.tport);
         f[0..6].copy_from_slice(&e.tmac); f[6..12].copy_from_slice(&e.tbmac);
         dbr = e.tbr; dport_sid = e.tps;
