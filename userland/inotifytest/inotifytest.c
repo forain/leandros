@@ -1428,6 +1428,66 @@ static void t_fanfid_self(void)
     if (ffd >= 0) close(ffd);
 }
 
+#include <sys/syscall.h>
+#if defined(__x86_64__)
+#define FH_N2H 303
+#define FH_OPEN 304
+#else
+#define FH_N2H 264
+#define FH_OPEN 265
+#endif
+struct fh20 { unsigned hb; int ht; unsigned long long ino; unsigned gen; };
+
+static void t_fhandle(void)
+{
+    wr("fhfile", "hello");
+    char p[128], d[128]; path(p, "fhfile");
+    snprintf(d, sizeof d, "%s", p); *strrchr(d, '/') = 0;
+    struct stat st; int sr = stat(p, &st);
+    int ffd = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_FID | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY);
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_ATTRIB | FAN_DELETE_SELF, AT_FDCWD, p);
+    int c1 = chmod(p, 0600);
+    struct fidev g[4]; int n = ffd < 0 ? 0 : fid_drain(ffd, g, 4);
+    struct fh20 h; memset(&h, 0xee, sizeof h); h.hb = 20; int mid = 0;
+    long nr = syscall(FH_N2H, AT_FDCWD, p, &h, &mid, 0);
+    int same = nr == 0 && n >= 1 && g[0].nr == 1 && g[0].r[0].hb == h.hb && g[0].r[0].ht == h.ht
+            && g[0].r[0].ino == h.ino && h.hb == 12 && h.ht == 0x4c && h.ino == (unsigned long long)st.st_ino;
+    /* too small: EOVERFLOW and the needed size */
+    struct fh20 s; memset(&s, 0, sizeof s);
+    long ov = syscall(FH_N2H, AT_FDCWD, p, &s, &mid, 0); int ove = errno; (void)ove;
+    int ov_ok = ov == -1 && errno == EOVERFLOW && s.hb == 12;
+    /* AT_EMPTY_PATH on an fd gives the same handle */
+    int pfd = open(p, O_RDONLY); struct fh20 h2; memset(&h2, 0, sizeof h2); h2.hb = 20;
+    long er = syscall(FH_N2H, pfd, "", &h2, &mid, 0x1000);
+    int empty_ok = er == 0 && h2.ino == h.ino && h2.ht == h.ht;
+    /* open_by_handle_at reopens the right file */
+    int mfd = open(d, O_RDONLY | O_DIRECTORY);
+    int ofd = (int)syscall(FH_OPEN, mfd, &h, O_RDONLY);
+    int oe = errno; struct stat sm; fstat(mfd, &sm);
+    char b[16] = {0}; ssize_t rn = ofd >= 0 ? read(ofd, b, sizeof b - 1) : -1;
+    struct stat so; int open_ok = ofd >= 0 && fstat(ofd, &so) == 0 && so.st_ino == st.st_ino && rn == 5 && !strcmp(b, "hello");
+    if (ofd >= 0) close(ofd);
+    /* unprivileged: EPERM */
+    pid_t c = fork(); int eperm_ok = 0;
+    if (c == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(2);
+        long r = syscall(FH_OPEN, mfd, &h, O_RDONLY);
+        _exit(r == -1 && errno == EPERM ? 0 : 3);
+    }
+    if (c > 0) { int stt = 0; waitpid(c, &stt, 0); eperm_ok = WIFEXITED(stt) && WEXITSTATUS(stt) == 0; }
+    /* deleted inode: ESTALE */
+    int ul = unlink(p);
+    long es = syscall(FH_OPEN, mfd, &h, O_RDONLY);
+    int estale_ok = ul == 0 && es == -1 && errno == ESTALE;
+    int ok = sr == 0 && mr == 0 && c1 == 0 && same && ov_ok && empty_ok && open_ok && eperm_ok && estale_ok;
+    if (!ok) printf("  fhandle: nr=%ld same=%d ov=%d empty=%d open=%d(ofd=%d) eperm=%d estale=%d oe=%d mdev=%llx fdev=%llx\n",
+                    nr, same, ov_ok, empty_ok, open_ok, ofd, eperm_ok, estale_ok, oe, (unsigned long long)sm.st_dev, (unsigned long long)st.st_dev);
+    report("t_fhandle", ok);
+    if (pfd >= 0) close(pfd);
+    if (mfd >= 0) close(mfd);
+    if (ffd >= 0) close(ffd);
+}
+
 /* A listener process denies / allows the execve of /bin/true. */
 static int fan_exec_run(unsigned resp, int *evmask, int *child_rc)
 {
@@ -1488,7 +1548,7 @@ static void t_hl_cases(void)
     t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
     t_fanperm_deny(); t_fanperm_allow(); t_fanperm_access(); t_fanperm_close_allows(); t_fanperm_self(); t_fanperm_einval(); t_fan_ignore();
     t_fan_hardlink();
-    t_fanfid_einval(); t_fanfid_dfid_name(); t_fanfid_dir_fid(); t_fanfid_self(); t_fanperm_exec(); t_fanperm_deny_errno();
+    t_fanfid_einval(); t_fanfid_dfid_name(); t_fanfid_dir_fid(); t_fanfid_self(); t_fhandle(); t_fanperm_exec(); t_fanperm_deny_errno();
 }
 
 static void l2_l3_cases(void)

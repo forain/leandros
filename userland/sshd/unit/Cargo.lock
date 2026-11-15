@@ -1314,6 +1314,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "seccomp-bpf"
+version = "0.1.0"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1519,7 +1523,9 @@ dependencies = [
 name = "sshd-unit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "russh",
+ "seccomp-bpf",
  "signature",
  "ssh-encoding",
 ]

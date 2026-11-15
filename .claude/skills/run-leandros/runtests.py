@@ -221,7 +221,7 @@ SUITES = {
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
-                "host:uartgaptest.py", "host:nvmemsixtest.py",
+                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
@@ -438,6 +438,12 @@ def find_fails(out):
     return seen
 
 
+# Host scripts that only make sense on one arch (they boot their own VM of that
+# arch). A run of the other arch reports them as a skip, not a failure.
+HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
+                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64"}
+
+
 def host_run(c, timeout, arch=None, scale=1.0):
     """`host:<script> [args]`: run a script of this directory ON THE HOST
     (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape.
@@ -445,6 +451,10 @@ def host_run(c, timeout, arch=None, scale=1.0):
     (a script that boots its own VM stops it)."""
     script = c.split()[0][len("host:"):]
     argv = [sys.executable, os.path.join(HERE, script)] + c.split()[1:]
+    want = HOST_ARCH_ONLY.get(script)
+    if want and arch and arch != want:
+        return {"rc": 0, "status": "ok", "secs": 0.0,
+                "output": f"SKIP {script}: {want} only (this run is {arch})\n"}
     timeout = max(timeout, HOST_TIMEOUTS.get(script, 0) * scale)
     env = dict(os.environ)
     if arch:
