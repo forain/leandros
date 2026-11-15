@@ -197,6 +197,8 @@ SUITES = {
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
                 # stops this VM, so it must come after every suite that uses it.
                 "host:f2fsnidtest.py",
+                # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
+                "host:f2fscommittest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -275,6 +277,7 @@ SUITES = {
     "rpi5check": ["host:rpi5checktest.py"],
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
+    "f2fscommit": ["host:f2fscommittest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
