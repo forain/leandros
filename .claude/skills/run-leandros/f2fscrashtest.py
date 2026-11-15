@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--cmdline "k=v ..."] [--keep]
+"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--crashpt N] [--wseed N] [--cmdline "k=v ..."] [--keep]
 
 Crash consistency of f2fs (lane f2fsync), on a fresh 64 MiB volume attached
 as an extra disk (run id `<caller>-f2fscr`). Every iteration:
@@ -62,7 +62,26 @@ def fsck(img, strict_leaks):
         args.append("--strict-leaks")
     r = subprocess.run(args, capture_output=True, text=True, timeout=600)
     tail = [l for l in r.stdout.splitlines() if l.startswith(("ERROR", "warning", "checkpoint", "fsck", "note"))]
+    fsck.full = r.stdout + r.stderr
     return r.returncode == 0, "\n    ".join(tail[-8:])
+
+
+def keep_failed(out, img, tag, seed, params, arch):
+    """Keep the image as the failure left it plus the full fsck output; at most 2 sets."""
+    kd = os.path.join(out, "failed")
+    os.makedirs(kd, exist_ok=True)
+    sets = sorted({f.rsplit(".", 1)[0] for f in os.listdir(kd)}, key=lambda n: os.path.getmtime(os.path.join(kd, n + ".txt")))
+    for old in sets[:max(0, len(sets) - 1)]:
+        for ext in (".img", ".txt"):
+            if os.path.exists(os.path.join(kd, old + ext)):
+                os.unlink(os.path.join(kd, old + ext))
+    base = os.path.join(kd, f"{arch}-seed{seed}-{tag}")
+    subprocess.run(["cp", "-c", img, base + ".img"], check=False, stderr=subprocess.DEVNULL)
+    if not os.path.exists(base + ".img"):
+        shutil.copyfile(img, base + ".img")
+    with open(base + ".txt", "w") as f:
+        f.write(f"seed {seed} {tag} params: {params}\n" + getattr(fsck, "full", ""))
+    print(f"    kept {base}.img (+ .txt)", flush=True)
 
 
 class Claims:
@@ -173,6 +192,7 @@ class Claims:
 def main(argv):
     arch, iters, mode, seed, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 6, "mix", None, False
     extra_cmd = ""
+    fixed_cp = fixed_ws = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -186,6 +206,10 @@ def main(argv):
             mode = argv[i + 1]; i += 1
         elif a == "--seed":
             seed = int(argv[i + 1]); i += 1
+        elif a == "--crashpt":
+            fixed_cp = int(argv[i + 1]); i += 1
+        elif a == "--wseed":
+            fixed_ws = int(argv[i + 1]); i += 1
         elif a == "--keep":
             keep = True
         else:
@@ -243,7 +267,9 @@ def main(argv):
         if not last:
             how = mode if mode != "mix" else ("crashpt" if it % 2 else "kill")
             if how == "crashpt":
-                cmdline = (f"f2fs.crashpt={rnd.randint(50, 6000)} "
+                cp = rnd.randint(50, 6000)
+                cp = fixed_cp if fixed_cp is not None else cp
+                cmdline = (f"f2fs.crashpt={cp} "
                            f"f2fs.crashpt_mount={2 if prev is not None else 1}")
         cmdline = " ".join(x for x in (cmdline, extra_cmd) if x) or None
         boot(cmdline)
@@ -282,6 +308,7 @@ def main(argv):
             print(f"iter {it - 1}: fsck after recovery + umount: {'PASS' if ok else 'FAIL'}\n    {detail}", flush=True)
             if not ok:
                 fails.append(f"iter {it - 1}: fsck after recovery failed")
+            keep_failed(out, img, f"it{it - 1}-recovered", seed, "see log", arch)
             if last:
                 driver.cmd_stop()
                 break
@@ -296,6 +323,8 @@ def main(argv):
         # The workload, until the crash.
         d = f"/mnt/cr/w{it}"
         wseed = rnd.randint(1, 10 ** 9)
+        wseed = fixed_ws if fixed_ws is not None else wseed
+        print(f"iter {it}: params seed={seed} how={how} wseed={wseed} cmdline={cmdline!r}", flush=True)
         ser = driver._Serial()
         try:
             ser.pump(0.2)
@@ -329,6 +358,7 @@ def main(argv):
         print(f"iter {it}: fsck of the crashed image: {'PASS' if ok else 'FAIL'}\n    {detail}", flush=True)
         if not ok:
             fails.append(f"iter {it}: fsck of the crashed image failed")
+            keep_failed(out, img, f"it{it}-crashed", seed, f"how={how} wseed={wseed} cmdline={cmdline!r}", arch)
         prev = (d, claims)
     if not keep and os.path.exists(boot_copy):
         os.unlink(boot_copy)
