@@ -61,6 +61,10 @@ pub struct Config {
     pub sftp_server: Option<String>,
     pub max_auth_tries: usize,
     pub login_grace_secs: u64,
+    /// `MaxStartups start:rate:full` — unauthenticated connections: above
+    /// `start` new ones are dropped with probability `rate`% rising linearly
+    /// to 100% at `full`.
+    pub max_startups: (usize, usize, usize),
 }
 
 impl Default for Config {
@@ -77,6 +81,7 @@ impl Default for Config {
             sftp_server: Some("/usr/lib/ssh/sftp-server".into()),
             max_auth_tries: 6,
             login_grace_secs: 120,
+            max_startups: (10, 30, 100),
         }
     }
 }
@@ -140,6 +145,14 @@ fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
                 cfg.login_grace_secs =
                     val.trim_end_matches('s').parse().map_err(|_| err(format!("bad LoginGraceTime {val}")))?
             }
+            "maxstartups" => {
+                let n: Vec<usize> = val.split(':').filter_map(|p| p.parse().ok()).collect();
+                cfg.max_startups = match n[..] {
+                    [full] if !val.contains(':') => (full, 100, full),
+                    [s, r, f] if s <= f && r <= 100 => (s, r, f),
+                    _ => return Err(err(format!("bad MaxStartups {val}"))),
+                }
+            }
             "permitemptypasswords" => {
                 if yes_no(val, &key).map_err(err)? {
                     return Err(err("PermitEmptyPasswords yes is not supported".into()));
@@ -149,6 +162,38 @@ fn parse_config(text: &str, cfg: &mut Config) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+static UNAUTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One unauthenticated connection (MaxStartups); released on drop.
+pub struct StartupSlot;
+
+impl Drop for StartupSlot {
+    fn drop(&mut self) {
+        UNAUTH.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Admit a new connection under MaxStartups, or None to drop it.
+fn admit(max: (usize, usize, usize)) -> Option<StartupSlot> {
+    use std::sync::atomic::Ordering::AcqRel;
+    let cur = UNAUTH.fetch_add(1, AcqRel); // unauthenticated connections before this one
+    let slot = StartupSlot;
+    let (start, rate, full) = max;
+    if cur >= full {
+        return None;
+    }
+    if cur >= start {
+        let span = (full - start).max(1) as u64;
+        let pct = rate as u64 + (100 - rate as u64) * (cur - start) as u64 / span;
+        let mut b = [0u8; 8];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+        if u64::from_le_bytes(b) % 100 < pct {
+            return None;
+        }
+    }
+    Some(slot)
 }
 
 static LOG: OnceLock<Mutex<Box<dyn Write + Send>>> = OnceLock::new();
@@ -379,11 +424,15 @@ async fn serve(cfg: Config, host_key: PrivateKey, fp: String) {
             loop {
                 match l.accept().await {
                     Ok((stream, peer)) => {
+                        let Some(slot) = admit(cfg.max_startups) else {
+                            log(&format!("{peer}: dropping connection (MaxStartups)"));
+                            continue;
+                        };
                         let local = stream.local_addr().ok();
                         let rcfg = rcfg.clone();
                         let cfg = cfg.clone();
                         tokio::spawn(async move {
-                            session::run_connection(rcfg, cfg, stream, peer, local).await;
+                            session::run_connection(rcfg, cfg, stream, peer, local, slot).await;
                         });
                     }
                     Err(e) => {

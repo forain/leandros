@@ -743,6 +743,9 @@ pub fn dev_path(idx: usize) -> &'static str {
 }
 
 /// Name, parent and geometry of entry `idx`, without any I/O.
+/// Partition-table identity (MBR signature / GPT GUID) of whole disk `idx`.
+pub fn disk_id_of(idx: usize) -> Option<BootDisk> { get_any(idx).and_then(|e| e.disk_id) }
+
 pub fn describe(idx: usize) -> Option<DiskDesc> {
     let e = get_any(idx)?;
     let tb = test_bootfat(&e);

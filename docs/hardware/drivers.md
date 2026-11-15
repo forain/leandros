@@ -57,7 +57,8 @@ Satellite crates:
 | `usb` | [drivers/usb](../../drivers/usb/src/lib.rs) | xHCI host controller (`xhci/`), bulk-only mass storage + SCSI (`msc/`), boot-protocol HID (`hid/`), `DmaBuf`, the `BulkTransport` seam. `descriptor`, `device`, `endpoint`, `transfer`, `hub` and `hcd` are protocol types and an older hub/HCD model that is not wired up. |
 | `nvidia-rm` | [drivers/nvidia](../../drivers/nvidia/src/lib.rs) | NVIDIA OpenRM OS shim and bring-up thread; optional, x86_64 only, feature `nvidia` |
 | `wifi` | [drivers/wifi](../../drivers/wifi/src/lib.rs) | A port of Linux's `cfg80211`/`mac80211`/`nl80211` layering with a simulated driver |
-| host tests | [drivers/partscan-tests](../../drivers/partscan-tests/Cargo.toml), [drivers/usb/msc-tests](../../drivers/usb/msc-tests/Cargo.toml), `drivers/r8169-tests`, `drivers/uapi-tests` | Host-side unit tests for the partition scanner, the BOT/SCSI layer, the r8169 chip table/ring/firmware interpreter, and the DRM sync-object and VM_BIND bookkeeping |
+| [ena.rs](../../drivers/src/ena.rs), [ena_hw.rs](../../drivers/src/ena_hw.rs) | Amazon ENA (AWS EC2 Nitro NIC, PCI 1d0f:ec20): polled admin queue + AENQ, readless MMIO (PCI revision bit 0), one host-placement TX/RX queue pair, keep-alive/fatal/admin-timeout watchdog with reset + re-init, registered as `ethN`; `ena.disable=1` skips the probe. Core is host-tested against a mock device in `drivers/ena-tests`; LLQ and MSI-X are separate work, not tested on real EC2 yet | [design-ec2](../../TODO.md) |
+| host tests | [drivers/partscan-tests](../../drivers/partscan-tests/Cargo.toml), [drivers/usb/msc-tests](../../drivers/usb/msc-tests/Cargo.toml), `drivers/r8169-tests`, `drivers/ena-tests` (mock ENA device), `drivers/uapi-tests` | Host-side unit tests for the partition scanner, the BOT/SCSI layer, the r8169 chip table/ring/firmware interpreter, and the DRM sync-object and VM_BIND bookkeeping |
 
 Cargo features on `drivers`: `rpi5` and `raspi4b` select the SDHCI driver as `drivers::blkdev` instead
 of virtio-blk; `usb-debug` turns on verbose xHCI tracing and a boot-time bulk-transport self-test.
@@ -253,6 +254,7 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 | `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
 | `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
 | `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
+| `iwlwifi.ht40_24=0` | on | do not use 40 MHz on 2.4 GHz; by default 20/40 is used only when the AP offers it and no 40 MHz-intolerant BSS is seen in the span |
 | `iwlwifi.txagg=0` | on | no TX aggregation (no ADDBA request from us) |
 | `iwlwifi.ht40=0` | on | 20 MHz only, also on 5 GHz |
 | `iwlwifi.txant=a\|b` | automatic | transmit on one antenna only: no comparison, no toggling |

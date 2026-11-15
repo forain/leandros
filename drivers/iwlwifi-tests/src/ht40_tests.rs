@@ -177,3 +177,47 @@ fn stbc_legacy_chain_keeps_antenna_when_equal() {
     assert_eq!(c.toggles, 0, "{}", c.summary(now));
     assert_eq!(c.ant, ANT_A);
 }
+
+// ── 2.4 GHz 20/40 coexistence ───────────────────────────────────────────────
+
+fn ap24(cap: u16, param: u8) -> BssHt {
+    let mut c = parse_ht_cap(&{
+        let mut cfg = iwl8265_ht_cfg(3, 3);
+        cfg.ht40 = true;
+        ht_cap_ie(&cfg)[2..].to_vec()
+    }).unwrap();
+    c.cap = (c.cap & !(htcap::INTOLERANT_40 | htcap::SUP_WIDTH_20_40)) | cap;
+    BssHt { ht_cap: Some(c), ht_op: Some(HtOp { primary: 1, ht_param: param, op_mode: 0 }), ..BssHt::default() }
+}
+
+#[test]
+fn ht40_24_follows_the_ap() {
+    let p = 1;
+    // AP runs 40 MHz (secondary above, STA width any), no intolerant neighbours: allowed.
+    let ap = ap24(htcap::SUP_WIDTH_20_40, 0x05);
+    assert_eq!(coex_40_24(&ap, p, &[]), Ok(1));
+    // Secondary below on channel 11 -> channel 7.
+    let ap = ap24(htcap::SUP_WIDTH_20_40, 0x07);
+    assert_eq!(coex_40_24(&ap, 11, &[]), Ok(-1));
+    // AP does not offer 40 MHz to stations.
+    assert!(coex_40_24(&ap24(htcap::SUP_WIDTH_20_40, 0x00), p, &[]).is_err());
+    assert!(coex_40_24(&ap24(0, 0x05), p, &[]).is_err());
+    // The AP itself is 40 MHz intolerant.
+    assert!(coex_40_24(&ap24(htcap::SUP_WIDTH_20_40 | htcap::INTOLERANT_40, 0x05), p, &[]).is_err());
+}
+
+#[test]
+fn ht40_24_respects_intolerant_neighbours() {
+    let ap = ap24(htcap::SUP_WIDTH_20_40, 0x05); // channel 1 + 5
+    // Intolerant BSS on channel 6 overlaps the 40 MHz span (1..5): refused.
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 6, intolerant: true }]).is_err());
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 3, intolerant: true }]).is_err());
+    // Intolerant BSS clear of the span (channel 11), and tolerant ones inside it: allowed.
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 11, intolerant: true }]).is_ok());
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 6, intolerant: false }]).is_ok());
+    // Channel 8 (|8-5| = 3 < 4) overlaps the secondary; channel 9 does not.
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 8, intolerant: true }]).is_err());
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 9, intolerant: true }]).is_ok());
+    // Off-band entries (5 GHz) never count.
+    assert!(coex_40_24(&ap, 1, &[Obss { channel: 36, intolerant: true }]).is_ok());
+}

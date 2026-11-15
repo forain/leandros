@@ -475,12 +475,19 @@ static int procsys_is(const char *path, const char *want)
     return slurp_file(path, b, sizeof b) >= 0 && strcmp(b, want) == 0 && !write_succeeds(path);
 }
 
+/* max_user_namespaces is a writable per-kind limit (lane nslimits): only check it reads as a positive number. */
+static int user_limit_readable(void)
+{
+    char b[32];
+    return slurp_file("/proc/sys/user/max_user_namespaces", b, sizeof b) >= 0 && atoi(b) > 0;
+}
+
 static void procsys_overflow(void)
 {
     report("procsys_overflow",
            procsys_is("/proc/sys/kernel/overflowuid", "65534\n")
         && procsys_is("/proc/sys/kernel/overflowgid", "65534\n")
-        && procsys_is("/proc/sys/user/max_user_namespaces", "32\n"));
+        && user_limit_readable());
 }
 
 /* ===== lane idcore: composed map cases ===== */

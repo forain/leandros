@@ -605,6 +605,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     write_str("Starting getty loop...\n");
     autorun();
     net_autorun();
+    ec2_firstboot();
     autorun_snd();
     autorun_i915();
     // The SSH server (userland/sshd), on 0.0.0.0:22 by default.
@@ -1125,6 +1126,32 @@ unsafe fn net_autorun() {
     }
 }
 
+/// Pid of `/bin/ec2init`, spared by `sweep_strays`.
+static mut EC2INIT_PID: i32 = 0;
+
+/// EC2 first boot (userland/ec2init): started in the background at every boot
+/// when the binary is in the image. It exits at once unless the kernel command
+/// line (`ec2=1`, `ec2init.endpoint=`) or the DMI vendor says this is EC2, so
+/// a machine that is not on EC2 never waits for it; on EC2 it waits for the
+/// network itself, then installs the IMDS key and sets the hostname once per
+/// instance id.
+unsafe fn ec2_firstboot() {
+    if !exists(b"/bin/ec2init\0") {
+        return;
+    }
+    let pid = fork();
+    if pid == 0 {
+        let path = b"/bin/ec2init\0";
+        let argv: [*const u8; 2] = [path.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid > 0 {
+        EC2INIT_PID = pid;
+    }
+}
+
 /// Pid of the `snd.test=1` sound self-test, spared by `sweep_strays`.
 static mut AUTORUN_SND_PID: i32 = 0;
 
@@ -1237,7 +1264,7 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
         let is_exempt = |p: u32| {
             let q = p as i32;
             p == me || q == login_pid || q == logger_pid || q == AUTORUN_PID
-                || q == NET_AUTORUN_PID || q == AUTORUN_SND_PID
+                || q == NET_AUTORUN_PID || q == AUTORUN_SND_PID || q == EC2INIT_PID
                 || q == AUTORUN_I915_PID || q == SSHD_PID
                 || daemon_index(q).is_some()
         };

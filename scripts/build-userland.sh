@@ -138,6 +138,9 @@ if command -v zig >/dev/null 2>&1; then
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
     echo "[userland] Building netcheck (zig cc -target $ZT)..."
     zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
+    # ec2init (lane ec2init): EC2 first boot, IMDSv2 key + hostname; started by init.
+    echo "[userland] Building ec2init (zig cc -target $ZT)..."
+    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ec2init" userland/ec2init/ec2init.c
     # sndtest (lane hda): plays test tones through /dev/pipewire, the path
     # PipeWire's sink uses; run at boot by /bin/snd-autotest (snd.test=1).
     echo "[userland] Building sndtest (zig cc -target $ZT)..."

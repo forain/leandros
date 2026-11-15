@@ -289,6 +289,78 @@ def full(ssh, user, pw, tmp):
              f"rc={r.returncode} log={out.strip()!r} {r.stderr.decode(errors='replace')[-300:]!r}")
 
 
+def set_keys(ssh, user, pw, line):
+    """Install `line` as the user's whole authorized_keys (over a password login)."""
+    rc, out, err = ssh.run(user, "umask 077; mkdir -p .ssh && cat > .ssh/authorized_keys && echo ok",
+                           password=pw, stdin=line.encode() + b"\n")
+    return rc == 0 and "ok" in out
+
+
+def options(ssh, user, pw, tmp):
+    """authorized_keys options (command=, from=, no-pty, restrict) and MaxStartups."""
+    if not os.path.exists(ssh.key):
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ssh.key], check=True)
+    pub = open(ssh.key + ".pub").read().strip()
+
+    def with_opts(opts):
+        return set_keys(ssh, user, pw, f"{opts} {pub}" if opts else pub)
+
+    # command=: forced, the client's command arrives in SSH_ORIGINAL_COMMAND
+    ok = with_opts('command="echo FORCED[$SSH_ORIGINAL_COMMAND]"')
+    rc, out, err = ssh.run(user, "echo hi there", key=True)
+    step("akopt_command", ok and rc == 0 and out.strip() == "FORCED[echo hi there]", f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    # sftp is refused for a command= key
+    rc, out, err = ssh.run(user, "true", key=True, extra=("-s",))
+    # (ssh -s sftp: the forced command key must not hand out the subsystem)
+    step("akopt_command_no_subsystem", rc != 0 or "FORCED" not in out, f"rc={rc}")
+
+    # from=: a non-matching list refuses the key, a matching/negated one accepts it
+    ok = with_opts('from="192.0.2.*,198.51.100.0/24"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_from_refused", ok and rc == 255, f"rc={rc}")
+    ok = with_opts('from="!192.0.2.1,*"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_from_allowed", ok and rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-120:]!r}")
+    ok = with_opts('from="0.0.0.0/0,::/0"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_from_cidr", ok and rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-120:]!r}")
+
+    # no-pty / restrict: -tt gets no tty
+    for opt in ("no-pty", "restrict"):
+        ok = with_opts(opt)
+        rc, out, err = ssh.run(user, "tty", key=True, extra=("-tt",))
+        step(f"akopt_{opt.replace('-', '_')}", ok and "/dev/pts/" not in out
+             and "PTY allocation request failed" in err, f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    # an option this server does not implement: the line is ignored, never half-applied
+    ok = with_opts('permitopen="127.0.0.1:1"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_unknown_skipped", ok and rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, pub)
+
+    # MaxStartups (default 10:30:100): 130 idle connections cannot all be held
+    import socket
+    socks, banners = [], 0
+    for _ in range(130):
+        try:
+            c = socket.create_connection((ssh.host, ssh.port), timeout=10)
+            c.settimeout(3)
+            socks.append(c)
+        except OSError:
+            continue
+    for c in socks:
+        try:
+            if c.recv(4).startswith(b"SSH-"):
+                banners += 1
+        except OSError:
+            pass
+    for c in socks:
+        c.close()
+    step("maxstartups_cap", 0 < banners <= 100, f"banners={banners}/{len(socks)}")
+    time.sleep(2)
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("maxstartups_recovers", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-120:]!r}")
+
+
 def main(argv):
     full_mode = "--full" in argv
     user, pw = "leandro", "leandro"
@@ -311,6 +383,7 @@ def main(argv):
             break
         time.sleep(2)
     quick(ssh, user, pw)
+    options(ssh, user, pw, tmp)
     if full_mode:
         full(ssh, user, pw, tmp)
     shutil.rmtree(tmp, ignore_errors=True)
