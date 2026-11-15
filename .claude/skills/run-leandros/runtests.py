@@ -49,6 +49,7 @@ Options:
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
                              podpasta host:podpastatest.py alone (rootless podman on pasta: echo, host wget, -p port-forward, dns, churn, no leaks)
+                             podsmoke host:podsmoketest.py alone (root podman run --rm alpine echo hi; skips without the alpine image)
                              podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks)
                              podpause host:podpausetest.py alone (podman pause/unpause freezes and resumes a container)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
@@ -194,6 +195,8 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
+                "host:podsmoketest.py",
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
                 # stops this VM, so it must come after every suite that uses it.
                 "host:f2fsnidtest.py",
@@ -232,6 +235,8 @@ SUITES = {
     "nettag2": ["host:nettag2test.py"],
     # Narrow kernel parks: console poll/epoll, empty poll sets, VT_WAITACTIVE.
     "kparks": ["host:kparkstest.py"],
+    # Root `podman run --rm alpine echo hi` (skips without the LEANDROS_IMAGE_ARCHIVE image).
+    "podsmoke": ["host:podsmoketest.py"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # podman pause/unpause freeze and resume a container (needs LEANDROS_IMAGE_ARCHIVE image).

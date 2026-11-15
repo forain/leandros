@@ -442,6 +442,12 @@ const MAX_TMP_FILE_SIZE: usize = 16 << 30;
 
 static TMP_FILES: Mutex<TmpPool> = Mutex::new(TmpPool::new());
 
+/// The `/proc` path each `/tmp/.psys_<idx>` snapshot of a generated system file
+/// was opened from, so the open descriptor names that path (readlink of
+/// `/proc/self/fd/N`, and the mount(2) targets crun passes that way) and not
+/// the synthetic one. Entries die with `gen_proc_system_file` reusing the slot.
+static PSYS_ORIGIN: Mutex<alloc::vec::Vec<(usize, alloc::vec::Vec<u8>)>> = Mutex::new(alloc::vec::Vec::new());
+
 // ── Shared VMO store (K1 shared file-backed mmap) ────────────────────────────
 //
 // A tmpfs/memfd inode is "promoted" into a `TmpVmo` — a list of real 4 KiB
@@ -6938,6 +6944,7 @@ fn gen_proc_system_file(buf: &[u8; TMP_BUF_SIZE], len: usize) -> Option<VnodeKin
         for i in (0..di).rev() { fake_path[fpl] = digits[i]; fpl += 1; }
     }
     let fl = fpl.min(MAX_TMP_PATH - 1);
+    PSYS_ORIGIN.lock().retain(|e| e.0 != idx);
     tmp.set_path(idx, &fake_path[..fl]);
     let copy = len.min(TMP_BUF_SIZE);
     if !tmp_fill_kernel(&mut tmp, idx, &buf[..copy]) { tmp.release(idx); return None; }
@@ -8717,6 +8724,13 @@ const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups"];
+/// The regular files `handle_open` generates through `gen_proc_system` (and
+/// the `/proc/sys/fs` ones), none of which is a RAMFS entry: stat must answer
+/// for them or they cannot be a bind-mount target.
+const PROC_SYSTEM_FILES: &[&[u8]] = &[b"/proc/meminfo", b"/proc/uptime", b"/proc/cmdline", b"/proc/nvrm_state",
+                                      b"/proc/loadavg", b"/proc/stat", b"/proc/mounts", b"/proc/interrupts",
+                                      b"/proc/sys/fs/nr_open", b"/proc/sys/fs/file-max", b"/proc/sys/fs/file-nr",
+                                      b"/proc/sys/fs/ovl_selftest", b"/proc/kmod_initrd", b"/proc/kmod_buildid"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj", b"cgroup",
                                    b"mountinfo", b"mounts"];
@@ -9768,7 +9782,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/sys/fs/file-nr"
                || lookup_path == b"/proc/sys/fs/ovl_selftest" {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
-                Some(v) => v,
+                Some(v) => {
+                    if let VnodeKind::TmpFile { idx, .. } = v {
+                        let mut o = PSYS_ORIGIN.lock();
+                        o.retain(|e| e.0 != idx);
+                        if o.len() < 64 { o.push((idx, lookup_path.to_vec())); }
+                    }
+                    v
+                }
                 None    => return err_reply(-2),
             }
         } else if lookup_path == b"/etc/mtab" {
@@ -16797,6 +16818,12 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
         return ok_reply();
     }
+    // The generated system files (`gen_proc_system`) exist for stat too:
+    // mount(2) of a bind onto one (OCI masked paths, lxcfs) stats its target.
+    if PROC_SYSTEM_FILES.contains(&strip_trailing_slash(path)) {
+        write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
+        return ok_reply();
+    }
 
     if let Some(lookup_path) = should_lookup_ramfs(path) {
         // A GPU backend's DRM PCI identity file (see `drm_sysfs_attr`).
@@ -17186,7 +17213,10 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
                 // "<path> (deleted)" (Linux d_path); tmpfs paths are the
                 // names, so a rename is followed already.
                 let suffix: &[u8] = if tmp[i].unlinked() { b" (deleted)" } else { b"" };
-                let path = tmp[i].path();
+                let origin = if tmp[i].path().starts_with(b"/tmp/.psys_") {
+                    PSYS_ORIGIN.lock().iter().find(|e| e.0 == i).map(|e| e.1.clone())
+                } else { None };
+                let path = match &origin { Some(o) => &o[..], None => tmp[i].path() };
                 let mut l = 0usize;
                 for &c in path.iter().chain(suffix.iter()) {
                     if l == buf_len || l == st.len() { break; }
