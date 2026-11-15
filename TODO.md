@@ -33,6 +33,9 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Panel-embedded applets render with tiny-skia** (root cause: cosmic-panel creates zwp_linux_dmabuf_v1 only if its GLES renderer exists at bind_display(); ours comes ~0.3 s later; measured 2026-11-13 aarch64: comp->panel start 0.42 s, no kernel DRM step visible in that window (handoff/klogms.md); needs a cosmic-panel source change, out of bounds - not a kernel bug); aarch64 desktop clicks need a physical-mouse check (P0 #5).
 - **VT switching**: a present inside its handler during a switch can flash; evdev VT gate not tested against cosmic-comp. (`EVIOCGRAB` exclusivity, `EVIOCREVOKE` and the Ctrl+Alt+Esc escape hatch are implemented and covered by `vttest`; see artifacts/notes/lane-evdevvt-2026-11-13.md.)
 
+- **gpuqtest --venus (x86_64 KVM box) fails 2/12**: `FENCE_FD_IN_WAITS` ("in-fence pending at submit in tries=5") and `DEAD_CTX_FAST` ("fence written off after ms=0 next submit errno=0 dead contexts=0"); the other 10 pass. First venus run of this contract (integx on 91b16768), so pre-existing, not a regression. aarch64 --venus cannot run on the Mac (host virglrenderer has no render server).
+- **Desktop DOOM check fails** (doomsession.py on aarch64/HVF/virgl, 91b16768): desktop frames never change (changed_frac 0.0, fps []) and desktop audio rms 0, while text-VT DOOM is fine (rms 6972). Possibly a harness limit (screendump cannot photograph a virgl session); needs a non-screendump frame probe before calling it a bug.
+
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
 - **f2fs crash-consistency: one unreproduced fsck failure.** `f2fscrashtest` (default mix, 6 iters, aarch64) once failed "fsck of the crashed image" (iter 5, a crashpt iteration, 20 errors, seed not logged). 40+ iterations on 2026-11-15 (mix, aarch64 TCG, 2x20) all green, so it is unreproduced. The tool now prints `params seed= wseed= cmdline=` per iteration, takes `--crashpt N --wseed N`, and on failure keeps the image + full fsck output in `$F2FSCR_OUT/failed/` (max 2). If it recurs, classify from the kept image.
@@ -74,6 +77,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - **Unpushed sibling-repo fix**: `sync FILE` → fsync lives in `../coreutils` commit 24b9372 (main, ahead of origin by 1). Push it together with the next leandros push. The box's `leandros-siblings/coreutils` has the same diff only as an uncommitted change, so a reset there silently reverts `sync FILE` to a whole-system sync (the `syncfile` regress suite catches it).
+
+- **kexecacpi runs an x86_64 VM on aarch64 box runs**: the suite is x86_64-only but runtests launches it with no arch argument, so an aarch64 regress2 run fails it at the first boot step ("cannot connect to serial socket"); runner should skip it by arch. Also no test covers a COSMIC/GLib file monitor (inotify) end to end (inotifydesk.py only samples idle load).
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
 
