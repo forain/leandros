@@ -266,6 +266,8 @@ impl VirtQueue {
         let mut spins: u32 = 0;
         let used_idx = core::ptr::addr_of!((*self.used).idx);
         let last = self.last_used_idx;
+        let armed = armed && !BLK_IRQ_DEAD.load(core::sync::atomic::Ordering::Relaxed);
+        let irq0 = BLK_IRQS.load(core::sync::atomic::Ordering::Relaxed);
         let _w = if armed { Some(WaitingCpu::enter()) } else { None };
         let mut warn_at = slow_ns;
         let mut slow = false;
@@ -295,6 +297,7 @@ impl VirtQueue {
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        if armed { irq_health(BLK_IRQS.load(core::sync::atomic::Ordering::Relaxed) != irq0); }
         Ok(slow)
     }
 }
@@ -320,6 +323,22 @@ static BLK_ISR: [core::sync::atomic::AtomicUsize; MAX_BLK_DEVICES] =
 static BLK_INTID: [core::sync::atomic::AtomicU32; MAX_BLK_DEVICES] =
     [const { core::sync::atomic::AtomicU32::new(0) }; MAX_BLK_DEVICES];
 static BLK_ARMED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Set when completions keep arriving with no interrupt (line masked by the
+/// storm guard, or routing broken): waiters go back to spinning for good.
+static BLK_IRQ_DEAD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BLK_IRQ_MISSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const IRQ_MISS_LIMIT: u32 = 64;
+
+/// Record whether a parked wait saw its completion interrupt.
+fn irq_health(saw_irq: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if saw_irq { BLK_IRQ_MISSES.store(0, Relaxed); return; }
+    if BLK_IRQ_MISSES.fetch_add(1, Relaxed) + 1 == IRQ_MISS_LIMIT {
+        BLK_IRQ_DEAD.store(true, Relaxed);
+        crate::kenv::pci::serial_debug("[VIRTIO-BLK] completions arrive without interrupts; back to polling\n");
+    }
+}
 
 /// Registers this CPU as a parked waiter for the guard's lifetime.
 struct WaitingCpu(u64);
