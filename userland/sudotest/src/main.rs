@@ -347,6 +347,18 @@ fn main() {
     let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
     t.check("leandro: sudo -n id fails again after -K", o.code != 0 && !o.stdout.contains("uid=0"), &o);
 
+    // ── su/sudo write no utmp/wtmp records (Linux: pam_unix does not; only
+    // login(1), sshd, getty and display managers do) ────────────────────────
+    let sz = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let (u0, w0) = (sz("/run/utmps/utmp"), sz("/var/log/wtmp"));
+    let o = run(As::Root, &[SUDO, "-n", "id"], &[], "");
+    let o2 = run(As::Root, &[SU, "leandro", "-c", "id"], &[], "");
+    t.check(
+        "su and sudo leave utmp and wtmp untouched (as Linux)",
+        o.code == 0 && o2.code == 0 && sz("/run/utmps/utmp") == u0 && sz("/var/log/wtmp") == w0,
+        &o,
+    );
+
     // ── sudo as a non-wheel user: denied, whatever the password ──────────
     let o = run(GREETER, &[SUDO, "-S", "id"], &[], "leandro\n");
     t.check("cosmic-greeter (not in wheel): sudo denied", o.code != 0 && !o.stdout.contains("uid=0"), &o);
