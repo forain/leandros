@@ -12,7 +12,10 @@
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering::*};
 
 pub type NsId = u16;
-pub const NS_MAX: usize = 256;
+/// Slots in the shared namespace table (ids are u16). Static, memory-bounded:
+/// ~0.55 KiB per slot (~4.5 MiB of BSS in total). Every per-id array below is
+/// indexed directly by id, so lookups stay O(1) and lock-free.
+pub const NS_MAX: usize = 8192;
 /// Linux `/proc/sys/user/max_user_namespaces` nesting limit.
 pub const MAX_USERNS_LEVEL: u8 = 32;
 /// Clone/unshare flags the namespace layer accepts so far.
@@ -150,7 +153,7 @@ pub const LIMIT_N: usize = 9;
 pub const LIMIT_NAMES: [&[u8]; LIMIT_N] =
     [b"", b"max_user_namespaces", b"max_mnt_namespaces", b"max_net_namespaces", b"max_pid_namespaces",
      b"max_time_namespaces", b"max_cgroup_namespaces", b"max_ipc_namespaces", b"max_uts_namespaces"];
-const LIMIT_DEFAULT: [u32; LIMIT_N] = [0, 72, 48, 32, 20, 8, 24, 24, 24];
+const LIMIT_DEFAULT: [u32; LIMIT_N] = [0, 2048, 1024, 2048, 512, 8, 512, 1024, 1000];
 static LIMIT: [AtomicU32; LIMIT_N] = {
     let mut a = [const { AtomicU32::new(0) }; LIMIT_N];
     let mut i = 0;

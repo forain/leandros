@@ -3535,7 +3535,7 @@ static void nsforge_bind_regression(void)
 
 
 /* --- per-kind namespace limits (/proc/sys/user/max_<kind>_namespaces) --- */
-#define NSLIM_MAXKIDS 300
+#define NSLIM_MAXKIDS 1100
 static pid_t nslim_kid[NSLIM_MAXKIDS];
 static int nslim_nkid;
 
@@ -3608,6 +3608,15 @@ static int nslim_fill(unsigned long flag, int *err)
 
 static void nslimit_cases(void)
 {
+    /* Namespace table is large enough for Linux-like per-kind budgets: 1000
+     * children each holding a fresh user AND net namespace (2000 slots). */
+    {
+        int n = 0, r = 0;
+        while (n < 1000 && (r = nslim_hold(CLONE_NEWUSER | CLONE_NEWNET)) == 0) n++;
+        if (n < 1000) printf("  nstable: held only %d (err %d)\n", n, r);
+        check("nslimit_1000_user_net", n == 1000);
+        nslim_release();
+    }
     static const char *kinds[] = { "user", "mnt", "net", "pid", "time", "cgroup", "ipc", "uts" };
     int ok = 1;
     for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
@@ -3644,6 +3653,8 @@ static void nslimit_cases(void)
     nslim_put("ipc", old_ipc);
 
     /* No starvation: exhausting uts leaves netns, ipc and mount creation working. */
+    long old_uts = nslim_get("uts");
+    nslim_put("uts", 40);
     n = nslim_fill(CLONE_NEWUTS, &err);
     base = n;
     ok = err == ENOSPC && n <= nslim_get("uts");
@@ -3657,6 +3668,7 @@ static void nslimit_cases(void)
     ok = nslim_hold(CLONE_NEWUTS) == 0;
     check("nslimit_uts_reusable_after_release", ok);
     nslim_release();
+    nslim_put("uts", old_uts);
 }
 
 static void nsforge_cases(void)
