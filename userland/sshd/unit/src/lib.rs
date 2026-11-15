@@ -3,6 +3,8 @@
 pub mod userauth;
 #[path = "../../src/rpc.rs"]
 pub mod rpc;
+#[path = "../../src/sandbox.rs"]
+pub mod sandbox;
 
 #[cfg(test)]
 mod extra {
