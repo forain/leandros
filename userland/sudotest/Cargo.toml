@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+# The same libpam ABI su, sudo and greetd link (rlib, no libpam.so exists).
+pam-leandros = { path = "../../ports/greetd/pam-leandros" }
 
 [profile.release]
 panic = "abort"
