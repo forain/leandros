@@ -5143,21 +5143,33 @@ static ORIG_PEER: Mutex<alloc::vec::Vec<(u32, usize, IpEndpoint, IpEndpoint)>> =
 /// nftables OUTPUT chain for a host-local connect (podnat L2): `fib daddr type local` + DNAT redirects
 /// 127.0.0.1:H / nicip:H to the container. getpeername keeps the original (see `ORIG_PEER`).
 fn nft_output_dnat(pid: u32, fd: usize, slot: usize, ip: IpAddress, ep: IpEndpoint) -> (IpAddress, IpEndpoint) {
-    let IpAddress::Ipv4(a) = ip else { return (ip, ep) };
     if !nfnl::has_tables(0) || sock_netns(pid, slot) != 0 { return (ip, ep) }
     let l4 = match sock_entry(pid, fd).map(|e| e.sock_type) {
         Some(t) if t == SOCK_STREAM as u8 => 6u8,
         Some(t) if t == SOCK_DGRAM as u8 => 17u8,
         _ => return (ip, ep),
     };
-    let d = a.0;
-    if !fwd::host_local(d) { return (ip, ep) }
-    let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
-    let mut m = nfnl::Pkt { l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None };
+    let (mut m, v6) = match ip {
+        IpAddress::Ipv4(a) => {
+            let d = a.0;
+            if !fwd::host_local(d) { return (ip, ep) }
+            let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
+            (nfnl::Pkt { l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None }, false)
+        }
+        IpAddress::Ipv6(a) => {
+            let d = a.0;
+            let lo = d == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            if !lo && !ip6::is_host6(&d) { return (ip, ep) }
+            (nfnl::Pkt { l4, src: [0; 4], dst: [0; 4], sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: Some((d, d)) }, true)
+        }
+    };
     let (acc, nat) = nfnl::eval(0, nfnl::H_OUT, &mut m);
     let _ = acc;
-    let nfnl::Nat::Dnat(c, cp) = nat else { return (ip, ep) };
-    let real = IpEndpoint::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(c[0], c[1], c[2], c[3])), if cp == 0 { ep.port } else { cp });
+    let real = match (nat, v6) {
+        (nfnl::Nat::Dnat(c, cp), false) => IpEndpoint::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(c[0], c[1], c[2], c[3])), if cp == 0 { ep.port } else { cp }),
+        (nfnl::Nat::Dnat6(c, cp), true) => IpEndpoint::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address(c)), if cp == 0 { ep.port } else { cp }),
+        _ => return (ip, ep),
+    };
     let mut t = ORIG_PEER.lock();
     t.retain(|x| !(x.0 == pid && x.1 == slot));
     if t.len() >= 256 { t.remove(0); }

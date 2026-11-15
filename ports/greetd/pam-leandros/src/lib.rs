@@ -44,6 +44,8 @@
 //! PAM only from the forked session worker, which is single-threaded, and real
 //! libpam handles are not thread-safe either.
 
+// A copy of lib/utmpx/utmpx.rs (see shadowhash below for why). Keep the two identical.
+mod utmpx;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
@@ -304,6 +306,9 @@ pub unsafe extern "C" fn pam_open_session(pamh: *mut PamHandle, _flags: c_int) -
     if matches!(h.service.as_deref().map(CStr::to_bytes), Some(b"greetd")) {
         if let Some(user) = h.user.as_ref() {
             join_session_cgroup(user);
+            if user.to_bytes() != b"cosmic-greeter" {
+                utmpx::login(libc::getpid(), b"greetd", user.to_bytes(), b"", libc::getpwnam(user.as_ptr()).as_ref().map(|p| p.pw_uid).unwrap_or(0));
+            }
         }
         return PAM_SUCCESS;
     }
@@ -352,7 +357,12 @@ unsafe fn join_session_cgroup(user: &CStr) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_close_session(_pamh: *mut PamHandle, _flags: c_int) -> c_int {
+pub unsafe extern "C" fn pam_close_session(pamh: *mut PamHandle, _flags: c_int) -> c_int {
+    if let Some(h) = pamh.as_ref() {
+        if matches!(h.service.as_deref().map(CStr::to_bytes), Some(b"greetd")) {
+            utmpx::logout_pid(libc::getpid());
+        }
+    }
     PAM_SUCCESS
 }
 
