@@ -35,6 +35,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Hardware (laptop / PC / Pi)
 - **Stick write commands of 0.5-1.3 s are hidden, not removed** (USB hubs now supported, usbhot2).
+- **f2fs crash-consistency: one unreproduced fsck failure.** `f2fscrashtest` (default mix, 6 iters, aarch64) once failed "fsck of the crashed image" (iter 5, a crashpt iteration, 20 errors, seed not logged). 40+ iterations on 2026-11-15 (mix, aarch64 TCG, 2x20) all green, so it is unreproduced. The tool now prints `params seed= wseed= cmdline=` per iteration, takes `--crashpt N --wseed N`, and on failure keeps the image + full fsck output in `$F2FSCR_OUT/failed/` (max 2). If it recurs, classify from the kept image.
+
 
 ## Missing features
 
