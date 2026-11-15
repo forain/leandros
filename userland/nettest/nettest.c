@@ -85,6 +85,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sys/epoll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -555,6 +557,69 @@ static void tcp_shutdown(void) {
     else if (rl == 0 || el != ENOTCONN) fail(N, "shutdown(listener) = %d errno %s (want ENOTCONN)", rl, strerror(el));
     else if (ru == 0 || eu != ENOTCONN) fail(N, "shutdown(unconnected) = %d errno %s (want ENOTCONN)", ru, strerror(eu));
     else { printf("%s: half-close both ways, ENOTCONN on listener/unconnected\n", N); pass(N); }
+}
+
+/* A process killed while it holds the last copy of an accepted socket must
+ * close it: the peer reads EOF.  threads=1 adds a sleeping second thread
+ * (like the tokio workers of sshd -R). */
+static void *kc_sleeper(void *a) { (void)a; for (;;) sleep(1000); return NULL; }
+static void *kc_epoller(void *a) {
+    int ep = *(int *)a;
+    struct epoll_event ev[4];
+    for (;;) epoll_wait(ep, ev, 4, -1);
+    return NULL;
+}
+
+static void tcp_kill_closes_one(const char *N, int threads, int sig) {
+    /* threads: 0 none, 1 sleeping thread, 2 thread blocked in epoll_wait on the socket */
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = sin4("127.0.0.1", 0);
+    if (l < 0 || bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) {
+        fail(N, "listener: %s", strerror(errno)); if (l >= 0) close(l); return;
+    }
+    char err[128];
+    int c = tcp_connect("127.0.0.1", local_port(l), 3000, err, sizeof err);
+    if (c < 0) { fail(N, "connect: %s", err); close(l); return; }
+    struct pollfd p = { l, POLLIN, 0 };
+    poll(&p, 1, 2000);
+    int s = accept(l, NULL, NULL);
+    if (s < 0) { fail(N, "accept: %s", strerror(errno)); close(c); close(l); return; }
+    int rp[2];
+    if (pipe(rp) < 0) { fail(N, "pipe"); return; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(c); close(l); close(rp[0]);
+        if (threads == 2) {
+            static int ep;
+            ep = epoll_create1(0);
+            struct epoll_event e = { .events = EPOLLIN | EPOLLOUT | EPOLLET, .data.fd = s };
+            epoll_ctl(ep, EPOLL_CTL_ADD, s, &e);
+            pthread_t t; pthread_create(&t, NULL, kc_epoller, &ep);
+        } else if (threads) { pthread_t t; pthread_create(&t, NULL, kc_sleeper, NULL); }
+        (void)!write(rp[1], "r", 1);
+        for (;;) sleep(1000);
+    }
+    close(s); close(rp[1]);
+    char b[4];
+    (void)!read(rp[0], b, 1);
+    close(rp[0]);
+    usleep(200000);
+    kill(pid, sig);
+    waitpid(pid, NULL, 0);
+    struct pollfd pc = { c, POLLIN, 0 };
+    int pr = poll(&pc, 1, 5000);
+    ssize_t n = pr > 0 ? recv(c, b, 1, MSG_DONTWAIT) : -2;
+    close(c); close(l);
+    if (n == 0) { printf("%s: peer read EOF after the holder was killed\n", N); pass(N); }
+    else fail(N, "no EOF within 5 s of killing the process holding the accepted socket (poll=%d recv=%zd)", pr, n);
+}
+
+static void tcp_kill_closes(void) {
+    tcp_kill_closes_one("tcp_kill_closes", 0, SIGKILL);
+    tcp_kill_closes_one("tcp_kill_closes_mt", 1, SIGKILL);
+    tcp_kill_closes_one("tcp_segv_closes_mt", 1, SIGSEGV);
+    tcp_kill_closes_one("tcp_kill_closes_epoll", 2, SIGKILL);
+    tcp_kill_closes_one("tcp_segv_closes_epoll", 2, SIGSEGV);
 }
 
 /* Linux owns all of 127.0.0.0/8 on lo: TCP and UDP to 127.0.0.3/.5 work. */
@@ -1217,6 +1282,7 @@ int main(int argc, char **argv) {
     tcp_dns(dns, name);
     tcp_http(http);
     tcp_shutdown();
+    tcp_kill_closes();
     lo_slash8();
     raw_close_delivers();
     icmp_sockopt();
