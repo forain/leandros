@@ -659,6 +659,7 @@ def main():
         b"root:x:0:0:root:/root:/bin/brush\n"
         b"cosmic-greeter:x:990:990:COSMIC Greeter:/home/cosmic-greeter:/bin/false\n"
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
+        b"sshd:x:22:22:sshd privsep:/var/empty:/sbin/nologin\n"
         b"nobody:x:65534:65534:nobody:/:/bin/false\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
@@ -700,6 +701,7 @@ def main():
     etc_files.append(("group", (
         b"root:x:0:\n"
         b"tty:x:5:\n"
+        b"sshd:x:22:\n"
         b"wheel:x:10:leandro\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
@@ -718,6 +720,7 @@ def main():
     shadow_lines = (
         f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
         f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
+        "sshd:!:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
@@ -3052,6 +3055,10 @@ def main():
     # /var/tmp: containers/storage and podman stage image copies there
     _ap_dirs.add("/var/tmp")
     _ap_dirmode["/var/tmp"] = 0o1777
+    # sshd privilege separation: the network child chroots here (root-owned,
+    # not group/other writable, empty; sshd refuses to start otherwise).
+    _ap_dirs.add("/var/empty")
+    _ap_dirmode["/var/empty"] = 0o755
     for _d in set(_ap_dirs):
         while _d not in ("/", ""):
             _ap_dirs.add(_d)
