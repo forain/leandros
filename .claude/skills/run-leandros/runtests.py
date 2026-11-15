@@ -18,6 +18,7 @@ Options:
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              serialxfer host:serialxfertest.py alone (serial push + kexec, scripts/pi-serial-*)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
+                             nitrox86 host:nitrotest.py alone (x86_64 without PIT/HPET/i8042/display, EC2 Nitro-like)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              usbisoch host:usbisochtest.py alone (xHCI isoch OUT: 2 s 1 kHz sine to usb-audio, WAV checked)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
@@ -34,6 +35,7 @@ Options:
                                       + host:inloadtest.py (hostfwd connects under bulk load and an unpumped held serial)
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
+                             ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
@@ -258,6 +260,8 @@ SUITES = {
     "kexecacpi": ["host:kexecacpitest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
+    # lane nitrox86: x86_64 with no PIT/HPET/i8042/display (EC2 Nitro-like): login on serial, TSC stated, clock true (own boot).
+    "nitrox86": ["/bin/timertest", "host:nitrotest.py"],
     "usbisoch": ["host:usbisochtest.py"],
     "blkslow": ["host:blkslowtest.py"],
     # 12 extra virtio-blk data disks all appear in /dev and mount (own boot, openbugs #83).
@@ -289,6 +293,8 @@ SUITES = {
                 "host:netflaptest.py",
                 # netctl metric + net.metric.<if>= boot knob (own boot).
                 "host:netmetrictest.py",
+                # EC2 first-boot service vs a fake IMDSv2 (own boot).
+                "host:ec2inittest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
                 # hostfwd connects under bulk load / a held unpumped serial (own boot).
@@ -308,6 +314,7 @@ SUITES = {
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
+    "ec2init": ["host:ec2inittest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
     # linkmontest.py alone.
@@ -432,6 +439,8 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "nitrox86" in suites:
+        os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915crtc2" in suites and cmdline is None:
