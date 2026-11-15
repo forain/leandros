@@ -928,9 +928,10 @@ static void t_hl_link_after_watch(void)
     watch(ifd, "hw_a", IN_ATTRIB | IN_MODIFY);
     char a[128], b[128]; path(a, "hw_a"); path(b, "hw_b"); link(a, b);
     struct got g[8]; int n0 = drain(ifd, g, 8);
+    int ok0 = n0 == 1 && g[0].mask == IN_ATTRIB;
     wr("hw_b", "y");
     int n1 = drain(ifd, g, 8);
-    report("t_hl_link_after_watch", n0 == 1 && g[0].mask == IN_ATTRIB && n1 == 1 && g[0].mask == IN_MODIFY);
+    report("t_hl_link_after_watch", ok0 && n1 == 1 && g[0].mask == IN_MODIFY);
     close(ifd);
 }
 
@@ -983,6 +984,9 @@ static void t_fan_basic(void)
     int n3 = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
     ok = ok && n2 <= 0 && n3 == 2 && g[0].mask == FAN_OPEN && g[1].mask == FAN_CLOSE_NOWRITE;
     fan_closeall(g, n3);
+    if (!ok) printf("  fan_basic: mr=%d n=%d n2=%d n3=%d first=%llx,%llx,%llx,%llx pid=%d/%d link=%s\n", mr, n, n2, n3,
+                    (unsigned long long)g[0].mask, (unsigned long long)g[1].mask, (unsigned long long)g[2].mask,
+                    (unsigned long long)g[3].mask, g[0].pid, getpid(), g[0].link);
     report("t_fan_basic", ok);
     if (ffd >= 0) close(ffd);
 }
