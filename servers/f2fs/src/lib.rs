@@ -8397,11 +8397,13 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     if buf_ptr == 0 { return err_reply(-14); } // EFAULT
 
     let bps          = ms.sb.blocks_per_seg as u64;
-    let user_blocks  = ms.sb.seg_cnt_main as u64 * bps;
+    // What the allocator can actually fill: the overprovision and the lx
+    // reserve of empty segments (`log_alloc`) never hold user data.
+    let user_blocks  = (ms.sb.seg_cnt_main as u64).saturating_sub(lx_ovp_segs(ms) as u64 + LX_RESERVE_SEGS as u64) * bps;
     let total_blocks = ms.sb.block_count.saturating_sub(ms.sb.segment0_blkaddr as u64);
     // A superblock we failed to make sense of must still not report zero —
     // `df` silently drops any filesystem with f_blocks == 0.
-    let total_blocks = if total_blocks == 0 { user_blocks.max(1) } else { total_blocks };
+    let total_blocks = if total_blocks == 0 { (ms.sb.seg_cnt_main as u64 * bps).max(1) } else { total_blocks };
 
     let valid_blocks = ms.valid_blocks;
     if statfs_check() {
