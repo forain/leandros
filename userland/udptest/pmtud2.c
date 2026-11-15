@@ -79,7 +79,11 @@ static void udp_pmtud_netns(void) {
     connect(s, (struct sockaddr *)&a, sizeof a);
     getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl);
     close(s);
-    if (v != 1000) fail(N, "parent namespace IP_MTU %d, want 1000", v);
+    int v2 = 0; { struct in_addr d2; inet_pton(AF_INET, "127.0.0.2", &d2);
+        pmtu_inject4(&d2, 17, 1000);
+        int s2 = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in a2 = sin4("127.0.0.2", 9); socklen_t l2 = sizeof v2;
+        connect(s2, (struct sockaddr *)&a2, sizeof a2); getsockopt(s2, IPPROTO_IP, IP_MTU, &v2, &l2); close(s2); }
+    if (v != 1000) fail(N, "parent namespace IP_MTU %d, want 1000 (127.0.0.2: %d, child %d)", v, v2, child);
     else if (child != 65536) fail(N, "child namespace IP_MTU %d, want 65536 (cache leaked across namespaces)", child);
     else pass(N);
 }
@@ -91,7 +95,7 @@ static void tcp_pmtud_clamp(void) {
     if (skipped(N)) return;
     char why[200] = "";
     int l = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in la = sin4("127.0.0.3", 0);
+    struct sockaddr_in la = sin4("127.0.0.1", 0);
     bind(l, (struct sockaddr *)&la, sizeof la); listen(l, 1);
     socklen_t ll = sizeof la; getsockname(l, (struct sockaddr *)&la, &ll);
     int c = socket(AF_INET, SOCK_STREAM, 0);
