@@ -71,7 +71,7 @@ framebuffer back into that same console surface and calls dpy_gfx_update(),
 and a 2D listener is what turns that into pixels a client can fetch.
 
 `--virgl` (any position after `start`): a virgl 3D device — aarch64
-`virtio-gpu-gl-pci,id=virglgpu`, x86_64 `virtio-vga-gl` — under
+`virtio-gpu-gl-pci,id=virglgpu`, x86_64 `virtio-vga-gl,id=virglgpu` — under
 `-display egl-headless` plus a loopback VNC listener on that console
 (LEANDROS_VNC_PORT, default 5909). `LEANDROS_GPU=virgl` does the same.
 On macOS this needs a GPU QEMU from scripts/mac-qemu-gpu/build.sh (virgl on
@@ -1100,7 +1100,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             # `screendump` fails outright with "no surface" — the device having
             # VGA registers does NOT mean it keeps a dumpable 2D surface. An
             # attached VNC client forces QEMU to maintain one.
-            gpu_args = ["-device", "virtio-vga-gl"]
+            gpu_args = ["-device", "virtio-vga-gl,id=virglgpu"]
             display_arg = "egl-headless"
         else:
             gpu_args = ["-device", "virtio-vga"]
