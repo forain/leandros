@@ -3106,6 +3106,11 @@ static int t_quota_hier(void)
     if (strstr(cl, "idmap=off")) { printf("  quota_hier: SKIP (idmap=off)\n"); return 0; }
     int ready[2], go[2], res[2];
     CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(res) == 0);
+    /* per-uid limit = /proc/sys/user/max_user_namespaces (Linux ucounts): pin it to 32 */
+    char old[32] = "2048\n"; int lf = open("/proc/sys/user/max_user_namespaces", O_RDWR);
+    if (lf >= 0) { int k = read(lf, old, sizeof old - 1); if (k > 0) old[k] = 0; }
+    int pinned = lf >= 0 && pwrite(lf, "32", 2, 0) == 2;
+    if (!pinned) { printf("  quota_hier: SKIP (cannot set max_user_namespaces)\n"); if (lf >= 0) close(lf); return 0; }
     pid_t c = fork();
     if (c == 0) {
         setpgid(0, 0);
@@ -3163,6 +3168,7 @@ static int t_quota_hier(void)
     }
     kill(-c, SIGKILL);
     waitpid(c, 0, 0);
+    { size_t ol = strlen(old); while (ol && old[ol - 1] == '\n') old[--ol] = 0; (void)!pwrite(lf, old, strlen(old), 0); close(lf); }
     return rc;
 }
 
