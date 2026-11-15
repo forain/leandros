@@ -308,7 +308,7 @@ def main(argv):
             print(f"iter {it - 1}: fsck after recovery + umount: {'PASS' if ok else 'FAIL'}\n    {detail}", flush=True)
             if not ok:
                 fails.append(f"iter {it - 1}: fsck after recovery failed")
-            keep_failed(out, img, f"it{it - 1}-recovered", seed, "see log", arch)
+                keep_failed(out, img, f"it{it - 1}-recovered", seed, "see log", arch)
             if last:
                 driver.cmd_stop()
                 break
