@@ -13,7 +13,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/darwin-sdk.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SHIP="$HOME/code/leandros-artifacts/m5-session-ship"
+SHIP="${LEANDROS_M5_SHIP:-$HOME/code/leandros-artifacts/m5-session-ship}"
 
 case "${1:-both}" in
   aarch64)  ARCHES=(aarch64) ;;

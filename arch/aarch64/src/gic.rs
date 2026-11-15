@@ -260,9 +260,10 @@ unsafe fn gicd_w64(off: usize, v: u64) {
     ((base + off) as *mut u64).mmio_write(v)
 }
 /// `rd` is a redistributor frame's *virtual* base (see `own_redistributor`).
-unsafe fn gicr_r32(rd: usize, off: usize) -> u32 { ((rd + off) as *const u32).mmio_read() }
-unsafe fn gicr_w32(rd: usize, off: usize, v: u32) { ((rd + off) as *mut u32).mmio_write(v) }
-unsafe fn gicr_r64(rd: usize, off: usize) -> u64 { ((rd + off) as *const u64).mmio_read() }
+pub(crate) unsafe fn gicr_r32(rd: usize, off: usize) -> u32 { ((rd + off) as *const u32).mmio_read() }
+pub(crate) unsafe fn gicr_w32(rd: usize, off: usize, v: u32) { ((rd + off) as *mut u32).mmio_write(v) }
+pub(crate) unsafe fn gicr_r64(rd: usize, off: usize) -> u64 { ((rd + off) as *const u64).mmio_read() }
+pub(crate) unsafe fn gicr_w64(rd: usize, off: usize, v: u64) { ((rd + off) as *mut u64).mmio_write(v) }
 
 // ── GICv3 mode ────────────────────────────────────────────────────────────
 //
@@ -381,7 +382,7 @@ unsafe fn gicd_wait_rwp() {
     crate::uart::serial_print_str("[GIC] GICD_CTLR.RWP never cleared\n");
 }
 
-unsafe fn gicr_wait_rwp(rd: usize) {
+pub(crate) unsafe fn gicr_wait_rwp(rd: usize) {
     for _ in 0..1_000_000 {
         if gicr_r32(rd, GICR_CTLR) & GICR_CTLR_RWP == 0 { return; }
     }
@@ -392,7 +393,7 @@ unsafe fn gicr_wait_rwp(rd: usize) {
 /// region and matching `GICR_TYPER`'s affinity to our `MPIDR_EL1`. `None` if
 /// the walk hits the Last frame without a match — a CPU the GIC cannot see.
 #[cfg(not(any(feature = "rpi5", feature = "raspi4b")))]
-unsafe fn own_redistributor() -> Option<usize> {
+pub(crate) unsafe fn own_redistributor() -> Option<usize> {
     let want = mpidr_to_typer_affinity(read_mpidr());
     for i in 0..gicr_frames() {
         let Some(rd) = gicr_virt(i) else { break; };
@@ -403,7 +404,7 @@ unsafe fn own_redistributor() -> Option<usize> {
     None
 }
 #[cfg(any(feature = "rpi5", feature = "raspi4b"))]
-unsafe fn own_redistributor() -> Option<usize> { None }
+pub(crate) unsafe fn own_redistributor() -> Option<usize> { None }
 
 /// GICv3 per-CPU bring-up: wake this CPU's redistributor, enable its PPI 27 and
 /// SGI 1 there, then switch on the system-register CPU interface. Run by the
@@ -1141,6 +1142,7 @@ const GICR_ICACTIVER0: usize = 0x380;
 /// interface off. The next kernel's `init` re-enables what it uses; it does
 /// not clear stale active state itself.
 pub fn kexec_quiesce() {
+    super::its::quiesce();
     unsafe {
         let words = (num_irqs_implemented() / 32) as usize;
         if is_v3() {

@@ -64,6 +64,7 @@ type size_t = usize;
 type ssize_t = isize;
 
 const O_RDWR: c_int = 0o2;
+const TCSETS: c_ulong = 0x5402;
 const O_NONBLOCK: c_int = 0o4000;
 
 const EAGAIN: c_int = 11;
@@ -944,6 +945,85 @@ unsafe fn t_grab_dies_on_close() -> bool {
 // it is a tty (TCGETS), it names itself `/dev/ttyN` (what ttyname() reads),
 // it knows the console's size, and the VT/KD set still addresses THAT VT.
 
+// ── Tabs and double-width cells ──────────────────────────────────────────────
+//
+// Cursor position is observable without a framebuffer: ESC[6n answers from
+// the VT's own text plane, which is what a repaint puts back on screen.
+
+unsafe fn cpr(fd: c_int, seq: &[u8]) -> (u32, u32) {
+    // Drop anything left over from the previous query.
+    let mut junk = [0u8; 32];
+    while read(fd, junk.as_mut_ptr() as *mut c_void, junk.len()) > 0 {}
+    write(fd, seq.as_ptr() as *const c_void, seq.len());
+    write(fd, b"\x1b[6n".as_ptr() as *const c_void, 4);
+    let mut buf = [0u8; 24];
+    let mut n = 0usize;
+    // Non-blocking fd: wait up to ~1.5 s for the reply, then take what is there.
+    let mut spins = 0;
+    while n < buf.len() && spins < 300 {
+        let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+        if r > 0 {
+            n += r as usize;
+            if buf[..n].contains(&b'R') { break; }
+        } else {
+            spins += 1;
+            sleep_ms(5);
+        }
+    }
+    // ESC [ row ; col R
+    let (mut row, mut col, mut in_col) = (0u32, 0u32, false);
+    for &b in &buf[..n] {
+        match b {
+            b'0'..=b'9' => { let d = (b - b'0') as u32; if in_col { col = col * 10 + d } else { row = row * 10 + d } }
+            b';' => in_col = true,
+            _ => {}
+        }
+    }
+    (row, col)
+}
+
+unsafe fn t_tabs_wide(tty0: c_int) -> bool {
+    // A VT nobody runs a getty on, or the shell would eat the reply.
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { out(b"  open failed\n"); return report(b"tabs_wide", false); }
+    // Raw, so the CPR reply is delivered without a newline.
+    let mut tio = [0u8; 64];
+    ioctl(fd, TCGETS, tio.as_mut_ptr() as *mut c_void);
+    for i in 0..4 { if i != 2 { for k in 0..4 { tio[i * 4 + k] = 0; } } }
+    tio[12..16].fill(0);
+    ioctl(fd, TCSETS, tio.as_mut_ptr() as *mut c_void);
+    let reset = b"\x1b[2J\x1b[H";
+    // HT from col 3 lands on the stop at col 9 (1-based); from a stop, the next.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let tab1 = cpr(fd, b"ab\t") == (1, 9);
+    let tab2 = cpr(fd, b"\t") == (1, 17);
+    // CHT 2 from col 1, then CBT 1 back one stop.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let cht = cpr(fd, b"\x1b[2I") == (1, 17);
+    let cbt = cpr(fd, b"\x1b[Z") == (1, 9);
+    // U+4E2D (CJK, East-Asian Wide) takes two cells; U+00E9 takes one.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let wide = cpr(fd, "\u{4e2d}".as_bytes()) == (1, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let narrow = cpr(fd, "\u{e9}".as_bytes()) == (1, 2);
+    // Emoji (U+1F600) is wide too; a wide glyph that cannot fit wraps whole.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let emoji = cpr(fd, "\u{1f600}".as_bytes()) == (1, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let wrap = cpr(fd, b"\x1b[1;1H\x1b[999C\xe4\xb8\xad") == (2, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    close(fd);
+    out(b"  tab1="); out_int(tab1 as c_int); out(b" tab2="); out_int(tab2 as c_int);
+    out(b" cht="); out_int(cht as c_int); out(b" cbt="); out_int(cbt as c_int);
+    out(b" wide="); out_int(wide as c_int); out(b" narrow="); out_int(narrow as c_int);
+    out(b" emoji="); out_int(emoji as c_int); out(b" wrap="); out_int(wrap as c_int); out(b"\n");
+    report(b"tabs_wide", tab1 && tab2 && cht && cbt && wide && narrow && emoji && wrap)
+}
+
 unsafe fn t_session_node(tty0: c_int) -> bool {
     let fd = open(b"/dev/tty5\0".as_ptr(), O_RDWR | O_NOCTTY);
     if fd < 0 {
@@ -1377,7 +1457,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 32usize;
+    let total = 33usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1402,6 +1482,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_grab_dies_on_vt_switch(tty0) { passed += 1; }
     if t_grab_dies_on_close() { passed += 1; }
     if t_session_node(tty0) { passed += 1; }
+    if t_tabs_wide(tty0) { passed += 1; }
     if t_revoke() { passed += 1; }
     if t_revoke_releases_grab() { passed += 1; }
     if t_kd_graphics_owner_death() { passed += 1; }
