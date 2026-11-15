@@ -78,7 +78,10 @@ pub(crate) static INQ_N: AtomicUsize = AtomicUsize::new(0);
 /// Diagnostic counters (/proc/net/nic "fwd_stats:"): where a forwarded UDP/ICMP flow is lost.
 /// Order: ing_udp ing_ttl ing_noroute ing_nft_drop ing_nopick emit arp_hit arp_miss pend_exp
 /// arp_learn arp_flush nicrx_udp nicrx_udp_hit nicrx_udp_miss icmperr_rx
-pub(crate) static STAT: [AtomicUsize; 15] = [const { AtomicUsize::new(0) }; 15];
+pub(crate) static STAT: [AtomicUsize; 25] = [const { AtomicUsize::new(0) }; 25];
+/// icmp_error_rx rejection reasons live at STAT[15 + n]; the last quoted tuple that found no conntrack entry is kept here.
+pub(crate) static LASTQ: [core::sync::atomic::AtomicU64; 2] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+fn rej(n: usize) -> bool { STAT[15 + n].fetch_add(1, Ordering::Relaxed); false }
 pub(crate) const S_ING_UDP: usize = 0;
 pub(crate) const S_ING_TTL: usize = 1;
 pub(crate) const S_ING_NOROUTE: usize = 2;
@@ -99,10 +102,15 @@ pub(crate) const S_ICMPERR_RX: usize = 14;
 pub(crate) fn dump_stats(w: &mut dyn core::fmt::Write) {
     let _ = write!(w, "fwd_stats:");
     for (n, i) in ["ing_udp", "ing_ttl", "ing_noroute", "ing_nft_drop", "ing_nopick", "emit", "arp_hit", "arp_miss", "pend_exp",
-                   "arp_learn", "arp_flush", "nicrx_udp", "nicrx_hit", "nicrx_miss", "icmperr_rx"].iter().zip(STAT.iter()) {
+                   "arp_learn", "arp_flush", "nicrx_udp", "nicrx_hit", "nicrx_miss", "icmperr_rx",
+                   "rej_hdr", "rej_frag", "rej_qhdr", "rej_proto", "rej_noct", "rej_odst", "icmperr_queued", "x7", "x8", "x9"].iter().zip(STAT.iter()) {
         let _ = write!(w, " {}={}", n, i.load(Ordering::Relaxed));
     }
     let _ = writeln!(w);
+    let (a, b) = (LASTQ[0].load(Ordering::Relaxed), LASTQ[1].load(Ordering::Relaxed));
+    let _ = writeln!(w, "fwd_lastq: noct quoted {}.{}.{}.{}:{} -> {}.{}.{}.{}:{} proto {}",
+        (a >> 56) as u8, (a >> 48) as u8, (a >> 40) as u8, (a >> 32) as u8, (a >> 16) as u16,
+        (b >> 56) as u8, (b >> 48) as u8, (b >> 40) as u8, (b >> 32) as u8, (b >> 16) as u16, a as u8);
     let now = sched::monotonic_ns();
     let g = FWD.lock();
     for a in g.arp.iter() {
@@ -523,14 +531,14 @@ fn icmp_error_type(b: &[u8]) -> bool {
 fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
     let ihl = (buf[14] & 15) as usize * 4;
     let tot = u16::from_be_bytes([buf[16], buf[17]]) as usize;
-    if ihl < 20 || tot < ihl + 8 + 20 || 14 + tot > buf.len() { return false; }
-    if u16::from_be_bytes([buf[20], buf[21]]) & 0x3fff != 0 { return false; }
+    if ihl < 20 || tot < ihl + 8 + 20 || 14 + tot > buf.len() { return rej(0); }
+    if u16::from_be_bytes([buf[20], buf[21]]) & 0x3fff != 0 { return rej(1); }
     let i = 14 + ihl + 8; // quoted IP header
-    if buf[i] >> 4 != 4 { return false; }
+    if buf[i] >> 4 != 4 { return rej(2); }
     let iihl = (buf[i] & 15) as usize * 4;
-    if iihl < 20 || 14 + tot < i + iihl + 8 { return false; }
+    if iihl < 20 || 14 + tot < i + iihl + 8 { return rej(2); }
     let proto = buf[i + 9];
-    if proto != PROTO_UDP && proto != PROTO_TCP && proto != PROTO_ICMP { return false; }
+    if proto != PROTO_UDP && proto != PROTO_TCP && proto != PROTO_ICMP { return rej(3); }
     let qsrc = [buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]];
     let qdst = [buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]];
     let l = i + iihl;
@@ -543,8 +551,13 @@ fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
     let mut st = FWD.lock();
     let now = sched::monotonic_ns();
     let Some(e) = st.ct.iter_mut().find(|e| e.nic == nic && e.proto == proto && e.nicip == qsrc && e.nat == qsport
-        && e.rip == qdst && (proto == PROTO_ICMP || e.rport == qdport)) else { return false };
-    if buf[30..34] != e.nicip { return false; }
+        && e.rip == qdst && (proto == PROTO_ICMP || e.rport == qdport)) else {
+        LASTQ[0].store((u32::from_be_bytes(qsrc) as u64) << 32 | (qsport as u64) << 16 | proto as u64, Ordering::Relaxed);
+        LASTQ[1].store((u32::from_be_bytes(qdst) as u64) << 32 | (qdport as u64) << 16, Ordering::Relaxed);
+        return rej(4);
+    };
+    if buf[30..34] != e.nicip { return rej(5); }
+    stat(21);
     e.last = now;
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
     let mut f = buf[..14 + tot].to_vec();
