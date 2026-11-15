@@ -4263,6 +4263,7 @@ fn cp_pos(ms: &MountState) -> [u32; 6] {
 /// remount-ro, shutdown and contexts that may not sleep only.
 fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
     act_code(ACT_CHECKPOINT);
+    vfs_server::F2FS_CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
     let seq = cp_seq_begin(ms.port);
     // An unlocked checkpoint or a roll-forward fsync may still be writing:
     // let it finish first (its commit decides which pack is durable, and an
@@ -4741,6 +4742,7 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
             return Ok(());
         }
     }
+    vfs_server::F2FS_CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
     // Phase 1.
     let (mut job, seq) = {
         let mut mounts = lock_mounts();

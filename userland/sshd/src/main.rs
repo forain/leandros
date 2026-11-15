@@ -24,6 +24,7 @@ mod utmpx;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
 mod session;
+mod userauth;
 
 use std::fs;
 use std::io::Write;
@@ -599,6 +600,9 @@ fn russh_config(cfg: &Config, host_key: PrivateKey) -> Arc<russh::server::Config
         methods,
         auth_rejection_time: Duration::from_secs(1),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
+        // Privsep P1 hooks: kex signs through `host_key_signer` (which also
+        // records the session id); `keys` only selects the algorithm/public half.
+        host_key_signer: Some(userauth::host_key_signer(vec![host_key.clone()])),
         keys: vec![host_key],
         max_auth_attempts: cfg.max_auth_tries,
         // An idle interactive shell must stay up; dead peers are found by

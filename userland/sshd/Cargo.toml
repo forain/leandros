@@ -20,7 +20,14 @@ russh = { version = "0.64.1", default-features = false, features = ["ring", "fla
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros", "signal"] }
 libc = "0.2"
 sha2 = "0.10"
+signature = "3"
+ssh-encoding = "0.3"
 
 [profile.release]
 panic = "abort"
 opt-level = 2
+
+[patch.crates-io]
+# russh 0.64.1 with the host-key signer and raw-userauth-signature hooks, see
+# vendor/russh/LEANDROS-PATCH.md.
+russh = { path = "vendor/russh" }

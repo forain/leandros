@@ -1264,12 +1264,231 @@ static void t_fan_hardlink(void)
     if (ffd >= 0) close(ffd);
 }
 
+
+/* ---- fanotify FID reporting, OPEN_EXEC_PERM, DENY_ERRNO ---- */
+#ifndef FAN_REPORT_FID
+#define FAN_REPORT_FID 0x200
+#endif
+#ifndef FAN_REPORT_DIR_FID
+#define FAN_REPORT_DIR_FID 0x400
+#endif
+#ifndef FAN_REPORT_NAME
+#define FAN_REPORT_NAME 0x800
+#endif
+#ifndef FAN_REPORT_DFID_NAME
+#define FAN_REPORT_DFID_NAME (FAN_REPORT_DIR_FID | FAN_REPORT_NAME)
+#endif
+#ifndef FAN_CREATE
+#define FAN_CREATE 0x100
+#define FAN_DELETE 0x200
+#define FAN_DELETE_SELF 0x400
+#define FAN_MOVE_SELF 0x800
+#define FAN_MOVED_FROM 0x40
+#define FAN_MOVED_TO 0x80
+#endif
+#ifndef FAN_ATTRIB
+#define FAN_ATTRIB 0x4
+#endif
+#ifndef FAN_OPEN_EXEC_PERM
+#define FAN_OPEN_EXEC_PERM 0x40000
+#endif
+#ifndef FAN_NOFD
+#define FAN_NOFD -1
+#endif
+#define FANX_ERRNO(e) (FAN_DENY | ((unsigned)(e) << 24))
+
+struct fidrec { int type; unsigned dev_lo, dev_hi, hb; int ht; unsigned long long ino; char name[64]; };
+struct fidev { unsigned long long mask; int fd, pid, nr; struct fidrec r[3]; };
+
+/* Parse like fsnotifywait: walk events by event_len, info records by hdr.len. */
+static int fid_drain(int ffd, struct fidev *g, int max)
+{
+    static char buf[8192]; int k = 0;
+    ssize_t n = read(ffd, buf, sizeof buf), off = 0;
+    while (n > 0 && off + (ssize_t)sizeof(struct fanotify_event_metadata) <= n && k < max) {
+        struct fanotify_event_metadata *m = (void *)(buf + off);
+        if (m->event_len < m->metadata_len || off + (ssize_t)m->event_len > n) break;
+        g[k].mask = m->mask; g[k].fd = m->fd; g[k].pid = m->pid; g[k].nr = 0;
+        unsigned o = m->metadata_len;
+        while (o + 4 <= m->event_len && g[k].nr < 3) {
+            unsigned char *h = (unsigned char *)m + o;
+            unsigned len = h[2] | (h[3] << 8);
+            if (len < 4 || o + len > m->event_len) break;
+            struct fidrec *r = &g[k].r[g[k].nr];
+            memset(r, 0, sizeof *r);
+            r->type = h[0];
+            if (h[0] >= 1 && h[0] <= 3 && len >= 20) {
+                memcpy(&r->dev_lo, h + 4, 4); memcpy(&r->dev_hi, h + 8, 4);
+                memcpy(&r->hb, h + 12, 4); memcpy(&r->ht, h + 16, 4);
+                if (r->hb >= 8 && 20 + r->hb <= len) memcpy(&r->ino, h + 20, 8);
+                if (h[0] == 2 && 20 + r->hb < len) snprintf(r->name, sizeof r->name, "%s", (char *)h + 20 + r->hb);
+                g[k].nr++;
+            }
+            o += len;
+        }
+        off += m->event_len; k++;
+    }
+    return k;
+}
+
+static int fid_is(const struct fidrec *r, int type, const struct stat *st, const char *name)
+{
+    return r->type == type && r->hb >= 8 && r->ino == (unsigned long long)st->st_ino
+        && r->dev_lo == (unsigned)st->st_dev && r->dev_hi == (unsigned)((unsigned long long)st->st_dev >> 32)
+        && (name == NULL || !strcmp(r->name, name));
+}
+
+static void t_fanfid_einval(void)
+{
+    int ok = 1;
+    ok = ok && fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_NAME, O_RDONLY) == -1 && errno == EINVAL;
+    ok = ok && fanotify_init(FAN_CLASS_CONTENT | FAN_REPORT_FID, O_RDONLY) == -1 && errno == EINVAL;
+    int a = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_FID | FAN_NONBLOCK, O_RDONLY);
+    char d[128]; path(d, "ffinv");
+    mkdir(d, 0755);
+    ok = ok && a >= 0 && fanotify_mark(a, FAN_MARK_ADD, FAN_CREATE | FAN_ONDIR, AT_FDCWD, d) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(a, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_ATTRIB, AT_FDCWD, d) == -1 && errno == EINVAL;
+    ok = ok && fanotify_mark(a, FAN_MARK_ADD, FAN_ATTRIB | FAN_DELETE_SELF | FAN_MOVE_SELF, AT_FDCWD, d) == 0;
+    int b = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME | FAN_NONBLOCK, O_RDONLY);
+    ok = ok && b >= 0 && fanotify_mark(b, FAN_MARK_ADD, FAN_CREATE | FAN_DELETE | FAN_ONDIR, AT_FDCWD, d) == 0;
+    int pl = fanotify_init(FAN_CLASS_NOTIF | FAN_NONBLOCK, O_RDONLY);
+    ok = ok && pl >= 0 && fanotify_mark(pl, FAN_MARK_ADD, FAN_CREATE, AT_FDCWD, d) == -1 && errno == EINVAL;
+    report("t_fanfid_einval", ok);
+    if (a >= 0) close(a);
+    if (b >= 0) close(b);
+    if (pl >= 0) close(pl);
+    rmdir(d);
+}
+
+static void t_fanfid_dfid_name(void)
+{
+    char d[128], pa[160], pb[160];
+    path(d, "ffd"); mkdir(d, 0755);
+    snprintf(pa, sizeof pa, "%s/aa", d); snprintf(pb, sizeof pb, "%s/bb", d);
+    struct stat dst; int sr = stat(d, &dst);
+    int ffd = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY);
+    unsigned long long mk = FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_ATTRIB | FAN_EVENT_ON_CHILD | FAN_ONDIR;
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, mk, AT_FDCWD, d);
+    int fd = open(pa, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);
+    int c1 = chmod(pa, 0600);
+    int r1 = rename(pa, pb);
+    int u1 = unlink(pb);
+    struct fidev g[8]; int n = ffd < 0 ? 0 : fid_drain(ffd, g, 8);
+    /* Like Linux, unlink also raises FAN_ATTRIB (link count change) before FAN_DELETE: drop it. */
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (i >= 4 && (g[i].mask & FAN_ATTRIB) && !(g[i].mask & FAN_DELETE)) continue;
+        g[m++] = g[i];
+    }
+    int n0 = n; n = m;
+    int ok = sr == 0 && mr == 0 && c1 == 0 && r1 == 0 && u1 == 0 && n == 5;
+    const unsigned long long want[5] = { FAN_CREATE, FAN_ATTRIB, FAN_MOVED_FROM, FAN_MOVED_TO, FAN_DELETE };
+    const char *nm[5] = { "aa", "aa", "aa", "bb", "bb" };
+    for (int i = 0; ok && i < 5; i++)
+        ok = (g[i].mask & ~(unsigned long long)FAN_ONDIR) == want[i] && g[i].fd == FAN_NOFD && g[i].pid == getpid()
+          && g[i].nr == 1 && fid_is(&g[i].r[0], 2, &dst, nm[i]);
+    if (!ok) printf("  fanfid_dfid_name: n0=%d sr=%d mr=%d n=%d m0=%llx nr0=%d t0=%d name0=%s\n", n0, sr, mr, n, n > 0 ? g[0].mask : 0, n > 0 ? g[0].nr : -1, n > 0 ? g[0].r[0].type : -1, n > 0 ? g[0].r[0].name : "");
+    report("t_fanfid_dfid_name", ok);
+    if (ffd >= 0) close(ffd);
+    rmdir(d);
+}
+
+static void t_fanfid_dir_fid(void)
+{
+    char d[128], pa[160];
+    path(d, "ffdd"); mkdir(d, 0755);
+    snprintf(pa, sizeof pa, "%s/xx", d);
+    struct stat dst; int sr = stat(d, &dst);
+    int ffd = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_DIR_FID | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY);
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_CREATE | FAN_ONDIR, AT_FDCWD, d);
+    int fd = open(pa, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);
+    struct fidev g[4]; int n = ffd < 0 ? 0 : fid_drain(ffd, g, 4);
+    int ok = sr == 0 && mr == 0 && n == 1 && g[0].fd == FAN_NOFD && g[0].nr == 1 && fid_is(&g[0].r[0], 3, &dst, NULL) && g[0].r[0].name[0] == 0;
+    report("t_fanfid_dir_fid", ok);
+    if (ffd >= 0) close(ffd);
+    unlink(pa); rmdir(d);
+}
+
+static void t_fanfid_self(void)
+{
+    wr("ffself", "x");
+    char p[128]; path(p, "ffself");
+    struct stat st; int sr = stat(p, &st);
+    int ffd = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_FID | FAN_NONBLOCK | FAN_CLOEXEC, O_RDONLY);
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_ATTRIB | FAN_DELETE_SELF, AT_FDCWD, p);
+    int c1 = chmod(p, 0600);
+    int u1 = unlink(p);
+    struct fidev g[4]; int n = ffd < 0 ? 0 : fid_drain(ffd, g, 4);
+    int ok = sr == 0 && mr == 0 && c1 == 0 && u1 == 0 && n == 2
+          && g[0].mask == FAN_ATTRIB && g[1].mask == FAN_DELETE_SELF
+          && g[0].fd == FAN_NOFD && g[1].fd == FAN_NOFD
+          && g[0].nr == 1 && g[1].nr == 1 && fid_is(&g[0].r[0], 1, &st, NULL) && fid_is(&g[1].r[0], 1, &st, NULL);
+    if (!ok) printf("  fanfid_self: sr=%d mr=%d n=%d m0=%llx m1=%llx\n", sr, mr, n, n > 0 ? g[0].mask : 0, n > 1 ? g[1].mask : 0);
+    report("t_fanfid_self", ok);
+    if (ffd >= 0) close(ffd);
+}
+
+/* A listener process denies / allows the execve of /bin/true. */
+static int fan_exec_run(unsigned resp, int *evmask, int *child_rc)
+{
+    int ffd = fan_perm_new(FAN_CLASS_CONTENT);
+    if (ffd < 0 || fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN_EXEC_PERM, AT_FDCWD, "/bin/true") != 0) return -1;
+    pid_t c = fork();
+    if (c == 0) {
+        char *av[] = { "true", NULL };
+        execv("/bin/true", av);
+        _exit(100 + (errno & 0x3f));
+    }
+    struct fev g[1];
+    int n = fan_wait1(ffd, g);
+    int ok = n == 1 && g[0].fd >= 0;
+    if (n == 1) *evmask = (int)g[0].mask;
+    if (ok) { fan_answer(ffd, g[0].fd, resp); close(g[0].fd); }
+    int st = 0; waitpid(c, &st, 0);
+    *child_rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    close(ffd);
+    return ok ? 0 : -2;
+}
+
+static void t_fanperm_exec(void)
+{
+    int em = 0, rc = 0, ok;
+    int r1 = fan_exec_run(FAN_DENY, &em, &rc);
+    ok = r1 == 0 && (em & FAN_OPEN_EXEC_PERM) && rc == 100 + EPERM;
+    if (!ok) printf("  fanperm_exec deny: r=%d em=%x rc=%d\n", r1, em, rc);
+    int r2 = fan_exec_run(FAN_ALLOW, &em, &rc);
+    ok = ok && r2 == 0 && rc == 0;
+    int r3 = fan_exec_run(FANX_ERRNO(EACCES), &em, &rc);
+    ok = ok && r3 == 0 && rc == 100 + EACCES;
+    if (!ok) printf("  fanperm_exec: r2=%d r3=%d rc=%d\n", r2, r3, rc);
+    report("t_fanperm_exec", ok);
+}
+
+static void t_fanperm_deny_errno(void)
+{
+    wr("fde", "x");
+    char p[128]; path(p, "fde");
+    int em = 0, ce = 0;
+    int r = fan_perm_run(p, FAN_OPEN_PERM, 'o', FANX_ERRNO(ENOSPC), &em, &ce);
+    int ok = r == 0 && ce == 100 + ENOSPC;
+    int r2 = fan_perm_run(p, FAN_ACCESS_PERM, 'r', FANX_ERRNO(EACCES), &em, &ce);
+    ok = ok && r2 == 0 && ce == 100 + EACCES;
+    /* errno bits without FAN_DENY are refused */
+    int f = fan_perm_new(FAN_CLASS_CONTENT);
+    struct fanotify_response bad = { .fd = 5, .response = FAN_ALLOW | (13u << 24) };
+    ok = ok && f >= 0 && write(f, &bad, sizeof bad) == -1 && errno == EINVAL;
+    if (f >= 0) close(f);
+    if (!ok) printf("  fanperm_deny_errno: r=%d ce=%d r2=%d\n", r, ce, r2);
+    report("t_fanperm_deny_errno", ok);
+}
+
 static void t_hl_cases(void)
 {
     t_hl_self(); t_hl_unlink_one(); t_hl_link_after_watch();
     t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
     t_fanperm_deny(); t_fanperm_allow(); t_fanperm_access(); t_fanperm_close_allows(); t_fanperm_self(); t_fanperm_einval(); t_fan_ignore();
     t_fan_hardlink();
+    t_fanfid_einval(); t_fanfid_dfid_name(); t_fanfid_dir_fid(); t_fanfid_self(); t_fanperm_exec(); t_fanperm_deny_errno();
 }
 
 static void l2_l3_cases(void)
