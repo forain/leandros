@@ -95,6 +95,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -867,7 +868,16 @@ static volatile int pw_stop;
 static pthread_t pw_tid[PW_WATCHERS];
 static volatile int pw_tid_ok[PW_WATCHERS];
 static volatile int pw_bad;
-static char pw_msg[PW_WATCHERS][200];
+static char pw_msg[PW_WATCHERS][480];
+/* Per-watcher timeline written by the conmon child and grandchild into a
+ * MAP_SHARED page, so a failure shows who was late: the sleeps, the
+ * grandchild fork, or the parent getting back from fork(). */
+struct pw_tl {
+    long long c_start, c_slept, g_forked, g_exit, c_exit;
+    int ns1, ns1_errno, gfork, gfork_errno, ns2, ns2_errno;
+};
+static struct pw_tl *pw_tl;
+static volatile int pw_late_fork;
 static int pw_iters = 10;
 
 static void pw_urg(int s) { (void)s; }
@@ -907,16 +917,26 @@ static void *pw_sockchurn(void *a) {
     return NULL;
 }
 
-static void pw_conmon_child(void) {
+static void pw_conmon_child(struct pw_tl *tl) {
+    tl->c_start = now_ms();
     struct timespec ts = { 0, 300000000 };
-    nanosleep(&ts, NULL);
+    tl->ns1 = nanosleep(&ts, NULL); tl->ns1_errno = tl->ns1 ? errno : 0;
+    tl->c_slept = now_ms();
     pid_t g = fork();
-    if (g == 0) { struct timespec t2 = { 0, 200000000 }; nanosleep(&t2, NULL); _exit(0); }
+    if (g == 0) {
+        struct timespec t2 = { 0, 200000000 };
+        tl->ns2 = nanosleep(&t2, NULL); tl->ns2_errno = tl->ns2 ? errno : 0;
+        tl->g_exit = now_ms();
+        _exit(0);
+    }
+    tl->gfork = (int)g; tl->gfork_errno = g < 0 ? errno : 0;
+    tl->g_forked = now_ms();
     for (;;) {
         pid_t w = waitpid(-1, NULL, 0);
         if (w < 0 && errno == EINTR) continue;
         if (w < 0) break;
     }
+    tl->c_exit = now_ms();
     _exit(0);
 }
 
@@ -925,8 +945,11 @@ static void *pw_watcher(void *arg) {
     pw_tid[idx] = pthread_self();
     pw_tid_ok[idx] = 1;
     for (int it = 0; it < pw_iters && !pw_bad; it++) {
+        struct pw_tl *tl = &pw_tl[idx];
+        memset(tl, 0, sizeof *tl);
+        long long tpre = now_ms();
         pid_t c = fork();
-        if (c == 0) pw_conmon_child();
+        if (c == 0) pw_conmon_child(tl);
         if (c < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "fork: %s", strerror(errno)); pw_bad = 1; break; }
         long long t0 = now_ms();
         int fd = pidfd_open(c, 0);
@@ -937,7 +960,8 @@ static void *pw_watcher(void *arg) {
             int n = ppoll(&pf, 1, &to, NULL);
             if (n < 0 && errno == EINTR) continue;
             if (n == 0) continue;
-            long long dt = now_ms() - t0;
+            long long tready = now_ms();
+            long long dt = tready - tpre;
             char pp[48]; snprintf(pp, sizeof pp, "/proc/%d/stat", (int)c);
             int alive = 0; char st = '?';
             FILE *f = fopen(pp, "r");
@@ -945,8 +969,23 @@ static void *pw_watcher(void *arg) {
             siginfo_t si; memset(&si, 0, sizeof si);
             int wr = (int)syscall(SYS_waitid, P_PIDFD, fd, &si, WEXITED | WNOHANG | WNOWAIT, NULL);
             int running = wr == 0 && si.si_pid == 0;
-            if (n < 0 || pf.revents != POLLIN || alive || running || dt < 480) {
-                snprintf(pw_msg[idx], sizeof pw_msg[idx], "iter %d n=%d errno=%d revents=%#x dt=%lld proc_state=%c waitid=%d si_pid=%d", it, n, errno, pf.revents, dt, st, wr, (int)si.si_pid);
+            /* The child cannot exit before tpre + 500 ms (it sleeps 300 ms,
+             * then waits for a 200 ms grandchild), and readiness must not
+             * precede the exits the child and grandchild recorded. dt used to
+             * be taken after fork() returned in the parent, so a parent
+             * resumed late (child-first scheduling under load) looked like an
+             * early wake. Keep a note when that old measure would have
+             * fired, with the timeline, without failing. */
+            int early = dt < 495 || (tl->c_exit && tready < tl->c_exit) || (tl->g_exit && tready < tl->g_exit);
+            if (!early && tready - t0 < 480 && !pw_late_fork) {
+                pw_late_fork = 1;
+                printf("pidfd_wake_conmon: note: parent resumed %lld ms after fork (after-fork dt=%lld, from pre-fork %lld); child start +%lld slept +%lld gforked +%lld gexit +%lld cexit +%lld\n",
+                       t0 - tpre, tready - t0, dt, tl->c_start - tpre, tl->c_slept - tpre, tl->g_forked - tpre, tl->g_exit - tpre, tl->c_exit - tpre);
+            }
+            if (n < 0 || pf.revents != POLLIN || alive || running || early) {
+                snprintf(pw_msg[idx], sizeof pw_msg[idx], "iter %d pid=%d n=%d errno=%d revents=%#x dt=%lld (fork returned +%lld) proc_state=%c waitid=%d si_pid=%d | child start +%lld slept +%lld ns1=%d/%d gfork=%d/%d at +%lld gexit +%lld ns2=%d/%d cexit +%lld",
+                         it, (int)c, n, errno, pf.revents, dt, t0 - tpre, st, wr, (int)si.si_pid,
+                         tl->c_start - tpre, tl->c_slept - tpre, tl->ns1, tl->ns1_errno, tl->gfork, tl->gfork_errno, tl->g_forked - tpre, tl->g_exit - tpre, tl->ns2, tl->ns2_errno, tl->c_exit - tpre);
                 /* Failure-only DETAIL: is the early readiness transient? */
                 struct pollfd p2 = { fd, POLLIN, 0 }; struct timespec z = { 0, 0 };
                 int n2 = ppoll(&p2, 1, &z, NULL);
@@ -972,7 +1011,12 @@ static void pidfd_wake_conmon(void) {
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_handler = pw_urg; sa.sa_flags = SA_RESTART;
     sigaction(SIGURG, &sa, NULL);
-    pw_stop = 0; pw_bad = 0;
+    pw_stop = 0; pw_bad = 0; pw_late_fork = 0;
+    if (!pw_tl) {
+        void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) { fail(n, "mmap shared timeline: %s", strerror(errno)); return; }
+        pw_tl = m;
+    }
     pthread_t sig, fc, sc, w[PW_WATCHERS];
     pthread_create(&fc, NULL, pw_forkchurn, NULL);
     pthread_create(&sc, NULL, pw_sockchurn, NULL);
