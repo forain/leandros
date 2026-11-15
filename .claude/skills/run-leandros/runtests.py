@@ -202,6 +202,9 @@ SUITES = {
                 "host:f2fsnidtest.py",
                 # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
                 "host:f2fscommittest.py",
+                # Space reuse on a small f2fs volume: churn writes N x capacity,
+                # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
+                "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -283,6 +286,7 @@ SUITES = {
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
+    "f2fsgc": ["host:f2fsgctest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -366,7 +370,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900}
 
 
 def find_fails(out):

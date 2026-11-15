@@ -179,9 +179,33 @@ enum Kind {
 }
 
 impl Conn {
-    fn may_login(&self, user: &User, by_password: bool) -> Result<(), &'static str> {
+    /// This connection's configuration for `name`: sshd_config plus the Match blocks that apply.
+    fn eff_for(&self, name: &str) -> Config {
+        if self.cfg.matches.is_empty() {
+            return (*self.cfg).clone();
+        }
+        let groups = accounts::lookup_user(name).map(|u| accounts::group_names(&u)).unwrap_or_default();
+        self.cfg.effective(name, &groups, self.peer, self.local)
+    }
+
+    /// Does the TCP forwarding policy (sshd_config AllowTcpForwarding and the
+    /// key's no-port-forwarding) allow a `-L` (local) or `-R` request?
+    fn forwarding_allowed(&self, local: bool) -> bool {
+        use crate::TcpFwd::*;
+        if self.key_opts.no_port_forwarding {
+            return false;
+        }
+        match self.cfg.allow_tcp_forwarding {
+            All => true,
+            No => false,
+            Local => local,
+            Remote => !local,
+        }
+    }
+
+    fn may_login(&self, cfg: &Config, user: &User, by_password: bool) -> Result<(), &'static str> {
         if user.uid == 0 {
-            match self.cfg.permit_root_login {
+            match cfg.permit_root_login {
                 RootLogin::No => return Err("root login refused (PermitRootLogin no)"),
                 RootLogin::ProhibitPassword if by_password => {
                     return Err("root password login refused (PermitRootLogin prohibit-password)")
@@ -200,18 +224,19 @@ impl Conn {
 
     /// The password check shared by `password` and `keyboard-interactive`.
     fn check_password(&mut self, user: &str, password: &str, method: &str) -> bool {
-        if !self.cfg.password_auth {
+        let eff = self.eff_for(user);
+        if !eff.password_auth {
             return false;
         }
         let Some(u) = accounts::lookup_user(user) else {
             log(&format!("{}: failed {method} for unknown user {user:?}", self.peer));
             return false;
         };
-        if let Err(why) = self.may_login(&u, true) {
+        if let Err(why) = self.may_login(&eff, &u, true) {
             log(&format!("{}: {method} for {user}: {why}", self.peer));
             return false;
         }
-        if password == user && !dev_password_allowed(self.cfg.dev_password_auth, self.peer) {
+        if password == user && !dev_password_allowed(eff.dev_password_auth, self.peer) {
             log(&format!("{}: {method} for {user}: dev password refused from the network (use a key)", self.peer));
             return false;
         }
@@ -219,6 +244,7 @@ impl Conn {
             log(&format!("{}: accepted {method} for {user}", self.peer));
             accounts::rehash_legacy(&u, password);
             self.user = Some(u);
+            self.cfg = Arc::new(eff);
             self.startup = None;
             self.authed.store(true, Ordering::Release);
             true
@@ -228,31 +254,39 @@ impl Conn {
         }
     }
 
-    fn pubkey_ok(&self, user: &str, key: &PublicKey) -> Option<(User, crate::accounts::KeyOpts)> {
-        if !self.cfg.pubkey_auth {
+    /// expiry-time= and from= of an authorized_keys line (also a cert-authority line).
+    fn opts_ok(&self, user: &str, o: &crate::accounts::KeyOpts) -> bool {
+        if let Some(exp) = o.expiry {
+            if now_secs() >= exp {
+                log(&format!("{}: publickey for {user}: expiry-time passed", self.peer));
+                return false;
+            }
+        }
+        if let Some(from) = &o.from {
+            if !accounts::from_matches(from, self.peer.ip()) {
+                log(&format!("{}: publickey for {user}: from= does not allow this address", self.peer));
+                return false;
+            }
+        }
+        true
+    }
+
+    fn pubkey_ok(&self, user: &str, key: &PublicKey) -> Option<(User, crate::accounts::KeyOpts, Config)> {
+        let eff = self.eff_for(user);
+        if !eff.pubkey_auth {
             return None;
         }
         let u = accounts::lookup_user(user)?;
-        if let Err(why) = self.may_login(&u, false) {
+        if let Err(why) = self.may_login(&eff, &u, false) {
             log(&format!("{}: publickey for {user}: {why}", self.peer));
             return None;
         }
-        match accounts::key_authorized(&u, &self.cfg.authorized_keys_file, key) {
+        match accounts::key_authorized(&u, &eff.authorized_keys_file, key) {
             Ok(Some(o)) => {
-                if let Some(exp) = o.expiry {
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                    if now >= exp {
-                        log(&format!("{}: publickey for {user}: expiry-time passed", self.peer));
-                        return None;
-                    }
+                if !self.opts_ok(user, &o) {
+                    return None;
                 }
-                if let Some(from) = &o.from {
-                    if !accounts::from_matches(from, self.peer.ip()) {
-                        log(&format!("{}: publickey for {user}: from= does not allow this address", self.peer));
-                        return None;
-                    }
-                }
-                Some((u, o))
+                Some((u, o, eff))
             }
             Ok(None) => None,
             Err(why) => {
@@ -260,6 +294,101 @@ impl Conn {
                 None
             }
         }
+    }
+
+    /// Could a certificate for `user` be accepted at all (a CA is configured)?
+    /// Used for the "would this key do" probe: russh hands that probe the
+    /// certificate's inner key, so it can only be answered by "a CA exists";
+    /// the real decision is `cert_ok`.
+    fn cert_possible(&self, user: &str) -> bool {
+        let eff = self.eff_for(user);
+        if !eff.pubkey_auth {
+            return false;
+        }
+        let Some(u) = accounts::lookup_user(user) else { return false };
+        eff.trusted_user_ca_keys.as_deref().map_or(false, |f| !accounts::trusted_cas(f).is_empty())
+            || !accounts::cert_authorities(&u, &eff.authorized_keys_file).is_empty()
+    }
+
+    /// Verify an OpenSSH user certificate: signed by a trusted CA, inside its
+    /// validity window, `user` (or the line's principals=) among its
+    /// principals, only known critical options. Returns the key options the
+    /// certificate and the CA line impose.
+    fn cert_ok(&self, user: &str, cert: &russh::keys::Certificate) -> Option<(User, crate::accounts::KeyOpts, Config)> {
+        let eff = self.eff_for(user);
+        let deny = |why: &str| -> Option<(User, crate::accounts::KeyOpts, Config)> {
+            log(&format!("{}: certificate for {user} (key id {:?}, serial {}): {why}", self.peer, cert.key_id(), cert.serial()));
+            None
+        };
+        if !eff.pubkey_auth {
+            return None;
+        }
+        let u = accounts::lookup_user(user)?;
+        if let Err(why) = self.may_login(&eff, &u, false) {
+            return deny(why);
+        }
+        if cert.cert_type() != russh::keys::ssh_key::certificate::CertType::User {
+            return deny("not a user certificate");
+        }
+        let now = now_secs();
+        if cert.verify_signature().is_err() || now < cert.valid_after() || now >= cert.valid_before() {
+            return deny("bad signature or outside its validity window");
+        }
+        // Who vouches for it: TrustedUserCAKeys (principal = the user name) or a cert-authority line.
+        let mut line_opts: Option<crate::accounts::KeyOpts> = None;
+        let mut principals: Option<String> = None;
+        let trusted = eff
+            .trusted_user_ca_keys
+            .as_deref()
+            .map_or(false, |f| accounts::trusted_cas(f).iter().any(|k| k.key_data() == cert.signature_key()));
+        if !trusted {
+            for (ca, o) in accounts::cert_authorities(&u, &eff.authorized_keys_file) {
+                if ca.key_data() == cert.signature_key() {
+                    if !self.opts_ok(user, &o) {
+                        return None;
+                    }
+                    principals = o.principals.clone();
+                    line_opts = Some(o);
+                    break;
+                }
+            }
+            if line_opts.is_none() {
+                return deny("signed by an untrusted CA");
+            }
+        }
+        // An empty principal list would match anyone: refuse it.
+        let allowed = match &principals {
+            Some(list) => cert.valid_principals().iter().any(|p| crate::pattern_list_match(list, p)),
+            None => cert.valid_principals().iter().any(|p| p == user),
+        };
+        if !allowed {
+            return deny("no matching principal");
+        }
+        let mut o = line_opts.unwrap_or_default();
+        o.cert_authority = false;
+        for (k, v) in cert.critical_options().iter() {
+            match k.as_str() {
+                "force-command" => {
+                    if o.command.as_deref().map_or(false, |c| c != v) {
+                        return deny("force-command conflicts with command=");
+                    }
+                    o.command = Some(v.clone());
+                }
+                "source-address" => {
+                    if !accounts::from_matches(v, self.peer.ip()) {
+                        return deny("source-address does not allow this address");
+                    }
+                }
+                other => return deny(&format!("unsupported critical option {other}")),
+            }
+        }
+        if !cert.extensions().contains_key("permit-port-forwarding") {
+            o.no_port_forwarding = true;
+        }
+        if !cert.extensions().contains_key("permit-pty") {
+            o.no_pty = true;
+        }
+        Some((u, o, eff))
     }
 
     fn base_env(&self, user: &User, pty: Option<&PtyReq>, tty: Option<&str>) -> Vec<(String, String)> {
@@ -311,7 +440,14 @@ impl Conn {
         // client's own command line is passed in SSH_ORIGINAL_COMMAND.
         let mut kind = kind;
         let mut forced_env: Option<String> = None;
-        if let Some(fc) = self.key_opts.command.clone() {
+        // sshd_config ForceCommand wins over the key's command= (OpenSSH).
+        let adm = self.cfg.force_command.clone();
+        if adm.as_deref() == Some("internal-sftp") {
+            match (&self.cfg.sftp_server, &kind) {
+                (Some(p), Kind::Subsystem(_)) => kind = Kind::Subsystem(p.clone()),
+                _ => return Err("ForceCommand internal-sftp: only the sftp subsystem is allowed".into()),
+            }
+        } else if let Some(fc) = adm.or_else(|| self.key_opts.command.clone()) {
             match &kind {
                 Kind::Subsystem(_) => return Err("subsystems are refused for a command= key".into()),
                 Kind::Exec(orig) => forced_env = Some(orig.clone()),
@@ -659,7 +795,7 @@ impl russh::server::Handler for Conn {
         _submethods: &str,
         response: Option<russh::server::Response<'a>>,
     ) -> Result<Auth, Self::Error> {
-        if !self.cfg.password_auth {
+        if !self.eff_for(user).password_auth {
             return Ok(Auth::reject());
         }
         // One hidden "Password: " prompt, answered through the conversation and
@@ -679,12 +815,12 @@ impl russh::server::Handler for Conn {
     }
 
     async fn auth_publickey_offered(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
-        Ok(if self.pubkey_ok(user, key).is_some() { Auth::Accept } else { Auth::reject() })
+        Ok(if self.pubkey_ok(user, key).is_some() || self.cert_possible(user) { Auth::Accept } else { Auth::reject() })
     }
 
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         match self.pubkey_ok(user, key) {
-            Some((u, opts)) => {
+            Some((u, opts, eff)) => {
                 log(&format!(
                     "{}: accepted publickey for {user}: {} {}",
                     self.peer,
@@ -693,6 +829,29 @@ impl russh::server::Handler for Conn {
                 ));
                 self.user = Some(u);
                 self.key_opts = opts;
+                self.cfg = Arc::new(eff);
+                self.startup = None;
+                self.authed.store(true, Ordering::Release);
+                Ok(Auth::Accept)
+            }
+            None => Ok(Auth::reject()),
+        }
+    }
+
+    async fn auth_openssh_certificate(&mut self, user: &str, cert: &russh::keys::Certificate) -> Result<Auth, Self::Error> {
+        match self.cert_ok(user, cert) {
+            Some((u, opts, eff)) => {
+                log(&format!(
+                    "{}: accepted certificate for {user}: {} id {:?} serial {} CA {}",
+                    self.peer,
+                    cert.algorithm(),
+                    cert.key_id(),
+                    cert.serial(),
+                    cert.signature_key().fingerprint(Default::default())
+                ));
+                self.user = Some(u);
+                self.key_opts = opts;
+                self.cfg = Arc::new(eff);
                 self.startup = None;
                 self.authed.store(true, Ordering::Release);
                 Ok(Auth::Accept)
@@ -732,8 +891,8 @@ impl russh::server::Handler for Conn {
         if self.user.is_none() {
             return Ok(());
         }
-        if self.key_opts.no_port_forwarding {
-            log(&format!("{peer}: direct-tcpip to {host}:{port} refused (port forwarding disabled for this key)"));
+        if !self.forwarding_allowed(true) {
+            log(&format!("{peer}: direct-tcpip to {host}:{port} refused (port forwarding disabled: AllowTcpForwarding or the key)"));
             return Ok(()); // dropping `reply` rejects
         }
         if !accounts::forward_permitted(&self.key_opts.permit_open, host, port) {
@@ -764,8 +923,8 @@ impl russh::server::Handler for Conn {
         if self.user.is_none() {
             return Ok(false);
         }
-        if self.key_opts.no_port_forwarding {
-            log(&format!("{peer}: tcpip-forward {address}:{port} refused (port forwarding disabled for this key)"));
+        if !self.forwarding_allowed(false) {
+            log(&format!("{peer}: tcpip-forward {address}:{port} refused (port forwarding disabled: AllowTcpForwarding or the key)"));
             return Ok(false);
         }
         let shown = if address.is_empty() { "localhost" } else { address };
@@ -969,6 +1128,10 @@ impl Conn {
 
 /// May a dev password (equal to the user name) log in from `peer`? See
 /// `DevPasswordAuthentication` in sshd_config.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 fn dev_password_allowed(policy: crate::DevPasswords, peer: SocketAddr) -> bool {
     use crate::DevPasswords::*;
     match policy {

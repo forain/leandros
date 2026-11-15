@@ -80,6 +80,25 @@ crypto) on tokio, one root process for every connection.
   `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
   `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
   `LoginGraceTime`, `PermitUserEnvironment` (default `no`), `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
+  Also `AllowTcpForwarding yes|all|no|local|remote` (`local` = `-L`/`-D`, `remote` = `-R`; combined with
+  the key's `no-port-forwarding`, the most restrictive wins), `ForceCommand` (wins over a key's
+  `command=`; the client's command goes to `SSH_ORIGINAL_COMMAND`; `internal-sftp` allows only the sftp
+  subsystem) and `TrustedUserCAKeys`. **`Match`** blocks (criteria `User`, `Group`, `Address`,
+  `LocalPort`, or `all`; comma pattern lists with `*`/`?` and `!` negation, CIDR for `Address`) are
+  evaluated per connection once the login name is known and may set `PasswordAuthentication`,
+  `PubkeyAuthentication`, `PermitRootLogin`, `AllowTcpForwarding`, `ForceCommand`,
+  `PermitUserEnvironment`, `AuthorizedKeysFile` and `DevPasswordAuthentication` (other keywords
+  inside a block are logged and ignored; `X11Forwarding`/`Banner` do not exist here). A matching
+  block overrides the global section; among matching blocks the first value of a keyword wins.
+- **User certificates.** `ssh-*-cert-v01@openssh.com` user certificates (ed25519, ecdsa, rsa) are accepted
+  when signed by a CA listed in `TrustedUserCAKeys` (principal must include the login name) or by
+  a `cert-authority` key in the user's `authorized_keys` (the line may carry `principals="a,b*"`,
+  `from=`, `command=`, `expiry-time=`). Checked: signature, validity window, user (not host)
+  certificate, principals (a certificate with none is refused), `force-command` (conflicting
+  `command=` refuses) and `source-address` critical options; any other critical option refuses the
+  login; without the `permit-port-forwarding` / `permit-pty` extensions those are denied. A
+  `cert-authority` key itself is never a login key. Not implemented: `AuthorizedPrincipalsFile`,
+  `RevokedKeys`.
 - **Authentication.** Passwords are checked against `/etc/shadow` in the system's
   sha512-crypt `$6$` format (legacy `$sha256$` fields still verify and are rewritten to `$6$rounds=65536` on the next successful login, atomically via `/etc/shadow.sshd-new` + rename), as `/bin/login` checks them. `keyboard-interactive` is offered with one hidden `Password:` prompt and the same checks as `password` (sshd implements the conversation itself; it does not load `pam-leandros`). Public keys come from
   `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks. Key options `from=` (globs, `!`
