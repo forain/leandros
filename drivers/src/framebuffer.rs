@@ -359,6 +359,10 @@ impl Framebuffer {
             self.cursor_y += self.char_height;
         } else if c == b'\r' {
             self.cursor_x = 0;
+        } else if c == b'\t' {
+            let cw = self.char_width;
+            let col = (self.cursor_x / cw / 8 + 1) * 8;
+            self.cursor_x = (col * cw).min(self.width.saturating_sub(cw));
         } else if c == b'\x08' {  // Backspace (ASCII 8)
             self.handle_backspace();
         } else {
@@ -387,8 +391,23 @@ impl Framebuffer {
                         // Complete UTF-8 character
                         let unicode_char = UTF8_STATE.1;
                         if !crate::glyphs::zero_width(unicode_char) {
-                            self.draw_unicode(self.cursor_x, self.cursor_y, unicode_char, self.fg);
-                            self.cursor_x += self.char_width;
+                            if crate::glyphs::wide(unicode_char) {
+                                // Two cells; wraps whole if only one is left.
+                                if self.cursor_x + 2 * self.char_width > self.width {
+                                    self.cursor_x = 0;
+                                    self.cursor_y += self.char_height;
+                                    if self.cursor_y + self.char_height > self.height {
+                                        self.scroll_vector();
+                                    }
+                                }
+                                let (x, y, cw, chh) = (self.cursor_x, self.cursor_y, self.char_width, self.char_height);
+                                self.fill_rect(x, y, 2 * cw, chh, 0x000000);
+                                self.draw_unicode(x, y, unicode_char, self.fg);
+                                self.cursor_x += 2 * cw;
+                            } else {
+                                self.draw_unicode(self.cursor_x, self.cursor_y, unicode_char, self.fg);
+                                self.cursor_x += self.char_width;
+                            }
                         }
                         UTF8_STATE = (0, 0);
                     }
@@ -532,6 +551,11 @@ impl Framebuffer {
             b'E' => { row = (row + p(0, 1)).min(rows - 1); col = 0; }        // CNL
             b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }          // CPL
             b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),    // CHA
+            b'I' => col = ((col / 8 + p(0, 1)) * 8).min(cols - 1),           // CHT
+            b'Z' => {                                                        // CBT
+                let n = p(0, 1);
+                col = if col % 8 == 0 { col.saturating_sub(8 * n) } else { (col / 8).saturating_sub(n - 1) * 8 };
+            }
             b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),           // VPA
             b'H' | b'f' => {                                                 // CUP
                 row = p(0, 1).saturating_sub(1).min(rows - 1);
