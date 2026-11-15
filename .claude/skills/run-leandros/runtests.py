@@ -201,7 +201,7 @@ SUITES = {
                 "host:f2fscommittest.py",
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
-                "host:f2fsgctest.py --factor 3",
+                "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
