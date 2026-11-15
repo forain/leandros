@@ -118,14 +118,78 @@ unsafe fn reg_base() -> Option<usize> {
     Some(base)
 }
 
+// ── Platform console selection (ACPI SPCR) ───────────────────────────────────
+//
+// The driver below speaks PL011. A 16550-compatible MMIO console (AWS Graviton
+// publishes one through SPCR) is served by translating the few PL011 accesses
+// the driver makes (`DR`, `FR`, `IMSC`; everything else is a no-op) onto the
+// 16550 registers, with the register shift / access width SPCR names.
+static PHYS_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(BASE);
+static KIND_16550: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static REG_SHIFT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static ACCESS_BYTES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+/// Physical base of the console UART (the compile-time default until an ACPI
+/// boot overrides it with SPCR's).
+#[inline] pub fn phys_base() -> usize { PHYS_BASE.load(core::sync::atomic::Ordering::Relaxed) }
+
+/// Select the console UART discovered through SPCR. Must run before
+/// `arch::init` maps it. `ns16550` selects the 16550 backend.
+pub unsafe fn set_platform(phys: usize, ns16550: bool, reg_shift: u8, access_bytes: u8) {
+    use core::sync::atomic::Ordering::Relaxed;
+    PHYS_BASE.store(phys, Relaxed);
+    KIND_16550.store(ns16550, Relaxed);
+    REG_SHIFT.store(reg_shift, Relaxed);
+    ACCESS_BYTES.store(access_bytes, Relaxed);
+    UART_BASE_ADDR = phys;
+}
+
+#[inline(always)]
+unsafe fn ns_rd(b: usize, idx: usize) -> u32 {
+    use core::sync::atomic::Ordering::Relaxed;
+    let a = b + (idx << REG_SHIFT.load(Relaxed));
+    match ACCESS_BYTES.load(Relaxed) {
+        4 => core::ptr::read_volatile(a as *const u32),
+        2 => core::ptr::read_volatile(a as *const u16) as u32,
+        _ => core::ptr::read_volatile(a as *const u8) as u32,
+    }
+}
+
+#[inline(always)]
+unsafe fn ns_wr(b: usize, idx: usize, v: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let a = b + (idx << REG_SHIFT.load(Relaxed));
+    match ACCESS_BYTES.load(Relaxed) {
+        4 => core::ptr::write_volatile(a as *mut u32, v),
+        2 => core::ptr::write_volatile(a as *mut u16, v as u16),
+        _ => core::ptr::write_volatile(a as *mut u8, v as u8),
+    }
+}
+
 #[inline(always)]
 unsafe fn rd(off: usize) -> u32 {
-    match reg_base() { Some(b) => ((b + off) as *const u32).mmio_read(), None => 0 }
+    match reg_base() {
+        Some(b) if KIND_16550.load(core::sync::atomic::Ordering::Relaxed) => match off {
+            DR => ns_rd(b, boot::acpi_a64::NS_RBR),
+            FR => boot::acpi_a64::fr_from_lsr(ns_rd(b, boot::acpi_a64::NS_LSR)),
+            _ => 0,
+        },
+        Some(b) => ((b + off) as *const u32).mmio_read(),
+        None => 0,
+    }
 }
 
 #[inline(always)]
 unsafe fn wr(off: usize, val: u32) {
-    if let Some(b) = reg_base() { ((b + off) as *mut u32).mmio_write(val) }
+    match reg_base() {
+        Some(b) if KIND_16550.load(core::sync::atomic::Ordering::Relaxed) => match off {
+            DR => ns_wr(b, boot::acpi_a64::NS_RBR, val & 0xFF),
+            IMSC => ns_wr(b, boot::acpi_a64::NS_IER, (val != 0) as u32),
+            _ => {}
+        },
+        Some(b) => ((b + off) as *mut u32).mmio_write(val),
+        None => {}
+    }
 }
 
 

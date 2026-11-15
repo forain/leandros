@@ -122,10 +122,10 @@ pub(crate) fn uart_irq() {
 /// slot. Idempotent — each entry is a single atomic store of the same pointer.
 pub(crate) fn register_builtin_handlers() {
     use super::gic;
-    gic::register_handler(gic::PPI_VIRT_TIMER, timer_irq);
-    gic::register_handler(gic::PPI_PHYS_TIMER, timer_irq);
+    gic::register_handler(gic::ppi_virt_timer(), timer_irq);
+    gic::register_handler(gic::ppi_phys_timer(), timer_irq);
     gic::register_handler(gic::SGI_RESCHED,    resched_ipi);
-    gic::register_handler(gic::SPI_PL011,      uart_irq);
+    gic::register_handler(gic::uart_intid(), uart_irq);
 }
 
 /// kexec stop hook (`kernel::kexec`): once set, every IRQ this CPU takes ends
@@ -155,7 +155,7 @@ fn handle_irq(frame: *mut UserFrame) {
     }
     let irq_id = super::gic::irq_id(iar);
     if sched::pcsample::ENABLED
-        && (irq_id == super::gic::PPI_VIRT_TIMER || irq_id == super::gic::PPI_PHYS_TIMER)
+        && (irq_id == super::gic::ppi_virt_timer() || irq_id == super::gic::ppi_phys_timer())
     {
         let f = unsafe { &*frame };
         sched::pcsample::sample(f.elr_el1, f.spsr_el1 & 0xf == 0);
