@@ -1835,7 +1835,9 @@ mod x86_64 {
     // interrupted code's copies across it.
     const FPREGS_PTR_OFFSET: usize = MCONTEXT_OFFSET + 184; // 232
     const FPSTATE_OFFSET:    usize = 968;
-    pub const SIGFRAME_SIZE: usize = FPSTATE_OFFSET + 512;  // 1480
+    // [1480..1736) upper YMM halves (AVX), see CpuContext::ymmh
+    const YMMH_OFFSET:       usize = FPSTATE_OFFSET + 512;  // 1480
+    pub const SIGFRAME_SIZE: usize = YMMH_OFFSET + 256;     // 1736
 
     /// A 512-byte FXSAVE area. fxsave64/fxrstor64 #GP on an address that is
     /// not 16-byte aligned, and the kernel stack's alignment is not something
@@ -1854,6 +1856,8 @@ mod x86_64 {
         /// fxsave64 / fxrstor64 of the live state (sched/src/context.rs).
         fn fpu_save_live(area: *mut u8);
         fn fpu_load_live(area: *const u8);
+        fn ymmh_save_live(buf: *mut u8);
+        fn ymmh_load_live(buf: *const u8);
     }
 
     // gregs[] indices — Linux REG_* enum order for x86-64.
@@ -1993,6 +1997,7 @@ mod x86_64 {
             let mut fx = FxArea::new();
             unsafe { fpu_save_live(fx.bytes_mut().as_mut_ptr()); }
             buf[FPSTATE_OFFSET..FPSTATE_OFFSET + 512].copy_from_slice(fx.bytes());
+            unsafe { ymmh_save_live(buf[YMMH_OFFSET..YMMH_OFFSET + 256].as_mut_ptr()); }
             buf[FPREGS_PTR_OFFSET..FPREGS_PTR_OFFSET + 8]
                 .copy_from_slice(&((new_sp + FPSTATE_OFFSET) as u64).to_le_bytes());
         }
@@ -2090,6 +2095,7 @@ mod x86_64 {
             let mxcsr = u32::from_le_bytes(fx.bytes()[24..28].try_into().unwrap()) & mask;
             fx.bytes_mut()[24..28].copy_from_slice(&mxcsr.to_le_bytes());
             unsafe { fpu_load_live(fx.bytes().as_ptr()); }
+            unsafe { ymmh_load_live(buf[YMMH_OFFSET..YMMH_OFFSET + 256].as_ptr()); }
         }
 
         // Restore the pre-handler signal mask from uc_sigmask.
