@@ -837,6 +837,8 @@ pub struct Pkt {
     pub local: bool,
     /// IPv6 source/destination (a v6 packet: `src`/`dst` unused, family ip6/inet).
     pub v6: Option<([u8; 16], [u8; 16])>,
+    /// `ct state`: true = the packet belongs to an established flow (reply seen), else NEW.
+    pub est: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -925,8 +927,8 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
                     }
                 }
             }
-            // New flows only: state is always NEW (8).
-            b"ct" => { let dreg = g(1)?; rset(&mut regs, dreg, &8u32.to_ne_bytes())?; }
+            // ct state: ESTABLISHED (2) for a flow whose reply was seen, else NEW (8).
+            b"ct" => { let dreg = g(1)?; let st: u32 = if cx.m.est { 2 } else { 8 }; rset(&mut regs, dreg, &st.to_ne_bytes())?; }
             b"fib" => {
                 let dreg = g(1)?;
                 let local = g(3)? & 2 != 0 && cx.m.local;

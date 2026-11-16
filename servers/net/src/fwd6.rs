@@ -158,7 +158,7 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
             drop(st);
             if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
-                let mut m = crate::nfnl::Pkt { l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
+                let mut m = crate::nfnl::Pkt { est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
                 if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return None; }
                 if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return None; }
             }
@@ -355,7 +355,7 @@ fn ns_into(st: &mut fwd::St, t: &Tgt6, target: [u8; 16]) {
 /// 0 = not ours (pass to the stack), 1 = dropped, 2 = entry created.
 fn new_in6(st: &mut fwd::St, nic: u8, p: &P6, now: u64) -> u8 {
     if !is_new_flow(p) || p.dst[0] == 0xff || !crate::ip6::is_host6(&p.dst) { return 0; }
-    let mut m = crate::nfnl::Pkt { l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: Some((p.src, p.dst)) };
+    let mut m = crate::nfnl::Pkt { est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: Some((p.src, p.dst)) };
     let (acc, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
     let crate::nfnl::Nat::Dnat6(cip, cport) = nat else { return if acc { 0 } else { 1 } };
     let cport = if cport == 0 { p.dport } else { cport };
@@ -413,7 +413,7 @@ fn hair6(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &P6) -> bool {
     }
     if hit.is_none() {
         if !is_new_flow(p) || !crate::ip6::is_host6(&p.dst) || fwd::ct4_len(&st) + st.ct6.len() >= fwd::CT_CAP { return false; }
-        let mut m = crate::nfnl::Pkt { l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: Some((p.src, p.dst)) };
+        let mut m = crate::nfnl::Pkt { est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: Some((p.src, p.dst)) };
         let (_, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
         let crate::nfnl::Nat::Dnat6(cip, cport) = nat else { return false };
         let cport = if cport == 0 { p.dport } else { cport };

@@ -1422,6 +1422,14 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
             snprintf(msg, sizeof msg, "%s: host bind() to the in-use NAT port gets EADDRINUSE (port %d)", name, natp);
             CHECK(msg, natp > 0 && nat_inuse(natp));
             write(cc[1], &ch, 1);
+        } else if (mode == 10) {
+            /* a filter rule added while the flow is established must bite its next packets */
+            FILE *nf = fopen("/tmp/fn.nft", "w");
+            if (nf) { fputs("table inet midflow {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state established drop\n }\n}\n", nf); fclose(nf); }
+            snprintf(msg, sizeof msg, "%s: nft -f adds `ct state established drop` mid-flow", name);
+            CHECK(msg, system("nft -f /tmp/fn.nft >/tmp/fn.err 2>&1") == 0);
+            usleep(200000);
+            write(cc[1], &ch, 1);
         } else if (mode >= 8) {
             /* attacker B: own netns, veth with the victim's MAC, then act (6: delete it, 7: join br0 and get learned) */
             int bc[2] = { ctl[0], ctl[1] };
@@ -1464,6 +1472,7 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     printf("%s child exit %d\n", name, rc);
     if (g_fwd_nft) snprintf(msg, sizeof msg, "%s: %s", name, g_fwd_expect ? "UDP DNS query is answered: the subnet has a masquerade rule" : "UDP DNS query gets no reply: no masquerade rule for the subnet (internal)");
     else if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
+    else if (mode == 10) snprintf(msg, sizeof msg, "%s: established TCP flow is dropped by a rule added mid-flow (FORWARD sees established packets)", name);
     else if (mode == 8) snprintf(msg, sizeof msg, "%s: victim flow survives another netns deleting a link with its MAC", name);
     else if (mode == 9) snprintf(msg, sizeof msg, "%s: spoofed MAC does not steal the victim's return traffic", name);
     else if (mode == 2) snprintf(msg, sizeof msg, "%s: TCP DNS query to the resolver%s is answered through NAT", name, g_http ? " and an HTTP GET" : "");
@@ -1480,11 +1489,96 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     CHECK(msg, rc == 0);
     ip_forward_set(0);
     if (g_fwd_nft) system("nft delete table inet netavark");
+    if (mode == 10) system("nft delete table inet midflow");
     if (hl >= 0) close(hl);
     if (iv > 0) link_del(s, iv);
     link_del(s, bidx);
     close(s);
 }
+
+
+/* ---- routed forwarding without NAT: bridge A -> host (ip_forward) -> bridge B -------------------------------- */
+static int g_rt_role; /* 0 client in 10.97.0.0/24, 1 UDP server in 10.98.0.0/24 */
+static int g_rt_expect; /* client: 1 = reply with the untranslated source expected */
+static int rt_body(void) {
+    const char *ip = g_rt_role ? "10.98.0.2" : "10.97.0.2", *gw = g_rt_role ? "10.98.0.1" : "10.97.0.1";
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || addr_add(s, idx, ip, 24) || link_set_up(s, idx)) return 1;
+    int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
+    if (route_default(s, idx, gw)) return 2;
+    close(s);
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(7000) };
+    if (g_rt_role) { inet_pton(AF_INET, ip, &me.sin_addr); if (bind(u, (struct sockaddr *)&me, sizeof me)) return 6; }
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (g_rt_role) {
+        for (int i = 0; i < 40; i++) {
+            struct pollfd p = { u, POLLIN, 0 };
+            if (poll(&p, 1, 1000) <= 0) continue;
+            char b[64]; struct sockaddr_in from; socklen_t fl = sizeof from;
+            if (recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&from, &fl) <= 0) continue;
+            char r[64]; char fa[32]; inet_ntop(AF_INET, &from.sin_addr, fa, sizeof fa);
+            int n = snprintf(r, sizeof r, "from=%s", fa);
+            sendto(u, r, n, 0, (struct sockaddr *)&from, fl);
+        }
+        return 0;
+    }
+    if (rd_to(ctl[0], &ch) != 1) return 3;
+    struct timeval tv = { 2, 0 };
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7000) };
+    inet_pton(AF_INET, "10.98.0.2", &to.sin_addr);
+    int got = 0;
+    for (int k = 0; k < 6 && !got; k++) {
+        char b[64];
+        sendto(u, "hi", 2, 0, (struct sockaddr *)&to, sizeof to);
+        ssize_t n = recv(u, b, sizeof b - 1, 0);
+        if (n > 0) { b[n] = 0; got = 1; printf("DETAIL routed reply '%s' try %d\n", b, k); if (strcmp(b, "from=10.97.0.2")) return 5; }
+    }
+    return got == g_rt_expect ? 0 : 4 + got;
+}
+static void routed_case(const char *name, int ipfwd) {
+    char msg[96];
+    int s = nl_sock();
+    unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
+    int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
+    int b0 = link_get(s, "br0", NULL, NULL), b1 = link_get(s, "br1", NULL, NULL);
+    ok = ok && b0 > 0 && b1 > 0 && addr_add(s, b0, "10.97.0.1", 24) == 0 && link_set_up(s, b0) == 0
+        && addr_add(s, b1, "10.98.0.1", 24) == 0 && link_set_up(s, b1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 and br1 10.98.0.1/24 up", name); CHECK(msg, ok);
+    snprintf(msg, sizeof msg, "%s: ip_forward=%d", name, ipfwd); CHECK(msg, ip_forward_set(ipfwd) == 0);
+    g_rt_expect = ipfwd;
+    char ch = 'g';
+    g_rt_role = 1;
+    pid_t sv = spawn_ns(rt_body);
+    int scc[2] = { ctl[0], ctl[1] }, sdd[2] = { done_[0], done_[1] };
+    int fc = netns_fd_of(sv);
+    int vs = veth_new_m(s, "vethS", "eth0", fc, b1) == 0 && link_set_up(s, link_get(s, "vethS", NULL, NULL)) == 0;
+    close(fc);
+    write(scc[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: server container on br1 serves UDP 7000", name); CHECK(msg, sv > 0 && vs && rd_to(sdd[0], &ch) == 1);
+    g_rt_role = 0;
+    pid_t cl = spawn_ns(rt_body);
+    int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
+    fc = netns_fd_of(cl);
+    int vc = veth_new_m(s, "vethC", "eth0", fc, b0) == 0 && link_set_up(s, link_get(s, "vethC", NULL, NULL)) == 0;
+    close(fc);
+    write(cc[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: client container on br0 configured", name); CHECK(msg, cl > 0 && vc && rd_to(dd[0], &ch) == 1);
+    write(cc[1], &ch, 1);
+    int rc = wait_child(cl);
+    kill(sv, SIGKILL); wait_child(sv);
+    if (ipfwd) snprintf(msg, sizeof msg, "%s: UDP crosses br0 -> host -> br1 routed, source address kept (no NAT)", name);
+    else snprintf(msg, sizeof msg, "%s: ip_forward=0 means nothing is routed between the bridges", name);
+    CHECK(msg, rc == 0);
+    ip_forward_set(0);
+    link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
+    link_del(s, b0); link_del(s, b1);
+    close(s);
+}
+static void routed_on(void) { routed_case("routed_l3", 1); }
+static void routed_off(void) { routed_case("routed_l3_off", 0); }
 
 /* ---- nftnat: rulesets from netavark's nftables driver drive DNAT (podnat L2) ------------------------- */
 static int g_nn_mode;      /* 0 host->127.0.0.1:H, 1 container -> bridge:H (self hairpin), 2 second container -> bridge:H */
@@ -1721,6 +1815,7 @@ static void fwd_mac_forge(void) { fwd_case("fwd_mac_forge", 8, 1); }
 static void fwd_mac_steal(void) { fwd_case("fwd_mac_steal", 9, 1); }
 static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
 static void fwd_hostlisten_early(void) { g_early_listen = 1; fwd_case("fwd_hostlisten_early", 6, 1); g_early_listen = 0; }
+static void nftfwd_midflow(void) { g_fwd_expect_ovr = 0; fwd_case("nftfwd_midflow_established", 10, 1); g_fwd_expect_ovr = -1; }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 
 /* A host wildcard listener must not leak into a container netns: a netns
@@ -1891,6 +1986,9 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_internal")) nftnat_internal();
     if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
+    if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
+    if (!only || !strcmp(only, "routed_l3")) routed_on();
+    if (!only || !strcmp(only, "routed_l3_off")) routed_off();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
     if (!only || !strcmp(only, "fwd_off")) fwd_off();
     if (!only || !strcmp(only, "fwd_icmperr")) fwd_icmperr();
