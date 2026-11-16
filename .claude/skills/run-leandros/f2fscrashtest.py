@@ -158,7 +158,7 @@ class Claims:
 
     def parse(self, text):
         for raw in text.splitlines():
-            m = re.match(r"^\s*(A|W|O|N|U|T|R|SETUP)\b(.*)$", raw)
+            m = re.match(r"^\s*(?:\[\s*\d+\.\d+\]\s*)?(A|W|O|N|U|T|R|SETUP)\b(.*)$", raw)  # a kernel log prefix can land in front of a workload line
             if not m:
                 continue
             tag, rest = m.group(1), m.group(2).split()
