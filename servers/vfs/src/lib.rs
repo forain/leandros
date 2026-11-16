@@ -5305,8 +5305,10 @@ fn inotify_fd_event(pid: u32, fd: usize, mask: u32) {
 
 /// FAN_OPEN_EXEC_PERM gate of execve(`path`): 0 to go ahead, else -errno.
 pub fn fan_exec_perm(path: &[u8]) -> i32 {
-    if !inotify::perm_watched() { return 0; }
+    if !inotify::armed() { return 0; }
     let p = tmpfs_path(path).unwrap_or_else(|| strip_trailing_slash(path)).to_vec();
+    if inotify_kind(&p) == Some(false) { inotify::fan_open_exec(&p); }
+    if !inotify::perm_watched() { return 0; }
     match inotify_kind(&p) { Some(false) => inotify::fan_perm(&p, inotify::FAN_OPEN_EXEC_PERM, false), _ => 0 }
 }
 
@@ -5337,15 +5339,24 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
                 Some(p) if flags & (O_CREAT | O_TRUNC) != 0 => inotify_kind_if_watched(p),
                 _ => None,
             };
+            // Linux raises FAN_OPEN_PERM for an O_CREAT that creates the file too,
+            // after the creation: a deny leaves the new file and fails the open.
+            let mut perm_after = false;
             if perm_watched() && flags & O_PATH == 0 {
                 if let Some(p) = &path {
                     if let Some(isdir) = inotify_kind(p) {
                         let pr = fan_perm(p, FAN_OPEN_PERM, isdir); if pr != 0 { return err_reply(pr); }
-                    }
+                    } else if flags & O_CREAT != 0 { perm_after = true; }
                 }
             }
             let r = dispatch_inner(msg, pid);
             let v = reply_val(&r);
+            if perm_after && v >= 0 {
+                if let Some(p) = &path {
+                    let pr = fan_perm(p, FAN_OPEN_PERM, false);
+                    if pr != 0 { let _ = handle_close(pid, v as usize); return err_reply(pr); }
+                }
+            }
             if let Some(p) = path {
                 if v >= 0 {
                     let created = flags & O_CREAT != 0 && pre.is_none() && may_watch(&p);
@@ -5428,6 +5439,7 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
                         if let (Some((op, on)), Some((np, nn))) = (inotify_split(&o), inotify_split(&n)) {
                             dirent(op, on, IN_MOVED_FROM | dir, cookie);
                             dirent(np, nn, IN_MOVED_TO | dir, cookie);
+                            fan_rename(&o, &n, isdir);
                         }
                         if let Some(di) = dst {
                             if di.nlink > 1 && !di.isdir { inode_id(&n, Some(di.id), IN_ATTRIB); } else { removed_id(&n, di.isdir, Some(di.id)); }
@@ -13369,10 +13381,12 @@ fn handle_fanotify_init(pid: u32, flags: u32, evflags: u32) -> Message {
     // CLOEXEC | NONBLOCK, class NOTIF (0), UNLIMITED_QUEUE | UNLIMITED_MARKS.
     // FAN_REPORT_FID 0x200, DIR_FID 0x400, NAME 0x800 (NAME needs DIR_FID; FID groups are notification-class only).
     let cls = flags & 0xc; // FAN_CLASS_NOTIF 0, CONTENT 4, PRE_CONTENT 8
-    let fid = flags & 0xe00;
-    if flags & !0xe3f != 0 || cls == 0xc || evflags & 3 == 3 { return err_reply(-22); }
+    let fid = flags & 0x1e00;
+    if flags & !0x1e3f != 0 || cls == 0xc || evflags & 3 == 3 { return err_reply(-22); }
     if fid != 0 && cls != 0 { return err_reply(-22); }
     if fid & inotify::FAN_REPORT_NAME != 0 && fid & inotify::FAN_REPORT_DIR_FID == 0 { return err_reply(-22); }
+    // FAN_REPORT_TARGET_FID needs FAN_REPORT_FID and FAN_REPORT_DFID_NAME.
+    if fid & inotify::FAN_REPORT_TARGET_FID != 0 && fid & 0xe00 != 0xe00 { return err_reply(-22); }
     if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return err_reply(-1); }
     let f = (if flags & 1 != 0 { O_CLOEXEC } else { 0 }) | (if flags & 2 != 0 { O_NONBLOCK_FL } else { 0 });
     let r = handle_inotify_create(pid, f);
@@ -13399,10 +13413,11 @@ fn handle_fanotify_mark(pid: u32, fd: usize, path_ptr: usize, flags: u32, mask: 
     let gfid = inotify::fan_fid(inst);
     // FID groups add ATTRIB / DELETE_SELF / MOVE_SELF; DIR_FID groups also the
     // directory-entry events. Neither is valid on a mount mark.
-    let fid_ev = if mount { 0 } else if gfid & inotify::FAN_REPORT_DIR_FID != 0 { inotify::FAN_FID_EVENTS }
+    let fs = flags & 0x100 != 0;
+    let fid_ev = if mount && !fs { 0 } else if gfid & inotify::FAN_REPORT_DIR_FID != 0 { inotify::FAN_FID_EVENTS | if gfid & inotify::FAN_REPORT_NAME != 0 { inotify::FAN_RENAME } else { 0 } }
         else if gfid != 0 { inotify::IN_ATTRIB | inotify::IN_DELETE_SELF | inotify::IN_MOVE_SELF } else { 0 };
-    let ok_mask = (inotify::FAN_EVENTS | fid_ev | inotify::FAN_ONDIR | inotify::FAN_ON_CHILD | if perm { inotify::FAN_PERM } else { 0 }) as u64;
-    if mask & !ok_mask != 0 || mask & (inotify::FAN_EVENTS | fid_ev | inotify::FAN_PERM) as u64 == 0 { return err_reply(-22); }
+    let ok_mask = (inotify::FAN_EVENTS | inotify::FAN_OPEN_EXEC | fid_ev | inotify::FAN_ONDIR | inotify::FAN_ON_CHILD | if perm { inotify::FAN_PERM } else { 0 }) as u64;
+    if mask & !ok_mask != 0 || mask & (inotify::FAN_EVENTS | inotify::FAN_OPEN_EXEC | fid_ev | inotify::FAN_PERM) as u64 == 0 { return err_reply(-22); }
     let path: Vec<u8> = if path_ptr == 0 {
         let mut buf = alloc::vec![0u8; 4096];
         let r = reply_val(&handle_fd_path(pid, dirfd, buf.as_mut_ptr() as usize, buf.len()));
@@ -13493,10 +13508,13 @@ fn fan_fid_records(out: &mut Vec<u8>, gfid: u32, path: &[u8], eino: (u64, u64), 
         Some(i) => (&path[..i], &path[i + 1..]),
         None => (&path[..0], path),
     };
-    let obj: Option<(u64, u64)> = if named { inotify_ident(path).map(|i| i.id) } else { Some(eino) };
+    // Mount / filesystem marks carry no watched inode: resolve it from the path.
+    let eino = if eino == (0, 0) && !named { inotify_ident(path).map_or((0, 0), |i| i.id) } else { eino };
+    let eino = if eino == (0, 0) && named { inotify_ident(dir).map_or((0, 0), |i| i.id) } else { eino };
+    let obj: Option<(u64, u64)> = if named { inotify_ident(path).map(|i| i.id) } else if eino == (0, 0) { None } else { Some(eino) };
     if let Some(o) = obj { fh_remember(o, path); }
     if gfid & inotify::FAN_REPORT_DIR_FID != 0 {
-        let (did, nm): (Option<(u64, u64)>, &[u8]) = if named { (Some(eino), base) }
+        let (did, nm): (Option<(u64, u64)>, &[u8]) = if named { (if eino == (0, 0) { None } else { Some(eino) }, base) }
             else if isdir { (Some(eino), b".") } else { (inotify_ident(dir).map(|i| i.id), base) };
         if let Some(d) = did {
             fh_remember(d, if named || !isdir { dir } else { path });
@@ -13504,6 +13522,24 @@ fn fan_fid_records(out: &mut Vec<u8>, gfid: u32, path: &[u8], eino: (u64, u64), 
         }
     }
     if gfid & inotify::FAN_REPORT_FID != 0 { if let Some(o) = obj { fan_fid_record(out, 1, o, None); } }
+}
+
+/// FAN_RENAME records: OLD_DFID_NAME (10), NEW_DFID_NAME (12) and, with
+/// FAN_REPORT_TARGET_FID, the FID (1) of the renamed object. `blob` is `old NUL new`.
+fn fan_rename_records(out: &mut Vec<u8>, gfid: u32, blob: &[u8]) {
+    let z = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+    let (old, new) = (&blob[..z], if z < blob.len() { &blob[z + 1..] } else { &blob[..0] });
+    for (ty, p) in [(10u8, old), (12u8, new)] {
+        let (dir, base) = match p.iter().rposition(|&b| b == b'/') {
+            Some(0) => (&p[..1], &p[1..]),
+            Some(i) => (&p[..i], &p[i + 1..]),
+            None => (&p[..0], p),
+        };
+        if let Some(d) = inotify_ident(dir).map(|i| i.id) { fh_remember(d, dir); fan_fid_record(out, ty, d, Some(base)); }
+    }
+    if gfid & inotify::FAN_REPORT_TARGET_FID != 0 {
+        if let Some(o) = inotify_ident(new).map(|i| i.id) { fh_remember(o, new); fan_fid_record(out, 1, o, None); }
+    }
 }
 
 /// read() on a fanotify group: `struct fanotify_event_metadata` records, each
@@ -13519,7 +13555,9 @@ fn handle_fan_read(pid: u32, inst: u32, buf: *mut u8, count: usize) -> Message {
     for (mask, path, epid, permid, eino, named) in evs {
         let mut efd: i32 = -1;
         let mut info: Vec<u8> = Vec::new();
-        if gfid != 0 {
+        if gfid != 0 && mask & inotify::FAN_RENAME != 0 {
+            fan_rename_records(&mut info, gfid, &path);
+        } else if gfid != 0 {
             fan_fid_records(&mut info, gfid, &path, eino, named, mask & inotify::IN_ISDIR != 0);
         } else if !path.is_empty() {
             let mut z = path.clone();

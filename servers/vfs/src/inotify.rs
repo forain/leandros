@@ -106,6 +106,11 @@ pub const FAN_OPEN_EXEC_PERM: u32 = 0x4_0000;
 pub const FAN_PERM: u32 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
 /// Events a FAN_REPORT_FID / FAN_REPORT_DIR_FID group may add.
 pub const FAN_FID_EVENTS: u32 = IN_ATTRIB | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF;
+pub const FAN_OPEN_EXEC: u32 = 0x1000;
+pub const FAN_RENAME: u32 = 0x1000_0000;
+pub const FAN_REPORT_TARGET_FID: u32 = 0x1000;
+/// Everything a fanotify mark may hold that keeps the mark alive.
+pub const FAN_ALLMARK: u32 = FAN_EVENTS | FAN_PERM | FAN_OPEN_EXEC | FAN_RENAME | FAN_FID_EVENTS;
 pub const FAN_REPORT_FID: u32 = 0x200;
 pub const FAN_REPORT_DIR_FID: u32 = 0x400;
 pub const FAN_REPORT_NAME: u32 = 0x800;
@@ -213,7 +218,7 @@ fn wake(keys: &[u64]) {
 /// Append `ev` to `i`'s queue (tail coalescing, overflow cap). True if the
 /// queue changed.
 fn push(i: &mut Instance, ev: Ev) -> bool {
-    if i.fan && ev.mask & (FAN_EVENTS | FAN_FID_EVENTS | FAN_PERM | IN_Q_OVERFLOW) == 0 { return false; }
+    if i.fan && ev.mask & (FAN_EVENTS | FAN_FID_EVENTS | FAN_PERM | FAN_OPEN_EXEC | FAN_RENAME | IN_Q_OVERFLOW) == 0 { return false; }
     let unit = if i.fan { 24 } else { 16 };
     if let Some(t) = i.queue.back() {
         if t.wd == ev.wd && t.mask == ev.mask && t.cookie == ev.cookie && t.name == ev.name { EV_COALESCED.fetch_add(1, Relaxed); return false; }
@@ -336,7 +341,7 @@ pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: 
         let p = found.ok_or(-2)?;
         let w = &mut i.watches[p];
         if ignore { w.ignore &= !mask; } else { let nm = w.mask & !mask; track(w.mask, nm); w.mask = nm; }
-        if w.mask & (FAN_EVENTS | FAN_PERM) == 0 && w.ignore == 0 { wdrop(st, inst, p); }
+        if w.mask & FAN_ALLMARK == 0 && w.ignore == 0 { wdrop(st, inst, p); }
         return Ok(());
     }
     if let Some(p) = found {
@@ -395,7 +400,7 @@ pub fn fan_read(inst: u32, max: usize) -> Result<Vec<(u32, Vec<u8>, u32, u32, Id
 
 /// Mount marks: an event on `path` reaches every mark whose mount root is a
 /// prefix of it.
-fn fan_mount(path: &[u8], mask: u32) {
+fn fan_mount(path: &[u8], mask: u32, named: bool) {
     let mut keys: Vec<u64> = Vec::new();
     {
         let mut st = STATE.lock();
@@ -407,10 +412,10 @@ fn fan_mount(path: &[u8], mask: u32) {
             if i.watches.iter().any(|w| !w.mount && w.path == path && w.ignore & mask != 0) { continue; }
             for w in i.watches.iter() {
                 if w.mount && w.ignore & mask != 0 && w.path == path { break; }
-                if !w.mount || w.mask & mask & FAN_EVENTS == 0 { continue; }
+                if !w.mount || w.mask & mask & (FAN_EVENTS | FAN_FID_EVENTS) == 0 { continue; }
                 if mask & IN_ISDIR != 0 && w.mask & FAN_ONDIR == 0 { continue; }
                 let under = w.path == path || w.path == b"/" || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/');
-                if under { evs.push(Ev { wd: w.wd, mask: mask & FAN_EVENTS | (mask & IN_ISDIR), cookie: pid as u32, name: path.to_vec(), ino: (0, 0), named: false }); break; }
+                if under { evs.push(Ev { wd: w.wd, mask: mask & (FAN_EVENTS | FAN_FID_EVENTS) | (mask & IN_ISDIR), cookie: pid as u32, name: path.to_vec(), ino: (0, 0), named }); break; }
             }
             for e in evs { hit |= push(i, e); }
             if hit { keys.push(key(inst)); }
@@ -512,6 +517,12 @@ fn candidates(st: &State, h: u64, id: Option<Id>) -> Vec<(u32, i32)> {
 /// by (dev, ino) when it was made on a multiply-linked inode, by path otherwise.
 pub fn dirent_id(parent: &[u8], name: &[u8], mask: u32, cookie: u32, id: Option<Id>) {
     if !armed() { return; }
+    if !name.is_empty() && FANM.load(Relaxed) != 0 && mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO) != 0 {
+        let mut full = parent.to_vec();
+        if full != b"/" { full.push(b'/'); }
+        full.extend_from_slice(name);
+        fan_mount(&full, mask, true);
+    }
     let h = fnv(parent);
     let by_i = id.is_some() && MULTI.load(Relaxed) != 0;
     if DIR_BLOOM[(h as usize) % BLOOM].load(Relaxed) == 0 && !by_i { return; }
@@ -668,7 +679,7 @@ pub fn inode_id(path: &[u8], id: Option<Id>, mask: u32) {
     if !armed() { return; }
     dirent_id(path, b"", mask, 0, id);
     if let Some((par, name)) = split(path) { dirent(par, name, mask, 0); }
-    if FANM.load(Relaxed) != 0 { fan_mount(path, mask); }
+    if FANM.load(Relaxed) != 0 { fan_mount(path, mask, false); }
 }
 
 /// The superblock/mount whose backing root is `prefix` went away: UNMOUNT +
@@ -871,4 +882,57 @@ pub fn fan_verdict(inst: u32, fd: i32, response: u32) -> Result<(), i32> {
     }
     sched::wake_poll_key(pkey(inst));
     Ok(())
+}
+
+/// FAN_RENAME: one event per FID_NAME group with a directory mark on the old or
+/// the new parent (or a filesystem mark covering either). The event name holds
+/// `old NUL new`.
+pub fn fan_rename(old: &[u8], new: &[u8], isdir: bool) {
+    if !armed() { return; }
+    let (po, pn) = (split(old).map(|(p, _)| p), split(new).map(|(p, _)| p));
+    let under = |w: &Watch, p: &[u8]| w.path == b"/" || w.path == p || (p.len() > w.path.len() && p.starts_with(&w.path) && p[w.path.len()] == b'/');
+    let mut name = old.to_vec();
+    name.push(0);
+    name.extend_from_slice(new);
+    let pid = sched::tgid_of(sched::current_pid()) as u32;
+    let mut keys: Vec<u64> = Vec::new();
+    {
+        let mut st = STATE.lock();
+        for (&inst, i) in st.insts.iter_mut() {
+            if !i.fan || i.fid & FAN_REPORT_NAME == 0 { continue; }
+            let hit = i.watches.iter().any(|w| {
+                if w.mask & FAN_RENAME == 0 || w.ignore & FAN_RENAME != 0 { return false; }
+                if isdir && w.mask & FAN_ONDIR == 0 { return false; }
+                if w.mount { return under(w, old) || under(w, new); }
+                w.isdir && (Some(&w.path[..]) == po || Some(&w.path[..]) == pn)
+            });
+            if !hit { continue; }
+            let wd = i.watches.iter().find(|w| w.mask & FAN_RENAME != 0).map_or(0, |w| w.wd);
+            if push(i, Ev { wd, mask: FAN_RENAME | if isdir { IN_ISDIR } else { 0 }, cookie: pid, name: name.clone(), ino: (0, 0), named: true }) { keys.push(key(inst)); }
+        }
+    }
+    wake(&keys);
+}
+
+/// FAN_OPEN_EXEC (non-perm): execve of `path` reaches the marks that cover it.
+pub fn fan_open_exec(path: &[u8]) {
+    if !armed() { return; }
+    let parent = split(path).map(|(p, _)| p);
+    let pid = sched::tgid_of(sched::current_pid()) as u32;
+    let mut keys: Vec<u64> = Vec::new();
+    {
+        let mut st = STATE.lock();
+        for (&inst, i) in st.insts.iter_mut() {
+            if !i.fan { continue; }
+            if i.watches.iter().any(|w| w.path == path && w.ignore & FAN_OPEN_EXEC != 0) { continue; }
+            let wd = i.watches.iter().find(|w| {
+                if w.mask & FAN_OPEN_EXEC == 0 || w.ignore & FAN_OPEN_EXEC != 0 { return false; }
+                if w.mount { return w.path == b"/" || w.path == path || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/'); }
+                w.path == path || (w.isdir && w.mask & FAN_ON_CHILD != 0 && parent == Some(&w.path[..]))
+            }).map(|w| w.wd);
+            let Some(wd) = wd else { continue };
+            if push(i, Ev { wd, mask: FAN_OPEN_EXEC, cookie: pid, name: path.to_vec(), ino: (0, 0), named: false }) { keys.push(key(inst)); }
+        }
+    }
+    wake(&keys);
 }
