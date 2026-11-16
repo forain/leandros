@@ -927,7 +927,7 @@ static int sendfam_child(void)
 {
     int bad = 0;
     unsigned char pkt[8] = { 8, 0, 0, 0, 0x12, 0x34, 0, 1 };
-    struct sockaddr_in a = { .sin_family = AF_UNIX, .sin_port = htons(41047) };
+    struct sockaddr_in a = { .sin_family = AF_UNIX, .sin_port = htons(30047) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     unsigned short fams[3] = { AF_UNIX, AF_INET6, 0 };
     int u = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1320,7 +1320,7 @@ static int t_procsysnet_ping_range(void)
 static int t_netns_sendfam(void)
 {
     int h = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41047) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(30047) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     CHECK(h >= 0 && bind(h, (void *)&a, sizeof a) == 0);
     pid_t c = fork();
@@ -1822,16 +1822,16 @@ static int sockcap_child_inherited(void)
 {
     /* the fd was created by the parent: parent netns, may reach the host listener */
     extern int g_cap_sock;
-    CHECK(inet_connect_fd(g_cap_sock, 41011) == 0);
+    CHECK(inet_connect_fd(g_cap_sock, 30011) == 0);
     int fresh = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(inet_connect_fd(fresh, 41011) == -ENETUNREACH);
+    CHECK(inet_connect_fd(fresh, 30011) == -ENETUNREACH);
     return 0;
 }
 int g_cap_sock;
 static int t_sock_netns_inherited(void)
 {
     CHECK(drop_to(1000) == 0);
-    int l; CHECK(inet_listener(41011, &l) == 0);
+    int l; CHECK(inet_listener(30011, &l) == 0);
     g_cap_sock = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(ns_child_netns(sockcap_child_inherited) == 0);
     return 0;
@@ -1839,7 +1839,7 @@ static int t_sock_netns_inherited(void)
 static int t_sock_netns_scm(void)
 {
     CHECK(drop_to(1000) == 0);
-    int l; CHECK(inet_listener(41012, &l) == 0);
+    int l; CHECK(inet_listener(30012, &l) == 0);
     int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
@@ -1850,9 +1850,9 @@ static int t_sock_netns_scm(void)
         struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
         if (!cm || cm->cmsg_type != SCM_RIGHTS) _exit(2);
         int fd; memcpy(&fd, CMSG_DATA(cm), sizeof fd);
-        if (inet_connect_fd(fd, 41012) != 0) _exit(3);
+        if (inet_connect_fd(fd, 30012) != 0) _exit(3);
         int fresh = socket(AF_INET, SOCK_STREAM, 0);
-        _exit(inet_connect_fd(fresh, 41012) == -ENETUNREACH ? 0 : 4);
+        _exit(inet_connect_fd(fresh, 30012) == -ENETUNREACH ? 0 : 4);
     }
     CHECK(c > 0);
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -1954,14 +1954,14 @@ static int t_sock_ns_leak(void)
 static int t_sock_before_unshare(void)
 {
     CHECK(drop_to(1000) == 0);
-    int l; CHECK(inet_listener(41013, &l) == 0);
+    int l; CHECK(inet_listener(30013, &l) == 0);
     pid_t c = fork();
     if (c == 0) {
         int old = socket(AF_INET, SOCK_STREAM, 0);
         if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(1);
-        if (inet_connect_fd(old, 41013) != 0) _exit(2);
+        if (inet_connect_fd(old, 30013) != 0) _exit(2);
         int fresh = socket(AF_INET, SOCK_STREAM, 0);
-        _exit(inet_connect_fd(fresh, 41013) == -ENETUNREACH ? 0 : 3);
+        _exit(inet_connect_fd(fresh, 30013) == -ENETUNREACH ? 0 : 3);
     }
     int st = 0; waitpid(c, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
@@ -1982,12 +1982,12 @@ static int wild_listener(unsigned port, int *fdout)
 static int t_netns_portspace(void)
 {
     CHECK(drop_to(1000) == 0);
-    int hp; CHECK(wild_listener(41021, &hp) == 0);       /* host holds P */
+    int hp; CHECK(wild_listener(30021, &hp) == 0);       /* host holds P */
     int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
         int a, b;
-        char ok = wild_listener(41021, &a) == 0 && wild_listener(41022, &b) == 0;
+        char ok = wild_listener(30021, &a) == 0 && wild_listener(30022, &b) == 0;
         write(pfd[1], &ok, 1);
         char x; read(qfd[0], &x, 1);
         _exit(0);
@@ -1995,8 +1995,8 @@ static int t_netns_portspace(void)
     CHECK(c > 0);
     char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);  /* child bound P too, and Q */
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(inet_connect_fd(s, 41022) == -ECONNREFUSED);    /* child's listener unreachable */
-    int h2; CHECK(wild_listener(41022, &h2) == 0);        /* and Q is free on the host */
+    CHECK(inet_connect_fd(s, 30022) == -ECONNREFUSED);    /* child's listener unreachable */
+    int h2; CHECK(wild_listener(30022, &h2) == 0);        /* and Q is free on the host */
     write(qfd[1], "x", 1);
     int st; waitpid(c, &st, 0);
     return 0;
@@ -2008,7 +2008,7 @@ static int t_netns_udp_bind(void)
     int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
-        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(30031) };
         int u = socket(AF_INET, SOCK_DGRAM, 0);
         struct timeval tv = { 0, 300000 };
         setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -2024,13 +2024,13 @@ static int t_netns_udp_bind(void)
     CHECK(c > 0);
     char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);
     int h = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(30031) };
     d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sendto(h, "hi", 2, 0, (void *)&d, sizeof d);
     write(qfd[1], "x", 1);
     char res = 0; CHECK(read(pfd[0], &res, 1) == 1 && res);   /* child got nothing */
     int hb = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(30031) };
     CHECK(bind(hb, (void *)&a, sizeof a) == 0);               /* P free on the host */
     int st; waitpid(c, &st, 0);
     return 0;
@@ -2091,11 +2091,11 @@ static int lo_traffic(unsigned port)
 }
 static int lo_updown_body(void)
 {
-    struct sockaddr_in a = lo_addr(41600);
+    struct sockaddr_in a = lo_addr(30600);
     int t = socket(AF_INET, SOCK_STREAM, 0);
     if (!(connect(t, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH)) return 1;   /* lo down */
     if (ns_lo_set(1)) return 2;
-    int r = lo_traffic(41600);
+    int r = lo_traffic(30600);
     if (r) return r;
     if (ns_lo_set(0)) return 3;
     int t2 = socket(AF_INET, SOCK_STREAM, 0);
@@ -2110,7 +2110,7 @@ static int t_netns_lo_echo(void)
 static int lo_same_port_body(void)
 {
     if (ns_lo_set(1)) return 2;
-    int l; struct sockaddr_in a = lo_addr(41610);
+    int l; struct sockaddr_in a = lo_addr(30610);
     l = socket(AF_INET, SOCK_STREAM, 0);
     if (bind(l, (void *)&a, sizeof a) || listen(l, 4)) return 3;
     int c = socket(AF_INET, SOCK_STREAM, 0);
@@ -2119,7 +2119,7 @@ static int lo_same_port_body(void)
 }
 static int t_netns_lo_two_ns_same_port(void)
 {
-    int hp; CHECK(wild_listener(41610, &hp) == 0);       /* the host holds the port too */
+    int hp; CHECK(wild_listener(30610, &hp) == 0);       /* the host holds the port too */
     int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
     pid_t cs[2];
     for (int i = 0; i < 2; i++) {
@@ -2144,12 +2144,12 @@ static int lo_host_unreach_body(void)
 {
     if (ns_lo_set(1)) return 2;
     int c = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in a = lo_addr(41620);
+    struct sockaddr_in a = lo_addr(30620);
     if (!(connect(c, (void *)&a, sizeof a) == -1 && errno == ECONNREFUSED)) return 3;   /* host's service is not here */
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct timeval tv = { 0, 300000 };
     setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    struct sockaddr_in b = lo_addr(41621);
+    struct sockaddr_in b = lo_addr(30621);
     if (sendto(u, "x", 1, 0, (void *)&b, sizeof b) < 0) return 4;
     char buf[4];
     if (recv(u, buf, sizeof buf, 0) >= 0) return 5;     /* nothing echoes back from the host */
@@ -2157,9 +2157,9 @@ static int lo_host_unreach_body(void)
 }
 static int t_netns_lo_host_unreachable(void)
 {
-    int hp; CHECK(wild_listener(41620, &hp) == 0);
+    int hp; CHECK(wild_listener(30620, &hp) == 0);
     int hu = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = lo_addr(41621);
+    struct sockaddr_in a = lo_addr(30621);
     CHECK(bind(hu, (void *)&a, sizeof a) == 0);
     CHECK(ns_child_netns(lo_host_unreach_body) == 0);
     /* and the host saw no datagram from the netns */
@@ -2173,7 +2173,7 @@ static int t_netns_lo_host_unreachable(void)
 static int lo_slot_body(void)
 {
     if (ns_lo_set(1)) return 2;
-    return lo_traffic(41630) ? 3 : 0;
+    return lo_traffic(30630) ? 3 : 0;
 }
 static int t_netns_lo_slots_reclaimed(void)
 {
@@ -3136,8 +3136,8 @@ static long sys_setns(int fd, int t) { return syscall(NR_SETNS, fd, t); }
 /* The port the setns cases bind. It must sit BELOW ip_local_port_range
  * (32768..60999): a client socket anywhere earlier in a long run that was
  * handed this port as its ephemeral one (live, or 60 s in TIME_WAIT) makes a
- * plain bind() answer EADDRINUSE, as on Linux (setns_net flaked this way at
- * 41500, which is inside the range). */
+ * plain bind() answer EADDRINUSE, as on Linux (setns_net flaked this way
+ * at 41500, which is inside the range). */
 #define NS_PORT 30500
 
 /* Fork a child that unshares `fl` (as `uid` when non-zero), listens on
@@ -3231,6 +3231,11 @@ static int t_setns_port_not_ephemeral(void)
     int lo = 0, hi = 0;
     CHECK(sscanf(b, "%d %d", &lo, &hi) == 2);
     CHECK(NS_PORT < lo || NS_PORT > hi);
+    /* every other fixed port the netns cases bind (keep in sync with the literals) */
+    static const int fixed[] = { 30011, 30012, 30013, 30021, 30022, 30031, 30047,
+                                 30600, 30610, 30620, 30621, 30630 };
+    for (unsigned i = 0; i < sizeof fixed / sizeof fixed[0]; i++)
+        CHECK(fixed[i] < lo || fixed[i] > hi);
     return 0;
 }
 
