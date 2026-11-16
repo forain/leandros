@@ -224,12 +224,15 @@ impl InterfaceInner {
             IpProtocol::Udp => {
                 crate::v6dbg(4);
                 let udp_packet = check!(UdpPacket::new_checked(ip_payload));
-                let udp_repr = check!(UdpRepr::parse(
+                let udp_repr = match UdpRepr::parse(
                     &udp_packet,
                     &ipv6_repr.src_addr.into(),
                     &ipv6_repr.dst_addr.into(),
                     &self.checksum_caps(),
-                ));
+                ) {
+                    Ok(r) => r,
+                    Err(_) => { crate::v6dbg(7); return None; }
+                };
 
                 crate::v6dbg(5);
                 self.process_udp(
