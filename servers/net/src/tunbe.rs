@@ -115,12 +115,14 @@ fn detach(h: TunHandle, keep: bool) {
         crate::nlsock::poll_notify();
         return;
     }
+    let mut gone_name = None;
     {
         let mut nss = NETNS.lock();
         let mut v = VIFS.lock();
-        v[sid as usize] = None;
+        if let Some(x) = v[sid as usize].take() { gone_name = Some(x.name); }
         if let Some(st) = nss.get_mut(&ns) { st.sids.retain(|&s| s != sid); }
     }
+    if let Some(name) = gone_name { crate::vif::forget_ifctl(ns, &name); }
     // Neither table is held: the stack lock is taken alone.
     *stack_for(sid) = None;
     crate::nlsock::poll_notify(); // DELLINK for the vanished tap

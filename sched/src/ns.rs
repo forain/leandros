@@ -1421,6 +1421,12 @@ fn fwd4_fanout(ns: NsId, v: u32) {
         i += 1;
     }
 }
+/// The link `(ns, name)` was deleted: forget its per-interface sysctl entry, so a link created later under the
+/// same name starts from `conf/default` again (Linux) instead of inheriting the old link's forwarding=0 etc.
+pub fn ifctl_forget(ns: NsId, name: &[u8]) {
+    let mut t = IFCTL.lock();
+    for e in t.iter_mut() { if e.used && e.ns == ns && &e.name[..e.nlen as usize] == name { e.used = false; } }
+}
 /// IPv4 forwarding state of interface `ifname` in netns `ns` (the forward gate of the net server).
 pub fn forwarding(ns: NsId, ifname: &[u8]) -> bool {
     match ifname {

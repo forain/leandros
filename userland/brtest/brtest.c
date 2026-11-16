@@ -1118,6 +1118,7 @@ static int route_default(int s, int oif, const char *gw) {
 static const unsigned char VICTIM_MAC[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0xaa };
 static int g_fwd_mode; /* 0 = UDP DNS query, 1 = ping the QEMU gateway; expect success */
 static int g_fwd_expect = 1;
+static int g_fwd_nonat;         /* nftnat_nonat_route: expect the route-without-NAT counter to move */
 static const char *g_fwd_nft;   /* nft ruleset loaded before the container starts (nftnat_*) */
 static int g_fwd_expect_ovr = -1;
 static void fwd_resolver(char *out) {
@@ -1240,6 +1241,45 @@ static int nat_scan(void) {
     fclose(f);
     return port;
 }
+/* One counter of the fwd_stats line of /proc/net/nic (-1 if absent). */
+static long stat_get(const char *key) {
+    FILE *f = fopen("/proc/net/nic", "r");
+    long v = -1;
+    if (!f) return v;
+    char line[1024], k[40];
+    snprintf(k, sizeof k, " %s=", key);
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "fwd_stats:", 10)) continue;
+        char *p = strstr(line, k);
+        if (p) v = atol(p + strlen(k));
+        break;
+    }
+    fclose(f);
+    return v;
+}
+/* Sum of the forwarder's per-flow / per-neighbour state counters (the "fwd_state:" line of /proc/net/nic:
+ * conntrack, learn, park, replay, probe entries). After a bridge/veth teardown it must be back at its baseline. */
+static int fwd_state_sum(char *detail, size_t n) {
+    FILE *f = fopen("/proc/net/nic", "r");
+    int sum = 0;
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "fwd_state:", 10)) continue;
+        if (detail) snprintf(detail, n, "%s", line);
+        for (char *t = strtok(line + 10, " \n"); t; t = strtok(NULL, " \n")) {
+            char *e = strchr(t, '=');
+            if (!e || !strncmp(t, "pend=", 5) || !strncmp(t, "inq=", 4)) continue;
+            sum += atoi(e + 1);
+        }
+    }
+    fclose(f);
+    return sum;
+}
+#define FWD_STATE_CHECK(name, base) do { char d_[512] = ""; int s_ = fwd_state_sum(d_, sizeof d_); char m_[160]; \
+    snprintf(m_, sizeof m_, "%s: forwarder state (ct/learn/park/probe) is back to its baseline after teardown (%d, was %d)", name, s_, base); \
+    CHECK(m_, s_ >= 0 && s_ <= base); if (s_ > base) printf("DIAG %s", d_); } while (0)
+
 /* Failure diagnostic: print the kernel's live TCP NAT entries (fwd_nat_ent lines of /proc/net/nic). */
 static void nat_dump(void) {
     FILE *f = fopen("/proc/net/nic", "r");
@@ -1247,7 +1287,7 @@ static void nat_dump(void) {
     char line[1024];
     while (fgets(line, sizeof line, f))
         if (!strncmp(line, "fwd_nat_ent:", 12) || !strncmp(line, "fwd:", 4) || !strncmp(line, "fwd_stats:", 10)
-            || !strncmp(line, "fwd_arp:", 8) || !strncmp(line, "fwd_pend:", 9) || !strncmp(line, "fwd_ct:", 7)) printf("DIAG %s", line);
+            || !strncmp(line, "fwd_state:", 10) || !strncmp(line, "fwd_arp:", 8) || !strncmp(line, "fwd_pend:", 9) || !strncmp(line, "fwd_ct:", 7)) printf("DIAG %s", line);
     fclose(f);
 }
 /* The same lines as nat_dump(), collected into buf (only the fwd_stats line when it is long). */
@@ -1363,6 +1403,7 @@ static const char *g_fwd_msg; /* overrides the per-mode check text */
 static int g_early_listen; /* mode 6: bind the host listener before br0 exists (httpd before podman0) */
 static void fwd_case(const char *name, int mode, int ipfwd) {
     char msg[96];
+    long nonat0 = stat_get("route_nonat");
     int hl = -1;
     if (mode == 6 && g_early_listen) {
         hl = socket(AF_INET, SOCK_STREAM, 0);
@@ -1489,6 +1530,10 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         nat_dump();
     }
     CHECK(msg, rc == 0);
+    if (g_fwd_nonat) {
+        snprintf(msg, sizeof msg, "%s: routed to the NIC subnet with the source kept (route_nonat %ld -> %ld), no NAT mapping", name, nonat0, stat_get("route_nonat"));
+        CHECK(msg, stat_get("route_nonat") > nonat0 && nat_scan() == 0);
+    }
     ip_forward_set(0);
     if (g_fwd_nft) system("nft delete table inet netavark");
     if (mode == 10) system("nft delete table inet midflow");
@@ -1534,14 +1579,23 @@ static int rt_body(void) {
     int got = 0;
     for (int k = 0; k < 6 && !got; k++) {
         char b[64];
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
         sendto(u, "hi", 2, 0, (struct sockaddr *)&to, sizeof to);
         ssize_t n = recv(u, b, sizeof b - 1, 0);
-        if (n > 0) { b[n] = 0; got = 1; printf("DETAIL routed reply '%s' try %d\n", b, k); if (strcmp(b, "from=10.97.0.2")) return 5; }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        int ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (n > 0) {
+            b[n] = 0; got = 1; printf("DETAIL routed reply '%s' try %d (%d ms)\n", b, k, ms); fflush(stdout);
+            if (strcmp(b, "from=10.97.0.2")) return 5;
+            /* cold neighbour caches on both bridges: the first packet is parked, not dropped */
+            { char m2[96]; snprintf(m2, sizeof m2, "routed first packet is not lost (try %d, %d ms < 100)", k, ms); CHECK(m2, k == 0 && ms < 100); }
+        }
     }
     return got == g_rt_expect ? 0 : 4 + got;
 }
 static void routed_case(const char *name, int ipfwd) {
     char msg[96];
+    int fs_base = fwd_state_sum(NULL, 0);
     int s = nl_sock();
     unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
     int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
@@ -1571,16 +1625,46 @@ static void routed_case(const char *name, int ipfwd) {
     write(cc[1], &ch, 1);
     int rc = wait_child(cl);
     kill(sv, SIGKILL); wait_child(sv);
+    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); nat_dump(); fflush(stdout); printf("DIAG nft ruleset:\n"); fflush(stdout); system("nft list ruleset 2>&1; echo DIAG ip_forward all default br0 br1; cat /proc/sys/net/ipv4/ip_forward /proc/sys/net/ipv4/conf/all/forwarding /proc/sys/net/ipv4/conf/default/forwarding /proc/sys/net/ipv4/conf/br0/forwarding /proc/sys/net/ipv4/conf/br1/forwarding 2>&1"); }
     if (ipfwd) snprintf(msg, sizeof msg, "%s: UDP crosses br0 -> host -> br1 routed, source address kept (no NAT)", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means nothing is routed between the bridges", name);
     CHECK(msg, rc == 0);
     ip_forward_set(0);
     link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
     link_del(s, b0); link_del(s, b1);
+    FWD_STATE_CHECK(name, fs_base);
     close(s);
 }
 static void routed_on(void) { routed_case("routed_l3", 1); }
 static void routed_off(void) { routed_case("routed_l3_off", 0); }
+
+/* A re-created link must start from conf/default, not inherit the deleted link's per-interface forwarding
+ * (stale sysctl state made routed_l3 fail after nftnat_xbridge/hairpin: br1 kept forwarding=0 from an earlier case). */
+static int proc_int(const char *path) {
+    char b[32] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    if (!fgets(b, sizeof b, f)) b[0] = 0;
+    fclose(f);
+    return b[0] ? atoi(b) : -1;
+}
+static void ifctl_recreate(void) {
+    int s = nl_sock();
+    unsigned char m[6] = { 0x02, 0x00, 0x5e, 0x99, 0x00, 0x01 };
+    ip_forward_set(0);
+    int ok = br_new(s, "br9", m) == 0;
+    ok = ok && ip_forward_set(0) == 0 && proc_int("/proc/sys/net/ipv4/conf/br9/forwarding") == 0;
+    CHECK("ifctl_recreate: br9 exists with forwarding=0", ok);
+    link_del(s, link_get(s, "br9", NULL, NULL));
+    ip_forward_set(1);
+    ok = br_new(s, "br9", m) == 0;
+    int v = proc_int("/proc/sys/net/ipv4/conf/br9/forwarding");
+    char msg[128]; snprintf(msg, sizeof msg, "ifctl_recreate: a re-created br9 starts from conf/default forwarding=1, not the old link's 0 (got %d)", v);
+    CHECK(msg, ok && v == 1);
+    link_del(s, link_get(s, "br9", NULL, NULL));
+    ip_forward_set(0);
+    close(s);
+}
 
 /* ---- nftnat: rulesets from netavark's nftables driver drive DNAT (podnat L2) ------------------------- */
 static int g_nn_mode;      /* 0 host->127.0.0.1:H, 1 container -> bridge:H (self hairpin), 2 second container -> bridge:H */
@@ -1821,6 +1905,70 @@ static void nftnat_cross(void) { nn_case("nftnat_cross_netns", 2); }
 static void nftnat_udp(void) { nn_case("nftnat_udp_local", 3); }
 static void nftnat_range(void) { nn_case("nftnat_port_range", 4); }
 
+/* nftnat_xbridge: a container on br1 connects to the host's br1 address :8080, which DNATs to a container
+ * on br0 (cross-bridge, source kept). Both neighbour caches are cold: the first SYN must be parked behind
+ * the ARP request and replayed, not dropped (was a ~1 s retransmit). */
+static int g_xb_role; /* 0 server container on br0, 1 client container on br1 */
+static int xb_body(void) {
+    const char *ip = g_xb_role ? "10.98.0.2" : "10.97.0.2", *gw = g_xb_role ? "10.98.0.1" : "10.97.0.1";
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || addr_add(s, idx, ip, 24) || link_set_up(s, idx)) return 1;
+    int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
+    if (route_default(s, idx, gw)) return 2;
+    close(s);
+    char ch = 'c'; write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 3;
+    g_nn_mode = 0;
+    if (!g_xb_role) return nn_serve(NULL);
+    int c = nn_connect("10.98.0.1", 8080);
+    if (c < 0) return 20;
+    { char m2[96]; snprintf(m2, sizeof m2, "cross-bridge DNAT first connect with a cold neighbour cache (%d ms < 100)", g_nn_ms); CHECK(m2, g_nn_ms < 100); }
+    char b[8] = { 0 };
+    if (!nn_poll(c, POLLIN, 8000) || read(c, b, 2) != 2) return 21;
+    return !strcmp(b, "hi") ? 0 : 22;
+}
+static void nftnat_xbridge(void) {
+    const char *name = "nftnat_xbridge";
+    char msg[120], ch = 'g';
+    int fs_base = fwd_state_sum(NULL, 0);
+    int s = nl_sock();
+    unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
+    int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
+    int b0 = link_get(s, "br0", NULL, NULL), b1 = link_get(s, "br1", NULL, NULL);
+    ok = ok && b0 > 0 && b1 > 0 && addr_add(s, b0, "10.97.0.1", 24) == 0 && link_set_up(s, b0) == 0
+        && addr_add(s, b1, "10.98.0.1", 24) == 0 && link_set_up(s, b1) == 0 && ip_forward_set(1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24, br1 10.98.0.1/24 up, ip_forward=1", name); CHECK(msg, ok);
+    FILE *fp = fopen("/tmp/nn.nft", "w");
+    if (fp) { fputs(NN_RULES, fp); fclose(fp); }
+    snprintf(msg, sizeof msg, "%s: nft -f loads the netavark-shaped ruleset", name);
+    CHECK(msg, system("nft -f /tmp/nn.nft >/tmp/nn.err 2>&1") == 0);
+    g_xb_role = 0;
+    pid_t sv = spawn_ns(xb_body);
+    int fc = netns_fd_of(sv);
+    int vs = veth_new_m(s, "vethS", "eth0", fc, b0) == 0 && link_set_up(s, link_get(s, "vethS", NULL, NULL)) == 0;
+    close(fc);
+    write(ctl[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: server container on br0 listens on 80", name); CHECK(msg, sv > 0 && vs && rd_to(done_[0], &ch) == 1 && (write(ctl[1], &ch, 1), rd_to(done_[0], &ch) == 1));
+    g_xb_role = 1;
+    pid_t cl = spawn_ns(xb_body);
+    fc = netns_fd_of(cl);
+    int vc = veth_new_m(s, "vethC", "eth0", fc, b1) == 0 && link_set_up(s, link_get(s, "vethC", NULL, NULL)) == 0;
+    close(fc);
+    write(ctl[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: client container on br1 configured", name); CHECK(msg, cl > 0 && vc && rd_to(done_[0], &ch) == 1);
+    write(ctl[1], &ch, 1);
+    int rc = wait_child(cl);
+    snprintf(msg, sizeof msg, "%s: br1 client reaches the br0 container through the DNAT (exit %d)", name, rc); CHECK(msg, rc == 0);
+    kill(sv, SIGKILL); wait_child(sv);
+    system("nft delete table inet netavark");
+    ip_forward_set(0);
+    link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
+    link_del(s, b0); link_del(s, b1);
+    FWD_STATE_CHECK(name, fs_base);
+    close(s);
+}
+
 static const char FN_RULES_FMT_A[] =
  "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n  oifname \"br0\" drop\n }\n"
  " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.98.0.0/24 masquerade\n }\n}\n";
@@ -1828,6 +1976,10 @@ static const char FN_RULES_FMT_B[] =
  "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n  ip saddr 10.97.0.0/24 accept\n }\n"
  " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.97.0.0/24 masquerade\n }\n}\n";
 /* --internal: ip_forward=1 (a later network clobbered forwarding=0) but no masquerade intent for the subnet */
+/* ip_forward=1, nftables loaded but no nat/postrouting chain at all: nothing masquerades, so the packet is routed with its own source (no reply comes back: the NIC peer has no route to the container) */
+static const char FN_RULES_NONAT[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n }\n}\n";
+static void nftnat_nonat_route(void) { g_fwd_nft = FN_RULES_NONAT; g_fwd_expect_ovr = 0; g_fwd_nonat = 1; fwd_case("nftnat_nonat_route", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; g_fwd_nonat = 0; }
 static void nftnat_internal(void) { g_fwd_nft = FN_RULES_FMT_A; g_fwd_expect_ovr = 0; fwd_case("nftnat_internal", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; }
 static void nftnat_masq_ok(void) { g_fwd_nft = FN_RULES_FMT_B; fwd_case("nftnat_masq_ok", 0, 1); g_fwd_nft = NULL; }
 static void fwd_udp(void) { fwd_case("fwd_udp", 0, 1); }
@@ -1844,9 +1996,11 @@ static void nftfwd_midflow(void) { g_fwd_expect_ovr = 0; fwd_case("nftfwd_midflo
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 /* ICMP errors of a tracked flow are `ct state related`: with a default-drop FORWARD policy they pass only when a rule accepts them. */
 static const char FR_RULES_OFF[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n}\n";
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.97.0.0/24 masquerade\n }\n}\n";
 static const char FR_RULES_ON[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.97.0.0/24 masquerade\n }\n}\n";
 static void nftfwd_related_off(void) {
     g_fwd_nft = FR_RULES_OFF; g_fwd_expect_ovr = 0;
     g_fwd_msg = "ICMP port-unreachable (ct state related) is dropped by the default-drop policy";
@@ -2110,54 +2264,65 @@ static void stale_race(void) {
     close(s);
 }
 
+/* `only` is one case name or a comma list ("nftnat_xbridge,routed_l3": run them in that order of the suite). */
+static const char *g_only;
+static int want(const char *name) {
+    if (!g_only) return 1;
+    size_t l = strlen(name);
+    for (const char *p = g_only; (p = strstr(p, name)); p += l)
+        if ((p == g_only || p[-1] == ',') && (p[l] == 0 || p[l] == ',')) return 1;
+    return 0;
+}
 int main(int argc, char **argv) {
-    const char *only = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") && i + 1 < argc) g_http = argv[++i];
-        else only = argv[i];
+        else g_only = argv[i];
     }
-    if (!only || !strcmp(only, "veth_pair")) veth_pair();
-    if (!only || !strcmp(only, "accept_ns")) accept_ns();
-    if (!only || !strcmp(only, "veth_tcp_reap")) veth_tcp_reap();
-    if (!only || !strcmp(only, "veth_tcp_bulk_exit")) veth_tcp_bulk_exit();
-    if (!only || !strcmp(only, "veth_listen_reap")) veth_listen_reap();
-    if (!only || !strcmp(only, "veth_ping")) veth_ping();
-    if (!only || !strcmp(only, "veth6")) veth6();
-    if (!only || !strcmp(only, "bridge6")) bridge6();
-    if (!only || !strcmp(only, "veth6gw")) veth6gw();
-    if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
-    if (!only || !strcmp(only, "veth_naming")) veth_naming();
-    if (!only || !strcmp(only, "veth_setlink_move")) veth_setlink_move();
-    if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
-    if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
-    if (!only || !strcmp(only, "nftnat_local_redirect")) nftnat_local();
-    if (!only || !strcmp(only, "nftnat_hairpin")) nftnat_hairpin();
-    if (!only || !strcmp(only, "nftnat_cross_netns")) nftnat_cross();
-    if (!only || !strcmp(only, "nftnat_udp_local")) nftnat_udp();
-    if (!only || !strcmp(only, "nftnat_port_range")) nftnat_range();
-    if (!only || !strcmp(only, "nftnat_internal")) nftnat_internal();
-    if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
-    if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
-    if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
-    if (!only || !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow();
-    if (!only || !strcmp(only, "nftfwd_related_drop")) nftfwd_related_off();
-    if (!only || !strcmp(only, "nftfwd_related_accept")) nftfwd_related_on();
-    if (!only || !strcmp(only, "nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
-    if (!only || !strcmp(only, "routed_l3")) routed_on();
-    if (!only || !strcmp(only, "routed_l3_off")) routed_off();
-    if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
-    if (!only || !strcmp(only, "fwd_off")) fwd_off();
-    if (!only || !strcmp(only, "fwd_icmperr")) fwd_icmperr();
-    if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
-    if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
-    if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
-    if (!only || !strcmp(only, "fwd_mac_forge")) fwd_mac_forge();
-    if (!only || !strcmp(only, "fwd_mac_steal")) fwd_mac_steal();
-    if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
-    if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
-    if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
-    if (!only || !strcmp(only, "stale_stack")) stale_stack();
-    if (!only || !strcmp(only, "stale_race")) stale_race();
+    if (want("veth_pair")) veth_pair();
+    if (want("accept_ns")) accept_ns();
+    if (want("veth_tcp_reap")) veth_tcp_reap();
+    if (want("veth_tcp_bulk_exit")) veth_tcp_bulk_exit();
+    if (want("veth_listen_reap")) veth_listen_reap();
+    if (want("veth_ping")) veth_ping();
+    if (want("veth6")) veth6();
+    if (want("bridge6")) bridge6();
+    if (want("veth6gw")) veth6gw();
+    if (want("veth_dellink")) veth_dellink();
+    if (want("veth_naming")) veth_naming();
+    if (want("veth_setlink_move")) veth_setlink_move();
+    if (want("veth_nsgone")) veth_nsgone();
+    if (want("bridge_l2")) bridge_l2();
+    if (want("nftnat_local_redirect")) nftnat_local();
+    if (want("nftnat_hairpin")) nftnat_hairpin();
+    if (want("nftnat_cross_netns")) nftnat_cross();
+    if (want("nftnat_udp_local")) nftnat_udp();
+    if (want("nftnat_port_range")) nftnat_range();
+    if (want("nftnat_internal")) nftnat_internal();
+    if (want("nftnat_nonat_route")) nftnat_nonat_route();
+    if (want("nftnat_xbridge")) nftnat_xbridge();
+    if (want("nftnat_masq_ok")) nftnat_masq_ok();
+    if (want("fwd_udp")) fwd_udp();
+    if (want("nftfwd_midflow_established")) nftfwd_midflow();
+    if (want("nftfwd6_midflow_established")) nftfwd6_midflow();
+    if (want("nftfwd_related_drop")) nftfwd_related_off();
+    if (want("nftfwd_related_accept")) nftfwd_related_on();
+    if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
+    if (want("routed_l3")) routed_on();
+    if (want("routed_l3_off")) routed_off();
+    if (want("ifctl_recreate")) ifctl_recreate();
+    if (want("fwd_ping")) fwd_ping();
+    if (want("fwd_off")) fwd_off();
+    if (want("fwd_icmperr")) fwd_icmperr();
+    if (want("fwd_tcp")) fwd_tcp();
+    if (want("fwd_port_reserved")) fwd_port_reserved();
+    if (want("fwd_reap")) fwd_reap();
+    if (want("fwd_mac_forge")) fwd_mac_forge();
+    if (want("fwd_mac_steal")) fwd_mac_steal();
+    if (want("fwd_hostlisten")) fwd_hostlisten();
+    if (want("fwd_hostlisten_early")) fwd_hostlisten_early();
+    if (want("hostlisten_not_in_ns")) hostlisten_not_in_ns();
+    if (want("stale_stack")) stale_stack();
+    if (want("stale_race")) stale_race();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
