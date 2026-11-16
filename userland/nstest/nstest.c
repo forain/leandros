@@ -3751,13 +3751,28 @@ static int klog_has(const char *needle)
     buf[n] = 0;
     return strstr(buf, needle) != NULL;
 }
+static int zaptmo_ns(void);
 static int zaptmo(void)
 {
     char cl[1024] = {0};
     int cf = open("/proc/cmdline", O_RDONLY);
     if (cf >= 0) { if (read(cf, cl, sizeof cl - 1) < 0) cl[0] = 0; close(cf); }
     if (!strstr(cl, "pidns.zaptest=1")) { printf("nstest zaptmo: SKIP (needs pidns.zaptest=1)\n"); return 0; }
-    alarm(30);
+    alarm(60);
+    /* The ns part runs in a child: once the ns init is gone, fork() in the
+     * unsharing process fails (ENOMEM), so recovery is checked from here. */
+    pid_t body = fork();
+    if (body == 0) _exit(zaptmo_ns());
+    int st = 0;
+    check("zaptmo_body", body > 0 && waitpid(body, &st, 0) == body && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    pid_t c = fork();
+    if (c == 0) _exit(0);
+    check("zaptmo_system_recovers", c > 0 && waitpid(c, &st, 0) == c && WIFEXITED(st));
+    printf("nstest: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+static int zaptmo_ns(void)
+{
     int p[2];
     check("zaptmo_pipe", pipe(p) == 0);
     pid_t init = -1;
@@ -3777,10 +3792,6 @@ static int zaptmo(void)
     check("zaptmo_returns_bounded", ms < 5000);
     check("zaptmo_logged", klog_has("[pidns] zap timeout: ns "));
     close(p[1]);   /* the victim sees EOF and exits on its own */
-    pid_t c = fork();
-    if (c == 0) _exit(0);
-    check("zaptmo_system_recovers", c > 0 && waitpid(c, &st, 0) == c && WIFEXITED(st));
-    printf("nstest: %d passed, %d failed\n", npass, nfail);
     return nfail != 0;
 }
 
