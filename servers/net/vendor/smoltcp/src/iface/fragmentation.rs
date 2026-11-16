@@ -325,6 +325,8 @@ pub(crate) struct Ipv4Fragmenter {
     pub ident: u16,
     /// LEANDROS: the TOS byte every fragment carries.
     pub tos: u8,
+    /// LEANDROS: the IP MTU every fragment is cut to (the cached path MTU).
+    pub mtu: usize,
 }
 
 #[cfg(feature = "proto-sixlowpan-fragmentation")]
@@ -369,6 +371,7 @@ impl Fragmenter {
                 frag_offset: 0,
                 ident: 0,
                 tos: 0,
+                mtu: 0,
             },
 
             #[cfg(feature = "proto-sixlowpan-fragmentation")]
