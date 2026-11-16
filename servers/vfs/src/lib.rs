@@ -9033,6 +9033,8 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             p = write_u32(buf, p, mode);
             p = write_lit(buf, p, b"\nSeccomp_filters:\t");
             p = write_u32(buf, p, nf);
+            p = write_lit(buf, p, b"\nSeccomp_irq_windows:\t");
+            p = write_u64(buf, p, sched::seccomp::IRQ_WINDOWS.load(core::sync::atomic::Ordering::Relaxed));
             p = write_lit(buf, p, b"\n");
         }
         let kb = |pages: usize| pages as u64 * KB_PER_PAGE;

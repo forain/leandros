@@ -262,6 +262,7 @@ pub fn subreaper_for(dead: u32, default: u32) -> u32 {
 /// Init `tgid` of namespace `n` is dying: SIGKILL every other process in `n`
 /// and its descendants, then wait (bounded) until they are all zombies.
 pub fn zap(n: NsId, tgid: u32) {
+    let zaptest = ZAPTEST.load(core::sync::atomic::Ordering::Relaxed);
     // (tid, tgid) of every live task in the subtree: leaderless groups (main
     // thread exited, other threads running) have no live leader to find.
     let mut victims: alloc::vec::Vec<(u32, u32)> = alloc::vec::Vec::new();
@@ -294,8 +295,11 @@ pub fn zap(n: NsId, tgid: u32) {
         }
     };
     collect(&mut victims);
-    kill(&victims);
-    let deadline = crate::monotonic_ns().saturating_add(5_000_000_000);
+    // Test hook (`pidns.zaptest=1`, off by default): a pid-ns child cannot
+    // survive SIGKILL, so skip the kill and use a 300 ms deadline; the
+    // survivors then force the timeout path.
+    if !zaptest { kill(&victims); }
+    let deadline = crate::monotonic_ns().saturating_add(if zaptest { 300_000_000 } else { 5_000_000_000 });
     loop {
         collect(&mut victims);
         if victims.is_empty() { return; }
@@ -303,11 +307,15 @@ pub fn zap(n: NsId, tgid: u32) {
             warn_timeout(n, tgid, &victims);
             return;
         }
-        kill(&victims);
+        if !zaptest { kill(&victims); }
         crate::irq_window();
         crate::yield_now("pidns_zap");
     }
 }
+
+static ZAPTEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Kernel cmdline `pidns.zaptest=1`: see `zap`.
+pub fn set_zaptest() { ZAPTEST.store(true, core::sync::atomic::Ordering::Relaxed); }
 
 /// Minimum spacing between two zap-timeout warnings.
 const ZAP_WARN_INTERVAL_NS: u64 = 10_000_000_000;
