@@ -13905,7 +13905,7 @@ fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv_ptr: usiz
 
 fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
                   optval_ptr: usize, optlen: usize) -> isize {
-    if optlen > 128 || (optlen != 0 && !validate_user_buf(optval_ptr, optlen)) { return -14; }
+    if optlen > 512 || (optlen != 0 && !validate_user_buf(optval_ptr, optlen)) { return -14; }
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SETSOCKOPT,
         &[sockfd as u64, level as u64, optname as u64, optval_ptr as u64, optlen as u64]);
