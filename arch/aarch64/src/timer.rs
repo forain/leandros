@@ -239,7 +239,6 @@ pub fn init() {
     let grid = epoch.wrapping_add((now.wrapping_sub(epoch) / iv).wrapping_mul(iv));
     GRID_CPU[cpu].store(grid, Ordering::Relaxed);
     LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
-    if cpu == 0 { CPU0_TIMER_IRQS.fetch_add(1, Ordering::Relaxed); }
     unsafe {
         // EL0 may read the virtual counter (CNTVCT_EL0, and with it
         // CNTFRQ_EL0), nothing else: exactly Linux's
@@ -330,6 +329,7 @@ pub fn on_tick() {
         super::uart::IRQ_LATE_MAX_TICKS.fetch_max(now.wrapping_sub(due), Ordering::Relaxed);
     }
     LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
+    if cpu == 0 { CPU0_TIMER_IRQS.fetch_add(1, Ordering::Relaxed); }
 
     // One-shot deadline: service it if due (any CPU), then fold the next
     // pending deadline back into the compare value (advance_grid just set it
