@@ -1908,7 +1908,7 @@ static int fwd6_body(void) {
     for (int k = 0; k < 3 && pr; k++) pr = ping6_sock(ic, g_gw6, 1 + k); /* NEW then reply (the first may be lost to ND): the flow is now established */
     if (pr) {
         printf("DIAG v6 ping to %s: rc %d errno %d\n", g_gw6, pr, errno); fflush(stdout);
-        system("cat /proc/net/if_inet6 /proc/net/ipv6_route 2>&1 | head -12; cat /proc/net/nic | head -30");
+        system("cat /proc/net/if_inet6 /proc/net/ipv6_route 2>&1 | head -12; grep -E '^(fwd_stats|fwd_ct6|fwd_nd)' /proc/net/nic");
         return 6;
     }
     write(done_[1], &ch, 1);
@@ -2139,7 +2139,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
-    if (only && !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow(); /* opt-in: no echo reply through NAT66 in this setup yet (see TODO) */
+    if (!only || !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow();
     if (!only || !strcmp(only, "nftfwd_related_drop")) nftfwd_related_off();
     if (!only || !strcmp(only, "nftfwd_related_accept")) nftfwd_related_on();
     if (!only || !strcmp(only, "nftnat_hairpin_midflow")) nftnat_hairpin_midflow();

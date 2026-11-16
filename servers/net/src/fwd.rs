@@ -78,7 +78,7 @@ pub(crate) static INQ_N: AtomicUsize = AtomicUsize::new(0);
 /// Diagnostic counters (/proc/net/nic "fwd_stats:"): where a forwarded UDP/ICMP flow is lost.
 /// Order: ing_udp ing_ttl ing_noroute ing_nft_drop ing_nopick emit arp_hit arp_miss pend_exp
 /// arp_learn arp_flush nicrx_udp nicrx_udp_hit nicrx_udp_miss icmperr_rx
-pub(crate) static STAT: [AtomicUsize; 25] = [const { AtomicUsize::new(0) }; 25];
+pub(crate) static STAT: [AtomicUsize; 35] = [const { AtomicUsize::new(0) }; 35];
 /// icmp_error_rx rejection reasons live at STAT[15 + n]; the last quoted tuple that found no conntrack entry is kept here.
 pub(crate) static LASTQ: [core::sync::atomic::AtomicU64; 2] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
 fn rej(n: usize) -> bool { STAT[15 + n].fetch_add(1, Ordering::Relaxed); false }
@@ -97,13 +97,27 @@ pub(crate) const S_NICRX_UDP: usize = 11;
 pub(crate) const S_NICRX_HIT: usize = 12;
 pub(crate) const S_NICRX_MISS: usize = 13;
 pub(crate) const S_ICMPERR_RX: usize = 14;
+/// IPv6 (fwd6) counters, STAT[22..]: divert reached the NAT stage / no NIC route / no NIC MAC / emitted / nd hit / nd miss (NS sent) /
+/// nd learned / nic_rx entered / nic_rx echo or L4 reply seen / reply key hit / reply key miss
+pub(crate) const S6_NAT: usize = 22;
+pub(crate) const S6_NOROUTE: usize = 23;
+pub(crate) const S6_NOMAC: usize = 24;
+pub(crate) const S6_EMIT: usize = 25;
+pub(crate) const S6_ND_HIT: usize = 26;
+pub(crate) const S6_ND_MISS: usize = 27;
+pub(crate) const S6_ND_LEARN: usize = 28;
+pub(crate) const S6_RX: usize = 29;
+pub(crate) const S6_RX_L4: usize = 30;
+pub(crate) const S6_RX_HIT: usize = 31;
+pub(crate) const S6_RX_MISS: usize = 32;
+#[inline] pub(crate) fn stat6(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }
 #[inline] fn stat(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }
 
 pub(crate) fn dump_stats(w: &mut dyn core::fmt::Write) {
     let _ = write!(w, "fwd_stats:");
     for (n, i) in ["ing_udp", "ing_ttl", "ing_noroute", "ing_nft_drop", "ing_nopick", "emit", "arp_hit", "arp_miss", "pend_exp",
                    "arp_learn", "arp_flush", "nicrx_udp", "nicrx_hit", "nicrx_miss", "icmperr_rx",
-                   "rej_hdr", "rej_frag", "rej_qhdr", "rej_proto", "rej_noct", "rej_odst", "icmperr_queued", "x7", "x8", "x9"].iter().zip(STAT.iter()) {
+                   "rej_hdr", "rej_frag", "rej_qhdr", "rej_proto", "rej_noct", "rej_odst", "icmperr_queued", "v6_nat", "v6_noroute", "v6_nomac", "v6_emit", "v6_nd_hit", "v6_nd_miss", "v6_nd_learn", "v6_rx", "v6_rx_l4", "v6_rx_hit", "v6_rx_miss", "x10", "x11"].iter().zip(STAT.iter()) {
         let _ = write!(w, " {}={}", n, i.load(Ordering::Relaxed));
     }
     let _ = writeln!(w);
@@ -125,6 +139,7 @@ pub(crate) fn dump_stats(w: &mut dyn core::fmt::Write) {
             e.proto, e.nat, e.cip[0], e.cip[1], e.cip[2], e.cip[3], e.cport, e.rip[0], e.rip[1], e.rip[2], e.rip[3], e.rport,
             e.kind, e.replied as u8, now.saturating_sub(e.last) / 1_000_000, e.br, e.port);
     }
+    crate::fwd6::dump6(w, &g, now);
 }
 
 fn ct_ttl(e: &Ct) -> u64 {

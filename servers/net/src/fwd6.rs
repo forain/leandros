@@ -140,8 +140,9 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
         if let Some(&(ba, _)) = addrs.iter().find(|&&(a, pl)| a[0] != 0xfe && a != src && prefix_match(&a, &src, pl)) { time_exceeded(br, port, bmac, ba, &f); }
         return None;
     }
-    let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { return None };
-    let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return None };
+    let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { fwd::stat6(fwd::S6_NOROUTE); return None };
+    let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { fwd::stat6(fwd::S6_NOMAC); return None };
+    fwd::stat6(fwd::S6_NAT);
     let now = sched::monotonic_ns();
     let cmac: [u8; 6] = f[6..12].try_into().unwrap();
     let rport = if p.proto == PROTO_ICMP6 { 0 } else { p.dport };
@@ -210,9 +211,11 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
 }
 
 fn emit(st: &mut fwd::St, now: u64, nic: u8, nh: [u8; 16], nicip: [u8; 16], nicmac: [u8; 6], mut f: Vec<u8>) {
+    fwd::stat6(fwd::S6_EMIT);
     match st.nd.iter().find(|a| a.nic == nic && a.ip == nh && now.saturating_sub(a.t) < fwd::ARP_NS).map(|a| a.mac) {
-        Some(m) => { f[0..6].copy_from_slice(&m); fwd::push_tx(st, nic, f); }
+        Some(m) => { fwd::stat6(fwd::S6_ND_HIT); f[0..6].copy_from_slice(&m); fwd::push_tx(st, nic, f); }
         None => {
+            fwd::stat6(fwd::S6_ND_MISS);
             let first = match st.pend6.iter_mut().find(|q| q.nic == nic && q.ip == nh) {
                 Some(q) => { if q.frames.len() < 4 { q.frames.push(f); } false }
                 None => { st.pend6.push(Pend6 { nic, ip: nh, t: now, frames: alloc::vec![f] }); true }
@@ -242,6 +245,7 @@ fn ns_frame(mac: [u8; 6], src: [u8; 16], target: [u8; 16]) -> Vec<u8> {
 }
 
 fn learn(st: &mut fwd::St, nic: u8, ip: [u8; 16], mac: [u8; 6], now: u64) {
+    fwd::stat6(fwd::S6_ND_LEARN);
     if let Some(a) = st.nd.iter_mut().find(|a| a.nic == nic && a.ip == ip) { a.mac = mac; a.t = now; }
     else if st.nd.len() < 64 { st.nd.push(Nd { nic, ip, mac, t: now }); }
     if let Some(i) = st.pend6.iter().position(|q| q.nic == nic && q.ip == ip) {
@@ -252,6 +256,7 @@ fn learn(st: &mut fwd::St, nic: u8, ip: [u8; 16], mac: [u8; 6], now: u64) {
 
 /// NIC rx hook for IPv6 frames. True = taken (a reply of a forwarded flow).
 pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
+    fwd::stat6(fwd::S6_RX);
     if !USED6.load(Ordering::Relaxed) && !crate::nfnl::has_tables(0) { return false; }
     let plen = u16::from_be_bytes([buf[18], buf[19]]) as usize;
     if buf[20] == PROTO_ICMP6 && plen >= 24 && buf.len() >= 54 + 24 {
@@ -272,7 +277,11 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
         }
         if (1..=4).contains(&ty) { return icmp6_err_rx(nic, buf); }
         if ty != 129 { return false; }
+    } else if buf[20] == PROTO_ICMP6 {
+        // Short ICMPv6 (plen < 24): only an echo reply (8-byte header + <16 bytes of data, e.g. a bare ping) is of interest.
+        if plen < 8 || buf.len() < 54 + 8 || buf[54] != 129 { return false; }
     } else if buf[20] != PROTO_TCP && buf[20] != PROTO_UDP { return false; }
+    fwd::stat6(fwd::S6_RX_L4);
     let mut st = FWD.lock();
     if st.ct6.is_empty() && !crate::nfnl::has_tables(0) { return false; }
     let mut f = buf.to_vec();
@@ -283,7 +292,8 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if p.proto != PROTO_ICMP6 && !st.ct6.iter().any(|e| key(e)) {
         match new_in6(&mut st, nic, &p, now) { 0 => return false, 1 => return true, _ => {} }
     }
-    let Some(e) = st.ct6.iter_mut().find(|e| key(e)) else { return false };
+    let Some(e) = st.ct6.iter_mut().find(|e| key(e)) else { fwd::stat6(fwd::S6_RX_MISS); return false };
+    fwd::stat6(fwd::S6_RX_HIT);
     e.last = now; e.replied = true;
     if p.proto == PROTO_TCP { fwd::tcp_fsm(&mut e.tst, &mut e.fins, p.flags, e.kind == 1); }
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
@@ -561,4 +571,18 @@ fn icmp6_err_rx(nic: u8, buf: &[u8]) -> bool {
     drop(st);
     drivers::netdev::kick();
     true
+}
+
+/// /proc/net/nic: the NAT66 conntrack table and the NIC neighbour cache.
+pub(crate) fn dump6(w: &mut dyn core::fmt::Write, g: &fwd::St, now: u64) {
+    use core::fmt::Write as _;
+    let h = |a: &[u8; 16]| { let mut s = alloc::string::String::new(); for i in 0..8 { let _ = write!(s, "{}{:x}", if i > 0 { ":" } else { "" }, u16::from_be_bytes([a[2 * i], a[2 * i + 1]])); } s };
+    for e in g.ct6.iter() {
+        let _ = writeln!(w, "fwd_ct6: proto {} nat {} cip {} cport {} rip {} rport {} nicip {} nic {} kind {} replied {} age_ms {}",
+            e.proto, e.nat, h(&e.cip), e.cport, h(&e.rip), e.rport, h(&e.nicip), e.nic, e.kind, e.replied as u8, now.saturating_sub(e.last) / 1_000_000);
+    }
+    for a in g.nd.iter() {
+        let _ = writeln!(w, "fwd_nd: nic {} {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} age_ms {}", a.nic, h(&a.ip),
+            a.mac[0], a.mac[1], a.mac[2], a.mac[3], a.mac[4], a.mac[5], now.saturating_sub(a.t) / 1_000_000);
+    }
 }
