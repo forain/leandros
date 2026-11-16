@@ -1349,6 +1349,7 @@ impl InterfaceInner {
                     }
                 }
                 if best > 0 {
+                    crate::v6dbg(6);
                     let pick = if best_rp && n_rp > 1 {
                         let mut h: u32 = 0x811c_9dc5;
                         let mut mix = |b: u8| h = (h ^ b as u32).wrapping_mul(0x0100_0193);

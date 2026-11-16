@@ -400,7 +400,9 @@ static void pmtud6_child(int wfd, int tun, const char *ifn) {
         if (write(tun, fr[7], pn) != pn) { snprintf(why, sizeof why, "plain reflect write: %s", strerror(errno)); goto out; }
         struct pollfd pf = { r, POLLIN, 0 };
         ssize_t got = poll(&pf, 1, 3000) > 0 ? recv(r, g, sizeof g, 0) : -1;
-        if (got != 600) { snprintf(why, sizeof why, "plain (unfragmented) reflect: received %zd bytes: rx path, not reassembly", got); goto out; }
+        if (got != 600) {
+            char dbg[120] = ""; int df = open("/proc/net/v6dbg", O_RDONLY); ssize_t dn = df >= 0 ? read(df, dbg, sizeof dbg - 1) : -1; if (dn > 0) { for (int i = 0; i < dn; i++) if (dbg[i] == '\n') dbg[i] = ','; dbg[dn] = 0; } if (df >= 0) close(df);
+            snprintf(why, sizeof why, "plain reflect: got %zd pn=%zd nh=%d hl=%d pl=%d ck=%02x%02x v6dbg=%s", got, pn, fr[7][6], fr[7][7], (fr[7][4] << 8) | fr[7][5], fr[7][46], fr[7][47], dbg); goto out; }
     }
     /* loop the fragments back (addresses swapped: the UDP checksum is unchanged), in order then reversed */
     for (int round = 0; round < 2; round++) {

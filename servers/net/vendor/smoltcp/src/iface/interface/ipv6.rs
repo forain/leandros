@@ -33,7 +33,9 @@ impl InterfaceInner {
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
         frag: &'frame mut FragmentsBuffer,
     ) -> Option<Packet<'frame>> {
+        crate::v6dbg(1);
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
+        crate::v6dbg(2);
         // LEANDROS: the traffic class, for IPV6_RECVTCLASS (see udp::Socket::process).
         self.rx_tos = ipv6_packet.traffic_class();
 
@@ -60,6 +62,7 @@ impl InterfaceInner {
             return None;
         }
 
+        crate::v6dbg(3);
         // LEANDROS: reassemble a fragmented datagram (RFC 8200 4.5); the
         // payload that follows is the upper layer of the whole.
         #[cfg(feature = "proto-ipv4-fragmentation")]
@@ -219,6 +222,7 @@ impl InterfaceInner {
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => {
+                crate::v6dbg(4);
                 let udp_packet = check!(UdpPacket::new_checked(ip_payload));
                 let udp_repr = check!(UdpRepr::parse(
                     &udp_packet,
@@ -227,6 +231,7 @@ impl InterfaceInner {
                     &self.checksum_caps(),
                 ));
 
+                crate::v6dbg(5);
                 self.process_udp(
                     sockets,
                     meta,

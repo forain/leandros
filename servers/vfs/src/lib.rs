@@ -4513,6 +4513,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/udp6",  data: b"" },
     RamEntry { path: b"/proc/net/raw",   data: b"" },
     RamEntry { path: b"/proc/net/raw6",  data: b"" },
+    RamEntry { path: b"/proc/net/v6dbg",  data: b"" },
     RamEntry { path: b"/proc/net/if_inet6",  data: b"" },
     RamEntry { path: b"/proc/net/fib_trie",  data: b"Main:\n  +-- 0.0.0.0/0\n" },
     RamEntry { path: b"/proc/sys/kernel/hostname",   data: b"leandros\n" },

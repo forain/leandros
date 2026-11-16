@@ -179,3 +179,8 @@ pub mod wire;
     )
 ))]
 mod tests;
+
+/// LEANDROS: temporary IPv6 receive-path counters (/proc/net/v6dbg).
+pub static V6DBG: [core::sync::atomic::AtomicU32; 8] = [const { core::sync::atomic::AtomicU32::new(0) }; 8];
+#[inline]
+pub fn v6dbg(i: usize) { V6DBG[i].fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
