@@ -1176,6 +1176,72 @@ unsafe fn fb_lifetime_cases(fd: c_int, kms: bool, restore_fb: u32,
     (failures, skips)
 }
 
+/// Lane vrr: the Linux VRR KMS properties. Linux's atomic core stores
+/// VRR_ENABLED without checking the sink (drivers just leave adaptive sync
+/// off), so a 1 on our non-capable connector is accepted; out-of-range values
+/// and writes to the immutable vrr_capable are EINVAL.
+unsafe fn vrr_props(fd: c_int, obj: u32, ty: u32) -> ([u32; 16], [u64; 16], usize) {
+    let mut ids = [0u32; 16];
+    let mut vals = [0u64; 16];
+    let mut g: [u64; 4] = [ids.as_mut_ptr() as u64, vals.as_mut_ptr() as u64, 16, 0];
+    g[2] = 16 | ((obj as u64) << 32);
+    g[3] = ty as u64;
+    let rc = ioctl(fd, 0xC02064B9, &mut g as *mut _);
+    (ids, vals, if rc == 0 { (g[2] & 0xFFFF_FFFF) as usize } else { 0 })
+}
+
+/// (id, flags, min, max) of the property named `name` on the object, or None.
+unsafe fn vrr_find(fd: c_int, obj: u32, ty: u32, name: &[u8]) -> Option<(u32, u32, u64, u64, u64)> {
+    let (ids, vals, n) = vrr_props(fd, obj, ty);
+    for i in 0..n.min(16) {
+        let mut rng = [0u64; 2];
+        let mut g = [0u64; 8];
+        g[0] = rng.as_mut_ptr() as u64;
+        *(g.as_mut_ptr() as *mut u32).add(4) = ids[i];
+        *(g.as_mut_ptr() as *mut u32).add(14) = 2;
+        if ioctl(fd, 0xC04064AA, &mut g as *mut _) != 0 { continue; }
+        let flags = *(g.as_ptr() as *const u32).add(5);
+        let nm = (g.as_ptr() as *const u8).add(24);
+        let mut eq = true;
+        for (j, &b) in name.iter().enumerate() { if *nm.add(j) != b { eq = false; } }
+        if eq && *nm.add(name.len()) == 0 { return Some((ids[i], flags, rng[0], rng[1], vals[i])); }
+    }
+    None
+}
+
+unsafe fn vrr_cases(fd: c_int) -> i32 {
+    let mut failures = 0i32;
+    const CRTC_T: u32 = 0xcccc_cccc;
+    const CONN_T: u32 = 0xc0c0_c0c0;
+    let en = vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED");
+    let cap = vrr_find(fd, 1, CONN_T, b"vrr_capable");
+    let props_ok = matches!(en, Some((_, fl, 0, 1, 0)) if fl & 4 == 0 && fl & 2 != 0)
+        && matches!(cap, Some((_, fl, 0, 1, 0)) if fl & 4 != 0 && fl & 2 != 0);
+    if !report(b"VRR_PROPS_ENUMERATE", props_ok) { failures += 1; return failures; }
+    let (en_id, cap_id) = (en.unwrap().0, cap.unwrap().0);
+    let a = |flags: u32, obj: u32, p: u32, v: u64| c2_atomic(fd, flags, &[obj], &[1], &[p], &[v]);
+    let t_ok = a(DRM_MODE_ATOMIC_TEST_ONLY, 1, en_id, 1) == 0 && a(DRM_MODE_ATOMIC_TEST_ONLY, 1, en_id, 0) == 0;
+    if !report(b"VRR_ENABLED_TEST_ONLY_ACCEPTED", t_ok) { failures += 1; }
+    let still0 = matches!(vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED"), Some((_, _, _, _, 0)));
+    if !report(b"VRR_TEST_ONLY_DOES_NOT_STICK", still0) { failures += 1; }
+    let r2 = a(DRM_MODE_ATOMIC_TEST_ONLY, 1, en_id, 2) != 0 && errno() == EINVAL;
+    if !report(b"VRR_ENABLED_OUT_OF_RANGE_EINVAL", r2) { failures += 1; }
+    let r3 = a(DRM_MODE_ATOMIC_TEST_ONLY, 1, cap_id, 1) != 0 && errno() == EINVAL;
+    if !report(b"VRR_CAPABLE_IMMUTABLE_EINVAL", r3) { failures += 1; }
+    // Legacy OBJ_SETPROPERTY: {value, prop_id, obj_id, obj_type}.
+    let mut sp: [u64; 3] = [1, (en_id as u64) | (1u64 << 32), CRTC_T as u64];
+    let set1 = ioctl(fd, 0xC01864BA, &mut sp as *mut _) == 0
+        && matches!(vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED"), Some((_, _, _, _, 1)));
+    sp[0] = 0;
+    let set0 = ioctl(fd, 0xC01864BA, &mut sp as *mut _) == 0
+        && matches!(vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED"), Some((_, _, _, _, 0)));
+    if !report(b"VRR_LEGACY_SETPROPERTY_ROUNDTRIP", set1 && set0) { failures += 1; }
+    sp[0] = 1; sp[1] = (cap_id as u64) | (1u64 << 32);
+    let bad = ioctl(fd, 0xC01864BA, &mut sp as *mut _) != 0 && errno() == EINVAL;
+    if !report(b"VRR_LEGACY_IMMUTABLE_EINVAL", bad) { failures += 1; }
+    failures
+}
+
 /// The out-fence atomicity cases. Run on a fresh open, so the context they
 /// create (and, in `demo` mode, deliberately break) is theirs alone.
 ///
@@ -3750,6 +3816,9 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         let (f, sk) = out_fence_cases(false);
         failures += f; skips += sk;
     }
+
+    // Lane vrr: VRR_ENABLED / vrr_capable properties.
+    failures += vrr_cases(fd);
 
     // Lane ffmagenta: virgl transfers and VIRTGPU_WAIT's busy errno.
     {
