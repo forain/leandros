@@ -2340,6 +2340,114 @@ static void stale_race(void) {
     close(s);
 }
 
+/* ---- routed IPv6 without NAT: br0 (fd00:97::/64) -> host (ipv6 forwarding) -> br1 (fd00:98::/64) ----------------- */
+static int g_rt6_role, g_rt6_mode; /* role 0 client / 1 UDP server; mode 0 routed, 1 forwarding=0, 2 hop limit 1, 3 no such host */
+static int rt6_body(void) {
+    g_ip6 = g_rt6_role ? "fd00:98::2" : "fd00:97::2";
+    int e = v6_conf_eth0(); if (e) return e;
+    int cs = nl_sock();
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    if (route6_default(cs, idx, g_rt6_role ? "fd00:98::1" : "fd00:97::1")) return 3;
+    close(cs);
+    sleep(2);                                        /* IPv6 DAD */
+    int u = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (u < 0) return 5;
+    struct sockaddr_in6 me; memset(&me, 0, sizeof me); me.sin6_family = AF_INET6; me.sin6_port = htons(7000);
+    if (g_rt6_role) { inet_pton(AF_INET6, g_ip6, &me.sin6_addr); if (bind(u, (struct sockaddr *)&me, sizeof me)) return 6; }
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (g_rt6_role) {
+        for (int i = 0; i < 40; i++) {
+            struct pollfd p = { u, POLLIN, 0 };
+            if (poll(&p, 1, 1000) <= 0) continue;
+            char b[64]; struct sockaddr_in6 from; socklen_t fl = sizeof from;
+            if (recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&from, &fl) <= 0) continue;
+            char r[96], fa[64]; inet_ntop(AF_INET6, &from.sin6_addr, fa, sizeof fa);
+            int n = snprintf(r, sizeof r, "from=%s", fa);
+            sendto(u, r, n, 0, (struct sockaddr *)&from, fl);
+        }
+        return 0;
+    }
+    if (rd_to(ctl[0], &ch) != 1) return 4;
+    int on = 1, hl = g_rt6_mode == 2 ? 1 : 64;
+    setsockopt(u, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hl, sizeof hl);
+    setsockopt(u, IPPROTO_IPV6, IPV6_RECVERR, &on, sizeof on);
+    struct timeval tv = { g_rt6_mode == 1 ? 2 : 5, 0 };
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct sockaddr_in6 to; memset(&to, 0, sizeof to); to.sin6_family = AF_INET6; to.sin6_port = htons(7000);
+    inet_pton(AF_INET6, g_rt6_mode == 3 ? "fd00:98::99" : "fd00:98::2", &to.sin6_addr);
+    if (connect(u, (struct sockaddr *)&to, sizeof to)) return 7;
+    int got = 0, err = 0, ms = 0;
+    for (int k = 0; k < (g_rt6_mode == 1 ? 2 : 4) && !got && !err; k++) {
+        char b[96];
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        send(u, "hi", 2, 0);
+        ssize_t n = recv(u, b, sizeof b - 1, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (n > 0) {
+            b[n] = 0; got = 1 + k * 0;
+            printf("DETAIL routed6 reply '%s' try %d (%d ms)\n", b, k, ms); fflush(stdout);
+            if (strcmp(b, "from=fd00:97::2")) return 8;
+            if (k) got = 2;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) err = errno;
+    }
+    printf("DETAIL routed6 mode %d got=%d err=%d ms=%d\n", g_rt6_mode, got, err, ms); fflush(stdout);
+    if (g_rt6_mode == 0) return got == 1 ? 0 : 10 + got;                  /* the very first packet is parked, not lost */
+    if (g_rt6_mode == 1) return got == 0 && err == 0 ? 0 : 20 + got;
+    if (g_rt6_mode == 2) return err && ms < 1000 ? 0 : 30;                /* time exceeded comes straight back */
+    return err && ms >= 1200 && ms < 4000 ? 0 : 40;                       /* address unreachable after the NS probes time out */
+}
+static void routed6_case(const char *name, int mode, const char *what) {
+    char msg[160];
+    int s = nl_sock();
+    unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x06, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x06, 0x01 };
+    int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
+    int b0 = link_get(s, "br0", NULL, NULL), b1 = link_get(s, "br1", NULL, NULL);
+    ok = ok && b0 > 0 && b1 > 0 && addr6_add(s, b0, "fd00:97::1", 64) == 0 && link_set_up(s, b0) == 0
+        && addr6_add(s, b1, "fd00:98::1", 64) == 0 && link_set_up(s, b1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 fd00:97::1/64 and br1 fd00:98::1/64 up", name); CHECK(msg, ok);
+    snprintf(msg, sizeof msg, "%s: ipv6 forwarding=%d", name, mode != 1); CHECK(msg, ip6_forward_set(mode != 1) == 0);
+    g_rt6_mode = mode;
+    char ch = 'g';
+    g_rt6_role = 1;
+    pid_t sv = spawn_ns(rt6_body);
+    int scc[2] = { ctl[0], ctl[1] }, sdd[2] = { done_[0], done_[1] };
+    int fc = netns_fd_of(sv);
+    int vs = veth_new_m(s, "vethS", "eth0", fc, b1) == 0 && link_set_up(s, link_get(s, "vethS", NULL, NULL)) == 0;
+    close(fc);
+    write(scc[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: server container on br1 serves UDP 7000", name); CHECK(msg, sv > 0 && vs && rd_to(sdd[0], &ch) == 1);
+    g_rt6_role = 0;
+    pid_t cl = spawn_ns(rt6_body);
+    int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
+    fc = netns_fd_of(cl);
+    int vc = veth_new_m(s, "vethC", "eth0", fc, b0) == 0 && link_set_up(s, link_get(s, "vethC", NULL, NULL)) == 0;
+    close(fc);
+    write(cc[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: client container on br0 configured", name); CHECK(msg, cl > 0 && vc && rd_to(dd[0], &ch) == 1);
+    write(cc[1], &ch, 1);
+    int rc = wait_child(cl);
+    kill(sv, SIGKILL); wait_child(sv);
+    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); fflush(stdout); system("grep -E '^(fwd_stats|fwd_state|fwd_ct6|fwd_nd)' /proc/net/nic | cut -c1-400 | head -12"); }
+    snprintf(msg, sizeof msg, "%s: %s (exit %d)", name, what, rc); CHECK(msg, rc == 0);
+    ip6_forward_set(0);
+    link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
+    link_del(s, b0); link_del(s, b1);
+    close(s);
+}
+static void routed6_on(void) {
+    int fs_base = fwd_state_sum(NULL, 0);
+    routed6_case("routed6_l3", 0, "UDP crosses br0 -> host -> br1 routed, source address kept (no NAT), first packet parked not lost");
+    FWD_STATE_CHECK("routed6_l3", fs_base);
+}
+static void routed6_off(void) { routed6_case("routed6_l3_off", 1, "ipv6 forwarding=0 means nothing is routed between the bridges"); }
+static void routed6_ttl(void) { routed6_case("routed6_l3_hoplimit", 2, "hop limit 1 is answered with ICMPv6 time exceeded"); }
+static void routed6_park(void) {
+    int fs_base = fwd_state_sum(NULL, 0);
+    routed6_case("routed6_l3_park", 3, "an unresolvable next hop is answered with ICMPv6 address unreachable after the NS probes");
+    FWD_STATE_CHECK("routed6_l3_park", fs_base);
+}
+
 /* `only` is one case name or a comma list ("nftnat_xbridge,routed_l3": run them in that order of the suite). */
 static const char *g_only;
 static int want(const char *name) {
@@ -2385,6 +2493,10 @@ int main(int argc, char **argv) {
     if (want("nftfwd_related_drop")) nftfwd_related_off();
     if (want("nftfwd_related_accept")) nftfwd_related_on();
     if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
+    if (want("routed6_l3")) routed6_on();
+    if (want("routed6_l3_off")) routed6_off();
+    if (want("routed6_l3_hoplimit")) routed6_ttl();
+    if (want("routed6_l3_park")) routed6_park();
     if (want("routed_l3")) routed_on();
     if (want("routed_l3_off")) routed_off();
     if (want("ifctl_recreate")) ifctl_recreate();
