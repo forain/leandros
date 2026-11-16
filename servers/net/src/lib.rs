@@ -1081,6 +1081,8 @@ struct BoundPath {
     /// True for a Linux abstract-namespace address (sun_path[0] == 0): matched
     /// by bytes here, never backed by a VFS node.
     is_abstract: bool,
+    /// `SOCK_*` type of the socket that bound this address (EPROTOTYPE checks).
+    sock_type:  u8,
     /// Network namespace of the binder: abstract names are scoped by it.
     netns:      u16,
     /// How many things still hold this bound address: one per `UnixListening`
@@ -1101,7 +1103,7 @@ struct BoundPath {
 impl BoundPath {
     const fn new() -> Self {
         Self { in_use: false, path: [0u8; PATH_MAX], path_len: 0,
-               sock_id: 0, is_abstract: false, netns: 0, refs: 0,
+               sock_id: 0, is_abstract: false, sock_type: 0, netns: 0, refs: 0,
                _owner_pid: 0, _owner_sock: 0 }
     }
 }
@@ -1339,6 +1341,11 @@ struct SockOpts {
     sndbuf:    u32,
     /// SO_PASSCRED: recvmsg returns the sender's SCM_CREDENTIALS.
     passcred:  bool,
+    /// AF_UNIX SOCK_DGRAM: `sock_id` of the default destination set by
+    /// connect() (0 = none), and of the inbox a send last got EAGAIN from
+    /// (what a blocked sender parks on).
+    dg_peer:   u64,
+    dg_wait:   u64,
     /// IPV6_V6ONLY on an AF_INET6 socket: it hears and reaches only v6.
     v6only:    bool,
     /// IPv6 ancillary data recvmsg adds (`RECV6_*`).
@@ -1402,7 +1409,7 @@ impl SockOpts {
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
                                  mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0,
-                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false, recv6: 0, icmp6f: [0; 8] };
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, dg_peer: 0, dg_wait: 0, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -2143,6 +2150,10 @@ fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
 /// case each boot (the bit follows the socket's key).
 pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<sched::PollTag> {
     let e = sock_entry(sched::tgid_of(pid), fd)?;
+    if e.domain as usize == AF_UNIX && e.sock_type & 0xf == SOCK_DGRAM as u8
+        && matches!(e.state, SockState::Unbound { .. } | SockState::UnixListening { .. }) {
+        return Some(unixdg::wake_tag(&e));
+    }
     match e.state {
         SockState::UnixConnected { conn_idx, is_a } => Some(unix_end_keys(conn_idx, is_a, 0)),
         SockState::UnixPendingAccept { conn_idx, .. } => Some(unix_end_keys(conn_idx, true, 0)),
@@ -2187,7 +2198,7 @@ fn free_bound_idx(bound_idx: usize) {
             }
         }
     }
-    if let Some(sock_id) = gone { unix_listener_gone(sock_id); }
+    if let Some(sock_id) = gone { unixdg::destroy(sock_id); unix_listener_gone(sock_id); }
 }
 
 /// The last reference to the listener bound as `sock_id` went away: every
@@ -3401,6 +3412,7 @@ fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
 }
 
 mod listen;
+mod unixdg;
 pub mod rxpolicy;
 pub mod latestack;
 mod mcast;
@@ -4187,7 +4199,7 @@ pub fn force_bind_unix(path_str: &str, _port: u32) {
             path,
             path_len,
             sock_id: alloc_sock_id(),
-            is_abstract: false, netns: 0,
+            is_abstract: false, sock_type: 0, netns: 0,
             // No fd names this one — it is bound on behalf of the system, and
             // the single reference is what keeps it alive for good.
             refs: 1,
@@ -4237,6 +4249,10 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                handle_connect(caller_pid, arg(msg,0) as usize,
                                               arg(msg,1) as usize, arg(msg,2) as usize,
                                               host_path_arg(msg))),
+        NET_SEND if arg(msg,6) != 0 && unixdg::dg_entry(caller_pid, arg(msg,0) as usize).is_some()
+                        => unixdg::handle_send(caller_pid, msg).unwrap_or_else(|| err_reply(-9)),
+        NET_SENDMSG if arg(msg,6) != 0 && arg(msg,1) != 0 && unixdg::dg_entry(caller_pid, arg(msg,0) as usize).is_some()
+                        => unixdg::handle_sendmsg(caller_pid, msg).unwrap_or_else(|| err_reply(-9)),
         NET_SEND        => handle_send(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize),
@@ -4539,6 +4555,10 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
             ok_reply()
         }
         AF_UNIX | _ => {
+            // bind(addrlen == 2) on a datagram socket: Linux autobind.
+            if addrlen == 2 && sa_family == AF_UNIX && unixdg::dg_entry(pid, fd).is_some() {
+                return match unixdg::autobind(pid, fd) { Ok(()) => ok_reply(), Err(e) => err_reply(e) };
+            }
             if addrlen < 3 || addrlen > 2 + PATH_MAX { return err_reply(-22); }
             let path_len = addrlen - 2;
             let path_ptr = (addr_ptr + 2) as *const u8;
@@ -4576,6 +4596,9 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 }
             }
 
+            let bind_e = sock_entry(pid, fd);
+            let bind_ty = bind_e.as_ref().map_or(0, |e| e.sock_type & 0xf);
+            let bind_ofd = bind_e.as_ref().map_or(0, |e| e.ofd);
             let mut bound = BOUND_PATHS.lock();
             let idx = match bound.iter().position(|b| !b.in_use) {
                 Some(i) => i,
@@ -4584,9 +4607,14 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 None => return err_reply(-12),
             };
             bound[idx] = BoundPath { in_use: true, path: pbytes, path_len,
-                                     sock_id, is_abstract, netns: if is_abstract { nsid_b } else { 0 }, refs: 1,
+                                     sock_id, is_abstract, sock_type: bind_ty, netns: if is_abstract { nsid_b } else { 0 }, refs: 1,
                                      _owner_pid: pid, _owner_sock: slot };
             drop(bound);
+            // A datagram socket receives into an inbox keyed by its sock_id,
+            // published before the state that makes the name connectable.
+            if bind_ty == SOCK_DGRAM as u8 && bind_e.as_ref().map_or(false, |e| e.domain as usize == AF_UNIX) {
+                unixdg::create(sock_id, sock_opts(bind_ofd).dg_peer);
+            }
 
             // Scope the SOCK_TABLES lock so it is released before any
             // free_bound_idx (which takes BOUND_PATHS) — the two are never held
@@ -4817,6 +4845,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 
             val_reply((new_slot + SOCK_FD_BASE) as u64)
         }
+        SockState::UnixListening { .. } if sock_type & 0xf == SOCK_DGRAM as u8 => err_reply(-EOPNOTSUPP),
         SockState::UnixListening { bound_idx } => {
             // Only pair a pending connect that targeted *this* listener's
             // address (matched by its unique sock_id), so multiple concurrent
@@ -5465,42 +5494,24 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         reply
     } else {
         // AF_UNIX Connect
+        if sa_family == AF_UNSPEC {
+            if let Some(r) = unixdg::disconnect(pid, fd) { return r; }
+        }
         if addrlen < 3 || addrlen > 2 + PATH_MAX { return err_reply(-22); }
         let path_len = addrlen - 2;
         let path_ptr = (addr_ptr + 2) as *const u8;
         let mut pbytes = [0u8; PATH_MAX];
         if !ucopy_in(&mut pbytes[..path_len], path_ptr as usize) { return err_reply(-14); }
         let is_abstract = pbytes[0] == 0;
-
-        // Resolve the address to the sock_id of a live listener. Abstract
-        // names byte-match here; pathnames resolve through the VFS (symlinks,
-        // the /dev/shm and /run/user tmpfs mounts, S_IFSOCK check).
-        let sock_id = if is_abstract {
-            let nsid = sock_netns(pid, slot);
-            let bound = BOUND_PATHS.lock();
-            let mut found = None;
-            for bp in bound.iter() {
-                if bp.in_use && bp.is_abstract && bp.netns == nsid && bp.path_len == path_len
-                   && bp.path[..path_len] == pbytes[..path_len] {
-                    found = Some(bp.sock_id);
-                    break;
-                }
-            }
-            match found { Some(id) => id, None => return err_reply(-111) } // ECONNREFUSED
-        } else {
-            let name_end = pbytes[..path_len].iter().position(|&b| b == 0).unwrap_or(path_len);
-            let name = &pbytes[..name_end];
-            if name.is_empty() { return err_reply(-22); }
-            let r = vfs::unix_resolve_node(pid, host.unwrap_or(name)); // sock_id (>=0) or -errno
-            if r < 0 { return make_reply(r); }
-            let sock_id = r as u64;
-            // The node resolved, but its listener may have since closed (Linux
-            // leaves the socket file behind) — connecting then is ECONNREFUSED.
-            let live = BOUND_PATHS.lock().iter()
-                .any(|bp| bp.in_use && !bp.is_abstract && bp.sock_id == sock_id);
-            if !live { return err_reply(-111); }
-            sock_id
+        if let Some(e) = unixdg::dg_entry(pid, fd) {
+            return unixdg::connect(pid, fd, &e, &pbytes, path_len, host);
+        }
+        let (sock_id, tgt_ty) = match unixdg::resolve(pid, slot, &pbytes, path_len, host) {
+            Ok(v) => v, Err(e) => return err_reply(e),
         };
+        // A stream or seqpacket connect to another kind of socket (a datagram
+        // name) is EPROTOTYPE, before any embryo exists.
+        if tgt_ty != 0 && sock_entry(pid, fd).map_or(false, |e| e.sock_type & 0xf != tgt_ty) { return err_reply(-91); }
 
         // The connecting socket becomes end A at accept time; capture its creds.
         let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
@@ -5702,6 +5713,15 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     let sock_domain = tbl.socks[slot].domain as usize;
     let sock_is_raw = tbl.socks[slot].sock_type & 0xf == SOCK_RAW as u8;
     let ofd = tbl.socks[slot].ofd;
+
+    // An AF_UNIX datagram socket that is not a socketpair end (bound or not):
+    // the inbox path (`unixdg`).
+    if sock_domain == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8
+        && matches!(state, SockState::Unbound { .. } | SockState::UnixListening { .. }) {
+        let e = tbl.socks[slot].clone();
+        drop(tbls);
+        return unixdg::send_k(pid, fd, e, buf_ptr, len, addr_ptr, addrlen, kdata, None);
+    }
 
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -6378,6 +6398,11 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         // A UDP socket bound in a non-initial netns has no stack socket: nothing
         // can ever arrive, so a read just reports no data (blocking waits on its key).
         SockState::InetBound { .. } if sock_type == SOCK_DGRAM as u8 => err_reply(-11),
+        SockState::UnixListening { bound_idx }
+            if sock_domain == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8 =>
+        {
+            unixdg::recv(unixdg::sid_of(bound_idx), buf_ptr, len, addr_ptr, addrlen_ptr, flags)
+        }
         SockState::InetConnected { .. } if sock_type == SOCK_DGRAM as u8 => {
             match udp_recv_k(pid, fd, len, peek, false) {
                 Ok((data, full, m)) => {
@@ -6788,6 +6813,10 @@ fn handle_sendmsg_x(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: 
                  rd_or_efault!(msghdr_ptr + 32), rd_or_efault!(msghdr_ptr + 40)),
     };
     if ctrl_ptr != 0 && ctrl_len > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_len) { return err_reply(-14); }
+
+    if let Some(e) = unixdg::dg_entry(pid, fd) {
+        return unixdg::sendmsg(pid, fd, e, msghdr_ptr, syn.is_some(), one, iov_ptr, iovcnt, ctrl_ptr, ctrl_len, None);
+    }
 
     let unix_end = unix_stream_end(pid, fd);
 
@@ -7257,6 +7286,14 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
     };
     if ctrl_ptr != 0 && ctrl_cap > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_cap) { return err_reply(-14); }
 
+    if let Some(e) = unixdg::dg_entry(pid, fd) {
+        if let SockState::UnixListening { bound_idx } = e.state {
+            return unixdg::recvmsg(pid, &e, unixdg::sid_of(bound_idx), msghdr_ptr, syn.is_some(),
+                                   iov_ptr, iovcnt, ctrl_ptr, ctrl_cap, flags);
+        }
+        return err_reply(-11);
+    }
+
     let unix_end = unix_stream_end(pid, fd);
 
     // AF_INET datagram: one datagram scattered over the iovecs, its source
@@ -7643,6 +7680,8 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
         (tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].ofd)
     };
 
+    if let Some(e) = unixdg::dg_entry(pid, fd) { return unixdg::shutdown(&e, how); }
+
     let unix_end = match state {
         SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
         // A connect() not yet accepted is end A of its connection, and accept
@@ -7762,6 +7801,7 @@ fn put_sockaddr_un(addr_ptr: usize, addrlen_ptr: usize, name: &[u8]) -> bool {
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::getpeername(o, addr_ptr, addrlen_ptr); }
+    if let Some(r) = unixdg::getpeername(pid, fd, addr_ptr, addrlen_ptr) { return r; }
     let endpoint = inet_remote_endpoint(pid, fd).map(|ep| {
         let slot = fd_to_slot(fd).unwrap_or(usize::MAX);
         ORIG_PEER.lock().iter().find(|x| x.0 == pid && x.1 == slot && x.3 == ep).map_or(ep, |x| x.2)
@@ -8723,6 +8763,11 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let sock_domain = tbl.socks[slot].domain as usize;
     drop(tbls);
     let n = match state {
+        SockState::UnixListening { bound_idx }
+            if sock_domain == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8 =>
+        {
+            if outq { 0 } else { unixdg::head_len(unixdg::sid_of(bound_idx)) }
+        }
         // A wildcard UDP server: the datagram a read would return next.
         SockState::InetConnected { socket_handle, sid, .. }
             if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
@@ -9151,6 +9196,18 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // parks after that wake keeps this mask, and the acceptor's data
             // then wakes only UNIX_RD(conn, A).
             (ev, Some(conn.seq), Some(unix_end_keys(conn_idx, true, requested)))
+        }
+        SockState::UnixListening { bound_idx }
+            if ent.domain as usize == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8 =>
+        {
+            drop(tbls);
+            unixdg::poll(unixdg::sid_of(bound_idx), ofd)
+        }
+        SockState::Unbound { domain, sock_type: ty }
+            if domain as usize == AF_UNIX && ty & 0xf == SOCK_DGRAM as u8 =>
+        {
+            drop(tbls);
+            unixdg::poll(0, ofd)
         }
         SockState::UnixListening { bound_idx } => {
             drop(tbls);

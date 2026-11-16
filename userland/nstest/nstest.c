@@ -2611,6 +2611,336 @@ static int t_scm_cred_late_enable(void)
     return 0;
 }
 
+/* AF_UNIX SOCK_DGRAM sendto()/sendmsg(msg_name) on unconnected senders:
+ * one bound receiver, many senders, per-message sender address + creds. */
+#include <sys/un.h>
+static socklen_t un_addr(struct sockaddr_un *a, const char *n, int abs_)
+{
+    memset(a, 0, sizeof *a); a->sun_family = AF_UNIX;
+    if (abs_) { strcpy(a->sun_path + 1, n); return offsetof(struct sockaddr_un, sun_path) + 1 + strlen(n); }
+    strcpy(a->sun_path, n);
+    return offsetof(struct sockaddr_un, sun_path) + strlen(n) + 1;
+}
+static int t_unix_dgram_sendto(void)
+{
+    struct sockaddr_un ra, sa[3], from;
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        const char *rn = abs_ ? "udgtest-recv" : "/tmp/udgtest-recv";
+        unlink("/tmp/udgtest-recv");
+        socklen_t rl = un_addr(&ra, rn, abs_);
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0);
+        CHECK(r >= 0 && bind(r, (struct sockaddr *)&ra, rl) == 0 && set_passcred(r) == 0);
+        int s[3];
+        const char *names[3] = { abs_ ? "udgtest-s0" : "/tmp/udgtest-s0", abs_ ? "udgtest-s1" : "/tmp/udgtest-s1", NULL };
+        socklen_t sl[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; i++) {
+            s[i] = socket(AF_UNIX, SOCK_DGRAM, 0);
+            CHECK(s[i] >= 0);
+            if (names[i]) {
+                if (!abs_) unlink(names[i]);
+                sl[i] = un_addr(&sa[i], names[i], abs_);
+                CHECK(bind(s[i], (struct sockaddr *)&sa[i], sl[i]) == 0);
+            }
+        }
+        /* sendto from all three, interleaved with a sendmsg(msg_name). */
+        for (int i = 0; i < 3; i++) {
+            char m = (char)('a' + i);
+            CHECK(sendto(s[i], &m, 1, 0, (struct sockaddr *)&ra, rl) == 1);
+        }
+        {
+            char m = 'd'; struct iovec iov = { &m, 1 };
+            struct msghdr h; memset(&h, 0, sizeof h);
+            h.msg_name = &ra; h.msg_namelen = rl; h.msg_iov = &iov; h.msg_iovlen = 1;
+            CHECK(sendmsg(s[1], &h, 0) == 1);
+        }
+        char exp[4] = { 'a', 'b', 'c', 'd' }; int from_i[4] = { 0, 1, 2, 1 };
+        for (int k = 0; k < 4; k++) {
+            char d, cb[64];
+            struct iovec iov = { &d, 1 };
+            struct msghdr h; memset(&h, 0, sizeof h);
+            memset(&from, 0, sizeof from);
+            h.msg_name = &from; h.msg_namelen = sizeof from;
+            h.msg_iov = &iov; h.msg_iovlen = 1; h.msg_control = cb; h.msg_controllen = sizeof cb;
+            CHECK(recvmsg(r, &h, 0) == 1 && d == exp[k]);
+            int i = from_i[k];
+            if (i == 2) CHECK(h.msg_namelen <= offsetof(struct sockaddr_un, sun_path));
+            else CHECK(h.msg_namelen == sl[i] && !memcmp(from.sun_path, sa[i].sun_path, sl[i] - offsetof(struct sockaddr_un, sun_path)));
+            int got = 0;
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&h); c; c = CMSG_NXTHDR(&h, c))
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
+                    struct ucred u; memcpy(&u, CMSG_DATA(c), sizeof u);
+                    got = u.pid == getpid() && u.uid == getuid();
+                }
+            CHECK(got);
+        }
+        /* Nothing missing for a dead / unbound destination. */
+        struct sockaddr_un na; socklen_t nl = un_addr(&na, abs_ ? "udgtest-none" : "/tmp/udgtest-none", abs_);
+        unlink("/tmp/udgtest-none");
+        errno = 0; CHECK(sendto(s[0], "x", 1, 0, (struct sockaddr *)&na, nl) == -1 && errno == (abs_ ? ECONNREFUSED : ENOENT));
+        for (int i = 0; i < 3; i++) close(s[i]);
+        close(r);
+        if (!abs_) { unlink("/tmp/udgtest-recv"); unlink("/tmp/udgtest-s0"); unlink("/tmp/udgtest-s1"); }
+        else {
+            /* A closed pathname receiver: ECONNREFUSED. */
+        }
+    }
+    /* Backpressure: a nonblocking sender to a receiver nobody reads gets EAGAIN. */
+    {
+        socklen_t rl = un_addr(&ra, "udgtest-bp", 1);
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0), s = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        CHECK(bind(r, (struct sockaddr *)&ra, rl) == 0);
+        static char big[8192];
+        int n = 0, e = 0;
+        for (; n < 4096; n++) { if (sendto(s, big, sizeof big, 0, (struct sockaddr *)&ra, rl) < 0) { e = errno; break; } }
+        CHECK(n > 0 && n < 4096 && e == EAGAIN);
+        close(s); close(r);
+    }
+    return 0;
+}
+
+/* ---- AF_UNIX SOCK_DGRAM: connect, filter, peer gone, trunc/peek, poll, rights, types, autobind ---- */
+#include <poll.h>
+static int udg_bound(const char *n, int abs_, struct sockaddr_un *a, socklen_t *l)
+{
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    if (!abs_) unlink(n);
+    *l = un_addr(a, n, abs_);
+    if (bind(s, (struct sockaddr *)a, *l)) { close(s); return -1; }
+    return s;
+}
+static void udg_to(int s, int ms) { struct timeval tv = { ms / 1000, (ms % 1000) * 1000 }; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+
+static int t_unix_dgram_connect(void)
+{
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        struct sockaddr_un a1, a2, got; socklen_t l1, l2, gl;
+        int r1 = udg_bound(abs_ ? "udgc-1" : "/tmp/udgc-1", abs_, &a1, &l1);
+        int r2 = udg_bound(abs_ ? "udgc-2" : "/tmp/udgc-2", abs_, &a2, &l2);
+        CHECK(r1 >= 0 && r2 >= 0);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        char b[8];
+        gl = sizeof got;
+        CHECK(getpeername(c, (struct sockaddr *)&got, &gl) == -1 && errno == ENOTCONN);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ENOTCONN);
+        CHECK(connect(c, (struct sockaddr *)&a1, l1) == 0);
+        gl = sizeof got;
+        CHECK(getpeername(c, (struct sockaddr *)&got, &gl) == 0 && gl == l1 && !memcmp(&got, &a1, l1));
+        CHECK(send(c, "one", 3, 0) == 3 && recv(r1, b, sizeof b, 0) == 3 && !memcmp(b, "one", 3));
+        CHECK(connect(c, (struct sockaddr *)&a2, l2) == 0);       /* reconnect replaces */
+        CHECK(write(c, "two", 3) == 3 && recv(r2, b, sizeof b, 0) == 3 && !memcmp(b, "two", 3));
+        struct sockaddr un = { AF_UNSPEC };
+        CHECK(connect(c, &un, sizeof un) == 0);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ENOTCONN);
+        close(c); close(r1); close(r2);
+    }
+    return 0;
+}
+
+static int t_unix_dgram_filter(void)
+{
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        struct sockaddr_un ar, aa, ab; socklen_t lr, la, lb;
+        int r = udg_bound(abs_ ? "udgf-r" : "/tmp/udgf-r", abs_, &ar, &lr);
+        int a = udg_bound(abs_ ? "udgf-a" : "/tmp/udgf-a", abs_, &aa, &la);
+        int b = udg_bound(abs_ ? "udgf-b" : "/tmp/udgf-b", abs_, &ab, &lb);
+        CHECK(r >= 0 && a >= 0 && b >= 0);
+        CHECK(connect(r, (struct sockaddr *)&aa, la) == 0);       /* r only hears a */
+        char m;
+        CHECK(sendto(a, "A", 1, 0, (struct sockaddr *)&ar, lr) == 1);
+        CHECK(sendto(b, "B", 1, 0, (struct sockaddr *)&ar, lr) == -1 && errno == EPERM);
+        CHECK(recv(r, &m, 1, 0) == 1 && m == 'A');
+        close(r); close(a); close(b);
+    }
+    return 0;
+}
+
+static int t_unix_dgram_peer_gone(void)
+{
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        const char *rn = abs_ ? "udgg-r" : "/tmp/udgg-r";
+        struct sockaddr_un ar; socklen_t lr;
+        int r = udg_bound(rn, abs_, &ar, &lr);
+        CHECK(r >= 0);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        CHECK(connect(c, (struct sockaddr *)&ar, lr) == 0 && send(c, "x", 1, 0) == 1);
+        close(r);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ECONNREFUSED);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ENOTCONN);
+        CHECK(sendto(c, "x", 1, 0, (struct sockaddr *)&ar, lr) == -1 && errno == ECONNREFUSED);
+        if (!abs_) {
+            unlink(rn);
+            CHECK(sendto(c, "x", 1, 0, (struct sockaddr *)&ar, lr) == -1 && errno == ENOENT);
+        }
+        close(c);
+    }
+    return 0;
+}
+
+static int t_unix_dgram_trunc_peek(void)
+{
+    struct sockaddr_un ar; socklen_t lr;
+    int r = udg_bound("udgt-r", 1, &ar, &lr);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    char big[100], small[10], b[200];
+    memset(big, 'z', sizeof big);
+    CHECK(r >= 0 && sendto(c, big, 100, 0, (struct sockaddr *)&ar, lr) == 100);
+    int q = 0; CHECK(ioctl(r, FIONREAD, &q) == 0 && q == 100);
+    CHECK(recv(r, small, sizeof small, MSG_PEEK) == 10);
+    CHECK(recv(r, small, sizeof small, MSG_TRUNC) == 100);        /* real length, rest discarded */
+    CHECK(sendto(c, big, 100, 0, (struct sockaddr *)&ar, lr) == 100);
+    struct iovec iov = { small, sizeof small }; struct msghdr h = { .msg_iov = &iov, .msg_iovlen = 1 };
+    CHECK(recvmsg(r, &h, 0) == 10 && (h.msg_flags & MSG_TRUNC));
+    CHECK(sendto(c, "", 0, 0, (struct sockaddr *)&ar, lr) == 0);  /* zero-length record */
+    CHECK(recv(r, b, sizeof b, 0) == 0);
+    CHECK(recv(r, b, sizeof b, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(r); close(c);
+    return 0;
+}
+
+static int t_unix_dgram_poll_block(void)
+{
+    struct sockaddr_un ar; socklen_t lr;
+    int r = udg_bound("udgp-r", 1, &ar, &lr);
+    CHECK(r >= 0);
+    struct pollfd p = { r, POLLIN, 0 };
+    CHECK(poll(&p, 1, 100) == 0);
+    pid_t k = fork();
+    if (k == 0) {
+        usleep(200 * 1000);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        _exit(sendto(c, "w", 1, 0, (struct sockaddr *)&ar, lr) == 1 ? 0 : 1);
+    }
+    p.revents = 0;
+    CHECK(poll(&p, 1, 3000) == 1 && (p.revents & POLLIN));
+    char m;
+    CHECK(recv(r, &m, 1, 0) == 1);
+    int st; waitpid(k, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* a blocking recv wakes on a later sendto */
+    udg_to(r, 2000);
+    k = fork();
+    if (k == 0) {
+        usleep(200 * 1000);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        _exit(sendto(c, "w", 1, 0, (struct sockaddr *)&ar, lr) == 1 ? 0 : 1);
+    }
+    CHECK(recv(r, &m, 1, 0) == 1);
+    waitpid(k, &st, 0);
+    /* a blocking sender on a full inbox wakes when the receiver drains */
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    udg_to(c, 2000);
+    int n = 0;
+    while (sendto(c, "f", 1, MSG_DONTWAIT, (struct sockaddr *)&ar, lr) == 1) n++;
+    CHECK(errno == EAGAIN && n >= 10 && n < 1000);
+    k = fork();
+    if (k == 0) { usleep(200 * 1000); char x; _exit(recv(r, &x, 1, 0) == 1 ? 0 : 1); }
+    CHECK(sendto(c, "g", 1, 0, (struct sockaddr *)&ar, lr) == 1);   /* blocked, then freed */
+    waitpid(k, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* ... and gets ECONNREFUSED when the receiver closes */
+    while (sendto(c, "f", 1, MSG_DONTWAIT, (struct sockaddr *)&ar, lr) == 1) {}
+    k = fork();
+    if (k == 0) {
+        close(r);                                                 /* only the parent's copy keeps the inbox alive */
+        int x = (int)sendto(c, "h", 1, 0, (struct sockaddr *)&ar, lr);
+        _exit(x == -1 && errno == ECONNREFUSED ? 0 : 1);
+    }
+    usleep(300 * 1000);
+    close(r);
+    waitpid(k, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(c);
+    return 0;
+}
+
+static int t_unix_dgram_rights(void)
+{
+    struct sockaddr_un ar; socklen_t lr;
+    int r = udg_bound("udgr-r", 1, &ar, &lr);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0), pp[2];
+    CHECK(r >= 0 && pipe(pp) == 0);
+    char cb[CMSG_SPACE(sizeof(int))] = {0}, d = 'd';
+    struct iovec iov = { &d, 1 };
+    struct msghdr h = { .msg_name = &ar, .msg_namelen = lr, .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&h);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &pp[1], sizeof(int));
+    CHECK(sendmsg(c, &h, 0) == 1);
+    char rb[CMSG_SPACE(sizeof(int))] = {0}, e;
+    struct iovec iv2 = { &e, 1 };
+    struct msghdr g = { .msg_iov = &iv2, .msg_iovlen = 1, .msg_control = rb, .msg_controllen = sizeof rb };
+    CHECK(recvmsg(r, &g, 0) == 1);
+    cm = CMSG_FIRSTHDR(&g);
+    CHECK(cm && cm->cmsg_type == SCM_RIGHTS);
+    int nfd; memcpy(&nfd, CMSG_DATA(cm), sizeof nfd);
+    CHECK(write(nfd, "p", 1) == 1);
+    char pb; CHECK(read(pp[0], &pb, 1) == 1 && pb == 'p');
+    close(nfd);
+    /* receiver closes with an fd still queued: the pipe's write end is released */
+    CHECK(sendmsg(c, &h, 0) == 1);
+    close(pp[1]);
+    close(r);
+    CHECK(read(pp[0], &pb, 1) == 0);                              /* every write end gone: EOF */
+    close(pp[0]); close(c);
+    return 0;
+}
+
+static int t_unix_dgram_types(void)
+{
+    struct sockaddr_un ad, as; socklen_t ld, ls;
+    int d = udg_bound("udgy-d", 1, &ad, &ld);
+    CHECK(d >= 0);
+    int st = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(connect(st, (struct sockaddr *)&ad, ld) == -1 && errno == EPROTOTYPE);
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    ls = un_addr(&as, "udgy-s", 1);
+    CHECK(bind(l, (struct sockaddr *)&as, ls) == 0 && listen(l, 1) == 0);
+    CHECK(sendto(d, "x", 1, 0, (struct sockaddr *)&as, ls) == -1 && errno == EPROTOTYPE);
+    CHECK(accept(d, NULL, NULL) == -1 && errno == EOPNOTSUPP);
+    CHECK(listen(d, 1) == -1 && errno == EOPNOTSUPP);
+    close(d); close(l); close(st);
+    return 0;
+}
+
+static int t_unix_dgram_autobind(void)
+{
+    struct sockaddr_un ar, got; socklen_t lr, gl = sizeof got;
+    int r = udg_bound("udga-r", 1, &ar, &lr);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    sa_family_t fam = AF_UNIX;
+    CHECK(r >= 0 && bind(c, (struct sockaddr *)&fam, sizeof fam) == 0);
+    CHECK(getsockname(c, (struct sockaddr *)&got, &gl) == 0 && gl == offsetof(struct sockaddr_un, sun_path) + 6 && got.sun_path[0] == 0);
+    /* an unbound sender with SO_PASSCRED is autobound and the receiver can reply */
+    int u = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(set_passcred(u) == 0 && sendto(u, "q", 1, 0, (struct sockaddr *)&ar, lr) == 1);
+    char m; struct sockaddr_un from; socklen_t fl = sizeof from;
+    CHECK(recvfrom(r, &m, 1, 0, (struct sockaddr *)&from, &fl) == 1);
+    CHECK(fl == offsetof(struct sockaddr_un, sun_path) + 6 && from.sun_path[0] == 0);
+    CHECK(sendto(r, "a", 1, 0, (struct sockaddr *)&from, fl) == 1 && recv(u, &m, 1, 0) == 1 && m == 'a');
+    close(r); close(c); close(u);
+    return 0;
+}
+
+/* libc syslog(3) -> /dev/log, the path syslogd/logger take: a bound dgram
+ * server on /dev/log hears openlog+syslog (musl: connect + send). No busybox
+ * ships in the image, so this stands in for the logger/syslogd smoke. */
+#include <syslog.h>
+static int t_unix_dgram_syslog(void)
+{
+    struct sockaddr_un a; socklen_t l;
+    int r = udg_bound("/dev/log", 0, &a, &l);
+    if (r < 0) { printf("  skip: cannot bind /dev/log (errno %d)\n", errno); return 0; }
+    udg_to(r, 3000);
+    openlog("udgsyslog", LOG_NDELAY, LOG_USER);
+    syslog(LOG_INFO, "hello-unixdg");
+    char b[256] = {0};
+    ssize_t n = recv(r, b, sizeof b - 1, 0);
+    closelog();
+    close(r);
+    unlink("/dev/log");
+    CHECK(n > 0 && strstr(b, "hello-unixdg") && strstr(b, "udgsyslog"));
+    return 0;
+}
+
 static int t_scm_cred_forge(void)
 {
     int sp[2];
@@ -3258,7 +3588,7 @@ static int run_userns_cases(void)
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
         { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit },
-        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "unix_dgram_connect", t_unix_dgram_connect }, { "unix_dgram_filter", t_unix_dgram_filter }, { "unix_dgram_peer_gone", t_unix_dgram_peer_gone }, { "unix_dgram_trunc_peek", t_unix_dgram_trunc_peek }, { "unix_dgram_poll_block", t_unix_dgram_poll_block }, { "unix_dgram_rights", t_unix_dgram_rights }, { "unix_dgram_types", t_unix_dgram_types }, { "unix_dgram_autobind", t_unix_dgram_autobind }, { "unix_dgram_syslog", t_unix_dgram_syslog }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
