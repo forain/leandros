@@ -119,6 +119,23 @@ pub async fn run(c: zbus::Connection, with_portal: bool) -> (u32, u32) {
         // Root writes /etc/timezone; a session user gets AccessDenied.
         if n == "ok" || n == "org.freedesktop.DBus.Error.AccessDenied" { Ok(n) } else { Err(fail(n)) }
     });
+    check!("timedate1 SetTimezone America/Sao_Paulo -> /etc/localtime + date", async {
+        let r = call::<_, ()>(c, T, TP, T, "SetTimezone", &("America/Sao_Paulo", false)).await;
+        let n = error_name(&r);
+        if n == "org.freedesktop.DBus.Error.AccessDenied" { return Ok(n); }
+        if n != "ok" { return Err(fail(n)); }
+        let link = std::fs::read_link("/etc/localtime").map_err(|e| fail(format!("readlink: {e}")))?;
+        let out = std::process::Command::new("date").arg("+%Z").env_remove("TZ").output().map_err(|e| fail(format!("date: {e}")))?;
+        let abbr = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let m = get_all(c, T, TP, T).await?;
+        let tz: String = m.get("Timezone").and_then(|v| v.downcast_ref::<&str>().ok().map(|s| s.to_string())).unwrap_or_default();
+        // restore before judging so a failure does not leave the image zone changed
+        let _ = call::<_, ()>(c, T, TP, T, "SetTimezone", &("UTC", false)).await;
+        if link.to_string_lossy() != "/usr/share/zoneinfo/America/Sao_Paulo" { return Err(fail(format!("link={}", link.display()))); }
+        if abbr != "-03" { return Err(fail(format!("date +%Z={abbr:?}"))); }
+        if tz != "America/Sao_Paulo" { return Err(fail(format!("Timezone={tz}"))); }
+        Ok(format!("link={} date={abbr}", link.display()))
+    });
     check!("timedate1 SetNTP(true) -> NotSupported", async {
         let r = call::<_, ()>(c, T, TP, T, "SetNTP", &(true, false)).await;
         let n = error_name(&r);

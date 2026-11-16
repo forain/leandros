@@ -182,6 +182,7 @@ pkg soxr 0.1.3-r7 community Q1bG+ny1CcsBzuUORQajRz1iMSHX8= 5a284c0485578e13c5328
 pkg speexdsp 1.2.1-r2 main Q18vzCYvRdruO3+lXKKjLtaTZ/yS4= 4badc79354db263b3fc83b68152a6091c16bbfbbe76dec1b6c1b8d5c43edb232 -
 pkg sqlite-libs 3.53.4-r0 main Q192MM6zfCMrZgmGGuq2zbnNEg5vo= a8a216e53d22faa3f04d2e3650c1991af66f8d0b42fadff5afcdb9afb60b19e5 -
 pkg tdb-libs 1.4.15-r1 main Q1q3m+xlnxejlQY8//teO96PUEOhg= 36479d87b3e9783a0093741a8f752c8d51082a01ad73836d144705c391de361e -
+pkg tzdata 2026f-r0 main Q1CLOCf1X5zFaR4n9o0D10G/lCKgs= f41a4a5913372a3694f157825f5133fe32743e679ed8476f258c984e13113602 -
 pkg userspace-rcu 0.15.3-r0 main Q1mh5BCu+3kmcYbSGs3ajbteMAE/E= 1cd69dd84e40d284e00182593068a17285ea7035306403d00eef62f33b1a7d2c -
 pkg utmps-libs 0.1.3.3-r0 main Q1o3x0mgYD21qNWia9NcIKFbeWd70= 497f0f1cb51f0e6c1acc338fded0dc7722b1d43ea17bdb749f0d556794f8b2d8 -
 pkg wayland-libs-client 1.25.0-r0 main Q1fTb7CIYS4EZu7Vn4we6m01MCPS0= a728f7103217cafdc83ff6ad0d679c197dbbe280bd5788c8336259f7a39cb303 -
