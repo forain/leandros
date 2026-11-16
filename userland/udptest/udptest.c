@@ -1104,6 +1104,8 @@ int main(int argc, char **argv) {
     udp_mcast_all();
     udp_mcast_group_req();
     udp6_mcast_req();
+    udp6_mcast_deliver();
+    udp_mcast_msfilter4();
     udp_broadcast();
     udp_reuse_unicast();
     udp_cmsgs();
