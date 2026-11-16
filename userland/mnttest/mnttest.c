@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <sys/mount.h>
 #include <sys/sysmacros.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -2683,6 +2684,49 @@ static int e7x_ns0_many(int m) {
     if (!rc && e7x_mrefs() != base) { printf("  mrefs leaked=%d base=%d\n", e7x_mrefs(), base); rc = 23; }
     return rc;
 }
+/* lane mntrace: open() racing umount2(MNT_DETACH) must still record the mount the fd was opened through */
+static int e7x_race(int m) {
+    (void)m;
+    volatile int *stop = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (stop == MAP_FAILED) return 12;
+    *stop = 0;
+    mkdir("/tmp/e7x/rc", 0755);
+    struct stat ss, st;
+    if (stat("/tmp/e7x/src", &ss) < 0) return 13;
+    pid_t c = fork();
+    if (c < 0) return 14;
+    if (c == 0) {
+        while (!*stop) {
+            stop[1]++; /* odd: mounting, not yet read-only */
+            if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) _exit(1);
+            if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
+            stop[1]++; /* even: read-only for sure */
+            for (volatile int i = 0; i < 3000; i++) {}
+            umount2("/tmp/e7x/rc", MNT_DETACH);
+        }
+        _exit(0);
+    }
+    int through = 0, bad = 0;
+    for (int i = 0; i < 150000 && !bad && (i < 3000 || through < 400); i++) {
+        int g1 = stop[1];
+        int d = open("/tmp/e7x/rc", O_RDONLY | O_DIRECTORY);
+        if (d < 0) continue;
+        int g2 = stop[1];
+        if ((g1 & 1) == 0 && g1 == g2 && fstat(d, &st) == 0 && st.st_ino == ss.st_ino && st.st_dev == ss.st_dev) {
+            through++;
+            /* the mount is gone by now or soon: the fd keeps the ro flag it was opened with */
+            for (volatile int k = 0; k < 400; k++) {}
+            errno = 0; int fd = openat(d, "rz", O_CREAT | O_WRONLY, 0644);
+            if (fd >= 0 || errno != EROFS) { printf("  fd opened through ro mount lost it: iter=%d errno=%d\n", i, errno); bad = 1; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/rz"); } }
+        }
+        close(d);
+    }
+    *stop = 1;
+    int sts; waitpid(c, &sts, 0);
+    umount2("/tmp/e7x/rc", MNT_DETACH);
+    if (through < 3) { printf("  only %d opens went through the mount\n", through); return 15; }
+    return bad ? 16 : 0;
+}
 static void e7x_suite(void) {
     e7_mk();
     mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
@@ -2694,6 +2738,7 @@ static void e7x_suite(void) {
     report("e7_ns0_dirfd_flags_live", nn_in_child(e7x_ns0_dirfd, 0));
     report("e7_ns0_dirfd_detached_keeps_flags", nn_in_child(e7x_ns0_gen, 0));
     report("e7_ns0_mount_refcount_no_cap_no_leak", nn_in_child(e7x_ns0_many, 0));
+    report("e7_ns0_open_vs_detach_race", nn_in_child(e7x_race, 0));
     system("rm -rf /tmp/e7 /tmp/e7x");
 }
 

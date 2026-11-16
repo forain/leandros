@@ -231,7 +231,7 @@ pub fn set_mnt(id: u32, ns: u16, mnt: u32, mfl: u8) {
             } }
         }
         // An ns-0 mount lives as long as a description opened under it.
-        if took { crate::mnt::ns0::mnt_ref(mnt); }
+        if took { crate::mnt::ns0::mnt_ref_at(mnt, mfl); }
         if let Some(o) = old { crate::mnt::ns0::mnt_unref(o); }
     }
 }
