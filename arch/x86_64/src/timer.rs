@@ -53,6 +53,25 @@ static EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
 static GRID_TSC: AtomicU64 = AtomicU64::new(0);
 /// Ticks the BSP accounted without an interrupt of their own (diagnostic).
 static CATCH_UP_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Diagnostics for `/proc/stat` `timerstat`: every cpu0 timer interrupt, the
+/// pure-deadline ones that returned before the tick work, and UART RX drains.
+static CPU0_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+static CPU0_DEADLINE_EARLY: AtomicU64 = AtomicU64::new(0);
+static UART_DRAINS: AtomicU64 = AtomicU64::new(0);
+/// TSC of the last UART RX drain (cpu0): the early-return deadline path drains
+/// too once 1 ms has passed, so RX latency does not depend on the LAPIC mode.
+static LAST_DRAIN_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// `[ticks, timer irqs, deadline-only irqs that returned early, uart drains]`.
+#[no_mangle]
+pub extern "C" fn arch_timer_stats(out: *mut u64) {
+    unsafe {
+        out.add(0).write(TICK_COUNT.load(Ordering::Relaxed));
+        out.add(1).write(CPU0_TIMER_IRQS.load(Ordering::Relaxed));
+        out.add(2).write(CPU0_DEADLINE_EARLY.load(Ordering::Relaxed));
+        out.add(3).write(UART_DRAINS.load(Ordering::Relaxed));
+    }
+}
 
 #[inline]
 fn rdtsc() -> u64 {
@@ -690,6 +709,7 @@ pub fn on_tick() {
     let mut elapsed = 1u64;
     let per = TSC_PER_TICK.load(Ordering::Relaxed);
     if cpu == 0 {
+        CPU0_TIMER_IRQS.fetch_add(1, Ordering::Relaxed);
         let grid = GRID_TSC.load(Ordering::Relaxed);
         if per != 0 && grid != 0 {
             elapsed = rdtsc().wrapping_sub(grid) / per;
@@ -700,7 +720,10 @@ pub fn on_tick() {
             let next_tick = GRID_TSC.load(Ordering::Relaxed).wrapping_add(per);
             let st = deadline_irq(c, next_tick);
             // A pure deadline interrupt (no grid point passed) is not a tick.
-            if st == ST_DEADLINE && elapsed == 0 { return; }
+            if st == ST_DEADLINE && elapsed == 0 {
+                CPU0_DEADLINE_EARLY.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
         TICK_COUNT.fetch_add(elapsed, Ordering::Relaxed);
 
@@ -717,6 +740,7 @@ pub fn on_tick() {
         // Flow-controlled (evdev_server::serial_rx_drain): bytes the console
         // cannot take yet wait in its backlog or in the UART, never dropped.
         // Polled, so a throttled return needs nothing more here.
+        UART_DRAINS.fetch_add(1, Ordering::Relaxed);
         let _ = evdev_server::serial_rx_drain(&mut || unsafe { super::serial_read_byte() });
 
         // One poll wake for everything this tick drained — virtio input above
