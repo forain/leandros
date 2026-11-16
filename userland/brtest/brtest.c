@@ -2235,6 +2235,8 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_udp_local")) nftnat_udp();
     if (!only || !strcmp(only, "nftnat_port_range")) nftnat_range();
     if (!only || !strcmp(only, "nftnat_internal")) nftnat_internal();
+    if (!only || !strcmp(only, "nftnat_nonat_route")) nftnat_nonat_route();
+    if (!only || !strcmp(only, "nftnat_xbridge")) nftnat_xbridge();
     if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
@@ -2244,8 +2246,6 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
     if (!only || !strcmp(only, "routed_l3")) routed_on();
     if (!only || !strcmp(only, "routed_l3_off")) routed_off();
-    if (!only || !strcmp(only, "nftnat_nonat_route")) nftnat_nonat_route();
-    if (!only || !strcmp(only, "nftnat_xbridge")) nftnat_xbridge();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
     if (!only || !strcmp(only, "fwd_off")) fwd_off();
     if (!only || !strcmp(only, "fwd_icmperr")) fwd_icmperr();
