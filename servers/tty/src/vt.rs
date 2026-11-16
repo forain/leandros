@@ -1124,6 +1124,16 @@ fn complete_switch(to: usize) {
     sched::wake_poll();
 }
 
+/// True while a `VT_PROCESS` release is outstanding: the outgoing console has
+/// been asked to let go of the display and has not yet answered. [`ACTIVE`]
+/// still names the outgoing VT in that window, so anything derived from it (DRM
+/// master) would still let the outgoing client present — onto a display the
+/// user has already asked to leave, and, once the handshake completes, over the
+/// incoming console. The DRM layer treats the window as "no master".
+pub fn release_pending() -> bool {
+    PHASE.load(Ordering::Acquire) == PHASE_WAIT_REL
+}
+
 /// `VT_RELDISP` — the client's half of the handshake.
 ///
 /// `arg` 0 refuses a release, 1 grants it, [`VT_ACKACQ`] acknowledges an
