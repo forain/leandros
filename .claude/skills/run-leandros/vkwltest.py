@@ -80,11 +80,15 @@ def main():
         check("vkwl + venus ICD + session launcher shipped", rc == 0, o.strip()[-120:])
         guest("mkdir -p /run/user/0; chmod 0700 /run/user/0; "
               "sh /bin/start-cosmic-leandros > /run/user/0/cosmic.log 2>&1 &", timeout=60)
-        rc, o = guest("i=0; while [ $i -lt 240 ]; do [ -e /run/user/0/wayland-1 ] && break; "
-                      "sleep 1; i=$((i+1)); done; echo WAITED=$i; ls /run/user/0/wayland-1", timeout=300)
-        check("cosmic-comp bound wayland-1", rc == 0 and "wayland-1" in o.split("WAITED=")[-1], o.strip()[-80:])
+        rc, o = guest("i=0; while [ $i -lt 240 ]; do for w in /run/user/0/wayland-*; do [ -S $w ] && break 2; done; "
+                      "sleep 1; i=$((i+1)); done; echo WAITED=$i; ls /run/user/0", timeout=300)
+        sock = re.search(r"(wayland-\d+)\b", o.split("WAITED=")[-1])
+        sock = sock.group(1) if sock else "wayland-1"
+        check("cosmic-comp bound a wayland socket", bool(re.search(r"wayland-\d+", o.split("WAITED=")[-1])), o.strip()[-80:])
+        if sock == "wayland-1" and "wayland-1" not in o.split("WAITED=")[-1]:
+            print(guest("ls -l /run/user/0; tail -n 40 /run/user/0/cosmic.log; ps | tail -n 30", timeout=60)[1][-3500:])
         guest("sleep 20", timeout=60)  # outputs probed before a client's surface gets a configure
-        rc, o = guest(f"XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-1 /bin/vkwl {ROUTE} {FRAMES} quiet",
+        rc, o = guest(f"XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY={sock} /bin/vkwl {ROUTE} {FRAMES} quiet",
                       timeout=600)
         print("\n".join(o.strip().splitlines()[-30:]), flush=True)
         m = re.search(r"vkwl done, failures = (\d+)", o)
@@ -94,7 +98,7 @@ def main():
         fc = re.search(r"frame_callbacks done=(\d+) presented=(\d+)", o)
         check(f"compositor answered frame callbacks ({fc.group(0) if fc else 'none'})",
               bool(fc) and int(fc.group(2)) == FRAMES and int(fc.group(1)) * 2 >= FRAMES)
-        rc, o = guest("ls /run/user/0/wayland-1 && grep -c cosmic-comp /proc/[0-9]*/comm | grep -v ':0' | head -1")
+        rc, o = guest(f"ls /run/user/0/{sock} && grep -c cosmic-comp /proc/[0-9]*/comm | grep -v ':0' | head -1")
         check("cosmic-comp still alive", rc == 0, o.strip()[-60:])
     finally:
         try:
