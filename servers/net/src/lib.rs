@@ -257,6 +257,10 @@ const IP_UNBLOCK_SOURCE: usize = 37;
 const IP_BLOCK_SOURCE: usize = 38;
 const IP_ADD_SOURCE_MEMBERSHIP: usize = 39;
 const IP_DROP_SOURCE_MEMBERSHIP: usize = 40;
+const IP_MSFILTER: usize = 41;
+const IPV6_JOIN_GROUP: usize = 20;
+const IPV6_LEAVE_GROUP: usize = 21;
+const IPV6_MULTICAST_ALL: usize = 29;
 const MCAST_JOIN_GROUP: usize = 42;
 const MCAST_BLOCK_SOURCE: usize = 43;
 const MCAST_UNBLOCK_SOURCE: usize = 44;
@@ -8068,6 +8072,22 @@ fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
 fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
     let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
     if e.domain as usize != AF_INET6 { return if optname == IPV6_V6ONLY { err_reply(-ENOPROTOOPT) } else { ok_reply() }; }
+    match optname {
+        MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP | MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP
+        | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => return mcast_group_req(&e, true, optname, optval_ptr, optlen),
+        // struct ipv6_mreq: group, interface index.
+        IPV6_JOIN_GROUP | IPV6_LEAVE_GROUP => {
+            if optlen < 20 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 16]>(optval_ptr) else { return err_reply(-14) };
+            let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr + 16) else { return err_reply(-14) };
+            if is_tcp_entry(&e) { return err_reply(-71); }
+            if !mcast::is_mcast(&group) { return err_reply(-22); }
+            let r = if optname == IPV6_JOIN_GROUP { mcast::join(e.ofd, group, [0; 4], ifindex) }
+                    else { mcast::leave(e.ofd, group, [0; 4], ifindex) };
+            return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        _ => {}
+    }
     let v = match (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) }) {
         Some(v) => v,
         None => return err_reply(if optlen < 4 { -22 } else { -14 }),
@@ -8095,6 +8115,7 @@ fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optle
             0..=255 => o.tos = v as u8,
             _ => return err_reply(-22),
         },
+        IPV6_MULTICAST_ALL => { mcast::set_all(e.ofd, v != 0); return ok_reply(); }
         IPV6_RECVPKTINFO => flag(&mut o, RECV6_PKTINFO),
         IPV6_RECVHOPLIMIT => flag(&mut o, RECV6_HOPLIMIT),
         IPV6_RECVTCLASS => flag(&mut o, RECV6_TCLASS),
@@ -8171,7 +8192,7 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
         IP_MULTICAST_LOOP => match int_val() { Ok(v) => o.mc_noloop = v == 0, Err(x) => return err_reply(x) },
         // Always on here: a socket hears every group joined on the host
         // for its port (Linux's default).
-        IP_MULTICAST_ALL => if let Err(x) = int_val() { return err_reply(x) },
+        IP_MULTICAST_ALL => match int_val() { Ok(v) => { mcast::set_all(e.ofd, v != 0); return ok_reply(); } Err(x) => return err_reply(x) },
         IP_MULTICAST_IF => {
             // struct ip_mreqn, struct ip_mreq or struct in_addr (Linux).
             let (addr, ifindex) = if optlen >= 12 {
@@ -8215,9 +8236,9 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
             if is_tcp_entry(&e) { return err_reply(-71); } // EPROTO
             if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
             let r = if optname == IP_ADD_MEMBERSHIP {
-                mcast::join(e.ofd, group, addr, ifindex)
+                mcast::join(e.ofd, mcast::m4(group), addr, ifindex)
             } else {
-                mcast::leave(e.ofd, group, addr, ifindex)
+                mcast::leave(e.ofd, mcast::m4(group), addr, ifindex)
             };
             return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
         }
@@ -8235,41 +8256,62 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
                 IP_BLOCK_SOURCE => mcast::SrcOp::Block,
                 _ => mcast::SrcOp::Unblock,
             };
-            return match mcast::source(e.ofd, op, group, addr, 0, src) { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+            return match mcast::source(e.ofd, op, mcast::m4(group), addr, 0, mcast::m4(src)) { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
         }
         MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP | MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP
-        | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => {
-            // struct group_req / group_source_req: u32 interface, then
-            // 128-byte sockaddr_storage group (at 8), source (at 136).
-            let with_src = !matches!(optname, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP);
-            if optlen < if with_src { 264 } else { 136 } { return err_reply(-22); }
-            let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr) else { return err_reply(-14) };
-            let Some(gfam) = sched::uaccess::read_user::<u16>(optval_ptr + 8) else { return err_reply(-14) };
-            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 12) else { return err_reply(-14) };
-            if gfam != 2 { return err_reply(-22); } // AF_INET only here
-            let mut src = [0u8; 4];
-            if with_src {
-                let Some(sfam) = sched::uaccess::read_user::<u16>(optval_ptr + 136) else { return err_reply(-14) };
-                let Some(a) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 140) else { return err_reply(-14) };
-                if sfam != 2 { return err_reply(-22); }
-                src = a;
-            }
+        | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => return mcast_group_req(&e, false, optname, optval_ptr, optlen),
+        IP_MSFILTER => {
+            // struct ip_msfilter: multiaddr, interface address, fmode, numsrc, slist[].
+            if optlen < 16 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let Some(fmode) = sched::uaccess::read_user::<u32>(optval_ptr + 8) else { return err_reply(-14) };
+            let Some(n) = sched::uaccess::read_user::<u32>(optval_ptr + 12) else { return err_reply(-14) };
             if is_tcp_entry(&e) { return err_reply(-71); }
-            if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
-            let r = match optname {
-                MCAST_JOIN_GROUP => mcast::join(e.ofd, group, [0; 4], ifindex),
-                MCAST_LEAVE_GROUP => mcast::leave(e.ofd, group, [0; 4], ifindex),
-                MCAST_JOIN_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Add, group, [0; 4], ifindex, src),
-                MCAST_LEAVE_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Drop, group, [0; 4], ifindex, src),
-                MCAST_BLOCK_SOURCE => mcast::source(e.ofd, mcast::SrcOp::Block, group, [0; 4], ifindex, src),
-                _ => mcast::source(e.ofd, mcast::SrcOp::Unblock, group, [0; 4], ifindex, src),
-            };
-            return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+            if group[0] & 0xf0 != 0xe0 || fmode > 1 { return err_reply(-22); }
+            if n as usize > 1024 || optlen < 16 + 4 * n as usize { return err_reply(-22); }
+            let mut srcs = alloc::vec::Vec::new();
+            for i in 0..n as usize {
+                let Some(a) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 16 + 4 * i) else { return err_reply(-14) };
+                srcs.push(mcast::m4(a));
+            }
+            return match mcast::msfilter_set(e.ofd, mcast::m4(group), addr, 0, fmode == 1, &srcs) {
+                Ok(()) => ok_reply(), Err(x) => err_reply(x) };
         }
         _ => return ok_reply(),
     }
     set_sock_opts(e.ofd, o);
     ok_reply()
+}
+
+/// MCAST_* (struct group_req / group_source_req) at either level: u32
+/// interface, then a 128-byte sockaddr_storage group (at 8) and source (at
+/// 136). `v6` is the IPPROTO_IPV6 level (AF_INET6 sockaddrs), else IPPROTO_IP.
+fn mcast_group_req(e: &SockEntry, v6: bool, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
+    let with_src = !matches!(optname, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP);
+    if optlen < if with_src { 264 } else { 136 } { return err_reply(-22); }
+    let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr) else { return err_reply(-14) };
+    let sa = |off: usize| -> Result<mcast::G, i32> {
+        let fam = sched::uaccess::read_user::<u16>(optval_ptr + off).ok_or(-14i32)?;
+        match (fam as usize, v6) {
+            (2, false) => Ok(mcast::m4(sched::uaccess::read_user::<[u8; 4]>(optval_ptr + off + 4).ok_or(-14i32)?)),
+            (10, true) => sched::uaccess::read_user::<[u8; 16]>(optval_ptr + off + 8).ok_or(-14i32),
+            _ => Err(-22),
+        }
+    };
+    let group = match sa(8) { Ok(g) => g, Err(x) => return err_reply(x) };
+    let src = if with_src { match sa(136) { Ok(g) => g, Err(x) => return err_reply(x) } } else { [0u8; 16] };
+    if is_tcp_entry(e) { return err_reply(-71); }
+    if !mcast::is_mcast(&group) { return err_reply(-22); }
+    let r = match optname {
+        MCAST_JOIN_GROUP => mcast::join(e.ofd, group, [0; 4], ifindex),
+        MCAST_LEAVE_GROUP => mcast::leave(e.ofd, group, [0; 4], ifindex),
+        MCAST_JOIN_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Add, group, [0; 4], ifindex, src),
+        MCAST_LEAVE_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Drop, group, [0; 4], ifindex, src),
+        MCAST_BLOCK_SOURCE => mcast::source(e.ofd, mcast::SrcOp::Block, group, [0; 4], ifindex, src),
+        _ => mcast::source(e.ofd, mcast::SrcOp::Unblock, group, [0; 4], ifindex, src),
+    };
+    match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) }
 }
 
 /// getsockopt(IPPROTO_IP, ...) for what `ip_setsockopt` keeps; `None` for
@@ -8297,7 +8339,7 @@ fn ip_getsockopt(e: &SockEntry, optname: usize) -> Option<u32> {
         IP_RECVERR => (o.recv & RECV_ERR != 0) as u32,
         IP_MULTICAST_TTL => o.mc_ttl as u32,
         IP_MULTICAST_LOOP => (!o.mc_noloop) as u32,
-        IP_MULTICAST_ALL => 1,
+        IP_MULTICAST_ALL => mcast::all(e.ofd) as u32,
         // struct in_addr: the address it was set by.
         IP_MULTICAST_IF => u32::from_ne_bytes(o.mc_addr),
         _ => return None,
@@ -8462,6 +8504,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                     IPV6_V6ONLY => Some(o.v6only as u32),
                     IPV6_UNICAST_HOPS => Some(if o.ttl == 0 { 64 } else { o.ttl as u32 }),
                     IPV6_MULTICAST_HOPS => Some(o.mc_ttl as u32),
+                    IPV6_MULTICAST_ALL => Some(mcast::all(e.ofd) as u32),
                     IPV6_TCLASS => Some(o.tos as u32),
                     IPV6_RECVPKTINFO => Some((o.recv6 & RECV6_PKTINFO != 0) as u32),
                     IPV6_RECVHOPLIMIT => Some((o.recv6 & RECV6_HOPLIMIT != 0) as u32),
@@ -8522,6 +8565,24 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if level == IPPROTO_IP && optname == IP_MTU && is_inet(e.domain)
             && !matches!(e.state, SockState::InetConnected { .. }) {
             return err_reply(-107);
+        }
+        // IP_MSFILTER: in = multiaddr/interface and room for sources; out = filter.
+        if level == IPPROTO_IP && optname == IP_MSFILTER && is_inet(e.domain) {
+            let Some(cap) = sched::uaccess::read_user::<u32>(optlen_ptr) else { return err_reply(-14) };
+            if (cap as usize) < 16 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let Some(room) = sched::uaccess::read_user::<u32>(optval_ptr + 12) else { return err_reply(-14) };
+            let (inc, srcs) = match mcast::msfilter_get(e.ofd, mcast::m4(group), addr, 0) {
+                Ok(r) => r, Err(x) => return err_reply(x) };
+            let n = (srcs.len()).min(room as usize).min((cap as usize - 16) / 4);
+            let mut b = alloc::vec![0u8; 16 + 4 * n];
+            b[..4].copy_from_slice(&group); b[4..8].copy_from_slice(&addr);
+            b[8..12].copy_from_slice(&(inc as u32).to_ne_bytes());
+            b[12..16].copy_from_slice(&(srcs.len() as u32).to_ne_bytes());
+            for (i, s) in srcs.iter().take(n).enumerate() { b[16 + 4 * i..20 + 4 * i].copy_from_slice(&s[12..]); }
+            if !ucopy_out(optval_ptr, &b) || !wr_user(optlen_ptr, b.len() as u32) { return err_reply(-14); }
+            return ok_reply();
         }
         // IP_MULTICAST_IF answers a struct in_addr.
         if level == IPPROTO_IP && optname == IP_MULTICAST_IF && is_inet(e.domain) {

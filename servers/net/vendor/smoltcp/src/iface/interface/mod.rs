@@ -116,6 +116,9 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "proto-igmp")]
     ipv4_multicast_groups: LinearMap<Ipv4Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
+    /// LEANDROS: IPv6 groups joined by sockets (no MLD reports on the wire).
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_multicast_groups: LinearMap<Ipv6Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
@@ -234,6 +237,8 @@ impl Interface {
                 neighbor_cache: NeighborCache::new(),
                 #[cfg(feature = "proto-igmp")]
                 ipv4_multicast_groups: LinearMap::new(),
+                #[cfg(feature = "proto-ipv6")]
+                ipv6_multicast_groups: LinearMap::new(),
                 #[cfg(feature = "proto-igmp")]
                 igmp_report_state: IgmpReportState::Inactive,
                 #[cfg(feature = "medium-ieee802154")]
@@ -406,6 +411,12 @@ impl Interface {
         &mut self,
     ) -> &mut Vec<SixlowpanAddressContext, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT> {
         &mut self.inner.sixlowpan_address_context
+    }
+
+    /// LEANDROS: the IPv6 multicast groups joined (`join_multicast_group`).
+    #[cfg(feature = "proto-ipv6")]
+    pub fn ipv6_multicast_groups(&self) -> impl Iterator<Item = Ipv6Address> + '_ {
+        self.inner.ipv6_multicast_groups.iter().map(|(a, _)| *a)
     }
 
     /// LEANDROS: the IPv4 multicast groups joined (`join_multicast_group`).
@@ -1165,7 +1176,7 @@ impl InterfaceInner {
             #[cfg(feature = "proto-rpl")]
             IpAddress::Ipv6(Ipv6Address::LINK_LOCAL_ALL_RPL_NODES) => true,
             #[cfg(feature = "proto-ipv6")]
-            IpAddress::Ipv6(addr) => self.has_solicited_node(addr),
+            IpAddress::Ipv6(addr) => self.ipv6_multicast_groups.get(&addr).is_some() || self.has_solicited_node(addr),
             #[allow(unreachable_patterns)]
             _ => false,
         }

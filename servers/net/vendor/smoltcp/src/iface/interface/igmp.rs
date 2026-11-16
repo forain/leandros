@@ -74,6 +74,14 @@ impl Interface {
                     Ok(false)
                 }
             }
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(addr) => {
+                self.inner
+                    .ipv6_multicast_groups
+                    .insert(addr, ())
+                    .map_err(|_| MulticastError::GroupTableFull)?;
+                Ok(false)
+            }
             // Multicast is not yet implemented for other address families
             #[allow(unreachable_patterns)]
             _ => Err(MulticastError::Ipv6NotSupported),
@@ -115,6 +123,11 @@ impl Interface {
                 } else {
                     Ok(false)
                 }
+            }
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(addr) => {
+                self.inner.ipv6_multicast_groups.remove(&addr);
+                Ok(false)
             }
             // Multicast is not yet implemented for other address families
             #[allow(unreachable_patterns)]
