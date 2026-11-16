@@ -4249,6 +4249,10 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                handle_connect(caller_pid, arg(msg,0) as usize,
                                               arg(msg,1) as usize, arg(msg,2) as usize,
                                               host_path_arg(msg))),
+        NET_SEND if arg(msg,6) != 0 && unixdg::dg_entry(caller_pid, arg(msg,0) as usize).is_some()
+                        => unixdg::handle_send(caller_pid, msg).unwrap_or_else(|| err_reply(-9)),
+        NET_SENDMSG if arg(msg,6) != 0 && arg(msg,1) != 0 && unixdg::dg_entry(caller_pid, arg(msg,0) as usize).is_some()
+                        => unixdg::handle_sendmsg(caller_pid, msg).unwrap_or_else(|| err_reply(-9)),
         NET_SEND        => handle_send(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize),
@@ -5716,7 +5720,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
         && matches!(state, SockState::Unbound { .. } | SockState::UnixListening { .. }) {
         let e = tbl.socks[slot].clone();
         drop(tbls);
-        return unixdg::send_k(pid, fd, e, buf_ptr, len, addr_ptr, addrlen, kdata);
+        return unixdg::send_k(pid, fd, e, buf_ptr, len, addr_ptr, addrlen, kdata, None);
     }
 
     match state {
@@ -6811,7 +6815,7 @@ fn handle_sendmsg_x(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: 
     if ctrl_ptr != 0 && ctrl_len > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_len) { return err_reply(-14); }
 
     if let Some(e) = unixdg::dg_entry(pid, fd) {
-        return unixdg::sendmsg(pid, fd, e, msghdr_ptr, syn.is_some(), one, iov_ptr, iovcnt, ctrl_ptr, ctrl_len);
+        return unixdg::sendmsg(pid, fd, e, msghdr_ptr, syn.is_some(), one, iov_ptr, iovcnt, ctrl_ptr, ctrl_len, None);
     }
 
     let unix_end = unix_stream_end(pid, fd);

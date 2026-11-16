@@ -13763,9 +13763,18 @@ fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
               flags: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if len != 0 && !validate_user_buf(buf_ptr, len) { return -14; }
     let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_SEND,
+    let mut msg = make_vfs_msg(net_server::NET_SEND,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen as u64]);
+    // A pathname AF_UNIX destination travels as its resolved host path
+    // (args 6-7), as for connect(): a chrooted sender reaches /dev/log.
+    let host = if addr_ptr != 0 && addrlen >= 3 && addrlen <= 128 {
+        match unix_sockaddr_backing(addr_ptr, addrlen, true) { Ok(h) => h, Err(e) => return e }
+    } else { None };
+    if let Some(k) = &host {
+        msg.data[48..56].copy_from_slice(&(k.ptr() as u64).to_le_bytes());
+        msg.data[56..64].copy_from_slice(&(k.bytes().len() as u64).to_le_bytes());
+    }
     net_blocking_op(pid, sockfd, flags, true, &msg)
 }
 
@@ -13782,8 +13791,22 @@ fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
 fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     if !validate_user_buf(msghdr_ptr, 56) { return -14; } // struct msghdr (msg_flags at +48)
     let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_SENDMSG,
+    let mut msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
+    // msg_name of a pathname AF_UNIX destination, as its resolved host path.
+    let host = {
+        let mut h = [0u8; 12];
+        let ok = with_current_address_space(|as_| as_.read_user_buf(msghdr_ptr, &mut h)).unwrap_or(false);
+        let np = usize::from_ne_bytes(h[0..8].try_into().unwrap_or([0; 8]));
+        let nl = u32::from_ne_bytes(h[8..12].try_into().unwrap_or([0; 4])) as usize;
+        if ok && np != 0 && nl >= 3 && nl <= 128 {
+            match unix_sockaddr_backing(np, nl, true) { Ok(h) => h, Err(e) => return e }
+        } else { None }
+    };
+    if let Some(k) = &host {
+        msg.data[48..56].copy_from_slice(&(k.ptr() as u64).to_le_bytes());
+        msg.data[56..64].copy_from_slice(&(k.bytes().len() as u64).to_le_bytes());
+    }
     let r = net_blocking_op(pid, sockfd, flags, true, &msg);
     if r > 0 { uxtrace("SND", pid, sockfd, r); }
     r

@@ -315,7 +315,7 @@ fn drop_fds(fds: Vec<XferFd>) { for x in fds { xfer_drop(x); } }
 /// Send one datagram from `e`. `name`: the user sockaddr (ptr, len), if the
 /// caller gave one.
 fn send_data(pid: u32, fd: usize, e: &SockEntry, data: Vec<u8>, name: Option<(usize, usize)>,
-             fds: Vec<XferFd>, explicit: Option<Ucred>) -> Message {
+             host: Option<&[u8]>, fds: Vec<XferFd>, explicit: Option<Ucred>) -> Message {
     let ofd = e.ofd;
     let opts = sock_opts(ofd);
     if data.len() > unix_sndbuf(ofd).saturating_sub(32) || data.len() > UNIX_DGRAM_MAX {
@@ -337,7 +337,7 @@ fn send_data(pid: u32, fd: usize, e: &SockEntry, data: Vec<u8>, name: Option<(us
             let path_len = len - 2;
             let mut pbytes = [0u8; PATH_MAX];
             if !ucopy_in(&mut pbytes[..path_len], ptr + 2) { drop_fds(fds); return err_reply(-14); }
-            match resolve(pid, slot, &pbytes, path_len, None) {
+            match resolve(pid, slot, &pbytes, path_len, host) {
                 Ok((sid, tt)) => {
                     if tt != SOCK_DGRAM as u8 { drop_fds(fds); return err_reply(-91); }
                     sid
@@ -377,7 +377,7 @@ fn send_data(pid: u32, fd: usize, e: &SockEntry, data: Vec<u8>, name: Option<(us
 
 /// send/sendto on a datagram socket.
 pub(super) fn send_k(pid: u32, fd: usize, e: SockEntry, buf_ptr: usize, len: usize,
-                     addr_ptr: usize, addrlen: usize, kdata: Option<Vec<u8>>) -> Message {
+                     addr_ptr: usize, addrlen: usize, kdata: Option<Vec<u8>>, host: Option<&[u8]>) -> Message {
     let data = match kdata {
         Some(d) => d,
         None => {
@@ -389,14 +389,14 @@ pub(super) fn send_k(pid: u32, fd: usize, e: SockEntry, buf_ptr: usize, len: usi
             d
         }
     };
-    send_data(pid, fd, &e, data, Some((addr_ptr, addrlen)), Vec::new(), None)
+    send_data(pid, fd, &e, data, Some((addr_ptr, addrlen)), host, Vec::new(), None)
 }
 
 /// sendmsg on a datagram socket: msg_name, the iovecs, SCM_RIGHTS and an
 /// explicit SCM_CREDENTIALS.
 pub(super) fn sendmsg(pid: u32, fd: usize, e: SockEntry, msghdr_ptr: usize, syn: bool,
                       one: Option<(usize, usize)>, iov_ptr: usize, iovcnt: usize,
-                      ctrl_ptr: usize, ctrl_len: usize) -> Message {
+                      ctrl_ptr: usize, ctrl_len: usize, host: Option<&[u8]>) -> Message {
     let (name_ptr, name_len) = if syn { (0, 0) } else {
         let Some(p) = sched::uaccess::read_user::<usize>(msghdr_ptr) else { return err_reply(-14) };
         let Some(l) = sched::uaccess::read_user::<u32>(msghdr_ptr + 8) else { return err_reply(-14) };
@@ -440,7 +440,7 @@ pub(super) fn sendmsg(pid: u32, fd: usize, e: SockEntry, msghdr_ptr: usize, syn:
             None => { drop_fds(batch); return err_reply(-9); }
         }
     }
-    send_data(pid, fd, &e, data, Some((name_ptr, name_len)), batch, explicit)
+    send_data(pid, fd, &e, data, Some((name_ptr, name_len)), host, batch, explicit)
 }
 
 /// recv/recvfrom: the head datagram into `buf_ptr`.
@@ -509,4 +509,35 @@ pub(super) fn recvmsg(pid: u32, e: &SockEntry, sid: u64, msghdr_ptr: usize, syn:
     let mflags = (if truncated { MSG_TRUNC } else { 0 }) | (if ctrunc { MSG_CTRUNC } else { 0 });
     if !syn { unsafe { write_msg_tail(msghdr_ptr, ctrl_written, mflags); } }
     val_reply((if truncated && flags & MSG_TRUNC as usize != 0 { full } else { off }) as u64)
+}
+
+/// The host path the kernel resolved for a pathname destination (args 6-7 of
+/// NET_SEND / NET_SENDMSG), so a chrooted or mount-namespace sender reaches
+/// the socket node a plain open() would.
+fn host_arg(msg: &Message) -> Option<&'static [u8]> {
+    let (ptr, len) = (arg(msg, 6) as usize, arg(msg, 7) as usize);
+    if ptr == 0 || len == 0 { return None; }
+    // SAFETY: a kernel buffer owned by the calling syscall (see `host_path_arg`).
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+/// NET_SEND carrying a host path: only for a datagram socket.
+pub(super) fn handle_send(pid: u32, msg: &Message) -> Option<Message> {
+    let fd = arg(msg, 0) as usize;
+    let e = dg_entry(pid, fd)?;
+    Some(send_k(pid, fd, e, arg(msg, 1) as usize, arg(msg, 2) as usize,
+                arg(msg, 4) as usize, arg(msg, 5) as usize, None, host_arg(msg)))
+}
+
+/// NET_SENDMSG carrying a host path (a real msghdr, not a writev).
+pub(super) fn handle_sendmsg(pid: u32, msg: &Message) -> Option<Message> {
+    let fd = arg(msg, 0) as usize;
+    let mh = arg(msg, 1) as usize;
+    let e = dg_entry(pid, fd)?;
+    let rd = |o: usize| sched::uaccess::read_user::<usize>(mh + o);
+    let (Some(iov), Some(cnt), Some(cp), Some(cl)) = (rd(16), rd(24), rd(32), rd(40)) else {
+        return Some(err_reply(-14));
+    };
+    if cp != 0 && cl > 0 && !sched::uaccess::user_range_ok(cp, cl) { return Some(err_reply(-14)); }
+    Some(sendmsg(pid, fd, e, mh, false, None, iov, cnt, cp, cl, host_arg(msg)))
 }
