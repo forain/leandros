@@ -13,6 +13,7 @@ while the newer pack (the commit that "failed") won at the next mount: the
 acknowledged file was gone. Exit 0 iff the claim survived.
 """
 import os
+import hostclean
 import signal
 import subprocess
 import sys
@@ -59,6 +60,7 @@ def main(argv):
         i += 1
     out = os.environ.get("F2FSCM_OUT", f"/tmp/f2fscm-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fscm-*")
     img = os.path.join(out, "cm.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -133,4 +135,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

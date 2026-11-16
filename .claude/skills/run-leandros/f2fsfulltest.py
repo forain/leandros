@@ -12,6 +12,7 @@ present and whole, no file may be torn; umount, fsck --strict-leaks.
 Exit 0 iff all pass.
 """
 import os, random, re, shutil, signal, subprocess, sys, time
+import hostclean
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -59,6 +60,7 @@ def main(argv):
     print(f"f2fsfulltest: seed {seed}, {iters} crash iterations", flush=True)
     out = f"/tmp/f2ffull-{arch}{('-' + caller) if caller else ''}"
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2ffull-*")
     img = os.path.join(out, "full.img")
     if os.path.exists(img): os.unlink(img)
     subprocess.run([sys.executable, os.path.join(REPO, "scripts", "mkfs-f2fs-home.py"), "create", img,
@@ -195,4 +197,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

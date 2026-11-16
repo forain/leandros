@@ -11,6 +11,7 @@ manifest: every pre-existing file must be unchanged (before the fix, new
 symlinks reused live nids and overwrote them). Then fsck-f2fs.py. Exit 0 iff PASS.
 """
 import os
+import hostclean
 import shutil
 import struct
 import subprocess
@@ -88,6 +89,7 @@ def main(argv):
     run_id = f"{caller}-f2fsnid" if caller else "f2fsnid"
     out = os.environ.get("F2FSNID_OUT", f"/tmp/f2fsnid-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fsnid-*")
     img = os.path.join(out, "nid.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -184,4 +186,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

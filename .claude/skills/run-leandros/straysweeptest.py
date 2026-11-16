@@ -21,6 +21,7 @@ then kills greetd from the root serial console:
 Prints `stray_<step>: PASS|FAIL` and a summary; exit 0 iff all passed.
 """
 import os
+import hostclean
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,7 @@ def alive(pid):
 def main():
     host, port = target()
     tmp = tempfile.mkdtemp(prefix="straysweep-")
+    hostclean.track(tmp)
     ssh = Ssh(host, port, tmp)
     user, pw = "leandro", "leandro"
     deadline = time.time() + 90
@@ -116,4 +118,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(hostclean.run(main))
