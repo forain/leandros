@@ -8,6 +8,7 @@ create+write+fsync), umounts, mounts again (timed) and prints
 `RESULT mount_ms=.. remount_ms=.. us_per_fsync=..`. Exit 0 iff the bench ran.
 """
 import os
+import hostclean
 import re
 import imgclone
 import shutil
@@ -61,6 +62,7 @@ def main(argv):
     run_id = f"{caller}-f2fsbench" if caller else "f2fsbench"
     out = os.environ.get("F2FSBENCH_OUT", f"/tmp/f2fsbench-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fsbench-*")
     img = os.path.join(out, "gc.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -135,4 +137,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

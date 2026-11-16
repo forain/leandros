@@ -40,6 +40,7 @@ Re-run one failure with the params printed per iteration
 (`--wseed W --crashpt C --mode crashpt|kill --iters 1`).
 """
 import os
+import hostclean
 import random
 import re
 import shutil
@@ -79,7 +80,7 @@ def fsck(img, strict_leaks):
 
 def keep_failed(out, img, tag, seed, params, arch):
     """Keep the image as the failure left it plus the full fsck output; at most 2 sets."""
-    kd = os.path.join(out, "failed")
+    kd = f"/tmp/f2fscr-failed-{arch}"   # bounded: one fixed path per arch, the next failure replaces it
     os.makedirs(kd, exist_ok=True)
     sets = sorted({f.rsplit(".", 1)[0] for f in os.listdir(kd)}, key=lambda n: os.path.getmtime(os.path.join(kd, n + ".txt")))
     for old in sets[:max(0, len(sets) - 1)]:
@@ -285,6 +286,7 @@ def main(argv):
     print(f"f2fscrashtest: seed {seed}, {iters} iterations, mode {mode}", flush=True)
     out = os.environ.get("F2FSCR_OUT", f"/tmp/f2fscr-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fscr-*")
     img = os.path.join(out, "cr.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -446,4 +448,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))
