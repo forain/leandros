@@ -1903,7 +1903,11 @@ static int fwd6_body(void) {
     setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     int pr = 3;
     for (int k = 0; k < 3 && pr; k++) pr = ping6_sock(ic, g_gw6, 1 + k); /* NEW then reply (the first may be lost to ND): the flow is now established */
-    if (pr) { printf("DIAG v6 ping to %s: rc %d errno %d\n", g_gw6, pr, errno); fflush(stdout); return 6; }
+    if (pr) {
+        printf("DIAG v6 ping to %s: rc %d errno %d\n", g_gw6, pr, errno); fflush(stdout);
+        system("ip -6 addr 2>&1 | grep -v valid_lft | head -6; ip -6 route 2>&1 | head -6; ip -6 neigh 2>&1 | head -4; grep -h '^fwd' /proc/net/nic | head -8");
+        return 6;
+    }
     write(done_[1], &ch, 1);
     if (rd_to(ctl[0], &ch) != 1) return 7;
     return ping6_sock(ic, g_gw6, 2) ? 0 : 8;         /* must NOT be answered once `ct state established drop` is loaded */
