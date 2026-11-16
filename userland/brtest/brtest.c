@@ -1625,7 +1625,7 @@ static void routed_case(const char *name, int ipfwd) {
     write(cc[1], &ch, 1);
     int rc = wait_child(cl);
     kill(sv, SIGKILL); wait_child(sv);
-    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); nat_dump(); fflush(stdout); }
+    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); nat_dump(); fflush(stdout); system("nft list ruleset 2>&1 | sed 's/^/DIAG nft: /'; cat /proc/sys/net/ipv4/ip_forward /proc/net/arp 2>&1 | sed 's/^/DIAG sys: /'"); }
     if (ipfwd) snprintf(msg, sizeof msg, "%s: UDP crosses br0 -> host -> br1 routed, source address kept (no NAT)", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means nothing is routed between the bridges", name);
     CHECK(msg, rc == 0);
@@ -2236,56 +2236,64 @@ static void stale_race(void) {
     close(s);
 }
 
+/* `only` is one case name or a comma list ("nftnat_xbridge,routed_l3": run them in that order of the suite). */
+static const char *g_only;
+static int want(const char *name) {
+    if (!g_only) return 1;
+    size_t l = strlen(name);
+    for (const char *p = g_only; (p = strstr(p, name)); p += l)
+        if ((p == g_only || p[-1] == ',') && (p[l] == 0 || p[l] == ',')) return 1;
+    return 0;
+}
 int main(int argc, char **argv) {
-    const char *only = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") && i + 1 < argc) g_http = argv[++i];
-        else only = argv[i];
+        else g_only = argv[i];
     }
-    if (!only || !strcmp(only, "veth_pair")) veth_pair();
-    if (!only || !strcmp(only, "accept_ns")) accept_ns();
-    if (!only || !strcmp(only, "veth_tcp_reap")) veth_tcp_reap();
-    if (!only || !strcmp(only, "veth_tcp_bulk_exit")) veth_tcp_bulk_exit();
-    if (!only || !strcmp(only, "veth_listen_reap")) veth_listen_reap();
-    if (!only || !strcmp(only, "veth_ping")) veth_ping();
-    if (!only || !strcmp(only, "veth6")) veth6();
-    if (!only || !strcmp(only, "bridge6")) bridge6();
-    if (!only || !strcmp(only, "veth6gw")) veth6gw();
-    if (!only || !strcmp(only, "veth_dellink")) veth_dellink();
-    if (!only || !strcmp(only, "veth_naming")) veth_naming();
-    if (!only || !strcmp(only, "veth_setlink_move")) veth_setlink_move();
-    if (!only || !strcmp(only, "veth_nsgone")) veth_nsgone();
-    if (!only || !strcmp(only, "bridge_l2")) bridge_l2();
-    if (!only || !strcmp(only, "nftnat_local_redirect")) nftnat_local();
-    if (!only || !strcmp(only, "nftnat_hairpin")) nftnat_hairpin();
-    if (!only || !strcmp(only, "nftnat_cross_netns")) nftnat_cross();
-    if (!only || !strcmp(only, "nftnat_udp_local")) nftnat_udp();
-    if (!only || !strcmp(only, "nftnat_port_range")) nftnat_range();
-    if (!only || !strcmp(only, "nftnat_internal")) nftnat_internal();
-    if (!only || !strcmp(only, "nftnat_nonat_route")) nftnat_nonat_route();
-    if (!only || !strcmp(only, "nftnat_xbridge")) nftnat_xbridge();
-    if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
-    if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
-    if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
-    if (!only || !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow();
-    if (!only || !strcmp(only, "nftfwd_related_drop")) nftfwd_related_off();
-    if (!only || !strcmp(only, "nftfwd_related_accept")) nftfwd_related_on();
-    if (!only || !strcmp(only, "nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
-    if (!only || !strcmp(only, "routed_l3")) routed_on();
-    if (!only || !strcmp(only, "routed_l3_off")) routed_off();
-    if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
-    if (!only || !strcmp(only, "fwd_off")) fwd_off();
-    if (!only || !strcmp(only, "fwd_icmperr")) fwd_icmperr();
-    if (!only || !strcmp(only, "fwd_tcp")) fwd_tcp();
-    if (!only || !strcmp(only, "fwd_port_reserved")) fwd_port_reserved();
-    if (!only || !strcmp(only, "fwd_reap")) fwd_reap();
-    if (!only || !strcmp(only, "fwd_mac_forge")) fwd_mac_forge();
-    if (!only || !strcmp(only, "fwd_mac_steal")) fwd_mac_steal();
-    if (!only || !strcmp(only, "fwd_hostlisten")) fwd_hostlisten();
-    if (!only || !strcmp(only, "fwd_hostlisten_early")) fwd_hostlisten_early();
-    if (!only || !strcmp(only, "hostlisten_not_in_ns")) hostlisten_not_in_ns();
-    if (!only || !strcmp(only, "stale_stack")) stale_stack();
-    if (!only || !strcmp(only, "stale_race")) stale_race();
+    if (want("veth_pair")) veth_pair();
+    if (want("accept_ns")) accept_ns();
+    if (want("veth_tcp_reap")) veth_tcp_reap();
+    if (want("veth_tcp_bulk_exit")) veth_tcp_bulk_exit();
+    if (want("veth_listen_reap")) veth_listen_reap();
+    if (want("veth_ping")) veth_ping();
+    if (want("veth6")) veth6();
+    if (want("bridge6")) bridge6();
+    if (want("veth6gw")) veth6gw();
+    if (want("veth_dellink")) veth_dellink();
+    if (want("veth_naming")) veth_naming();
+    if (want("veth_setlink_move")) veth_setlink_move();
+    if (want("veth_nsgone")) veth_nsgone();
+    if (want("bridge_l2")) bridge_l2();
+    if (want("nftnat_local_redirect")) nftnat_local();
+    if (want("nftnat_hairpin")) nftnat_hairpin();
+    if (want("nftnat_cross_netns")) nftnat_cross();
+    if (want("nftnat_udp_local")) nftnat_udp();
+    if (want("nftnat_port_range")) nftnat_range();
+    if (want("nftnat_internal")) nftnat_internal();
+    if (want("nftnat_nonat_route")) nftnat_nonat_route();
+    if (want("nftnat_xbridge")) nftnat_xbridge();
+    if (want("nftnat_masq_ok")) nftnat_masq_ok();
+    if (want("fwd_udp")) fwd_udp();
+    if (want("nftfwd_midflow_established")) nftfwd_midflow();
+    if (want("nftfwd6_midflow_established")) nftfwd6_midflow();
+    if (want("nftfwd_related_drop")) nftfwd_related_off();
+    if (want("nftfwd_related_accept")) nftfwd_related_on();
+    if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
+    if (want("routed_l3")) routed_on();
+    if (want("routed_l3_off")) routed_off();
+    if (want("fwd_ping")) fwd_ping();
+    if (want("fwd_off")) fwd_off();
+    if (want("fwd_icmperr")) fwd_icmperr();
+    if (want("fwd_tcp")) fwd_tcp();
+    if (want("fwd_port_reserved")) fwd_port_reserved();
+    if (want("fwd_reap")) fwd_reap();
+    if (want("fwd_mac_forge")) fwd_mac_forge();
+    if (want("fwd_mac_steal")) fwd_mac_steal();
+    if (want("fwd_hostlisten")) fwd_hostlisten();
+    if (want("fwd_hostlisten_early")) fwd_hostlisten_early();
+    if (want("hostlisten_not_in_ns")) hostlisten_not_in_ns();
+    if (want("stale_stack")) stale_stack();
+    if (want("stale_race")) stale_race();
     printf("brtest: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }
