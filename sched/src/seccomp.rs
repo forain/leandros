@@ -14,7 +14,11 @@
 //! (`check_filter`, `run_stack`).
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+
+/// Interrupt windows opened from inside filter evaluation (test probe, shown
+/// in /proc/<pid>/status as `Seccomp_irq_windows`).
+pub static IRQ_WINDOWS: AtomicU64 = AtomicU64::new(0);
 
 pub use seccomp_bpf::{Program, SeccompData, SockFilter};
 
@@ -142,7 +146,7 @@ impl SeccompSlot {
             it = c.prev.as_deref();
             Some(&c.prog)
         });
-        Some(seccomp_bpf::run_stack_ticked(chain, d, &mut || crate::irq_window()))
+        Some(seccomp_bpf::run_stack_ticked(chain, d, &mut || { IRQ_WINDOWS.fetch_add(1, Ordering::Relaxed); crate::irq_window() }))
     }
 }
 
