@@ -1638,6 +1638,34 @@ static void routed_case(const char *name, int ipfwd) {
 static void routed_on(void) { routed_case("routed_l3", 1); }
 static void routed_off(void) { routed_case("routed_l3_off", 0); }
 
+/* A re-created link must start from conf/default, not inherit the deleted link's per-interface forwarding
+ * (stale sysctl state made routed_l3 fail after nftnat_xbridge/hairpin: br1 kept forwarding=0 from an earlier case). */
+static int proc_int(const char *path) {
+    char b[32] = "";
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    if (!fgets(b, sizeof b, f)) b[0] = 0;
+    fclose(f);
+    return b[0] ? atoi(b) : -1;
+}
+static void ifctl_recreate(void) {
+    int s = nl_sock();
+    unsigned char m[6] = { 0x02, 0x00, 0x5e, 0x99, 0x00, 0x01 };
+    ip_forward_set(0);
+    int ok = br_new(s, "br9", m) == 0;
+    ok = ok && ip_forward_set(0) == 0 && proc_int("/proc/sys/net/ipv4/conf/br9/forwarding") == 0;
+    CHECK("ifctl_recreate: br9 exists with forwarding=0", ok);
+    link_del(s, link_get(s, "br9", NULL, NULL));
+    ip_forward_set(1);
+    ok = br_new(s, "br9", m) == 0;
+    int v = proc_int("/proc/sys/net/ipv4/conf/br9/forwarding");
+    char msg[128]; snprintf(msg, sizeof msg, "ifctl_recreate: a re-created br9 starts from conf/default forwarding=1, not the old link's 0 (got %d)", v);
+    CHECK(msg, ok && v == 1);
+    link_del(s, link_get(s, "br9", NULL, NULL));
+    ip_forward_set(0);
+    close(s);
+}
+
 /* ---- nftnat: rulesets from netavark's nftables driver drive DNAT (podnat L2) ------------------------- */
 static int g_nn_mode;      /* 0 host->127.0.0.1:H, 1 container -> bridge:H (self hairpin), 2 second container -> bridge:H */
 static int g_nn_ms;        /* last nn_connect latency */
@@ -2281,6 +2309,7 @@ int main(int argc, char **argv) {
     if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
     if (want("routed_l3")) routed_on();
     if (want("routed_l3_off")) routed_off();
+    if (want("ifctl_recreate")) ifctl_recreate();
     if (want("fwd_ping")) fwd_ping();
     if (want("fwd_off")) fwd_off();
     if (want("fwd_icmperr")) fwd_icmperr();

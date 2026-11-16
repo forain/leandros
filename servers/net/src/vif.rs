@@ -185,10 +185,18 @@ pub(crate) fn free_vifs(list: &[(u16, Sid)]) {
     // The VIFS slot (the sid allocator's "taken" mark) is released only after
     // the stack is gone: freeing it first let a new veth reuse the sid and have
     // its fresh stack wiped by this late `= None`.
+    let mut gone: Vec<(u16, [u8; 16])> = Vec::new();
     {
         let mut v = VIFS.lock();
-        for &(_, sid) in list { v[sid as usize] = None; }
+        for &(_, sid) in list { if let Some(x) = v[sid as usize].take() { gone.push((x.netns, x.name)); } }
     }
+    for (ns, name) in gone { forget_ifctl(ns, &name); }
+}
+
+/// Drop the per-interface sysctl state of a deleted link (no table lock may be held: IFCTL takes VIFS).
+pub(crate) fn forget_ifctl(ns: u16, name: &[u8; 16]) {
+    let n = name.iter().position(|&c| c == 0).unwrap_or(16);
+    sched::ns::ifctl_forget(ns, &name[..n]);
 }
 
 fn reap(ns: u16) {
@@ -268,7 +276,11 @@ fn finish_dying(force: bool) {
         // No stack lock is held here (VIFS/NETNS are released).
         for &sid in x.sids.iter() { *crate::STACKS[sid as usize].lock() = None; }
         // Release the sids only now (see free_vifs): a reused sid must not lose its new stack.
-        let mut v = VIFS.lock();
-        for &sid in x.sids.iter() { v[sid as usize] = None; }
+        let mut gone: Vec<(u16, [u8; 16])> = Vec::new();
+        {
+            let mut v = VIFS.lock();
+            for &sid in x.sids.iter() { if let Some(g) = v[sid as usize].take() { gone.push((g.netns, g.name)); } }
+        }
+        for (gns, name) in gone { forget_ifctl(gns, &name); }
     }
 }
