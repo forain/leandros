@@ -1926,7 +1926,7 @@ static void nftfwd6_midflow(void) {
     unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x06 };
     int ok = br_new(s, "br0", brmac) == 0;
     int bidx = link_get(s, "br0", NULL, NULL);
-    ok = ok && bidx > 0 && addr6_add(s, bidx, "fd00:97::1", 64) == 0 && link_set_up(s, bidx) == 0 && ip6_forward_set(1) == 0;
+    ok = ok && bidx > 0 && addr6_add(s, bidx, "fd00:97::1", 64) == 0 && link_set_up(s, bidx) == 0 && ip_forward_set(1) == 0 && ip6_forward_set(1) == 0;
     snprintf(msg, sizeof msg, "%s: br0 fd00:97::1/64 up, ipv6 forwarding=1", name); CHECK(msg, ok);
     pid_t c = spawn_ns(fwd6_body);
     int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
@@ -1956,7 +1956,7 @@ static void nftfwd6_midflow(void) {
     int rc = c > 0 ? wait_child(c) : -1;
     snprintf(msg, sizeof msg, "%s: established v6 flow is dropped by a rule added mid-flow (exit %d)", name, rc); CHECK(msg, rc == 0);
     system("nft delete table inet midflow");
-    ip6_forward_set(0);
+    ip6_forward_set(0); ip_forward_set(0);
     if (iv > 0) link_del(s, iv);
     link_del(s, bidx);
     close(s);
