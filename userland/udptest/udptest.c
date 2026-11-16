@@ -1088,6 +1088,7 @@ int main(int argc, char **argv) {
     tcp_pmtud_clamp();
     udp6_pmtud();
     udp_recverr_refused();
+    udp_recverr_recvvariants();
     udp_recverr_emsgsize();
     udp6_recverr_dstunreach();
     udp6_icmp6_refused_plain();

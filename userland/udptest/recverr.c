@@ -72,6 +72,53 @@ static void udp_recverr_refused(void) {
     else pass(N);
 }
 
+/* recv/recvfrom/recvmmsg with MSG_ERRQUEUE dequeue the entry too: the
+ * quoted payload, the failed destination as source. */
+#include <sys/syscall.h>
+#include <unistd.h>
+static void udp_recverr_recvvariants(void) {
+    const char *N = "udp_recverr_recvvariants";
+    if (skipped(N)) return;
+    int u = udp_bound("127.0.0.1", 0, NULL);
+    uint16_t cp = closed_port();
+    int on = 1;
+    if (u < 0 || setsockopt(u, IPPROTO_IP, IP_RECVERR, &on, sizeof on)) { fail(N, "setup: %s", strerror(errno)); return; }
+    struct sockaddr_in to = sin4("127.0.0.1", cp);
+    char b[16], why[96] = "";
+    for (int k = 0; k < 4 && !why[0]; k++) {
+        sendto(u, "hi", 2, 0, (struct sockaddr *)&to, sizeof to);
+        wait_ev(u, POLLERR, 2000);
+        ssize_t n = -1;
+        struct sockaddr_in a; socklen_t al = sizeof a;
+        memset(&a, 0, sizeof a);
+        if (k == 0) {
+            n = recv(u, b, sizeof b, MSG_ERRQUEUE | MSG_DONTWAIT);
+            if (n != 2 || memcmp(b, "hi", 2)) snprintf(why, sizeof why, "recv: %zd %s", n, strerror(errno));
+        } else if (k == 1) {
+            n = recvfrom(u, b, sizeof b, MSG_ERRQUEUE | MSG_DONTWAIT, (struct sockaddr *)&a, &al);
+            if (n != 2 || memcmp(b, "hi", 2)) snprintf(why, sizeof why, "recvfrom: %zd %s", n, strerror(errno));
+            else if (a.sin_port != htons(cp)) snprintf(why, sizeof why, "recvfrom name port %u", ntohs(a.sin_port));
+        } else if (k == 3) {
+            /* the raw recvfrom syscall, as a static binary without relibc's recvmsg conversion issues it */
+            socklen_t al2 = sizeof a;
+            n = syscall(SYS_recvfrom, u, b, sizeof b, MSG_ERRQUEUE | MSG_DONTWAIT, &a, &al2);
+            if (n != 2 || memcmp(b, "hi", 2)) snprintf(why, sizeof why, "raw recvfrom: %zd %s", n, strerror(errno));
+            else if (a.sin_port != htons(cp)) snprintf(why, sizeof why, "raw recvfrom name port %u", ntohs(a.sin_port));
+        } else {
+            char cb[128];
+            struct iovec iov = { b, sizeof b };
+            struct mmsghdr mm; memset(&mm, 0, sizeof mm);
+            mm.msg_hdr.msg_iov = &iov; mm.msg_hdr.msg_iovlen = 1;
+            mm.msg_hdr.msg_control = cb; mm.msg_hdr.msg_controllen = sizeof cb;
+            n = recvmmsg(u, &mm, 1, MSG_ERRQUEUE | MSG_DONTWAIT, NULL);
+            if (n != 1 || mm.msg_len != 2 || memcmp(b, "hi", 2)) snprintf(why, sizeof why, "recvmmsg: %zd len %u %s", n, mm.msg_len, strerror(errno));
+            else if (mm.msg_hdr.msg_controllen == 0) snprintf(why, sizeof why, "recvmmsg: no cmsg");
+        }
+    }
+    close(u);
+    if (why[0]) fail(N, "%s", why); else pass(N);
+}
+
 /* Frag-needed on a connected IP_RECVERR socket: EMSGSIZE, ee_info = MTU;
  * and a DF send past the learned path fails locally with an
  * SO_EE_ORIGIN_LOCAL entry carrying the MTU. */

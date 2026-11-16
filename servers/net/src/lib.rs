@@ -6312,6 +6312,15 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                flags: usize) -> Message {
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::recv(o, buf_ptr, len, addr_ptr, addrlen_ptr, flags); }
     let peek = flags & MSG_PEEK != 0;
+    if flags & MSG_ERRQUEUE != 0 && inet_dgram(pid, fd) {
+        // recv/recvfrom(MSG_ERRQUEUE): the quoted payload and the failed
+        // destination as the source address, no cmsgs (Linux ip_recv_error).
+        let e = match udp_recv_err(pid, fd, !peek) { Ok(e) => e, Err(x) => return err_reply(x) };
+        let n = e.payload.len().min(len);
+        if n > 0 && !ucopy_out(buf_ptr, &e.payload[..n]) { return err_reply(-14); }
+        if addr_ptr != 0 && addrlen_ptr != 0 { sa::write(sock_dom(pid, fd), addr_ptr, addrlen_ptr, e.dst); }
+        return val_reply((if flags & MSG_TRUNC as usize != 0 { e.payload.len() } else { n }) as u64);
+    }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
