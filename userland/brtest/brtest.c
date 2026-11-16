@@ -1625,7 +1625,7 @@ static void routed_case(const char *name, int ipfwd) {
     write(cc[1], &ch, 1);
     int rc = wait_child(cl);
     kill(sv, SIGKILL); wait_child(sv);
-    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); nat_dump(); fflush(stdout); system("nft list ruleset 2>&1 | sed 's/^/DIAG nft: /'; cat /proc/sys/net/ipv4/ip_forward /proc/net/arp 2>&1 | sed 's/^/DIAG sys: /'"); }
+    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); nat_dump(); fflush(stdout); printf("DIAG nft ruleset:\n"); fflush(stdout); system("nft list ruleset 2>&1; echo DIAG ip_forward; cat /proc/sys/net/ipv4/ip_forward 2>&1"); }
     if (ipfwd) snprintf(msg, sizeof msg, "%s: UDP crosses br0 -> host -> br1 routed, source address kept (no NAT)", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means nothing is routed between the bridges", name);
     CHECK(msg, rc == 0);
