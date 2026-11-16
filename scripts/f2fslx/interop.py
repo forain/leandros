@@ -800,10 +800,71 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
     step(v, "B.back-verify", ok, "LeandrOS reads Linux's files" if ok else "verify failed: " + (outs[1].strip()[-500:].replace("\n", " | ") if outs else "no guest"))
 
 
+def skew_valid_count(path):
+    """Make fsck.f2fs find something to fix: valid_block_count + 1 in the newest pack's commit
+    block and in its footer copy (CRC resealed). A clean volume is left alone by `fsck.f2fs -f`."""
+    with open(path, "r+b") as f:
+        f.seek(1024)
+        sb = f.read(256)
+        cp_blk = struct.unpack_from("<I", sb, 76)[0]
+        bps = 1 << struct.unpack_from("<I", sb, 20)[0]
+        best = None
+        for pack in (0, 1):
+            f.seek((cp_blk + pack * bps) * 4096)
+            ver = struct.unpack("<Q", f.read(8))[0]
+            if best is None or ver > best[0]:
+                best = (ver, cp_blk + pack * bps)
+        f.seek(best[1] * 4096)
+        h = bytearray(f.read(4096))
+        total = struct.unpack_from("<I", h, 136)[0]
+        for blk in (best[1], best[1] + total - 1):
+            f.seek(blk * 4096)
+            b = bytearray(f.read(4096))
+            struct.pack_into("<Q", b, 16, struct.unpack_from("<Q", b, 16)[0] + 1)
+            struct.pack_into("<I", b, 4092, f2fs_crc(bytes(b[:4092])))
+            f.seek(blk * 4096)
+            f.write(b)
+
+
+def direction_fsckfix(tmp):
+    """Review M5: `fsck.f2fs -f` rewrites our checkpoint with the same version. We write, Linux
+    fsck -f, we mount again: the checkpoint must be detected as foreign (kernel log) and the data intact."""
+    v = "fsckfix"
+    img = os.path.join(tmp, "fsckfix.img")
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home.py"), "create", img, "--size", "256M"],
+                       capture_output=True, text=True)
+    if not step(v, "F.lx-mkfs", r.returncode == 0, "mkfs-f2fs-home create" if r.returncode == 0 else r.stderr.strip()[-100:]):
+        return
+    W = ("cd /mnt/h && mkdir -p w && dd if=/dev/urandom of=w/big bs=4096 count=1500 2>/dev/null && "
+         "for i in $(seq 1 50); do echo f$i > w/n$i; done && (cd w && md5sum big n1 n50 > ours.md5); sync; cd /; echo WORK_OK")
+    outs = guest([img], [MNTH, W, "umount /mnt/h; echo UMOUNT_RC=$?"], "F1")
+    if outs is None or "MNT_RW" not in outs[0] or "WORK_OK" not in outs[1] or "UMOUNT_RC=0" not in outs[2]:
+        step(v, "F.work", False, "LeandrOS mount/workload/umount failed"); return
+    step(v, "F.work", True, "workload + umount ok")
+    skew_valid_count(img)
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    try:
+        box(f"mkdir -p {rd}")
+        if not push(img, f"{rd}/fsckfix.img"):
+            step(v, "F.ship", False, "push failed"); return
+        rc, out = box(f"cd {rd}; timeout 300 fsck.f2fs -f fsckfix.img </dev/null >ff.txt 2>&1; echo FSCKF_RC=$?; "
+                      "cp fsckfix.img fsckfix.orig; timeout 180 fsck.f2fs --dry-run fsckfix.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?")
+        step(v, "F.fsck-f", "FSCKF_RC=" in out, "fsck.f2fs -f ran: " + out.strip()[-60:].replace("\n", " "))
+        if not fetch(f"{rd}/fsckfix.img", img):
+            step(v, "F.ship-back", False, "fetch failed"); return
+    finally:
+        box(f"rm -rf {rd}")
+    outs = guest([img], [MNTH, "cd /mnt/h/w && md5sum -c ours.md5 2>&1; echo END; cd /; dmesg | grep 'foreign check' | cut -c1-120; umount /mnt/h"], "F2")
+    if outs is None or "MNT_FAIL" in outs[0]:
+        step(v, "F.mount", False, "LeandrOS cannot mount the fsck-fixed volume"); return
+    step(v, "F.data", outs[1].count(": OK") >= 3 and "FAILED" not in outs[1], "data intact after fsck -f")
+    step(v, "F.detected", "journal dropped" in outs[1], "checkpoint detected as foreign" if "journal dropped" in outs[1] else repr(outs[1][-400:]) + " LEN=" + str(len(outs[1])))
+
+
 def main(argv):
     if argv[:1] == ["--guest"]:
         return guest_main(argv[1])
-    allv = list(VARIANTS) + ["home", "orph", "fsync", "fsynce"]
+    allv = list(VARIANTS) + ["home", "orph", "fsync", "fsynce", "fsckfix"]
     if not argv or argv[0] in ("-h", "--help", "--list"):
         print(__doc__ if argv[:1] != ["--list"] else " ".join(allv)); return 0
     vs = allv if argv == ["all"] else argv
@@ -817,6 +878,8 @@ def main(argv):
             direction_a(a, tmp)
         if "home" in vs:
             direction_b(tmp)
+        if "fsckfix" in vs:
+            direction_fsckfix(tmp)
         if "orph" in vs:
             direction_orph(tmp)
         if "fsync" in vs:

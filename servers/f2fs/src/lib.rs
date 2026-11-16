@@ -189,6 +189,11 @@ const CP_OWN_HEADS:      usize = 3348;
 /// checkpoint apart (`cp_is_foreign`). Past the version bitmaps (192..) and
 /// before the journal header (3072).
 const CP_OWN_VER:        usize = 2048;
+/// Writer signature (lane fsckcp): a CRC over the fields `fsck.f2fs` rewrites
+/// in place while keeping `checkpoint_ver` and our private area (flags, pack
+/// total, ver). `fsck.f2fs -f` sets NOCRC|UMOUNT and a shorter pack total on
+/// the same version, which `CP_OWN_VER` alone cannot tell from our own write.
+const CP_OWN_SIG:        usize = 2056;
 /// `sit_nat_version_bitmap`: the SIT bitmap, then the NAT bitmap (cp_payload 0).
 const CP_VER_BITMAP:     usize = 192;
 const CP_ORPHAN_PRESENT: u32   = 0x0000_0002;
@@ -3784,7 +3789,24 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
 /// f2fslayout) can be mounted by Linux at all; the older one-copy volumes
 /// never take this path.
 fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
-    sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
+    sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b)
+        && (r64(b, CP_OWN_VER) != r64(b, CP_VER) || cp_sig_foreign(b))
+}
+
+/// CRC of the fields an external fixer rewrites (see `CP_OWN_SIG`).
+fn cp_own_sig(b: &[u8; BLOCK_SIZE]) -> u32 {
+    let mut f = [0u8; 16];
+    f[0..4].copy_from_slice(&b[CP_CKPT_FLAGS..CP_CKPT_FLAGS + 4]);
+    f[4..8].copy_from_slice(&b[CP_PACK_TOTAL..CP_PACK_TOTAL + 4]);
+    f[8..16].copy_from_slice(&b[CP_VER..CP_VER + 8]);
+    durable::linux_crc(&f)
+}
+
+/// A signed block whose signature no longer matches was rewritten by someone
+/// else. A zero signature is a block from before this lane: not judged.
+fn cp_sig_foreign(b: &[u8; BLOCK_SIZE]) -> bool {
+    let s = r32(b, CP_OWN_SIG);
+    s != 0 && s != cp_own_sig(b)
 }
 
 /// Linux's roll-forward (recover_fsync_data / find_fsync_dnodes): from the
@@ -4338,6 +4360,8 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, logs: &LinuxLogs)
     ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 }
         | if durable::lx_enabled() { cpflags::CP_CRC_RECOVERY_FLAG } else { 0 };
     w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
+    let sig = cp_own_sig(&buf);
+    w32(&mut buf, CP_OWN_SIG,         sig);
     (cp_blkno as u64, buf)
 }
 
@@ -9303,6 +9327,7 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
     let foreign1 = rd1 && cp_is_foreign(&sb, &cp_buf1);
     for (f, b) in [(foreign0, &mut cp_buf0), (foreign1, &mut cp_buf1)] {
         if !f { continue; }
+        dbg_str("[F2FS] foreign checkpoint (Linux or fsck.f2fs wrote it); journal dropped\n");
         w32(b, durable::CPJ_MAGIC_OFF, 0);
         let (ds, ns) = (r32(b, CP_CUR_DATA_SEGNO), r32(b, CP_CUR_NODE_SEGNO));
         let (db, nb) = (r16(b, CP_CUR_DATA_BLKOFF), r16(b, CP_CUR_NODE_BLKOFF));
