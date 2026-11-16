@@ -583,26 +583,31 @@ def phase_sysfsinput(arch, run_id, env):
         out = sh(f"cd {d} && echo NAME=$(cat device/name) && echo DEV=$(cat dev) && echo EV=$(cat device/capabilities/ev) "
                  f"&& echo KEY=$(cat device/capabilities/key) && echo BUS=$(cat device/id/bustype) && cat uevent && "
                  f"echo INPUT=$(cat /sys/class/input/input{n}/name) && echo CHAR=$(cat /sys/dev/char/13:{64 + n}/dev) && "
-                 f"echo MSC=$(cat device/capabilities/msc)", 30)
+                 f"echo MSC=$(cat device/capabilities/msc); cd /", 30)  # leave the node's dir: the shell outlives it
         print("  " + " | ".join(l.strip() for l in out.splitlines() if "=" in l)[-300:])
-        for what, cond in (("name", "NAME=USB" in out and "Keyboard" in out), ("dev", f"DEV=13:{64 + n}" in out),
+        for what, cond in (("name", "NAME=QEMU USB Keyboard" in out), ("dev", f"DEV=13:{64 + n}" in out),
                            ("ev", re.search(r"EV=0*20003\b", out) is not None),
                            ("key", re.search(r"KEY=[0-9a-f]{1,}", out) is not None and "KEY=0\n" not in out),
                            ("bustype", "BUS=0003" in out), ("uevent", f"DEVNAME=input/{node}" in out),
-                           ("inputN", f"INPUT=USB" in out), ("char", f"CHAR=13:{64 + n}" in out)):
+                           ("inputN", "INPUT=QEMU USB Keyboard" in out), ("char", f"CHAR=13:{64 + n}" in out)):
             if cond: print(f"PASS: (sysfsinput) {what}")
             else: ok = False; print(f"FAIL: (sysfsinput) {what}")
         drv("qmp", "device_del", json.dumps({"id": "kbds"}), timeout=60)
         t0, gone = time.time(), False
         while time.time() - t0 < REPLUG_S and not gone:
             time.sleep(1)
-            gone = node not in sh("ls /sys/class/input", 20).split()
+            gone = "GONE" in sh(f"test -e /sys/class/input/{node} && echo STILL || echo GONE", 20)
         miss = sh(f"test -e /sys/dev/char/13:{64 + n} && echo STILL || echo GONE", 20)
         if gone and "GONE" in miss: print(f"PASS: (sysfsinput) {node} disappeared after unplug")
         else: ok = False; print(f"FAIL: (sysfsinput) {node} still present after unplug (listed={not gone} char={miss.strip()[-20:]})")
-        s1 = set(sh("ls /sys/class/input", 20).split())
+        # The listing settles a moment after the node goes (the unplug is still unwinding).
+        t0, s1 = time.time(), set()
+        while time.time() - t0 < REPLUG_S and not {"event0", "event1"} <= s1:
+            time.sleep(1)
+            s1 = set(sh("ls /sys/class/input 2>/dev/null", 20).split())
+        if node in s1: ok = False; print(f"FAIL: (sysfsinput) {node} still listed after unplug")
         if {"event0", "event1"} <= s1: print("PASS: (sysfsinput) fixed nodes survive")
-        else: ok = False; print("FAIL: (sysfsinput) fixed nodes lost")
+        else: ok = False; print(f"FAIL: (sysfsinput) fixed nodes lost: {sorted(s1)}")
     finally:
         try: drv("stop", timeout=60)
         except subprocess.TimeoutExpired: pass
