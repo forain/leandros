@@ -2611,6 +2611,93 @@ static int t_scm_cred_late_enable(void)
     return 0;
 }
 
+/* AF_UNIX SOCK_DGRAM sendto()/sendmsg(msg_name) on unconnected senders:
+ * one bound receiver, many senders, per-message sender address + creds. */
+#include <sys/un.h>
+static socklen_t un_addr(struct sockaddr_un *a, const char *n, int abs_)
+{
+    memset(a, 0, sizeof *a); a->sun_family = AF_UNIX;
+    if (abs_) { strcpy(a->sun_path + 1, n); return offsetof(struct sockaddr_un, sun_path) + 1 + strlen(n); }
+    strcpy(a->sun_path, n);
+    return offsetof(struct sockaddr_un, sun_path) + strlen(n) + 1;
+}
+static int t_unix_dgram_sendto(void)
+{
+    struct sockaddr_un ra, sa[3], from;
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        const char *rn = abs_ ? "udgtest-recv" : "/tmp/udgtest-recv";
+        unlink("/tmp/udgtest-recv");
+        socklen_t rl = un_addr(&ra, rn, abs_);
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0);
+        CHECK(r >= 0 && bind(r, (struct sockaddr *)&ra, rl) == 0 && set_passcred(r) == 0);
+        int s[3];
+        const char *names[3] = { abs_ ? "udgtest-s0" : "/tmp/udgtest-s0", abs_ ? "udgtest-s1" : "/tmp/udgtest-s1", NULL };
+        socklen_t sl[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; i++) {
+            s[i] = socket(AF_UNIX, SOCK_DGRAM, 0);
+            CHECK(s[i] >= 0);
+            if (names[i]) {
+                if (!abs_) unlink(names[i]);
+                sl[i] = un_addr(&sa[i], names[i], abs_);
+                CHECK(bind(s[i], (struct sockaddr *)&sa[i], sl[i]) == 0);
+            }
+        }
+        /* sendto from all three, interleaved with a sendmsg(msg_name). */
+        for (int i = 0; i < 3; i++) {
+            char m = (char)('a' + i);
+            CHECK(sendto(s[i], &m, 1, 0, (struct sockaddr *)&ra, rl) == 1);
+        }
+        {
+            char m = 'd'; struct iovec iov = { &m, 1 };
+            struct msghdr h; memset(&h, 0, sizeof h);
+            h.msg_name = &ra; h.msg_namelen = rl; h.msg_iov = &iov; h.msg_iovlen = 1;
+            CHECK(sendmsg(s[1], &h, 0) == 1);
+        }
+        char exp[4] = { 'a', 'b', 'c', 'd' }; int from_i[4] = { 0, 1, 2, 1 };
+        for (int k = 0; k < 4; k++) {
+            char d, cb[64];
+            struct iovec iov = { &d, 1 };
+            struct msghdr h; memset(&h, 0, sizeof h);
+            memset(&from, 0, sizeof from);
+            h.msg_name = &from; h.msg_namelen = sizeof from;
+            h.msg_iov = &iov; h.msg_iovlen = 1; h.msg_control = cb; h.msg_controllen = sizeof cb;
+            CHECK(recvmsg(r, &h, 0) == 1 && d == exp[k]);
+            int i = from_i[k];
+            if (i == 2) CHECK(h.msg_namelen <= offsetof(struct sockaddr_un, sun_path));
+            else CHECK(h.msg_namelen == sl[i] && !memcmp(from.sun_path, sa[i].sun_path, sl[i] - offsetof(struct sockaddr_un, sun_path)));
+            int got = 0;
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&h); c; c = CMSG_NXTHDR(&h, c))
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
+                    struct ucred u; memcpy(&u, CMSG_DATA(c), sizeof u);
+                    got = u.pid == getpid() && u.uid == getuid();
+                }
+            CHECK(got);
+        }
+        /* Nothing missing for a dead / unbound destination. */
+        struct sockaddr_un na; socklen_t nl = un_addr(&na, abs_ ? "udgtest-none" : "/tmp/udgtest-none", abs_);
+        unlink("/tmp/udgtest-none");
+        errno = 0; CHECK(sendto(s[0], "x", 1, 0, (struct sockaddr *)&na, nl) == -1 && errno == (abs_ ? ECONNREFUSED : ENOENT));
+        for (int i = 0; i < 3; i++) close(s[i]);
+        close(r);
+        if (!abs_) { unlink("/tmp/udgtest-recv"); unlink("/tmp/udgtest-s0"); unlink("/tmp/udgtest-s1"); }
+        else {
+            /* A closed pathname receiver: ECONNREFUSED. */
+        }
+    }
+    /* Backpressure: a nonblocking sender to a receiver nobody reads gets EAGAIN. */
+    {
+        socklen_t rl = un_addr(&ra, "udgtest-bp", 1);
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0), s = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        CHECK(bind(r, (struct sockaddr *)&ra, rl) == 0);
+        static char big[8192];
+        int n = 0, e = 0;
+        for (; n < 4096; n++) { if (sendto(s, big, sizeof big, 0, (struct sockaddr *)&ra, rl) < 0) { e = errno; break; } }
+        CHECK(n > 0 && n < 4096 && e == EAGAIN);
+        close(s); close(r);
+    }
+    return 0;
+}
+
 static int t_scm_cred_forge(void)
 {
     int sp[2];
@@ -3258,7 +3345,7 @@ static int run_userns_cases(void)
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
         { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit },
-        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
