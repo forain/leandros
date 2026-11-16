@@ -76,7 +76,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - **Unpushed sibling-repo fix**: `sync FILE` → fsync lives in `../coreutils` commit 24b9372 (main, ahead of origin by 1). Push it together with the next leandros push. The box's `leandros-siblings/coreutils` has the same diff only as an uncommitted change, so a reset there silently reverts `sync FILE` to a whole-system sync (the `syncfile` regress suite catches it).
 
-- **No test covers a COSMIC/GLib file monitor (inotify) end to end** (inotifydesk.py only samples idle load).
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
 
