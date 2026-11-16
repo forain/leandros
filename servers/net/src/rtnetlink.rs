@@ -25,6 +25,9 @@ const RTM_NEWADDR: u16 = 20;
 const RTM_SETLINK: u16 = 19;
 const RTM_DELLINK: u16 = 17;
 const IFLA_LINK: u16 = 5;
+const IFLA_AF_SPEC: u16 = 26;
+const IFLA_INET6_FLAGS: u16 = 1;
+const IFLA_INET6_ADDR_GEN_MODE: u16 = 8;
 const IFLA_NET_NS_PID: u16 = 19;
 const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_DATA: u16 = 2;
@@ -199,6 +202,16 @@ fn link_msg(l: &Link, seq: u32, pid: u32) -> Vec<u8> {
     attr(&mut v, IFLA_OPERSTATE, &[if l.loopback { 0 } else if l.running { 6 } else { 2 }]);
     attr(&mut v, IFLA_TXQLEN, &1000u32.to_ne_bytes());
     if l.veth && l.peer != 0 { attr(&mut v, IFLA_LINK, &l.peer.to_ne_bytes()); }
+    {
+        // IFLA_AF_SPEC { AF_INET6 { IFLA_INET6_FLAGS, IFLA_INET6_ADDR_GEN_MODE } }:
+        // no IF_RA_* bits, IN6_ADDR_GEN_MODE_EUI64.
+        let mut i6 = Vec::new();
+        attr(&mut i6, IFLA_INET6_FLAGS, &0u32.to_ne_bytes());
+        attr(&mut i6, IFLA_INET6_ADDR_GEN_MODE, &[0u8]);
+        let mut spec = Vec::new();
+        attr(&mut spec, AF_INET6 as u16 | NLA_F_NESTED, &i6);
+        attr(&mut v, IFLA_AF_SPEC | NLA_F_NESTED, &spec);
+    }
     if l.master != 0 { attr(&mut v, IFLA_MASTER, &l.master.to_ne_bytes()); }
     if l.tap {
         let mut li = Vec::new();
@@ -233,7 +246,7 @@ fn addr_msg(l: &Link, a: [u8; 4], prefix: u8, seq: u32, pid: u32) -> Vec<u8> {
     v
 }
 
-fn addr6_msg(a: &A6, name: &str, seq: u32, pid: u32) -> Vec<u8> {
+pub fn addr6_msg(a: &A6, name: &str, seq: u32, pid: u32) -> Vec<u8> {
     let mut v = Vec::new();
     let s = begin_msg(&mut v, RTM_NEWADDR, NLM_F_MULTI, seq, pid);
     v.push(AF_INET6);
@@ -252,7 +265,7 @@ fn addr6_msg(a: &A6, name: &str, seq: u32, pid: u32) -> Vec<u8> {
     v
 }
 
-fn route6_msg(r: &R6, seq: u32, pid: u32, multi: bool, dst128: Option<[u8; 16]>) -> Vec<u8> {
+pub fn route6_msg(r: &R6, seq: u32, pid: u32, multi: bool, dst128: Option<[u8; 16]>) -> Vec<u8> {
     let mut v = Vec::new();
     let s = begin_msg(&mut v, RTM_NEWROUTE, if multi { NLM_F_MULTI } else { 0 }, seq, pid);
     let (dst, plen) = match dst128 { Some(d) => (d, 128), None => (r.dst, r.plen) };

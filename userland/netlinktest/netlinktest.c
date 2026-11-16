@@ -7,6 +7,7 @@
 #include <ifaddrs.h>
 #include <linux/if_tun.h>
 #include <linux/netlink.h>
+#include <linux/if_link.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <net/if_arp.h>
@@ -357,6 +358,88 @@ static int proc_has(const char *file, const char *needle) {
     return ok;
 }
 
+/* Wait up to ~3 s on a multicast subscriber for a notification of `type`
+ * (RTM_NEWADDR/DELADDR: IFA_ADDRESS == addr; RTM_NEWROUTE/DELROUTE: RTA_DST
+ * == addr, rtm_dst_len == plen). Returns 1 when seen. */
+static int wait_ntf6(int sub, int type, const char *addr, int plen) {
+    struct in6_addr want; inet_pton(AF_INET6, addr, &want);
+    for (int round = 0; round < 8; round++) {
+        struct pollfd pf = { .fd = sub, .events = POLLIN };
+        if (poll(&pf, 1, 400) <= 0) continue;
+        static char b[8192];
+        int n = recv(sub, b, sizeof b, MSG_DONTWAIT);
+        for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type != type || (h->nlmsg_flags & NLM_F_MULTI)) continue;
+            int isaddr = type == RTM_NEWADDR || type == RTM_DELADDR;
+            struct rtattr *r; int al; unsigned char fam, plen_;
+            if (isaddr) { struct ifaddrmsg *a = NLMSG_DATA(h); fam = a->ifa_family; plen_ = a->ifa_prefixlen; r = IFA_RTA(a); al = IFA_PAYLOAD(h); }
+            else { struct rtmsg *m = NLMSG_DATA(h); fam = m->rtm_family; plen_ = m->rtm_dst_len; r = RTM_RTA(m); al = RTM_PAYLOAD(h); }
+            if (fam != AF_INET6 || plen_ != plen) continue;
+            for (; RTA_OK(r, al); r = RTA_NEXT(r, al))
+                if (r->rta_type == (isaddr ? IFA_ADDRESS : RTA_DST) && !memcmp(RTA_DATA(r), &want, 16)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int nl_subscribe(int by_bind, unsigned grpmask, int grpnum) {
+    int sub = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    struct sockaddr_nl sn = { .nl_family = AF_NETLINK, .nl_groups = by_bind ? grpmask : 0 };
+    if (bind(sub, (struct sockaddr *)&sn, sizeof sn) < 0) { close(sub); return -1; }
+    if (!by_bind && setsockopt(sub, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &grpnum, sizeof grpnum) < 0) { close(sub); return -1; }
+    return sub;
+}
+
+/* RTM_NEWLINK dump carries IFLA_AF_SPEC { AF_INET6 { FLAGS, ADDR_GEN_MODE } }. */
+static void link_afspec_test(int s) {
+    static char b[16384];
+    int n = dump_fam(s, RTM_GETLINK, 31, AF_UNSPEC, b, sizeof b), seen = 0, bad = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+        if (h->nlmsg_type != RTM_NEWLINK) continue;
+        struct ifinfomsg *i = NLMSG_DATA(h);
+        int al = IFLA_PAYLOAD(h), ok = 0;
+        for (struct rtattr *r = IFLA_RTA(i); RTA_OK(r, al); r = RTA_NEXT(r, al)) {
+            if ((r->rta_type & 0x3fff) != IFLA_AF_SPEC) continue;
+            int sl = RTA_PAYLOAD(r);
+            for (struct rtattr *q = RTA_DATA(r); RTA_OK(q, sl); q = RTA_NEXT(q, sl)) {
+                if ((q->rta_type & 0x3fff) != AF_INET6) continue;
+                int fl = 0, gm = 0, il = RTA_PAYLOAD(q);
+                for (struct rtattr *t = RTA_DATA(q); RTA_OK(t, il); t = RTA_NEXT(t, il)) {
+                    if (t->rta_type == IFLA_INET6_FLAGS && RTA_PAYLOAD(t) == 4) fl = 1;
+                    if (t->rta_type == IFLA_INET6_ADDR_GEN_MODE && RTA_PAYLOAD(t) == 1) gm = 1;
+                }
+                ok = fl && gm;
+            }
+        }
+        seen++; if (!ok) bad++;
+    }
+    CHECK("newlink IFLA_AF_SPEC AF_INET6 flags + addr_gen_mode on every link", seen >= 2 && bad == 0);
+}
+
+static int slurp(const char *cmd, char *out, int cap) {
+    FILE *f = popen(cmd, "r");
+    if (!f) return -1;
+    int n = fread(out, 1, cap - 1, f);
+    out[n > 0 ? n : 0] = 0;
+    return pclose(f);
+}
+
+/* busybox `ip -6 addr` / `ip -6 route` read our dumps: output must be sane. */
+static void busybox_ip6_tests(int eth, int have_router) {
+    static char o[8192];
+    if (slurp("busybox.static ip -6 addr show 2>&1", o, sizeof o) != 0 || !strstr(o, "inet6")) {
+        printf("SKIP busybox ip -6 (not in image)\n");
+        return;
+    }
+    CHECK("busybox ip -6 addr: lo ::1/128 scope host", strstr(o, "inet6 ::1/128 scope host") != NULL);
+    CHECK("busybox ip -6 addr: no v4 lines", strstr(o, "inet 127.0.0.1") == NULL);
+    if (!eth) return;
+    CHECK("busybox ip -6 addr: eth0 fe80:: /64 scope link", strstr(o, "inet6 fe80::") != NULL && strstr(o, "/64 scope link") != NULL);
+    int rc = slurp("busybox.static ip -6 route show 2>&1", o, sizeof o);
+    CHECK("busybox ip -6 route: fe80::/64 dev eth0", rc == 0 && strstr(o, "fe80::/64 dev eth0") != NULL);
+    if (have_router) CHECK("busybox ip -6 route: default via", strstr(o, "default via ") != NULL);
+}
+
 static void v6_tests(void) {
     int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
     int eth = if_nametoindex("eth0");
@@ -400,8 +483,34 @@ static void v6_tests(void) {
     CHECK("deladdr6 bind EADDRNOTAVAIL", bind(b2, (struct sockaddr *)&sa, sizeof sa) < 0 && errno == EADDRNOTAVAIL);
     close(b2);
 
+    link_afspec_test(s);
+    char nh[40];
+    {   /* RTNLGRP_IPV6_IFADDR notifications, joined by bind mask and by ADD_MEMBERSHIP */
+        int sb = nl_subscribe(1, RTMGRP_IPV6_IFADDR, 0), sm = nl_subscribe(0, 0, RTNLGRP_IPV6_IFADDR);
+        int sr = nl_subscribe(1, RTMGRP_IPV6_ROUTE, 0);
+        CHECK("rtnlgrp ipv6 subscribe", sb >= 0 && sm >= 0 && sr >= 0);
+        nl_addr6(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, 1, "2001:db8:1::7", 64);
+        CHECK("rtnlgrp ifaddr NEWADDR (bind mask)", wait_ntf6(sb, RTM_NEWADDR, "2001:db8:1::7", 64));
+        CHECK("rtnlgrp ifaddr NEWADDR (ADD_MEMBERSHIP)", wait_ntf6(sm, RTM_NEWADDR, "2001:db8:1::7", 64));
+        nl_addr6(s, RTM_DELADDR, 0, 1, "2001:db8:1::7", 64);
+        CHECK("rtnlgrp ifaddr DELADDR", wait_ntf6(sb, RTM_DELADDR, "2001:db8:1::7", 64));
+        struct pollfd pf = { .fd = sr, .events = POLLIN };
+        CHECK("rtnlgrp route group gets no addr events", poll(&pf, 1, 100) == 0);
+        close(sb); close(sm);
+        if (eth && proc_router6(nh, sizeof nh)) {
+            struct in6_addr wg; for (int i = 0; i < 16; i++) { unsigned v; sscanf(nh + 2 * i, "%2x", &v); ((unsigned char *)&wg)[i] = v; }
+            char gs[64]; inet_ntop(AF_INET6, &wg, gs, sizeof gs);
+            nl_route6(s, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, "2001:db8:3::", 64, gs, eth);
+            CHECK("rtnlgrp route NEWROUTE", wait_ntf6(sr, RTM_NEWROUTE, "2001:db8:3::", 64));
+            nl_route6(s, RTM_DELROUTE, 0, "2001:db8:3::", 64, gs, eth);
+            CHECK("rtnlgrp route DELROUTE", wait_ntf6(sr, RTM_DELROUTE, "2001:db8:3::", 64));
+        }
+        close(sr);
+    }
+    busybox_ip6_tests(eth, eth && proc_router6(nh, sizeof nh));
+
     /* routes: discover the router, never hardcode it */
-    char nh[40]; int have = eth && proc_router6(nh, sizeof nh);
+    int have = eth && proc_router6(nh, sizeof nh);
     struct in6_addr gw, want; int oif, hg;
     if (have) {
         for (int i = 0; i < 16; i++) { unsigned v; sscanf(nh + 2 * i, "%2x", &v); ((unsigned char *)&want)[i] = v; }
