@@ -1562,7 +1562,7 @@ static int rt_body(void) {
         clock_gettime(CLOCK_MONOTONIC, &t1);
         int ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
         if (n > 0) {
-            b[n] = 0; got = 1; printf("DETAIL routed reply '%s' try %d (%d ms)\n", b, k, ms);
+            b[n] = 0; got = 1; printf("DETAIL routed reply '%s' try %d (%d ms)\n", b, k, ms); fflush(stdout);
             if (strcmp(b, "from=10.97.0.2")) return 5;
             /* cold neighbour caches on both bridges: the first packet is parked, not dropped */
             { char m2[96]; snprintf(m2, sizeof m2, "routed first packet is not lost (try %d, %d ms < 100)", k, ms); CHECK(m2, k == 0 && ms < 100); }
@@ -1601,6 +1601,7 @@ static void routed_case(const char *name, int ipfwd) {
     write(cc[1], &ch, 1);
     int rc = wait_child(cl);
     kill(sv, SIGKILL); wait_child(sv);
+    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); nat_dump(); fflush(stdout); }
     if (ipfwd) snprintf(msg, sizeof msg, "%s: UDP crosses br0 -> host -> br1 routed, source address kept (no NAT)", name);
     else snprintf(msg, sizeof msg, "%s: ip_forward=0 means nothing is routed between the bridges", name);
     CHECK(msg, rc == 0);
