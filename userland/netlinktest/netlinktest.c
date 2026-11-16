@@ -182,16 +182,78 @@ static int has_addr(int s, int idx, const char *ip) {
 }
 
 /* Runs inside unshare -Urn: returns the number of failures. */
+
+/* ---- RTNLGRP_LINK / IPV4_IFADDR / IPV4_ROUTE notifications, IFLA_INET6_FLAGS, tentative re-announce ---- */
+#ifndef IF_READY
+#define IF_READY 0x80000000u
+#endif
+#define IF_RA_RCVD_ 0x20u
+#define IFA_F_TENTATIVE_ 0x40u
+struct nm { int type; int idx; int fam; const void *addr; int alen; int plen; unsigned flagmask, flagval; unsigned *seen_fl; };
+/* Wait up to ~4 s for a non-dump message matching `w`. */
+static int wait_nm(int sub, const struct nm *w) {
+    for (int round = 0; round < 10; round++) {
+        struct pollfd pf = { .fd = sub, .events = POLLIN };
+        if (poll(&pf, 1, 400) <= 0) continue;
+        static char b[8192];
+        int n;
+        while ((n = recv(sub, b, sizeof b, MSG_DONTWAIT)) > 0)
+        for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            if (h->nlmsg_type != w->type || (h->nlmsg_flags & NLM_F_MULTI)) continue;
+            if (w->type == RTM_NEWLINK || w->type == RTM_DELLINK) {
+                struct ifinfomsg *i = NLMSG_DATA(h);
+                if (i->ifi_index != w->idx) continue;
+                if ((i->ifi_flags & w->flagmask) != w->flagval) continue;
+                return 1;
+            }
+            int isaddr = w->type == RTM_NEWADDR || w->type == RTM_DELADDR;
+            struct rtattr *r; int al, fam, plen; unsigned fl = 0; int idx = 0;
+            if (isaddr) { struct ifaddrmsg *a = NLMSG_DATA(h); fam = a->ifa_family; plen = a->ifa_prefixlen; fl = a->ifa_flags; idx = a->ifa_index; r = IFA_RTA(a); al = IFA_PAYLOAD(h); }
+            else { struct rtmsg *m = NLMSG_DATA(h); fam = m->rtm_family; plen = m->rtm_dst_len; r = RTM_RTA(m); al = RTM_PAYLOAD(h); }
+            if (fam != w->fam || plen != w->plen) continue;
+            if (isaddr && w->idx && idx != w->idx) continue;
+            if (isaddr && (fl & w->flagmask) != w->flagval) continue;
+            for (; RTA_OK(r, al); r = RTA_NEXT(r, al))
+                if (r->rta_type == (isaddr ? IFA_ADDRESS : RTA_DST) && RTA_PAYLOAD(r) == w->alen && !memcmp(RTA_DATA(r), w->addr, w->alen)) { if (isaddr && w->seen_fl) *w->seen_fl = fl; return 1; }
+        }
+    }
+    return 0;
+}
+static int link_inet6_flags(int s, int idx, unsigned *out) {
+    static char b[16384];
+    int n = dump_fam(s, RTM_GETLINK, 41, AF_UNSPEC, b, sizeof b), found = 0;
+    for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+        if (h->nlmsg_type != RTM_NEWLINK) continue;
+        struct ifinfomsg *i = NLMSG_DATA(h);
+        if (i->ifi_index != idx) continue;
+        int al = IFLA_PAYLOAD(h);
+        for (struct rtattr *r = IFLA_RTA(i); RTA_OK(r, al); r = RTA_NEXT(r, al)) {
+            if ((r->rta_type & 0x3fff) != IFLA_AF_SPEC) continue;
+            int sl = RTA_PAYLOAD(r);
+            for (struct rtattr *q = RTA_DATA(r); RTA_OK(q, sl); q = RTA_NEXT(q, sl)) {
+                if ((q->rta_type & 0x3fff) != AF_INET6) continue;
+                int il = RTA_PAYLOAD(q);
+                for (struct rtattr *t = RTA_DATA(q); RTA_OK(t, il); t = RTA_NEXT(t, il))
+                    if (t->rta_type == IFLA_INET6_FLAGS && RTA_PAYLOAD(t) == 4) { memcpy(out, RTA_DATA(t), 4); found = 1; }
+            }
+        }
+    }
+    return found;
+}
+
+static int nl_subscribe(int by_bind, unsigned grpmask, int grpnum);
 static int tap_cfg_body(void) {
     int bad = 0;
 #define C(name, cond) do { if (cond) printf("PASS %s\n", name); else { bad++; printf("FAIL %s (errno %d)\n", name, errno); } } while (0)
     if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) { printf("FAIL unshare\n"); return 1; }
+    int sub = nl_subscribe(1, RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE, 0);
     int tfd = open("/dev/net/tun", O_RDWR);
     struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
     strcpy(ifr.ifr_name, "tap0"); ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
     if (tfd < 0 || ioctl(tfd, TUNSETIFF, &ifr) < 0) { printf("FAIL TUNSETIFF\n"); return 1; }
     int idx = if_nametoindex("tap0");
     int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    { struct nm w = { .type = RTM_NEWLINK, .idx = idx }; C("rtnlgrp_link NEWLINK on tap create", sub >= 0 && wait_nm(sub, &w)); }
     unsigned char mac[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
     C("setlink_type19_mtu_mac", nl_link(s, RTM_SETLINK, 0, idx, 0, 0, 65520, mac, NULL) == 0);
     struct linfo li; get_link(s, idx, &li);
@@ -199,21 +261,29 @@ static int tap_cfg_body(void) {
     C("link_has_txqlen_oper", li.txq == 1000 && li.has_oper);
     C("link_kind_tun", !strcmp(li.kind, "tun"));
     C("newaddr", nl_addr(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, idx, "10.0.2.15", 24) == 0);
+    struct in_addr a4; inet_pton(AF_INET, "10.0.2.15", &a4);
     C("newaddr_excl_eexist", nl_addr(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, idx, "10.0.2.15", 24) == EEXIST);
     C("setlink_up", nl_link(s, RTM_SETLINK, 0, idx, IFF_UP, IFF_UP, 0, NULL, NULL) == 0);
+    { struct nm w = { .type = RTM_NEWLINK, .idx = idx, .flagmask = IFF_UP, .flagval = IFF_UP }; C("rtnlgrp_link NEWLINK on up", wait_nm(sub, &w)); }
+    { struct nm w = { .type = RTM_NEWADDR, .idx = idx, .fam = AF_INET, .addr = &a4, .alen = 4, .plen = 24 }; C("rtnlgrp_ipv4_ifaddr NEWADDR (link up)", wait_nm(sub, &w)); }
     get_link(s, idx, &li);
     C("link_up_visible", li.found && (li.flags & IFF_UP));
     C("newroute_default", nl_route(s, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, "0.0.0.0", 0, "10.0.2.2", idx) == 0);
     C("newroute_excl_eexist", nl_route(s, RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL, "0.0.0.0", 0, "10.0.2.2", idx) == EEXIST);
     C("route_dump_default", has_route(s, "0.0.0.0", 0, "10.0.2.2"));
     C("newroute_static", nl_route(s, RTM_NEWROUTE, NLM_F_CREATE, "192.168.7.0", 24, "10.0.2.2", idx) == 0);
+    struct in_addr r4; inet_pton(AF_INET, "192.168.7.0", &r4);
+    { struct nm w = { .type = RTM_NEWROUTE, .fam = AF_INET, .addr = &r4, .alen = 4, .plen = 24 }; C("rtnlgrp_ipv4_route NEWROUTE", wait_nm(sub, &w)); }
     C("route_dump_static", has_route(s, "192.168.7.0", 24, "10.0.2.2"));
     C("addr_dump_has", has_addr(s, idx, "10.0.2.15"));
     C("delroute_static", nl_route(s, RTM_DELROUTE, 0, "192.168.7.0", 24, "10.0.2.2", idx) == 0);
+    { struct nm w = { .type = RTM_DELROUTE, .fam = AF_INET, .addr = &r4, .alen = 4, .plen = 24 }; C("rtnlgrp_ipv4_route DELROUTE", wait_nm(sub, &w)); }
     C("delroute_missing_esrch", nl_route(s, RTM_DELROUTE, 0, "192.168.7.0", 24, "10.0.2.2", idx) == ESRCH);
     C("delroute_default", nl_route(s, RTM_DELROUTE, 0, "0.0.0.0", 0, "10.0.2.2", idx) == 0);
     C("route_gone", !has_route(s, "0.0.0.0", 0, "10.0.2.2") && !has_route(s, "192.168.7.0", 24, NULL));
     C("setlink_down", nl_link(s, RTM_SETLINK, 0, idx, 0, IFF_UP, 0, NULL, NULL) == 0);
+    { struct nm w = { .type = RTM_NEWLINK, .idx = idx, .flagmask = IFF_UP, .flagval = 0 }; C("rtnlgrp_link NEWLINK on down", wait_nm(sub, &w)); }
+    { struct nm w = { .type = RTM_DELADDR, .idx = idx, .fam = AF_INET, .addr = &a4, .alen = 4, .plen = 24 }; C("rtnlgrp_ipv4_ifaddr DELADDR (link down)", wait_nm(sub, &w)); }
     C("setlink_rename", nl_link(s, RTM_SETLINK, 0, idx, 0, 0, 0, NULL, "tapx") == 0);
     get_link(s, idx, &li);
     C("rename_visible", li.found && !strcmp(li.name, "tapx"));
@@ -224,7 +294,10 @@ static int tap_cfg_body(void) {
     C("setlink_lo_up", nl_link(s, RTM_SETLINK, 0, 1, IFF_UP, IFF_UP, 0, NULL, NULL) == 0);
     C("setlink_lo_down", nl_link(s, RTM_SETLINK, 0, 1, 0, IFF_UP, 0, NULL, NULL) == 0);
     C("setlink_enodev", nl_link(s, RTM_SETLINK, 0, 9999, IFF_UP, IFF_UP, 0, NULL, NULL) == ENODEV);
-    close(s); close(tfd);
+    nl_link(s, RTM_DELLINK, 0, idx, 0, 0, 0, NULL, NULL);
+    close(tfd);
+    { struct nm w = { .type = RTM_DELLINK, .idx = idx }; C("rtnlgrp_link DELLINK on tap destroy", wait_nm(sub, &w)); }
+    close(s); close(sub);
     return bad;
 }
 
@@ -263,14 +336,17 @@ static void rtnl_write_tests(void) {
 
 
 /* ---- IPv6 (design-ipv6 L6) ---- */
-static int nl_addr6(int s, int type, int flags, int idx, const char *ip, int plen) {
+static int nl_addr6f(int s, int type, int flags, int idx, const char *ip, int plen, int ifaf) {
     struct ifaddrmsg a; memset(&a, 0, sizeof a);
-    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = idx; a.ifa_flags = IFA_F_NODAD;
+    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = idx; a.ifa_flags = ifaf;
     struct in6_addr in; inet_pton(AF_INET6, ip, &in);
     struct nlb m; nl_begin(&m, type, flags, &a, sizeof a);
     nl_attr(&m, IFA_LOCAL, &in, 16);
     nl_attr(&m, IFA_ADDRESS, &in, 16);
     return nl_do(s, &m);
+}
+static int nl_addr6(int s, int type, int flags, int idx, const char *ip, int plen) {
+    return nl_addr6f(s, type, flags, idx, ip, plen, IFA_F_NODAD);
 }
 /* Find an address in an AF_INET6 dump (idx 0 = any): returns scope+1, or 0. */
 static int find_addr6(int s, int idx, const char *ip, int plen, int fam) {
@@ -497,6 +573,28 @@ static void v6_tests(void) {
         struct pollfd pf = { .fd = sr, .events = POLLIN };
         CHECK("rtnlgrp route group gets no addr events", poll(&pf, 1, 100) == 0);
         close(sb); close(sm);
+        if (eth) {   /* DAD: NEWADDR carries IFA_F_TENTATIVE first, then again once permanent */
+            int st = nl_subscribe(1, RTMGRP_IPV6_IFADDR, 0);
+            struct in6_addr d6; inet_pton(AF_INET6, "2001:db8:1::9", &d6);
+            nl_addr6f(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, eth, "2001:db8:1::9", 64, 0);
+            char dv[16] = "";
+            int dad = proc_has("/proc/sys/net/ipv6/conf/eth0/accept_dad", "1") && !proc_has("/proc/sys/net/ipv6/conf/eth0/dad_transmits", "0");
+            unsigned f1 = 0;
+            struct nm t = { .type = RTM_NEWADDR, .idx = eth, .fam = AF_INET6, .addr = &d6, .alen = 16, .plen = 64, .seen_fl = &f1 };
+            int got1 = st >= 0 && wait_nm(st, &t);
+            CHECK("static v6 NEWADDR notified on eth0", got1);
+            if (dad) {
+                CHECK("NEWADDR announced with IFA_F_TENTATIVE (DAD on)", got1 && (f1 & IFA_F_TENTATIVE_));
+                struct nm p = t; p.seen_fl = NULL; p.flagmask = IFA_F_TENTATIVE_; p.flagval = 0;
+                CHECK("NEWADDR again once DAD passed (no TENTATIVE)", wait_nm(st, &p));
+            }
+            (void)dv;
+            nl_addr6(s, RTM_DELADDR, 0, eth, "2001:db8:1::9", 64);
+            close(st);
+            unsigned f6 = 0;
+            CHECK("IFLA_INET6_FLAGS eth0 has IF_READY (non-tentative link-local)", link_inet6_flags(s, eth, &f6) && (f6 & IF_READY));
+            if (proc_router6(nh, sizeof nh)) CHECK("IFLA_INET6_FLAGS eth0 has IF_RA_RCVD after an RA", (f6 & IF_RA_RCVD_) != 0);
+        }
         if (eth && proc_router6(nh, sizeof nh)) {
             struct in6_addr wg; for (int i = 0; i < 16; i++) { unsigned v; sscanf(nh + 2 * i, "%2x", &v); ((unsigned char *)&wg)[i] = v; }
             char gs[64]; inet_ntop(AF_INET6, &wg, gs, sizeof gs);

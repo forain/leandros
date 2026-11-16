@@ -35,12 +35,18 @@ struct NlSock {
 /// `RTNLGRP_n` = bit n-1) to receive IPv6 address / route notifications.
 const GRP_IPV6_IFADDR: u32 = 1 << 8;
 const GRP_IPV6_ROUTE: u32 = 1 << 10;
-const GRP_V6: u32 = GRP_IPV6_IFADDR | GRP_IPV6_ROUTE;
+const GRP_LINK: u32 = 1;
+const GRP_IPV4_IFADDR: u32 = 1 << 4;
+const GRP_IPV4_ROUTE: u32 = 1 << 6;
+const GRP_V6: u32 = GRP_IPV6_IFADDR | GRP_IPV6_ROUTE | GRP_LINK | GRP_IPV4_IFADDR | GRP_IPV4_ROUTE;
 
 /// Last-seen IPv6 addresses/routes per namespace that has subscribers; the
 /// diff against the live tables is what produces RTM_NEW/DELADDR/ROUTE
 /// multicasts, so every source (static, SLAAC, vif, tun) notifies alike.
-static SNAP: Mutex<BTreeMap<u16, (Vec<rt::A6>, Vec<rt::R6>)>> = Mutex::new(BTreeMap::new());
+static SNAP: Mutex<BTreeMap<u16, Snap>> = Mutex::new(BTreeMap::new());
+/// Links with their IFLA_INET6_FLAGS, v6 addresses/routes, v4 routes.
+#[derive(Clone)]
+struct Snap { a6: Vec<rt::A6>, r6: Vec<rt::R6>, links: Vec<(rt::Link, u32)>, r4: Vec<rt::RouteEnt> }
 static V6_SUBS: AtomicU32 = AtomicU32::new(0);
 
 static NL: Mutex<BTreeMap<u32, NlSock>> = Mutex::new(BTreeMap::new());
@@ -341,12 +347,16 @@ fn note_subs() {
     }
 }
 
-fn live6(ns: u16) -> (Vec<rt::A6>, Vec<rt::R6>) {
+fn live6(ns: u16) -> Snap {
     let (mut a, mut r) = if ns == 0 { (crate::ip6::addrs6(), crate::ip6::routes6()) } else { (crate::ip6::lo_addrs6(ns), Vec::new()) };
     a.extend(crate::tunbe::addrs6(ns));
     r.extend(crate::tunbe::routes6(ns));
-    (a, r)
+    let links = rt::current_links(ns).into_iter().map(|l| { let f = rt::inet6_flags(&a, l.index); (l, f) }).collect();
+    Snap { a6: a, r6: r, links, r4: rt::current_routes(ns) }
 }
+
+/// A link compared without its IPv4 address (that is an address event).
+fn link_key(l: &rt::Link) -> rt::Link { let mut k = l.clone(); k.addr = None; k }
 
 fn with_hdr(mut m: Vec<u8>, ty: u16) -> Vec<u8> {
     m[4..6].copy_from_slice(&ty.to_ne_bytes());
@@ -362,15 +372,37 @@ pub fn poll_notify() {
     let nss: Vec<u16> = SNAP.lock().keys().copied().collect();
     for ns in nss {
         let cur = live6(ns);
-        let (olda, oldr) = match SNAP.lock().get(&ns) { Some(x) => x.clone(), None => continue };
-        if cur.0 == olda && cur.1 == oldr { continue; }
-        let links = rt::current_links(ns);
-        let name = |i: u32| links.iter().find(|l| l.index == i).map_or(alloc::string::String::new(), |l| l.name.clone());
+        let old = match SNAP.lock().get(&ns) { Some(x) => x.clone(), None => continue };
+        let (olda, oldr) = (&old.a6, &old.r6);
+        let same_links = old.links.len() == cur.links.len()
+            && old.links.iter().zip(&cur.links).all(|(o, c)| link_key(&o.0) == link_key(&c.0) && o.0.addr == c.0.addr && o.1 == c.1);
+        if cur.a6 == old.a6 && cur.r6 == old.r6 && cur.r4 == old.r4 && same_links { continue; }
+        let name = |i: u32| cur.links.iter().chain(old.links.iter()).find(|l| l.0.index == i).map_or(alloc::string::String::new(), |l| l.0.name.clone());
         let mut ev: Vec<(u32, Vec<u8>)> = Vec::new();
-        for a in &olda { if !cur.0.iter().any(|c| c.index == a.index && c.addr == a.addr && c.prefix == a.prefix) { ev.push((GRP_IPV6_IFADDR, with_hdr(rt::addr6_msg(a, &name(a.index), 0, 0), 21))); } }
-        for a in &cur.0 { if !olda.contains(a) { ev.push((GRP_IPV6_IFADDR, with_hdr(rt::addr6_msg(a, &name(a.index), 0, 0), 20))); } }
-        for r in &oldr { if !cur.1.contains(r) { ev.push((GRP_IPV6_ROUTE, with_hdr(rt::route6_msg(r, 0, 0, false, None), 25))); } }
-        for r in &cur.1 { if !oldr.contains(r) { ev.push((GRP_IPV6_ROUTE, with_hdr(rt::route6_msg(r, 0, 0, false, None), 24))); } }
+        // Links: DELLINK for the gone, NEWLINK for the new or changed (flags, state, IFLA_INET6_FLAGS).
+        for (o, f) in &old.links { if !cur.links.iter().any(|c| c.0.index == o.index) { ev.push((GRP_LINK, with_hdr(rt::link_msg(o, *f, 0, 0), 17))); } }
+        for (c, f) in &cur.links {
+            let was = old.links.iter().find(|o| o.0.index == c.index);
+            if was.map_or(true, |o| link_key(&o.0) != link_key(c) || o.1 != *f) { ev.push((GRP_LINK, with_hdr(rt::link_msg(c, *f, 0, 0), 16))); }
+        }
+        // IPv4 addresses.
+        for (o, _) in &old.links {
+            if let Some((a, p)) = o.addr {
+                if !cur.links.iter().any(|c| c.0.index == o.index && c.0.addr == o.addr) { ev.push((GRP_IPV4_IFADDR, with_hdr(rt::addr_msg(o, a, p, 0, 0), 21))); }
+            }
+        }
+        for (c, _) in &cur.links {
+            if let Some((a, p)) = c.addr {
+                if !old.links.iter().any(|o| o.0.index == c.index && o.0.addr == c.addr) { ev.push((GRP_IPV4_IFADDR, with_hdr(rt::addr_msg(c, a, p, 0, 0), 20))); }
+            }
+        }
+        for r in &old.r4 { if !cur.r4.contains(r) { ev.push((GRP_IPV4_ROUTE, with_hdr(rt::route_ent_msg(r, 0, 0), 25))); } }
+        for r in &cur.r4 { if !old.r4.contains(r) { ev.push((GRP_IPV4_ROUTE, with_hdr(rt::route_ent_msg(r, 0, 0), 24))); } }
+        // IPv6: a flag change of a kept address (tentative -> permanent) re-announces it.
+        for a in olda { if !cur.a6.iter().any(|c| c.index == a.index && c.addr == a.addr && c.prefix == a.prefix) { ev.push((GRP_IPV6_IFADDR, with_hdr(rt::addr6_msg(a, &name(a.index), 0, 0), 21))); } }
+        for a in &cur.a6 { if !olda.contains(a) { ev.push((GRP_IPV6_IFADDR, with_hdr(rt::addr6_msg(a, &name(a.index), 0, 0), 20))); } }
+        for r in oldr { if !cur.r6.contains(r) { ev.push((GRP_IPV6_ROUTE, with_hdr(rt::route6_msg(r, 0, 0, false, None), 25))); } }
+        for r in &cur.r6 { if !oldr.contains(r) { ev.push((GRP_IPV6_ROUTE, with_hdr(rt::route6_msg(r, 0, 0, false, None), 24))); } }
         SNAP.lock().insert(ns, cur);
         let mut keys = Vec::new();
         {

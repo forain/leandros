@@ -291,6 +291,9 @@ struct Slaac {
     next_rs: u64,
 }
 impl Slaac { const NONE: Slaac = Slaac { addr: None, pfx: None, router: None, rs_sent: 0, next_rs: 0 }; }
+/// Netifs that received a router advertisement (IF_RA_RCVD).
+static RA_SEEN: Mutex<[bool; MAX_NETIF]> = Mutex::new([false; MAX_NETIF]);
+pub(crate) fn ra_rcvd(id: usize) -> bool { id < MAX_NETIF && RA_SEEN.lock()[id] }
 static SLAAC: Mutex<[Slaac; MAX_NETIF]> = Mutex::new([Slaac::NONE; MAX_NETIF]);
 /// The internal raw ICMPv6 socket of each NIC stack.
 static RAW: Mutex<[Option<SocketHandle>; MAX_NETIF]> = Mutex::new([None; MAX_NETIF]);
@@ -356,6 +359,7 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
     let mut src = [0u8; 16]; src.copy_from_slice(&ip[8..24]);
     let icmp = &ip[40..];
     if icmp[0] != 134 || icmp[1] != 0 || !is_link_local(&src) { return; }
+    RA_SEEN.lock()[id] = true;
     let sid = iface::sid_of(id as u8);
     let rlife = u16::from_be_bytes([icmp[6], icmp[7]]) as u32;
     let iid: [u8; 8] = match LL.lock()[id] { Some(l) => l[8..16].try_into().unwrap(), None => return };
