@@ -116,6 +116,9 @@ pub fn register(_dev: &'static dyn BlockDevice) -> Result<usize, BlkErr> {
 
 /// No log partition support on the SD-card boards.
 pub fn find_log_partition(_boot: Option<BootDisk>) -> Option<usize> { None }
+
+/// Partition-table identity of whole disk `idx`: the SD path does not record one.
+pub fn disk_id_of(_idx: usize) -> Option<BootDisk> { None }
 pub fn raw_geometry(_idx: usize) -> Option<(u32, u64)> { None }
 pub fn raw_read(_idx: usize, _byte_off: u64, _buf: &mut [u8]) -> bool { false }
 pub fn raw_write(_idx: usize, _byte_off: u64, _buf: &[u8], _panic_path: bool) -> bool { false }

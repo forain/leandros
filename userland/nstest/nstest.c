@@ -4172,6 +4172,65 @@ static void nsforge_cases(void)
     nsforge_oob();
 }
 
+/* ---- pidns zap timeout (cmdline pidns.zaptest=1; suite pidnszap) --------
+ * The hook makes the kernel skip the SIGKILL of a dying ns init's survivors and
+ * use a 300 ms deadline, so a victim "survives" and zap must log the timeout
+ * and give up instead of hanging the init's exit. */
+static int klog_has(const char *needle)
+{
+    int fd = open("/proc/klog", O_RDONLY);
+    if (fd < 0) return 0;
+    static char buf[1 << 20];
+    size_t n = 0; ssize_t r;
+    while (n < sizeof buf - 1 && (r = read(fd, buf + n, sizeof buf - 1 - n)) > 0) n += (size_t)r;
+    close(fd);
+    buf[n] = 0;
+    return strstr(buf, needle) != NULL;
+}
+static int zaptmo_ns(void);
+static int zaptmo(void)
+{
+    char cl[1024] = {0};
+    int cf = open("/proc/cmdline", O_RDONLY);
+    if (cf >= 0) { if (read(cf, cl, sizeof cl - 1) < 0) cl[0] = 0; close(cf); }
+    if (!strstr(cl, "pidns.zaptest=1")) { printf("nstest zaptmo: SKIP (needs pidns.zaptest=1)\n"); return 0; }
+    alarm(60);
+    /* The ns part runs in a child: once the ns init is gone, fork() in the
+     * unsharing process fails (ENOMEM), so recovery is checked from here. */
+    pid_t body = fork();
+    if (body == 0) _exit(zaptmo_ns());
+    int st = 0;
+    check("zaptmo_body", body > 0 && waitpid(body, &st, 0) == body && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    pid_t c = fork();
+    if (c == 0) _exit(0);
+    check("zaptmo_system_recovers", c > 0 && waitpid(c, &st, 0) == c && WIFEXITED(st));
+    printf("nstest: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+static int zaptmo_ns(void)
+{
+    int p[2];
+    check("zaptmo_pipe", pipe(p) == 0);
+    pid_t init = -1;
+    check("zaptmo_unshare", unshare(CLONE_NEWPID) == 0);
+    init = fork();
+    if (init == 0) {
+        if (fork() == 0) { close(p[1]); char c; (void)!read(p[0], &c, 1); _exit(0); }
+        usleep(100000);
+        _exit(0);   /* init dies with a live child: zap runs */
+    }
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    int st = 0;
+    check("zaptmo_init_reaped", init > 0 && waitpid(init, &st, 0) == init);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    long ms = (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
+    printf("zaptmo: init reaped after %ld ms\n", ms);
+    check("zaptmo_returns_bounded", ms < 5000);
+    check("zaptmo_logged", klog_has("[pidns] zap timeout: ns "));
+    close(p[1]);   /* the victim sees EOF and exits on its own */
+    return nfail != 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 3 && !strcmp(argv[1], "--nondump")) {
@@ -4182,6 +4241,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
+    if (argc > 1 && !strcmp(argv[1], "--zaptmo")) return zaptmo();
     if (getenv("NSTEST_HOST")) { printf("nstest: SKIP (host)\n"); return 0; }
     for (unsigned i = 0; i < sizeof flags / sizeof flags[0]; i++) {
         char nm[64];

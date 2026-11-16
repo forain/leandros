@@ -238,6 +238,8 @@ SUITES = {
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
                 # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
                 "host:blanktest.py",
+                # pid-ns zap timeout log + recovery via the pidns.zaptest=1 hook (own boot).
+                "host:pidnszaptest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -286,6 +288,8 @@ SUITES = {
     "netctl": ["/bin/netctltest"],
     "kmodctl": ["/bin/kmodctltest"],
     "ns": ["/bin/nstest"],
+    "pidnszap": ["/bin/nstest --zaptmo"],
+    "pidnszaphost": ["host:pidnszaptest.py"],
     "mnt": ["/bin/mnttest"],
     "ovl": ["/bin/ovltest"],
     "ovlmknod": ["/bin/ovlmknodtest"],
@@ -505,7 +509,7 @@ def self_boots(c):
     try:
         with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
             t = f.read()
-            return '"start"' in t or "cmd_start(" in t or "ffsession.py" in t  # ffsession.py boots its own VM
+            return '"start"' in t or "cmd_start(" in t or "ffsession.py" in t or "SELF_BOOTS" in t  # ffsession.py boots its own VM
     except OSError:
         return False
 
@@ -551,6 +555,8 @@ def main(argv):
         cmds += SUITES[s]
     if "nitrox86" in suites:
         os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
+    if "pidnszap" in suites and cmdline is None:
+        cmdline = "pidns.zaptest=1"
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915crtc2" in suites and cmdline is None:
