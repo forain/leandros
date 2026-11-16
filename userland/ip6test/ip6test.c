@@ -864,6 +864,106 @@ static void test_disable_ipv6(void) {
     CHECK("disable_ipv6", gone && back);
 }
 
+// ---- DAD of the NIC addresses (lane ip6dad): tentative -> permanent, accept_dad,
+// dad_transmits, a duplicate -> DADFAILED, flags in /proc/net/if_inet6 ----
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/if_addr.h>
+
+static int conf_rw(const char *field, int set, int v) {
+    char p[96]; snprintf(p, sizeof p, "/proc/sys/net/ipv6/conf/eth0/%s", field);
+    int fd = open(p, set ? O_WRONLY : O_RDONLY);
+    if (fd < 0) return -1;
+    char b[16] = ""; int r;
+    if (set) { int n = snprintf(b, sizeof b, "%d\n", v); r = write(fd, b, n) == n ? 0 : -1; }
+    else { r = read(fd, b, sizeof b - 1) > 0 ? atoi(b) : -1; }
+    close(fd);
+    return r;
+}
+
+/* Flags (hex column 5) of the if_inet6 line of eth0 starting with `prefix`; -1 when absent. */
+static int inet6_flags(const char *prefix) {
+    char l[256];
+    if (!if_inet6_find("eth0", prefix, l, sizeof l)) return -1;
+    unsigned ix, pl, sc, fl;
+    if (sscanf(l + 33, "%x %x %x %x", &ix, &pl, &sc, &fl) != 4) return -1;
+    return (int)fl;
+}
+
+static void test_dad_sysctl(void) {
+    int a = conf_rw("accept_dad", 0, 0), t = conf_rw("dad_transmits", 0, 0);
+    int w = conf_rw("dad_transmits", 1, 3) == 0 && conf_rw("dad_transmits", 0, 0) == 3;
+    conf_rw("dad_transmits", 1, 1);
+    CHECK("dad_sysctl", a == 1 && t == 1 && w && conf_rw("dad_transmits", 0, 0) == 1);
+}
+
+static void test_dad_tentative_then_permanent(void) {
+    conf_rw("dad_transmits", 1, 2);                  /* a 2 s probing window */
+    int off = set_disable(1) == 0;
+    for (int i = 0; off && i < 50 && inet6_flags("fe80") >= 0; i++) usleep(100000);
+    int on = set_disable(0) == 0, first = -1;
+    for (int i = 0; on && i < 400 && first < 0; i++) { first = inet6_flags("fe80"); if (first < 0) usleep(5000); }
+    int last = first;
+    for (int i = 0; first >= 0 && i < 100 && (last & 0x40); i++) { usleep(100000); last = inet6_flags("fe80"); }
+    conf_rw("dad_transmits", 1, 1);
+    printf("  first flags %x then %x\n", first, last);
+    CHECK("dad_tentative_flag", first >= 0 && (first & 0x40) && !(first & 0x800));
+    CHECK("dad_becomes_permanent", last == 0x80);
+}
+
+static void test_dad_off(void) {
+    conf_rw("accept_dad", 1, 0);
+    int off = set_disable(1) == 0;
+    for (int i = 0; off && i < 50 && inet6_flags("fe80") >= 0; i++) usleep(100000);
+    int on = set_disable(0) == 0, first = -1;
+    for (int i = 0; on && i < 400 && first < 0; i++) { first = inet6_flags("fe80"); if (first < 0) usleep(5000); }
+    conf_rw("accept_dad", 1, 1);
+    CHECK("dad_accept_dad_0", first == 0x80);
+}
+
+/* RTM_NEWADDR / RTM_DELADDR of a v6 address on eth0. */
+static int nl_addr6(int add, const unsigned char *a, int plen, unsigned flags) {
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    tmo(s, 3);
+    struct { struct nlmsghdr h; struct ifaddrmsg m; struct rtattr la; unsigned char a[16]; struct rtattr fa; unsigned f; } q;
+    memset(&q, 0, sizeof q);
+    q.h.nlmsg_len = sizeof q; q.h.nlmsg_type = add ? RTM_NEWADDR : RTM_DELADDR;
+    q.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
+    q.m.ifa_family = AF_INET6; q.m.ifa_prefixlen = plen; q.m.ifa_index = if_nametoindex("eth0");
+    q.la.rta_len = RTA_LENGTH(16); q.la.rta_type = IFA_LOCAL; memcpy(q.a, a, 16);
+    q.fa.rta_len = RTA_LENGTH(4); q.fa.rta_type = IFA_FLAGS; q.f = flags;
+    int r = -1;
+    if (send(s, &q, sizeof q, 0) == (ssize_t)sizeof q) {
+        char b[256];
+        ssize_t n = recv(s, b, sizeof b, 0);
+        if (n >= (ssize_t)sizeof(struct nlmsghdr) + 4) { struct nlmsgerr *e = NLMSG_DATA((struct nlmsghdr *)b); r = e->error; }
+    }
+    close(s);
+    return r;
+}
+
+/* The flags of eth0's 2001:db8:dad::<n> style line: `hex` is the 32 hex digits. */
+static void test_dad_static_and_dup(void) {
+    unsigned char fresh[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x0d, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05 };
+    const char *fh = "20010db80dad00000000000000000005";
+    /* fresh address: tentative, then permanent */
+    conf_rw("dad_transmits", 1, 2);
+    int r = nl_addr6(1, fresh, 64, 0);
+    int first = inet6_flags(fh), last = first;
+    for (int i = 0; first >= 0 && i < 100 && (last & 0x40); i++) { usleep(100000); last = inet6_flags(fh); }
+    CHECK("dad_static_tentative", r == 0 && first >= 0 && (first & 0x40));
+    CHECK("dad_static_permanent", last == 0x80);
+    nl_addr6(0, fresh, 64, 0);
+    /* duplicate -> DADFAILED: slirp does not answer an NS for fec0::2, so it is not testable here (TODO.md) */
+    /* IFA_F_NODAD skips it */
+    r = nl_addr6(1, fresh, 64, 0x02);
+    int fl = inet6_flags(fh);
+    CHECK("dad_nodad", r == 0 && fl == 0x80);
+    nl_addr6(0, fresh, 64, 0);
+    conf_rw("dad_transmits", 1, 1);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
@@ -900,6 +1000,10 @@ int main(int argc, char **argv) {
     test_ll_noscope();
     test_ll_bind_scope();
     test_disable_ipv6();
+    test_dad_sysctl();
+    test_dad_tentative_then_permanent();
+    test_dad_off();
+    test_dad_static_and_dup();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }

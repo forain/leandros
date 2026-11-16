@@ -462,7 +462,28 @@ fn all6_of(sid: Sid) -> (Vec<([u8; 16], u8)>, bool) {
     let mut o = Vec::new();
     if is_tun_kind(x.kind) && x.admin_up && !sched::ns::ipv6_disabled(x.netns, &x.name[..name_len(&x.name)]) { o.push((ll_from_mac(x.mac), 64)); }
     o.extend(x.addrs6.iter().copied());
-    (o, x.admin_up && x.kind != VifKind::Tun)
+    let nm = &x.name[..name_len(&x.name)];
+    let on = sched::ns::ipv6_conf(x.netns, nm, "accept_dad") != 0 && sched::ns::ipv6_conf(x.netns, nm, "dad_transmits") != 0;
+    (o, x.admin_up && x.kind != VifKind::Tun && on)
+}
+
+/// Probes `dad_transmits` asks for on `sid`.
+fn dad_probes(sid: Sid) -> u8 {
+    let v = VIFS.lock();
+    v[sid as usize].as_ref().map_or(1, |x| sched::ns::ipv6_conf(x.netns, &x.name[..name_len(&x.name)], "dad_transmits").clamp(1, 64) as u8)
+}
+
+/// `/proc/net/if_inet6` lines of the initial namespace's tun/tap/veth/bridge links.
+pub(crate) fn proc_if_inet6(out: &mut impl core::fmt::Write) {
+    for a in addrs6(0) {
+        let name = sid_by_ifindex(0, a.index).and_then(|s| {
+            let v = VIFS.lock();
+            v[s as usize].as_ref().map(|x| alloc::string::String::from_utf8_lossy(&x.name[..name_len(&x.name)]).into_owned())
+        }).unwrap_or_default();
+        for b in a.addr { let _ = write!(out, "{:02x}", b); }
+        let scope = match a.scope { 254 => 0x10, 253 => 0x20, _ => 0 };
+        let _ = writeln!(out, " {:02x} {:02x} {:02x} {:02x} {:>8}", a.index, a.prefix, scope, a.flags, name);
+    }
 }
 
 // ── Duplicate address detection (RFC 4862) ──────────────────────────────────
@@ -474,7 +495,7 @@ const DAD_MS: u64 = 1000;
 const IFA_F_TENTATIVE: u32 = 0x40;
 const IFA_F_DADFAILED: u32 = 0x800;
 #[derive(Clone, Copy, PartialEq)]
-enum DadSt { New, Sent(u64), Done, Failed }
+enum DadSt { New, Sent(u8, u64), Done, Failed }
 struct Dad { sid: Sid, addr: [u8; 16], st: DadSt, nodad: bool }
 static DAD: Mutex<Vec<Dad>> = Mutex::new(Vec::new());
 
@@ -484,7 +505,7 @@ fn dad_state(sid: Sid, addr: &[u8; 16]) -> DadSt {
 /// IFA_F_* for an address of `sid`.
 fn dad_flags(sid: Sid, addr: &[u8; 16]) -> u32 {
     match dad_state(sid, addr) {
-        DadSt::New | DadSt::Sent(_) => IFA_F_TENTATIVE,
+        DadSt::New | DadSt::Sent(..) => IFA_F_TENTATIVE,
         DadSt::Failed => IFA_F_TENTATIVE | IFA_F_DADFAILED,
         DadSt::Done => 0,
     }
@@ -511,6 +532,7 @@ fn icmp6_sum(src: &[u8], dst: &[u8], p: &[u8]) -> u16 {
 /// NS frames to transmit and whether the stack's address list changed.
 fn dad_step(sid: Sid, mac: [u8; 6], rx: &VecDeque<Vec<u8>>, now_ms: u64, next_ms: &mut Option<u64>) -> (Vec<Vec<u8>>, bool) {
     let _ = addrs6_of(sid); // registers new addresses
+    let probes = dad_probes(sid);
     let mut t = DAD.lock();
     let mut out = Vec::new();
     let mut changed = false;
@@ -520,12 +542,18 @@ fn dad_step(sid: Sid, mac: [u8; 6], rx: &VecDeque<Vec<u8>>, now_ms: u64, next_ms
         let unspec_ns = ty == 135 && f[14 + 8..14 + 24].iter().all(|&b| b == 0);
         if !(ty == 136 || unspec_ns) { continue; }
         let tgt = &f[14 + 48..14 + 64];
-        for d in t.iter_mut().filter(|d| d.sid == sid && matches!(d.st, DadSt::New | DadSt::Sent(_)) && d.addr == tgt) {
+        for d in t.iter_mut().filter(|d| d.sid == sid && matches!(d.st, DadSt::New | DadSt::Sent(..)) && d.addr == tgt) {
             d.st = DadSt::Failed; changed = true;
         }
     }
     for d in t.iter_mut().filter(|d| d.sid == sid) {
-        if d.st == DadSt::New {
+        let sent = match d.st {
+            DadSt::New => Some(0u8),
+            DadSt::Sent(n, dl) if now_ms >= dl && n < probes => Some(n),
+            DadSt::Sent(_, dl) if now_ms >= dl => { d.st = DadSt::Done; changed = true; None }
+            _ => None,
+        };
+        if let Some(n) = sent {
             let mut f = alloc::vec![0u8; 14 + 40 + 24];
             f[0..2].copy_from_slice(&[0x33, 0x33]);
             f[2] = 0xff; f[3..6].copy_from_slice(&d.addr[13..16]);
@@ -538,11 +566,10 @@ fn dad_step(sid: Sid, mac: [u8; 6], rx: &VecDeque<Vec<u8>>, now_ms: u64, next_ms
             let c = icmp6_sum(&f[22..38], &f[38..54], &f[54..78]);
             f[56..58].copy_from_slice(&c.to_be_bytes());
             out.push(f);
-            d.st = DadSt::Sent(now_ms + DAD_MS);
+            d.st = DadSt::Sent(n + 1, now_ms + DAD_MS);
         }
-        if let DadSt::Sent(dl) = d.st {
-            if now_ms >= dl { d.st = DadSt::Done; changed = true; }
-            else { let w = dl - now_ms; *next_ms = Some(next_ms.map_or(w, |n| n.min(w))); }
+        if let DadSt::Sent(_, dl) = d.st {
+            if now_ms < dl { let w = dl - now_ms; *next_ms = Some(next_ms.map_or(w, |n| n.min(w))); }
         }
     }
     (out, changed)

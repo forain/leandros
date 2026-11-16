@@ -1186,7 +1186,7 @@ pub fn setns_cgroup(id: NsId) -> isize {
 // ── /proc/sys/net (per network namespace) ────────────────────────────────────
 
 pub struct NetCtl { pub path: &'static str, pub def: u32, pub max: u32, pub pair: bool }
-pub const NETCTL_N: usize = 40;
+pub const NETCTL_N: usize = 43;
 /// Entries with `pair` own this slot and the next ("lo hi" files); the next has an empty path.
 pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "core/somaxconn", def: 4096, max: 2147483647, pair: false },
@@ -1228,6 +1228,9 @@ pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "ipv6/conf/all/autoconf", def: 1, max: 1, pair: false },
     NetCtl { path: "ipv6/conf/default/autoconf", def: 1, max: 1, pair: false },
     NetCtl { path: "ipv6/conf/lo/autoconf", def: 1, max: 1, pair: false },
+    NetCtl { path: "ipv6/conf/all/dad_transmits", def: 1, max: 64, pair: false },
+    NetCtl { path: "ipv6/conf/default/dad_transmits", def: 1, max: 64, pair: false },
+    NetCtl { path: "ipv6/conf/lo/dad_transmits", def: 1, max: 64, pair: false },
     NetCtl { path: "ipv6/bindv6only", def: 0, max: 1, pair: false },
 ];
 const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
@@ -1299,17 +1302,17 @@ pub fn netctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
 // ── per-interface entries (/proc/sys/net/ipv{4,6}/conf/<if>/...) ─────────────
 
 /// Fields of one interface, in slot order. Slot = NETCTL_N + entry * IF_STRIDE + field.
-const IF_FIELDS: [(&str, &str, u32); 9] = [
+const IF_FIELDS: [(&str, &str, u32); 10] = [
     ("ipv4", "forwarding", 1), ("ipv4", "rp_filter", 2), ("ipv4", "route_localnet", 1), ("ipv4", "arp_notify", 1),
     ("ipv6", "disable_ipv6", 1), ("ipv6", "forwarding", 1), ("ipv6", "accept_ra", 2), ("ipv6", "accept_dad", 2),
-    ("ipv6", "autoconf", 1),
+    ("ipv6", "autoconf", 1), ("ipv6", "dad_transmits", 64),
 ];
 const IF_STRIDE: usize = 16;
 const IF_MAX: usize = 64;
 #[derive(Clone, Copy)]
-struct IfEnt { used: bool, ns: u16, nlen: u8, name: [u8; 16], v: [u32; 9] }
+struct IfEnt { used: bool, ns: u16, nlen: u8, name: [u8; 16], v: [u32; 10] }
 static IFCTL: spin::Mutex<[IfEnt; IF_MAX]> =
-    spin::Mutex::new([IfEnt { used: false, ns: 0, nlen: 0, name: [0; 16], v: [0; 9] }; IF_MAX]);
+    spin::Mutex::new([IfEnt { used: false, ns: 0, nlen: 0, name: [0; 16], v: [0; 10] }; IF_MAX]);
 /// `fn(ns, index, name_out) -> len` (0 = no interface at `index`): the names of the links of a netns.
 static IF_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 pub fn set_ifnames_hook(f: fn(NsId, usize, &mut [u8; 16]) -> usize) { IF_HOOK.store(f as usize, Release); }
@@ -1354,7 +1357,7 @@ fn ifctl_entry(ns: NsId, name: &[u8]) -> Option<usize> {
         }
     }
     let i = free?;
-    let mut v = [0u32; 9];
+    let mut v = [0u32; 10];
     for (j, f) in IF_FIELDS.iter().enumerate() { v[j] = static_field(ns, "default", f.0, f.1); }
     let mut nm = [0u8; 16]; nm[..name.len()].copy_from_slice(name);
     t[i] = IfEnt { used: true, ns, nlen: name.len() as u8, name: nm, v };
@@ -1389,11 +1392,11 @@ pub fn netctl_find_ns(ns: NsId, rel: &[u8]) -> Option<usize> {
 fn ifctl_get(ns: NsId, k: usize) -> u32 {
     let (e, f) = ((k - NETCTL_N) / IF_STRIDE, (k - NETCTL_N) % IF_STRIDE);
     let t = IFCTL.lock();
-    if e < IF_MAX && f < 9 && t[e].used && t[e].ns == ns { t[e].v[f] } else { 0 }
+    if e < IF_MAX && f < 10 && t[e].used && t[e].ns == ns { t[e].v[f] } else { 0 }
 }
 fn ifctl_set(ns: NsId, k: usize, data: &[u8]) -> isize {
     let (e, f) = ((k - NETCTL_N) / IF_STRIDE, (k - NETCTL_N) % IF_STRIDE);
-    if e >= IF_MAX || f >= 9 { return -2; }
+    if e >= IF_MAX || f >= 10 { return -2; }
     let mut x = 0u64; let mut seen = false;
     for &c in data {
         if c.is_ascii_digit() { x = x * 10 + (c - b'0') as u64; seen = true; if x > u32::MAX as u64 { return -22; } }
