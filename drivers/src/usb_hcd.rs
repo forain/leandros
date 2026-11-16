@@ -83,6 +83,7 @@ fn relax() {
     const SPIN_BUDGET_NS: u64 = 300_000;
     /// A gap this long since the previous poll on this CPU starts a new wait.
     const NEW_WAIT_GAP_NS: u64 = 50_000;
+    crate::usb_storage::stall_dump_tick();
     if !sched::irqs_masked() {
         sched::yield_now("usb-poll");
     } else if sched::preempt_disabled() {

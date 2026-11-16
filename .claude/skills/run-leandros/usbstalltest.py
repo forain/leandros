@@ -44,7 +44,7 @@ def drv(*args, timeout=200, env=None):
     return p.returncode, p.stdout + p.stderr
 
 
-STALL_CMDLINE = "usbms.stall_lba=25600 usbms.stall_ms=20000"
+STALL_CMDLINE = "usbms.stall_lba=25600 usbms.stall_ms=20000 usbms.stall_dump=1"
 
 
 def cmdline_image(arch, run_id):
@@ -110,6 +110,8 @@ def main():
             if "PONG" not in out:
                 dt = max(dt, 30.0)
             rtts.append(dt); worst = max(worst, dt)
+            if dt > 2.0:
+                print(f"slow echo #{len(rtts)}: {dt:.1f} s, started {t - t0:.1f} s into the window", flush=True)
             time.sleep(1)
         print(f"shell round trips during the stall: n={len(rtts)} worst={worst:.1f} s "
               f"median={sorted(rtts)[len(rtts) // 2]:.1f} s")
@@ -133,8 +135,12 @@ def main():
             print("I/O after the stall ok")
         log = serial_log(run_id)
         lines = log.splitlines()
-        for l in [l for l in lines if "[USB-MSC]" in l][-6:]:
-            print(l.strip()[-160:])
+        msc = [l for l in lines if "[USB-MSC]" in l or "[WDOG]" in l]
+        if not ok:   # task dumps taken from the stalled reader (usbms.stall_dump=1)
+            for l in [l for l in lines if "[TASKS]" in l][:120]:
+                print(l.strip()[-200:])
+        for l in (msc if not ok else msc[-6:]):   # a failure keeps the whole ladder + any atomic/lockup note
+            print(l.strip()[-200:])
         for l in [l for l in lines if "soft lockup" in l][-2:]:
             print(l.strip()[-160:])
     finally:
