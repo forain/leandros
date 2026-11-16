@@ -196,7 +196,8 @@ static int wait_nm(int sub, const struct nm *w) {
         struct pollfd pf = { .fd = sub, .events = POLLIN };
         if (poll(&pf, 1, 400) <= 0) continue;
         static char b[8192];
-        int n = recv(sub, b, sizeof b, MSG_DONTWAIT);
+        int n;
+        while ((n = recv(sub, b, sizeof b, MSG_DONTWAIT)) > 0)
         for (struct nlmsghdr *h = (struct nlmsghdr *)b; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
             if (h->nlmsg_type != w->type || (h->nlmsg_flags & NLM_F_MULTI)) continue;
             if (w->type == RTM_NEWLINK || w->type == RTM_DELLINK) {
