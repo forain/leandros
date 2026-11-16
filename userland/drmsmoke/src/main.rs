@@ -646,6 +646,39 @@ unsafe fn atomic_plane_commit(fd: c_int, fb_id: u32, w: u32, h: u32, flags: u32)
     ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &mut req as *mut _)
 }
 
+/// Read `/sys/class/drm/card0-<TYPE>-<id>/<file>` into `buf`; length or -1.
+fn read_conn_attr(ty: u32, id: u32, file: &[u8], buf: &mut [u8]) -> isize {
+    let name: &[u8] = match ty { 10 => b"DP", 11 => b"HDMI-A", 14 => b"eDP", 15 => b"Virtual", _ => return -1 };
+    let mut p = [0u8; 96];
+    let mut n = 0;
+    for part in [&b"/sys/class/drm/card0-"[..], name, b"-"] { p[n..n + part.len()].copy_from_slice(part); n += part.len(); }
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = id;
+    loop { digits[d] = b'0' + (v % 10) as u8; d += 1; v /= 10; if v == 0 { break; } }
+    while d > 0 { d -= 1; p[n] = digits[d]; n += 1; }
+    p[n] = b'/'; n += 1;
+    p[n..n + file.len()].copy_from_slice(file); n += file.len();
+    p[n] = 0;
+    unsafe {
+        let fd = open(p.as_ptr(), 0);
+        if fd < 0 { return -1; }
+        let r = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+        close(fd);
+        r
+    }
+}
+
+fn sysfs_connector_matches(ty: u32, id: u32, connection: u32, count_modes: u32) -> bool {
+    let mut b = [0u8; 1024];
+    let n = read_conn_attr(ty, id, b"status", &mut b);
+    if n <= 0 { return false; }
+    let want: &[u8] = if connection == 1 { b"connected\n" } else { b"disconnected\n" };
+    if &b[..n as usize] != want { return false; }
+    let n = read_conn_attr(ty, id, b"modes", &mut b);
+    n >= 0 && b[..n as usize].iter().filter(|&&c| c == b'\n').count() as u32 == count_modes.min(if connection == 1 { 99 } else { 0 })
+}
+
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
         write(1, name.as_ptr() as *const c_void, name.len());
@@ -2329,6 +2362,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         && modes[0].hdisplay > 0 && modes[0].vdisplay > 0;
     let conn_errno = errno();
     if !report_errno(b"GETCONNECTOR", conn_ok, conn_errno) { failures += 1; }
+    // /sys/class/drm/card0-<TYPE>-<n>/{status,modes} agree with GETCONNECTOR.
+    if conn_ok && !report(b"SYSFS_CONNECTOR", sysfs_connector_matches(conn2.connector_type, conn2.connector_type_id, conn2.connection, conn2.count_modes)) { failures += 1; }
 
     let w = if modes[0].hdisplay > 0 { modes[0].hdisplay as u32 } else { 256 };
     let h = if modes[0].vdisplay > 0 { modes[0].vdisplay as u32 } else { 256 };
