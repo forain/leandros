@@ -213,9 +213,8 @@ static int wait_nm(int sub, const struct nm *w) {
             if (fam != w->fam || plen != w->plen) continue;
             if (isaddr && w->idx && idx != w->idx) continue;
             if (isaddr && (fl & w->flagmask) != w->flagval) continue;
-            if (isaddr && w->seen_fl) *w->seen_fl = fl;
             for (; RTA_OK(r, al); r = RTA_NEXT(r, al))
-                if (r->rta_type == (isaddr ? IFA_ADDRESS : RTA_DST) && RTA_PAYLOAD(r) == w->alen && !memcmp(RTA_DATA(r), w->addr, w->alen)) return 1;
+                if (r->rta_type == (isaddr ? IFA_ADDRESS : RTA_DST) && RTA_PAYLOAD(r) == w->alen && !memcmp(RTA_DATA(r), w->addr, w->alen)) { if (isaddr && w->seen_fl) *w->seen_fl = fl; return 1; }
         }
     }
     return 0;
@@ -295,6 +294,7 @@ static int tap_cfg_body(void) {
     C("setlink_lo_up", nl_link(s, RTM_SETLINK, 0, 1, IFF_UP, IFF_UP, 0, NULL, NULL) == 0);
     C("setlink_lo_down", nl_link(s, RTM_SETLINK, 0, 1, 0, IFF_UP, 0, NULL, NULL) == 0);
     C("setlink_enodev", nl_link(s, RTM_SETLINK, 0, 9999, IFF_UP, IFF_UP, 0, NULL, NULL) == ENODEV);
+    nl_link(s, RTM_DELLINK, 0, idx, 0, 0, 0, NULL, NULL);
     close(tfd);
     { struct nm w = { .type = RTM_DELLINK, .idx = idx }; C("rtnlgrp_link DELLINK on tap destroy", wait_nm(sub, &w)); }
     close(s); close(sub);
