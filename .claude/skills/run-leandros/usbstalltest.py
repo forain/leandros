@@ -45,6 +45,44 @@ def drv(*args, timeout=200, env=None):
 
 
 STALL_CMDLINE = "usbms.stall_lba=25600 usbms.stall_ms=20000"
+if os.environ.get("USBSTALL_DUMP") == "1":   # opt-in: task dumps from the stalled reader (perturbs timing)
+    STALL_CMDLINE += " usbms.stall_dump=1"
+# Echo median in the stall window may be at most this factor of the no-stall
+# baseline median (plus BASE_SLACK s of harness noise): the stall must not
+# slow the shell down, only a real hold would.
+MEDIAN_FACTOR = 4.0
+BASE_SLACK = 1.0
+
+
+def timerstat():
+    """`/proc/stat` timerstat line: ticks, timer irqs, early deadline irqs, uart drains."""
+    _, out = drv("run", "grep ^timerstat /proc/stat", "20", timeout=60)
+    m = re.search(r"timerstat (\d+) (\d+) (\d+) (\d+)", out)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def echo_rtts(n, pause=1.0, limit=None):
+    rtts = []
+    for _ in range(n):
+        t = time.time()
+        try:
+            rc, out = drv("run", "echo PONG", "30", timeout=60)
+        except subprocess.TimeoutExpired:
+            out = ""
+        dt = time.time() - t
+        if "PONG" not in out:
+            dt = max(dt, 30.0)
+        rtts.append(dt)
+        time.sleep(pause)
+    return rtts
+
+
+def counters_line(tag, a, b, secs):
+    if not a or not b:
+        return f"timerstat {tag}: unavailable"
+    d = [y - x for x, y in zip(a, b)]
+    return (f"timerstat {tag}: {secs:.1f} s ticks={d[0]} timer_irqs={d[1]} ({d[1] / secs:.0f}/s) "
+            f"deadline_early={d[2]} uart_drains={d[3]} ({d[3] / secs:.0f}/s)")
 
 
 def cmdline_image(arch, run_id):
@@ -96,10 +134,17 @@ def main():
         if want not in out:
             print("FAIL: baseline read of /dev/sda wrong\n" + out.strip()[-300:]); return 1
         print("baseline read ok")
+        st0 = timerstat(); tb = time.time()
+        base = echo_rtts(8)
+        st1 = timerstat(); te = time.time()
+        base_med = sorted(base)[len(base) // 2]
+        print(f"baseline echo (no stall): n={len(base)} worst={max(base):.1f} s median={base_med:.2f} s")
+        print(counters_line("baseline", st0, st1, te - tb), flush=True)
         drv("run", "sh -c 'dd if=/dev/sda of=/dev/null bs=64k skip=200 count=4 > /tmp/sd.err 2>&1; "
                    "echo SRC=$? > /tmp/src' </dev/null >/dev/null 2>&1 & true", "20")
         time.sleep(6)   # first transfer deadline passes: the ladder is running
         worst, rtts, t0 = 0.0, [], time.time()
+        st2 = timerstat()
         while time.time() - t0 < 35:
             t = time.time()
             try:
@@ -110,9 +155,16 @@ def main():
             if "PONG" not in out:
                 dt = max(dt, 30.0)
             rtts.append(dt); worst = max(worst, dt)
+            if dt > 2.0:
+                print(f"slow echo #{len(rtts)}: {dt:.1f} s, started {t - t0:.1f} s into the window", flush=True)
             time.sleep(1)
+        med = sorted(rtts)[len(rtts) // 2]
         print(f"shell round trips during the stall: n={len(rtts)} worst={worst:.1f} s "
-              f"median={sorted(rtts)[len(rtts) // 2]:.1f} s")
+              f"median={med:.2f} s (baseline median {base_med:.2f} s)")
+        st3 = timerstat()
+        print(counters_line("stall window", st2, st3, time.time() - t0), flush=True)
+        if med > MEDIAN_FACTOR * base_med + BASE_SLACK:
+            ok = False; print(f"FAIL: stall-window echo median {med:.2f} s > {MEDIAN_FACTOR}x baseline {base_med:.2f} s + {BASE_SLACK} s")
         if worst > MAX_RTT:
             ok = False; print(f"FAIL: the CPU was held (an echo took {worst:.1f} s > {MAX_RTT} s)")
         src = None
@@ -133,8 +185,12 @@ def main():
             print("I/O after the stall ok")
         log = serial_log(run_id)
         lines = log.splitlines()
-        for l in [l for l in lines if "[USB-MSC]" in l][-6:]:
-            print(l.strip()[-160:])
+        msc = [l for l in lines if "[USB-MSC]" in l or "[WDOG]" in l]
+        if not ok:   # task dumps taken from the stalled reader (usbms.stall_dump=1)
+            for l in [l for l in lines if "[TASKS]" in l][:120]:
+                print(l.strip()[-200:])
+        for l in (msc if not ok else msc[-6:]):   # a failure keeps the whole ladder + any atomic/lockup note
+            print(l.strip()[-200:])
         for l in [l for l in lines if "soft lockup" in l][-2:]:
             print(l.strip()[-160:])
     finally:

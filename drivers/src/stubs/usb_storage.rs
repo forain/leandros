@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 pub struct Inflight { pub disk: usize, pub op: &'static str, pub lba: u64, pub bytes: u32, pub age_ns: u64, pub pid: u32 }
 pub fn set_cmdline(_cmdline: &str) {}
+pub fn stall_dump_tick() {}
 pub fn inflight(_now: u64) -> Vec<Inflight> { Vec::new() }
 pub fn lock_owners() -> Vec<(usize, u32, usize)> { Vec::new() }
 pub fn task_disk_wait_ns(_pid: u32) -> u64 { 0 }
