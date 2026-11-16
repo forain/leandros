@@ -2580,6 +2580,52 @@ static int t_scm_cred_accept_inherit(void)
     return 0;
 }
 
+/* Linux attaches the sender's creds to every message the receiver wants them for, whatever the send call. */
+static int t_scm_cred_plain_send(void)
+{
+    int sp[2], types[2] = { SOCK_STREAM, SOCK_DGRAM };
+    struct ucred u;
+    for (int i = 0; i < 2; i++) {
+        CHECK(socketpair(AF_UNIX, types[i], 0, sp) == 0 && set_passcred(sp[0]) == 0);
+        memset(&u, 0, sizeof u);
+        CHECK(send(sp[1], "x", 1, 0) == 1 && cred_recv(sp[0], &u) == 0 && u.pid == getpid());
+        memset(&u, 0, sizeof u);
+        CHECK(write(sp[1], "x", 1) == 1 && cred_recv(sp[0], &u) == 0 && u.pid == getpid());
+        close(sp[0]); close(sp[1]);
+    }
+    return 0;
+}
+
+/* Data queued before SO_PASSCRED is switched on still reports the sender's creds. */
+static int t_scm_cred_late_enable(void)
+{
+    int sp[2], types[2] = { SOCK_STREAM, SOCK_DGRAM };
+    struct ucred u;
+    for (int i = 0; i < 2; i++) {
+        CHECK(socketpair(AF_UNIX, types[i], 0, sp) == 0);
+        CHECK(send(sp[1], "x", 1, 0) == 1 && set_passcred(sp[0]) == 0);
+        memset(&u, 0, sizeof u);
+        CHECK(cred_recv(sp[0], &u) == 0 && u.pid == getpid());
+        close(sp[0]); close(sp[1]);
+    }
+    return 0;
+}
+
+/* sendto() on an unconnected dgram socket carries the creds too. */
+static int t_scm_cred_sendto(void)
+{
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    memcpy(a.sun_path + 1, "nst-pcto", 8);
+    socklen_t al = offsetof(struct sockaddr_un, sun_path) + 1 + 8;
+    int r = socket(AF_UNIX, SOCK_DGRAM, 0), s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    struct ucred u; memset(&u, 0, sizeof u);
+    CHECK(r >= 0 && s >= 0 && bind(r, (struct sockaddr *)&a, al) == 0 && set_passcred(r) == 0);
+    CHECK(sendto(s, "x", 1, 0, (struct sockaddr *)&a, al) == 1);
+    CHECK(cred_recv(r, &u) == 0 && u.pid == getpid());
+    close(r); close(s);
+    return 0;
+}
+
 static int t_scm_cred_forge(void)
 {
     int sp[2];
@@ -3226,7 +3272,8 @@ static int run_userns_cases(void)
         { "setns_ioctl", t_setns_ioctl }, { "setns_pidfd", t_setns_pidfd }, { "setns_fd_holds", t_setns_fd_holds }, { "setns_uts", t_setns_uts },
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
-        { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit },
+        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "scm_cred_sendto", t_scm_cred_sendto }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
