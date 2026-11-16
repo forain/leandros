@@ -2124,6 +2124,89 @@ static void nftfwd6_midflow(void) {
     close(s);
 }
 
+/* ---- ICMPv6 errors of a tracked routed v6 flow are `ct state related` ------------------------------------- */
+/* A container on br0 sends UDP to a closed port of a container on br1 (routed, no NAT); the peer answers with an
+ * ICMPv6 port-unreachable that must pass FORWARD only when `related` is accepted (default-drop policy). */
+static const char FR6_RULES_OFF[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n}\n";
+static const char FR6_RULES_ON[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+static int g_r6_role, g_r6_expect;
+static int rel6_body(void) {
+    g_ip6 = g_r6_role ? "fd00:98::2" : "fd00:97::2";
+    const char *gw = g_r6_role ? "fd00:98::1" : "fd00:97::1";
+    int e = v6_conf_eth0(); if (e) return e;
+    int cs = nl_sock();
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    if (route6_default(cs, idx, gw)) return 3;
+    close(cs);
+    sleep(2);                                        /* IPv6 DAD */
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (g_r6_role) { pause(); return 0; }
+    if (rd_to(ctl[0], &ch) != 1) return 4;
+    int u = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (u < 0) return 5;
+    struct sockaddr_in6 to; memset(&to, 0, sizeof to); to.sin6_family = AF_INET6; to.sin6_port = htons(7001);
+    inet_pton(AF_INET6, "fd00:98::2", &to.sin6_addr);
+    if (connect(u, (struct sockaddr *)&to, sizeof to)) return 6;
+    struct timeval tv = { 2, 0 };
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int refused = 0;
+    for (int k = 0; k < 4 && !refused; k++) {
+        char b[16];
+        send(u, "hi", 2, 0);
+        if (recv(u, b, sizeof b, 0) < 0 && errno == ECONNREFUSED) refused = 1;
+    }
+    printf("DETAIL rel6 refused=%d\n", refused); fflush(stdout);
+    return refused == g_r6_expect ? 0 : 10 + refused;
+}
+static void rel6_case(const char *name, const char *rules, int expect, const char *what) {
+    char msg[160];
+    int fs_base = fwd_state_sum(NULL, 0);
+    int s = nl_sock();
+    unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
+    int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
+    int b0 = link_get(s, "br0", NULL, NULL), b1 = link_get(s, "br1", NULL, NULL);
+    ok = ok && b0 > 0 && b1 > 0 && addr6_add(s, b0, "fd00:97::1", 64) == 0 && link_set_up(s, b0) == 0
+        && addr6_add(s, b1, "fd00:98::1", 64) == 0 && link_set_up(s, b1) == 0 && ip6_forward_set(1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 fd00:97::1/64, br1 fd00:98::1/64 up, ipv6 forwarding=1", name); CHECK(msg, ok);
+    FILE *fp = fopen("/tmp/r6.nft", "w");
+    if (fp) { fputs(rules, fp); fclose(fp); }
+    snprintf(msg, sizeof msg, "%s: nft -f loads a default-drop FORWARD policy", name);
+    CHECK(msg, system("nft -f /tmp/r6.nft >/tmp/r6.err 2>&1") == 0);
+    g_r6_expect = expect;
+    char ch = 'g';
+    g_r6_role = 1;
+    pid_t sv = spawn_ns(rel6_body);
+    int scc[2] = { ctl[0], ctl[1] }, sdd[2] = { done_[0], done_[1] };
+    int fc = netns_fd_of(sv);
+    int vs = veth_new_m(s, "vethS", "eth0", fc, b1) == 0 && link_set_up(s, link_get(s, "vethS", NULL, NULL)) == 0;
+    close(fc);
+    write(scc[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: peer container on br1 configured (no listener on 7001)", name); CHECK(msg, sv > 0 && vs && rd_to(sdd[0], &ch) == 1);
+    g_r6_role = 0;
+    pid_t cl = spawn_ns(rel6_body);
+    int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
+    fc = netns_fd_of(cl);
+    int vc = veth_new_m(s, "vethC", "eth0", fc, b0) == 0 && link_set_up(s, link_get(s, "vethC", NULL, NULL)) == 0;
+    close(fc);
+    write(cc[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: client container on br0 configured", name); CHECK(msg, cl > 0 && vc && rd_to(dd[0], &ch) == 1);
+    write(cc[1], &ch, 1);
+    int rc = wait_child(cl);
+    kill(sv, SIGKILL); wait_child(sv);
+    if (rc != 0) { printf("DIAG %s child rc %d\n", name, rc); fflush(stdout); system("grep -E '^(fwd_stats|fwd_ct6|fwd_nd)' /proc/net/nic | head -12"); }
+    snprintf(msg, sizeof msg, "%s: %s (exit %d)", name, what, rc); CHECK(msg, rc == 0);
+    system("nft delete table inet netavark");
+    ip6_forward_set(0);
+    link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
+    link_del(s, b0); link_del(s, b1);
+    FWD_STATE_CHECK(name, fs_base);
+    close(s);
+}
+static void nftfwd6_related_off(void) { rel6_case("nftfwd6_related_drop", FR6_RULES_OFF, 0, "ICMPv6 port-unreachable (ct state related) is dropped by the default-drop policy"); }
+static void nftfwd6_related_on(void) { rel6_case("nftfwd6_related_accept", FR6_RULES_ON, 1, "ICMPv6 port-unreachable is delivered by `ct state related accept` (ECONNREFUSED)"); }
+
 /* A host wildcard listener must not leak into a container netns: a netns
  * stack that connects to its OWN address on the listener's port gets
  * ECONNREFUSED, and the host listener never sees a connection. */
@@ -2304,6 +2387,8 @@ int main(int argc, char **argv) {
     if (want("fwd_udp")) fwd_udp();
     if (want("nftfwd_midflow_established")) nftfwd_midflow();
     if (want("nftfwd6_midflow_established")) nftfwd6_midflow();
+    if (want("nftfwd6_related_drop")) nftfwd6_related_off();
+    if (want("nftfwd6_related_accept")) nftfwd6_related_on();
     if (want("nftfwd_related_drop")) nftfwd_related_off();
     if (want("nftfwd_related_accept")) nftfwd_related_on();
     if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
