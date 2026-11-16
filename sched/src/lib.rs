@@ -3683,6 +3683,12 @@ pub mod poll_class {
     pub const MQ: u32 = 27;
     /// A V4L2 capture node (kernel/src/v4l2.rs), index 0.
     pub const VIDEO: u32 = 26;
+    /// A bound AF_UNIX datagram socket's inbox, indexed by its `sock_id`
+    /// (servers/net `unixdg::rd_key`): a datagram was queued.
+    pub const UNIX_DG: u32 = 28;
+    /// Same inbox, write side (`unixdg::wr_key`): the receiver drained a
+    /// datagram or went away, so a sender parked on a full inbox re-probes.
+    pub const UNIX_DGW: u32 = 29;
 }
 
 /// Bumped by every producer whose object's poll tag itself changes (a
