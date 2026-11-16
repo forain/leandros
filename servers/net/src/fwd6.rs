@@ -148,10 +148,17 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
     // Anti-spoof: a global source inside one of the bridge's prefixes, never the bridge itself.
     if !addrs.iter().any(|&(a, p)| a[0] != 0xfe && a != src && prefix_match(&a, &src, p)) { return None; }
     let Some(p) = parse(&mut f, false) else { return None };
+    // Another ns-0 bridge's prefix: route as a plain IPv6 router, no NAT (forwarding on both sides).
+    let rt = bridge_for6(p.dst).filter(|t| t.br != br);
+    if let Some(t) = &rt {
+        let n = t.name.iter().position(|&c| c == 0).unwrap_or(16);
+        if !sched::ns::forwarding6(0, &t.name[..n]) { return None; }
+    }
     if f[21] <= 1 {
         if let Some(&(ba, _)) = addrs.iter().find(|&&(a, pl)| a[0] != 0xfe && a != src && prefix_match(&a, &src, pl)) { time_exceeded(br, port, bmac, ba, &f); }
         return None;
     }
+    if let Some(t) = rt { route6_l3(br, port, &p, &t, f); return None; }
     let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { fwd::stat6(fwd::S6_NOROUTE); return None };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { fwd::stat6(fwd::S6_NOMAC); return None };
     fwd::stat6(fwd::S6_NAT);
@@ -241,6 +248,36 @@ fn emit(st: &mut fwd::St, now: u64, nic: u8, nh: [u8; 16], nicip: [u8; 16], nicm
 }
 
 /// Neighbor solicitation for `target`, to its solicited-node group.
+/// Routed forward (no NAT) of an IPv6 frame from one ns-0 bridge into another's prefix: FORWARD hook, hop limit,
+/// then the destination's learned MAC; a miss parks the packet (a few per next hop) and sends an NS, `fwd::divert`
+/// replays it on the NA and `sweep6` answers the sender with address unreachable after the timeout. The source is kept.
+fn route6_l3(sbr: Sid, sport: Sid, p: &P6, t: &Tgt6, mut f: Vec<u8>) {
+    if crate::nfnl::has_tables(0) {
+        let est = p.proto == PROTO_TCP && p.flags & 0x12 != 0x02;
+        let rport = if p.proto == PROTO_ICMP6 { 0 } else { p.dport };
+        let mut m = crate::nfnl::Pkt { rel: false, est, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif: t.name, mark: 0, local: false, v6: Some((p.src, p.dst)) };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return; }
+    }
+    let mut st = FWD.lock();
+    USED6.store(true, Ordering::Relaxed);
+    fwd::USED.store(true, Ordering::Relaxed);
+    let Some((tmac, tport)) = st.l6.lrn.iter().find(|l| l.br == t.br && l.ip == p.dst).map(|l| (l.mac, l.port)) else {
+        if st.l6.park.iter().filter(|q| q.br == t.br && q.ip == p.dst).count() < fwd::PARK_PER_IP && st.l6.park.len() < 16 {
+            st.l6.park.push(Park6 { br: t.br, sbr, ip: p.dst, t: sched::monotonic_ns(), port: sport, frame: f });
+        }
+        ns_into(&mut st, t, p.dst);
+        drop(st);
+        drivers::netdev::kick();
+        return;
+    };
+    f[21] -= 1;
+    f[0..6].copy_from_slice(&tmac);
+    f[6..12].copy_from_slice(&t.mac);
+    if st.inq.len() < 256 { st.inq.push_back((t.br, tport, f)); fwd::INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+}
+
 fn ns_frame(mac: [u8; 6], src: [u8; 16], target: [u8; 16]) -> Vec<u8> {
     let mut f = alloc::vec![0u8; 14 + 40 + 32];
     f[0..6].copy_from_slice(&[0x33, 0x33, 0xff, target[13], target[14], target[15]]);
