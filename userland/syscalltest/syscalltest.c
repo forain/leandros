@@ -882,7 +882,7 @@ static pthread_t pw_tid[PW_WATCHERS];
 static volatile int pw_tid_ok[PW_WATCHERS];
 static volatile pid_t pw_ktid[PW_WATCHERS];
 static volatile int pw_bad;
-static char pw_msg[PW_WATCHERS][480];
+static char pw_msg[PW_WATCHERS][960];
 /* Per-watcher timeline written by the conmon child and grandchild into a
  * MAP_SHARED page, so a failure shows who was late: the sleeps, the
  * grandchild fork, or the parent getting back from fork(). */
@@ -1012,6 +1012,15 @@ static void *pw_watcher(void *arg) {
                 int w2 = (int)syscall(SYS_waitid, P_PIDFD, fd, &s2, WEXITED | WNOHANG | WNOWAIT, NULL);
                 size_t l = strlen(pw_msg[idx]);
                 snprintf(pw_msg[idx] + l, sizeof pw_msg[idx] - l, " | recheck n=%d revents=%#x waitid=%d si_pid=%d", n2, p2.revents, w2, (int)s2.si_pid);
+                /* Which clause fired, and whether the clocks agree: an early
+                 * wake with a sane timeline points at the kernel's clock or
+                 * pidfd state, a bad timeline at nanosleep/scheduling. */
+                l = strlen(pw_msg[idx]);
+                struct timespec cm, cb, cr;
+                clock_gettime(CLOCK_MONOTONIC, &cm); clock_gettime(CLOCK_BOOTTIME, &cb); clock_gettime(CLOCK_REALTIME, &cr);
+                snprintf(pw_msg[idx] + l, sizeof pw_msg[idx] - l, " | why: n<0=%d revents!=IN=%d alive=%d running=%d early=%d(dt<495=%d c_exit>tready=%d g_exit>tready=%d) tready=%lld tpre=%lld mono=%lld boot=%lld real=%lld ms",
+                         n < 0, pf.revents != POLLIN, alive, running, early, dt < 495, tl->c_exit && tready < tl->c_exit, tl->g_exit && tready < tl->g_exit,
+                         tready, tpre, (long long)cm.tv_sec * 1000 + cm.tv_nsec / 1000000, (long long)cb.tv_sec * 1000 + cb.tv_nsec / 1000000, (long long)cr.tv_sec * 1000 + cr.tv_nsec / 1000000);
                 pw_bad = 1;
             }
             break;
