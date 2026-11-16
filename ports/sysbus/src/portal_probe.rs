@@ -141,6 +141,19 @@ pub async fn run(conn: zbus::Connection, what: &str, timeout_s: u64) -> (u32, u3
     }
 
     if all || what == "screenshot" {
+        // A non-interactive Screenshot makes xdg-desktop-portal ask the user
+        // (Access.AccessDialog, answered by a cosmic dialog) unless the
+        // permission store already holds "yes" for the caller; with nobody to
+        // click it the request times out after 25 s with response 2. Record the
+        // grant the way the dialog's "Allow" would (table "screenshot", id
+        // "screenshot", host app id "").
+        check!("PermissionStore grants screenshot", async {
+            c.call_method(Some("org.freedesktop.impl.portal.PermissionStore"),
+                "/org/freedesktop/impl/portal/PermissionStore",
+                Some("org.freedesktop.impl.portal.PermissionStore"), "SetPermission",
+                &("screenshot", true, "screenshot", "", vec!["yes"])).await?;
+            Ok::<_, zbus::Error>(String::from("host app: yes"))
+        });
         check!("Screenshot.Screenshot (non-interactive)", async {
             let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
             opts.insert("handle_token", "leandros_shot".into());
@@ -154,6 +167,9 @@ pub async fn run(conn: zbus::Connection, what: &str, timeout_s: u64) -> (u32, u3
             let uri: String = r.get("uri").cloned().ok_or_else(|| fail("no uri"))?.try_into()?;
             let path = uri_path(&uri).ok_or_else(|| fail(format!("not a file uri: {uri}")))?;
             let data = std::fs::read(&path).map_err(|e| fail(format!("{path}: {e}")))?;
+            if data.is_empty() {
+                return Err(fail(format!("{path}: empty file")));
+            }
             if data.len() < 24 || &data[..8] != b"\x89PNG\r\n\x1a\n" || &data[12..16] != b"IHDR" {
                 return Err(fail(format!("{path}: not a PNG ({} bytes)", data.len())));
             }
