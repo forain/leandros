@@ -336,14 +336,17 @@ static void rtnl_write_tests(void) {
 
 
 /* ---- IPv6 (design-ipv6 L6) ---- */
-static int nl_addr6(int s, int type, int flags, int idx, const char *ip, int plen) {
+static int nl_addr6f(int s, int type, int flags, int idx, const char *ip, int plen, int ifaf) {
     struct ifaddrmsg a; memset(&a, 0, sizeof a);
-    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = idx; a.ifa_flags = IFA_F_NODAD;
+    a.ifa_family = AF_INET6; a.ifa_prefixlen = plen; a.ifa_index = idx; a.ifa_flags = ifaf;
     struct in6_addr in; inet_pton(AF_INET6, ip, &in);
     struct nlb m; nl_begin(&m, type, flags, &a, sizeof a);
     nl_attr(&m, IFA_LOCAL, &in, 16);
     nl_attr(&m, IFA_ADDRESS, &in, 16);
     return nl_do(s, &m);
+}
+static int nl_addr6(int s, int type, int flags, int idx, const char *ip, int plen) {
+    return nl_addr6f(s, type, flags, idx, ip, plen, IFA_F_NODAD);
 }
 /* Find an address in an AF_INET6 dump (idx 0 = any): returns scope+1, or 0. */
 static int find_addr6(int s, int idx, const char *ip, int plen, int fam) {
@@ -573,7 +576,7 @@ static void v6_tests(void) {
         if (eth) {   /* DAD: NEWADDR carries IFA_F_TENTATIVE first, then again once permanent */
             int st = nl_subscribe(1, RTMGRP_IPV6_IFADDR, 0);
             struct in6_addr d6; inet_pton(AF_INET6, "2001:db8:1::9", &d6);
-            nl_addr6(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, eth, "2001:db8:1::9", 64);
+            nl_addr6f(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, eth, "2001:db8:1::9", 64, 0);
             char dv[16] = "";
             int dad = proc_has("/proc/sys/net/ipv6/conf/eth0/accept_dad", "1") && !proc_has("/proc/sys/net/ipv6/conf/eth0/dad_transmits", "0");
             unsigned f1 = 0;
