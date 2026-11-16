@@ -8,6 +8,9 @@
 #include <netinet/icmp6.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
+#include <poll.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #ifndef IPV6_MTU_DISCOVER
 #define IPV6_MTU_DISCOVER 23
@@ -296,6 +299,151 @@ static void udp_pmtud_want_frag(void) {
     char why[220] = ""; ssize_t n = read(p[0], why, sizeof why - 1); waitpid(c, NULL, 0);
     if (n <= 0) fail(N, "child died");
     else if (!strncmp(why, "SKIP", 4)) fail(N, "%s", why);
+    else if (why[0]) fail(N, "%s", why);
+    else pass(N);
+}
+
+/* Lane udp6frag: IPv6 source fragmentation. A datagram over the cached path
+ * MTU (ICMPv6 packet-too-big, 1280) leaves as Fragment-header packets cut to
+ * it (one ident, offsets contiguous, M on all but the last, each <= 1280);
+ * looped back through the wire they reassemble (in order and reversed);
+ * IPV6_DONTFRAG makes the same send EMSGSIZE with nothing on the wire. */
+#ifndef IPV6_DONTFRAG
+#define IPV6_DONTFRAG 62
+#endif
+static int tun6_addr(const char *ifn, const char *ip, int plen) {
+    struct { struct nlmsghdr h; struct ifaddrmsg a; struct rtattr r1; struct in6_addr l; struct rtattr r2; struct in6_addr x; } m;
+    memset(&m, 0, sizeof m);
+    m.h.nlmsg_len = sizeof m; m.h.nlmsg_type = RTM_NEWADDR; m.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK;
+    m.a.ifa_family = AF_INET6; m.a.ifa_prefixlen = plen; m.a.ifa_index = if_nametoindex(ifn);
+    m.r1.rta_len = RTA_LENGTH(16); m.r1.rta_type = IFA_LOCAL; inet_pton(AF_INET6, ip, &m.l);
+    m.r2.rta_len = RTA_LENGTH(16); m.r2.rta_type = IFA_ADDRESS; m.x = m.l;
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    char rb[512]; int r = -1;
+    if (send(s, &m, sizeof m, 0) == (ssize_t)sizeof m) {
+        ssize_t n = recv(s, rb, sizeof rb, 0);
+        struct nlmsghdr *h = (struct nlmsghdr *)rb;
+        if (n >= (ssize_t)NLMSG_HDRLEN && h->nlmsg_type == NLMSG_ERROR) r = -((struct nlmsgerr *)NLMSG_DATA(h))->error;
+    }
+    close(s);
+    return r;
+}
+
+/* Read the fragments of one datagram off the wire into fr[] (raw packets). */
+static int pmtud6_collect(int tun, uint8_t fr[][1600], int *frlen, int max, char *why, size_t wl, int pmtu, int paylen) {
+    int nfr = 0, total = 0, next = 0; uint32_t ident = 0; static uint8_t pk[2048];
+    for (int tries = 0; tries < 40; tries++) {
+        ssize_t n = read(tun, pk, sizeof pk);
+        if (n <= 0) { msleep(50); continue; }
+        if ((pk[0] >> 4) != 6 || pk[6] != 44) continue;       /* only Fragment-header packets */
+        int plen = (pk[4] << 8) | pk[5], len = 40 + plen;
+        uint8_t *h = pk + 40;
+        int fo = (((h[2] << 8) | h[3]) & 0xfff8), mf = h[3] & 1, pay = plen - 8;
+        uint32_t id = (h[4] << 24) | (h[5] << 16) | (h[6] << 8) | h[7];
+        if (len > pmtu) { snprintf(why, wl, "fragment %d is %d bytes, over the %d path", nfr, len, pmtu); return -1; }
+        if (h[0] != 17) { snprintf(why, wl, "fragment header next header %d, want 17", h[0]); return -1; }
+        if (nfr && id != ident) { snprintf(why, wl, "ident changed %u -> %u", ident, id); return -1; }
+        ident = id;
+        if (fo != next) { snprintf(why, wl, "fragment %d offset %d, want %d", nfr, fo, next); return -1; }
+        if (mf && (pay & 7)) { snprintf(why, wl, "non-last fragment payload %d not a multiple of 8", pay); return -1; }
+        if (nfr >= max) { snprintf(why, wl, "too many fragments"); return -1; }
+        memcpy(fr[nfr], pk, len); frlen[nfr] = len;
+        next += pay; total += pay; nfr++;
+        if (!mf) break;
+    }
+    if (nfr < 3 || total != paylen + 8) { snprintf(why, wl, "%d fragments carrying %d bytes, want >=3 carrying %d", nfr, total, paylen + 8); return -1; }
+    return nfr;
+}
+
+static void pmtud6_child(int wfd, int tun, const char *ifn) {
+    char why[200] = "";
+    uint16_t pmtu = 1280;
+    struct in6_addr me, peer;
+    inet_pton(AF_INET6, "fd00:77::1", &me); inet_pton(AF_INET6, "fd00:77::2", &peer);
+    static char d[4000], g[4000]; static uint8_t fr[8][1600]; int frlen[8];
+    for (int i = 0; i < 4000; i++) d[i] = (char)(i * 7);
+    if (tun6_addr(ifn, "fd00:77::1", 64)) { snprintf(why, sizeof why, "add v6 address: %s", strerror(errno)); goto out; }
+    int s = socket(AF_INET6, SOCK_DGRAM, 0), r = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 pa = { .sin6_family = AF_INET6, .sin6_port = htons(9000), .sin6_addr = peer };
+    struct sockaddr_in6 ra = { .sin6_family = AF_INET6, .sin6_port = htons(9000), .sin6_addr = IN6ADDR_ANY_INIT };
+    if (bind(r, (struct sockaddr *)&ra, sizeof ra)) { snprintf(why, sizeof why, "bind r: %s", strerror(errno)); goto out; }
+    if (connect(s, (struct sockaddr *)&pa, sizeof pa)) { snprintf(why, sizeof why, "connect: %s", strerror(errno)); goto out; }
+    struct sockaddr_in6 la; socklen_t ll = sizeof la; getsockname(s, (struct sockaddr *)&la, &ll);
+    /* ICMPv6 packet-too-big from the peer quoting our datagram, onto the wire */
+    uint8_t m[40 + 8 + 40 + 8]; memset(m, 0, sizeof m);
+    m[0] = 0x60; m[5] = sizeof m - 40; m[6] = 58; m[7] = 64;
+    memcpy(m + 8, &peer, 16); memcpy(m + 24, &me, 16);
+    uint8_t *ic = m + 40; ic[0] = 2; ic[6] = pmtu >> 8; ic[7] = pmtu & 255;
+    uint8_t *q = ic + 8; q[0] = 0x60; q[4] = (8 + 3000) >> 8; q[5] = (8 + 3000) & 255; q[6] = 17; q[7] = 63;
+    memcpy(q + 8, &me, 16); memcpy(q + 24, &peer, 16);
+    memcpy(q + 40, &la.sin6_port, 2); memcpy(q + 42, &pa.sin6_port, 2);
+    uint16_t c = csum6(&peer, &me, ic, 8 + 48); ic[2] = c >> 8; ic[3] = c & 255;
+    if (write(tun, m, sizeof m) != (ssize_t)sizeof m) { snprintf(why, sizeof why, "inject: %s", strerror(errno)); goto out; }
+    msleep(200);
+    int v = 0; socklen_t vl = sizeof v;
+    if (getsockopt(s, IPPROTO_IPV6, IPV6_MTU, &v, &vl) || v != pmtu) { snprintf(why, sizeof why, "IPV6_MTU %d (%s), want %d", v, strerror(errno), pmtu); goto out; }
+    while (read(tun, fr[0], 1600) > 0) {}
+    if (send(s, d, 3000, 0) != 3000) { snprintf(why, sizeof why, "default send of 3000: %s", strerror(errno)); goto out; }
+    msleep(200);
+    int nfr = pmtud6_collect(tun, fr, frlen, 8, why, sizeof why, pmtu, 3000);
+    if (nfr < 0) goto out;
+    /* loop the fragments back (addresses swapped: the UDP checksum is unchanged), in order then reversed */
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            while (read(tun, fr[7], 1600) > 0) {}
+            if (send(s, d, 3000, 0) != 3000) { snprintf(why, sizeof why, "second send: %s", strerror(errno)); goto out; }
+            msleep(200);
+            nfr = pmtud6_collect(tun, fr, frlen, 8, why, sizeof why, pmtu, 3000);
+            if (nfr < 0) goto out;
+        }
+        for (int i = 0; i < nfr; i++) {
+            int k = round ? nfr - 1 - i : i;
+            uint8_t t[16]; memcpy(t, fr[k] + 8, 16); memcpy(fr[k] + 8, fr[k] + 24, 16); memcpy(fr[k] + 24, t, 16);
+            if (write(tun, fr[k], frlen[k]) != frlen[k]) { snprintf(why, sizeof why, "loopback write: %s", strerror(errno)); goto out; }
+        }
+        struct pollfd pf = { r, POLLIN, 0 };
+        ssize_t got = poll(&pf, 1, 3000) > 0 ? recv(r, g, sizeof g, 0) : -1;
+        if (got != 3000 || memcmp(g, d, 3000)) { snprintf(why, sizeof why, "reassembly round %d: received %zd bytes (%s), want the 3000 sent", round, got, got < 0 ? "none" : "content or size differs"); goto out; }
+    }
+    int on = 1;
+    if (setsockopt(s, IPPROTO_IPV6, IPV6_DONTFRAG, &on, sizeof on)) { snprintf(why, sizeof why, "set IPV6_DONTFRAG: %s", strerror(errno)); goto out; }
+    v = 0; vl = sizeof v;
+    if (getsockopt(s, IPPROTO_IPV6, IPV6_DONTFRAG, &v, &vl) || v != 1) { snprintf(why, sizeof why, "IPV6_DONTFRAG reads %d, want 1", v); goto out; }
+    while (read(tun, fr[0], 1600) > 0) {}
+    errno = 0;
+    if (send(s, d, 3000, 0) != -1 || errno != EMSGSIZE) { snprintf(why, sizeof why, "DONTFRAG send of 3000: %s, want EMSGSIZE", strerror(errno)); goto out; }
+    msleep(100);
+    for (int i = 0; i < 5; i++) {
+        ssize_t n = read(tun, fr[0], 1600);
+        if (n > 0 && (fr[0][0] >> 4) == 6 && (fr[0][6] == 44 || fr[0][6] == 17)) { snprintf(why, sizeof why, "DONTFRAG refused send still put a packet on the wire"); goto out; }
+    }
+    if (send(s, d, 1000, 0) != 1000) snprintf(why, sizeof why, "DONTFRAG send of 1000: %s", strerror(errno));
+out:
+    write(wfd, why, strlen(why) + 1);
+}
+
+static void udp6_pmtud_want_frag(void) {
+    const char *N = "udp6_pmtud_want_frag";
+    if (skipped(N)) return;
+    int p[2]; if (pipe(p)) { fail(N, "pipe"); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        char why[220] = "";
+        if (unshare(CLONE_NEWNET)) { snprintf(why, sizeof why, "SKIP unshare: %s", strerror(errno)); write(p[1], why, strlen(why) + 1); _exit(0); }
+        int tun = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+        struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+        strcpy(ifr.ifr_name, "pm6%d"); ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        if (tun < 0 || ioctl(tun, 0x400454ca, &ifr) < 0) { snprintf(why, sizeof why, "SKIP tun: %s", strerror(errno)); write(p[1], why, strlen(why) + 1); _exit(0); }
+        int u = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in *sa = (struct sockaddr_in *)&ifr.ifr_addr;
+        sa->sin_family = AF_INET; inet_pton(AF_INET, "10.78.0.1", &sa->sin_addr); ioctl(u, SIOCSIFADDR, &ifr);
+        inet_pton(AF_INET, "255.255.255.0", &sa->sin_addr); ioctl(u, SIOCSIFNETMASK, &ifr);
+        ioctl(u, SIOCGIFFLAGS, &ifr); ifr.ifr_flags |= IFF_UP; ioctl(u, SIOCSIFFLAGS, &ifr); close(u);
+        pmtud6_child(p[1], tun, ifr.ifr_name);
+        _exit(0);
+    }
+    char why[220] = ""; ssize_t n = read(p[0], why, sizeof why - 1); waitpid(c, NULL, 0);
+    if (n <= 0) fail(N, "child died");
     else if (why[0]) fail(N, "%s", why);
     else pass(N);
 }
