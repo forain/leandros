@@ -1525,6 +1525,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         arch_x86_64::cpufreq::set_msrtest(k("cpu.msrtest").unwrap_or(0) != 0);
     }
     if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "idmap=off")) { sched::ns::set_idmap_off(); }
+    if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pidns.zaptest=1")) { sched::pidns::set_zaptest(); }
     // `apic.x2apic=1`: run the local APICs in x2APIC mode even when no APIC
     // ID needs it (tests the mode firmware and kexec hand-offs leave us in).
     #[cfg(target_arch = "x86_64")]
