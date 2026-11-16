@@ -277,6 +277,9 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
         }
         if (1..=4).contains(&ty) { return icmp6_err_rx(nic, buf); }
         if ty != 129 { return false; }
+    } else if buf[20] == PROTO_ICMP6 {
+        // Short ICMPv6 (plen < 24): only an echo reply (8-byte header + <16 bytes of data, e.g. a bare ping) is of interest.
+        if plen < 8 || buf.len() < 54 + 8 || buf[54] != 129 { return false; }
     } else if buf[20] != PROTO_TCP && buf[20] != PROTO_UDP { return false; }
     fwd::stat6(fwd::S6_RX_L4);
     let mut st = FWD.lock();
