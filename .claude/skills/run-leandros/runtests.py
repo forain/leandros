@@ -329,6 +329,7 @@ SUITES = {
     "evclock": ["host:evclocktest.py"],
     "f2fscp": ["host:f2fscptest.py"],
     "f2fscrash": ["host:f2fscrashtest.py"],
+    "f2fscrashlx": ["host:f2fscrashtest.py --linux --iters 6"],  # needs the box (F2FSINTEROP_LOCK); opt-in, not in regress
     "f2fsfull": ["host:f2fsfulltest.py"],
     "f2fsorphan": ["host:f2fsorphantest.py"],
     "hidkey": ["host:hidkeytest.py"],
