@@ -9,6 +9,7 @@
 extern crate leandros_libc;
 use leandros_libc::*;
 
+mod bench;
 mod churn;
 mod commit;
 mod crash;
@@ -37,6 +38,12 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return churn::churn(dir, factor.max(1));
             }
             b"verify" => return churn::verify(dir),
+            b"fsyncbench" => {
+                let n = if argc >= 4 {
+                    arg(argv, 3).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
+                } else { 300 };
+                return bench::fsyncbench(dir, n.max(1));
+            }
             b"crash" => {
                 let seed = if argc >= 4 {
                     arg(argv, 3).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
