@@ -1903,10 +1903,11 @@ static int fwd6_body(void) {
     struct timeval tv = { 4, 0 };
     setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     int pr = 3;
+    printf("DIAG child ping bridge fd00:97::1 -> %d\n", ping6_sock(ic, "fd00:97::1", 9)); fflush(stdout);
     for (int k = 0; k < 3 && pr; k++) pr = ping6_sock(ic, g_gw6, 1 + k); /* NEW then reply (the first may be lost to ND): the flow is now established */
     if (pr) {
         printf("DIAG v6 ping to %s: rc %d errno %d\n", g_gw6, pr, errno); fflush(stdout);
-        system("cat /proc/net/if_inet6 /proc/net/ipv6_route 2>&1 | head -12; grep -h '^fwd' /proc/net/nic | head -8");
+        system("cat /proc/net/if_inet6 /proc/net/ipv6_route 2>&1 | head -12; cat /proc/net/nic | head -30");
         return 6;
     }
     write(done_[1], &ch, 1);
