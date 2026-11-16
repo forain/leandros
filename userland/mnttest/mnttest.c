@@ -2684,48 +2684,77 @@ static int e7x_ns0_many(int m) {
     if (!rc && e7x_mrefs() != base) { printf("  mrefs leaked=%d base=%d\n", e7x_mrefs(), base); rc = 23; }
     return rc;
 }
-/* lane mntrace: open() racing umount2(MNT_DETACH) must still record the mount the fd was opened through */
+/* lane mntrace: open() racing umount2(MNT_DETACH) must still record the mount the fd was opened through.
+ * Every failure prints one "DIAG e7race:" line carrying everything needed to diagnose it from the log. */
 static int e7x_race(int m) {
     (void)m;
     volatile int *stop = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (stop == MAP_FAILED) return 12;
-    *stop = 0;
+    long long t0 = now_ns();
+#define E7R_DIAG(rc, fmt, ...) printf("DIAG e7race: rc=%d " fmt " ms=%lld\n", rc, ##__VA_ARGS__, (now_ns() - t0) / 1000000)
+    if (stop == MAP_FAILED) { E7R_DIAG(12, "mmap errno=%d", errno); return 12; }
+    stop[0] = 0; stop[1] = 0; stop[2] = 0; stop[3] = 0; stop[4] = 0;
     mkdir("/tmp/e7x/rc", 0755);
     struct stat ss, st;
-    if (stat("/tmp/e7x/src", &ss) < 0) return 13;
+    if (stat("/tmp/e7x/src", &ss) < 0) { E7R_DIAG(13, "stat src errno=%d", errno); return 13; }
     pid_t c = fork();
-    if (c < 0) return 14;
+    if (c < 0) { E7R_DIAG(14, "fork errno=%d", errno); return 14; }
     if (c == 0) {
-        while (!*stop) {
+        /* stop[2]=child exit site (1 mount, 2 remount), stop[3]=its errno, stop[4]=cycles done */
+        while (!stop[0]) {
             stop[1]++; /* odd: mounting, not yet read-only */
-            if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) _exit(1);
-            if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
+            if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) { stop[3] = errno; stop[2] = 1; _exit(1); }
+            if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { stop[3] = errno; stop[2] = 2; umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
             stop[1]++; /* even: read-only for sure */
             for (volatile int i = 0; i < 3000; i++) {}
             umount2("/tmp/e7x/rc", MNT_DETACH);
+            stop[4]++;
         }
         _exit(0);
     }
-    int through = 0, bad = 0;
-    for (int i = 0; i < 150000 && !bad && (i < 3000 || through < 400); i++) {
+    int through = 0, bad = 0, i = 0, opens = 0, openfail = 0, lasterr = 0;
+    for (; i < 150000 && !bad && (i < 3000 || through < 400); i++) {
         int g1 = stop[1];
         int d = open("/tmp/e7x/rc", O_RDONLY | O_DIRECTORY);
-        if (d < 0) continue;
+        if (d < 0) { openfail++; lasterr = errno; continue; }
+        opens++;
         int g2 = stop[1];
         if ((g1 & 1) == 0 && g1 == g2 && fstat(d, &st) == 0 && st.st_ino == ss.st_ino && st.st_dev == ss.st_dev) {
             through++;
             /* the mount is gone by now or soon: the fd keeps the ro flag it was opened with */
             for (volatile int k = 0; k < 400; k++) {}
             errno = 0; int fd = openat(d, "rz", O_CREAT | O_WRONLY, 0644);
-            if (fd >= 0 || errno != EROFS) { printf("  fd opened through ro mount lost it: iter=%d errno=%d\n", i, errno); bad = 1; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/rz"); } }
+            if (fd >= 0 || errno != EROFS) {
+                int e = errno, g3 = stop[1];
+                E7R_DIAG(16, "check=ro-lost iter=%d through=%d errno=%d created=%d g1=%d g2=%d g3=%d cycles=%d child_exit_site=%d child_errno=%d",
+                         i, through, e, fd >= 0, g1, g2, g3, stop[4], stop[2], stop[3]);
+                bad = 1; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/rz"); }
+            }
         }
         close(d);
     }
-    *stop = 1;
+    stop[0] = 1;
     int sts; waitpid(c, &sts, 0);
     umount2("/tmp/e7x/rc", MNT_DETACH);
-    if (through < 3) { printf("  only %d opens went through the mount\n", through); return 15; }
+    if (stop[2]) { E7R_DIAG(stop[2], "check=child-mount-failed site=%d errno=%d cycles=%d iter=%d through=%d", stop[2], stop[3], stop[4], i, through); if (!bad) return 17; }
+    if (through < 3) {
+        E7R_DIAG(15, "check=too-few-through iter=%d through=%d opens=%d openfail=%d lasterr=%d cycles=%d gen=%d", i, through, opens, openfail, lasterr, stop[4], stop[1]);
+        return 15;
+    }
     return bad ? 16 : 0;
+}
+/* `mnttest race [N]`: loop the open-vs-detach race N times (default 20) for load reproduction */
+static int race_loop(int n) {
+    mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        long long t0 = now_ns();
+        int ok = nn_in_child(e7x_race, 0);
+        printf("race run %d/%d: %s (%lld ms)\n", i + 1, n, ok ? "PASS" : "FAIL", (now_ns() - t0) / 1000000);
+        if (!ok) bad++;
+    }
+    system("rm -rf /tmp/e7x");
+    printf("race: %d/%d failed\n", bad, n);
+    return bad ? 1 : 0;
 }
 static void e7x_suite(void) {
     e7_mk();
@@ -3115,6 +3144,7 @@ static void procbind_suite(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "race")) return race_loop(argc > 2 ? atoi(argv[2]) : 20);
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
     if (argc > 1 && !strcmp(argv[1], "euid-chk")) return geteuid() == 1000 ? 42 : geteuid() == 0 ? 44 : 45;
     newapi_enosys();

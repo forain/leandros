@@ -11913,11 +11913,27 @@ impl KPath {
             kp.ns = Some(ns);
             return Ok(kp);
         }
-        let mut denied = false;
-        let walked = backing_walk_d(&ns, &mut false, &mut denied);
-        if denied { return Err(-13); }
         // Per-mount flags of the ns-0 mount the path lies in (ro/nodev/noexec).
-        let (mid0, fl) = vfs::alias::mount_at(&ns).unwrap_or((0, 0));
+        // Looked up BEFORE the backing walk and re-checked after it: the walk
+        // translates through the alias table, so a mount lazily detached between
+        // the walk and a later lookup would leave a path that resolved through
+        // the mount with no mount (and no flags) recorded on the fd. Mount ids
+        // are never reused, so the same id on both sides means the mount was
+        // live across the whole walk.
+        let mut denied = false;
+        let mut mnt0 = vfs::alias::mount_at(&ns);
+        let mut walked = backing_walk_d(&ns, &mut false, &mut denied);
+        if denied { return Err(-13); }
+        if mnt0.is_some() {
+            for _ in 0..8 {
+                let again = vfs::alias::mount_at(&ns);
+                if again.map(|m| m.0) == mnt0.map(|m| m.0) { break; }
+                mnt0 = again;
+                walked = backing_walk_d(&ns, &mut false, &mut denied);
+                if denied { return Err(-13); }
+            }
+        }
+        let (mid0, fl) = mnt0.unwrap_or((0, 0));
         let mut kp = match walked { Some(b) => {
             if b.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
             let mut kp = KPath::raw(&b);
