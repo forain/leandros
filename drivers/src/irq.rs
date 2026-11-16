@@ -344,6 +344,7 @@ pub extern "C" fn drivers_irq_report(buf: *mut u8, cap: usize) -> usize {
             let _ = writeln!(w, "{:>5}: {:>10}  IDT-MSI", v, s.count.load(Ordering::Relaxed));
         }
     }
+    crate::virtio_blk::wait_stats(&mut w);
     w.n
 }
 

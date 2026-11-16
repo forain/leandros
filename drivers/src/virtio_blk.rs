@@ -8,6 +8,8 @@
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
+use core::sync::atomic::AtomicU64;
+use core::fmt::Write as _;
 use crate::kenv::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
 use crate::kenv::{mm, sched};
 
@@ -281,8 +283,9 @@ impl VirtQueue {
                 n = n.wrapping_add(1);
                 if n % 16 == 0 && sched::monotonic_ns().saturating_sub(s0) >= win { break; }
             }
-            if self.last_used_idx != used_idx.read_volatile() { armed = false; }
+            if self.last_used_idx != used_idx.read_volatile() { armed = false; ST_SPIN_HIT.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
         }
+        ST_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let parked = armed;
         let _w = if armed { Some(WaitingCpu::enter()) } else { None };
         let mut warn_at = slow_ns;
@@ -290,7 +293,24 @@ impl VirtQueue {
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
             spins = spins.wrapping_add(1);
             if armed {
-                park_until_irq(|| used_idx.read_volatile() != last);
+                use core::sync::atomic::Ordering::Relaxed;
+                ST_PARK.fetch_add(1, Relaxed);
+                let i0 = BLK_IRQS.load(Relaxed);
+                let p0 = sched::monotonic_ns();
+                if park_until_irq(|| used_idx.read_volatile() != last) {
+                    ST_HLT.fetch_add(1, Relaxed);
+                    let dt = sched::monotonic_ns().saturating_sub(p0);
+                    if BLK_IRQS.load(Relaxed) != i0 {
+                        ST_WAKE_IRQ.fetch_add(1, Relaxed);
+                        ST_WAKE_IRQ_NS.fetch_add(dt, Relaxed);
+                    } else {
+                        ST_WAKE_OTHER.fetch_add(1, Relaxed);
+                        ST_WAKE_OTHER_NS.fetch_add(dt, Relaxed);
+                        if used_idx.read_volatile() != last { ST_WAKE_OTHER_DONE.fetch_add(1, Relaxed); }
+                    }
+                } else {
+                    ST_RECHECK_HIT.fetch_add(1, Relaxed);
+                }
             }
             if armed || spins % 256 == 0 {
                 // A syscall (aarch64 reads run IRQ-masked with preemption
@@ -406,11 +426,13 @@ impl Drop for WaitingCpu {
 /// at the `hlt`). IRQ state is preserved: a masked caller gets an explicit
 /// window (preemption off, so the tick cannot switch tasks under the device
 /// lock); an unmasked one has IRQs re-enabled on return.
-fn park_until_irq(done: impl Fn() -> bool) {
+fn park_until_irq(done: impl Fn() -> bool) -> bool {
+    let mut halted = false;
     unsafe {
         if sched::irqs_masked() {
             sched::preempt_disable();
             if !done() {
+                halted = true;
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("wfi", options(nomem, nostack));
                 #[cfg(target_arch = "x86_64")]
@@ -422,17 +444,41 @@ fn park_until_irq(done: impl Fn() -> bool) {
             #[cfg(target_arch = "aarch64")]
             {
                 core::arch::asm!("msr daifset, #2", options(nomem, nostack));
-                if !done() { core::arch::asm!("wfi", options(nomem, nostack)); }
+                if !done() { halted = true; core::arch::asm!("wfi", options(nomem, nostack)); }
                 core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
             }
             #[cfg(target_arch = "x86_64")]
             {
                 core::arch::asm!("cli", options(nomem, nostack));
-                if !done() { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+                if !done() { halted = true; core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                 else { core::arch::asm!("sti", options(nomem, nostack)); }
             }
         }
     }
+    halted
+}
+
+/// Wait statistics (`/proc/interrupts` "virtio-blk wait:" line): why each
+/// park ended, to tell a lost or late wakeup from a timely IRQ.
+static ST_WAITS: AtomicU64 = AtomicU64::new(0);
+static ST_SPIN_HIT: AtomicU64 = AtomicU64::new(0);
+static ST_PARK: AtomicU64 = AtomicU64::new(0);
+static ST_RECHECK_HIT: AtomicU64 = AtomicU64::new(0);
+static ST_HLT: AtomicU64 = AtomicU64::new(0);
+static ST_WAKE_IRQ: AtomicU64 = AtomicU64::new(0);
+static ST_WAKE_OTHER: AtomicU64 = AtomicU64::new(0);
+static ST_WAKE_OTHER_DONE: AtomicU64 = AtomicU64::new(0);
+static ST_WAKE_OTHER_NS: AtomicU64 = AtomicU64::new(0);
+static ST_WAKE_IRQ_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Append the wait statistics line to `/proc/interrupts`.
+pub fn wait_stats(w: &mut dyn core::fmt::Write) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let _ = writeln!(w,
+        "virtio-blk wait: waits={} spin_hit={} park={} recheck_hit={} hlt={} wake_irq={} wake_other={} wake_other_done={} wake_irq_us={} wake_other_us={} irqs={}",
+        ST_WAITS.load(Relaxed), ST_SPIN_HIT.load(Relaxed), ST_PARK.load(Relaxed), ST_RECHECK_HIT.load(Relaxed),
+        ST_HLT.load(Relaxed), ST_WAKE_IRQ.load(Relaxed), ST_WAKE_OTHER.load(Relaxed), ST_WAKE_OTHER_DONE.load(Relaxed),
+        ST_WAKE_IRQ_NS.load(Relaxed) / 1000, ST_WAKE_OTHER_NS.load(Relaxed) / 1000, BLK_IRQS.load(Relaxed));
 }
 
 /// Completion handler. `ctx` is 0 for a private MSI-X vector, else the INTID of
