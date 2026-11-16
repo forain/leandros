@@ -452,7 +452,8 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
     let now = sched::monotonic_ns();
     // Nftables is loaded but no nat/postrouting chain exists: nothing may masquerade, so the packet is
     // routed to the NIC subnet with its source address kept (Linux ip_forward without a NAT rule).
-    if crate::nfnl::has_tables(0) && !crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
+    if crate::nfnl::has_tables(0) && !crate::nfnl::has_hook(0, crate::nfnl::H_POST)
+        && !FWD.lock().ct.iter().any(|e| e.kind == 0 && e.proto == p.proto && e.br == br && e.port == port && e.cip == p.src && e.cport == p.sport) {
         let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
         let est = p.proto == PROTO_TCP && p.flags & 0x12 != 0x02;
         let rp = if p.proto == PROTO_ICMP { 0 } else { p.dport };

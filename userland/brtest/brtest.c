@@ -1941,9 +1941,11 @@ static void nftfwd_midflow(void) { g_fwd_expect_ovr = 0; fwd_case("nftfwd_midflo
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
 /* ICMP errors of a tracked flow are `ct state related`: with a default-drop FORWARD policy they pass only when a rule accepts them. */
 static const char FR_RULES_OFF[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n}\n";
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.97.0.0/24 masquerade\n }\n}\n";
 static const char FR_RULES_ON[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.97.0.0/24 masquerade\n }\n}\n";
 static void nftfwd_related_off(void) {
     g_fwd_nft = FR_RULES_OFF; g_fwd_expect_ovr = 0;
     g_fwd_msg = "ICMP port-unreachable (ct state related) is dropped by the default-drop policy";
