@@ -79,7 +79,7 @@ def main():
         rc, o = guest("ls /bin/vkwl /usr/lib/libvulkan_virtio.so /bin/start-cosmic-leandros")
         check("vkwl + venus ICD + session launcher shipped", rc == 0, o.strip()[-120:])
         guest("mkdir -p /run/user/0; chmod 0700 /run/user/0; "
-              "sh /bin/start-cosmic-leandros > /run/user/0/cosmic.log 2>&1 &", timeout=60)
+              "(sh /bin/start-cosmic-leandros > /run/user/0/cosmic.log 2>&1 &)", timeout=60)
         rc, o = guest("i=0; while [ $i -lt 240 ]; do for w in /run/user/0/wayland-*; do [ -S $w ] && break 2; done; "
                       "sleep 1; i=$((i+1)); done; echo WAITED=$i; ls /run/user/0", timeout=300)
         sock = re.search(r"(wayland-\d+)\b", o.split("WAITED=")[-1])
