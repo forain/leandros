@@ -794,7 +794,10 @@ unsafe fn t_present_in_release_window(tty0: c_int) -> bool {
         if t1 >= 0 { close(t1); }
         return report(b"present_in_release_window", false);
     }
+    // Both the release (USR1) and acquire (USR2) signals must be ignored: the
+    // default action of either kills the test.
     let old = signal(SIGUSR1, SIG_IGN);
+    let old2 = signal(12, SIG_IGN);
     let grant = set_master(fd) == 0;
     let before = dirtyfb(fd) == 0;
     let pm = vt_mode { mode: VT_PROCESS, waitv: 0, relsig: 10, acqsig: 12, frsig: 0, _guard: 0 };
@@ -828,6 +831,7 @@ unsafe fn t_present_in_release_window(tty0: c_int) -> bool {
     close(fd);
     close(t1);
     signal(SIGUSR1, old);
+    signal(12, old2);
     out(b"  in_window_rc="); out_int(in_rc); out(b" errno="); out_int(in_errno); out(b"\n");
     report(b"present_in_release_window",
            grant && before && armed && req && still1 && refused_in_window && nack
