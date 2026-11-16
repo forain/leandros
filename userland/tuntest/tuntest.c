@@ -635,8 +635,58 @@ static int next_icmp6(int fd, int type, const unsigned char *tgt, unsigned char 
     }
     return 0;
 }
+/* Flags (hex column 5) of the /proc/net/if_inet6 line of `addr32` (32 hex digits) on `ifn`; -1 if absent. */
+static int proc_inet6_flags(const char *addr32, const char *ifn)
+{
+    FILE *f = fopen("/proc/net/if_inet6", "r");
+    if (!f) return -1;
+    char b[256]; int r = -1;
+    while (fgets(b, sizeof b, f)) {
+        unsigned ix, pl, sc, fl; char nm[32];
+        if (strncmp(b, addr32, 32) || sscanf(b + 33, "%x %x %x %x %31s", &ix, &pl, &sc, &fl, nm) != 5) continue;
+        if (!strcmp(nm, ifn)) { r = (int)fl; break; }
+    }
+    fclose(f);
+    return r;
+}
+
+/* vif addresses of the initial namespace are listed in /proc/net/if_inet6 with their DAD flags. */
+static void tun6_proc_cases(void)
+{
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    char tn[IFNAMSIZ];
+    int tp = tun_open("tap%d", F_TAP | F_NO_PI, tn);
+    if (tp < 0 || nl < 0) { CHECK("proc6_tap_create", 0); return; }
+    set_addr(tn, "10.9.0.1", "255.255.255.0");
+    struct in6_addr a2, allnodes;
+    inet_pton(AF_INET6, "fd00:9::2", &a2);
+    inet_pton(AF_INET6, "ff02::1", &allnodes);
+    CHECK("proc6_addr_add", addr6_add(nl, tn, "fd00:9::1", 64) == 0 && addr6_add(nl, tn, "fd00:9::2", 64) == 0);
+    char x1[40] = "fd00" "0009" "0000" "0000" "0000" "0000" "0000" "0001";
+    char x2[40] = "fd00" "0009" "0000" "0000" "0000" "0000" "0000" "0002";
+    int f1 = proc_inet6_flags(x1, tn);
+    CHECK("proc6_vif_listed_tentative", f1 >= 0 && (f1 & 0x40) && !(f1 & 0x800));
+    {   /* a defender answers for fd00:9::2 */
+        unsigned char f[14 + 40 + 32]; memset(f, 0, sizeof f);
+        memcpy(f, "\x33\x33\x00\x00\x00\x01", 6); memcpy(f + 6, p_mac, 6); f[12] = 0x86; f[13] = 0xdd;
+        unsigned char *ip = f + 14; ip[0] = 0x60; ip[5] = 32; ip[6] = 58; ip[7] = 255;
+        memcpy(ip + 8, &a2, 16); memcpy(ip + 24, &allnodes, 16);
+        unsigned char *ic = ip + 40; ic[0] = 136; ic[4] = 0x20; memcpy(ic + 8, &a2, 16);
+        ic[24] = 2; ic[25] = 1; memcpy(ic + 26, p_mac, 6);
+        uint16_t c = icmp6_csum(ip + 8, ip + 24, ic, 32); ic[2] = c >> 8; ic[3] = c;
+        write(tp, f, sizeof f);
+    }
+    usleep(1500 * 1000);
+    int f2 = proc_inet6_flags(x2, tn), f1b = proc_inet6_flags(x1, tn);
+    CHECK("proc6_vif_dadfailed", f2 >= 0 && (f2 & 0x800) && (f2 & 0x40));
+    CHECK("proc6_vif_permanent", f1b >= 0 && (f1b & 0x80) && !(f1b & 0x40) && !(f1b & 0x800));
+    close(tp);
+}
+
 static int tun6_cases(void)
 {
+    tun6_proc_cases();
+
     if (enter_ns() != 0) { printf("tun6: unshare failed\n"); return 1; }
     int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     char tn[IFNAMSIZ];
