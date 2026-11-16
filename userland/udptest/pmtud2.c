@@ -388,6 +388,20 @@ static void pmtud6_child(int wfd, int tun, const char *ifn) {
     msleep(200);
     int nfr = pmtud6_collect(tun, fr, frlen, 8, why, sizeof why, pmtu, 3000);
     if (nfr < 0) goto out;
+    /* control: one UNfragmented datagram reflected the same way must reach r (separates rx path from reassembly) */
+    {
+        while (read(tun, fr[7], 1600) > 0) {}
+        if (send(s, d, 600, 0) != 600) { snprintf(why, sizeof why, "send of 600: %s", strerror(errno)); goto out; }
+        msleep(200);
+        ssize_t pn = -1;
+        for (int i = 0; i < 20 && pn <= 0; i++) { pn = read(tun, fr[7], 1600); if (pn <= 0) msleep(50); }
+        if (pn < 48 || fr[7][6] != 17) { snprintf(why, sizeof why, "plain reflect: no UDP packet on the wire (%zd)", pn); goto out; }
+        uint8_t t[16]; memcpy(t, fr[7] + 8, 16); memcpy(fr[7] + 8, fr[7] + 24, 16); memcpy(fr[7] + 24, t, 16);
+        if (write(tun, fr[7], pn) != pn) { snprintf(why, sizeof why, "plain reflect write: %s", strerror(errno)); goto out; }
+        struct pollfd pf = { r, POLLIN, 0 };
+        ssize_t got = poll(&pf, 1, 3000) > 0 ? recv(r, g, sizeof g, 0) : -1;
+        if (got != 600) { snprintf(why, sizeof why, "plain (unfragmented) reflect: received %zd bytes: rx path, not reassembly", got); goto out; }
+    }
     /* loop the fragments back (addresses swapped: the UDP checksum is unchanged), in order then reversed */
     for (int round = 0; round < 2; round++) {
         if (round) {
