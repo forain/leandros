@@ -1895,6 +1895,7 @@ static int fwd6_body(void) {
     int idx = link_get(cs, "eth0", NULL, NULL);
     if (route6_default(cs, idx, "fd00:97::1")) return 3;
     close(cs);
+    sleep(2);                                        /* 1 s IPv6 DAD: a tentative source address sends nothing */
     char ch = 'r'; write(done_[1], &ch, 1);
     if (rd_to(ctl[0], &ch) != 1) return 4;
     int ic = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
@@ -2135,7 +2136,7 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
-    if (only && !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow(); /* opt-in until the NAT66 echo setup works (TODO) */
+    if (!only || !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow();
     if (!only || !strcmp(only, "nftfwd_related_drop")) nftfwd_related_off();
     if (!only || !strcmp(only, "nftfwd_related_accept")) nftfwd_related_on();
     if (!only || !strcmp(only, "nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
