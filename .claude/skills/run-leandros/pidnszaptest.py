@@ -12,7 +12,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
 tag = sys.argv[2] if len(sys.argv) > 2 else f"pidnszap-{arch}"
-os.environ.setdefault("LEANDROS_RUN_ID", f"pidnszap-{arch}")
+# SELF_BOOTS: runtests.py below boots its own VM (own cmdline), so run under our own run id.
+os.environ["LEANDROS_RUN_ID"] = f"{os.environ.get('LEANDROS_RUN_ID', 'x')}-pidnszap"
 r = subprocess.run([sys.executable, os.path.join(HERE, "runtests.py"), arch, tag, "--suite", "pidnszap"])
 print(f"pidnszaptest.py {arch}: {'PASS' if r.returncode == 0 else 'FAIL'}")
 sys.exit(r.returncode)
