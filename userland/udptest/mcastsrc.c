@@ -264,6 +264,8 @@ static void udp6_mcast_deliver(void) {
     int s = socket(AF_INET6, SOCK_DGRAM, 0), noall = 0;
     if (a < 0 || c < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
     setsockopt(c, IPPROTO_IPV6, 29, &noall, sizeof noall);   /* IPV6_MULTICAST_ALL=0 */
+    { struct sockaddr_in6 sb = {0}; sb.sin6_family = AF_INET6; inet_pton(AF_INET6, me, &sb.sin6_addr); sb.sin6_scope_id = ifx;
+      if (bind(s, (struct sockaddr *)&sb, sizeof sb) < 0) { fail(N, "bind sender to %s: %s", me, strerror(errno)); return; } }
     int sif = setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifx, sizeof ifx);
     int hops = 4, sh = setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof hops);
     int rif = -1; socklen_t l = sizeof rif;
