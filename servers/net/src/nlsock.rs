@@ -31,6 +31,18 @@ struct NlSock {
     gen: u64,
 }
 
+/// RTMGRP_* bits a NETLINK_ROUTE socket can bind (or NETLINK_ADD_MEMBERSHIP
+/// `RTNLGRP_n` = bit n-1) to receive IPv6 address / route notifications.
+const GRP_IPV6_IFADDR: u32 = 1 << 8;
+const GRP_IPV6_ROUTE: u32 = 1 << 10;
+const GRP_V6: u32 = GRP_IPV6_IFADDR | GRP_IPV6_ROUTE;
+
+/// Last-seen IPv6 addresses/routes per namespace that has subscribers; the
+/// diff against the live tables is what produces RTM_NEW/DELADDR/ROUTE
+/// multicasts, so every source (static, SLAAC, vif, tun) notifies alike.
+static SNAP: Mutex<BTreeMap<u16, (Vec<rt::A6>, Vec<rt::R6>)>> = Mutex::new(BTreeMap::new());
+static V6_SUBS: AtomicU32 = AtomicU32::new(0);
+
 static NL: Mutex<BTreeMap<u32, NlSock>> = Mutex::new(BTreeMap::new());
 static NL_EVER: AtomicU32 = AtomicU32::new(0);
 
@@ -79,6 +91,7 @@ pub fn bind(ofd: u32, addr_ptr: usize, addrlen: usize) -> Message {
         if pid != 0 { s.pid = pid; }
         s.groups = groups;
     }
+    note_subs();
     ok_reply()
 }
 
@@ -231,6 +244,7 @@ pub fn send(ofd: u32, data: &[u8]) -> Message {
         }
     }
     sock_state_moved(&[sock_state_key(ofd)]);
+    poll_notify();
     val_reply(data.len() as u64)
 }
 
@@ -299,4 +313,77 @@ pub fn recv_msg(ofd: u32, msghdr_ptr: usize, flags: usize) -> Message {
     let truncated = off < d.len();
     unsafe { write_msg_tail(msghdr_ptr, 0, if truncated { MSG_TRUNC } else { 0 }); }
     val_reply(if flags & MSG_TRUNC_F != 0 { d.len() } else { off } as u64)
+}
+
+/// NETLINK_ADD_MEMBERSHIP (1) / NETLINK_DROP_MEMBERSHIP (2) on a netlink socket.
+pub fn membership(ofd: u32, optname: usize, grp: u32) -> Message {
+    if grp == 0 || grp > 31 { return err_reply(-22); }
+    if let Some(s) = NL.lock().get_mut(&ofd) {
+        match optname {
+            1 => s.groups |= 1 << (grp - 1),
+            2 => s.groups &= !(1 << (grp - 1)),
+            _ => {}
+        }
+    }
+    note_subs();
+    ok_reply()
+}
+
+/// Recount the IPv6 subscribers and baseline the namespaces that gained one.
+fn note_subs() {
+    let nss: Vec<u16> = NL.lock().values().filter(|s| s.proto == rt::NETLINK_ROUTE && s.groups & GRP_V6 != 0).map(|s| s.ns.id()).collect();
+    V6_SUBS.store(nss.len() as u32, Ordering::Release);
+    let mut snap = SNAP.lock();
+    snap.retain(|k, _| nss.contains(k));
+    drop(snap);
+    for ns in nss {
+        if !SNAP.lock().contains_key(&ns) { let cur = live6(ns); SNAP.lock().insert(ns, cur); }
+    }
+}
+
+fn live6(ns: u16) -> (Vec<rt::A6>, Vec<rt::R6>) {
+    let (mut a, mut r) = if ns == 0 { (crate::ip6::addrs6(), crate::ip6::routes6()) } else { (crate::ip6::lo_addrs6(ns), Vec::new()) };
+    a.extend(crate::tunbe::addrs6(ns));
+    r.extend(crate::tunbe::routes6(ns));
+    (a, r)
+}
+
+fn with_hdr(mut m: Vec<u8>, ty: u16) -> Vec<u8> {
+    m[4..6].copy_from_slice(&ty.to_ne_bytes());
+    m[6..8].copy_from_slice(&0u16.to_ne_bytes()); // not part of a dump
+    m
+}
+
+/// Multicast the IPv6 address / route changes since the last call to the
+/// subscribed sockets. Cheap when nobody listens; called from the net daemon
+/// loop and right after a request that may have changed state.
+pub fn poll_notify() {
+    if V6_SUBS.load(Ordering::Acquire) == 0 { return; }
+    let nss: Vec<u16> = SNAP.lock().keys().copied().collect();
+    for ns in nss {
+        let cur = live6(ns);
+        let (olda, oldr) = match SNAP.lock().get(&ns) { Some(x) => x.clone(), None => continue };
+        if cur.0 == olda && cur.1 == oldr { continue; }
+        let links = rt::current_links(ns);
+        let name = |i: u32| links.iter().find(|l| l.index == i).map_or(alloc::string::String::new(), |l| l.name.clone());
+        let mut ev: Vec<(u32, Vec<u8>)> = Vec::new();
+        for a in &olda { if !cur.0.iter().any(|c| c.index == a.index && c.addr == a.addr && c.prefix == a.prefix) { ev.push((GRP_IPV6_IFADDR, with_hdr(rt::addr6_msg(a, &name(a.index), 0, 0), 21))); } }
+        for a in &cur.0 { if !olda.contains(a) { ev.push((GRP_IPV6_IFADDR, with_hdr(rt::addr6_msg(a, &name(a.index), 0, 0), 20))); } }
+        for r in &oldr { if !cur.1.contains(r) { ev.push((GRP_IPV6_ROUTE, with_hdr(rt::route6_msg(r, 0, 0, false, None), 25))); } }
+        for r in &cur.1 { if !oldr.contains(r) { ev.push((GRP_IPV6_ROUTE, with_hdr(rt::route6_msg(r, 0, 0, false, None), 24))); } }
+        SNAP.lock().insert(ns, cur);
+        let mut keys = Vec::new();
+        {
+            let mut m = NL.lock();
+            for (&ofd, s) in m.iter_mut() {
+                if s.proto != rt::NETLINK_ROUTE || s.ns.id() != ns { continue; }
+                let mut got = false;
+                for (g, msg) in &ev {
+                    if s.groups & g != 0 && s.q.len() < MAX_QUEUED { s.q.push_back(msg.clone()); got = true; }
+                }
+                if got { s.gen += 1; keys.push(sock_state_key(ofd)); }
+            }
+        }
+        if !keys.is_empty() { sock_state_moved(&keys); }
+    }
 }

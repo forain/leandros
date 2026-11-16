@@ -18,6 +18,8 @@ use alloc::vec::Vec;
 const DGRAM_QLEN: usize = 10;
 
 pub(super) struct DgMsg {
+    /// ofd of the sending socket: its wmem is charged until this is consumed.
+    pub sender: u32,
     pub data: Vec<u8>,
     /// The sender's bound name as getsockname reports it; empty = unnamed.
     pub from: Vec<u8>,
@@ -42,6 +44,35 @@ static AUTOBIND_NEXT: AtomicU32 = AtomicU32::new(1);
 pub(super) fn rd_key(sid: u64) -> u64 { sched::poll_key(sched::poll_class::UNIX_DG, sid as u32) }
 /// Key of "the inbox of `sid` freed space or died".
 pub(super) fn wr_key(sid: u64) -> u64 { sched::poll_key(sched::poll_class::UNIX_DGW, sid as u32) }
+
+/// Key of "a datagram charged to sender `ofd` was consumed or dropped".
+pub(super) fn snd_key(ofd: u32) -> u64 { sched::poll_key(sched::poll_class::UNIX_DGS, ofd) }
+
+/// Per-sender wmem: bytes (data + `DGRAM_OVERHEAD` each) a sending socket has
+/// queued in other sockets' inboxes. They are bounded by its SO_SNDBUF.
+/// A leaf lock, never held together with `UNIX_INBOX`.
+static DG_WMEM: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
+
+/// Charge `n` to `ofd` unless that would pass `limit` (an empty sender may
+/// always queue one datagram).
+fn wmem_charge(ofd: u32, n: usize, limit: usize) -> bool {
+    let mut m = DG_WMEM.lock();
+    let used = m.get(&ofd).copied().unwrap_or(0);
+    if used != 0 && used + n > limit { return false; }
+    m.insert(ofd, used + n);
+    true
+}
+
+fn wmem_release(ofd: u32, n: usize) {
+    {
+        let mut m = DG_WMEM.lock();
+        if let Some(u) = m.get_mut(&ofd) {
+            *u = u.saturating_sub(n);
+            if *u == 0 { m.remove(&ofd); }
+        }
+    }
+    sched::wake_poll_key(snd_key(ofd));
+}
 
 /// The entry of `fd` when it is an AF_UNIX SOCK_DGRAM socket that is not a
 /// socketpair end: state `Unbound` or `UnixListening` (bound).
@@ -89,7 +120,10 @@ pub(super) fn create(sid: u64, peer: u64) {
 pub(super) fn destroy(sid: u64) {
     let ib = UNIX_INBOX.lock().remove(&sid);
     if let Some(ib) = ib {
-        for m in ib.q { for x in m.fds { xfer_drop(x); } }
+        for m in ib.q {
+            wmem_release(m.sender, m.data.len() + DGRAM_OVERHEAD);
+            for x in m.fds { xfer_drop(x); }
+        }
         sched::wake_poll_key(rd_key(sid));
         sched::wake_poll_key(wr_key(sid));
     }
@@ -104,11 +138,17 @@ fn is_full(ib: &Inbox, n: usize) -> bool {
 /// its fds with no lock held).
 fn push(my_sid: u64, dst: u64, msg: DgMsg) -> Result<usize, (i32, DgMsg)> {
     let n = msg.data.len();
+    let sender = msg.sender;
+    let limit = unix_sndbuf(sender); // takes the options lock: before UNIX_INBOX
     let mut m = UNIX_INBOX.lock();
     let Some(ib) = m.get_mut(&dst) else { return Err((-111, msg)) };
     if ib.peer != 0 && ib.peer != my_sid { return Err((-1, msg)); }
     if ib.shut_rd { return Err((-32, msg)); }
     if is_full(ib, n) { return Err((-11, msg)); }
+    // The sender's own budget (Linux sk_wmem_alloc vs sk_sndbuf). Taken under
+    // the inbox lock so a failed push never leaves a charge: the two locks
+    // are leaves, DG_WMEM is only ever the inner one here.
+    if !wmem_charge(sender, n + DGRAM_OVERHEAD, limit) { return Err((-11, msg)); }
     ib.charge += n + DGRAM_OVERHEAD;
     ib.seq = ib.seq.wrapping_add(1);
     ib.q.push_back(msg);
@@ -124,7 +164,7 @@ pub(super) fn pop(sid: u64, peek: bool) -> Pop {
     let Some(ib) = m.get_mut(&sid) else { return Pop::Gone };
     if peek {
         return match ib.q.front() {
-            Some(h) => Pop::Msg(DgMsg { data: h.data.clone(), from: h.from.clone(), cred: h.cred, fds: Vec::new() }),
+            Some(h) => Pop::Msg(DgMsg { sender: h.sender, data: h.data.clone(), from: h.from.clone(), cred: h.cred, fds: Vec::new() }),
             None => Pop::Empty { shut: ib.shut_rd },
         };
     }
@@ -133,6 +173,7 @@ pub(super) fn pop(sid: u64, peek: bool) -> Pop {
             ib.charge = ib.charge.saturating_sub(h.data.len() + DGRAM_OVERHEAD);
             ib.seq = ib.seq.wrapping_add(1);
             drop(m);
+            wmem_release(h.sender, h.data.len() + DGRAM_OVERHEAD);
             sched::wake_poll_key(wr_key(sid));
             Pop::Msg(h)
         }
@@ -172,7 +213,7 @@ pub(super) fn poll(sid: u64, ofd: u32) -> (u64, Option<u64>, Option<sched::PollT
 /// What a blocking call on a datagram socket parks on (`fd_wake_tag`).
 pub(super) fn wake_tag(e: &SockEntry) -> sched::PollTag {
     let o = sock_opts(e.ofd);
-    let mut keys = alloc::vec![sock_state_key(e.ofd)];
+    let mut keys = alloc::vec![sock_state_key(e.ofd), snd_key(e.ofd)];
     if let SockState::UnixListening { bound_idx } = e.state {
         let sid = sid_of(bound_idx);
         if sid != 0 { keys.push(rd_key(sid)); }
@@ -356,7 +397,7 @@ fn send_data(pid: u32, fd: usize, e: &SockEntry, data: Vec<u8>, name: Option<(us
     let me = sock_entry(pid, fd).unwrap_or_else(|| e.clone());
     let (my_sid, from) = my_name(&me);
     let cred = explicit.unwrap_or(Ucred { pid, uid: sched::ruid_of(pid), gid: sched::rgid_of(pid) });
-    match push(my_sid, dst, DgMsg { data, from, cred, fds }) {
+    match push(my_sid, dst, DgMsg { sender: ofd, data, from, cred, fds }) {
         Ok(n) => val_reply(n as u64),
         Err((er, m)) => {
             drop_fds(m.fds);
@@ -540,4 +581,29 @@ pub(super) fn handle_sendmsg(pid: u32, msg: &Message) -> Option<Message> {
     };
     if cp != 0 && cl > 0 && !sched::uaccess::user_range_ok(cp, cl) { return Some(err_reply(-14)); }
     Some(sendmsg(pid, fd, e, mh, false, None, iov, cnt, cp, cl, host_arg(msg)))
+}
+
+/// GC view of the inboxes: for each bound datagram socket (by `BoundPath`
+/// index) the graph nodes of the sockets queued as SCM_RIGHTS in its inbox.
+/// Caller holds BOUND_PATHS (passed in); UNIX_INBOX is the innermost lock.
+pub(super) fn gc_edges(bp: &[BoundPath]) -> Vec<(usize, Vec<usize>)> {
+    let m = UNIX_INBOX.lock();
+    let mut out = Vec::new();
+    for (bi, b) in bp.iter().enumerate() {
+        if !b.in_use { continue; }
+        let Some(ib) = m.get(&b.sock_id) else { continue };
+        let t: Vec<usize> = ib.q.iter().flat_map(|d| d.fds.iter()).filter_map(gc_target).collect();
+        if !t.is_empty() { out.push((bi, t)); }
+    }
+    out
+}
+
+/// Lift every queued fd out of the inbox of `sid` (the GC found it
+/// unreachable). The datagrams stay, without their descriptors.
+pub(super) fn gc_take(sid: u64) -> Vec<XferFd> {
+    let mut out = Vec::new();
+    if let Some(ib) = UNIX_INBOX.lock().get_mut(&sid) {
+        for d in ib.q.iter_mut() { out.append(&mut d.fds); }
+    }
+    out
 }

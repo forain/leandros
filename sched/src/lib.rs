@@ -3689,6 +3689,9 @@ pub mod poll_class {
     /// Same inbox, write side (`unixdg::wr_key`): the receiver drained a
     /// datagram or went away, so a sender parked on a full inbox re-probes.
     pub const UNIX_DGW: u32 = 29;
+    /// A datagram sender's own wmem budget (`unixdg::snd_key`, indexed by its
+    /// ofd): a datagram it queued in some inbox was consumed or dropped.
+    pub const UNIX_DGS: u32 = 30;
 }
 
 /// Bumped by every producer whose object's poll tag itself changes (a

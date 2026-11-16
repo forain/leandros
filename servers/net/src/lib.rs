@@ -2537,10 +2537,20 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
         }
     }
     let bound = if listeners { Some(BOUND_PATHS.lock()) } else { None };
+    // Sockets queued in bound datagram inboxes (the inbox owner is a node
+    // with outgoing edges). Only visible when BOUND_PATHS is held; without a
+    // listener in flight no inbox can be part of a cycle.
+    let inbox_edges: alloc::vec::Vec<(usize, alloc::vec::Vec<usize>)> = match bound.as_ref() {
+        Some(bp) => unixdg::gc_edges(&bp[..]),
+        None => alloc::vec::Vec::new(),
+    };
 
     // 1. In-flight copies per node.
     let mut inflight = alloc::vec![0u32; GC_NODES];
     let mut any = false;
+    for (_, ts) in inbox_edges.iter() {
+        for &t in ts { inflight[t] += 1; any = true; }
+    }
     for c in conns.iter().filter(|c| c.in_use) {
         for b in c.fdq_ab.iter().chain(c.fdq_ba.iter()) {
             for x in b.fds.iter() {
@@ -2589,10 +2599,14 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
 
     // 2. Mark everything reachable from a root.
     fn reach(n: usize, conns: &[UnixConn], embryos: &[(usize, usize)],
+             inbox: &[(usize, alloc::vec::Vec<usize>)],
              st: &mut [u8], stack: &mut alloc::vec::Vec<usize>) {
         let mut visit = |m: usize, st: &mut [u8]| { if st[m] == 1 { st[m] = 2; stack.push(m); } };
         if n >= GC_LISTENER_BASE {
             for &(ln, en) in embryos.iter() { if ln == n { visit(en, st); } }
+            for (bi, ts) in inbox.iter() {
+                if GC_LISTENER_BASE + *bi == n { for &m in ts { visit(m, st); } }
+            }
             return;
         }
         let c = &conns[n / 2];
@@ -2607,13 +2621,20 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     for ci in (0..conns.len()).filter(|&ci| conns[ci].in_use) {
         for is_a in [true, false] {
             let n = gc_node(ci, is_a);
-            if st[n] == 0 { reach(n, &*conns, &embryos, &mut st, &mut stack); }
+            if st[n] == 0 { reach(n, &*conns, &embryos, &inbox_edges, &mut st, &mut stack); }
+        }
+    }
+    // A bound datagram socket that is itself a root (or not a node at all)
+    // keeps whatever sits in its inbox alive.
+    for (bi, ts) in inbox_edges.iter() {
+        if st[GC_LISTENER_BASE + *bi] != 1 {
+            for &m in ts { if st[m] == 1 { st[m] = 2; stack.push(m); } }
         }
     }
     // A root listener's embryos are roots already (see above), so listeners
     // need no seeding of their own.
     while let Some(n) = stack.pop() {
-        reach(n, &*conns, &embryos, &mut st, &mut stack);
+        reach(n, &*conns, &embryos, &inbox_edges, &mut st, &mut stack);
     }
 
     // 3. Purge the receive queues of the ends nothing reached. An unreached
@@ -2621,6 +2642,11 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     // here, which drops the copies that kept it alive.
     for n in 0..GC_LISTENER_BASE {
         if st[n] == 1 { out.append(&mut conns[n / 2].take_rx_fds(n % 2 == 0)); }
+    }
+    if let Some(bp) = bound.as_ref() {
+        for (bi, _) in inbox_edges.iter() {
+            if st[GC_LISTENER_BASE + *bi] == 1 { out.append(&mut unixdg::gc_take(bp[*bi].sock_id)); }
+        }
     }
     drop(bound);
     drop(conns);
@@ -3760,6 +3786,7 @@ pub fn net_daemon() -> ! {
     let (mut prev_tx, mut prev_rx) = (0u64, 0u64);
     loop {
         vif::daemon_pass();
+        nlsock::poll_notify();
         // This task runs with IRQs masked between parks: let the tick in on
         // every pass, so a pass that keeps restarting cannot starve the CPU
         // and the wedge scan / watchdog can still run on it (1-CPU boots).
@@ -7836,8 +7863,14 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
 /// unrelated behaviour change.
 fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                      optval_ptr: usize, optlen: usize) -> Message {
-    // Netlink: buffer sizes and the like are accepted and ignored.
-    if nlsock::of(pid, fd).is_some() { return ok_reply(); }
+    // Netlink: group membership is honoured, buffer sizes and the like are accepted and ignored.
+    if let Some(o) = nlsock::of(pid, fd) {
+        if level == 270 && (optname == 1 || optname == 2) && optlen >= 4 {
+            if let Some(g) = sched::uaccess::read_user::<u32>(optval_ptr) { return nlsock::membership(o, optname, g); }
+            return err_reply(-14);
+        }
+        return ok_reply();
+    }
     const SO_REUSEADDR: usize = 2;
     if level == SOL_SOCKET as usize && optname == SO_REUSEADDR {
         // The int is read out of user memory before any server lock is taken:
