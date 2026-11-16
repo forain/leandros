@@ -328,3 +328,28 @@ pub(crate) fn proc_igmp(out: &mut alloc::string::String) {
         }
     }
 }
+
+/// /proc/net/igmp6 (Linux igmp6_mc_seq_show): index, device, group, users,
+/// flags, timer. Every interface is a member of ff01::1 and ff02::1.
+pub(crate) fn proc_igmp6(out: &mut alloc::string::String) {
+    use core::fmt::Write;
+    let counts: alloc::vec::Vec<(G, Sid)> = GROUPS.lock().values().flatten().copied().collect();
+    let mut sids: alloc::vec::Vec<(Sid, alloc::string::String)> = alloc::vec![(LO, "lo".into())];
+    for n in drivers::netdev::iter() { sids.push((iface::sid_of(n.id), n.name().into())); }
+    for (sid, name) in sids {
+        let groups: alloc::vec::Vec<[u8; 16]> = {
+            let stack = stack_for(sid);
+            let Some(s) = stack.as_ref() else { continue };
+            s.interface.ipv6_multicast_groups().map(|a| a.0).collect()
+        };
+        let mut all: alloc::vec::Vec<[u8; 16]> = alloc::vec::Vec::new();
+        for lead in [1u8, 2] { let mut g = [0u8; 16]; g[0] = 0xff; g[1] = lead; g[15] = 1; all.push(g); }
+        for g in groups { if !all.contains(&g) { all.push(g); } }
+        for g in all {
+            let users = counts.iter().filter(|&&m| m == (g, sid)).count().max(1);
+            let _ = write!(out, "{:<4} {:<15} ", sid as u32 + 1, name);
+            for b in g { let _ = write!(out, "{:02x}", b); }
+            let _ = write!(out, " {:5} {:08X} 0\n", users, 0x0c);
+        }
+    }
+}

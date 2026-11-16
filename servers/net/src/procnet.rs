@@ -199,6 +199,11 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
             crate::mcast::proc_igmp(&mut t);
             let _ = w.write_str(&t);
         }
+        b"igmp6" => {
+            let mut t = alloc::string::String::new();
+            crate::mcast::proc_igmp6(&mut t);
+            let _ = w.write_str(&t);
+        }
         b"wifi"  => {
             let mut t = alloc::string::String::new();
             drivers::iwlwifi::scan_lines(&mut t);
