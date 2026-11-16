@@ -65,17 +65,19 @@ pub(crate) struct NPark { pub(crate) br: Sid, pub(crate) ip: [u8; 16], pub(crate
 /// At most this many frames wait per unresolved next hop (Linux's neighbour queue is about 3).
 pub(crate) const PARK_PER_IP: usize = 3;
 const PARK_TOTAL: usize = 16;
+/// Neighbour solicitation resend state for an unresolved next hop with parked frames (Linux mcast_solicit = 3).
+pub(crate) struct Probe { br: Sid, ip: [u8; 16], t: u64, sent: u8, frame: Vec<u8> }
 struct Lrn { br: Sid, ip: [u8; 4], mac: [u8; 6], port: Sid, t: u64 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
 pub(crate) struct St {
     pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>, pub(crate) l6: crate::fwd6::L6,
     ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>, park: Vec<Park>,
-    pub(crate) npark: Vec<NPark>, nreplay: Vec<(u8, Vec<u8>)>, replay: Vec<(Sid, Sid, Vec<u8>)>, expired: Vec<(Sid, Sid, Vec<u8>)>,
+    pub(crate) npark: Vec<NPark>, nreplay: Vec<(u8, Vec<u8>)>, replay: Vec<(Sid, Sid, Vec<u8>)>, expired: Vec<(Sid, Sid, Vec<u8>)>, pub(crate) expired6: Vec<(Sid, Sid, Vec<u8>)>, probe: Vec<Probe>,
     pub(crate) txq: VecDeque<(u8, Vec<u8>)>, pub(crate) inq: VecDeque<(Sid, Sid, Vec<u8>)>,
     pub(crate) next: u16, pub(crate) swept: u64,
 }
-pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), l6: crate::fwd6::L6::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(), npark: Vec::new(), nreplay: Vec::new(), replay: Vec::new(), expired: Vec::new(),
+pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), l6: crate::fwd6::L6::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(), npark: Vec::new(), nreplay: Vec::new(), replay: Vec::new(), expired: Vec::new(), expired6: Vec::new(), probe: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
 pub(crate) static USED: AtomicBool = AtomicBool::new(false);
@@ -136,6 +138,8 @@ pub(crate) fn dump_stats(w: &mut dyn core::fmt::Write) {
         (b >> 56) as u8, (b >> 48) as u8, (b >> 40) as u8, (b >> 32) as u8, (b >> 16) as u16, a as u8);
     let now = sched::monotonic_ns();
     let g = FWD.lock();
+    let _ = writeln!(w, "fwd_state: ct={} ct6={} lrn={} lrn6={} park={} park6={} npark={} replay={} expired={} nreplay={} pend={} inq={} probe={} expired6={}",
+        g.ct.len(), g.ct6.len(), g.lrn.len(), g.l6.lrn_len(), g.park.len(), g.l6.park_len(), g.npark.len(), g.replay.len(), g.expired.len(), g.nreplay.len(), g.pend.len(), g.inq.len(), g.probe.len(), g.expired6.len());
     for a in g.arp.iter() {
         let _ = writeln!(w, "fwd_arp: nic {} {}.{}.{}.{} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} age_ms {}", a.nic, a.ip[0], a.ip[1], a.ip[2], a.ip[3],
             a.mac[0], a.mac[1], a.mac[2], a.mac[3], a.mac[4], a.mac[5], now.saturating_sub(a.t) / 1_000_000);
@@ -215,7 +219,15 @@ pub(crate) fn forget(sid: Sid) {
     let mut g = FWD.lock();
     g.ct.retain(|e| e.br != sid && e.port != sid && e.tbr != sid && e.tps != sid);
     g.lrn.retain(|l| l.br != sid && l.port != sid);
-    g.ct6.retain(|e| e.br != sid && e.port != sid);
+    g.ct6.retain(|e| e.br != sid && e.port != sid && e.tbr != sid && e.tps != sid);
+    g.park.retain(|q| q.br != sid && q.sbr != sid && q.port != sid);
+    g.npark.retain(|q| q.br != sid);
+    g.replay.retain(|q| q.0 != sid && q.1 != sid);
+    g.expired.retain(|q| q.0 != sid && q.1 != sid);
+    g.inq.retain(|q| q.0 != sid && q.1 != sid);
+    g.l6.forget(sid);
+    g.expired6.retain(|q| q.0 != sid && q.1 != sid);
+    g.probe.retain(|q| q.br != sid);
 }
 
 // ---- checksums ---------------------------------------------------------------
@@ -341,26 +353,13 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
     let nft = crate::nfnl::has_tables(0);
     let mut work: VecDeque<(Sid, Vec<u8>)> = rx.into_iter().enumerate()
         .map(|(i, f)| (if aligned { rxsrc[i] } else { crate::vifsel::NO_PEER }, f)).collect();
-    let mut exp: Vec<(Sid, Vec<u8>)> = Vec::new();
     {
         let mut st = FWD.lock();
-        if !st.replay.is_empty() || !st.expired.is_empty() || !st.park.is_empty() {
+        if !st.replay.is_empty() || !st.park.is_empty() {
             expire_park(&mut st, sched::monotonic_ns());
             let mut i = 0;
             while i < st.replay.len() { if st.replay[i].0 == br { let (_, p, f) = st.replay.remove(i); work.push_back((p, f)); } else { i += 1; } }
-            i = 0;
-            while i < st.expired.len() { if st.expired[i].0 == br { let (_, p, f) = st.expired.remove(i); exp.push((p, f)); } else { i += 1; } }
         }
-    }
-    for (port, f) in exp {
-        // Linux: a neighbour that never resolves gives the sender ICMP host unreachable.
-        let a = addrs.iter().find(|&&(a, p)| a != [f[26], f[27], f[28], f[29]] && u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes([f[26], f[27], f[28], f[29]]) & mask(p)).map(|x| x.0);
-        if let Some(a) = a { if let Some(r) = host_unreach(bmac, a, &f) {
-            let mut st = FWD.lock();
-            st.inq.push_back((br, port, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
-            drop(st);
-            drivers::netdev::kick();
-        } }
     }
     while let Some((port, mut f)) = work.pop_front() {
         if (nft || on4) && port != crate::vifsel::NO_PEER && port != br {
@@ -430,6 +429,7 @@ fn route_l3(sbr: Sid, sport: Sid, t: &Tgt, mut f: Vec<u8>) {
             st.park.push(Park { br: t.br, sbr, ip: dip, t: sched::monotonic_ns(), port: sport, frame: f });
         }
         let r = arp_request(t.mac, t.addr, dip);
+        { let mut w = [0u8; 16]; w[..4].copy_from_slice(&dip); add_probe(&mut st, t.br, w, &r); }
         st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
         drop(st);
         drivers::netdev::kick();
@@ -752,7 +752,11 @@ pub(crate) fn drain_in() {
     if USED.load(Ordering::Relaxed) {
         let mut st = FWD.lock(); sweep(&mut st, sched::monotonic_ns()); // expiry timer
         let nr: Vec<(u8, Vec<u8>)> = st.nreplay.drain(..).collect();
+        let ex: Vec<(Sid, Sid, Vec<u8>)> = st.expired.drain(..).collect();
+        let ex6: Vec<(Sid, Sid, Vec<u8>)> = st.expired6.drain(..).collect();
         drop(st);
+        for (sbr, port, f) in ex { unreach4(sbr, port, &f); }
+        for (sbr, port, f) in ex6 { crate::fwd6::unreach6(sbr, port, &f); }
         for (nic, f) in nr { nic_rx(nic, &f); } // NIC frames released by a learned neighbour
     }
     if INQ_N.load(Ordering::Relaxed) == 0 { return; }
@@ -790,6 +794,24 @@ fn expire_park(st: &mut St, now: u64) {
         } else { i += 1; }
     }
     st.npark.retain(|q| now.saturating_sub(q.t) < PEND_NS * 2);
+    // Resend the solicitation up to three times in all, spread over the park timeout (Linux mcast_solicit = 3).
+    let mut i = 0;
+    while i < st.probe.len() {
+        let age = now.saturating_sub(st.probe[i].t);
+        if age >= PEND_NS * 2 { st.probe.remove(i); continue; }
+        if (st.probe[i].sent as u64) < 3 && age >= st.probe[i].sent as u64 * PEND_NS * 2 / 3 {
+            let (br, f) = (st.probe[i].br, st.probe[i].frame.clone());
+            st.probe[i].sent += 1;
+            st.inq.push_back((br, crate::vifsel::NO_PEER, f)); INQ_N.fetch_add(1, Ordering::Relaxed);
+        }
+        i += 1;
+    }
+}
+
+/// Remember an ARP request / NS sent for a parked frame so it is resent until the park times out.
+pub(crate) fn add_probe(st: &mut St, br: Sid, ip: [u8; 16], frame: &[u8]) {
+    if st.probe.iter().any(|q| q.br == br && q.ip == ip) || st.probe.len() >= PARK_TOTAL { return; }
+    st.probe.push(Probe { br, ip, t: sched::monotonic_ns(), sent: 1, frame: frame.to_vec() });
 }
 
 /// Park a NIC frame whose container next hop has no learned MAC; `take_npark` releases it.
@@ -803,6 +825,7 @@ pub(crate) fn park_nic(st: &mut St, br: Sid, ip: [u8; 16], v6: bool, nic: u8, no
 /// Queue the NIC frames waiting for `ip` on `br` for replay through `nic_rx` (see `drain_in`).
 pub(crate) fn take_npark(st: &mut St, br: Sid, ip: [u8; 16], v6: bool, now: u64) {
     st.npark.retain(|q| now.saturating_sub(q.t) < PEND_NS * 2);
+    st.probe.retain(|q| !(q.br == br && q.ip == ip));
     let mut i = 0;
     while i < st.npark.len() {
         if st.npark[i].br == br && st.npark[i].ip == ip && st.npark[i].v6 == v6 { let q = st.npark.remove(i); st.nreplay.push((q.nic, q.frame)); } else { i += 1; }
@@ -834,6 +857,24 @@ pub(crate) fn requeue(br: Sid, list: Vec<(Sid, Sid, Vec<u8>)>, work: &mut VecDeq
         if sbr == br { work.push_front((port, f)); } else { FWD.lock().replay.push((sbr, port, f)); other = true; }
     }
     if other { drivers::netdev::kick(); }
+}
+
+/// A parked packet whose next hop never resolved: Linux answers the sender with ICMP host unreachable.
+fn unreach4(sbr: Sid, port: Sid, f: &[u8]) {
+    let info = {
+        let v = crate::vif::VIFS.lock();
+        v[sbr as usize].as_ref().filter(|b| b.kind == VifKind::Bridge && b.netns == 0).map(|b| (b.mac, b.addrs.clone()))
+    };
+    let Some((bmac, addrs)) = info else { return };
+    let src = [f[26], f[27], f[28], f[29]];
+    let a = addrs.iter().find(|&&(a, p)| a != src && u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(src) & mask(p)).map(|x| x.0);
+    let Some(a) = a else { return };
+    if let Some(r) = host_unreach(bmac, a, f) {
+        let mut st = FWD.lock();
+        st.inq.push_back((sbr, port, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
+        drop(st);
+        drivers::netdev::kick();
+    }
 }
 
 /// ICMP destination unreachable / host unreachable for `f` (an Ethernet+IPv4 frame), from the bridge address `baddr`.
@@ -911,6 +952,7 @@ fn new_in(st: &mut St, nic: u8, p: &Pkt, now: u64, frame: &[u8]) -> u8 {
         let mut wide = [0u8; 16]; wide[..4].copy_from_slice(&cip);
         park_nic(st, t.br, wide, false, nic, now, frame);
         let r = arp_request(t.mac, t.addr, cip);
+        add_probe(st, t.br, wide, &r);
         st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
         return 1;
     };
@@ -985,6 +1027,7 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
                 st.park.push(Park { br: t.br, sbr: br, ip: cip, t: now, port, frame: fr });
             }
             let r = arp_request(t.mac, t.addr, cip);
+            { let mut w = [0u8; 16]; w[..4].copy_from_slice(&cip); add_probe(&mut st, t.br, w, &r); }
             st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
             drop(st);
             drivers::netdev::kick(); // else the ARP request waits for the next housekeeping tick (~450 ms)

@@ -24,7 +24,7 @@ pub(crate) struct Ct6 {
     /// 0 = outbound SNAT flow, 1 = inbound DNAT flow (peer -> published port), 2 = hairpin (container -> host address, DNAT + masquerade).
     kind: u8,
     /// Hairpin target: container ip/port, its bridge and port, its MAC and the bridge MAC.
-    tip: [u8; 16], tport: u16, tbr: Sid, tps: Sid, tmac: [u8; 6], tbmac: [u8; 6],
+    tip: [u8; 16], tport: u16, pub(crate) tbr: Sid, pub(crate) tps: Sid, tmac: [u8; 6], tbmac: [u8; 6],
 }
 impl Ct6 {
     const BLANK: Ct6 = Ct6 { proto: 0, nat: 0, cip: [0; 16], cport: 0, cmac: [0; 6], br: crate::vifsel::NO_PEER, port: crate::vifsel::NO_PEER, bmac: [0; 6],
@@ -34,7 +34,13 @@ impl Ct6 {
 struct Lrn6 { br: Sid, ip: [u8; 16], mac: [u8; 6], port: Sid, t: u64 }
 struct Park6 { br: Sid, sbr: Sid, ip: [u8; 16], t: u64, port: Sid, frame: Vec<u8> }
 pub(crate) struct L6 { lrn: Vec<Lrn6>, park: Vec<Park6> }
-impl L6 { pub(crate) const fn new() -> L6 { L6 { lrn: Vec::new(), park: Vec::new() } } }
+impl L6 { pub(crate) const fn new() -> L6 { L6 { lrn: Vec::new(), park: Vec::new() } }
+    pub(crate) fn forget(&mut self, sid: Sid) {
+        self.lrn.retain(|l| l.br != sid && l.port != sid);
+        self.park.retain(|q| q.br != sid && q.sbr != sid && q.port != sid);
+    }
+    pub(crate) fn lrn_len(&self) -> usize { self.lrn.len() }
+    pub(crate) fn park_len(&self) -> usize { self.park.len() } }
 pub(crate) struct Nd { nic: u8, ip: [u8; 16], mac: [u8; 6], t: u64 }
 pub(crate) struct Pend6 { nic: u8, ip: [u8; 16], t: u64, frames: Vec<Vec<u8>> }
 
@@ -52,7 +58,13 @@ pub(crate) fn sweep6(st: &mut fwd::St, now: u64) {
     st.ct6.retain(|e| now.saturating_sub(e.last) < ttl(e));
     st.pend6.retain(|q| now.saturating_sub(q.t) < fwd::PEND_NS);
     st.nd.retain(|a| now.saturating_sub(a.t) < fwd::ARP_NS);
-    st.l6.park.retain(|q| now.saturating_sub(q.t) < fwd::PEND_NS * 2);
+    let mut i = 0;
+    while i < st.l6.park.len() {
+        if now.saturating_sub(st.l6.park[i].t) >= fwd::PEND_NS * 2 {
+            let q = st.l6.park.remove(i);
+            if st.expired6.len() < 16 { st.expired6.push((q.sbr, q.port, q.frame)); }
+        } else { i += 1; }
+    }
 }
 
 fn sum(d: &[u8], mut acc: u32) -> u32 {
@@ -372,6 +384,7 @@ fn rewrite_dst(f: &mut [u8], ip: [u8; 16], port: u16) {
 
 fn ns_into(st: &mut fwd::St, t: &Tgt6, target: [u8; 16]) {
     let r = ns_frame(t.mac, t.addr, target);
+    fwd::add_probe(st, t.br, target, &r);
     st.inq.push_back((t.br, crate::vifsel::NO_PEER, r));
     fwd::INQ_N.fetch_add(1, Ordering::Relaxed);
 }
@@ -520,7 +533,19 @@ fn hair6(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &P6) -> bool {
 // ---- ICMPv6 errors for forwarded flows (design-ipv6 L9 phase 2, B) ----------------------
 
 /// Hop limit exhausted on `f` (the container's packet): Time Exceeded back to it from the bridge address `ba`.
-fn time_exceeded(br: Sid, port: Sid, bmac: [u8; 6], ba: [u8; 16], f: &[u8]) {
+fn time_exceeded(br: Sid, port: Sid, bmac: [u8; 6], ba: [u8; 16], f: &[u8]) { icmp6_err(br, port, bmac, ba, f, 3, 0) }
+
+/// A parked IPv6 packet whose next hop never answered the NS: ICMPv6 destination unreachable, address unreachable.
+pub(crate) fn unreach6(sbr: Sid, port: Sid, f: &[u8]) {
+    if f.len() < 54 || f[20] == PROTO_ICMP6 { return; }
+    let mac = { let v = crate::vif::VIFS.lock(); v[sbr as usize].as_ref().filter(|b| b.kind == crate::vifsel::VifKind::Bridge && b.netns == 0).map(|b| b.mac) };
+    let Some(mac) = mac else { return };
+    let src: [u8; 16] = f[22..38].try_into().unwrap();
+    let Some(&(a, _)) = crate::tunbe::addrs6_of(sbr).iter().find(|&&(a, pl)| a[0] != 0xfe && a != src && prefix_match(&a, &src, pl)) else { return };
+    icmp6_err(sbr, port, mac, a, f, 1, 3);
+}
+
+fn icmp6_err(br: Sid, port: Sid, bmac: [u8; 6], ba: [u8; 16], f: &[u8], ty: u8, code: u8) {
     let inv = &f[14..f.len().min(14 + 1232)];
     let mut r = alloc::vec![0u8; 14 + 40 + 8 + inv.len()];
     r[0..6].copy_from_slice(&f[6..12]);
@@ -531,7 +556,7 @@ fn time_exceeded(br: Sid, port: Sid, bmac: [u8; 6], ba: [u8; 16], f: &[u8]) {
     r[20] = PROTO_ICMP6; r[21] = 64;
     r[22..38].copy_from_slice(&ba);
     r[38..54].copy_from_slice(&f[22..38]);
-    r[54] = 3;
+    r[54] = ty; r[55] = code;
     r[62..].copy_from_slice(inv);
     let n = 8 + inv.len();
     csum6(&mut r, PROTO_ICMP6, n);

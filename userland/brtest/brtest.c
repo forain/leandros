@@ -1257,6 +1257,29 @@ static long stat_get(const char *key) {
     fclose(f);
     return v;
 }
+/* Sum of the forwarder's per-flow / per-neighbour state counters (the "fwd_state:" line of /proc/net/nic:
+ * conntrack, learn, park, replay, probe entries). After a bridge/veth teardown it must be back at its baseline. */
+static int fwd_state_sum(char *detail, size_t n) {
+    FILE *f = fopen("/proc/net/nic", "r");
+    int sum = 0;
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "fwd_state:", 10)) continue;
+        if (detail) snprintf(detail, n, "%s", line);
+        for (char *t = strtok(line + 10, " \n"); t; t = strtok(NULL, " \n")) {
+            char *e = strchr(t, '=');
+            if (!e || !strncmp(t, "pend=", 5) || !strncmp(t, "inq=", 4)) continue;
+            sum += atoi(e + 1);
+        }
+    }
+    fclose(f);
+    return sum;
+}
+#define FWD_STATE_CHECK(name, base) do { char d_[512] = ""; int s_ = fwd_state_sum(d_, sizeof d_); char m_[160]; \
+    snprintf(m_, sizeof m_, "%s: forwarder state (ct/learn/park/probe) is back to its baseline after teardown (%d, was %d)", name, s_, base); \
+    CHECK(m_, s_ >= 0 && s_ <= base); if (s_ > base) printf("DIAG %s", d_); } while (0)
+
 /* Failure diagnostic: print the kernel's live TCP NAT entries (fwd_nat_ent lines of /proc/net/nic). */
 static void nat_dump(void) {
     FILE *f = fopen("/proc/net/nic", "r");
@@ -1572,6 +1595,7 @@ static int rt_body(void) {
 }
 static void routed_case(const char *name, int ipfwd) {
     char msg[96];
+    int fs_base = fwd_state_sum(NULL, 0);
     int s = nl_sock();
     unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
     int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
@@ -1608,6 +1632,7 @@ static void routed_case(const char *name, int ipfwd) {
     ip_forward_set(0);
     link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
     link_del(s, b0); link_del(s, b1);
+    FWD_STATE_CHECK(name, fs_base);
     close(s);
 }
 static void routed_on(void) { routed_case("routed_l3", 1); }
@@ -1878,6 +1903,7 @@ static int xb_body(void) {
 static void nftnat_xbridge(void) {
     const char *name = "nftnat_xbridge";
     char msg[120], ch = 'g';
+    int fs_base = fwd_state_sum(NULL, 0);
     int s = nl_sock();
     unsigned char m0[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x01 }, m1[6] = { 0x02, 0x00, 0x5e, 0x98, 0x00, 0x01 };
     int ok = br_new(s, "br0", m0) == 0 && br_new(s, "br1", m1) == 0;
@@ -1911,6 +1937,7 @@ static void nftnat_xbridge(void) {
     ip_forward_set(0);
     link_del(s, link_get(s, "vethS", NULL, NULL)); link_del(s, link_get(s, "vethC", NULL, NULL));
     link_del(s, b0); link_del(s, b1);
+    FWD_STATE_CHECK(name, fs_base);
     close(s);
 }
 
