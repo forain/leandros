@@ -64,7 +64,7 @@ impl InterfaceInner {
         // payload that follows is the upper layer of the whole.
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let (next_header, ip_payload) = if next_header == IpProtocol::Ipv6Frag {
-            let fh = check!(Ipv6FragmentHeader::new_checked(ip_payload));
+            let fh = check!(Ipv6FragmentHeader::new_checked(check!(ip_payload.get(2..).ok_or(crate::wire::Error))));
             let first_nh = ip_payload[0];
             let (fr, data) = (check!(Ipv6FragmentRepr::parse(&fh)), &ip_payload[8..]);
             let off = fr.frag_offset as usize * 8;

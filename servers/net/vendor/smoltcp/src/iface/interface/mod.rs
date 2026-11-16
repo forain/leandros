@@ -2060,10 +2060,11 @@ pub(crate) fn emit_ipv6_fragment(
     }
     let fr = Ipv6FragmentRepr { frag_offset: (offset / 8) as u16, more_frags: more, ident };
     {
-        let mut fh = Ipv6FragmentHeader::new_unchecked(&mut out[40..48]);
+        let mut fh = Ipv6FragmentHeader::new_unchecked(&mut out[42..48]);
         fr.emit(&mut fh);
-        // `emit` leaves the next-header byte to the caller
+        // smoltcp's header starts after the next-header and reserved bytes
     }
+    out[41] = 0;
     out[40] = u8::from(repr.next_header);
     out[48..48 + data.len()].copy_from_slice(data);
 }
