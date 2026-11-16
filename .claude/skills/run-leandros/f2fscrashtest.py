@@ -158,7 +158,7 @@ class Claims:
 
     def parse(self, text):
         for raw in text.splitlines():
-            m = re.match(r"^\s*(A|W|O|N|U|T|R|SETUP)\b(.*)$", raw)
+            m = re.match(r"^\s*(?:\[\s*\d+\.\d+\]\s*)?(A|W|O|N|U|T|R|SETUP)\b(.*)$", raw)  # a kernel log prefix can land in front of a workload line
             if not m:
                 continue
             tag, rest = m.group(1), m.group(2).split()
@@ -349,7 +349,7 @@ def main(argv):
             if "F2FS" in l:
                 print("  log:", l.strip()[:160], flush=True)
         if prev is not None:
-            pdir, claims = prev
+            pdir, claims, ppre = prev
             r = run(f"/bin/f2fstest crashscan {pdir}", 300)
             scan = r["output"]
             if "SCAN_DONE" not in scan:
@@ -367,6 +367,8 @@ def main(argv):
                     print("    ", e, flush=True)
                 if errs:
                     fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
+                    if ppre and os.path.exists(ppre):
+                        keep_failed(out, ppre, f"it{it - 1}-prelinux", seed, "image before Linux recovery", arch)
             run(f"rm -rf {pdir}", 300)
             r = run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
             ok, detail = fsck(img, strict_leaks=True)
@@ -408,8 +410,8 @@ def main(argv):
         finally:
             ser.close()
         hard_kill()
-        if os.environ.get("F2FSCR_OUT"):
-            with open(os.path.join(os.environ["F2FSCR_OUT"], f"work-{it}.txt"), "w") as f:
+        if os.environ.get("F2FSCR_OUT") or linux:
+            with open(os.path.join(os.environ.get("F2FSCR_OUT") or out, f"work-{it}.txt"), "w") as f:
                 f.write(text)
         claims = Claims()
         claims.parse(text)
@@ -424,14 +426,19 @@ def main(argv):
         if not ok:
             fails.append(f"iter {it}: fsck of the crashed image failed")
             keep_failed(out, img, f"it{it}-crashed", seed, f"how={how} wseed={wseed} cmdline={cmdline!r}", arch)
+        pre = None
         if linux:
+            pre = os.path.join(out, f"pre-linux-{it}.img")
+            subprocess.run(["cp", "-c", img, pre], check=False, stderr=subprocess.DEVNULL)
+            if not os.path.exists(pre):
+                shutil.copyfile(img, pre)
             lok, ldet = linux_recover(img, out, it)
             print(f"iter {it}: Linux recovery + fsck.f2fs: {'PASS' if lok else 'FAIL ' + ldet}", flush=True)
             if not lok:
                 fails.append(f"iter {it}: Linux recovery: {ldet} (seed={seed} wseed={wseed} how={how} cmdline={cmdline!r})")
                 keep_failed(out, img, f"it{it}-linux", seed, f"how={how} wseed={wseed} cmdline={cmdline!r}", arch)
                 break
-        prev = (d, claims)
+        prev = (d, claims, pre)
     if not keep and os.path.exists(boot_copy):
         os.unlink(boot_copy)
     print(f"f2fscrashtest: {'PASS' if not fails else 'FAIL'} {fails}")

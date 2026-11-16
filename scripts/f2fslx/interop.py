@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 BOX = os.environ.get("F2FSINTEROP_BOX", "forain@172.16.158.150")
 LOCK = os.environ.get("F2FSINTEROP_LOCK", "")
-SSH = ["ssh", "-o", "BatchMode=yes", BOX]
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", BOX]
 # name -> (mkfs options, mount options used while populating[, image size])
 VARIANTS = {
     "lxdef": ("", ""),
