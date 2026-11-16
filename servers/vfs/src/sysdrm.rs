@@ -22,6 +22,8 @@ use super::sysclass::{SC_BASE, NAME_LEN};
 
 pub const SD_CLS: u16 = 0xC;
 pub const LVL_CONN: u8 = 0xC0;
+pub const LVL_CLASS: u8 = 0xC1;
+const CLASS_DIR: &[u8] = b"/sys/class/drm";
 pub const MAX_CONN: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -81,9 +83,11 @@ fn conn_name(c: &Conn, out: &mut [u8]) -> usize {
     w.pos
 }
 
+pub fn present() -> bool { ops().is_some() }
+
 pub fn is_path(path: &[u8]) -> bool {
     let p = trim(path);
-    p.starts_with(PREFIX) && ops().is_some()
+    (p.starts_with(PREFIX) || p == CLASS_DIR) && ops().is_some()
 }
 
 fn trim(p: &[u8]) -> &[u8] {
@@ -92,10 +96,11 @@ fn trim(p: &[u8]) -> &[u8] {
     p
 }
 
-enum Node { Dir(usize), File(usize, &'static str) }
+enum Node { Class, Dir(usize), File(usize, &'static str) }
 
 fn parse(path: &[u8]) -> Option<Node> {
     let o = ops()?;
+    if trim(path) == CLASS_DIR { return Some(Node::Class); }
     let rest = trim(path).strip_prefix(b"/sys/class/drm/")?;
     let (name, file) = match rest.iter().position(|&c| c == b'/') {
         Some(k) => (&rest[..k], Some(&rest[k + 1..])),
@@ -118,6 +123,7 @@ fn parse(path: &[u8]) -> Option<Node> {
 pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
     match parse(path)? {
         Node::Dir(i) => Some((SC_BASE | SD_CLS << 8 | i as u16, LVL_CONN)),
+        Node::Class => Some((SC_BASE | SD_CLS << 8 | 0xFF, LVL_CLASS)),
         _ => None,
     }
 }
@@ -144,8 +150,19 @@ pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// The `idx`-th entry of overlay directory `(dev, level)`: `(name length, is_dir)`.
 pub fn dirent(_dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    if level == LVL_CLASS {
+        // Linux order: the nodes first, then the connectors (`card0-<TYPE>-<n>`).
+        const NODES: [&str; 2] = ["card0", "renderD128"];
+        if idx < 2 { out[..NODES[idx].len()].copy_from_slice(NODES[idx].as_bytes()); return Some((NODES[idx].len(), false)); }
+        let o = ops()?;
+        let c = (o.conn)(idx - 2)?;
+        return Some((conn_name(&c, &mut out[..]), true));
+    }
     if level != LVL_CONN { return None; }
     let f = FILES.get(idx)?;
     out[..f.len()].copy_from_slice(f.as_bytes());
     Some((f.len(), false))
 }
+
+/// `card0` / `renderD128` in the class directory are symlinks (staged on disk).
+pub fn dirent_link(level: u8, idx: usize) -> bool { level == LVL_CLASS && idx < 2 }
