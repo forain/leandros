@@ -218,6 +218,90 @@ static void udp_mcast_loop(void) {
     else pass(N);
 }
 
+#ifndef IP_UNBLOCK_SOURCE
+#define IP_UNBLOCK_SOURCE 37
+#define IP_BLOCK_SOURCE 38
+#define IP_ADD_SOURCE_MEMBERSHIP 39
+#define IP_DROP_SOURCE_MEMBERSHIP 40
+#endif
+#define T_MCAST_JOIN_SOURCE_GROUP 46
+#define T_MCAST_LEAVE_SOURCE_GROUP 47
+#define T_MCAST_BLOCK_SOURCE 43
+
+/* One of the four ip_mreq_source options. */
+static int srcopt(int fd, int opt, const char *group, const char *src) {
+    struct { struct in_addr g, i, s; } m;
+    inet_pton(AF_INET, group, &m.g); m.i.s_addr = 0; inet_pton(AF_INET, src, &m.s);
+    return setsockopt(fd, IPPROTO_IP, opt, &m, sizeof m);
+}
+
+/* struct group_source_req by hand (layout: u32 iface, 128-byte group, 128-byte source). */
+static int gsropt(int fd, int opt, const char *group, const char *src) {
+    unsigned char r[264]; memset(r, 0, sizeof r);
+    struct sockaddr_in g = sin4(group, 0), s = sin4(src, 0);
+    memcpy(r + 8, &g, sizeof g); memcpy(r + 136, &s, sizeof s);
+    return setsockopt(fd, IPPROTO_IP, opt, r, sizeof r);
+}
+
+/* Source-specific multicast: the per-socket source filter. */
+static void udp_mcast_ssm(void) {
+    const char *N = "udp_mcast_ssm";
+    if (skipped(N)) return;
+    char me[64];
+    if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
+    const char *G = "239.255.42.98", *OTHER = "192.0.2.77";
+    uint16_t port = 47021;
+    int a = bound_reuse(port, SO_REUSEADDR), b = bound_reuse(port, SO_REUSEADDR);
+    int c = bound_reuse(port, SO_REUSEADDR), d = bound_reuse(port, SO_REUSEADDR);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (a < 0 || b < 0 || c < 0 || d < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
+    struct sockaddr_in to = sin4(G, port);
+    /* A includes our source, B only someone else, C joins any-source and blocks us, D joins via MCAST_*. */
+    int ja = srcopt(a, IP_ADD_SOURCE_MEMBERSHIP, G, me);
+    int jb = srcopt(b, IP_ADD_SOURCE_MEMBERSHIP, G, OTHER);
+    int jc = join(c, G, "0.0.0.0", 0);
+    int bc = srcopt(c, IP_BLOCK_SOURCE, G, me);
+    int jd = gsropt(d, T_MCAST_JOIN_SOURCE_GROUP, G, me);
+    send_to(s, "s1", 2, &to);
+    int na = got(a, "s1", 600), nb = got(b, "s1", 1), nc = got(c, "s1", 1), nd = got(d, "s1", 1);
+    /* Unblocking C lets us through; dropping A's only source leaves the group. */
+    int uc = srcopt(c, IP_UNBLOCK_SOURCE, G, me);
+    int uc2 = srcopt(c, IP_UNBLOCK_SOURCE, G, me), euc2 = errno;
+    int da = srcopt(a, IP_DROP_SOURCE_MEMBERSHIP, G, me);
+    int da2 = srcopt(a, IP_DROP_SOURCE_MEMBERSHIP, G, me), eda2 = errno;
+    send_to(s, "s2", 2, &to);
+    int nc2 = got(c, "s2", 600), na2 = got(a, "s2", 1), nd2 = got(d, "s2", 1);
+    /* Mixing: include sources on B, then a block is EINVAL; a duplicate add is EADDRINUSE;
+     * an ASM join over an SSM one too. */
+    int mix = srcopt(b, IP_BLOCK_SOURCE, G, me), emix = errno;
+    int dup = srcopt(b, IP_ADD_SOURCE_MEMBERSHIP, G, OTHER), edup = errno;
+    int asm_ = join(b, G, "0.0.0.0", 0), easm = errno;
+    /* Block-then-add on C (exclude list non-empty) is EINVAL. */
+    srcopt(c, IP_BLOCK_SOURCE, G, OTHER);
+    int mix2 = srcopt(c, IP_ADD_SOURCE_MEMBERSHIP, G, me), emix2 = errno;
+    /* Source ops without a membership: block/drop are EINVAL, MCAST_LEAVE of nothing is an error. */
+    int e1 = srcopt(s, IP_BLOCK_SOURCE, G, me), ee1 = errno;
+    int e2 = srcopt(s, IP_DROP_SOURCE_MEMBERSHIP, G, me), ee2 = errno;
+    int e3 = gsropt(s, T_MCAST_LEAVE_SOURCE_GROUP, G, me), ee3 = errno;
+    int e4 = srcopt(s, IP_ADD_SOURCE_MEMBERSHIP, "10.1.2.3", me), ee4 = errno;
+    int dd = gsropt(d, T_MCAST_LEAVE_SOURCE_GROUP, G, me);
+    close(a); close(b); close(c); close(d); close(s);
+    if (ja || jb || jc || bc || jd) fail(N, "setup options: %d %d %d %d %d (%s)", ja, jb, jc, bc, jd, strerror(errno));
+    else if (na != 1 || nb != 0 || nc != 0 || nd != 1) fail(N, "filtered rx: A %d B %d C %d D %d, want 1 0 0 1", na, nb, nc, nd);
+    else if (uc || uc2 == 0 || euc2 != EADDRNOTAVAIL) fail(N, "unblock: %d, again %d %s, want 0 / EADDRNOTAVAIL", uc, uc2, strerror(euc2));
+    else if (da || da2 == 0) fail(N, "drop source: %d, again %d %s", da, da2, strerror(eda2));
+    else if (nc2 != 1 || na2 != 0 || nd2 != 1) fail(N, "after unblock/drop: C %d A %d D %d, want 1 0 1", nc2, na2, nd2);
+    else if (mix == 0 || emix != EINVAL) fail(N, "block on an include filter: %d %s, want EINVAL", mix, strerror(emix));
+    else if (dup == 0 || edup != EADDRINUSE) fail(N, "duplicate source: %d %s, want EADDRINUSE", dup, strerror(edup));
+    else if (asm_ == 0 || easm != EADDRINUSE) fail(N, "ASM join over SSM: %d %s, want EADDRINUSE", asm_, strerror(easm));
+    else if (mix2 == 0 || emix2 != EINVAL) fail(N, "add on an exclude filter: %d %s, want EINVAL", mix2, strerror(emix2));
+    else if (e1 == 0 || ee1 != EINVAL || e2 == 0 || ee2 != EINVAL) fail(N, "no membership: block %d %s, drop %d %s, want EINVAL", e1, strerror(ee1), e2, strerror(ee2));
+    else if (e3 == 0 || (ee3 != EINVAL && ee3 != EADDRNOTAVAIL)) fail(N, "MCAST_LEAVE_SOURCE_GROUP without join: %d %s", e3, strerror(ee3));
+    else if (e4 == 0 || ee4 != EINVAL) fail(N, "source add on a non-source address: %d %s", e4, strerror(ee4));
+    else if (dd) fail(N, "MCAST_LEAVE_SOURCE_GROUP: %d %s", dd, strerror(errno));
+    else pass(N);
+}
+
 /* SO_BROADCAST is required (EACCES); every socket on the port gets the
  * host's own broadcast (Linux loops broadcast back). */
 static void udp_broadcast(void) {
