@@ -13506,6 +13506,12 @@ fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize, follow: bool) -> Resul
     const AF_UNIX: u16 = 1;
     const SUN_PATH_MAX: usize = 108;
     if addrlen < 3 { return Ok(None); }
+    // Probe the family alone first: sendto/sendmsg call this for every socket
+    // domain (netlink, inet), and only an AF_UNIX name is ours to resolve. An
+    // unreadable address is left for the net server to report as EFAULT.
+    let mut fam = [0u8; 2];
+    let fam_ok = with_current_address_space(|as_| as_.read_user_buf(addr_ptr, &mut fam)).unwrap_or(false);
+    if !fam_ok || u16::from_ne_bytes(fam) != AF_UNIX { return Ok(None); }
     let mut raw = [0u8; 2 + SUN_PATH_MAX];
     let n = addrlen.min(raw.len());
     let ok = with_current_address_space(|as_| as_.read_user_buf(addr_ptr, &mut raw[..n])).unwrap_or(false);
