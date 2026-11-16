@@ -62,9 +62,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Firefox
 - x86 KVM audio verification (?).
-- **SCM_CREDENTIALS**: plain send()/write() on a SO_PASSCRED peer attaches no credentials (only sendmsg does; servers/net).
-- **SCM_CREDENTIALS**: data queued before SO_PASSCRED is enabled carries no credentials (Linux reports the sender's).
-- **SCM_CREDENTIALS**: sendto() on an unconnected AF_UNIX dgram socket attaches no credentials.
+- **AF_UNIX unconnected dgram sendto**: `sendto(addr)` on an unconnected AF_UNIX SOCK_DGRAM socket is not delivered at all (EPIPE from `handle_send_k`; the server models dgram as connect-to-bound-address, a bound receiver has no multi-sender inbox), so its SCM_CREDENTIALS cannot be tested until that exists (servers/net).
 - **seccomp irq window**: `max_len_filter_threads_tsync` cannot fail on the old code (4096-insn run is only tens of us); needs a longer-running filter or a timing probe to gate regressions.
 - **pidns zap timeout**: the `[pidns] zap timeout` log has no automated test (a ns child cannot survive SIGKILL); needs a test hook that forces the deadline.
 

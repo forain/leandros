@@ -4883,6 +4883,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                     if l_pc {
                         let mut o = sock_opts(tbl.socks[new_slot].ofd);
                         o.passcred = true;
+                        PASSCRED_USED.store(true, Ordering::Relaxed);
                         set_sock_opts(tbl.socks[new_slot].ofd, o);
                     }
 
@@ -5612,8 +5613,23 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             return udp_send_gso(pid, fd, addr_ptr, addrlen, data, seg);
         }
     }
+    // A plain send()/write() to a peer with SO_PASSCRED carries the sender's
+    // credentials, as sendmsg does (Linux scm_send/maybe_add_creds).
+    if PASSCRED_USED.load(Ordering::Relaxed) && addr_ptr == 0 && len > 0 {
+        let end = unix_stream_end(pid, fd)
+            .or_else(|| if unix_dgram_connected(pid, fd) { unix_conn_end(pid, fd) } else { None });
+        if let Some((ci, ia)) = end {
+            if send_cred(pid, ci, ia, None).is_some() {
+                return handle_sendmsg_x(pid, fd, 0, 0, None, Some((buf_ptr, len)));
+            }
+        }
+    }
     handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, None)
 }
+
+/// Set once any AF_UNIX socket enables SO_PASSCRED (or inherits it at
+/// accept): until then no send needs the credential lookup.
+static PASSCRED_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Some socket set UDP_SEGMENT once: only then does a send look it up.
 static GSO_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -6751,7 +6767,15 @@ fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &
     val_reply(data.len() as u64)
 }
 
-fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Option<(usize, usize)>) -> Message {
+fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Option<(usize, usize)>) -> Message {
+    handle_sendmsg_x(pid, fd, msghdr_ptr, flags, syn, None)
+}
+
+/// `handle_sendmsg`; `one` = a single buffer `(base, len)` in place of the
+/// iovec array (a plain send()/write() that must carry SCM_CREDENTIALS).
+fn handle_sendmsg_x(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Option<(usize, usize)>,
+                    one: Option<(usize, usize)>) -> Message {
+    let syn = if one.is_some() { Some((0, 1)) } else { syn };
     if msghdr_ptr == 0 && syn.is_none() { return err_reply(-14); }
     if let Some(o) = nlsock::of(pid, fd) {
         // A netlink writev stays one send per iovec (the caller's fallback).
@@ -6832,8 +6856,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Op
         let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov  = iov_ptr + i * 16;
-            let base = rd_or_efault!(iov);
-            let len  = rd_or_efault!(iov + 8);
+            let (base, len) = match one { Some(o) => o, None => (rd_or_efault!(iov), rd_or_efault!(iov + 8)) };
             if len > 0 && !sched::uaccess::user_range_ok(base, len) { return err_reply(-14); } // EFAULT: kernel iov_base
             if data.len() + len > UNIX_DGRAM_MAX { return err_reply(-90); } // EMSGSIZE
             let at = data.len();
@@ -6887,7 +6910,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Op
     let mut requested = 0usize;
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
-        iovs[i] = match (rd_usize(iov), rd_usize(iov + 8)) {
+        iovs[i] = match (one.map_or_else(|| rd_usize(iov), |o| Ok(o.0)), one.map_or_else(|| rd_usize(iov + 8), |o| Ok(o.1))) {
             (Ok(b), Ok(l)) if l == 0 || sched::uaccess::user_range_ok(b, l) => (b, l),
             _ => { for tf in batch { xfer_drop(tf); } return err_reply(-14); }
         };
@@ -7855,6 +7878,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if e.domain as usize != AF_UNIX { return err_reply(-ENOPROTOOPT); }
         let mut o = sock_opts(e.ofd);
         o.passcred = v != 0;
+        if v != 0 { PASSCRED_USED.store(true, Ordering::Relaxed); }
         set_sock_opts(e.ofd, o);
         let end = match e.state {
             SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
@@ -8500,13 +8524,18 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
 /// The credentials recvmsg on `fd` reports: those of the batch it took, when
 /// the receiving description has SO_PASSCRED.
 fn rcv_cred(pid: u32, fd: usize, c: Option<Ucred>) -> Option<Ucred> {
-    let c = c?;
     let e = sock_entry(pid, fd)?;
-    if sock_opts(e.ofd).passcred { Some(c) } else { None }
+    if !sock_opts(e.ofd).passcred { return None; }
+    // Data sent while nobody wanted credentials (SO_PASSCRED enabled later,
+    // or a send that did not record them) reports the peer end's own, as
+    // Linux's always-attached sender credentials did.
+    if c.is_some() { return c; }
+    let p = unix_peer_cred(pid, fd);
+    if p.pid == 0 { None } else { Some(p) }
 }
 
 fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
-    let (conn_idx, is_a) = match unix_stream_end(pid, fd) {
+    let (conn_idx, is_a) = match unix_stream_end(pid, fd).or_else(|| unix_conn_end(pid, fd)) {
         Some(e) => e,
         None => return Ucred::zero(),
     };
