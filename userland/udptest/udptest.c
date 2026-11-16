@@ -1035,6 +1035,7 @@ static void udp_wildcard_connect(void) {
 
 /* Lane udp2: ICMP errors, multicast, broadcast, cmsgs, disconnect. */
 #include "udp2cases.c"
+#include "mcastsrc.c"
 #include "pmtud2.c"
 #include "recverr.c"
 
@@ -1099,6 +1100,10 @@ int main(int argc, char **argv) {
     udp_icmp_refused();
     udp_mcast_loop();
     udp_mcast_ssm();
+    udp_mcast_msfilter();
+    udp_mcast_all();
+    udp_mcast_group_req();
+    udp6_mcast_req();
     udp_broadcast();
     udp_reuse_unicast();
     udp_cmsgs();

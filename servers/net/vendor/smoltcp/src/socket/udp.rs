@@ -16,7 +16,7 @@ use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, I
 static BIND_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// LEANDROS: multicast source filter hook (IP_ADD_SOURCE_MEMBERSHIP & co):
-/// a `fn(owner: u32, group: [u8; 4], src: [u8; 4]) -> bool` stored as usize
+/// a `fn(owner: u32, group: [u8; 16], src: [u8; 16]) -> bool` (IPv4 as ::ffff:a.b.c.d) stored as usize
 /// (0 = none), set by the net server. Called under the stack lock, so it
 /// may only take leaf locks.
 pub static MCAST_SRC_FILTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -681,15 +681,26 @@ impl<'a> Socket<'a> {
             }
             score += 8;
         }
-        if let (Some(owner), IpAddress::Ipv4(dst), IpAddress::Ipv4(src)) =
-            (self.owner, ip_repr.dst_addr(), ip_repr.src_addr())
-        {
+        if let Some(owner) = self.owner {
+            let (dst, src) = (ip_repr.dst_addr(), ip_repr.src_addr());
             let f = MCAST_SRC_FILTER.load(core::sync::atomic::Ordering::Relaxed);
             if dst.is_multicast() && f != 0 {
-                // SAFETY: only ever stored from a `fn(u32, [u8; 4], [u8; 4]) -> bool`.
+                let m = |a: IpAddress| -> [u8; 16] {
+                    match a {
+                        IpAddress::Ipv4(a) => {
+                            let mut b = [0u8; 16];
+                            b[10] = 0xff;
+                            b[11] = 0xff;
+                            b[12..].copy_from_slice(&a.0);
+                            b
+                        }
+                        IpAddress::Ipv6(a) => a.0,
+                    }
+                };
+                // SAFETY: only ever stored from a `fn(u32, [u8; 16], [u8; 16]) -> bool`.
                 #[allow(unsafe_code)]
-                let f: fn(u32, [u8; 4], [u8; 4]) -> bool = unsafe { core::mem::transmute(f) };
-                if !f(owner, dst.0, src.0) {
+                let f: fn(u32, [u8; 16], [u8; 16]) -> bool = unsafe { core::mem::transmute(f) };
+                if !f(owner, m(dst), m(src)) {
                     return None;
                 }
             }
