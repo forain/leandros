@@ -514,6 +514,8 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // follows a registered GPU backend (NVK checks vendor 0x10de); with none
     // registered the hook answers nothing and the on-disk virtio stubs stand.
     vfs_server::set_drm_sysfs_override(drivers::gpu_uapi::drm_sysfs_attr);
+    // `/sys/class/drm/card0-<TYPE>-<n>/*` follows the live GETCONNECTOR state.
+    vfs_server::sysdrm::set_ops(&SYSDRM_OPS);
     // The i915 periodic `[i915] stat` line reports the global tmpfs pool
     // (every memfd and every exported dma-buf is one slot of it) next to its
     // own objects; `drivers` cannot see the VFS, so the edge lives here too.
@@ -526,3 +528,13 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     sched::register_tick_hook(drivers::drm_device_interface::drm_tick);
     Some(port_id)
 }
+
+fn sysdrm_conn(i: usize) -> Option<vfs_server::sysdrm::Conn> {
+    let c = drivers::drm_device_interface::sysfs_connector(i)?;
+    Some(vfs_server::sysdrm::Conn {
+        conn_type: c.conn_type, type_id: c.type_id, connected: c.connected,
+        nmodes: c.nmodes, modes: c.modes,
+    })
+}
+
+static SYSDRM_OPS: vfs_server::sysdrm::Ops = vfs_server::sysdrm::Ops { conn: sysdrm_conn };

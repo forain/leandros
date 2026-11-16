@@ -763,6 +763,98 @@ struct drm_mode_modeinfo {
     name: [u8; 32],
 }
 
+/// Mode sizes of the primary connector: the native mode first, then the common
+/// sizes that fit inside it. Shared by GETCONNECTOR and `/sys/class/drm`.
+fn primary_modes() -> ([(u32, u32); 17], usize) {
+        // The native mode is the boot console's size, i.e. the host's preferred
+        // scanout from GET_DISPLAY_INFO. It never changes after boot, so the
+        // list below is stable across a mode switch.
+        extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
+        let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+        unsafe { vfs_get_framebuffer_info(&mut info); }
+        let (nw, nh) = if let Some((w, h, _)) = crate::gpu_kms::fixed_mode() {
+            (w, h)
+        } else if info.width > 0 && info.height > 0 {
+            (info.width, info.height)
+        } else {
+            (1280, 800)
+        };
+
+        // Mode list: the native mode first (PREFERRED, and index 0 for callers
+        // that read only one), then the common VESA/CEA sizes that fit inside
+        // it, like Linux virtio-gpu (drm_add_modes_noedid up to the preferred
+        // size). Only one mode used to be listed, so Settings > Displays had
+        // no resolution to switch to. Every mode is 60 Hz; a virtio-gpu
+        // scanout takes its size from the framebuffer bound to it, so a mode
+        // switch is the compositor allocating buffers of the new size.
+        let mut sizes: [(u32, u32); 17] = [(0, 0); 17];
+        let mut n = 0usize;
+        sizes[n] = (nw, nh);
+        n += 1;
+        // A KMS backend's scanout has exactly its own mode (no modeset).
+        let extra = !crate::gpu_kms::active();
+        for &(w, h) in STANDARD_MODES.iter() {
+            if extra && w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
+                sizes[n] = (w, h);
+                n += 1;
+            }
+        }
+
+    (sizes, n)
+}
+
+
+/// One connector as `/sys/class/drm/card0-<TYPE>-<n>` shows it (the VFS
+/// `sysdrm` overlay). Built from the same state GETCONNECTOR answers.
+#[derive(Clone, Copy)]
+pub struct SysConn {
+    pub conn_type: u32,
+    pub type_id: u32,
+    pub connected: bool,
+    pub nmodes: usize,
+    /// width, height, refresh Hz
+    pub modes: [(u32, u32, u32); 17],
+}
+
+/// Is there a DRM device whose GETCONNECTOR works?
+fn sysfs_drm_present() -> bool {
+    extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
+    let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+    unsafe { vfs_get_framebuffer_info(&mut info); }
+    crate::gpu_uapi::active() || crate::gpu_kms::active() || (info.width > 0 && info.height > 0)
+}
+
+/// Connector `i` (0 = the primary, 1.. = the backend's extras), `None` past the end.
+pub fn sysfs_connector(i: usize) -> Option<SysConn> {
+    if !sysfs_drm_present() { return None; }
+    let mut c = SysConn { conn_type: 0, type_id: 0, connected: false, nmodes: 0, modes: [(0, 0, 0); 17] };
+    if i == 0 {
+        c.conn_type = if crate::gpu_kms::internal_panel() { 14 } else { 11 };
+        c.type_id = 1;
+        c.connected = true;
+        let (sizes, n) = primary_modes();
+        for k in 0..n { c.modes[k] = (sizes[k].0, sizes[k].1, 60); }
+        c.nmodes = n;
+        return Some(c);
+    }
+    let e = i - 1;
+    if e >= crate::gpu_kms::ext_count() { return None; }
+    let inf = crate::gpu_kms::outputs().and_then(|o| (o.cached)(e))?;
+    let hidden = crate::gpu_kms::ext_crtc_mask(e) == 0 && crate::nvidia_probe::cmdline_opt("i915.extout_show") != Some(1);
+    c.conn_type = inf.conn_type;
+    c.type_id = inf.type_id;
+    c.connected = inf.connected && !hidden;
+    if c.connected {
+        for (k, t) in inf.modes[..inf.nmodes.min(4)].iter().enumerate() {
+            let tot = t.h[3] as u64 * t.v[3] as u64;
+            let hz = if tot > 0 { ((t.clock_khz as u64 * 1000 + tot / 2) / tot) as u32 } else { 60 };
+            c.modes[k] = (t.h[0] as u32, t.v[0] as u32, hz);
+            c.nmodes = k + 1;
+        }
+    }
+    Some(c)
+}
+
 /// Common sizes offered below the native mode (largest first), see
 /// `std_handle_get_connector`.
 const STANDARD_MODES: [(u32, u32); 16] = [
@@ -6998,20 +7090,8 @@ impl DrmDeviceInterface {
         conn.connector_type_id = 1;
         conn.connection = 1; // Connected
 
-        // The native mode is the boot console's size, i.e. the host's preferred
-        // scanout from GET_DISPLAY_INFO. It never changes after boot, so the
-        // list below is stable across a mode switch.
-        extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
-        let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
-        unsafe { vfs_get_framebuffer_info(&mut info); }
-        let (nw, nh) = if let Some((w, h, _)) = crate::gpu_kms::fixed_mode() {
-            (w, h)
-        } else if info.width > 0 && info.height > 0 {
-            (info.width, info.height)
-        } else {
-            (1280, 800)
-        };
-
+        let (sizes, n) = primary_modes();
+        let (nw, nh) = (sizes[0].0, sizes[0].1);
         // Physical size at 100 DPI, the same figure QEMU's generated EDID uses
         // (hw/display/edid-generate.c, dpi=100). It used to be a fixed 320x200
         // mm whatever the resolution, so any other resolution got a skewed DPI
@@ -7024,26 +7104,6 @@ impl DrmDeviceInterface {
             unsafe { sched::uaccess::copy_to_user(conn.encoders_ptr as usize, encoders.as_ptr() as *const u8, (1) * 4); }
         }
         conn.count_encoders = 1;
-
-        // Mode list: the native mode first (PREFERRED, and index 0 for callers
-        // that read only one), then the common VESA/CEA sizes that fit inside
-        // it, like Linux virtio-gpu (drm_add_modes_noedid up to the preferred
-        // size). Only one mode used to be listed, so Settings > Displays had
-        // no resolution to switch to. Every mode is 60 Hz; a virtio-gpu
-        // scanout takes its size from the framebuffer bound to it, so a mode
-        // switch is the compositor allocating buffers of the new size.
-        let mut sizes: [(u32, u32); 17] = [(0, 0); 17];
-        let mut n = 0usize;
-        sizes[n] = (nw, nh);
-        n += 1;
-        // A KMS backend's scanout has exactly its own mode (no modeset).
-        let extra = !crate::gpu_kms::active();
-        for &(w, h) in STANDARD_MODES.iter() {
-            if extra && w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
-                sizes[n] = (w, h);
-                n += 1;
-            }
-        }
 
         if conn.modes_ptr != 0 {
             let fit = (conn.count_modes as usize).min(n);

@@ -51,6 +51,7 @@ extern crate mm;
 pub mod block;
 pub mod sysclass;
 pub mod sysinput;
+pub mod sysdrm;
 pub mod cgroupfs;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
