@@ -1359,6 +1359,7 @@ static int ip_forward_set(int on) {
     close(fd);
     return r == 2 ? 0 : -1;
 }
+static const char *g_fwd_msg; /* overrides the per-mode check text */
 static int g_early_listen; /* mode 6: bind the host listener before br0 exists (httpd before podman0) */
 static void fwd_case(const char *name, int mode, int ipfwd) {
     char msg[96];
@@ -1470,7 +1471,8 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         rc = 0;
     }
     printf("%s child exit %d\n", name, rc);
-    if (g_fwd_nft) snprintf(msg, sizeof msg, "%s: %s", name, g_fwd_expect ? "UDP DNS query is answered: the subnet has a masquerade rule" : "UDP DNS query gets no reply: no masquerade rule for the subnet (internal)");
+    if (g_fwd_msg) snprintf(msg, sizeof msg, "%s: %s", name, g_fwd_msg);
+    else if (g_fwd_nft) snprintf(msg, sizeof msg, "%s: %s", name, g_fwd_expect ? "UDP DNS query is answered: the subnet has a masquerade rule" : "UDP DNS query gets no reply: no masquerade rule for the subnet (internal)");
     else if (mode == 6) snprintf(msg, sizeof msg, "%s: connect to the bridge address reaches the host 0.0.0.0 listener", name);
     else if (mode == 10) snprintf(msg, sizeof msg, "%s: established TCP flow is dropped by a rule added mid-flow (FORWARD sees established packets)", name);
     else if (mode == 8) snprintf(msg, sizeof msg, "%s: victim flow survives another netns deleting a link with its MAC", name);
@@ -1665,12 +1667,21 @@ static int nn_serve(const char *want_peer) {
     if (bind(l, (struct sockaddr *)&a, sizeof a) || listen(l, 4)) return 10;
     char ch = 'r'; write(done_[1], &ch, 1);     /* listening */
     int selfc = -1;
-    if (g_nn_mode == 1) selfc = nn_connect("10.97.0.1", 8080);
+    if (g_nn_mode == 1 || g_nn_mode == 5) selfc = nn_connect("10.97.0.1", 8080);
     if (!nn_poll(l, POLLIN, 15000)) return 11;
     struct sockaddr_in p; socklen_t pl = sizeof p;
     int c = accept(l, (struct sockaddr *)&p, &pl);
     if (c < 0) return 12;
     char got[32]; inet_ntop(AF_INET, &p.sin_addr, got, sizeof got);
+    if (g_nn_mode == 5) {
+        /* established hairpin flow: the parent loads `ct state established drop`; our reply must not arrive */
+        char e = 'e'; write(done_[1], &e, 1);
+        if (rd_to(ctl[0], &e) != 1) return 14;
+        write(c, "hi", 2);
+        int got_data = nn_poll(selfc, POLLIN, 2500);
+        close(c); if (selfc >= 0) close(selfc);
+        return got_data ? 15 : 0;
+    }
     write(c, "hi", 2);
     usleep(200000);
     if (selfc >= 0) close(selfc);
@@ -1779,17 +1790,31 @@ static void nn_case(const char *name, int mode) {
         CHECK(msg, !strcmp(ip, "127.0.0.1") && ntohs(from.sin_port) == 9090);
         close(u);
     }
+    if (ok && mode == 5) {
+        ok = rd_to(dd[0], &ch) == 1;
+        snprintf(msg, sizeof msg, "%s: hairpin flow established through DNAT", name); CHECK(msg, ok);
+        FILE *nf = fopen("/tmp/fn.nft", "w");
+        if (nf) { fputs("table inet midflow {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state established drop\n }\n}\n", nf); fclose(nf); }
+        snprintf(msg, sizeof msg, "%s: nft -f adds `ct state established drop` mid-flow", name);
+        CHECK(msg, system("nft -f /tmp/fn.nft >/tmp/fn.err 2>&1") == 0);
+        usleep(200000);
+        write(cc[1], &ch, 1);
+    }
     if (c > 0) {
         int r = wait_child(c);
-        snprintf(msg, sizeof msg, "%s: server saw the connection%s (exit %d)", name, mode ? " from 10.97.0.1" : "", r); CHECK(msg, r == 0);
+        if (mode == 5) { snprintf(msg, sizeof msg, "%s: established hairpin flow is dropped by a rule added mid-flow (exit %d)", name, r); CHECK(msg, r == 0); }
+        else {
+        snprintf(msg, sizeof msg, "%s: server saw the connection%s (exit %d)", name, mode ? " from 10.97.0.1" : "", r); CHECK(msg, r == 0); }
     }
     if (c2 > 0) {
         int r = wait_child(c2);
         snprintf(msg, sizeof msg, "%s: client got the reply through the published port (exit %d)", name, r); CHECK(msg, r == 0);
     }
     system("nft delete table inet netavark");
+    if (mode == 5) system("nft delete table inet midflow");
     link_del(s, bidx); close(s);
 }
+static void nftnat_hairpin_midflow(void) { nn_case("nftnat_hairpin_midflow", 5); }
 static void nftnat_local(void) { nn_case("nftnat_local_redirect", 0); }
 static void nftnat_hairpin(void) { nn_case("nftnat_hairpin", 1); }
 static void nftnat_cross(void) { nn_case("nftnat_cross_netns", 2); }
@@ -1817,6 +1842,123 @@ static void fwd_hostlisten(void) { fwd_case("fwd_hostlisten", 6, 1); }
 static void fwd_hostlisten_early(void) { g_early_listen = 1; fwd_case("fwd_hostlisten_early", 6, 1); g_early_listen = 0; }
 static void nftfwd_midflow(void) { g_fwd_expect_ovr = 0; fwd_case("nftfwd_midflow_established", 10, 1); g_fwd_expect_ovr = -1; }
 static void fwd_reap(void) { fwd_case("fwd_reap", 5, 1); }
+/* ICMP errors of a tracked flow are `ct state related`: with a default-drop FORWARD policy they pass only when a rule accepts them. */
+static const char FR_RULES_OFF[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n}\n";
+static const char FR_RULES_ON[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+static void nftfwd_related_off(void) {
+    g_fwd_nft = FR_RULES_OFF; g_fwd_expect_ovr = 0;
+    g_fwd_msg = "ICMP port-unreachable (ct state related) is dropped by the default-drop policy";
+    fwd_case("nftfwd_related_drop", 3, 1);
+    g_fwd_nft = NULL; g_fwd_expect_ovr = -1; g_fwd_msg = NULL;
+}
+static void nftfwd_related_on(void) {
+    g_fwd_nft = FR_RULES_ON;
+    g_fwd_msg = "ICMP port-unreachable is delivered by `ct state related accept` under a default-drop policy (ECONNREFUSED)";
+    fwd_case("nftfwd_related_accept", 3, 1);
+    g_fwd_nft = NULL; g_fwd_msg = NULL;
+}
+
+/* ---- IPv6 established flows traverse FORWARD (NAT66 through the NIC) -------------------------------------- */
+static char g_gw6[64];
+static int gw6_find(void) {
+    /* QEMU slirp: the router is <SLAAC prefix>::2 (the default route's next hop is a link-local address) */
+    FILE *f = fopen("/proc/net/if_inet6", "r");
+    if (!f) return -1;
+    char l[256]; int r = -1;
+    while (fgets(l, sizeof l, f)) {
+        char a[40], ifn[24]; unsigned ix, pl, sc, fl;
+        if (sscanf(l, "%32s %x %x %x %x %23s", a, &ix, &pl, &sc, &fl, ifn) != 6) continue;
+        if (sc != 0 || strncmp(ifn, "eth", 3)) continue;
+        unsigned g[4];
+        for (int i = 0; i < 4; i++) { char q[5]; memcpy(q, a + i * 4, 4); q[4] = 0; sscanf(q, "%x", &g[i]); }
+        snprintf(g_gw6, sizeof g_gw6, "%x:%x:%x:%x::2", g[0], g[1], g[2], g[3]);
+        r = 0; break;
+    }
+    fclose(f);
+    return r;
+}
+static int ping6_sock(int ic, const char *dst, unsigned short seq) {
+    struct sockaddr_in6 to; memset(&to, 0, sizeof to); to.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, dst, &to.sin6_addr);
+    unsigned char pk[8] = { 128, 0, 0, 0, 0x12, 0x34, (unsigned char)(seq >> 8), (unsigned char)seq };
+    if (sendto(ic, pk, 8, 0, (struct sockaddr *)&to, sizeof to) != 8) return 2;
+    unsigned char rb[64];
+    ssize_t n = recv(ic, rb, sizeof rb, 0);
+    return n >= 8 && rb[0] == 129 ? 0 : 3;
+}
+static int fwd6_body(void) {
+    g_ip6 = "fd00:97::2";
+    int e = v6_conf_eth0(); if (e) return e;
+    int cs = nl_sock();
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    if (route6_default(cs, idx, "fd00:97::1")) return 3;
+    close(cs);
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 4;
+    int ic = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (ic < 0) return 5;
+    struct timeval tv = { 4, 0 };
+    setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (ping6_sock(ic, g_gw6, 1)) return 6;          /* NEW then reply: the flow is now established */
+    write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 7;
+    return ping6_sock(ic, g_gw6, 2) ? 0 : 8;         /* must NOT be answered once `ct state established drop` is loaded */
+}
+static int ip6_forward_set(int on) {
+    int fd = open("/proc/sys/net/ipv6/conf/all/forwarding", O_WRONLY);
+    if (fd < 0) return -1;
+    int r = write(fd, on ? "1\n" : "0\n", 2);
+    close(fd);
+    return r == 2 ? 0 : -1;
+}
+static void nftfwd6_midflow(void) {
+    const char *name = "nftfwd6_midflow_established";
+    char msg[140];
+    snprintf(msg, sizeof msg, "%s: the NIC has a global v6 address (slirp router ::2)", name);
+    int have = gw6_find() == 0;
+    CHECK(msg, have);
+    if (!have) return;
+    int s = nl_sock();
+    unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x06 };
+    int ok = br_new(s, "br0", brmac) == 0;
+    int bidx = link_get(s, "br0", NULL, NULL);
+    ok = ok && bidx > 0 && addr6_add(s, bidx, "fd00:97::1", 64) == 0 && link_set_up(s, bidx) == 0 && ip6_forward_set(1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 fd00:97::1/64 up, ipv6 forwarding=1", name); CHECK(msg, ok);
+    pid_t c = spawn_ns(fwd6_body);
+    int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
+    int fc = c > 0 ? netns_fd_of(c) : -1;
+    ok = c > 0 && veth_new_m(s, "vethS", "eth0", fc, bidx) == 0;
+    if (fc >= 0) close(fc);
+    int iv = link_get(s, "vethS", NULL, NULL);
+    ok = ok && iv > 0 && link_set_up(s, iv) == 0;
+    snprintf(msg, sizeof msg, "%s: netns + veth", name); CHECK(msg, ok);
+    char ch = 'g';
+    if (ok) {
+        write(cc[1], &ch, 1);
+        ok = rd_to(dd[0], &ch) == 1;
+        snprintf(msg, sizeof msg, "%s: netns configured", name); CHECK(msg, ok);
+        if (ok) write(cc[1], &ch, 1);
+        ok = ok && rd_to(dd[0], &ch) == 1;
+        snprintf(msg, sizeof msg, "%s: ICMPv6 echo to %s answered through NAT66 (flow established)", name, g_gw6); CHECK(msg, ok);
+        if (ok) {
+            FILE *nf = fopen("/tmp/fn.nft", "w");
+            if (nf) { fputs("table inet midflow {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state established drop\n }\n}\n", nf); fclose(nf); }
+            snprintf(msg, sizeof msg, "%s: nft -f adds `ct state established drop` mid-flow", name);
+            CHECK(msg, system("nft -f /tmp/fn.nft >/tmp/fn.err 2>&1") == 0);
+            usleep(200000);
+            write(cc[1], &ch, 1);
+        }
+    }
+    int rc = c > 0 ? wait_child(c) : -1;
+    snprintf(msg, sizeof msg, "%s: established v6 flow is dropped by a rule added mid-flow (exit %d)", name, rc); CHECK(msg, rc == 0);
+    system("nft delete table inet midflow");
+    ip6_forward_set(0);
+    if (iv > 0) link_del(s, iv);
+    link_del(s, bidx);
+    close(s);
+}
 
 /* A host wildcard listener must not leak into a container netns: a netns
  * stack that connects to its OWN address on the listener's port gets
@@ -1987,6 +2129,10 @@ int main(int argc, char **argv) {
     if (!only || !strcmp(only, "nftnat_masq_ok")) nftnat_masq_ok();
     if (!only || !strcmp(only, "fwd_udp")) fwd_udp();
     if (!only || !strcmp(only, "nftfwd_midflow_established")) nftfwd_midflow();
+    if (!only || !strcmp(only, "nftfwd6_midflow_established")) nftfwd6_midflow();
+    if (!only || !strcmp(only, "nftfwd_related_drop")) nftfwd_related_off();
+    if (!only || !strcmp(only, "nftfwd_related_accept")) nftfwd_related_on();
+    if (!only || !strcmp(only, "nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
     if (!only || !strcmp(only, "routed_l3")) routed_on();
     if (!only || !strcmp(only, "routed_l3_off")) routed_off();
     if (!only || !strcmp(only, "fwd_ping")) fwd_ping();
