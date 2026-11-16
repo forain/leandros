@@ -6036,6 +6036,7 @@ fn master_vt_of(open_id: u32) -> Option<usize> {
 
 /// Grant the active VT's slot to `open_id` if it is free.
 fn master_grant_active(open_id: u32) -> bool {
+    if tty_server::vt::release_pending() { return false; }
     let vt = tty_server::vt::active().clamp(1, tty_server::vt::VT_COUNT);
     if MASTER_BY_VT[vt - 1]
         .compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst)
@@ -6073,7 +6074,14 @@ fn requires_master(cmd: u32) -> bool {
 /// screen. Two relaxed-ish atomic loads and nothing else — this is on the path
 /// of every present.
 fn master_ok(open_id: u32) -> bool {
-    open_id != 0 && active_slot().load(Ordering::SeqCst) == open_id
+    // A VT_PROCESS release in flight suspends master for everyone: ACTIVE still
+    // names the outgoing VT until the owner answers VT_RELDISP, so without this
+    // a present issued from inside the release handler reached the scanout
+    // (the VT-switch flash). PHASE is stored before the release signal is sent,
+    // so the handler always observes it.
+    open_id != 0
+        && !tty_server::vt::release_pending()
+        && active_slot().load(Ordering::SeqCst) == open_id
 }
 
 /// Gate one master-only ioctl, granting master implicitly on first use.

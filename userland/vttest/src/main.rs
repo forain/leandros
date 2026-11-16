@@ -79,6 +79,7 @@ const VT_GETMODE: c_ulong = 0x5601;
 const VT_SETMODE: c_ulong = 0x5602;
 const VT_GETSTATE: c_ulong = 0x5603;
 const VT_ACTIVATE: c_ulong = 0x5606;
+const VT_RELDISP: c_ulong = 0x5605;
 const VT_WAITACTIVE: c_ulong = 0x5607;
 
 // KD* — <linux/kd.h>
@@ -239,6 +240,7 @@ extern "C" {
     pub fn __errno_location() -> *mut c_int;
     pub fn readlink(path: *const u8, buf: *mut u8, len: size_t) -> ssize_t;
     pub fn fork() -> c_int;
+    pub fn signal(sig: c_int, handler: usize) -> usize;
     pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 }
 
@@ -770,6 +772,71 @@ unsafe fn t_master_follows_vt(tty0: c_int) -> bool {
     out(b" vt2="); out_int(bg_rc); out(b" errno="); out_int(bg_errno);
     out(b" vt1_again="); out(if rearmed { b"0" } else { b"!0" }); out(b"\n");
     report(b"master_follows_vt", grant && on_vt1 && moved && suspended && back && rearmed)
+}
+
+/// A present issued while a `VT_PROCESS` release is outstanding is refused.
+///
+/// This is the window the VT-switch flash lived in: `VT_ACTIVATE` sends the
+/// release signal but the display has not moved (`ACTIVE` still names the
+/// outgoing VT) until `VT_RELDISP(1)`, so a compositor that flips from inside
+/// its release handler was still master and reached the scanout — and the flip
+/// that lands just before the handover is what shows over the incoming console.
+/// The probe is the same DIRTYFB-with-no-framebuffer as the other master tests:
+/// permitted returns 0 and touches nothing, so only the permission moves. A
+/// refused release (`VT_RELDISP(0)`) must give master back.
+unsafe fn t_present_in_release_window(tty0: c_int) -> bool {
+    const SIGUSR1: c_int = 10;
+    const SIG_IGN: usize = 1;
+    let fd = card0();
+    let t1 = open(b"/dev/tty1\0".as_ptr(), O_RDWR);
+    if fd < 0 || t1 < 0 || active_vt(tty0) != 1 {
+        if fd >= 0 { close(fd); }
+        if t1 >= 0 { close(t1); }
+        return report(b"present_in_release_window", false);
+    }
+    // Both the release (USR1) and acquire (USR2) signals must be ignored: the
+    // default action of either kills the test.
+    let old = signal(SIGUSR1, SIG_IGN);
+    let old2 = signal(12, SIG_IGN);
+    let grant = set_master(fd) == 0;
+    let before = dirtyfb(fd) == 0;
+    let pm = vt_mode { mode: VT_PROCESS, waitv: 0, relsig: 10, acqsig: 12, frsig: 0, _guard: 0 };
+    let armed = ioctl(t1, VT_SETMODE, &pm as *const vt_mode as *mut c_void) == 0;
+
+    // Refused release first: the display must not move and master must return.
+    let req = ioctl(tty0, VT_ACTIVATE, 2usize as *mut c_void) == 0;
+    let still1 = active_vt(tty0) == 1;
+    let in_rc = dirtyfb(fd);
+    let in_errno = errno();
+    let refused_in_window = in_rc < 0 && in_errno == EACCES;
+    let nack = ioctl(t1, VT_RELDISP, 0usize as *mut c_void) == 0;
+    let back_after_nack = dirtyfb(fd) == 0;
+
+    // Granted release: refused during the window and after the switch.
+    let req2 = ioctl(tty0, VT_ACTIVATE, 2usize as *mut c_void) == 0;
+    let win2 = dirtyfb(fd) < 0 && errno() == EACCES;
+    let grant_rel = ioctl(t1, VT_RELDISP, 1usize as *mut c_void) == 0;
+    let moved = ioctl(tty0, VT_WAITACTIVE, 2usize as *mut c_void) == 0 && active_vt(tty0) == 2;
+    let bg = dirtyfb(fd) < 0 && errno() == EACCES;
+
+    // Return: switch_to completes at once (VT 2 is VT_AUTO) and asks VT 1 to
+    // acknowledge the acquire.
+    let ret = switch_to(tty0, 1);
+    let ack = ioctl(t1, VT_RELDISP, 2usize as *mut c_void) == 0;
+    let auto = vt_mode { mode: VT_AUTO, waitv: 0, relsig: 0, acqsig: 0, frsig: 0, _guard: 0 };
+    ioctl(t1, VT_SETMODE, &auto as *const vt_mode as *mut c_void);
+    let rearmed = dirtyfb(fd) == 0;
+
+    drop_master(fd);
+    close(fd);
+    close(t1);
+    signal(SIGUSR1, old);
+    signal(12, old2);
+    out(b"  in_window_rc="); out_int(in_rc); out(b" errno="); out_int(in_errno); out(b"\n");
+    report(b"present_in_release_window",
+           grant && before && armed && req && still1 && refused_in_window && nack
+           && back_after_nack && req2 && win2 && grant_rel && moved && bg
+           && ret && ack && rearmed)
 }
 
 /// SET_MASTER from the holder while its VT is off screen is EACCES — and does
@@ -1510,7 +1577,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 34usize;
+    let total = 35usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1529,6 +1596,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_master_gates_present() { passed += 1; }
     if t_master_follows_vt(tty0) { passed += 1; }
     if t_setmaster_background(tty0) { passed += 1; }
+    if t_present_in_release_window(tty0) { passed += 1; }
     if t_master_per_vt(tty0) { passed += 1; }
     if t_grab_roundtrip() { passed += 1; }
     if t_grab_is_exclusive() { passed += 1; }
