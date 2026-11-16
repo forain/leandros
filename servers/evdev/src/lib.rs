@@ -1235,16 +1235,27 @@ fn rel_bits(dev: usize) -> u32 {
 
 /// EVIOCGBIT(ev, len): report the capability bitmask for event type `ev`.
 fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) -> Message {
-    const MAXB: usize = 96; // covers the KEY bitmap up to ~KEY code 0x2FF
-    let mut buf = [0u8; MAXB];
-    let n = core::cmp::min(size, MAXB);
+    let mut buf = [0u8; EV_BITS_MAX];
+    let n = core::cmp::min(size, EV_BITS_MAX);
+    ev_bits(dev_id, ev, &mut buf[..n]);
+    copy_out(pid, arg_ptr, &buf[..n])
+}
+
+/// Longest capability bitmap (covers the KEY bitmap up to ~KEY code 0x2FF).
+pub const EV_BITS_MAX: usize = 96;
+
+/// The capability bitmask for event type `ev` of `dev_id`, written into `buf`
+/// (zeroed by the caller). Shared by EVIOCGBIT and the synthesized sysfs
+/// `capabilities/*` files so the two cannot disagree.
+fn ev_bits(dev_id: usize, ev: usize, buf: &mut [u8]) {
+    let n = buf.len();
     if dev_id >= FIXED_DEVICES {
         let kind = { let f = unsafe { arch_interrupt_save() };
                      let k = STATE.lock().devs[dev_id].kind;
                      unsafe { arch_interrupt_restore(f); } k };
         if uinput::is_kind(kind) {
-            uinput::fill_bits(dev_id, ev, &mut buf[..n]);
-            return copy_out(pid, arg_ptr, &buf[..n]);
+            uinput::fill_bits(dev_id, ev, buf);
+            return;
         }
         let mut set = |bit: usize| if bit / 8 < n { buf[bit / 8] |= 1 << (bit % 8); };
         match (kind, ev) {
@@ -1267,7 +1278,7 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
             }
             _ => {}
         }
-        return copy_out(pid, arg_ptr, &buf[..n]);
+        return;
     }
     match ev {
         0 => { // supported event types
@@ -1311,7 +1322,6 @@ fn eviocgbit(dev_id: usize, ev: usize, arg_ptr: usize, size: usize, pid: u32) ->
         }
         _ => {} // EV_MSC/... → none
     }
-    copy_out(pid, arg_ptr, &buf[..n])
 }
 
 /// EVIOCGABS(abs): report input_absinfo for an absolute axis (tablet only).
@@ -2206,6 +2216,7 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // fill that slot; a raw user IPC naming another pid would read or write
     // that process's memory (openbugs L1.17).
     EVDEV_PORT.store(port_id, core::sync::atomic::Ordering::Release);
+    vfs_server::sysinput::set_ops(&SYSINPUT_OPS);
     port::register_kernel_handler(port_id, handle);
     Some(port_id)
 }
@@ -2284,6 +2295,48 @@ pub fn unregister_input_device(dev: u32) {
     hp_broadcast(rec);
     crate_log(b"[EVDEV] removed ", EVENT_PATHS[i], "");
 }
+
+// ── synthesized /sys/class/input (servers/vfs/src/sysinput.rs) ───────────────
+
+/// Identity of live node `n` for sysfs; `None` when the node does not exist.
+/// Mirrors EVIOCGID / EVIOCGNAME exactly.
+fn sysfs_info(n: usize) -> Option<vfs_server::sysinput::Info> {
+    if n >= MAX_DEVICES { return None; }
+    let f = unsafe { arch_interrupt_save() };
+    let r = {
+        let st = STATE.lock();
+        let d = &st.devs[n];
+        if !d.in_use { None } else if n >= FIXED_DEVICES {
+            let mut i = vfs_server::sysinput::Info::empty();
+            let l = d.name_len as usize;
+            i.name[..l].copy_from_slice(&d.name[..l]);
+            i.name_len = l;
+            i.ids = [d.bus, d.vendor, d.product, 0x0110];
+            Some(i)
+        } else {
+            let mut i = vfs_server::sysinput::Info::empty();
+            let (nm, ids): (&[u8], [u16; 4]) = if n == DEV_TABLET {
+                (b"QEMU Virtio Tablet", [BUS_VIRTUAL, 0x0627, 0x0001, 0x0001])
+            } else {
+                (b"QEMU Virtio Keyboard", [BUS_VIRTUAL, 0x0627, 0x0002, 0x0001])
+            };
+            i.name[..nm.len()].copy_from_slice(nm);
+            i.name_len = nm.len();
+            i.ids = ids;
+            Some(i)
+        }
+    };
+    unsafe { arch_interrupt_restore(f); }
+    r
+}
+
+fn sysfs_bits(n: usize, ev: usize, out: &mut [u8]) {
+    let l = out.len().min(EV_BITS_MAX);
+    ev_bits(n, ev, &mut out[..l]);
+}
+
+static SYSINPUT_OPS: vfs_server::sysinput::Ops =
+    vfs_server::sysinput::Ops { info: sysfs_info, bits: sysfs_bits };
 
 // ── /dev/input/hotplug: uevent-like add/remove stream ─────────────────────────
 //

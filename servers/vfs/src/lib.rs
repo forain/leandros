@@ -50,6 +50,7 @@ extern crate mm;
 /// sysfs is generated on demand rather than stored.
 pub mod block;
 pub mod sysclass;
+pub mod sysinput;
 pub mod cgroupfs;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
