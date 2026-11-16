@@ -2884,6 +2884,112 @@ static int t_unix_dgram_rights(void)
     return 0;
 }
 
+/* ---- AF_UNIX dgram inbox: GC of SCM_RIGHTS fds queued in an inbox, and
+ * the per-sender wmem budget ---- */
+static int udg_send_fds(int s, struct sockaddr_un *a, socklen_t l, const int *fds, int n)
+{
+    char cb[CMSG_SPACE(sizeof(int) * 4)] = {0}, d = 'g';
+    struct iovec iov = { &d, 1 };
+    struct msghdr h = { .msg_name = a, .msg_namelen = l, .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = CMSG_SPACE(sizeof(int) * n) };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&h);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int) * n);
+    memcpy(CMSG_DATA(cm), fds, sizeof(int) * n);
+    return (int)sendmsg(s, &h, 0);
+}
+
+/* A socket cycle through inboxes (A's inbox holds A, or A holds B and B holds
+ * A) is garbage once every fd is closed: the pipe write end riding along is
+ * released, and the names are free to bind again. */
+static int t_unix_dgram_gc_cycle(void)
+{
+    struct sockaddr_un aa, ab, x; socklen_t la, lb, lx;
+    int pp[2];
+    CHECK(pipe2(pp, O_NONBLOCK) == 0);
+    int a = udg_bound("udgg-a", 1, &aa, &la), b = udg_bound("udgg-b", 1, &ab, &lb);
+    CHECK(a >= 0 && b >= 0);
+    int f1[2] = { a, pp[1] }, f2[1] = { b }, f3[1] = { a };
+    CHECK(udg_send_fds(a, &aa, la, f1, 2) == 1);        /* A's inbox holds A and the pipe */
+    CHECK(udg_send_fds(a, &ab, lb, f1, 2) == 1);        /* B's inbox holds A too: B is reachable only via A */
+    CHECK(udg_send_fds(b, &aa, la, f2, 1) == 1);        /* A's inbox holds B: A <-> B cycle */
+    close(pp[1]);
+    char c;
+    CHECK(read(pp[0], &c, 1) == -1 && errno == EAGAIN); /* still queued, nothing freed early */
+    close(a);
+    CHECK(read(pp[0], &c, 1) == -1 && errno == EAGAIN); /* B still open: A is live through B */
+    close(b);
+    usleep(100 * 1000);
+    CHECK(read(pp[0], &c, 1) == 0);                     /* cycle collected: every write end gone */
+    int a2 = udg_bound("udgg-a", 1, &x, &lx), b2 = udg_bound("udgg-b", 1, &x, &lx);
+    CHECK(a2 >= 0 && b2 >= 0);                          /* names are free again */
+    (void)f3;
+    close(a2); close(b2); close(pp[0]);
+    return 0;
+}
+
+/* The collector never frees what is still reachable: an fd queued in a live
+ * inbox keeps its socket (and the datagrams in it) alive, and is receivable. */
+static int t_unix_dgram_gc_live(void)
+{
+    struct sockaddr_un aa, ab; socklen_t la, lb;
+    int a = udg_bound("udgl-a", 1, &aa, &la), b = udg_bound("udgl-b", 1, &ab, &lb);
+    CHECK(a >= 0 && b >= 0);
+    int fa[1] = { a }, fb[1] = { b };
+    CHECK(udg_send_fds(a, &ab, lb, fa, 1) == 1);        /* B's inbox holds A */
+    CHECK(udg_send_fds(b, &aa, la, fb, 1) == 1);        /* A's inbox holds B */
+    close(a);                                           /* B is still open here: nothing may be freed */
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(sendto(s, "live", 4, 0, (struct sockaddr *)&aa, la) == 4);   /* A still bound and accepting */
+    char rb[CMSG_SPACE(sizeof(int))] = {0}, e;
+    struct iovec iv = { &e, 1 };
+    struct msghdr g = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = rb, .msg_controllen = sizeof rb };
+    CHECK(recvmsg(b, &g, 0) == 1);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&g);
+    CHECK(cm && cm->cmsg_type == SCM_RIGHTS);
+    int na; memcpy(&na, CMSG_DATA(cm), sizeof na);      /* A, reborn as an fd */
+    char m[8];
+    CHECK(recv(na, m, sizeof m, 0) == 1);               /* the datagram A queued earlier: B's fd message */
+    CHECK(recv(na, m, sizeof m, 0) == 4 && memcmp(m, "live", 4) == 0);
+    close(na); close(b); close(s);
+    return 0;
+}
+
+/* A sender's SO_SNDBUF bounds what it has queued in other sockets' inboxes:
+ * nonblocking sends get EAGAIN with both inboxes nearly empty, a blocking one
+ * waits for a receiver to drain. */
+static int t_unix_dgram_wmem(void)
+{
+    struct sockaddr_un a1, a2; socklen_t l1, l2;
+    int r1 = udg_bound("udgw-1", 1, &a1, &l1), r2 = udg_bound("udgw-2", 1, &a2, &l2);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(r1 >= 0 && r2 >= 0 && c >= 0);
+    int sb = 4096; socklen_t sl = sizeof sb;
+    CHECK(setsockopt(c, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb) == 0);
+    CHECK(getsockopt(c, SOL_SOCKET, SO_SNDBUF, &sb, &sl) == 0 && sb < 100000);
+    char buf[1000]; memset(buf, 'w', sizeof buf);
+    int n = 0;
+    for (;;) {
+        struct sockaddr_un *a = (n & 1) ? &a2 : &a1; socklen_t l = (n & 1) ? l2 : l1;
+        if (sendto(c, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)a, l) != (ssize_t)sizeof buf) break;
+        if (++n > 100) break;
+    }
+    CHECK(errno == EAGAIN && n >= 1 && n <= 12);       /* inboxes alone (11 each) would have taken 22 */
+    udg_to(c, 3000);
+    pid_t k = fork();
+    if (k == 0) { usleep(200 * 1000); char x[1000]; _exit(recv(r1, x, sizeof x, 0) == (ssize_t)sizeof x ? 0 : 1); }
+    CHECK(sendto(c, buf, sizeof buf, 0, (struct sockaddr *)&a2, l2) == (ssize_t)sizeof buf);   /* parks, then wakes */
+    int st; waitpid(k, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* an unrelated sender has its own budget */
+    int d = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(sendto(d, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&a1, l1) == (ssize_t)sizeof buf);
+    /* draining everything gives the budget back */
+    char x[1000];
+    while (recv(r1, x, sizeof x, MSG_DONTWAIT) > 0) {}
+    while (recv(r2, x, sizeof x, MSG_DONTWAIT) > 0) {}
+    CHECK(sendto(c, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&a1, l1) == (ssize_t)sizeof buf);
+    close(r1); close(r2); close(c); close(d);
+    return 0;
+}
+
 static int t_unix_dgram_types(void)
 {
     struct sockaddr_un ad, as; socklen_t ld, ls;
@@ -3588,7 +3694,7 @@ static int run_userns_cases(void)
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
         { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit },
-        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "unix_dgram_connect", t_unix_dgram_connect }, { "unix_dgram_filter", t_unix_dgram_filter }, { "unix_dgram_peer_gone", t_unix_dgram_peer_gone }, { "unix_dgram_trunc_peek", t_unix_dgram_trunc_peek }, { "unix_dgram_poll_block", t_unix_dgram_poll_block }, { "unix_dgram_rights", t_unix_dgram_rights }, { "unix_dgram_types", t_unix_dgram_types }, { "unix_dgram_autobind", t_unix_dgram_autobind }, { "unix_dgram_syslog", t_unix_dgram_syslog }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "unix_dgram_connect", t_unix_dgram_connect }, { "unix_dgram_filter", t_unix_dgram_filter }, { "unix_dgram_peer_gone", t_unix_dgram_peer_gone }, { "unix_dgram_trunc_peek", t_unix_dgram_trunc_peek }, { "unix_dgram_poll_block", t_unix_dgram_poll_block }, { "unix_dgram_rights", t_unix_dgram_rights }, { "unix_dgram_gc_cycle", t_unix_dgram_gc_cycle }, { "unix_dgram_gc_live", t_unix_dgram_gc_live }, { "unix_dgram_wmem", t_unix_dgram_wmem }, { "unix_dgram_types", t_unix_dgram_types }, { "unix_dgram_autobind", t_unix_dgram_autobind }, { "unix_dgram_syslog", t_unix_dgram_syslog }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
