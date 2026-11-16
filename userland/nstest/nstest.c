@@ -3133,8 +3133,15 @@ PCASE(timer_sig_in_pidns, ub_timer_sig)
 #define NR_PIDFD_OPEN 434
 static long sys_setns(int fd, int t) { return syscall(NR_SETNS, fd, t); }
 
+/* The port the setns cases bind. It must sit BELOW ip_local_port_range
+ * (32768..60999): a client socket anywhere earlier in a long run that was
+ * handed this port as its ephemeral one (live, or 60 s in TIME_WAIT) makes a
+ * plain bind() answer EADDRINUSE, as on Linux (setns_net flaked this way at
+ * 41500, which is inside the range). */
+#define NS_PORT 30500
+
 /* Fork a child that unshares `fl` (as `uid` when non-zero), listens on
- * 127.0.0.1:41500 when it has a new netns, then parks until *hold_w closes. */
+ * 127.0.0.1:NS_PORT when it has a new netns, then parks until *hold_w closes. */
 static pid_t ns_spawn(unsigned long fl, int uid, int *hold_w)
 {
     int rdy[2], hold[2];
@@ -3146,7 +3153,7 @@ static pid_t ns_spawn(unsigned long fl, int uid, int *hold_w)
         if (unshare(fl)) _exit(2);
         if (fl & CLONE_NEWNET) {
             int s = socket(AF_INET, SOCK_STREAM, 0);
-            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
+            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(NS_PORT) };
             if (s < 0 || bind(s, (void *)&a, sizeof a) || listen(s, 4)) _exit(3);
         }
         char b = 'r'; (void)!write(rdy[1], &b, 1);
@@ -3182,7 +3189,7 @@ static unsigned long ns_link_ino(pid_t pid, const char *nm)
 static unsigned long fd_ino(int fd) { struct stat st; return fstat(fd, &st) ? 0 : st.st_ino; }
 static struct sockaddr_in ns_lo(void)
 {
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(NS_PORT) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     return a;
 }
@@ -3193,9 +3200,16 @@ static int t_setns_net(void)
     CHECK(c > 0);
     int fd = ns_open(c, "net");
     CHECK(fd >= 0);
-    struct sockaddr_in a = ns_lo(), w = { .sin_family = AF_INET, .sin_port = htons(41500) };
+    struct sockaddr_in a = ns_lo(), w = { .sin_family = AF_INET, .sin_port = htons(NS_PORT) };
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(bind(s, (void *)&w, sizeof w) == 0);   /* host namespace: port is free */
+    if (bind(s, (void *)&w, sizeof w) != 0) {   /* host namespace: port is free */
+        int e = errno, one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        printf("  DIAG setns_net: host bind %d errno %d; with SO_REUSEADDR %s (ok = TIME_WAIT, EADDRINUSE = live socket)\n",
+               NS_PORT, e, bind(s, (void *)&w, sizeof w) == 0 ? "ok" : strerror(errno));
+        errno = e;
+        CHECK(0);
+    }
     close(s);
     CHECK(sys_setns(fd, CLONE_NEWNET) == 0);
     s = socket(AF_INET, SOCK_STREAM, 0);
@@ -3204,6 +3218,19 @@ static int t_setns_net(void)
     (void)a;   /* a non-initial netns has a down loopback: no connect to check */
     close(fd);
     ns_release(c, hw);
+    return 0;
+}
+
+/* Guard: the setns cases' fixed port must not be an ephemeral one. */
+static int t_setns_port_not_ephemeral(void)
+{
+    char b[64] = {0};
+    int f = open("/proc/sys/net/ipv4/ip_local_port_range", O_RDONLY);
+    CHECK(f >= 0 && read(f, b, sizeof b - 1) > 0);
+    close(f);
+    int lo = 0, hi = 0;
+    CHECK(sscanf(b, "%d %d", &lo, &hi) == 2);
+    CHECK(NS_PORT < lo || NS_PORT > hi);
     return 0;
 }
 
@@ -3657,6 +3684,10 @@ static int t_quota_hier(void)
     return rc;
 }
 
+/* `nstest --case NAME [N]`: run only the userns case NAME, N times back to back (flake hunting). */
+static const char *only_case;
+static int only_reps = 1;
+
 static int run_userns_cases(void)
 {
     struct { const char *n; int (*f)(void); } cs[] = {
@@ -3686,7 +3717,7 @@ static int run_userns_cases(void)
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
-        { "setns_net", t_setns_net }, { "setns_stat", t_setns_stat }, { "setns_eperm", t_setns_eperm },
+        { "setns_net", t_setns_net }, { "setns_port_not_ephemeral", t_setns_port_not_ephemeral }, { "setns_stat", t_setns_stat }, { "setns_eperm", t_setns_eperm },
         { "setns_userns_owner", t_setns_userns_owner }, { "setns_userns_root", t_setns_userns_root },
         { "setns_userns_threaded", t_setns_userns_threaded }, { "setns_userns_chroot", t_setns_userns_chroot },
         { "setns_misc", t_setns_misc }, { "setns_pid_children", t_setns_pid_children },
@@ -3701,10 +3732,13 @@ static int run_userns_cases(void)
         { "cgns_in_userns", t_cgns_in_userns }, { "cgns_leak", t_cgns_leak },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
-        pid_t c = fork();
-        if (c == 0) _exit(cs[i].f());
-        int st = 0; waitpid(c, &st, 0);
-        check(cs[i].n, WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        if (only_case && strcmp(only_case, cs[i].n)) continue;
+        for (int rep = 0; rep < (only_case ? only_reps : 1); rep++) {
+            pid_t c = fork();
+            if (c == 0) _exit(cs[i].f());
+            int st = 0; waitpid(c, &st, 0);
+            check(cs[i].n, WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        }
     }
     return 0;
 }
@@ -4243,6 +4277,12 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
     if (argc > 1 && !strcmp(argv[1], "--zaptmo")) return zaptmo();
     if (getenv("NSTEST_HOST")) { printf("nstest: SKIP (host)\n"); return 0; }
+    if (argc > 2 && !strcmp(argv[1], "--case")) {
+        only_case = argv[2]; only_reps = argc > 3 ? atoi(argv[3]) : 1;
+        run_userns_cases();
+        printf("nstest: %d passed, %d failed\n", npass, nfail);
+        return nfail != 0;
+    }
     for (unsigned i = 0; i < sizeof flags / sizeof flags[0]; i++) {
         char nm[64];
         long r;
