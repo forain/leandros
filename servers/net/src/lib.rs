@@ -3760,6 +3760,7 @@ pub fn net_daemon() -> ! {
     let (mut prev_tx, mut prev_rx) = (0u64, 0u64);
     loop {
         vif::daemon_pass();
+        nlsock::poll_notify();
         // This task runs with IRQs masked between parks: let the tick in on
         // every pass, so a pass that keeps restarting cannot starve the CPU
         // and the wedge scan / watchdog can still run on it (1-CPU boots).
@@ -7836,8 +7837,14 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
 /// unrelated behaviour change.
 fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                      optval_ptr: usize, optlen: usize) -> Message {
-    // Netlink: buffer sizes and the like are accepted and ignored.
-    if nlsock::of(pid, fd).is_some() { return ok_reply(); }
+    // Netlink: group membership is honoured, buffer sizes and the like are accepted and ignored.
+    if let Some(o) = nlsock::of(pid, fd) {
+        if level == 270 && (optname == 1 || optname == 2) && optlen >= 4 {
+            if let Some(g) = sched::uaccess::read_user::<u32>(optval_ptr) { return nlsock::membership(o, optname, g); }
+            return err_reply(-14);
+        }
+        return ok_reply();
+    }
     const SO_REUSEADDR: usize = 2;
     if level == SOL_SOCKET as usize && optname == SO_REUSEADDR {
         // The int is read out of user memory before any server lock is taken:
