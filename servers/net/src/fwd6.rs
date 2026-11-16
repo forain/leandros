@@ -32,7 +32,7 @@ impl Ct6 {
         kind: 0, tip: [0; 16], tport: 0, tbr: crate::vifsel::NO_PEER, tps: crate::vifsel::NO_PEER, tmac: [0; 6], tbmac: [0; 6] };
 }
 struct Lrn6 { br: Sid, ip: [u8; 16], mac: [u8; 6], port: Sid, t: u64 }
-struct Park6 { br: Sid, ip: [u8; 16], t: u64, port: Sid, frame: Vec<u8> }
+struct Park6 { br: Sid, sbr: Sid, ip: [u8; 16], t: u64, port: Sid, frame: Vec<u8> }
 pub(crate) struct L6 { lrn: Vec<Lrn6>, park: Vec<Park6> }
 impl L6 { pub(crate) const fn new() -> L6 { L6 { lrn: Vec::new(), park: Vec::new() } } }
 pub(crate) struct Nd { nic: u8, ip: [u8; 16], mac: [u8; 6], t: u64 }
@@ -290,7 +290,7 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     let key = |e: &Ct6| e.nic == nic && e.proto == p.proto && e.nicip == p.dst && e.nat == p.dport
         && e.rip == p.src && (p.proto == PROTO_ICMP6 || e.rport == p.sport) && e.kind < 2;
     if p.proto != PROTO_ICMP6 && !st.ct6.iter().any(|e| key(e)) {
-        match new_in6(&mut st, nic, &p, now) { 0 => return false, 1 => return true, _ => {} }
+        match new_in6(&mut st, nic, &p, now, buf) { 0 => return false, 1 => return true, _ => {} }
     }
     let Some(e) = st.ct6.iter_mut().find(|e| key(e)) else { fwd::stat6(fwd::S6_RX_MISS); return false };
     fwd::stat6(fwd::S6_RX_HIT);
@@ -330,15 +330,18 @@ pub(crate) fn learn_c(br: Sid, port: Sid, bmac: [u8; 6], f: &[u8]) -> Option<[u8
 }
 
 /// Frames parked on a learn miss for `ip` on `br`, oldest first.
-pub(crate) fn unpark(br: Sid, ip: [u8; 16]) -> Vec<(Sid, Vec<u8>)> {
+pub(crate) fn unpark(br: Sid, ip: [u8; 16]) -> Vec<(Sid, Sid, Vec<u8>)> {
     let now = sched::monotonic_ns();
     let mut st = FWD.lock();
     st.l6.park.retain(|q| now.saturating_sub(q.t) < fwd::PEND_NS * 2);
+    fwd::take_npark(&mut st, br, ip, true, now);
     let mut out = Vec::new();
     let mut i = 0;
     while i < st.l6.park.len() {
-        if st.l6.park[i].br == br && st.l6.park[i].ip == ip { let q = st.l6.park.remove(i); out.push((q.port, q.frame)); } else { i += 1; }
+        if st.l6.park[i].br == br && st.l6.park[i].ip == ip { let q = st.l6.park.remove(i); out.push((q.sbr, q.port, q.frame)); } else { i += 1; }
     }
+    drop(st);
+    if !out.is_empty() { drivers::netdev::kick(); }
     out
 }
 
@@ -375,7 +378,7 @@ fn ns_into(st: &mut fwd::St, t: &Tgt6, target: [u8; 16]) {
 
 /// A new packet from the NIC to an address of this host: PREROUTING DNAT, then FORWARD must accept.
 /// 0 = not ours (pass to the stack), 1 = dropped, 2 = entry created.
-fn new_in6(st: &mut fwd::St, nic: u8, p: &P6, now: u64) -> u8 {
+fn new_in6(st: &mut fwd::St, nic: u8, p: &P6, now: u64, frame: &[u8]) -> u8 {
     if !is_new_flow(p) || p.dst[0] == 0xff || !crate::ip6::is_host6(&p.dst) { return 0; }
     let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: Some((p.src, p.dst)) };
     let (acc, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
@@ -386,6 +389,7 @@ fn new_in6(st: &mut fwd::St, nic: u8, p: &P6, now: u64) -> u8 {
     if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return 1; }
     if fwd::ct4_len(st) + st.ct6.len() >= fwd::CT_CAP || st.ct6.iter().filter(|e| e.kind == 1).count() >= fwd::CT_CAP / 2 { return 1; }
     let Some((cmac, port)) = st.l6.lrn.iter().find(|l| l.br == t.br && l.ip == cip).map(|l| (l.mac, l.port)) else {
+        fwd::park_nic(st, t.br, cip, true, nic, now, frame);
         ns_into(st, &t, cip);
         return 1;
     };
@@ -461,10 +465,10 @@ fn hair6(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &P6) -> bool {
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return true; }
         if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return false; }
         let Some((tmac, tps)) = st.l6.lrn.iter().find(|l| l.br == t.br && l.ip == cip).map(|l| (l.mac, l.port)) else {
-            if t.br == br && st.l6.park.len() < 16 {
-                // Hold the SYN until the NA teaches us the MAC; `fwd::divert` replays it.
+            if st.l6.park.iter().filter(|q| q.br == t.br && q.ip == cip).count() < fwd::PARK_PER_IP && st.l6.park.len() < 16 {
+                // Hold the SYN until the NA teaches us the MAC; `fwd::divert` replays it (also across bridges).
                 let fr = core::mem::take(f);
-                st.l6.park.push(Park6 { br, ip: cip, t: now, port, frame: fr });
+                st.l6.park.push(Park6 { br: t.br, sbr: br, ip: cip, t: now, port, frame: fr });
             }
             ns_into(&mut st, &t, cip);
             return true;
