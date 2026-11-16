@@ -4817,6 +4817,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 }
                 bound[bound_idx].sock_id
             };
+            let l_pc = sock_opts(listen_ofd).passcred;
             let mut tbls = SOCK_TABLES.lock();
             // The oldest connection on this listener's backlog, including one
             // whose connector has closed meanwhile (see `pending_sid`).
@@ -4845,6 +4846,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                             return err_reply(-11);
                         }
                         c[conn_idx].cred_b = cred_b;
+                        // Linux unix_sock_inherit_flags: the accepted end inherits SO_PASSCRED.
+                        c[conn_idx].pc_b = l_pc;
                         c[conn_idx].pending_sid = 0;
                         // Connection established: the connector's poll becomes
                         // writable/connected (an edge for it).
@@ -4866,6 +4869,11 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         ns:         sched::ns::NsRef::get(lnetns),
                         connecting: false,
                     };
+                    if l_pc {
+                        let mut o = sock_opts(tbl.socks[new_slot].ofd);
+                        o.passcred = true;
+                        set_sock_opts(tbl.socks[new_slot].ofd, o);
+                    }
 
                     // EVERY alias of this connection flips, in every table —
                     // no `break`. One connect() is now nameable by several
