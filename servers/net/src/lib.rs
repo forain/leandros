@@ -253,6 +253,16 @@ const IP_MULTICAST_LOOP: usize = 34;
 const IP_ADD_MEMBERSHIP: usize = 35;
 const IP_DROP_MEMBERSHIP: usize = 36;
 const IP_MULTICAST_ALL:  usize = 49;
+const IP_UNBLOCK_SOURCE: usize = 37;
+const IP_BLOCK_SOURCE: usize = 38;
+const IP_ADD_SOURCE_MEMBERSHIP: usize = 39;
+const IP_DROP_SOURCE_MEMBERSHIP: usize = 40;
+const MCAST_JOIN_GROUP: usize = 42;
+const MCAST_BLOCK_SOURCE: usize = 43;
+const MCAST_UNBLOCK_SOURCE: usize = 44;
+const MCAST_LEAVE_GROUP: usize = 45;
+const MCAST_JOIN_SOURCE_GROUP: usize = 46;
+const MCAST_LEAVE_SOURCE_GROUP: usize = 47;
 
 /// First socket *handle*: `SOCK_FD_BASE + slot` names slot `slot` of a
 /// process's socket table. Since lane fdmax a handle is not a descriptor: a
@@ -3399,6 +3409,7 @@ mod syngate;
 mod sa;
 
 pub fn init() {
+    mcast::init();
     sched::register_dump_hook(dump_sockets);
     vfs::set_proc_net_gen(procnet::generate);
     seed_ephemeral();
@@ -4973,6 +4984,7 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
         if socket.bind(port).is_err() { return false; }
         socket.set_peer(remote);
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        socket.set_owner(tbl.socks[slot].ofd);
         { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
         s.socket_set.add(socket)
     };
@@ -5096,6 +5108,7 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, scope: u32, s
         if socket.bind(ep).is_err() { return Err(-22); }
         if fam.is_some() { socket.set_family(fam); }
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        socket.set_owner(tbl.socks[slot].ofd);
         { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
         s.socket_set.add(socket)
     };
@@ -5429,6 +5442,7 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 if socket.bind(local_port).is_err() { return err_reply(-22); }
                 socket.set_peer(Some(remote_endpoint));
                 socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+                socket.set_owner(tbl.socks[slot].ofd);
         { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
@@ -8107,6 +8121,51 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
                 mcast::join(e.ofd, group, addr, ifindex)
             } else {
                 mcast::leave(e.ofd, group, addr, ifindex)
+            };
+            return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        IP_ADD_SOURCE_MEMBERSHIP | IP_DROP_SOURCE_MEMBERSHIP | IP_BLOCK_SOURCE | IP_UNBLOCK_SOURCE => {
+            // struct ip_mreq_source: multiaddr, interface address, source.
+            if optlen < 12 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let Some(src) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 8) else { return err_reply(-14) };
+            if is_tcp_entry(&e) { return err_reply(-71); }
+            if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
+            let op = match optname {
+                IP_ADD_SOURCE_MEMBERSHIP => mcast::SrcOp::Add,
+                IP_DROP_SOURCE_MEMBERSHIP => mcast::SrcOp::Drop,
+                IP_BLOCK_SOURCE => mcast::SrcOp::Block,
+                _ => mcast::SrcOp::Unblock,
+            };
+            return match mcast::source(e.ofd, op, group, addr, 0, src) { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP | MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP
+        | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => {
+            // struct group_req / group_source_req: u32 interface, then
+            // 128-byte sockaddr_storage group (at 8), source (at 136).
+            let with_src = !matches!(optname, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP);
+            if optlen < if with_src { 264 } else { 136 } { return err_reply(-22); }
+            let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr) else { return err_reply(-14) };
+            let Some(gfam) = sched::uaccess::read_user::<u16>(optval_ptr + 8) else { return err_reply(-14) };
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 12) else { return err_reply(-14) };
+            if gfam != 2 { return err_reply(-22); } // AF_INET only here
+            let mut src = [0u8; 4];
+            if with_src {
+                let Some(sfam) = sched::uaccess::read_user::<u16>(optval_ptr + 136) else { return err_reply(-14) };
+                let Some(a) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 140) else { return err_reply(-14) };
+                if sfam != 2 { return err_reply(-22); }
+                src = a;
+            }
+            if is_tcp_entry(&e) { return err_reply(-71); }
+            if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
+            let r = match optname {
+                MCAST_JOIN_GROUP => mcast::join(e.ofd, group, [0; 4], ifindex),
+                MCAST_LEAVE_GROUP => mcast::leave(e.ofd, group, [0; 4], ifindex),
+                MCAST_JOIN_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Add, group, [0; 4], ifindex, src),
+                MCAST_LEAVE_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Drop, group, [0; 4], ifindex, src),
+                MCAST_BLOCK_SOURCE => mcast::source(e.ofd, mcast::SrcOp::Block, group, [0; 4], ifindex, src),
+                _ => mcast::source(e.ofd, mcast::SrcOp::Unblock, group, [0; 4], ifindex, src),
             };
             return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
         }

@@ -69,10 +69,122 @@ fn interface_set(sid: Sid, group: [u8; 4], join: bool) -> Result<(), i32> {
     }
 }
 
+/// One socket's source filter for one group on one interface (RFC 3376
+/// state): `include` says the list is the only sources heard (IP_ADD_SOURCE_
+/// MEMBERSHIP), else the sources listed are blocked (IP_BLOCK_SOURCE). A
+/// membership without an entry is the any-source join (exclude, empty).
+struct Filter { group: [u8; 4], sid: Sid, include: bool, srcs: alloc::vec::Vec<[u8; 4]> }
+
+/// Leaf lock (taken under a stack lock by the rx filter, and under `GROUPS`
+/// here): nothing is acquired while holding it.
+static FILTERS: Mutex<alloc::collections::BTreeMap<u32, alloc::vec::Vec<Filter>>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+/// Linux net.ipv4.igmp_max_msf.
+const MAX_SOURCES: usize = 10;
+
+fn drop_filter(ofd: u32, group: [u8; 4], sid: Sid) {
+    let mut f = FILTERS.lock();
+    if let Some(v) = f.get_mut(&ofd) {
+        v.retain(|x| !(x.group == group && x.sid == sid));
+        if v.is_empty() { f.remove(&ofd); }
+    }
+}
+
+pub(crate) enum SrcOp { Add, Drop, Block, Unblock }
+
+/// The four source options (Linux ip_mc_source): the sources `ofd` hears
+/// from `group`. `Add` on a group not yet joined joins it in include mode;
+/// the others need a prior membership (EINVAL). Include and exclude
+/// (blocked) lists cannot be mixed while non-empty (EINVAL).
+pub(crate) fn source(ofd: u32, op: SrcOp, group: [u8; 4], addr: [u8; 4], ifindex: i32, src: [u8; 4]) -> Result<(), i32> {
+    const EINVAL: i32 = -22; const EADDRINUSE: i32 = -98; const EADDRNOTAVAIL: i32 = -99; const ENOBUFS: i32 = -105;
+    if src[0] & 0xf0 == 0xe0 { return Err(EINVAL); }
+    let sid = interface_of(group, addr, ifindex)?;
+    let mut g = GROUPS.lock();
+    let member = g.get(&ofd).map_or(false, |m| m.contains(&(group, sid)));
+    if !member {
+        if !matches!(op, SrcOp::Add) { return Err(EINVAL); }
+        join_locked(&mut g, ofd, group, sid)?;
+        FILTERS.lock().entry(ofd).or_default().push(Filter { group, sid, include: true, srcs: alloc::vec![src] });
+        return Ok(());
+    }
+    let mut fl = FILTERS.lock();
+    let list = fl.entry(ofd).or_default();
+    let pos = list.iter().position(|x| x.group == group && x.sid == sid);
+    // Block/unblock work on the exclude list, add/drop on the include list.
+    let want_include = matches!(op, SrcOp::Add | SrcOp::Drop);
+    let mut leave = false;
+    match pos {
+        None => match op {
+            // Any-source membership: an empty exclude list.
+            SrcOp::Add => list.push(Filter { group, sid, include: true, srcs: alloc::vec![src] }),
+            SrcOp::Block => list.push(Filter { group, sid, include: false, srcs: alloc::vec![src] }),
+            SrcOp::Drop | SrcOp::Unblock => return Err(EADDRNOTAVAIL),
+        },
+        Some(i) => {
+            let f = &mut list[i];
+            if f.include != want_include { return Err(EINVAL); } // sources of the other kind are set
+            let at = f.srcs.iter().position(|&x| x == src);
+            match op {
+                SrcOp::Add | SrcOp::Block => {
+                    if at.is_some() { return Err(EADDRINUSE); }
+                    if f.srcs.len() >= MAX_SOURCES { return Err(ENOBUFS); }
+                    f.srcs.push(src);
+                }
+                SrcOp::Drop | SrcOp::Unblock => {
+                    let Some(at) = at else { return Err(EADDRNOTAVAIL) };
+                    f.srcs.remove(at);
+                    if f.srcs.is_empty() {
+                        list.remove(i);
+                        // The last included source gone is a leave; the last
+                        // unblock is back to the plain any-source join.
+                        leave = matches!(op, SrcOp::Drop);
+                    }
+                }
+            }
+        }
+    }
+    if list.is_empty() { fl.remove(&ofd); }
+    drop(fl);
+    if leave {
+        if let Some(mine) = g.get_mut(&ofd) {
+            mine.retain(|&m| m != (group, sid));
+            if mine.is_empty() { g.remove(&ofd); }
+        }
+        if !g.values().any(|v| v.contains(&(group, sid))) { let _ = interface_set(sid, group, false); }
+    }
+    Ok(())
+}
+
+/// Receive filter (called by smoltcp's UDP demultiplexing under the stack
+/// lock): does the socket `owner` hear `src` sending to `group`?
+pub(crate) fn src_accepts(owner: u32, group: [u8; 4], src: [u8; 4]) -> bool {
+    let fl = FILTERS.lock();
+    let Some(v) = fl.get(&owner) else { return true };
+    match v.iter().find(|x| x.group == group) {
+        None => true,
+        Some(f) => f.include == f.srcs.contains(&src),
+    }
+}
+
+/// Install the receive filter hook.
+pub(crate) fn init() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let f: fn(u32, [u8; 4], [u8; 4]) -> bool = src_accepts;
+    smoltcp::socket::udp::MCAST_SRC_FILTER.store(f as usize, Relaxed);
+}
+
 /// IP_ADD_MEMBERSHIP for description `ofd`.
 pub(crate) fn join(ofd: u32, group: [u8; 4], addr: [u8; 4], ifindex: i32) -> Result<(), i32> {
     let sid = interface_of(group, addr, ifindex)?;
     let mut g = GROUPS.lock();
+    join_locked(&mut g, ofd, group, sid)
+}
+
+type Groups = alloc::collections::BTreeMap<u32, alloc::vec::Vec<([u8; 4], Sid)>>;
+
+fn join_locked(g: &mut Groups, ofd: u32, group: [u8; 4], sid: Sid) -> Result<(), i32> {
     if !g.contains_key(&ofd) { g.retain(|&k, _| vfs::ofd::live(k)); }
     let (has, n) = g.get(&ofd).map_or((false, 0), |m| (m.contains(&(group, sid)), m.len()));
     if has { return Err(-98); } // EADDRINUSE
@@ -93,6 +205,7 @@ pub(crate) fn leave(ofd: u32, group: [u8; 4], addr: [u8; 4], ifindex: i32) -> Re
     let Some(i) = mine.iter().position(|&(gr, s)| gr == group && want.map_or(true, |w| w == s)) else { return Err(-99) };
     let (_, sid) = mine.remove(i);
     if mine.is_empty() { g.remove(&ofd); }
+    drop_filter(ofd, group, sid);
     if !g.values().any(|v| v.contains(&(group, sid))) { let _ = interface_set(sid, group, false); }
     Ok(())
 }
@@ -100,6 +213,7 @@ pub(crate) fn leave(ofd: u32, group: [u8; 4], addr: [u8; 4], ifindex: i32) -> Re
 /// The description is gone: leave all its groups.
 pub(crate) fn release(ofd: u32) {
     let mut g = GROUPS.lock();
+    FILTERS.lock().remove(&ofd);
     let Some(mine) = g.remove(&ofd) else { return };
     for (group, sid) in mine {
         if !g.values().any(|v| v.contains(&(group, sid))) { let _ = interface_set(sid, group, false); }

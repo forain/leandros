@@ -15,6 +15,12 @@ use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, I
 /// bound socket wins" unicast demultiplexing).
 static BIND_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
+/// LEANDROS: multicast source filter hook (IP_ADD_SOURCE_MEMBERSHIP & co):
+/// a `fn(owner: u32, group: [u8; 4], src: [u8; 4]) -> bool` stored as usize
+/// (0 = none), set by the net server. Called under the stack lock, so it
+/// may only take leaf locks.
+pub static MCAST_SRC_FILTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Metadata for a sent or received UDP packet.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +179,9 @@ pub struct Socket<'a> {
     /// LEANDROS: SO_REUSEPORT: unicast to a group of such sockets sharing a
     /// port is spread over them by a hash of the flow.
     reuseport: bool,
+    /// LEANDROS: the owner token (open file description) handed to
+    /// `MCAST_SRC_FILTER`.
+    owner: Option<u32>,
     /// LEANDROS: when the socket was bound (`BIND_SEQ`).
     bind_seq: u64,
     /// LEANDROS: a pending socket error (errno, 0 = none) from an ICMP
@@ -204,6 +213,7 @@ impl<'a> Socket<'a> {
             hop_limit: None,
             peer: None,
             reuseport: false,
+            owner: None,
             bind_seq: 0,
             error: 0,
             recverr: false,
@@ -333,6 +343,11 @@ impl<'a> Socket<'a> {
     /// LEANDROS: set or clear the connected peer.
     pub fn set_peer(&mut self, peer: Option<IpEndpoint>) {
         self.peer = peer;
+    }
+
+    /// LEANDROS: owner token for the multicast source filter.
+    pub fn set_owner(&mut self, owner: u32) {
+        self.owner = Some(owner);
     }
 
     /// LEANDROS: SO_REUSEPORT.
@@ -665,6 +680,19 @@ impl<'a> Socket<'a> {
                 return None;
             }
             score += 8;
+        }
+        if let (Some(owner), IpAddress::Ipv4(dst), IpAddress::Ipv4(src)) =
+            (self.owner, ip_repr.dst_addr(), ip_repr.src_addr())
+        {
+            let f = MCAST_SRC_FILTER.load(core::sync::atomic::Ordering::Relaxed);
+            if dst.is_multicast() && f != 0 {
+                // SAFETY: only ever stored from a `fn(u32, [u8; 4], [u8; 4]) -> bool`.
+                #[allow(unsafe_code)]
+                let f: fn(u32, [u8; 4], [u8; 4]) -> bool = unsafe { core::mem::transmute(f) };
+                if !f(owner, dst.0, src.0) {
+                    return None;
+                }
+            }
         }
         Some(score)
     }

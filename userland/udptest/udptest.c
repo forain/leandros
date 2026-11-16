@@ -1098,6 +1098,7 @@ int main(int argc, char **argv) {
     udp_wildcard_connect();
     udp_icmp_refused();
     udp_mcast_loop();
+    udp_mcast_ssm();
     udp_broadcast();
     udp_reuse_unicast();
     udp_cmsgs();
