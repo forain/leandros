@@ -55,6 +55,7 @@
  *                       blocking sends all succeed
  *   udp_pmtud_notconn   IP_MTU on an unconnected socket is ENOTCONN
  *   udp_pmtud_netns     a path MTU learned in one namespace is invisible in another
+ *   udp_pmtud_want_frag a WANT datagram over the cached path MTU leaves as fragments cut to it (tun wire); DO is EMSGSIZE
  *   tcp_pmtud_clamp     frag-needed shrinks TCP's segment size (TCP_INFO snd_mss/pmtu)
  *   udp6_pmtud          IPV6_MTU_DISCOVER / IPV6_MTU, ICMPv6 packet-too-big, EMSGSIZE
  *   udp_pmtud           IP_MTU_DISCOVER / IP_MTU, frag-needed shrinks the path, DO sends past it are EMSGSIZE
@@ -1086,6 +1087,7 @@ int main(int argc, char **argv) {
     udp_pmtud();
     udp_pmtud_notconn();
     udp_pmtud_netns();
+    udp_pmtud_want_frag();
     tcp_pmtud_clamp();
     udp6_pmtud();
     udp_recverr_refused();

@@ -205,3 +205,97 @@ static void udp6_pmtud(void) {
     close(r); close(s);
     if (why[0]) fail(N, "%s", why); else pass(N);
 }
+
+/* Lane udppmtu: a WANT-mode (default) datagram larger than the cached path
+ * MTU leaves the host as IP fragments cut to that MTU (DF clear, MF on all
+ * but the last, one ident, offsets contiguous), read off an IFF_TUN wire in
+ * a private namespace; DO refuses it with EMSGSIZE and puts nothing on the
+ * wire; IP_MTU reports the cached value. */
+#ifndef IFF_TUN
+#define IFF_TUN 1
+#endif
+#ifndef IFF_NO_PI
+#define IFF_NO_PI 0x1000
+#endif
+static void pmtud_want_child(int wfd, int tun) {
+    char why[200] = "";
+    uint16_t pmtu = 1000;
+    struct in_addr me, peer;
+    inet_pton(AF_INET, "10.77.0.1", &me); inet_pton(AF_INET, "10.77.0.2", &peer);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in pa = sin4("10.77.0.2", 9000);
+    static char d[4000]; static uint8_t pk[2048];
+    for (int i = 0; i < 4000; i++) d[i] = (char)i;
+    if (connect(s, (struct sockaddr *)&pa, sizeof pa)) { snprintf(why, sizeof why, "connect: %s", strerror(errno)); goto out; }
+    struct sockaddr_in la; socklen_t ll = sizeof la; getsockname(s, (struct sockaddr *)&la, &ll);
+    /* ICMP frag-needed from the peer, quoting our UDP datagram, written onto the wire */
+    uint8_t m[20 + 8 + 20 + 8]; memset(m, 0, sizeof m);
+    m[0] = 0x45; m[2] = 0; m[3] = sizeof m; m[8] = 64; m[9] = 1;
+    memcpy(m + 12, &peer, 4); memcpy(m + 16, &me, 4);
+    uint16_t c = pmtu_csum(m, 20); m[10] = c >> 8; m[11] = c & 255;
+    uint8_t *ic = m + 20; ic[0] = 3; ic[1] = 4; ic[6] = pmtu >> 8; ic[7] = pmtu & 255;
+    uint8_t *q = ic + 8; q[0] = 0x45; q[3] = 28 + 3000 > 65535 ? 0 : 20 + 8 + 3000 - 0; q[2] = (20 + 8 + 3000) >> 8; q[3] = (20 + 8 + 3000) & 255;
+    q[6] = 0x40; q[8] = 63; q[9] = 17; memcpy(q + 12, &me, 4); memcpy(q + 16, &peer, 4);
+    c = pmtu_csum(q, 20); q[10] = c >> 8; q[11] = c & 255;
+    memcpy(q + 20, &la.sin_port, 2); memcpy(q + 22, &pa.sin_port, 2);
+    c = pmtu_csum(ic, 8 + 28); ic[2] = c >> 8; ic[3] = c & 255;
+    if (write(tun, m, sizeof m) != (ssize_t)sizeof m) { snprintf(why, sizeof why, "inject: %s", strerror(errno)); goto out; }
+    msleep(200);
+    int v = 0; socklen_t vl = sizeof v;
+    if (getsockopt(s, IPPROTO_IP, IP_MTU, &v, &vl) || v != pmtu) { snprintf(why, sizeof why, "IP_MTU %d (%s), want %d", v, strerror(errno), pmtu); goto out; }
+    while (read(tun, pk, sizeof pk) > 0) {}   /* drop anything queued so far */
+    if (send(s, d, 3000, 0) != 3000) { snprintf(why, sizeof why, "WANT send of 3000: %s", strerror(errno)); goto out; }
+    msleep(200);
+    int nfr = 0, total = 0, next = 0, ident = -1;
+    for (;;) {
+        ssize_t n = read(tun, pk, sizeof pk);
+        if (n <= 0) break;
+        if ((pk[0] >> 4) != 4 || pk[9] != 17) continue;
+        int len = (pk[2] << 8) | pk[3], fo = (((pk[6] & 0x1f) << 8) | pk[7]) * 8, mf = !!(pk[6] & 0x20), df = !!(pk[6] & 0x40);
+        int id = (pk[4] << 8) | pk[5], pay = len - 20;
+        if (len > pmtu) { snprintf(why, sizeof why, "fragment %d is %d bytes, over the %d path", nfr, len, pmtu); goto out; }
+        if (df) { snprintf(why, sizeof why, "DF set on a WANT fragment"); goto out; }
+        if (ident >= 0 && id != ident) { snprintf(why, sizeof why, "ident changed %d -> %d", ident, id); goto out; }
+        ident = id;
+        if (fo != next) { snprintf(why, sizeof why, "fragment %d offset %d, want %d", nfr, fo, next); goto out; }
+        if (mf && (pay & 7)) { snprintf(why, sizeof why, "non-last fragment payload %d not a multiple of 8", pay); goto out; }
+        next += pay; total += pay; nfr++;
+        if (!mf) break;
+    }
+    if (nfr < 4 || total != 3008) { snprintf(why, sizeof why, "%d fragments carrying %d bytes, want >=4 carrying 3008", nfr, total); goto out; }
+    int pd = 2;
+    setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &pd, sizeof pd);
+    errno = 0;
+    if (send(s, d, 3000, 0) != -1 || errno != EMSGSIZE) { snprintf(why, sizeof why, "DO send of 3000: %s, want EMSGSIZE", strerror(errno)); goto out; }
+    msleep(100);
+    if (read(tun, pk, sizeof pk) > 0) snprintf(why, sizeof why, "DO refused send still put a packet on the wire");
+out:
+    close(s);
+    write(wfd, why, strlen(why) + 1);
+}
+
+static void udp_pmtud_want_frag(void) {
+    const char *N = "udp_pmtud_want_frag";
+    if (skipped(N)) return;
+    int p[2]; if (pipe(p)) { fail(N, "pipe"); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        char why[220] = "";
+        if (unshare(CLONE_NEWNET)) { snprintf(why, sizeof why, "SKIP unshare: %s", strerror(errno)); write(p[1], why, strlen(why) + 1); _exit(0); }
+        int tun = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+        struct ifreq ifr; memset(&ifr, 0, sizeof ifr);
+        strcpy(ifr.ifr_name, "pmt%d"); ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        if (tun < 0 || ioctl(tun, 0x400454ca, &ifr) < 0) { snprintf(why, sizeof why, "SKIP tun: %s", strerror(errno)); write(p[1], why, strlen(why) + 1); _exit(0); }
+        int u = socket(AF_INET, SOCK_DGRAM, 0); struct sockaddr_in *sa = (struct sockaddr_in *)&ifr.ifr_addr;
+        sa->sin_family = AF_INET; inet_pton(AF_INET, "10.77.0.1", &sa->sin_addr); ioctl(u, SIOCSIFADDR, &ifr);
+        inet_pton(AF_INET, "255.255.255.0", &sa->sin_addr); ioctl(u, SIOCSIFNETMASK, &ifr);
+        ioctl(u, SIOCGIFFLAGS, &ifr); ifr.ifr_flags |= IFF_UP; ioctl(u, SIOCSIFFLAGS, &ifr); close(u);
+        pmtud_want_child(p[1], tun);
+        _exit(0);
+    }
+    char why[220] = ""; ssize_t n = read(p[0], why, sizeof why - 1); waitpid(c, NULL, 0);
+    if (n <= 0) fail(N, "child died");
+    else if (!strncmp(why, "SKIP", 4)) fail(N, "%s", why);
+    else if (why[0]) fail(N, "%s", why);
+    else pass(N);
+}
