@@ -2697,8 +2697,10 @@ static int e7x_race(int m) {
     if (c < 0) return 14;
     if (c == 0) {
         while (!*stop) {
+            stop[1]++; /* odd: mounting, not yet read-only */
             if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) _exit(1);
             if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
+            stop[1]++; /* even: read-only for sure */
             for (volatile int i = 0; i < 40; i++) {}
             umount2("/tmp/e7x/rc", MNT_DETACH);
         }
@@ -2706,9 +2708,11 @@ static int e7x_race(int m) {
     }
     int through = 0, bad = 0;
     for (int i = 0; i < 40000 && !bad; i++) {
+        int g1 = stop[1];
         int d = open("/tmp/e7x/rc", O_RDONLY | O_DIRECTORY);
         if (d < 0) continue;
-        if (fstat(d, &st) == 0 && st.st_ino == ss.st_ino && st.st_dev == ss.st_dev) {
+        int g2 = stop[1];
+        if ((g1 & 1) == 0 && g1 == g2 && fstat(d, &st) == 0 && st.st_ino == ss.st_ino && st.st_dev == ss.st_dev) {
             through++;
             /* the mount is gone by now or soon: the fd keeps the ro flag it was opened with */
             for (volatile int k = 0; k < 400; k++) {}
