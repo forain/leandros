@@ -142,7 +142,7 @@ the service, and busd activates each from a `.service` file in
 | power-profiles | claims both `org.freedesktop.UPower.PowerProfiles` and `net.hadess.PowerProfiles`; Settings' Power page shows three modes | a placeholder driver |
 | `org.freedesktop.PolicyKit1` | authentication-agent registry, so cosmic-osd's agent registers | only root is authorised |
 | `org.freedesktop.RealtimeKit1` | answers, so PipeWire does not warn three times per start | zero limits; `NotSupported` for every request |
-| `org.freedesktop.timedate1` | Timezone, LocalRTC (false), CanNTP/NTP (false), TimeUSec, `ListTimezones`; `SetTimezone` writes `/etc/timezone` and the `/etc/localtime` symlink | `AccessDenied` as a normal user; `SetNTP(true)`, `SetLocalRTC(true)`, `SetTime` are `NotSupported`; the image has no tzdata, so only `UTC` validates until zoneinfo is installed |
+| `org.freedesktop.timedate1` | Timezone, LocalRTC (false), CanNTP/NTP (false), TimeUSec, `ListTimezones`; `SetTimezone` writes `/etc/timezone` and the `/etc/localtime` symlink | `AccessDenied` as a normal user; `SetNTP(true)`, `SetLocalRTC(true)`, `SetTime` are `NotSupported`; zones validate against `/usr/share/zoneinfo` (Alpine `tzdata`, ~1.4 MB); `/etc/localtime` ships as a symlink to `UTC` |
 | `net.hadess.SwitcherooControl` | `GPUs` from `/sys/class/drm/card*` (driver name, Default on the first), `NumGPUs`, `HasDualGpu` = false | no PRIME environment: `Environment` is empty |
 | `org.a11y.Bus` | `GetAddress` answers with the session bus address, so GTK/libcosmic stop waiting for the activation timeout; `org.a11y.Status` IsEnabled / ScreenReaderEnabled (false) | no at-spi registry or screen reader exists, so toolkits find no accessibility tree |
 
