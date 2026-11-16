@@ -91,11 +91,12 @@ fn split(path: &[u8]) -> Option<Split<'_>> {
 
 /// True when `path` is inside an active overlay class directory.
 pub fn is_path(path: &[u8]) -> bool {
-    cpu_split(path).is_some() || split(path).is_some()
+    super::sysinput::is_path(path) || cpu_split(path).is_some() || split(path).is_some()
 }
 
 /// Resolve `path` to an overlay directory as `(dev, level)`.
 pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
+    if super::sysinput::is_path(path) { return super::sysinput::dir(path); }
     if let Some(c) = cpu_split(path) { return cpu_dir(c); }
     let s = split(path)?;
     if s.cls == POWER { return if s.attr.is_none() { Some((SC_BASE | (POWER as u16) << 8 | 0xFF, LVL_SC_CLASS)) } else { None }; }
@@ -111,6 +112,7 @@ pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
 
 /// Read an attribute file.
 pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    if super::sysinput::is_path(path) { return super::sysinput::attr(path, out); }
     if let Some(c) = cpu_split(path) { return cpu_attr(c, out); }
     let s = split(path)?;
     if s.cls == POWER { return (s.o.read)("power", "", s.attr?, out); }
@@ -179,6 +181,7 @@ pub fn write(path: &[u8], data: &[u8]) -> i32 {
 /// The `idx`-th entry of an overlay directory: `(name length, is_dir)`.
 pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
     if dev == SC_TABLES { return tables_dirent(idx, out); }
+    if (dev >> 8) & 0xF == super::sysinput::SI_CLS { return super::sysinput::dirent(dev, level, idx, out); }
     if (dev >> 8) & 0xF == CPU_CLS as u16 { return cpu_dirent(dev, idx, out); }
     let o = ops()?;
     let cls = ((dev >> 8) & 0xF) as usize;

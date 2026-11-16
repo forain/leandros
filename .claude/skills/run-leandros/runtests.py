@@ -108,11 +108,12 @@ SYSFS_CHECK = (
     "t drm_dev_char 'grep -q MAJOR=226 /sys/dev/char/226:0/uevent && test -d /sys/dev/char/226:0/device/drm'; "
     "t drm_device_vendor 'grep -q 0x /sys/class/drm/card0/device/vendor && grep -q 0x /sys/class/drm/card0/device/device'; "
     "t drm_subsystem 'test -L /sys/dev/char/226:0/device/subsystem'; "
-    "t input_class 'test -L /sys/class/input/event0 && test -L /sys/class/input/event1'; "
+    "t input_class 'test -d /sys/class/input/event0 && test -d /sys/class/input/event1 && test -d /sys/class/input/input0'; "
     "t input_uevent 'grep -q DEVNAME=input/event1 /sys/class/input/event1/uevent && grep -q MAJOR=13 /sys/class/input/event0/uevent'; "
     "t input_name 'grep -q Keyboard /sys/class/input/event0/device/name && grep -q Tablet /sys/class/input/event1/device/name'; "
     "t input_caps 'test -s /sys/class/input/event0/device/capabilities/ev && test -s /sys/class/input/event1/device/capabilities/abs'; "
-    "t input_dev_char 'test -d /sys/dev/char/13:65/device/id'; "
+    "t input_dev_char 'test -d /sys/dev/char/13:65/device/id && grep -q 13:65 /sys/class/input/event1/dev'; "
+    "t input_caps_eviocgbit 'grep -qx 3 /sys/class/input/event1/device/capabilities/abs && grep -q 0627 /sys/class/input/event1/device/id/vendor'; "
     "test $__f = 0"
 )
 
