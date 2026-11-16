@@ -2920,6 +2920,27 @@ static int t_unix_dgram_autobind(void)
     return 0;
 }
 
+/* libc syslog(3) -> /dev/log, the path syslogd/logger take: a bound dgram
+ * server on /dev/log hears openlog+syslog (musl: connect + send). No busybox
+ * ships in the image, so this stands in for the logger/syslogd smoke. */
+#include <syslog.h>
+static int t_unix_dgram_syslog(void)
+{
+    struct sockaddr_un a; socklen_t l;
+    int r = udg_bound("/dev/log", 0, &a, &l);
+    if (r < 0) { printf("  skip: cannot bind /dev/log (errno %d)\n", errno); return 0; }
+    udg_to(r, 3000);
+    openlog("udgsyslog", LOG_NDELAY, LOG_USER);
+    syslog(LOG_INFO, "hello-unixdg");
+    char b[256] = {0};
+    ssize_t n = recv(r, b, sizeof b - 1, 0);
+    closelog();
+    close(r);
+    unlink("/dev/log");
+    CHECK(n > 0 && strstr(b, "hello-unixdg") && strstr(b, "udgsyslog"));
+    return 0;
+}
+
 static int t_scm_cred_forge(void)
 {
     int sp[2];
@@ -3567,7 +3588,7 @@ static int run_userns_cases(void)
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
         { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit },
-        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "unix_dgram_connect", t_unix_dgram_connect }, { "unix_dgram_filter", t_unix_dgram_filter }, { "unix_dgram_peer_gone", t_unix_dgram_peer_gone }, { "unix_dgram_trunc_peek", t_unix_dgram_trunc_peek }, { "unix_dgram_poll_block", t_unix_dgram_poll_block }, { "unix_dgram_rights", t_unix_dgram_rights }, { "unix_dgram_types", t_unix_dgram_types }, { "unix_dgram_autobind", t_unix_dgram_autobind }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "unix_dgram_connect", t_unix_dgram_connect }, { "unix_dgram_filter", t_unix_dgram_filter }, { "unix_dgram_peer_gone", t_unix_dgram_peer_gone }, { "unix_dgram_trunc_peek", t_unix_dgram_trunc_peek }, { "unix_dgram_poll_block", t_unix_dgram_poll_block }, { "unix_dgram_rights", t_unix_dgram_rights }, { "unix_dgram_types", t_unix_dgram_types }, { "unix_dgram_autobind", t_unix_dgram_autobind }, { "unix_dgram_syslog", t_unix_dgram_syslog }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
