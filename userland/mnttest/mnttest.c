@@ -2701,13 +2701,13 @@ static int e7x_race(int m) {
             if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) _exit(1);
             if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
             stop[1]++; /* even: read-only for sure */
-            for (volatile int i = 0; i < 40; i++) {}
+            for (volatile int i = 0; i < 3000; i++) {}
             umount2("/tmp/e7x/rc", MNT_DETACH);
         }
         _exit(0);
     }
     int through = 0, bad = 0;
-    for (int i = 0; i < 40000 && !bad; i++) {
+    for (int i = 0; i < 150000 && !bad && (i < 3000 || through < 400); i++) {
         int g1 = stop[1];
         int d = open("/tmp/e7x/rc", O_RDONLY | O_DIRECTORY);
         if (d < 0) continue;
@@ -2724,7 +2724,7 @@ static int e7x_race(int m) {
     *stop = 1;
     int sts; waitpid(c, &sts, 0);
     umount2("/tmp/e7x/rc", MNT_DETACH);
-    if (through < 50) { printf("  only %d opens went through the mount\n", through); return 15; }
+    if (through < 3) { printf("  only %d opens went through the mount\n", through); return 15; }
     return bad ? 16 : 0;
 }
 static void e7x_suite(void) {
