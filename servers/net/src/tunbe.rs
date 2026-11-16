@@ -111,6 +111,8 @@ fn detach(h: TunHandle, keep: bool) {
     if keep {
         let mut v = VIFS.lock();
         if let Some(x) = v[sid as usize].as_mut() { x.tun = NO_TUN; x.rxq.clear(); x.rxsrc.clear(); }
+        drop(v);
+        crate::nlsock::poll_notify();
         return;
     }
     {
@@ -121,6 +123,7 @@ fn detach(h: TunHandle, keep: bool) {
     }
     // Neither table is held: the stack lock is taken alone.
     *stack_for(sid) = None;
+    crate::nlsock::poll_notify(); // DELLINK for the vanished tap
 }
 
 fn input(h: TunHandle, frame: &[u8]) -> Result<(), i32> {

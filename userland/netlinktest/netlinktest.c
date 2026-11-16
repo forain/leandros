@@ -189,7 +189,7 @@ static int has_addr(int s, int idx, const char *ip) {
 #endif
 #define IF_RA_RCVD_ 0x20u
 #define IFA_F_TENTATIVE_ 0x40u
-struct nm { int type; int idx; int fam; const void *addr; int alen; int plen; unsigned flagmask, flagval; };
+struct nm { int type; int idx; int fam; const void *addr; int alen; int plen; unsigned flagmask, flagval; unsigned *seen_fl; };
 /* Wait up to ~4 s for a non-dump message matching `w`. */
 static int wait_nm(int sub, const struct nm *w) {
     for (int round = 0; round < 10; round++) {
@@ -212,6 +212,7 @@ static int wait_nm(int sub, const struct nm *w) {
             if (fam != w->fam || plen != w->plen) continue;
             if (isaddr && w->idx && idx != w->idx) continue;
             if (isaddr && (fl & w->flagmask) != w->flagval) continue;
+            if (isaddr && w->seen_fl) *w->seen_fl = fl;
             for (; RTA_OK(r, al); r = RTA_NEXT(r, al))
                 if (r->rta_type == (isaddr ? IFA_ADDRESS : RTA_DST) && RTA_PAYLOAD(r) == w->alen && !memcmp(RTA_DATA(r), w->addr, w->alen)) return 1;
         }
@@ -572,10 +573,18 @@ static void v6_tests(void) {
             int st = nl_subscribe(1, RTMGRP_IPV6_IFADDR, 0);
             struct in6_addr d6; inet_pton(AF_INET6, "2001:db8:1::9", &d6);
             nl_addr6(s, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, eth, "2001:db8:1::9", 64);
-            struct nm t = { .type = RTM_NEWADDR, .idx = eth, .fam = AF_INET6, .addr = &d6, .alen = 16, .plen = 64, .flagmask = IFA_F_TENTATIVE_, .flagval = IFA_F_TENTATIVE_ };
-            struct nm p = t; p.flagval = 0;
-            CHECK("tentative NEWADDR announced with IFA_F_TENTATIVE", st >= 0 && wait_nm(st, &t));
-            CHECK("NEWADDR again once DAD passed (no TENTATIVE)", st >= 0 && wait_nm(st, &p));
+            char dv[16] = "";
+            int dad = proc_has("/proc/sys/net/ipv6/conf/eth0/accept_dad", "1") && !proc_has("/proc/sys/net/ipv6/conf/eth0/dad_transmits", "0");
+            unsigned f1 = 0;
+            struct nm t = { .type = RTM_NEWADDR, .idx = eth, .fam = AF_INET6, .addr = &d6, .alen = 16, .plen = 64, .seen_fl = &f1 };
+            int got1 = st >= 0 && wait_nm(st, &t);
+            CHECK("static v6 NEWADDR notified on eth0", got1);
+            if (dad) {
+                CHECK("NEWADDR announced with IFA_F_TENTATIVE (DAD on)", got1 && (f1 & IFA_F_TENTATIVE_));
+                struct nm p = t; p.seen_fl = NULL; p.flagmask = IFA_F_TENTATIVE_; p.flagval = 0;
+                CHECK("NEWADDR again once DAD passed (no TENTATIVE)", wait_nm(st, &p));
+            }
+            (void)dv;
             nl_addr6(s, RTM_DELADDR, 0, eth, "2001:db8:1::9", 64);
             close(st);
             unsigned f6 = 0;
