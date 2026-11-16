@@ -1143,10 +1143,11 @@ pub fn mnt_ref_at(id: u32, mfl: u8) {
     mnt_ref(id);
     let mfl = mfl & ENFORCED;
     if mfl == 0 { return; }
-    let live = ALIASES.lock().iter().any(|a| a.gen == id) || SELF_BINDS.lock().iter().any(|m| m.2 == id);
-    if !live {
-        if let Some(e) = MREFS.lock().iter_mut().find(|e| e.0 == id) { if e.2.is_none() { e.2 = Some(mfl); } }
-    }
+    // Stamp unconditionally: while the mount is live `flags_by_id` reads the
+    // live flags first, and `detach` (which may already have run, or may be
+    // about to) overwrites this with the flags at removal. This also covers
+    // `detach` running before the mount leaves ALIASES.
+    if let Some(e) = MREFS.lock().iter_mut().find(|e| e.0 == id) { if e.2.is_none() { e.2 = Some(mfl); } }
 }
 /// The reference `mnt_ref` took is gone; the last one frees the record.
 pub fn mnt_unref(id: u32) {
@@ -1161,8 +1162,9 @@ pub fn mnt_unref(id: u32) {
 pub fn mrefs_len() -> usize { MREFS.lock().len() }
 fn detach(id: u32, flags: u8) {
     let flags = flags & ENFORCED;
-    if flags == 0 { return; }
-    if let Some(e) = MREFS.lock().iter_mut().find(|e| e.0 == id) { e.2 = Some(flags); }
+    let mut d = MREFS.lock();
+    let e = d.iter_mut().find(|e| e.0 == id);
+    if let Some(e) = e { if flags != 0 || e.2.is_some() { e.2 = Some(flags); } }
 }
 /// Number of ns-0 mounts (aliases + self-binds) with nonzero flags.
 static FLAGGED: AtomicUsize = AtomicUsize::new(0);
