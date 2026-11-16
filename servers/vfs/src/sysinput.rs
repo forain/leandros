@@ -68,6 +68,50 @@ fn ops() -> Option<&'static Ops> {
     if p == 0 { None } else { Some(unsafe { &*(p as *const Ops) }) }
 }
 
+pub fn present() -> bool { ops().is_some() }
+
+/// Target of the generated symlink at `path`, if it is one:
+/// `class/input/event<N>/device -> ../input<N>`, `{event,input}<N>/subsystem
+/// -> ../../../class/input`, `dev/char/13:<64+N> -> ../../class/input/event<N>`.
+pub fn link(path: &[u8]) -> Option<alloc::string::String> {
+    use alloc::format;
+    let o = ops()?;
+    let s = core::str::from_utf8(trim(path)).ok()?;
+    let rest = s.strip_prefix("/sys/")?;
+    if let Some(m) = rest.strip_prefix("dev/char/13:") {
+        let m: usize = m.parse().ok()?;
+        if m < MINOR_BASE { return None; }
+        let n = live(o, m - MINOR_BASE)?;
+        return Some(format!("../../class/input/event{}", n));
+    }
+    let rest = rest.strip_prefix("class/input/")?;
+    let (dir, leaf) = rest.split_once('/')?;
+    if let Some(n) = parse_num(dir, "event") {
+        let n = live(o, n)?;
+        return match leaf { "device" => Some(format!("../input{}", n)), "subsystem" => Some("../../../class/input".into()), _ => None };
+    }
+    if let Some(n) = parse_num(dir, "input") {
+        live(o, n)?;
+        return if leaf == "subsystem" { Some("../../../class/input".into()) } else { None };
+    }
+    None
+}
+
+/// Is entry `idx` of directory `level` a symlink?
+pub fn dirent_link(level: u8, idx: usize) -> bool {
+    (level == LVL_EVENT && idx >= 2) || (level == LVL_DEVICE && idx == 6)
+}
+
+/// The `idx`-th `13:<minor>` symlink of `/sys/dev/char`.
+pub fn char_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    use core::fmt::Write;
+    let o = ops()?;
+    let n = (0..MAX_N).filter(|&i| (o.info)(i).is_some()).nth(idx)?;
+    let mut w = W { out: &mut out[..], pos: 0 };
+    let _ = write!(w, "13:{}", MINOR_BASE + n);
+    Some((w.pos, false))
+}
+
 const CLASS: &[u8] = b"/sys/class/input";
 const CHAR13: &[u8] = b"/sys/dev/char/13:";
 
@@ -294,7 +338,8 @@ pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Opti
         LVL_EVENT => {
             (o.info)(n)?;
             match idx { 0 => Some((put_name(out, "dev"), false)), 1 => Some((put_name(out, "uevent"), false)),
-                        2 => Some((put_name(out, "device"), true)), _ => None }
+                        2 => Some((put_name(out, "device"), false)),
+                        3 => Some((put_name(out, "subsystem"), false)), _ => None }
         }
         LVL_DEVICE => {
             (o.info)(n)?;
@@ -303,6 +348,7 @@ pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Opti
                 3 => Some((put_name(out, DEV_UEVENT), false)),
                 4 => Some((put_name(out, "id"), true)),
                 5 => Some((put_name(out, "capabilities"), true)),
+                6 => Some((put_name(out, "subsystem"), false)),
                 _ => None,
             }
         }

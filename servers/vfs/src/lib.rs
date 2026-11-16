@@ -5131,6 +5131,14 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
         }
         }
     }
+    if path.starts_with(b"/sys/") {
+        if let Some(r) = sysclass::expand(path, follow)? {
+            *buf = r;
+            buf.push(0);
+            msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+            return Ok(());
+        }
+    }
     if !is_tmp_path(path) { return Ok(()); }
 
     let resolved = tmp_resolve_links(path, follow)?;
@@ -12379,7 +12387,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 core::ptr::write(p as *mut u64, ino);
                 core::ptr::write(p.add(8) as *mut u64, 0u64);
                 core::ptr::write(p.add(16) as *mut u16, reclen as u16);
-                *p.add(18) = if is_dir { 4 } else { 8 }; // DT_DIR / DT_REG
+                *p.add(18) = if is_dir { 4 } else if dev >= sysclass::SC_BASE && sysclass::dirent_link(dev, level, cur - 2) { 10 } else { 8 }; // DT_DIR / DT_LNK / DT_REG
                 core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), nlen);
                 *p.add(19 + nlen) = 0;
             }
@@ -15182,6 +15190,15 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
         return val_reply(n as u64);
     }
 
+    if raw.starts_with(b"/sys/") {
+        let mut lb = [0u8; 96];
+        if let Some(n) = sysclass::link(raw, &mut lb) {
+            let n = n.min(buf_len);
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, lb.as_ptr(), n); }
+            return val_reply(n as u64);
+        }
+        if sysclass::is_path(raw) { return err_reply(-22); } // generated, not a link
+    }
     if let Some(path) = tmpfs_path(raw) {
         let tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
@@ -17144,6 +17161,13 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 Some((m, nl, ino, u, g)) => { write_stat_full(stat_ptr, m, nl as u64, 0, ino, u, g); ok_reply() }
                 None => err_reply(-2),
             };
+        }
+        if !follow && lookup_path.starts_with(b"/sys/") {
+            let mut lb = [0u8; 96];
+            if let Some(n) = sysclass::link(lookup_path, &mut lb) {
+                write_stat(stat_ptr, 0o120777, n as u64, path_ino(lookup_path, 6));
+                return ok_reply();
+            }
         }
         if sysclass::is_path(lookup_path) {
             if let Some((dev, level)) = sysclass::dir(lookup_path) {
