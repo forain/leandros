@@ -1901,7 +1901,9 @@ static int fwd6_body(void) {
     if (ic < 0) return 5;
     struct timeval tv = { 4, 0 };
     setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    if (ping6_sock(ic, g_gw6, 1)) return 6;          /* NEW then reply: the flow is now established */
+    int pr = 3;
+    for (int k = 0; k < 3 && pr; k++) pr = ping6_sock(ic, g_gw6, 1 + k); /* NEW then reply (the first may be lost to ND): the flow is now established */
+    if (pr) { printf("DIAG v6 ping to %s: rc %d errno %d\n", g_gw6, pr, errno); fflush(stdout); return 6; }
     write(done_[1], &ch, 1);
     if (rd_to(ctl[0], &ch) != 1) return 7;
     return ping6_sock(ic, g_gw6, 2) ? 0 : 8;         /* must NOT be answered once `ct state established drop` is loaded */
