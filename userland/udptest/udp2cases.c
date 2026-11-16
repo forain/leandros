@@ -264,7 +264,9 @@ static void udp_mcast_ssm(void) {
     int jd = gsropt(d, T_MCAST_JOIN_SOURCE_GROUP, G, me);
     send_to(s, "s1", 2, &to);
     int na = got(a, "s1", 600), nb = got(b, "s1", 1), nc = got(c, "s1", 1), nd = got(d, "s1", 1);
-    /* Unblocking C lets us through; dropping A's only source leaves the group. */
+    /* Unblocking C lets us through; dropping A's only source leaves the group, and a
+     * socket bound to the port still hears it while the interface is a member
+     * (IP_MULTICAST_ALL default), like Linux. */
     int uc = srcopt(c, IP_UNBLOCK_SOURCE, G, me);
     int uc2 = srcopt(c, IP_UNBLOCK_SOURCE, G, me), euc2 = errno;
     int da = srcopt(a, IP_DROP_SOURCE_MEMBERSHIP, G, me);
@@ -290,7 +292,7 @@ static void udp_mcast_ssm(void) {
     else if (na != 1 || nb != 0 || nc != 0 || nd != 1) fail(N, "filtered rx: A %d B %d C %d D %d, want 1 0 0 1", na, nb, nc, nd);
     else if (uc || uc2 == 0 || euc2 != EADDRNOTAVAIL) fail(N, "unblock: %d, again %d %s, want 0 / EADDRNOTAVAIL", uc, uc2, strerror(euc2));
     else if (da || da2 == 0) fail(N, "drop source: %d, again %d %s", da, da2, strerror(eda2));
-    else if (nc2 != 1 || na2 != 0 || nd2 != 1) fail(N, "after unblock/drop: C %d A %d D %d, want 1 0 1", nc2, na2, nd2);
+    else if (nc2 != 1 || na2 != 1 || nd2 != 1) fail(N, "after unblock/drop: C %d A %d D %d, want 1 1 1", nc2, na2, nd2);
     else if (mix == 0 || emix != EINVAL) fail(N, "block on an include filter: %d %s, want EINVAL", mix, strerror(emix));
     else if (dup == 0 || edup != EADDRINUSE) fail(N, "duplicate source: %d %s, want EADDRINUSE", dup, strerror(edup));
     else if (asm_ == 0 || easm != EADDRINUSE) fail(N, "ASM join over SSM: %d %s, want EADDRINUSE", asm_, strerror(easm));
