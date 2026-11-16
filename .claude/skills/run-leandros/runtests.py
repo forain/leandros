@@ -26,6 +26,7 @@ Options:
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
                              nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
+                             vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -236,6 +237,8 @@ SUITES = {
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
+                # Vulkan swapchain on a Wayland surface presented to cosmic-comp (--venus, x86_64 only; own boot, ~3 min).
+                "host:vkwltest.py",
                 # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
                 "host:blanktest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
@@ -307,6 +310,8 @@ SUITES = {
     "kexecblk": ["host:kexecblktest.py"],
     # lane kexecacpi: x86_64 ACPI tables in Reserved RAM above 2 GiB survive kexec (own boot, 6G + max-ram-below-4g=3G).
     "kexecacpi": ["host:kexecacpitest.py"],
+    # lane vkwltest: Venus Vulkan swapchain -> cosmic-comp over Wayland, frame callbacks counted (x86_64 only, own boot).
+    "vkwl": ["host:vkwltest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
     # lane nitrox86: x86_64 with no PIT/HPET/i8042/display (EC2 Nitro-like): login on serial, TSC stated, clock true (own boot).
@@ -426,7 +431,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900,
+HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200}
 
 
@@ -445,7 +450,7 @@ def find_fails(out):
 # Host scripts that only make sense on one arch (they boot their own VM of that
 # arch). A run of the other arch reports them as a skip, not a failure.
 HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
-                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64"}
+                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64"}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):
