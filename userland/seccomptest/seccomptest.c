@@ -501,6 +501,17 @@ static int c_big_filter(void) {
     }
     printf("big_filter: max sleep-loop gap %ld ms\n", maxgap);
     if (big_bad) return 4;
+    /* Deterministic probe: the kernel counts IRQ windows opened inside filter
+     * evaluation (one per 256 insns + one per filter). A 4096-insn filter run
+     * is only tens of microseconds, so latency cannot show a regression; the
+     * counter does (the pre-secirq code opened none inside a filter). */
+    {
+        long w0 = pstat("Seccomp_irq_windows");
+        for (int i = 0; i < 100; i++) syscall(SYS_getpid);
+        long dw = pstat("Seccomp_irq_windows") - w0;
+        printf("big_filter: irq windows over 100 getpid: %ld\n", dw);
+        if (w0 < 0 || dw < 100 * (BIG_INSNS / 256 - 1)) return 7;
+    }
     if (syscall(SYS_getpid) != big_pid) return 5;
     return maxgap > 1000 ? 6 : 0;
 }
