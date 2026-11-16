@@ -1287,7 +1287,7 @@ static void nat_dump(void) {
     char line[1024];
     while (fgets(line, sizeof line, f))
         if (!strncmp(line, "fwd_nat_ent:", 12) || !strncmp(line, "fwd:", 4) || !strncmp(line, "fwd_stats:", 10)
-            || !strncmp(line, "fwd_arp:", 8) || !strncmp(line, "fwd_pend:", 9) || !strncmp(line, "fwd_ct:", 7)) printf("DIAG %s", line);
+            || !strncmp(line, "fwd_state:", 10) || !strncmp(line, "fwd_arp:", 8) || !strncmp(line, "fwd_pend:", 9) || !strncmp(line, "fwd_ct:", 7)) printf("DIAG %s", line);
     fclose(f);
 }
 /* The same lines as nat_dump(), collected into buf (only the fwd_stats line when it is long). */
