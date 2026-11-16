@@ -55,7 +55,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **xdg-desktop-portal gaps**: a non-interactive portal Screenshot through xdg-desktop-portal-cosmic returns response 2 after 25 s (no PNG); the image ships no tzdata, so timedate1 SetTimezone validates only UTC. (timedate1, SwitcherooControl and the a11y bus are activatable since lane portaldbus.)
 - **`cosmic-store` backend** (PackageKit service or libflatpak); **`cosmic-player`** (needs GStreamer closure, ~1-2 days).
 - **A permanent Vulkan-Wayland test** (needs a dynamic-musl build shape).
-- **VRR** (`VRR_ENABLED` DRM property).
+- **VRR hardware path**: `VRR_ENABLED` (CRTC) and `vrr_capable` (connector, immutable, always 0) exist and round-trip (atomic + legacy OBJ_SETPROPERTY) but nothing programs adaptive sync. i915 still needs EDID range-descriptor / DP `MSA_TIMING_PAR_IGNORED` parsing to report capable=1, then the VRR timing registers.
 - **Mesa v3d / Pi 5 acceleration** wiring (`GET_PARAM`+`CREATE_BO` first; single-device design).
 
 ### Firefox

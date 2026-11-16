@@ -41,6 +41,8 @@ const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // _IOWR('d', 0xB9, drm_mode_obj_get_properties) — struct is 28 data bytes,
 // padded to 32 by its u64 members, hence size 0x20 in the request code.
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
+// _IOWR('d', 0xBA, drm_mode_obj_set_property {u64 value; u32 prop_id; u32 obj_id; u32 obj_type}).
+const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC01864BA;
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5; // _IOWR('d',0xB5, drm_mode_get_plane_res=16)
 const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;          // _IOWR('d',0xB6, drm_mode_get_plane=32)
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;       // _IOWR('d',0xAA, drm_mode_get_property=64)
@@ -260,6 +262,14 @@ const PROP_IN_FORMATS: u32 = 52;
 const PROP_IN_FENCE_FD: u32 = 53;
 const PROP_ACTIVE: u32 = 60;
 const PROP_MODE_ID: u32 = 61;
+/// CRTC `VRR_ENABLED` (range 0..1, mutable). Stored and read back as Linux's
+/// core does (the core never rejects a 1 on a non-capable sink; drivers just
+/// leave adaptive sync off), but no backend programs variable refresh yet.
+const PROP_VRR_ENABLED: u32 = 62;
+/// Connector `vrr_capable` (immutable range 0..1). Always 0: virtio-gpu has no
+/// variable-refresh scanout, and i915 does not yet parse the EDID range
+/// descriptor / DP MSA_TIMING_PAR_IGNORED (TODO.md "VRR").
+const PROP_VRR_CAPABLE: u32 = 71;
 const PROP_CONN_CRTC_ID: u32 = 70;
 
 // drm_mode_object types (used as OBJECT-property value types).
@@ -271,6 +281,7 @@ const DRM_MODE_OBJECT_CONNECTOR_T: u32 = 0xc0c0_c0c0;
 
 // drm_mode_property flags.
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 const DRM_MODE_PROP_OBJECT: u32 = 1 << 6; // DRM_MODE_PROP_TYPE(1)
@@ -280,6 +291,7 @@ const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6; // DRM_MODE_PROP_TYPE(2)
 const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
 const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
 const EBUSY: i32 = 16;
+const EACCES: i32 = 13;
 const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 
 /// How a property's value array must be reported. The compositor's drm-rs
@@ -331,6 +343,8 @@ static PROPS: &[PropDef] = &[
     prop(PROP_ACTIVE, b"ACTIVE\0", PropKind::Range(0, 1)),
     prop(PROP_MODE_ID, b"MODE_ID\0", PropKind::Blob),
     prop(PROP_CONN_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
+    prop(PROP_VRR_ENABLED, b"VRR_ENABLED\0", PropKind::Range(0, 1)),
+    prop(PROP_VRR_CAPABLE, b"vrr_capable\0", PropKind::Range(0, 1)),
 ];
 
 fn prop_def(id: u32) -> Option<&'static PropDef> {
@@ -398,8 +412,8 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         PROP_CRTC_W,
         PROP_CRTC_H,
     ];
-    const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID];
-    const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID];
+    const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID, PROP_VRR_ENABLED];
+    const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID, PROP_VRR_CAPABLE];
     // With a KMS backend (gpu_kms): IN_FORMATS on the primary (so smithay
     // allocates with the modifiers the backend can scan out), and a cursor
     // plane only when the backend has a hardware cursor (`gpu_kms::cursor`).
@@ -3515,6 +3529,7 @@ const MAX_DAMAGE_RECTS: usize = 64;
 
 // Committed crtc/connector state. Only used to decide whether an incoming
 // atomic request needs ALLOW_MODESET.
+static CRTC_VRR: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CRTC_ACTIVE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CRTC_MODE_BLOB: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CONN_CRTC: AtomicU32 = AtomicU32::new(0);
@@ -6328,6 +6343,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETPLANERESOURCES => self.std_handle_get_plane_resources(arg),
             DRM_IOCTL_MODE_GETPLANE => self.std_handle_get_plane(arg),
             DRM_IOCTL_MODE_GETPROPERTY => self.std_handle_get_property(arg),
+            DRM_IOCTL_MODE_OBJ_SETPROPERTY => Self::std_handle_obj_set_property(arg, open_id),
 
             // ── Atomic KMS ──
             DRM_IOCTL_MODE_ATOMIC => self.std_handle_atomic(arg, open_id),
@@ -7672,6 +7688,7 @@ impl DrmDeviceInterface {
             },
             PROP_IN_FORMATS => in_formats_blob() as u64,
             PROP_IN_FENCE_FD => -1i64 as u64,
+            PROP_VRR_ENABLED => CRTC_VRR[(obj_id == DRM_CRTC2_ID) as usize].load(Ordering::Relaxed) as u64,
             PROP_CONN_CRTC_ID if two => {
                 if obj_id == DRM_CONNECTOR_ID { CONN_CRTC.load(Ordering::Relaxed) as u64 }
                 else { crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE)
@@ -7759,6 +7776,24 @@ impl DrmDeviceInterface {
     /// counts at 0 makes drm-ffi's get_property a single-pass call (no array fetch).
     /// struct drm_mode_get_property { u64 values_ptr@0; u64 enum_blob_ptr@8; u32 prop_id@16;
     ///   u32 flags@20; char name[32]@24; u32 count_values@56; u32 count_enum_blobs@60; }.
+    /// DRM_IOCTL_MODE_OBJ_SETPROPERTY: the legacy single-property write. Only
+    /// the CRTC `VRR_ENABLED` property is settable this way (everything else a
+    /// legacy client toggles goes through its own ioctl); an immutable or
+    /// unknown property is EINVAL, as Linux, and the caller must be master.
+    fn std_handle_obj_set_property(arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let value = uread::<u64>(arg)?;
+        let prop_id = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
+        let obj_id = unsafe { ptr::read_unaligned((arg + 12) as *const u32) };
+        if open_id != 0 && !master_ok(open_id) { return Err(DriverError::Errno(EACCES)); }
+        if prop_id != PROP_VRR_ENABLED || value > 1 { return Err(DriverError::InvalidParameter); }
+        let idx = if obj_id == DRM_CRTC_ID { 0 }
+            else if obj_id == DRM_CRTC2_ID && crate::gpu_kms::extra_crtcs() > 0 { 1 }
+            else { return Err(DriverError::InvalidParameter) };
+        CRTC_VRR[idx].store(value as u32, Ordering::Relaxed);
+        Ok(0)
+    }
+
     fn std_handle_get_property(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let prop_id = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
@@ -7773,7 +7808,8 @@ impl DrmDeviceInterface {
         let in_count = unsafe { ptr::read_unaligned((arg + 56) as *const u32) };
 
         unsafe {
-            ptr::write_unaligned((arg + 20) as *mut u32, prop_flags(def.kind));
+            ptr::write_unaligned((arg + 20) as *mut u32, prop_flags(def.kind)
+                | if def.id == PROP_VRR_CAPABLE { DRM_MODE_PROP_IMMUTABLE } else { 0 });
             // name[32] — zero the field first so a shorter name never inherits
             // the caller's stack bytes.
             ptr::write_bytes((arg + 24) as *mut u8, 0, 32);
@@ -7923,6 +7959,7 @@ impl DrmDeviceInterface {
         let mut ext_conn: [Option<u64>; crate::gpu_kms::EXT_MAX] = [None; crate::gpu_kms::EXT_MAX];
         let mut touch_b = false;
         let mut a_obj = false;
+        let mut want_vrr: [Option<u32>; 2] = [None; 2];
 
         let mut k = 0usize;
         for (i, &obj) in objs.iter().enumerate() {
@@ -7933,6 +7970,15 @@ impl DrmDeviceInterface {
 
                 match pid {
                     // ── crtc ──
+                    // Linux: a value outside the 0..1 range is EINVAL; vrr_capable
+                    // is immutable (EINVAL); an unknown object is ENOENT-ish EINVAL.
+                    PROP_VRR_ENABLED => {
+                        if val > 1 { return Err(DriverError::InvalidParameter); }
+                        if obj == DRM_CRTC_ID { want_vrr[0] = Some(val as u32); }
+                        else if b_on && obj == DRM_CRTC2_ID { want_vrr[1] = Some(val as u32); }
+                        else { return Err(DriverError::InvalidParameter); }
+                    }
+                    PROP_VRR_CAPABLE => return Err(DriverError::InvalidParameter),
                     PROP_ACTIVE if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_active_b = Some(val); }
                     PROP_MODE_ID if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_mode_b = Some(val); }
                     PROP_ACTIVE => {
@@ -8140,6 +8186,7 @@ impl DrmDeviceInterface {
         };
         let mut hw_ev_owned = hw_ev != 0;
 
+        for i in 0..2 { if let Some(v) = want_vrr[i] { CRTC_VRR[i].store(v, Ordering::Relaxed); } }
         if let Some(v) = want_active { CRTC_ACTIVE[0].store(v as u32, Ordering::Relaxed); }
         if let Some(v) = want_mode { CRTC_MODE_BLOB[0].store(v as u32, Ordering::Relaxed); }
 
