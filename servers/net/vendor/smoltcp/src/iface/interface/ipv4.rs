@@ -507,7 +507,7 @@ impl InterfaceInner {
     pub(super) fn dispatch_ipv4_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
         let caps = self.caps.clone();
 
-        let mtu_max = self.ip_mtu();
+        let mtu_max = if frag.ipv4.mtu != 0 { frag.ipv4.mtu } else { self.ip_mtu() };
         let hdr_len = frag.ipv4.repr.buffer_len();
         // LEANDROS: every fragment but the last carries a multiple of 8
         // payload bytes (RFC 791).

@@ -1873,6 +1873,7 @@ impl InterfaceInner {
                         ipv4_packet.set_dscp(meta.tos >> 2);
                         ipv4_packet.set_ecn(meta.tos & 3);
                         frag.ipv4.tos = meta.tos;
+                        frag.ipv4.mtu = path_mtu;
 
                         if caps.checksum.ipv4.tx() {
                             ipv4_packet.fill_checksum();
