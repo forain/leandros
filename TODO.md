@@ -62,7 +62,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ### Firefox
 - x86 KVM audio verification (?).
-- **AF_UNIX unconnected dgram sendto**: `sendto(addr)` on an unconnected AF_UNIX SOCK_DGRAM socket is not delivered at all (EPIPE from `handle_send_k`; the server models dgram as connect-to-bound-address, a bound receiver has no multi-sender inbox), so its SCM_CREDENTIALS cannot be tested until that exists (servers/net).
+- **AF_UNIX dgram inbox, phase 2**: `unix_gc_collect` does not count SCM_RIGHTS fds queued in a bound dgram socket's inbox (`servers/net/src/unixdg.rs`), so a socket cycle through an inbox can leak (never freed wrongly); no per-sender wmem accounting (a sender's SO_SNDBUF does not bound what it has queued in other inboxes).
 - **seccomp irq window**: `max_len_filter_threads_tsync` cannot fail on the old code (4096-insn run is only tens of us); needs a longer-running filter or a timing probe to gate regressions.
 - **pidns zap timeout**: the `[pidns] zap timeout` log has no automated test (a ns child cannot survive SIGKILL); needs a test hook that forces the deadline.
 
