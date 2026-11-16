@@ -16,7 +16,7 @@ this page is the explanation.
   org.freedesktop.portal.Documents` warning per login.
 - **No `locale -a`**, so Settings' "Add language" list is empty. timedate1, SwitcherooControl and
   the a11y bus exist but are minimal ([session.md](session.md#system-services-leandros-sysbus)): no
-  NTP, no tzdata beyond UTC, no PRIME, no at-spi registry.
+  NTP, no PRIME, no at-spi registry.
 - **Services run as the session user.** There is no system bus and no setuid helper, so the
   login1/locale1/UPower implementations cannot do anything that needs root. `SetLocale` as a
   normal user answers `AccessDenied` (`/etc` is root's); power-off is the one root operation

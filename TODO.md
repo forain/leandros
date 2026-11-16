@@ -52,7 +52,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **iwlwifi**: HT40 on 2.4 GHz (`iwlwifi.ht40_24`, coexistence check in `wifi_ht::coex_40_24`) is implemented but unverified on hardware (no 40 MHz 2.4 GHz AP seen; the only reachable AP advertises 20 MHz). 5 GHz is untested (needs the user's 5 GHz SSID/passphrase on the stick). Throughput vs Linux not measured. Rate-control idea: column re-entry hysteresis / stay-in-column timer in `iwl_rs.rs`.
 
 ### Desktop / apps
-- **xdg-desktop-portal gaps**: a non-interactive portal Screenshot through xdg-desktop-portal-cosmic returns response 2 after 25 s (no PNG); the image ships no tzdata, so timedate1 SetTimezone validates only UTC. (timedate1, SwitcherooControl and the a11y bus are activatable since lane portaldbus.)
+- **xdg-desktop-portal gaps**: a non-interactive portal Screenshot through xdg-desktop-portal-cosmic returns response 2 after 25 s (no PNG). (timedate1, SwitcherooControl and the a11y bus are activatable since lane portaldbus.)
 - **`cosmic-store` backend** (PackageKit service or libflatpak); **`cosmic-player`** (needs GStreamer closure, ~1-2 days).
 - **VRR hardware path**: `VRR_ENABLED` (CRTC) and `vrr_capable` (connector, immutable, always 0) exist and round-trip (atomic + legacy OBJ_SETPROPERTY) but nothing programs adaptive sync. i915 still needs EDID range-descriptor / DP `MSA_TIMING_PAR_IGNORED` parsing to report capable=1, then the VRR timing registers.
 - **Mesa v3d / Pi 5 acceleration** wiring (`GET_PARAM`+`CREATE_BO` first; single-device design).

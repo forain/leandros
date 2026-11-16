@@ -672,8 +672,9 @@ def main():
     # Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
     # list musl's default search dirs so policy and loader agree.
     etc_files.append(("ld.so.conf", b"/lib\n/usr/lib\n/usr/local/lib\n", 0o100644))
-    # Minimal v1 TZif file for UTC (no zoneinfo package in the image).
-    etc_files.append(("localtime", b"\x54\x5a\x69\x66" + b"\x00" * 35 + b"\x01\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00UTC\x00", 0o100644))
+    # /etc/localtime is a symlink into the Alpine tzdata package's zoneinfo
+    # (ports/alpine/world); timedate1 SetTimezone repoints it.
+    etc_files.append(("localtime", b"/usr/share/zoneinfo/UTC", S_IFLNK | 0o777))
     # There is deliberately no /etc/passwd.greeter here any more. The bring-up
     # scaffold reached the greeter role by adding a SECOND, uid-0
     # "cosmic-greeter" entry ahead of root and copying that file over

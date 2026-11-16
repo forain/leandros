@@ -37,3 +37,4 @@ slirp4netns
 shadow-subids
 containers-common
 nftables
+tzdata
