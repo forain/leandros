@@ -630,13 +630,13 @@ static void v6_tests(void) {
     /* proc_tcp6: a [::1] listener is in tcp6, not tcp */
     int l = socket(AF_INET6, SOCK_STREAM, 0);
     struct sockaddr_in6 lo6; memset(&lo6, 0, sizeof lo6);
-    lo6.sin6_family = AF_INET6; lo6.sin6_addr = in6addr_loopback; lo6.sin6_port = htons(40611);
+    lo6.sin6_family = AF_INET6; lo6.sin6_addr = in6addr_loopback; lo6.sin6_port = htons(20611);
     CHECK("proc_tcp6 listen", bind(l, (struct sockaddr *)&lo6, sizeof lo6) == 0 && listen(l, 1) == 0);
     CHECK("proc_tcp6 listed in tcp6", proc_has("/proc/net/tcp6", "00000000000000000000000001000000:9EA3 00000000000000000000000000000000:0000 0A"));
     CHECK("proc_tcp6 not in tcp", !proc_has("/proc/net/tcp", ":9EA3 "));
     close(l);
     int u = socket(AF_INET6, SOCK_DGRAM, 0);
-    lo6.sin6_port = htons(40612);
+    lo6.sin6_port = htons(20612);
     CHECK("proc_udp6 bind", bind(u, (struct sockaddr *)&lo6, sizeof lo6) == 0);
     CHECK("proc_udp6 listed in udp6", proc_has("/proc/net/udp6", "00000000000000000000000001000000:9EA4 "));
     CHECK("proc_udp6 not in udp", !proc_has("/proc/net/udp", ":9EA4 "));

@@ -3233,7 +3233,11 @@ static int t_setns_port_not_ephemeral(void)
     CHECK(NS_PORT < lo || NS_PORT > hi);
     /* every other fixed port the netns cases bind (keep in sync with the literals) */
     static const int fixed[] = { 30011, 30012, 30013, 30021, 30022, 30031, 30047,
-                                 30600, 30610, 30620, 30621, 30630 };
+                                 30600, 30610, 30620, 30621, 30630,
+                                 /* other suites (moved from 47xxx/406xx/40123, all below the range): */
+                                 27661, 27662, 27301, 27302, 27303, 27304, 27305, 27306, 27307, 27320,
+                                 27400, 27401, 27402, 27403, 27520, 20611, 20612, 27031, 27032, 27033,
+                                 27041, 27042, 27011, 27013, 27015, 27017, 27021, 20123 };
     for (unsigned i = 0; i < sizeof fixed / sizeof fixed[0]; i++)
         CHECK(fixed[i] < lo || fixed[i] > hi);
     return 0;

@@ -38,7 +38,7 @@ static void udp_mcast_msfilter(void) {
     char me[64];
     if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
     const char *G = "239.255.42.97", *OTHER = "192.0.2.77";
-    uint16_t port = 47031;
+    uint16_t port = 27031;
     int a = bound_reuse(port, SO_REUSEADDR), s = socket(AF_INET, SOCK_DGRAM, 0);
     if (a < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
     struct sockaddr_in to = sin4(G, port);
@@ -95,7 +95,7 @@ static void udp_mcast_all(void) {
     char me[64];
     if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
     const char *G = "239.255.42.96";
-    uint16_t port = 47032;
+    uint16_t port = 27032;
     int a = bound_reuse(port, SO_REUSEADDR), b = bound_reuse(port, SO_REUSEADDR);
     int s = socket(AF_INET, SOCK_DGRAM, 0), zero = 0;
     if (a < 0 || b < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
@@ -132,7 +132,7 @@ static void udp_mcast_group_req(void) {
     char me[64];
     if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
     const char *G = "239.255.42.95";
-    uint16_t port = 47033;
+    uint16_t port = 27033;
     int c = bound_reuse(port, SO_REUSEADDR), s = socket(AF_INET, SOCK_DGRAM, 0);
     if (c < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
     struct sockaddr_in to = sin4(G, port);
@@ -259,7 +259,7 @@ static void udp6_mcast_deliver(void) {
     char me[64]; int ifx = 0;
     if (!nic6(me, sizeof me, &ifx)) { skip(N, "no NIC link-local address"); return; }
     const char *G = "ff15::4a01", *OTHER = "fe80::99";
-    uint16_t port = 47041;
+    uint16_t port = 27041;
     int a = v6rx(G, port, ifx, 0), c = v6rx(G, port, ifx, 1);   /* c never joined */
     int s = socket(AF_INET6, SOCK_DGRAM, 0), noall = 0;
     if (a < 0 || c < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
@@ -323,7 +323,7 @@ static void udp_mcast_msfilter4(void) {
     if (skipped(N)) return;
     char me[64];
     if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
-    int a = bound_reuse(47042, SO_REUSEADDR);
+    int a = bound_reuse(27042, SO_REUSEADDR);
     if (a < 0) { fail(N, "setup: %s", strerror(errno)); return; }
     join(a, "239.255.42.98", "0.0.0.0", 0);
     unsigned char b[144 + 128 * 2]; memset(b, 0, sizeof b);
