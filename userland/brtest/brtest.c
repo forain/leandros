@@ -1886,7 +1886,8 @@ static int ping6_sock(int ic, const char *dst, unsigned short seq) {
     if (sendto(ic, pk, 8, 0, (struct sockaddr *)&to, sizeof to) != 8) return 2;
     unsigned char rb[64];
     ssize_t n = recv(ic, rb, sizeof rb, 0);
-    return n >= 8 && rb[0] == 129 ? 0 : 3;
+    if (n >= 8 && rb[0] != 129) return 1000 + rb[0] * 10 + rb[1];  /* an ICMPv6 error instead of the reply (type*10+code) */
+    return n >= 8 ? 0 : 3;
 }
 static int fwd6_body(void) {
     g_ip6 = "fd00:97::2";
