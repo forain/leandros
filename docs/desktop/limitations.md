@@ -38,8 +38,10 @@ this page is the explanation.
   confirmed; other machines' keys appear as `kbd: unmapped sc` lines until mapped.
 - **cosmic-monitor has no disk or network data.** `/proc/diskstats`, `/sys/class/net`, `/sys/class/drm` and `/sys/devices/system/cpu` (cpufreq) do not exist, so the disk/network graphs and GPU/frequency readouts stay empty; CPU, memory, load and the process list work. CPU is shown as user time (no user/system split is kept).
 - **cosmic-initial-setup's Network pages need the system bus.** They `unwrap()` `zbus::Connection::system()`; it works only with `DBUS_SYSTEM_BUS_ADDRESS` set as in the session, not from a bare shell.
-- **cosmic-screenshot's capture path is unverified.** The app starts, but the
-  portal/screencopy capture has not produced a PNG in a test.
+- **Headless portal Screenshot needs a stored grant.** The portal asks the user through an
+  Access dialog first; without an answer (or a "screenshot" entry in the permission store) the
+  non-interactive call returns response 2 after 25 s. With the grant the cosmic backend's
+  screencopy capture works (`leandros-sysbus portal screenshot`, 1280x800 PNG).
 - **Firefox is still heavy during YouTube** (about 310 % total CPU on the laptop, Firefox
   decoding in software unless hardware decode is enabled) and a first greetd login after boot
   once failed on the laptop and was not reproduced (diagnostics are in
