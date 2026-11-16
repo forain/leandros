@@ -410,8 +410,8 @@ def main(argv):
         finally:
             ser.close()
         hard_kill()
-        if os.environ.get("F2FSCR_OUT"):
-            with open(os.path.join(os.environ["F2FSCR_OUT"], f"work-{it}.txt"), "w") as f:
+        if os.environ.get("F2FSCR_OUT") or linux:
+            with open(os.path.join(os.environ.get("F2FSCR_OUT") or out, f"work-{it}.txt"), "w") as f:
                 f.write(text)
         claims = Claims()
         claims.parse(text)
