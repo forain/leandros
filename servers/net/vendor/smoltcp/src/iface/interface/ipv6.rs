@@ -31,6 +31,7 @@ impl InterfaceInner {
         sockets: &mut SocketSet,
         meta: PacketMeta,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+        frag: &'frame mut FragmentsBuffer,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
         // LEANDROS: the traffic class, for IPV6_RECVTCLASS (see udp::Socket::process).
@@ -59,6 +60,44 @@ impl InterfaceInner {
             return None;
         }
 
+        // LEANDROS: reassemble a fragmented datagram (RFC 8200 4.5); the
+        // payload that follows is the upper layer of the whole.
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let (next_header, ip_payload) = if next_header == IpProtocol::Ipv6Frag {
+            let fh = check!(Ipv6FragmentHeader::new_checked(ip_payload));
+            let first_nh = ip_payload[0];
+            let (fr, data) = (check!(Ipv6FragmentRepr::parse(&fh)), &ip_payload[8..]);
+            let off = fr.frag_offset as usize * 8;
+            if fr.more_frags && (data.is_empty() || data.len() % 8 != 0) {
+                return None;
+            }
+            if data.is_empty() && !(fr.more_frags) && off == 0 {
+                return None;
+            }
+            let key = FragKey::Ipv6(Ipv6FragKey { src: ipv6_repr.src_addr, dst: ipv6_repr.dst_addr, ident: fr.ident });
+            let f = match frag.assembler.get(&key, self.now + frag.reassembly_timeout) {
+                Ok(f) => f,
+                Err(_) => {
+                    net_debug!("No available packet assembler for fragmented packet");
+                    return None;
+                }
+            };
+            if !fr.more_frags {
+                check!(f.set_total_size(off + data.len()));
+            }
+            if let Err(e) = f.add(data, off) {
+                net_debug!("fragmentation error: {:?}", e);
+                f.reset();
+                return None;
+            }
+            match f.assemble() {
+                Some(payload) => (IpProtocol::from(first_nh), payload),
+                None => return None,
+            }
+        } else {
+            (next_header, ip_payload)
+        };
+
         #[cfg(feature = "socket-raw")]
         let handled_by_raw_socket = self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload);
         #[cfg(not(feature = "socket-raw"))]
@@ -72,6 +111,40 @@ impl InterfaceInner {
             handled_by_raw_socket,
             ip_payload,
         )
+    }
+
+    /// LEANDROS: the next IPv6 fragment of the packet the fragmenter holds.
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    pub(super) fn dispatch_ipv6_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+        let mtu_max = if frag.ipv6.mtu != 0 { frag.ipv6.mtu } else { self.ip_mtu() };
+        let left = frag.packet_len - frag.sent_bytes;
+        let offset = frag.sent_bytes - 40;
+        // every fragment but the last carries a multiple of 8 bytes
+        let payload_len = if 40 + 8 + left <= mtu_max { left } else { (mtu_max - 40 - 8) & !7 };
+        let more = left != payload_len;
+        let mut tx_len = 40 + 8 + payload_len;
+        #[cfg(feature = "medium-ethernet")]
+        if matches!(self.caps.medium, Medium::Ethernet) {
+            tx_len += EthernetFrame::<&[u8]>::header_len();
+        }
+        let src = self.hardware_addr;
+        let repr = frag.ipv6.repr;
+        let (ident, tclass) = (frag.ipv6.ident, frag.ipv6.tclass);
+        let data = &frag.buffer[40 + offset..40 + offset + payload_len];
+        #[cfg(feature = "medium-ethernet")]
+        let dst_hw = frag.ipv6.dst_hardware_addr;
+        tx_token.consume(tx_len, |mut tx_buffer| {
+            #[cfg(feature = "medium-ethernet")]
+            if matches!(self.caps.medium, Medium::Ethernet) {
+                let mut frame = EthernetFrame::new_unchecked(&mut tx_buffer[..]);
+                frame.set_src_addr(src.ethernet_or_panic());
+                frame.set_dst_addr(dst_hw);
+                frame.set_ethertype(EthernetProtocol::Ipv6);
+                tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+            }
+            emit_ipv6_fragment(&repr, &mut tx_buffer[..], ident, offset, more, tclass, data);
+        });
+        frag.sent_bytes += payload_len;
     }
 
     fn process_hopbyhop<'frame>(
