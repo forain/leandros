@@ -8476,7 +8476,7 @@ fn rcv_cred(pid: u32, fd: usize, c: Option<Ucred>) -> Option<Ucred> {
 }
 
 fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
-    let (conn_idx, is_a) = match unix_stream_end(pid, fd) {
+    let (conn_idx, is_a) = match unix_stream_end(pid, fd).or_else(|| unix_conn_end(pid, fd)) {
         Some(e) => e,
         None => return Ucred::zero(),
     };
