@@ -1928,6 +1928,7 @@ static void nftfwd6_midflow(void) {
     int have = gw6_find() == 0;
     CHECK(msg, have);
     if (!have) return;
+    { int hp = ping6_once(g_gw6, 0); printf("DIAG host ping %s -> %d\n", g_gw6, hp); fflush(stdout); }
     int s = nl_sock();
     unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x06 };
     int ok = br_new(s, "br0", brmac) == 0;
