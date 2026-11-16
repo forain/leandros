@@ -20,6 +20,7 @@ cosmic-osd reach. Boots its own image clones; LEANDROS_RUN_ID must be set.
 Prints `powerctl_<step>: PASS|FAIL` and a summary; exit 0 iff all passed.
 """
 import os
+import hostclean
 import re
 import subprocess
 import sys
@@ -112,6 +113,7 @@ def run(arch, scale):
     # 1. a non-session caller (ssh) is refused
     host, port = sshsmoke.target()
     tmp = tempfile.mkdtemp(prefix="powerctl-")
+    hostclean.track(tmp)
     ssh = sshsmoke.Ssh(host, port, tmp)
     mark = log_size()
     rc, out, err = ssh.run("leandro", "/bin/reboot; echo rc=$?; /bin/systemctl poweroff; echo rc=$?",
@@ -198,4 +200,4 @@ def run(arch, scale):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(hostclean.run(main))

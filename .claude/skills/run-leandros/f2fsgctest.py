@@ -20,6 +20,7 @@ Space reuse on a small f2fs volume (lane f2fsgc), in its own boot (run id
 Exit 0 iff all PASS.
 """
 import os
+import hostclean
 import imgclone
 import shutil
 import subprocess
@@ -72,6 +73,7 @@ def main(argv):
     run_id = f"{caller}-f2fsgc" if caller else "f2fsgc"
     out = os.environ.get("F2FSGC_OUT", f"/tmp/f2fsgc-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fsgc-*")
     img = os.path.join(out, "gc.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -149,4 +151,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

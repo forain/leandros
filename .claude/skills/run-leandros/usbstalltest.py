@@ -28,7 +28,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 DRV = [sys.executable, os.path.join(HERE, "driver.py")]
 MIB = 1024 * 1024
-MAX_RTT = 3.0   # an echo through the serial shell normally takes < 1 s
+MAX_RTT = 3.0   # an echo through the serial shell normally takes < 1 s (KVM/HVF)
+MAX_RTT_TCG = 8.0   # TCG with several VMs per host adds scheduling noise (3.5 s seen); a real hold is ~20 s
+
+
+def rtt_bound(arch):
+    sys.path.insert(0, HERE)
+    import driver
+    return MAX_RTT_TCG if driver.accel_kind(arch) == "tcg" else MAX_RTT
 
 
 def drv(*args, timeout=200, env=None):
@@ -61,6 +68,9 @@ def serial_log(run_id):
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     run_id = os.environ.get("LEANDROS_RUN_ID", "x")
+    global MAX_RTT
+    MAX_RTT = rtt_bound(arch)
+    print(f"usbstalltest: echo RTT bound {MAX_RTT:.1f} s ({arch})", flush=True)
     img = os.path.join(REPO, f"usbstall-{run_id}.img")
     data = os.urandom(32 * MIB)
     with open(img, "wb") as f:
