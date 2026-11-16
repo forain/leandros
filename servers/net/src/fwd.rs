@@ -362,7 +362,7 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
         }
     }
     while let Some((port, mut f)) = work.pop_front() {
-        if (nft || on4) && port != crate::vifsel::NO_PEER && port != br {
+        if (nft || on4 || on6) && port != crate::vifsel::NO_PEER && port != br {
             if let Some(ip) = learn(br, port, bmac, &f) { requeue(br, unpark(br, ip), &mut work); }
             if let Some(ip) = crate::fwd6::learn_c(br, port, bmac, &f) { requeue(br, crate::fwd6::unpark(br, ip), &mut work); }
         }
