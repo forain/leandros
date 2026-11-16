@@ -372,7 +372,7 @@ fn route_l3(t: &Tgt, mut f: Vec<u8>) {
         let (sport, dport, est) = if (l4 == PROTO_TCP || l4 == PROTO_UDP) && f.len() >= o + 14 {
             (u16::from_be_bytes([f[o], f[o + 1]]), u16::from_be_bytes([f[o + 2], f[o + 3]]), l4 == PROTO_TCP && f[o + 13] & 0x12 != 0x02)
         } else { (0, 0, false) };
-        let mut m = crate::nfnl::Pkt { est, l4, src: [f[26], f[27], f[28], f[29]], dst: [f[30], f[31], f[32], f[33]], sport, dport, oif: t.name, mark: 0, local: false, v6: None };
+        let mut m = crate::nfnl::Pkt { rel: false, est, l4, src: [f[26], f[27], f[28], f[29]], dst: [f[30], f[31], f[32], f[33]], sport, dport, oif: t.name, mark: 0, local: false, v6: None };
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
     }
     let dip = [f[30], f[31], f[32], f[33]];
@@ -412,7 +412,7 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
             // Established flows traverse the filter hook too, so a rule added mid-flow bites.
             if crate::nfnl::has_tables(0) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
-                let mut m = crate::nfnl::Pkt { est: rep, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
+                let mut m = crate::nfnl::Pkt { rel: false, est: rep, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
                 if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
             }
             n
@@ -425,7 +425,7 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
             // verdict (netavark: an internal network has none, so a leaked ip_forward=1 cannot SNAT it).
             if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
-                let mut m = crate::nfnl::Pkt { est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
+                let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
                 if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
                 if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { stat(S_ING_NFT); return; }
             }
@@ -552,7 +552,7 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if p.proto == PROTO_TCP { tcp_step(e, p.flags, e.kind == 1); }
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
     if crate::nfnl::has_tables(0) {
-        let mut m = crate::nfnl::Pkt { est: true, l4: p.proto, src: p.src, dst: cip, sport: p.sport, dport: cport, oif: br_name(br), mark: 0, local: false, v6: None };
+        let mut m = crate::nfnl::Pkt { rel: false, est: true, l4: p.proto, src: p.src, dst: cip, sport: p.sport, dport: cport, oif: br_name(br), mark: 0, local: false, v6: None };
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
     }
     if f[22] <= 1 { return true; }
@@ -613,6 +613,11 @@ fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
     stat(21);
     e.last = now;
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
+    // ct state related: the error quotes a tracked flow; the FORWARD hook sees it like any forwarded packet.
+    if crate::nfnl::has_tables(0) {
+        let mut m = crate::nfnl::Pkt { rel: true, est: true, l4: PROTO_ICMP, src: [buf[26], buf[27], buf[28], buf[29]], dst: cip, sport: 0, dport: 0, oif: br_name(br), mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
     let mut f = buf[..14 + tot].to_vec();
     if f[22] <= 1 { return true; }
     f[22] -= 1;
@@ -732,7 +737,7 @@ fn bridge_for(ip: [u8; 4]) -> Option<Tgt> {
 }
 
 /// Zero-padded interface name of ns-0 bridge `br` (for `meta oifname`).
-fn br_name(br: Sid) -> [u8; 16] {
+pub(crate) fn br_name(br: Sid) -> [u8; 16] {
     let v = crate::vif::VIFS.lock();
     let mut o = [0u8; 16];
     if let Some(b) = v.get(br as usize).and_then(|x| x.as_ref()) { let n = b.name.len().min(16); o[..n].copy_from_slice(&b.name[..n]); }
@@ -751,7 +756,7 @@ fn is_new_flow(p: &Pkt) -> bool { p.proto == PROTO_UDP || (p.proto == PROTO_TCP 
 /// Creates an In entry. 0 = not ours (pass to the stack), 1 = dropped, 2 = entry created.
 fn new_in(st: &mut St, nic: u8, p: &Pkt, now: u64) -> u8 {
     if !is_new_flow(p) || !crate::iface::is_nic_addr(p.dst) { return 0; }
-    let mut m = crate::nfnl::Pkt { est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
+    let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
     let (acc, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
     let crate::nfnl::Nat::Dnat(cip, cport) = nat else { return if acc { 0 } else { 1 } };
     let cport = if cport == 0 { p.dport } else { cport };
@@ -783,7 +788,7 @@ fn reply_in(br: Sid, port: Sid, f: &mut Vec<u8>, p: &Pkt) -> bool {
     let (nic, nicip, nat) = (e.nic, e.nicip, e.nat);
     if crate::nfnl::has_tables(0) {
         let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
-        let mut m = crate::nfnl::Pkt { est: true, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif, mark: 0, local: false, v6: None };
+        let mut m = crate::nfnl::Pkt { rel: false, est: true, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif, mark: 0, local: false, v6: None };
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
     }
     if f[22] <= 1 { return true; }
@@ -815,9 +820,10 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
             && ((e.kind == 2 && e.nicip == p.dst && e.nat == p.dport) || (e.kind == 3 && e.cip == p.dst && e.cport == p.dport)));
         rev = hit.is_some();
     }
+    let existed = hit.is_some();
     if hit.is_none() {
         if !is_new_flow(p) || !host_local(p.dst) || st.ct.len() >= CT_CAP { return false; }
-        let mut m = crate::nfnl::Pkt { est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
+        let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
         let (_, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
         let crate::nfnl::Nat::Dnat(cip, cport) = nat else { return false };
         let cport = if cport == 0 { p.dport } else { cport };
@@ -856,6 +862,16 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
     }
     USED.store(true, Ordering::Relaxed);
     let i = hit.unwrap();
+    if existed && crate::nfnl::has_tables(0) {
+        // Established hairpin flows traverse FORWARD too (post-DNAT addresses, the target's bridge as oif).
+        let e = &st.ct[i];
+        let mut m = if !rev {
+            crate::nfnl::Pkt { rel: false, est: e.replied, l4: p.proto, src: p.src, dst: e.tip, sport: p.sport, dport: e.tport, oif: br_name(e.tbr), mark: 0, local: false, v6: None }
+        } else {
+            crate::nfnl::Pkt { rel: false, est: true, l4: p.proto, src: e.tip, dst: e.cip, sport: e.tport, dport: e.cport, oif: br_name(e.br), mark: 0, local: false, v6: None }
+        };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
     if f[22] <= 1 { return true; }
     f[22] -= 1;
     let o = 14 + p.ihl;

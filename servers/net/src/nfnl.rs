@@ -839,6 +839,8 @@ pub struct Pkt {
     pub v6: Option<([u8; 16], [u8; 16])>,
     /// `ct state`: true = the packet belongs to an established flow (reply seen), else NEW.
     pub est: bool,
+    /// `ct state related`: an ICMP/ICMPv6 error quoting a tracked flow.
+    pub rel: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -928,7 +930,7 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
                 }
             }
             // ct state: ESTABLISHED (2) for a flow whose reply was seen, else NEW (8).
-            b"ct" => { let dreg = g(1)?; let st: u32 = if cx.m.est { 2 } else { 8 }; rset(&mut regs, dreg, &st.to_ne_bytes())?; }
+            b"ct" => { let dreg = g(1)?; let st: u32 = if cx.m.rel { 4 } else if cx.m.est { 2 } else { 8 }; rset(&mut regs, dreg, &st.to_ne_bytes())?; }
             b"fib" => {
                 let dreg = g(1)?;
                 let local = g(3)? & 2 != 0 && cx.m.local;

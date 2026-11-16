@@ -5316,13 +5316,13 @@ fn nft_output_dnat(pid: u32, fd: usize, slot: usize, ip: IpAddress, ep: IpEndpoi
             let d = a.0;
             if !fwd::host_local(d) { return (ip, ep) }
             let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
-            (nfnl::Pkt { est: false, l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None }, false)
+            (nfnl::Pkt { rel: false, est: false, l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None }, false)
         }
         IpAddress::Ipv6(a) => {
             let d = a.0;
             let lo = d == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
             if !lo && !ip6::is_host6(&d) { return (ip, ep) }
-            (nfnl::Pkt { est: false, l4, src: [0; 4], dst: [0; 4], sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: Some((d, d)) }, true)
+            (nfnl::Pkt { rel: false, est: false, l4, src: [0; 4], dst: [0; 4], sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: Some((d, d)) }, true)
         }
     };
     let (acc, nat) = nfnl::eval(0, nfnl::H_OUT, &mut m);
