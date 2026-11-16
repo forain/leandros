@@ -261,8 +261,9 @@ static void udp6_mcast_deliver(void) {
     const char *G = "ff15::4a01", *OTHER = "fe80::99";
     uint16_t port = 47041;
     int a = v6rx(G, port, ifx, 0), c = v6rx(G, port, ifx, 1);   /* c never joined */
-    int s = socket(AF_INET6, SOCK_DGRAM, 0);
+    int s = socket(AF_INET6, SOCK_DGRAM, 0), noall = 0;
     if (a < 0 || c < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
+    setsockopt(c, IPPROTO_IPV6, 29, &noall, sizeof noall);   /* IPV6_MULTICAST_ALL=0 */
     int sif = setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifx, sizeof ifx);
     int hops = 4, sh = setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof hops);
     int rif = -1; socklen_t l = sizeof rif;
