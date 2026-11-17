@@ -2778,10 +2778,14 @@ int main(int argc, char **argv) {
         /* Flake hunter: --pidfd-wake-loop <runs> [cpu-hogs] */
         int runs = argc > 2 ? atoi(argv[2]) : 10, hogs = argc > 3 ? atoi(argv[3]) : 0;
         setvbuf(stdout, NULL, _IOLBF, 0);
-        for (int i = 0; i < hogs; i++) if (fork() == 0) { for (;;) __asm__ volatile(""); }
+        /* Kill only our own hogs: kill(0, ...) would also hit the caller's
+         * shell, which shares our process group (sh -c 'loop' exited 143). */
+        pid_t hp[64]; if (hogs > 64) hogs = 64;
+        for (int i = 0; i < hogs; i++) if ((hp[i] = fork()) == 0) { for (;;) __asm__ volatile(""); }
         for (int i = 0; i < runs; i++) pidfd_wake_conmon();
-        signal(SIGTERM, SIG_IGN); kill(0, SIGTERM);
-        return 0;
+        for (int i = 0; i < hogs; i++) if (hp[i] > 0) { kill(hp[i], SIGKILL); waitpid(hp[i], NULL, 0); }
+        printf("pidfd-wake-loop: %d runs, %d failed\n", runs, nfail);
+        return nfail > 100 ? 100 : nfail;
     }
     const char *dirs[8];
     int ndirs = 0;
