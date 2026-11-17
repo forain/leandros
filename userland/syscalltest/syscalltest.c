@@ -966,9 +966,20 @@ static void *pw_watcher(void *arg) {
         struct pw_tl *tl = &pw_tl[idx];
         memset(tl, 0, sizeof *tl);
         long long tpre = now_ms();
-        pid_t c = fork();
+        /* EAGAIN here is setup back-pressure, not a pidfd verdict: right after
+         * procmax (it runs just before this suite in regress) exiting tasks can
+         * still hold process-table slots for a moment. Retry for up to 2 s and
+         * label a persistent failure as setup, never as an early wake. */
+        pid_t c = -1;
+        for (int t = 0; t < 200; t++) {
+            c = fork();
+            if (c >= 0 || errno != EAGAIN) break;
+            struct timespec ts = { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            tpre = now_ms();
+        }
         if (c == 0) pw_conmon_child(tl);
-        if (c < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "fork: %s", strerror(errno)); pw_bad = 1; break; }
+        if (c < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "setup, not a wake verdict: fork: %s", strerror(errno)); pw_bad = 1; break; }
         long long t0 = now_ms();
         int fd = pidfd_open(c, 0);
         if (fd < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "pidfd_open: %s", strerror(errno)); pw_bad = 1; waitpid(c, NULL, 0); break; }
