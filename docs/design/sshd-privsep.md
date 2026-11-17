@@ -1,8 +1,8 @@
 # sshd privilege separation
 
 Status: P1-P4 implemented (listener, per-connection `sshd -R`, monitor/net-child split,
-seccomp allow-list). Open: RSS/throughput numbers, a listener backstop for a stalled
-monitor, `close_range` before the id drop (see `TODO.md`).
+seccomp allow-list), plus the listener backstop for a stalled monitor and `close_range`
+before the id drop. Measured numbers are under "Cost measurements".
 
 ## Process model
 
@@ -73,6 +73,38 @@ uid 22 come from the image builder (`docs/servers/security.md`).
   `privsep_postauth_uid`, `privsep_hooks` (incl. `privsep_forbidden_syscall_kills_conn`,
   `privsep_forged_auth_refused`), `privsep_grace`/`privsep_grace_kill`, `privsep_crash_isolated`
   (probe_eof is KNOWN-OPEN, not gating), `privsep_count`, `privsep_listener_survives_count`.
+
+## Stalled monitor and descriptor hygiene
+
+- While a connection is unauthenticated the listener arms a backstop of `LoginGraceTime + 10 s`;
+  if the monitor (which normally enforces the grace time itself) is stopped or wedged, the
+  listener kills the `sshd -R` process and the client sees EOF. Test `privsep_stalled_monitor_backstop`
+  (SIGSTOP of the monitor only).
+- `sandbox::close_except` closes every fd from 3 up with `close_range(2)` (loop to RLIMIT_NOFILE
+  if the syscall is missing) in the net child before chroot/id drop and in the forward-socket
+  fork, so descriptors above 1023 cannot leak. Test `privsep_confine_closes_high_fds`
+  (hook `SSHD_TEST_HOOK=highfd` opens /etc/shadow at fd 1100 in the monitor; it was found in the
+  net child before the fix).
+
+## Cost measurements
+
+`sshsmoke` step `privsep_perf_measured` (QEMU guest, ssh from the host over the forwarded port,
+4 authenticated sessions open; 2026-11-17, box). RSS in kB per process:
+
+| arch | listener | monitor/session | net child (sshd-net) |
+|---|---|---|---|
+| aarch64 (TCG) | 2164 | 2008-2108 | 2920 |
+| x86_64 (KVM) | 2404 | 2212-2360 | 3244-3268 |
+
+So one connection costs about 5-6 MB RSS (monitor + net child), before the user's shell.
+Throughput of 16 MiB through `ssh host cat`, and scp (sftp mode; the guest has no `scp` binary):
+
+| arch | ssh pipe up | ssh pipe down | scp up |
+|---|---|---|---|
+| aarch64 (TCG) | 3.7 MiB/s | 12.6 MiB/s | 4.5 MiB/s |
+| x86_64 (KVM) | 55.9 MiB/s | 84.5 MiB/s | 13.2 MiB/s |
+
+The aarch64 numbers are dominated by TCG emulation of the crypto, not by privsep.
 
 ## Original design
 
