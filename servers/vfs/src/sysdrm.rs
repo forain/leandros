@@ -8,8 +8,11 @@
 //! desktop): only paths under `/sys/class/drm/card0-*` are claimed, and only
 //! while a table is registered. The class directory itself, the `card0` /
 //! `renderD128` symlinks, `/sys/dev/char/226:*` and `device/*` stay on disk
-//! (libdrm and udev need those symlinks; the overlay has none), so a listing of
-//! `/sys/class/drm` does not show the connectors; lookups by name do.
+//! (staged Linux-shaped by mkfs-f2fs-populated.py: real directories under
+//! `/sys/devices/pci.../drm/cardN`, the class and char entries are links into
+//! it). The same connector directories are also answered at
+//! `/sys/devices/.../drm/card0/card0-<TYPE>-<n>` (lookup by name; the staged
+//! card directory's own listing does not show them).
 //!
 //! ```text
 //! /sys/class/drm/card0-<TYPE>-<n>/{status,enabled,modes,dpms,edid}
@@ -87,7 +90,17 @@ pub fn present() -> bool { ops().is_some() }
 
 pub fn is_path(path: &[u8]) -> bool {
     let p = trim(path);
-    (p.starts_with(PREFIX) || p == CLASS_DIR) && ops().is_some()
+    (p.starts_with(PREFIX) || p == CLASS_DIR || card_rest(p).is_some()) && ops().is_some()
+}
+
+/// For `/sys/devices/<...>/drm/card0/card0-<TYPE>-<n>[/file]`: the part after
+/// `card0/` (the connector directories Linux nests under the card; the card
+/// directory itself and its `device`/`subsystem` links are staged on disk).
+fn card_rest(p: &[u8]) -> Option<&[u8]> {
+    const MARK: &[u8] = b"/drm/card0/card0-";
+    if !p.starts_with(b"/sys/devices/") { return None; }
+    let k = p.windows(MARK.len()).position(|w| w == MARK)?;
+    Some(&p[k + b"/drm/card0/".len()..])
 }
 
 fn trim(p: &[u8]) -> &[u8] {
@@ -101,7 +114,10 @@ enum Node { Class, Dir(usize), File(usize, &'static str) }
 fn parse(path: &[u8]) -> Option<Node> {
     let o = ops()?;
     if trim(path) == CLASS_DIR { return Some(Node::Class); }
-    let rest = trim(path).strip_prefix(b"/sys/class/drm/")?;
+    let rest = match card_rest(trim(path)) {
+        Some(r) => r,
+        None => trim(path).strip_prefix(b"/sys/class/drm/")?,
+    };
     let (name, file) = match rest.iter().position(|&c| c == b'/') {
         Some(k) => (&rest[..k], Some(&rest[k + 1..])),
         None => (rest, None),

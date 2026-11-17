@@ -347,7 +347,7 @@ fn chardir_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)>
     let mut idx = idx;
     if super::sysdrm::present() {
         let names: [&str; 2] = ["226:0", "226:128"];
-        if idx < 2 { out[..names[idx].len()].copy_from_slice(names[idx].as_bytes()); return Some((names[idx].len(), true)); }
+        if idx < 2 { out[..names[idx].len()].copy_from_slice(names[idx].as_bytes()); return Some((names[idx].len(), false)); }
         idx -= 2;
     }
     super::sysinput::char_dirent(idx, out)
@@ -355,7 +355,7 @@ fn chardir_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)>
 
 /// Is entry `idx` of overlay directory `(dev, level)` a symlink (DT_LNK)?
 pub fn dirent_link(dev: u16, level: u8, idx: usize) -> bool {
-    if dev == CHAR_DEV { return idx >= if super::sysdrm::present() { 2 } else { 0 }; }
+    if dev == CHAR_DEV { return true; }
     match (dev >> 8) & 0xF {
         c if c == super::sysinput::SI_CLS => super::sysinput::dirent_link(level, idx),
         c if c == super::sysdrm::SD_CLS => super::sysdrm::dirent_link(level, idx),
