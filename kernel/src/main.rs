@@ -686,13 +686,45 @@ fn outbox_empty() -> bool {
 fn write_tagged(e: &[u16]) {
     if e.is_empty() { return; }
     let _batch = drivers::framebuffer::FlushBatch::new();
-    for &x in e {
+    // A previous kernel line lost its '\n' on the UART: end it first.
+    if UART_LINE_OPEN.load(core::sync::atomic::Ordering::Relaxed) {
+        let d = uart_tx_dropped();
+        unsafe { serial_write_byte_direct_noklog(b'\n') };
+        if uart_tx_dropped() == d {
+            UART_LINE_OPEN.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let last = e.len() - 1;
+    for (i, &x) in e.iter().enumerate() {
+        let d = if i == last { uart_tx_dropped() } else { 0 };
         if x & STAGE_DIRECT != 0 {
             unsafe { serial_write_byte_direct_noklog(x as u8) };
         } else {
             serial_write_byte_noklog(x as u8);
         }
+        if i == last && x as u8 == b'\n' && uart_tx_dropped() != d {
+            UART_LINE_OPEN.store(true, core::sync::atomic::Ordering::Relaxed);
+        }
     }
+}
+
+/// Set when a kernel line's terminating '\n' was dropped by the bounded
+/// (`putc`, 5 ms) UART wait under host back-pressure. Kernel bytes may be
+/// lost, but a lost '\n' left the UART mid-line and the next user write
+/// (`serial_write_raw`, patient) was glued onto the kernel fragment:
+/// "[   79.232039] [FORK] tgid=37 shared_pages=1400 private_rw_pa     1\ta"
+/// on x86_64/KVM, whose AF_UNIX serial socket takes only ~278 bytes before
+/// EAGAIN (a prompt repaint plus one [FORK] line). A serial harness that
+/// drops kernel lines then lost the command's first output line (lane
+/// x86virgl: coreutils 8/105 empty outputs). The next UART writer ends the
+/// line first.
+static UART_LINE_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn uart_tx_dropped() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    { arch_x86_64::UART_TX_DROPPED.load(core::sync::atomic::Ordering::Relaxed) }
+    #[cfg(target_arch = "aarch64")]
+    { arch_aarch64::uart::UART_TX_DROPPED.load(core::sync::atomic::Ordering::Relaxed) }
 }
 
 /// Print `msg` to the UART, VT 1's text console and the klog ring NOW,
@@ -909,6 +941,14 @@ pub fn serial_write_raw(bytes: &[u8]) {
     klog::push_bytes(bytes);
     #[cfg(target_arch = "aarch64")]
     arch_aarch64::uart::tx_window_begin();
+    // A kernel line lost its '\n' on the UART (see `UART_LINE_OPEN`): end it
+    // (UART only, the VT got the whole line) so this write starts a line.
+    if !bytes.is_empty() && UART_LINE_OPEN.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe { arch_x86_64::putc_patient(b'\n'); }
+        #[cfg(target_arch = "aarch64")]
+        unsafe { arch_aarch64::uart::putc_patient(b'\n'); }
+    }
     for (i, &b) in bytes.iter().enumerate() {
         serial_write_byte_patient_noklog(b);
         // The write runs with IRQs masked: keep the console RX FIFO moving
