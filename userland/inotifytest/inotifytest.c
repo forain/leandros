@@ -1618,7 +1618,7 @@ static void t_fan_mount_scope(void)
     for (int i = 0; i < n; i++) { if (ends_with(g[i].link, "/ms2/sib")) sib++; if (ends_with(g[i].link, "/.fanmnt-other")) oth++; }
     fan_closeall(g, n);
     unlink("/tmp/.fanmnt-other");
-    if (!(mr == 0 && sib >= 1 && oth == 0)) printf("  fan_mount_scope: mr=%d sib=%d oth=%d\n", mr, sib, oth);
+    if (!(mr == 0 && sib >= 1 && oth == 0)) { printf("  fan_mount_scope: mr=%d sib=%d oth=%d n=%d\n", mr, sib, oth, n); for (int i = 0; i < n && i < 6; i++) printf("    ev %llx %s\n", (unsigned long long)g[i].mask, g[i].link); }
     report("t_fan_mount_scope", mr == 0 && sib >= 1 && oth == 0);
     if (ffd >= 0) close(ffd);
 }
