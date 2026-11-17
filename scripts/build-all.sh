@@ -750,7 +750,7 @@ build_coreutils() {
         #
         # CC_<triple> points at the cc wrapper, not the linker wrapper, because
         # blake3 and oniguruma compile C/.S sources through cc-rs, and cc-rs
-        # appends a --target spelling that zig rejects.
+        # appends a --target spelling.
         #
         # AR_<triple> matters just as much: cc-rs otherwise defaults to the host
         # macOS ar, whose Mach-O-format archives ld.lld cannot read — the C
@@ -1049,7 +1049,7 @@ build_grep() {
 # as a prebuilt blob from ~/code/leandros-artifacts/m4-input-ship because
 # nothing in build-all.sh ever invoked the build script; wiring it in here
 # closes that drift hole. Builds both arches in one call; degrades to a
-# warning (not a failure) if zig is unavailable, matching the other
+# warning (not a failure) if the musl toolchain is unavailable, matching the other
 # out-of-repo build dependencies below.
 build_input_stack_shims() {
     echo "🔌 Building input-stack shims (libseat, libudev)..."
@@ -1100,6 +1100,13 @@ stage_dbus_session() {
 # Main
 download_limine "$LIMINE_VERSION"
 LIMINE_DIR="$LIMINE_CACHE_DIR/limine-$LIMINE_VERSION-binary"
+
+# The clang/lld musl toolchain (scripts/toolchain) backs the linker-*/cc-*/ar-musl
+# wrappers every Rust port uses. mk-sysroot.sh is idempotent ("up to date" when
+# the stamp matches), so a fresh host (the regress box) bootstraps itself here.
+for _tc_arch in aarch64 x86_64; do
+    ./scripts/toolchain/mk-sysroot.sh "$_tc_arch" || { echo "❌ musl toolchain setup failed for $_tc_arch" >&2; exit 1; }
+done
 
 build_input_stack_shims
 

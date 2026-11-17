@@ -92,132 +92,133 @@ if [[ "$TARGET" == "x86_64-unknown-none" ]]; then
 fi
 
 # privtest is plain C, shared verbatim with a host Linux run (cc privtest.c)
-# so every expectation is checked against a real kernel. Static musl via zig,
-# like the other C bits of userland; skipped with a warning without zig.
-if command -v zig >/dev/null 2>&1; then
-    case "$TARGET" in
-        aarch64-unknown-none) ZT=aarch64-linux-musl ;;
-        *)                    ZT=x86_64-linux-musl ;;
-    esac
-    echo "[userland] Building privtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/privtest" userland/privtest/privtest.c
-    # memcpybench-musl: memcpybench built against zig's static musl (its compiler_rt mem*), to compare with the libc/musl-dynamic mem* (lane relibcmem).
-    zig cc -target "$ZT" -static -O2 -fno-builtin -s -o "${OUT}/memcpybench-musl" userland/memcpybench-c/memcpybench.c "$(scripts/musl-mem-obj.sh "${ZT%%-*}")"
+# so every expectation is checked against a real kernel. Built with clang + the locked Alpine musl sysroot
+# (scripts/toolchain, static ET_EXEC); skipped with a warning without clang.
+case "$TARGET" in
+    aarch64-unknown-none) ZT=aarch64-linux-musl ;;
+    *)                    ZT=x86_64-linux-musl ;;
+esac
+if scripts/toolchain/ensure.sh "${ZT%%-*}"; then
+    CCT="$PWD/scripts/toolchain/${ZT}-cc"
+    echo "[userland] Building privtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/privtest" userland/privtest/privtest.c
+    # memcpybench-musl: memcpybench built against the static musl (Alpine musl mem*), to compare with the libc/musl-dynamic mem* (lane relibcmem).
+    "$CCT" -O2 -fno-builtin -s -o "${OUT}/memcpybench-musl" userland/memcpybench-c/memcpybench.c
     # nettest: same idea (ICMP/UDP/TCP basics, checked against a host kernel).
-    echo "[userland] Building nettest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
+    echo "[userland] Building nettest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/nettest" userland/nettest/nettest.c
     # netlinktest: NETLINK_ROUTE dumps, getifaddrs, if_nameindex, SIOCGIF* (nICEr / Firefox WebRTC ICE gathering).
-    echo "[userland] Building netlinktest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netlinktest" userland/netlinktest/netlinktest.c
+    echo "[userland] Building netlinktest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/netlinktest" userland/netlinktest/netlinktest.c
     # nfttest: NETLINK_NETFILTER / nf_tables control plane via Alpine nft (podnat L1).
-    echo "[userland] Building nfttest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nfttest" userland/nfttest/nfttest.c
+    echo "[userland] Building nfttest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/nfttest" userland/nfttest/nfttest.c
     # ip6test: AF_INET6 TCP/UDP on ::1, the family filter (design-ipv6 L1).
-    echo "[userland] Building ip6test (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ip6test" userland/ip6test/ip6test.c
+    echo "[userland] Building ip6test (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/ip6test" userland/ip6test/ip6test.c
     # udpselftest: UDP to our own interface IP is delivered locally; an unresolved next hop does not block the socket.
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udpselftest" userland/udpselftest/udpselftest.c
+    "$CCT" -O2 -s -Wall -o "${OUT}/udpselftest" userland/udpselftest/udpselftest.c
     # udptest: UDP semantics, EPOLLET edges of UDP/ICMP/listeners (checked against a host kernel).
-    echo "[userland] Building udptest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/udptest" userland/udptest/udptest.c
+    echo "[userland] Building udptest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/udptest" userland/udptest/udptest.c
     # pollnarrow: blocked /dev/netctl and console readers park on a narrow poll tag.
-    echo "[userland] Building pollnarrow (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/pollnarrow" userland/pollnarrow/pollnarrow.c
+    echo "[userland] Building pollnarrow (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/pollnarrow" userland/pollnarrow/pollnarrow.c
     # listentag: a TCP listener's pollers park on its own key and see every connect at once.
-    echo "[userland] Building listentag (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/listentag" userland/listentag/listentag.c
+    echo "[userland] Building listentag (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/listentag" userland/listentag/listentag.c
     # vfstag: blocked flock/signalfd/inotify/device waiters park on a narrow poll tag.
-    echo "[userland] Building vfstag (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/vfstag" userland/vfstag/vfstag.c
+    echo "[userland] Building vfstag (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/vfstag" userland/vfstag/vfstag.c
     # nettag2: blocking socket I/O and unbound/ICMP sockets park on a narrow tag and still wake at once.
-    echo "[userland] Building nettag2 (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nettag2" userland/nettag2/nettag2.c
+    echo "[userland] Building nettag2 (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/nettag2" userland/nettag2/nettag2.c
     # kparks: console poll/epoll, empty poll sets and VT_WAITACTIVE park on a narrow poll tag.
-    echo "[userland] Building kparks (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kparks" userland/kparks/kparks.c
+    echo "[userland] Building kparks (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/kparks" userland/kparks/kparks.c
     # netcheck: the end-to-end Internet check behind /bin/net-autotest (net.test=1).
-    echo "[userland] Building netcheck (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
+    echo "[userland] Building netcheck (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/netcheck" userland/netcheck/netcheck.c
     # ec2init (lane ec2init): EC2 first boot, IMDSv2 key + hostname; started by init.
-    echo "[userland] Building ec2init (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ec2init" userland/ec2init/ec2init.c
+    echo "[userland] Building ec2init (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/ec2init" userland/ec2init/ec2init.c
     # sndtest (lane hda): plays test tones through /dev/pipewire, the path
     # PipeWire's sink uses; run at boot by /bin/snd-autotest (snd.test=1).
-    echo "[userland] Building sndtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/sndtest" userland/sndtest/sndtest.c -lm
+    echo "[userland] Building sndtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/sndtest" userland/sndtest/sndtest.c -lm
     # camtest (lane lapv4l2): V4L2 mmap capture from /dev/video0; --probe is the no-camera regress check.
-    echo "[userland] Building camtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/camtest" userland/camtest/camtest.c
+    echo "[userland] Building camtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/camtest" userland/camtest/camtest.c
     # syscalltest: splice/tee/vmsplice, rseq and pidfd (checked against a host kernel).
-    echo "[userland] Building syscalltest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
+    echo "[userland] Building syscalltest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/syscalltest" userland/syscalltest/syscalltest.c
     # uaccesstest: read(2)/write(2) on never-touched user pages (console, pipe, file, socket, pty).
-    echo "[userland] Building uaccesstest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/uaccesstest" userland/uaccesstest/uaccesstest.c
+    echo "[userland] Building uaccesstest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/uaccesstest" userland/uaccesstest/uaccesstest.c
     # proctest: rusage/faults, /proc links, clone3/pdeathsig/CLONE_FS (checked against a host kernel).
-    echo "[userland] Building proctest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/proctest" userland/proctest/proctest.c
+    echo "[userland] Building proctest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/proctest" userland/proctest/proctest.c
     # proctest-cold.bin: 2 MiB of real bytes nothing reads before proctest's majflt_cold (staged into /bin).
     yes proctest-cold | head -c 2097152 > "${OUT}/proctest-cold.bin" || true  # yes dies of SIGPIPE under pipefail
     # chroottest: openat2, vfork/clone3, PATH_MAX paths, /proc in a chroot (checked against a host kernel).
-    echo "[userland] Building chroottest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
+    echo "[userland] Building chroottest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/chroottest" userland/chroottest/chroottest.c
     echo "[userland] Building mnttest..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c -lpthread
+    "$CCT" -O2 -s -Wall -o "${OUT}/mnttest" userland/mnttest/mnttest.c -lpthread
     echo "[userland] Building captest..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
+    "$CCT" -O2 -s -Wall -o "${OUT}/captest" userland/captest/captest.c
     # bpftest: bpf(2) cgroup device programs (lane bpfsys).
-    echo "[userland] Building bpftest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/bpftest" userland/bpftest/bpftest.c
+    echo "[userland] Building bpftest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/bpftest" userland/bpftest/bpftest.c
     # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
-    echo "[userland] Building seccomptest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c
+    echo "[userland] Building seccomptest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c
     # preadtest: 8 threads pread/pwrite one shared block-device fd (positional VFS ops).
-    echo "[userland] Building preadtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/preadtest" userland/preadtest/preadtest.c -lpthread
+    echo "[userland] Building preadtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/preadtest" userland/preadtest/preadtest.c -lpthread
     # kexectest: kexec_file_load of /boot/kexec (load, re-load, bad flags, unload).
-    echo "[userland] Building kexectest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexectest" userland/kexectest/kexectest.c
+    echo "[userland] Building kexectest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/kexectest" userland/kexectest/kexectest.c
     # memfdtest: crun cloned-binary sequence (memfd_create, seals, sendfile, fexecve).
-    echo "[userland] Building memfdtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/memfdtest" userland/memfdtest/memfdtest.c
+    echo "[userland] Building memfdtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/memfdtest" userland/memfdtest/memfdtest.c
     # conmontest: syscall sequences conmon performs at start (lane conmondbg).
-    echo "[userland] Building conmontest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/conmontest" userland/conmontest/conmontest.c
+    echo "[userland] Building conmontest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/conmontest" userland/conmontest/conmontest.c
     # exitracetest: reaped-pid and rename visibility to a freshly exec'd process (lane exitrace).
-    echo "[userland] Building exitracetest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/exitracetest" userland/exitracetest/exitracetest.c
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/exitwrap" userland/exitracetest/exitwrap.c
+    echo "[userland] Building exitracetest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/exitracetest" userland/exitracetest/exitracetest.c
+    "$CCT" -O2 -s -Wall -o "${OUT}/exitwrap" userland/exitracetest/exitwrap.c
     # suspendtest: one freeze-only device suspend/resume cycle (kernel pm).
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/suspendtest" userland/suspendtest/suspendtest.c
+    "$CCT" -O2 -s -Wall -o "${OUT}/suspendtest" userland/suspendtest/suspendtest.c
     # kexec: kexec-tools style front end (-l/-u/-e) over kexec_file_load + reboot(KEXEC).
-    echo "[userland] Building kexec (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kexec" userland/kexec/kexec.c
+    echo "[userland] Building kexec (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/kexec" userland/kexec/kexec.c
     # kmodctl / kmodctltest: kernel module list/load/unload/info and the finit_module error-path test.
-    echo "[userland] Building kmodctl, kmodctltest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kmodctl" userland/kmodctl/kmodctl.c
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/kmodctltest" userland/kmodctltest/kmodctltest.c
+    echo "[userland] Building kmodctl, kmodctltest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/kmodctl" userland/kmodctl/kmodctl.c
+    "$CCT" -O2 -s -Wall -o "${OUT}/kmodctltest" userland/kmodctltest/kmodctltest.c
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
-    echo "[userland] Building nstest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
-    echo "[userland] Building tuntest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/tuntest" userland/tuntest/tuntest.c
-    echo "[userland] Building brtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/brtest" userland/brtest/brtest.c
-    echo "[userland] Building ovltest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
-    echo "[userland] Building ovlmknodtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/ovlmknodtest" userland/ovlmknodtest/ovlmknodtest.c
-    echo "[userland] Building inotifytest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/inotifytest" userland/inotifytest/inotifytest.c
-    echo "[userland] Building idmaptest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/idmaptest" userland/idmaptest/idmaptest.c
-    echo "[userland] Building cgtest (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -O2 -s -Wall -o "${OUT}/cgtest" userland/cgtest/cgtest.c
-    echo "[userland] Building serrx (zig cc -target $ZT)..."
-    zig cc -target "$ZT" -static -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
+    echo "[userland] Building nstest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
+    echo "[userland] Building tuntest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/tuntest" userland/tuntest/tuntest.c
+    echo "[userland] Building brtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/brtest" userland/brtest/brtest.c
+    echo "[userland] Building ovltest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/ovltest" userland/ovltest/ovltest.c
+    echo "[userland] Building ovlmknodtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/ovlmknodtest" userland/ovlmknodtest/ovlmknodtest.c
+    echo "[userland] Building inotifytest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/inotifytest" userland/inotifytest/inotifytest.c
+    echo "[userland] Building idmaptest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/idmaptest" userland/idmaptest/idmaptest.c
+    echo "[userland] Building cgtest (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/cgtest" userland/cgtest/cgtest.c
+    echo "[userland] Building serrx (clang $ZT)..."
+    "$CCT" -Os -s -Wall -o "${OUT}/serrx" userland/serrx/serrx.c
 else
-    echo "[userland] WARNING: zig not found — privtest/nettest/udptest/netcheck/sndtest/syscalltest/chroottest/kexectest/kexec not built"
+    echo "[userland] WARNING: clang/musl toolchain unavailable — privtest/nettest/udptest/netcheck/sndtest/syscalltest/chroottest/kexectest/kexec not built"
 fi
 
 echo ""

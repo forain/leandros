@@ -158,9 +158,9 @@ fi
 # netcheck (the net.test=1 self-test) is plain C; --quick reuses an older
 # userland build, so make sure it is there and current.
 NETCHECK_BIN=userland/target/x86_64-unknown-none/release/netcheck
-if [[ $QUICK == 1 && ( ! -x "$NETCHECK_BIN" || userland/netcheck/netcheck.c -nt "$NETCHECK_BIN" ) ]] && command -v zig >/dev/null 2>&1; then
+if [[ $QUICK == 1 && ( ! -x "$NETCHECK_BIN" || userland/netcheck/netcheck.c -nt "$NETCHECK_BIN" ) ]] && scripts/toolchain/ensure.sh x86_64; then
     mkdir -p "$(dirname "$NETCHECK_BIN")"
-    zig cc -target x86_64-linux-musl -static -O2 -s -Wall -o "$NETCHECK_BIN" userland/netcheck/netcheck.c \
+    scripts/toolchain/x86_64-linux-musl-cc -O2 -s -Wall -o "$NETCHECK_BIN" userland/netcheck/netcheck.c \
         || echo "WARNING: netcheck build failed; net.test=1 will report it missing"
 fi
 if [[ $QUICK == 1 ]]; then
