@@ -1606,11 +1606,11 @@ static void t_fan_open_exec(void)
  * FILESYSTEM = every mount of the superblock (a bind mount included); FAN_OPEN_EXEC also raises FAN_OPEN. */
 static void t_fan_mount_scope(void)
 {
-    mkd("ms1"); mkd("ms2"); touch("ms2/sib");
+    mkd("ms1"); mkd("ms2"); touch("ms2/sib"); touch("ms1/pre");
     char d1[128]; path(d1, "ms1");
     int ffd = fan_new();
     int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, d1);
-    wr("ms1/self", "z"); wr("ms2/sib", "z");
+    wr("ms1/pre", "z"); wr("ms1/self", "z"); wr("ms2/sib2", "z"); wr("ms2/sib", "z");
     int other = open("/tmp/.fanmnt-other", O_CREAT | O_WRONLY, 0644);
     if (other >= 0) { write(other, "z", 1); close(other); }
     struct fev g[32]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 32);
