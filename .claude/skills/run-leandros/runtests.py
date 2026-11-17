@@ -157,10 +157,45 @@ SYNCFILE_CHECK = (
     "test $__f = 0"
 )
 
+# Serial input throughput (lane conrx): a ~4.5 KB command line typed as ONE
+# unpaced burst, never staged through a guest file (driver.serial_run raw=True),
+# right after /bin/uinputtest as in the original failure. x86_64 left the
+# 16550 FIFO off, so QEMU handed over one byte per host main-loop pass and the
+# 100 Hz tick drain got ~1-3 bytes per tick: a 3-4 KB typed line took tens of
+# seconds to arrive, the harness saw no echo, retyped it behind the queued
+# copy, and the suite timed out minutes later with the guest idle. The gate is
+# the end-to-end rate: bytes typed / seconds until the command finished.
+RAWLINE_CMD = (
+    "__n=0; "
+    + "".join(f"__n=$((__n+1)); test {i} = {i} && : raw-raw-raw-raw; " for i in range(85))
+    + "echo \"rawline: $__n steps\"; grep ^timerstat /proc/stat; test $__n = 85"
+)
+RAWLINE_CHECK = "rawline:" + RAWLINE_CMD
+# Minimum end-to-end serial input rate (bytes/s) on KVM/HVF; divided by
+# wait_scale on TCG. Fixed x86_64/KVM measures ~1 KB/s and up; the unfixed one
+# well under 400 B/s.
+RAWLINE_MIN_BPS = float(os.environ.get("LEANDROS_RAWLINE_MIN_BPS", "600"))
+
+
+def rawline_run(c, timeout, arch):
+    cmd = c[len("rawline:"):]
+    r = driver.serial_run(cmd, timeout=timeout, arch=arch, raw=True)
+    secs = max(r["secs"], 0.001)
+    rate = len(cmd) / secs
+    need = RAWLINE_MIN_BPS / driver.wait_scale(arch)
+    good = (r["rc"] == 0 and r["status"] in ("ok", "rc-file") and r.get("echo_ok")
+            and rate >= need and "rawline: 85 steps" in r["output"])
+    r["output"] += (f"\nrawline_rate: {len(cmd)} B in {secs:.1f} s = {rate:.0f} B/s "
+                    f"(need >= {need:.0f}), echo_ok={r.get('echo_ok')}: {'PASS' if good else 'FAIL'}")
+    if not good:
+        r["rc"] = r["rc"] if r["rc"] not in (0, None) else 1
+    return r
+
+
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
-                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", SYSFS_CHECK,
+                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", RAWLINE_CHECK, SYSFS_CHECK,
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
@@ -455,6 +490,7 @@ SUITES = {
     # Harness guard: a 4 KB typed line must reach the shell intact (brush
     # repaints the whole line per burst; lane sysfshang). 120 checks of 30 chars.
     "longline": [LONGLINE_CHECK],
+    "rawline": ["/bin/uinputtest", RAWLINE_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
@@ -660,6 +696,8 @@ def main(argv):
                             raise RuntimeError("reboot failed")
                     if c.startswith("host:"):
                         r = host_run(c, timeout, arch, scale)
+                    elif c.startswith("rawline:"):
+                        r = rawline_run(c, timeout, arch)
                     else:
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001
