@@ -115,7 +115,12 @@ def typ(s):
 def drv(*a, t=400):
     r = subprocess.run([sys.executable, DRV, *a], capture_output=True, text=True, timeout=t)
     log("driver", a[0], "rc", r.returncode, (r.stdout + r.stderr)[-400:])
+    global LAST_OUT
+    LAST_OUT = r.stdout + r.stderr
     return r.returncode
+
+
+LAST_OUT = ""
 
 
 SER = None
@@ -353,7 +358,12 @@ def ctrl_t(name):
 def main():
     global SER
     log(f"ffsession arch={ARCH} accel={driver.accel_kind(ARCH)} gpu={GPU} scale={SCALE}")
-    if drv("start", ARCH, f"--{GPU}", t=900) != 0:
+    rc = drv("start", ARCH, f"--{GPU}", t=900)
+    if rc != 0 and "QEMU exited" in LAST_OUT:
+        log("start: QEMU exited during boot, retrying once")
+        drv("stop", t=60)
+        rc = drv("start", ARCH, f"--{GPU}", t=900)
+    if rc != 0:
         # A start that times out leaves QEMU up, and every later run under this
         # id then fails with "QEMU already running".
         drv("stop", t=60)
