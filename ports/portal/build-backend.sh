@@ -34,7 +34,7 @@ for c in "${LEANDROS_COSMIC_EPOCH:-}" "$ROOT/../cosmic-epoch" "$HOME/code/cosmic
     [ -n "$c" ] && [ -f "$c/xdg-desktop-portal-cosmic/Cargo.toml" ] && { SRC="$c/xdg-desktop-portal-cosmic"; break; }
 done
 [ -n "$SRC" ] || { echo "no cosmic-epoch/xdg-desktop-portal-cosmic checkout (set LEANDROS_COSMIC_EPOCH)"; exit 2; }
-for p in "$D/toolchain/zig-ld-lld" "$S/usr/lib/libc.so" "$PG/inc/pipewire-0.3" "$SDK/usr/lib/libgio-2.0.so" \
+for p in "$D/toolchain/ld.lld" "$S/usr/lib/libc.so" "$PG/inc/pipewire-0.3" "$SDK/usr/lib/libgio-2.0.so" \
          "$HERE/out/$arch.alpine/usr/lib/libpipewire-0.3.so.0"; do
     [ -e "$p" ] || { echo "missing $p (run ports/portal/build.sh first / check leandros-artifacts)"; exit 2; }
 done
@@ -55,7 +55,7 @@ STUB=$STABLE/stub
 cfg=$STABLE/cargo.toml
 cat > "$cfg" <<EOF
 [target.$triple]
-linker = "$D/toolchain/zig-ld-lld"
+linker = "$D/toolchain/ld.lld"
 rustflags = [
   "-C", "linker-flavor=ld",
   "-C", "target-feature=-crt-static",
