@@ -99,6 +99,12 @@ sys.path.insert(0, HERE)
 os.chdir(REPO)
 import driver  # noqa: E402
 
+LONGLINE_CHECK = (
+    "__n=0; "
+    + "".join(f"__n=$((__n+1)); test {i} = {i} && : pad-pad-pad-pad-pad-pad; " for i in range(80))
+    + "echo \"longline: $__n steps: PASS\"; test $__n = 80"
+)
+
 SYSFS_CHECK = (
     "__f=0; "
     "t() { eval \"$2\" >/dev/null 2>&1 && echo \"sysfs: $1: PASS\" || { echo \"sysfs: $1: FAIL\"; __f=1; }; }; "
@@ -431,6 +437,9 @@ SUITES = {
     # identity libdrm/udev consumers read (lane sysfs).
     "sysfs": [SYSFS_CHECK],
     "syncfile": [SYNCFILE_CHECK],
+    # Harness guard: a 4 KB typed line must reach the shell intact (brush
+    # repaints the whole line per burst; lane sysfshang). 120 checks of 30 chars.
+    "longline": [LONGLINE_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
