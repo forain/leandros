@@ -1611,6 +1611,27 @@ unsafe fn emu(fd: c_int, bytes: &[u8]) -> Option<Snap> {
     snap(6)
 }
 
+unsafe fn dump(tag: &[u8], s: &Option<Snap>) {
+    out(b"  dbg "); out(tag);
+    match s {
+        Some(s) => {
+            out(b" cur="); out_num(s.col as usize); out(b","); out_num(s.row as usize);
+            out(b" r0:");
+            for c in 0..14 { out(b" "); out_hex(s.cells[0][c]); }
+            out(b" r1:");
+            for c in 0..4 { out(b" "); out_hex(s.cells[1][c]); }
+        }
+        None => out(b" none"),
+    }
+    out(b"\n");
+}
+
+unsafe fn out_hex(v: u32) {
+    let mut b = [0u8; 8];
+    for i in 0..8 { let d = ((v >> (28 - 4 * i)) & 0xf) as u8; b[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 }; }
+    out(&b);
+}
+
 /// Put VT 6's tab stops back to every 8 columns (through col 80).
 unsafe fn reset_tabs(fd: c_int) {
     let mut seq = [0u8; 160];
@@ -1671,6 +1692,7 @@ unsafe fn t_emu_tab_stops() -> bool {
     let ok4 = c(&s4) == Some((4, 0));
     let ok5 = s5.as_ref().map_or(false, |s| s.cells[0][11] == b'W' as u32 && s.cells[0][4] == 0);
     let ok6 = s6.as_ref().map_or(false, |s| s.cells[0][8] == b'q' as u32);
+    dump(b"s1", &s1); dump(b"s2", &s2); dump(b"s3", &s3); dump(b"s4", &s4); dump(b"s5", &s5); dump(b"s6", &s6);
     out(b"  hts="); out_int(ok1 as c_int); out(b" cht="); out_int(ok2 as c_int);
     out(b" cbt="); out_int((ok3 && ok4) as c_int); out(b" tbc="); out_int(ok5 as c_int);
     out(b" reset="); out_int(ok6 as c_int); out(b"\n");
@@ -1680,15 +1702,17 @@ unsafe fn t_emu_tab_stops() -> bool {
 unsafe fn t_emu_wide_advance() -> bool {
     let fd = open_emu_vt();
     if fd < 0 { return report(b"emu_wide_advance", false); }
-    // A, CJK (2 cells), B, emoji, fullwidth 'a', e + combining acute, e-acute.
+    // A, CJK (2 cells), B, emoji, fullwidth 'a', e + combining acute (folds into
+    // the precomposed e-acute in the cell before the cursor), e-acute.
     let s = emu(fd, "A\u{4e16}B\u{1F600}\u{ff41}e\u{301}\u{e9}".as_bytes());
     close(fd);
+    dump(b"adv", &s);
     let ok = match s {
         Some(s) => {
             let r = &s.cells[0];
             r[0] == b'A' as u32 && r[1] == 0x4e16 && r[2] == WIDE_CONT && r[3] == b'B' as u32
                 && r[4] == 0x1F600 && r[5] == WIDE_CONT && r[6] == 0xff41 && r[7] == WIDE_CONT
-                && r[8] == b'e' as u32 && r[9] == 0xe9 && s.col == 10 && s.row == 0
+                && r[8] == 0xe9 && r[9] == 0xe9 && s.col == 10 && s.row == 0
         }
         None => false,
     };
@@ -1706,6 +1730,7 @@ unsafe fn t_emu_wide_overwrite() -> bool {
     // EL 0 from the right half of the second: the whole character goes.
     let s3 = emu2(fd, a, b"\x1b[4G\x1b[K");
     close(fd);
+    dump(b"ow1", &s1); dump(b"ow2", &s2); dump(b"ow3", &s3);
     let ok1 = s1.as_ref().map_or(false, |s| {
         let r = &s.cells[0];
         r[0] == 0 && r[1] == b'x' as u32 && r[2] == 0x754c && r[3] == WIDE_CONT });
@@ -1726,6 +1751,7 @@ unsafe fn t_emu_wide_wrap() -> bool {
     // Last column, then a double-width character: it wraps whole.
     let s = emu(fd, "\x1b[999C\u{4e16}".as_bytes());
     close(fd);
+    dump(b"wrap", &s);
     let ok = match s {
         Some(s) => s.cells[1][0] == 0x4e16 && s.cells[1][1] == WIDE_CONT && s.col == 2 && s.row == 1,
         None => false,
