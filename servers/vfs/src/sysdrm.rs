@@ -26,6 +26,7 @@ use super::sysclass::{SC_BASE, NAME_LEN};
 pub const SD_CLS: u16 = 0xC;
 pub const LVL_CONN: u8 = 0xC0;
 pub const LVL_CLASS: u8 = 0xC1;
+pub const LVL_CARD: u8 = 0xC2;
 const CLASS_DIR: &[u8] = b"/sys/class/drm";
 pub const MAX_CONN: usize = 8;
 
@@ -90,7 +91,31 @@ pub fn present() -> bool { ops().is_some() }
 
 pub fn is_path(path: &[u8]) -> bool {
     let p = trim(path);
-    (p.starts_with(PREFIX) || p == CLASS_DIR || card_rest(p).is_some()) && ops().is_some()
+    (p.starts_with(PREFIX) || p == CLASS_DIR || card_rest(p).is_some() || is_card_dir(p)) && ops().is_some()
+}
+
+/// `/sys/devices/<...>/drm/card0` itself: its listing is generated (the staged
+/// entries plus the connector directories, as Linux nests them under the card).
+fn is_card_dir(p: &[u8]) -> bool {
+    p.starts_with(b"/sys/devices/") && p.ends_with(b"/drm/card0")
+}
+
+const CLASS_CARD0: &[u8] = b"/sys/class/drm/card0";
+
+/// Target of the generated `/sys/class/drm/card0-<TYPE>-<n>` symlink: the
+/// connector directory under the card's real directory, relative to the class
+/// directory (the card link's own target plus the connector name).
+pub fn link(path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let p = trim(path);
+    if !p.starts_with(PREFIX) || p[PREFIX.len()..].contains(&b'/') { return None; }
+    let o = ops()?;
+    let name = &p[b"/sys/class/drm/".len()..];
+    let mut nb = [0u8; 48];
+    (0..MAX_CONN).find(|&i| (o.conn)(i).map_or(false, |c| { let l = conn_name(&c, &mut nb); &nb[..l] == name }))?;
+    let mut t = super::sys_readlink(CLASS_CARD0)?;
+    t.push(b'/');
+    t.extend_from_slice(name);
+    Some(t)
 }
 
 /// For `/sys/devices/<...>/drm/card0/card0-<TYPE>-<n>[/file]`: the part after
@@ -109,11 +134,12 @@ fn trim(p: &[u8]) -> &[u8] {
     p
 }
 
-enum Node { Class, Dir(usize), File(usize, &'static str) }
+enum Node { Class, Card, Dir(usize), File(usize, &'static str) }
 
 fn parse(path: &[u8]) -> Option<Node> {
     let o = ops()?;
     if trim(path) == CLASS_DIR { return Some(Node::Class); }
+    if is_card_dir(trim(path)) { return Some(Node::Card); }
     let rest = match card_rest(trim(path)) {
         Some(r) => r,
         None => trim(path).strip_prefix(b"/sys/class/drm/")?,
@@ -140,6 +166,7 @@ pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
     match parse(path)? {
         Node::Dir(i) => Some((SC_BASE | SD_CLS << 8 | i as u16, LVL_CONN)),
         Node::Class => Some((SC_BASE | SD_CLS << 8 | 0xFF, LVL_CLASS)),
+        Node::Card => Some((SC_BASE | SD_CLS << 8 | 0xFE, LVL_CARD)),
         _ => None,
     }
 }
@@ -172,6 +199,14 @@ pub fn dirent(_dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Opt
         if idx < 2 { out[..NODES[idx].len()].copy_from_slice(NODES[idx].as_bytes()); return Some((NODES[idx].len(), false)); }
         let o = ops()?;
         let c = (o.conn)(idx - 2)?;
+        // Linux: the connectors in the class directory are symlinks.
+        return Some((conn_name(&c, &mut out[..]), false));
+    }
+    if level == LVL_CARD {
+        // The staged entries of the card directory, then its connectors.
+        const STAGED: [(&str, bool); 4] = [("uevent", false), ("dev", false), ("device", false), ("subsystem", false)];
+        if idx < STAGED.len() { out[..STAGED[idx].0.len()].copy_from_slice(STAGED[idx].0.as_bytes()); return Some((STAGED[idx].0.len(), false)); }
+        let c = (ops()?.conn)(idx - STAGED.len())?;
         return Some((conn_name(&c, &mut out[..]), true));
     }
     if level != LVL_CONN { return None; }
@@ -180,5 +215,7 @@ pub fn dirent(_dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Opt
     Some((f.len(), false))
 }
 
-/// `card0` / `renderD128` in the class directory are symlinks (staged on disk).
-pub fn dirent_link(level: u8, idx: usize) -> bool { level == LVL_CLASS && idx < 2 }
+/// Class directory entries are all symlinks; `device`/`subsystem` of the card are too.
+pub fn dirent_link(level: u8, idx: usize) -> bool {
+    (level == LVL_CLASS) || (level == LVL_CARD && (idx == 2 || idx == 3))
+}

@@ -4943,6 +4943,18 @@ fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
 /// every RamFS and mount path — is handed to the handlers byte-identical to
 /// how it arrived, so no non-tmpfs lookup (the exec path above all) can change
 /// behaviour because of this.
+/// Readlink of a staged `/sys` symlink; `None` when it is not a link.
+fn sys_readlink(path: &[u8]) -> Option<Vec<u8>> {
+    let mut p = path.to_vec();
+    p.push(0);
+    let mut out = alloc::vec![0u8; 256];
+    let r = handle_readlink(p.as_ptr() as usize, out.as_mut_ptr() as usize, out.len());
+    let n = reply_val(&r);
+    if n <= 0 { return None; }
+    out.truncate(n as usize);
+    Some(out)
+}
+
 /// Readlink of one backing path on any filesystem; `None` when it is not a link.
 fn backing_readlink(backing: &[u8]) -> Option<Vec<u8>> {
     if backing.starts_with(b"/proc") || backing.starts_with(b"/sys") || backing.starts_with(b"/dev") { return None; }
