@@ -173,6 +173,9 @@ if scripts/toolchain/ensure.sh "${ZT%%-*}"; then
     # seccomptest: prctl/seccomp(2) behaviour (lane seccore).
     echo "[userland] Building seccomptest (clang $ZT)..."
     "$CCT" -O2 -s -Wall -o "${OUT}/seccomptest" userland/seccomptest/seccomptest.c
+    # execdev: ET_EXEC whose segments sit at the QEMU virt GIC/UART addresses (lane execfault).
+    echo "[userland] Building execdev (clang $ZT)..."
+    "$CCT" -O2 -s -Wall -o "${OUT}/execdev" userland/execdev/execdev.c
     # preadtest: 8 threads pread/pwrite one shared block-device fd (positional VFS ops).
     echo "[userland] Building preadtest (clang $ZT)..."
     "$CCT" -O2 -s -Wall -o "${OUT}/preadtest" userland/preadtest/preadtest.c -lpthread
