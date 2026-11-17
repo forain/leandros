@@ -2,7 +2,7 @@
 # Build sshd, the LeandrOS SSH server (russh) -- static musl, one arch per
 # invocation: ./build.sh aarch64 | ./build.sh x86_64
 #
-# Mirrors userland/claude-run/build.sh (pinned nightly, zig-cc linker wrapper,
+# Mirrors userland/claude-run/build.sh (pinned nightly, clang/lld linker wrapper,
 # link-self-contained=no, relocation-model=static => ET_EXEC), plus the cc/ar
 # wrappers for ring's C and assembly (as build_coreutils does for blake3):
 # cc-rs would otherwise reach for the host compiler and the macOS ar.
