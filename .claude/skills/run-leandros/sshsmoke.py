@@ -1047,6 +1047,69 @@ def privsep_grace(ssh, user, pw, tmp):
     step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within 25 s")
 
 
+def second_tunnel(ssh, user, pw, conf, env=""):
+    """Start the second sshd and an ssh -L tunnel to it; return (tunnel Popen, local port) or (None, why)."""
+    if not sshd2_start(ssh, user, pw, conf, env=env):
+        return None, "second sshd did not start"
+    lp = free_port()
+    tun = subprocess.Popen(["ssh", *ssh.pw_opts(), "-N", "-L", f"{lp}:127.0.0.1:{SSHD2_PORT}", "-p", str(ssh.port),
+                            f"{user}@{ssh.host}"], env=ssh.env(pw), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        try:
+            s = socket.create_connection(("127.0.0.1", lp), timeout=5)
+            if s.recv(256).startswith(b"SSH-"):
+                s.close()
+                return tun, lp
+            s.close()
+        except OSError:
+            time.sleep(0.5)
+    stop(tun)
+    return None, "cannot reach the second sshd through the tunnel"
+
+
+def privsep_stalled_monitor(ssh, user, pw):
+    """A monitor that stops (SIGSTOP) pre-auth cannot enforce LoginGraceTime itself: the listener's backstop
+    kills the connection process after LoginGraceTime + 10 s and the client sees EOF."""
+    tun, lp = second_tunnel(ssh, user, pw, "LoginGraceTime 4\nPasswordAuthentication yes\n")
+    if tun is None:
+        step("privsep_stalled_monitor_backstop", False, lp)
+        return
+    s = socket.create_connection(("127.0.0.1", lp), timeout=10)
+    s.recv(256)
+    s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
+    time.sleep(1)
+    procs = sshd_procs(ssh, user, pw)
+    pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
+    if pre:
+        sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]} {pre[0][0]}")  # monitor and child both hung
+    ok = bool(pre) and probe_eof(s, 40)
+    if pre:
+        sudo_sh(ssh, user, pw, f"kill -KILL {pre[0][1]} {pre[0][0]} 2>/dev/null; true")
+    s.close()
+    stop(tun)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+    step("privsep_stalled_monitor_backstop", ok, "" if ok else f"preauth {'found' if pre else 'missing'}, no EOF within 40 s")
+
+
+def privsep_highfd(ssh, user, pw):
+    """An fd above 1023 open in the monitor (hook highfd) must not survive into the net child."""
+    tun, lp = second_tunnel(ssh, user, pw, "PasswordAuthentication yes\n", env="SSHD_TEST_HOOK=highfd")
+    if tun is None:
+        step("privsep_confine_closes_high_fds", False, lp)
+        return
+    s = socket.create_connection(("127.0.0.1", lp), timeout=10)
+    s.recv(256)
+    s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
+    time.sleep(2)
+    det = [d for d in sshd_detail(ssh, user, pw) if d["comm"] == "sshd-preauth"]
+    ok = bool(det) and all(d["keyfds"] == 0 for d in det)
+    s.close()
+    stop(tun)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+    step("privsep_confine_closes_high_fds", ok, f"preauth={[(d['pid'], d['keyfds']) for d in det]}")
+
+
 def privsep_crash(ssh, user, pw):
     """Crash isolation: a SEGV in one connection's process must not take the listener or other sessions down."""
     pid, fd = pty.fork()
@@ -1146,6 +1209,8 @@ def main(argv):
     privsep_isolation(ssh, user, pw)
     privsep_hooks(ssh, user, pw, tmp)
     privsep_grace(ssh, user, pw, tmp)
+    privsep_stalled_monitor(ssh, user, pw)
+    privsep_highfd(ssh, user, pw)
     privsep_crash(ssh, user, pw)
     privsep_count(ssh, user, pw)  # last: on a tree without per-connection processes it leaves the guest without sshd
     shutil.rmtree(tmp, ignore_errors=True)

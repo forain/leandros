@@ -133,6 +133,17 @@ pub fn run(cfg: Config, host_key: PrivateKey) -> ! {
     }
     let (logr, logw) = (lp[0], lp[1]);
     log(&format!("connection from {peer}"));
+    if std::env::var("SSHD_TEST_HOOK").as_deref() == Ok("highfd") {
+        // Test only: a root-only file open above fd 1023 that the net child must not inherit.
+        unsafe {
+            let lim = libc::rlimit { rlim_cur: 4096, rlim_max: 4096 };
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            let f = libc::open(c"/etc/shadow".as_ptr(), libc::O_RDONLY);
+            if f >= 0 {
+                libc::fcntl(f, libc::F_DUPFD, 1100);
+            }
+        }
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         log(&format!("{peer}: fork: {}", std::io::Error::last_os_error()));
