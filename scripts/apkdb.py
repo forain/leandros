@@ -25,8 +25,7 @@ EXCLUDE_FILES = {"etc/apk/world", "etc/apk/arch", "etc/passwd", "etc/group",
 EXCLUDE_PREFIXES = ("lib/apk/", "home/", "root/", "tmp/", "var/", "run/", "proc/",
                     "sys/", "dev/", "mnt/", "media/")
 
-# musl=1.2.5-r99 (the fake provide) is added by mkfs only for LEANDROS_LIBC=zig;
-# with alpine, musl is a real package record (apk_stanza) leandros-base depends on.
+# musl is a real package record (apk_stanza) leandros-base depends on.
 STATIC_PROVIDES = [
     "/bin/sh=1", "cmd:sh=1",
     "alpine-baselayout=3.6.8-r99", "alpine-baselayout-data=3.6.8-r99",
@@ -143,7 +142,7 @@ def excluded(rel):
 
 
 def musl_excluded(rel):
-    """Paths owned by the real musl package (LEANDROS_LIBC=alpine) or left
+    """Paths owned by the real musl package or left
     unowned (/usr/lib/libc.so: a symlink a later `apk add musl-dev` may take)."""
     return (rel.startswith("lib/ld-musl-") or rel.startswith("lib/libc.musl-")
             or rel == "usr/lib/libc.so")

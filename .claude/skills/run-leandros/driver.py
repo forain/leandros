@@ -120,6 +120,30 @@ SERIAL_LOG   = f"/tmp/leandros{_TAG}-serial.log"
 # in SERIAL_LOG. Truncated at every start.
 SERIAL_FULL_LOG = f"/tmp/leandros{_TAG}-serial-full.log"
 QEMU_STDERR_LOG = f"/tmp/leandros{_TAG}-qemu-stderr.log"
+QEMU_TRACE_LOG = f"/tmp/leandros{_TAG}-qemu-trace.log"
+
+# Progress must be visible when the output is piped or captured: line-buffer
+# stdout/stderr regardless of how python was started (no `python3 -u` needed).
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+
+def ensure_trace_log(tokens, path=None):
+    """Host tracing (-d <items>, -trace ...) writes to stderr unless -D/file= is
+    given, flooding it. Append `-D <path>` when tracing is on and no log is set."""
+    tokens = list(tokens)
+    path = path or QEMU_TRACE_LOG
+    tracing = any(t == "-d" or t == "-trace" or t.startswith("-trace=") for t in tokens)
+    if not tracing or "-D" in tokens:
+        return tokens
+    # `-trace ...,file=X` already redirects trace-event output (but not -d).
+    if "-d" not in tokens and any("file=" in t for t in tokens):
+        return tokens
+    print(f"driver: host tracing on, adding -D {path}", flush=True)
+    return tokens + ["-D", path]
 
 
 _HARNESS_LOCK = None
@@ -1451,7 +1475,7 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
     # Permanent QMP socket (TODO item 18 gap 1). Skips adding a second -qmp
     # if extra_tokens already has one (see _prepare_qmp).
     qemu_cmd += _prepare_qmp(arch, extra_tokens)
-    qemu_cmd += extra_tokens
+    qemu_cmd += ensure_trace_log(qemu_cmd + extra_tokens)[len(qemu_cmd):]
     if mode in ("uefi", "uefi-hvf", "uefi-tcg"):
         vmnet = _socket_vmnet_prefix()
         if vmnet:

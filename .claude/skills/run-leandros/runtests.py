@@ -24,6 +24,7 @@ Options:
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             harness   host:harnesstest.py (line-buffering, auto -D on host tracing, quoted-command survival)
                              nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
@@ -388,6 +389,7 @@ SUITES = {
     "blkmany": ["host:blkmanytest.py"],
     # --features rpi5 kernel compile-check (cargo check, no boot; integ lanes run it).
     "rpi5check": ["host:rpi5checktest.py"],
+    "harness": ["host:harnesstest.py"],
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],

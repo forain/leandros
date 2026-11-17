@@ -95,7 +95,7 @@ sibling_dir() {
 # Install them once at a fixed path beside the checkouts and use that instead.
 TOOLS_DIR="$(cd "$ROOT_DIR/.." && pwd)/.leandros-tools"
 mkdir -p "$TOOLS_DIR"
-for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh "$ROOT_DIR"/scripts/musl-mem-obj.sh "$ROOT_DIR"/scripts/memset-*-musl.S "$ROOT_DIR"/scripts/memset-*.S; do
+for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh "$ROOT_DIR"/scripts/ar-musl.sh; do
     [[ -f "$_w" ]] || continue
     cmp -s "$_w" "$TOOLS_DIR/$(basename "$_w")" || { cp "$_w" "$TOOLS_DIR/.$$.tmp" && chmod +x "$TOOLS_DIR/.$$.tmp" && mv "$TOOLS_DIR/.$$.tmp" "$TOOLS_DIR/$(basename "$_w")"; }
 done
@@ -695,11 +695,9 @@ build_apk() {
     else
         "$port/build.sh" "$arch" || port_failed apk "$arch" "apk-tools staging; the image would ship without apk.static"
     fi
-    # LEANDROS_LIBC=alpine (default): the image's libc is the locked Alpine musl
-    # .apk; fail the build if its exported ABI drifted from the golden list.
-    if [[ "${LEANDROS_LIBC:-alpine}" == alpine ]]; then
-        "$ROOT_DIR/scripts/musl/alpine-parity.sh" "$arch" || exit 1
-    fi
+    # The image's libc is the locked Alpine musl .apk; fail the build if its
+    # exported ABI drifted from the golden list.
+    "$ROOT_DIR/scripts/musl/alpine-parity.sh" "$arch" || exit 1
 }
 
 # Function to build bottom
