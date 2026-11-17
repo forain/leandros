@@ -351,6 +351,18 @@ impl Screen {
 
             // Zero-width joiners/spaces and variation selectors take no cell
             // (the console drawing side skips them too: drivers::glyphs).
+            // A combining mark folds into the cell before the cursor when the
+            // pair has a precomposed form (the framebuffer draws those as base
+            // plus overlay); otherwise it is dropped. Never moves the cursor.
+            if let Some(m) = ch {
+                if crate::wcwidth::is_combining(m) && self.cur_col > 0
+                    && (self.cur_row as usize) < VT_ROWS && (self.cur_col as usize) <= VT_COLS {
+                    let i = self.cur_row as usize * VT_COLS + self.cur_col as usize - 1;
+                    if let Some(p) = crate::wcwidth::compose(self.cells[i] as u32, m) {
+                        self.cells[i] = (self.cells[i] & !0xFFFF_FFFF) | p as u64;
+                    }
+                }
+            }
             let ch = ch.filter(|&u| crate::wcwidth::width(u) != 0);
             if let Some(ch) = ch {
                 let w = crate::wcwidth::width(ch);
