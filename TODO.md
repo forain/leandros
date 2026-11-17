@@ -68,7 +68,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
 
 ### Toolchain / dev experience
-- **Box sibling `mame` is stale** (zigl6 2026-11-17): `leandros-siblings/mame` on the box is at the old `osd: add LeandrOS OSD port` commit whose `Makefile.leandros` still calls `zig c++` (box regress lists `mame` in `LEANDROS_OPTIONAL_PORTS`-style failure); update it from the Mac `../mame` master (after merging branch `zigl6`, which drops the `--image-base` workaround) before expecting a no-zig MAME build on the box. The box dynamic toolchain forwarders (`m6-session-bins`/`m3-gl-stack` `toolchain/`) point at a copy in `leandros-artifacts/dyn-canon/scripts/toolchain`: refresh it (`rsync scripts/toolchain/`, rerun `dyn/install.sh`) after toolchain changes.
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Unpushed sibling-repo fix**: `sync FILE` → fsync lives in `../coreutils` commit 24b9372 (main, ahead of origin by 1). Push it together with the next leandros push. The box's `leandros-siblings/coreutils` has the same diff only as an uncommitted change, so a reset there silently reverts `sync FILE` to a whole-system sync (the `syncfile` regress suite catches it).
 
