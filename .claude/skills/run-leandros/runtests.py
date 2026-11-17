@@ -28,6 +28,7 @@ Options:
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
+                             portalshot host:portalshottest.py alone (live COSMIC session: portal Screenshot returns response 0 and a non-empty PNG)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
@@ -99,6 +100,12 @@ sys.path.insert(0, HERE)
 os.chdir(REPO)
 import driver  # noqa: E402
 
+LONGLINE_CHECK = (
+    "__n=0; "
+    + "".join(f"__n=$((__n+1)); test {i} = {i} && : pad-pad-pad-pad-pad-pad; " for i in range(80))
+    + "echo \"longline: $__n steps: PASS\"; test $__n = 80"
+)
+
 SYSFS_CHECK = (
     "__f=0; "
     "t() { eval \"$2\" >/dev/null 2>&1 && echo \"sysfs: $1: PASS\" || { echo \"sysfs: $1: FAIL\"; __f=1; }; }; "
@@ -114,6 +121,12 @@ SYSFS_CHECK = (
     "t sys_drm_list 'ls /sys/class/drm | grep -qx card0 && ls /sys/class/drm | grep -qx renderD128 && ls /sys/class/drm | grep -q ^card0-'; "
     "t sys_char_list 'ls /sys/dev/char | grep -qx 226:0 && ls /sys/dev/char | grep -qx 226:128 && ls /sys/dev/char | grep -q ^13:'; "
     "t sys_drm_walk 'p=$(realpath /sys/dev/char/226:0/device) && grep -q ^PCI_SLOT_NAME= $p/uevent && grep -q ^PCI_ID= $p/uevent && test -s $p/vendor && test -s $p/device && test -s $p/subsystem_vendor && test -s $p/subsystem_device && readlink /sys/dev/char/226:0/device/subsystem | grep -q /bus/'; "
+    "t drm_char_is_link 'test -L /sys/dev/char/226:0 && test -L /sys/dev/char/226:128 && readlink /sys/dev/char/226:0 | grep -q ^../../devices/'; "
+    "t drm_char_realpath 'realpath /sys/dev/char/226:0 | grep -Eq \"^/sys/devices/(pci[0-9a-f:]+/[0-9a-f:.]+|platform/.+)/drm/card0$\" && realpath /sys/dev/char/226:128 | grep -q /drm/renderD128$'; "
+    "t drm_class_is_link 'readlink /sys/class/drm/card0 | grep -q ^../../devices/ && readlink /sys/class/drm/renderD128 | grep -q /drm/renderD128$ && test \"$(realpath /sys/class/drm/card0)\" = \"$(realpath /sys/dev/char/226:0)\"'; "
+    "t drm_card_links 'c=$(realpath /sys/dev/char/226:0) && test -L $c/device && test -L $c/subsystem && test \"$(readlink $c/subsystem | grep -c class/drm)\" = 1 && test \"$(realpath $c/subsystem)\" = /sys/class/drm && test \"$(realpath $c/device)\" = \"$(realpath /sys/dev/char/226:0/device)\" && grep -qx 226:0 $c/dev'; "
+    "t drm_parent_dev 'p=$(realpath /sys/dev/char/226:0/device) && case $p in /sys/devices/*) ;; *) exit 1;; esac && test -d $p/drm/card0 && test -d $p/drm/renderD128 && ls $p/drm | grep -qx card0 && ls $p/drm | grep -qx renderD128 && test -L $p/subsystem && readlink $p/subsystem | grep -Eq \"bus/(pci|platform)$\"'; "
+    "t drm_conn_under_card 'c=$(realpath /sys/dev/char/226:0) && grep -qx connected $c/card0-HDMI-A-1/status && test -d $c/card0-HDMI-A-1 && grep -q x $c/card0-HDMI-A-1/modes'; "
     "t sys_input_links 'test -L /sys/class/input/event0/device && test -L /sys/class/input/event0/subsystem && test -L /sys/class/input/input0/subsystem && test -L /sys/dev/char/13:64 && test \"$(readlink /sys/class/input/event0/subsystem)\" = ../../../class/input && test \"$(readlink /sys/class/input/event0/device)\" = ../input0 && test -d /sys/class/input/event0/subsystem && grep -q Keyboard /sys/dev/char/13:64/device/name && ls -F /sys/class/input/event0 | grep -q device@ && ls -F /sys/dev/char | grep -q ^13:64@'; "
     "t input_class 'test -d /sys/class/input/event0 && test -d /sys/class/input/event1 && test -d /sys/class/input/input0'; "
     "t input_uevent 'grep -q DEVNAME=input/event1 /sys/class/input/event1/uevent && grep -q MAJOR=13 /sys/class/input/event0/uevent'; "
@@ -146,13 +159,13 @@ SYNCFILE_CHECK = (
 
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
-                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
+                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/execdev", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", SYSFS_CHECK,
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
-                SYNCFILE_CHECK,
+                SYNCFILE_CHECK, LONGLINE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
@@ -249,6 +262,8 @@ SUITES = {
                 "host:vkwltest.py",
                 # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
                 "host:blanktest.py",
+                # xdg-desktop-portal Screenshot in a live COSMIC session: response 0 + non-empty PNG (lane portalreg; own boot).
+                "host:portalshottest.py",
                 # pid-ns zap timeout log + recovery via the pidns.zaptest=1 hook (own boot).
                 "host:pidnszaptest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
@@ -340,6 +355,7 @@ SUITES = {
     "f2fsgc": ["host:f2fsgctest.py"],
     "a64acpi": ["host:a64acpitest.py"],
     "blank": ["host:blanktest.py"],
+    "portalshot": ["host:portalshottest.py"],
     "blkhang": ["host:blkhangtest.py"],
     "espreset": ["host:espresettest.py"],
     "evbtn": ["host:evbtntest.py"],
@@ -359,6 +375,11 @@ SUITES = {
     "uartgap": ["host:uartgaptest.py"],
     "usbstall": ["host:usbstalltest.py"],
     "usbunplug": ["host:usbunplugtest.py"],
+    # slow group: each boots its own VM and takes 2-6 min (too slow for regress,
+    # which stays ~10 min); gate with `--suite slow` (box: regress2.sh <ref> <arch> --suite slow).
+    # Per-suite timeouts live in HOST_TIMEOUTS.
+    "slow": ["host:f2fsorphantest.py", "host:f2fscptest.py", "host:f2fscrashtest.py",
+             "host:pagecache-crashtest.py", "host:usbunplugtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -431,6 +452,9 @@ SUITES = {
     # identity libdrm/udev consumers read (lane sysfs).
     "sysfs": [SYSFS_CHECK],
     "syncfile": [SYNCFILE_CHECK],
+    # Harness guard: a 4 KB typed line must reach the shell intact (brush
+    # repaints the whole line per burst; lane sysfshang). 120 checks of 30 chars.
+    "longline": [LONGLINE_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
@@ -444,7 +468,8 @@ SUITES = {
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
 HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
-                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900}
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
+                 "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
 
 def find_fails(out):

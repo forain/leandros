@@ -2,7 +2,7 @@
 # Build espctl, the ESP and kernel-slot tool -- static musl, one arch per
 # invocation: ./build.sh aarch64 | ./build.sh x86_64
 #
-# Same recipe as userland/sshd/build.sh (pinned nightly, zig-cc linker wrapper,
+# Same recipe as userland/sshd/build.sh (pinned nightly, clang/lld linker wrapper,
 # link-self-contained=no, relocation-model=static => ET_EXEC). No C deps, but
 # the cc/ar wrappers are kept so a future one cannot reach for the host tools.
 set -euo pipefail

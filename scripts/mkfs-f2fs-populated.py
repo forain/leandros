@@ -479,7 +479,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "ip6test", "netlinktest", "nfttest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "ec2init", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "inotifytest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "exitracetest", "exitwrap", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest", "w", "users", "lastlog", "utmptest",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "execdev", "chroottest", "nstest", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "inotifytest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "exitracetest", "exitwrap", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest", "w", "users", "lastlog", "utmptest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -1108,46 +1108,53 @@ def main():
               "/sys/fs", "/sys/fs/cgroup"):
         m4_share_dirs.add(d)
 
+    # Linux-shaped DRM tree: the PCI (or platform) device owns real
+    # `drm/<node>` directories under /sys/devices; /sys/class/drm/<node> and
+    # /sys/dev/char/226:<minor> are symlinks into them, and each node has
+    # `device` (-> the parent device) and `subsystem` (-> class/drm) links, so a
+    # realpath()/readlink walk (libdrm, udev, drm-rs) resolves as on Linux.
+    _rpi5 = os.environ.get("LEANDROS_BOARD") == "rpi5"
+    if _rpi5:
+        _devdir = "/sys/devices/platform/axi/2000000.v3d"
+        _dev_to_sys = "../../../.."          # device dir -> /sys
+        _devparents = ("/sys/devices", "/sys/devices/platform", "/sys/devices/platform/axi")
+    else:
+        _devdir = f"/sys/devices/pci0000:00/{PCI_SLOT_NAME}"
+        _dev_to_sys = "../../.."
+        _devparents = ("/sys/devices", "/sys/devices/pci0000:00")
+    _devrel = _devdir[len("/sys"):]          # /devices/...
+    for d in ("/sys/dev", "/sys/dev/char") + _devparents + (_devdir, _devdir + "/drm"):
+        m4_share_dirs.add(d)
+    if _rpi5:
+        # Raspberry Pi 5: the DRM device is the V3D 7.1 platform device
+        # (DT /axi/v3d@2000000). libdrm's drmGetDevices2 classifies it from
+        # the `subsystem` link name and reads OF_FULLNAME + OF_COMPATIBLE_*
+        # from uevent; v3dv only accepts DRM_BUS_PLATFORM devices, and
+        # Mesa's GL loader falls back to DRM_IOCTL_VERSION ("v3d") only
+        # when there is no PCI id. The PCI virtio identity would send
+        # GL to virtio_gpu and hide the GPU from Vulkan.
+        _sysfs_attr(_devdir, "subsystem", _dev_to_sys + "/bus/platform", 0o120777)
+        _sysfs_attr(_devdir, "uevent", RPI5_V3D_UEVENT)
+    else:
+        _sysfs_attr(_devdir, "subsystem", _dev_to_sys + "/bus/pci", 0o120777)
+        _sysfs_attr(_devdir, "uevent",           _uevent)
+        _sysfs_attr(_devdir, "vendor",           f"0x{PCI_VENDOR:04x}\n")
+        _sysfs_attr(_devdir, "device",           f"0x{PCI_DEVICE:04x}\n")
+        _sysfs_attr(_devdir, "subsystem_vendor", f"0x{PCI_SUBVENDOR:04x}\n")
+        _sysfs_attr(_devdir, "subsystem_device", f"0x{PCI_SUBDEVICE:04x}\n")
+        _sysfs_attr(_devdir, "revision",         f"0x{PCI_REVISION:02x}\n")
+        _sysfs_attr(_devdir, "class",            f"0x{PCI_CLASS:06x}\n")
+        _sysfs_attr(_devdir, "config",           bytes(_cfg))
     for _minor, _node in ((0, "card0"), (128, "renderD128")):
-        _base = f"/sys/dev/char/{DRM_MAJOR}:{_minor}"
-        _dev  = _base + "/device"
-        # `device/drm/<node>` holds only THIS node's directory. Linux would list
-        # both siblings there, but drm-rs's node_with_type() enumerates that
-        # directory to find a peer node, and the compositor path that uses it is
-        # the most fragile thing in the tree — listing only the node that owns
-        # the char device keeps card0's discovery byte-identical to before.
-        for d in ("/sys/dev", "/sys/dev/char", _base, _dev,
-                  _dev + "/drm", _dev + "/drm/" + _node):
-            m4_share_dirs.add(d)
-        # Node-level identity (Linux: the drm minor's own uevent) and the
-        # /sys/class/drm/<node> entry. These are NEW paths: nothing libdrm or
-        # drm-rs stats today (device/*, device/drm, device/subsystem) moves.
-        _sysfs_attr(_base, "uevent",
+        _nd = f"{_devdir}/drm/{_node}"
+        m4_share_dirs.add(_nd)
+        _sysfs_attr(_nd, "uevent",
                     f"MAJOR={DRM_MAJOR}\nMINOR={_minor}\nDEVNAME=dri/{_node}\nDEVTYPE=drm_minor\n")
-        _sysfs_attr(_base, "subsystem", "../../../class/drm", 0o120777)
-        _sysfs_attr("/sys/class/drm", _node, f"../../dev/char/{DRM_MAJOR}:{_minor}", 0o120777)
-        # `../../../../bus/pci`: from /sys/dev/char/<maj>:<min>/device, four
-        # levels up is /sys. Only the trailing "/pci" is ever inspected.
-        if os.environ.get("LEANDROS_BOARD") == "rpi5":
-            # Raspberry Pi 5: the DRM device is the V3D 7.1 platform device
-            # (DT /axi/v3d@2000000). libdrm's drmGetDevices2 classifies it from
-            # the `subsystem` link name and reads OF_FULLNAME + OF_COMPATIBLE_*
-            # from uevent; v3dv only accepts DRM_BUS_PLATFORM devices, and
-            # Mesa's GL loader falls back to DRM_IOCTL_VERSION ("v3d") only
-            # when there is no PCI id. The PCI virtio identity below would send
-            # GL to virtio_gpu and hide the GPU from Vulkan.
-            _sysfs_attr(_dev, "subsystem", "../../../../bus/platform", 0o120777)
-            _sysfs_attr(_dev, "uevent", RPI5_V3D_UEVENT)
-            continue
-        _sysfs_attr(_dev, "subsystem", "../../../../bus/pci", 0o120777)
-        _sysfs_attr(_dev, "uevent",           _uevent)
-        _sysfs_attr(_dev, "vendor",           f"0x{PCI_VENDOR:04x}\n")
-        _sysfs_attr(_dev, "device",           f"0x{PCI_DEVICE:04x}\n")
-        _sysfs_attr(_dev, "subsystem_vendor", f"0x{PCI_SUBVENDOR:04x}\n")
-        _sysfs_attr(_dev, "subsystem_device", f"0x{PCI_SUBDEVICE:04x}\n")
-        _sysfs_attr(_dev, "revision",         f"0x{PCI_REVISION:02x}\n")
-        _sysfs_attr(_dev, "class",            f"0x{PCI_CLASS:06x}\n")
-        _sysfs_attr(_dev, "config",           bytes(_cfg))
+        _sysfs_attr(_nd, "dev", f"{DRM_MAJOR}:{_minor}\n")
+        _sysfs_attr(_nd, "device", "../..", 0o120777)
+        _sysfs_attr(_nd, "subsystem", "../../" + _dev_to_sys + "/class/drm", 0o120777)
+        _sysfs_attr("/sys/class/drm", _node, f"../..{_devrel}/drm/{_node}", 0o120777)
+        _sysfs_attr("/sys/dev/char", f"{DRM_MAJOR}:{_minor}", f"../..{_devrel}/drm/{_node}", 0o120777)
 
     # /sys/class/input and /sys/dev/char/13:* are NOT staged: the vfs
     # synthesizes them from the live evdev registry (servers/vfs/src/sysinput.rs),

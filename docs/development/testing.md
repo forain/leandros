@@ -117,6 +117,8 @@ Known flakes (re-run once under the lock before investigating): the `nettag2test
 
 The graphical session has its own tests
 
+`portalshottest.py <arch> [tag]` (suite `portalshot`, also in `regress`) boots the same session, then as `leandro` runs `leandros-sysbus portal screenshot 90`: it grants the PermissionStore "screenshot" permission (otherwise the portal waits on an Access dialog nobody answers) and requires Screenshot response 0 and a non-empty PNG. About 1.5 min per arch.
+
 The graphical session has its own tests outside `runtests.py`, because `regress` boots without a compositor. `blanktest.py <arch> [tag]` boots a GPU session (`ffsession.py --nofirefox`) and runs `/bin/blanktest` against cosmic-comp. The test powers every output off and checks four things: frame callbacks keep coming at about 1/s, a window mapped while the outputs are off gets its first callback, an idle inhibitor on such a window does not resume idle, and the compositor leaves the outputs off ([ports/cosmic-comp](../../ports/cosmic-comp/README.md)).
 
 A command `host:<script> [args]` runs a script from the skill directory on the host. Output goes to `$FFSESSION_OUT/tests-<tag>/` (default `/tmp/ffsession`): every command's output, the serial log, QEMU's full serial log and `summary.json`; the exit status is 0 only if every command returned 0 with a known status.
