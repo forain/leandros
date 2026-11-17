@@ -14,7 +14,7 @@ which targets exist, how far each one gets, and the drivers behind them.
 | AArch64 (QEMU raspi4b) | BCM2711 board model, `--raspi4b` | SDHCI and mailbox test path only |
 | Raspberry Pi 5 | RPi firmware flat-image load + BCM2712 DTB (`--rpi5`), or RPi UEFI + Limine | Boot-ready: serial console, F2FS root on the SD card, shell prompt |
 | x86-64 real PC (UEFI) | Limine UEFI from a USB stick | Root on the stick, USB keyboard/mouse, Realtek Ethernet, Intel HD Audio; NVIDIA RTX 3070 boots GSP-RM and renders through NVK/Zink, so COSMIC and Firefox run |
-| AWS EC2 (Nitro, x86_64 and Graviton) | Limine UEFI from an EBS AMI | Image and AMI tooling only ([aws-ec2.md](aws-ec2.md)); ENA, EBS quirks, IMDS pending |
+| AWS EC2 (Nitro, x86_64 and Graviton) | Limine UEFI from an EBS AMI | Image and AMI tooling, EBS NVMe quirks, the ENA driver (mock-tested, LLQ, MSI-X) and IMDS first-boot setup; unproven on a real instance ([aws-ec2.md](aws-ec2.md)) |
 | x86-64 laptop (HP EliteBook 840 G5, all Intel) | Limine UEFI from a USB stick | Root on the stick, i915 with iris/ANV so COSMIC runs, Wi-Fi, Bluetooth, e1000e, ACPI battery/AC/backlight, I2C touchpad, webcam, microphone; external outputs opt-in; S3 unresolved |
 
 Every change must be tested on **both** architectures — cross-platform parity is a project invariant,

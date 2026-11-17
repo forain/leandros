@@ -58,8 +58,9 @@ emulation`). After Homebrew moved to 11.1.1, every aarch64 boot on a Mac died th
 — silently, with an empty serial log, because the error goes to QEMU's stderr. The kernel was taught
 to drive **GICv3 as well as GICv2**, detecting which at `init` (`9063303`, 2026-09-14), and every
 launcher now passes `gic-version=3` on every host. The port was small because only four interrupt IDs
-are in use on `virt` (two PPIs for timers, one SGI for rescheduling, one SPI); virtio devices are
-polled and there is no MSI on aarch64, so no ITS is needed.
+are in use on `virt` (two PPIs for timers, one SGI for rescheduling, one SPI); virtio devices were
+polled and there was no MSI on aarch64, so no ITS was needed. (An ITS driver was added later for
+the EC2 work, below.)
 
 Detection traps, measured and not worth retrying:
 
@@ -123,7 +124,7 @@ the drivers accept either device ID.
 The block, network, input, sound and entropy drivers poll their queues and set the PCI command
 register's **Interrupt Disable** bit. A device whose ISR status is never read holds its INTx line
 asserted forever, and on `virt` the four shared PCIe INTx lines would then storm the virtio-gpu
-completion interrupt. Only the GPU takes interrupts (MSI-X on x86_64, a shared INTx line on aarch64). The rationale and the generic interrupt
+completion interrupt. Only the GPU takes interrupts (MSI-X on x86_64, a shared INTx line on aarch64). Since lane a64its, aarch64 virtio-net and NVMe (opt-in `nvme.msix=1`) can take MSI-X through the GICv3 ITS (see [drivers.md](drivers.md#interrupts)) on QEMU TCG; HVF has no ITS. The rationale and the generic interrupt
 API are in [drivers.md](drivers.md#interrupts).
 
 ### Entropy

@@ -73,7 +73,7 @@ Each connection is then split into a root monitor and an unprivileged, chrooted,
 `LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
 the session id, and every publickey/certificate login has its raw signature re-verified
 against that session id (`src/userauth.rs`) before the authorized_keys check. SHA-1 `ssh-rsa` publickey signatures are refused (as OpenSSH 8.8+ does by default); use `rsa-sha2-256`/`rsa-sha2-512`. This is the
-groundwork for splitting the pre-auth code into an unprivileged child.
+reason the monitor can trust the unprivileged child: it cannot vouch for a login the client never signed.
 
 - **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
   `/etc/ssh/sshd_not_to_be_run` exists or the kernel command line has `sshd=0`. It runs in
@@ -83,9 +83,12 @@ groundwork for splitting the pre-auth code into an unprivileged child.
   `sshd-net` after. The listener enforces `MaxStartups` (a connection counts until its
   process writes to the startup pipe or exits) and kills a process still unauthenticated 2 s
   after `LoginGraceTime`, even if it is hung. Children do not inherit the listener's fds
-  (fds 3/4 are close-on-exec in the child so shells do not get them).
-- **Listening.** `0.0.0.0:22`. It also tries `[::]:22`, which fails with `EAFNOSUPPORT`
-  because there is no IPv6 yet; it logs that and goes on.
+  (fds 3/4 are close-on-exec in the child so shells do not get them); the monitor and child
+  also close every other inherited descriptor with `close_range`, and a stalled monitor is
+  backstopped by the listener (measured about 5-6 MB RSS per connection, monitor plus net child;
+  details in [../design/sshd-privsep.md](../design/sshd-privsep.md)).
+- **Listening.** `0.0.0.0:22` and `[::]:22`. IPv6 sockets are dual-stack unless `IPV6_V6ONLY` is
+  set, so the second listener is attempted too and a failure there is only logged.
 - **Host key.** An ed25519 key is generated on first boot into
   `/etc/ssh/ssh_host_ed25519_key` (0600, plus `.pub`) and reused afterwards.
 - **Configuration.** `/etc/ssh/sshd_config` uses an OpenSSH keyword subset: `Port`,
@@ -186,7 +189,7 @@ leandros-libc.
 
 | Program | Source | Notes |
 |---|---|---|
-| coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `id`, `env`, …) | [uutils/coreutils](https://github.com/uutils/coreutils), sibling `../coreutils` | One static musl multicall binary built with upstream's `feat_os_unix_musl` set (which drops `stdbuf`, the one utility that needs a cdylib); every command name is a hardlink, the list derived from the checkout's `Cargo.toml` and `src/uu`. Also installed as `/usr/bin/env`. |
+| coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `id`, `env`, …) | [uutils/coreutils](https://github.com/uutils/coreutils), sibling `../coreutils` | One static musl multicall binary built with upstream's `feat_os_unix_musl` set (which drops `stdbuf`, the one utility that needs a cdylib); every command name is a hardlink, the list derived from the checkout's `Cargo.toml` and `src/uu`. Also installed as `/usr/bin/env`. `sync FILE` fsyncs just that file (a local patch in the sibling checkout; upstream's whole-system `sync` made fsync-heavy scripts pay for a full checkpoint), guarded by the `syncfile` suite. |
 | `btm` / `bottom` | sibling `../bottom-leandros` | system monitor, static musl |
 | `mkfs.fat`, `mkfs.xfs` | [ports/mkfs-fat](../../ports/mkfs-fat/), [ports/mkfs-xfs](../../ports/mkfs-xfs/README.md) | in-tree Rust formatters for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
 | `disktester` | sibling `../disks-rs` | AerynOS's provisioning tester, unmodified |

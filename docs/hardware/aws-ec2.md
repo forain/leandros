@@ -1,9 +1,16 @@
 # AWS EC2
 
-Status: **image and AMI tooling only**. The disk image boots in QEMU as a plain UEFI NVMe disk on
-both architectures. The EC2-specific kernel pieces (ENA network driver, Amazon EBS NVMe quirks,
-Nitro platform without PIT/i8042/VGA, ACPI-only aarch64 boot, IMDS first-boot) are separate work
-items and no real EC2 instance has been booted yet. The design is in `orch/designs/design-ec2.md`.
+Status: **image and AMI tooling, plus the EC2-specific kernel pieces, all verified in QEMU or against a
+mock device only; no real EC2 instance has been booted yet** (the gated real-instance runs need AWS
+credentials and explicit approval). Done: the disk image boots as a plain UEFI NVMe disk on both
+architectures; Amazon EBS NVMe quirks; the ENA network driver with LLQ and MSI-X (mock device);
+Nitro x86_64 timing without a PIT (PIT-absent detection, kvmclock-derived TSC rate, APIC timer
+calibration, the `nitrox86` suite); ACPI-only aarch64 boot (`acpi=force`, `a64acpitest`); aarch64
+MSI/MSI-X through the GICv3 ITS; and IMDSv2 first-boot setup (`ec2init`, see
+[programs.md](../userland/programs.md#ec2init-ec2-first-boot)). Still open: proof of the ENA/LLQ
+register layouts on a real instance (they were written from the public headers, and the mock encodes
+the same reading), real EBS verification (QEMU cannot set the EBS model string), and PCI segments
+other than the first ECAM one. The design is in `orch/designs/design-ec2.md`.
 
 ## Building the image
 
@@ -75,9 +82,9 @@ and that vector). The ISR only counts and wakes the network daemon; the device m
 firing, and the daemon's `rx_rearm` unmasks it through the CQ's interrupt-unmask register (bit 30)
 after draining the ring, then re-checks for frames that slipped in (NAPI style). Polling remains the
 fallback: `ena.msix=0`, no MSI-X capability or fewer than two entries, the device refusing an
-interrupt-mode CQ or giving no unmask register (the bring-up is redone polled), and aarch64 until the
-GICv3 ITS lane lands (`MsixTable::enable` returns `Unsupported`; the same code lights up once it
-succeeds). The boot log prints `[ena] MSI-X active: ...` or `polled completions (...)`;
+interrupt-mode CQ or giving no unmask register (the bring-up is redone polled), and aarch64 where the GICv3 ITS
+is unavailable (`MsixTable::enable` returns `Unsupported`). With the ITS (lane a64its, verified on
+QEMU TCG only) the same code takes the vectors as LPIs, subject to the driver's own gate. The boot log prints `[ena] MSI-X active: ...` or `polled completions (...)`;
 `/proc/net/nic` shows `irq_mode`, `irqs_mgmt` and `irqs_io`. Verified on the mock only, like the rest
 of the driver (`drivers/ena-tests`: vector assignment, unmask doorbells, completion-driven wakeups,
 10k-frame loopback without a lost wakeup, both fallbacks, reset recovery).

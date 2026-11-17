@@ -102,8 +102,13 @@ Drivers that do need interrupts use [irq.rs](../../drivers/src/irq.rs):
   `MsixTable::request`; messages target the BSP with fixed delivery, edge-triggered. Legacy INTx is not
   routed on x86_64 (there is no ACPI `_PRT` parser).
 - **aarch64**: interrupts are GIC INTIDs. A line can have up to four sharers (for shared PCI INTx), is
-  enabled level-triggered, and is reached through the GIC dispatcher's fallback. MSI needs a GICv3
-  ITS, which is not driven yet, so `request_msi` returns `Unsupported` there.
+  enabled level-triggered, and is reached through the GIC dispatcher's fallback. MSI/MSI-X go through the GICv3
+  **ITS** (lane a64its): the kernel builds the command queue and device/collection tables, maps the
+  function's requester ID to a DeviceID through the ACPI IORT, and delivers each vector as an LPI.
+  virtio-net and NVMe (`nvme.msix=1`) use it, `/proc/interrupts` lists the LPI counts, and
+  `gic.its=0` turns it off. Limits: a flat device table (DeviceID below 65536), delivery to the BSP
+  only, IORT SMMU chains are not followed, and HVF refuses an ITS so the Mac stays on INTx. Real
+  Graviton is unverified. Without an ITS `request_msi` returns `Unsupported` and drivers poll.
 - **Handler contract**: handlers run in hard-IRQ context with interrupts masked on whatever task was
   interrupted. They must not sleep; they may take `KSpinLock`s, wake waiters, queue work items, and
   allocate from the atomic pool. A level-triggered handler must quiesce its device before returning. A
@@ -203,7 +208,7 @@ and is a loadable module on the kernel-owned Wi-Fi radio class (`kmodwifi`, see 
 The real Wi-Fi driver is `iwlwifi` in the `drivers` crate: Intel's 8265 (the laptop) as `wifi0`, with
 WPA2, scanning, roaming and the connection manager that `/dev/netctl` and the NetworkManager shim drive
 ([servers/netctl.md](../servers/netctl.md)). In QEMU, `wifi_sim` stands in for the radio and an access
-point, running the same station-side code paths. The Pi 5's SDIO Wi-Fi is untouched.
+point, running the same station-side code paths. WPA3-Personal (SAE with P-256, hunt-and-peck and hash-to-element, anti-clogging, a PMKSA cache), 802.11w protected management frames (BIP-CMAC, SA Query), WPA3 transition fallback and roaming are implemented in the connection manager and run against `wifi_sim`'s SAE/MFP access points; the real radios (iwlwifi and the Pi 5's brcmf) do not yet report the `SAE`/`PMF`/`ROAM` capabilities, because firmware key install for BIP/IGTK and SAE authentication frames are not done, so WPA3 is unverified against a real AP. On 2.4 GHz the 8265 may use HT40 with the 20/40 coexistence rules (the AP must offer it and no 40 MHz-intolerant BSS may be seen in the span; `iwlwifi.ht40_24=0` disables it).
 
 ### Wi-Fi: QoS, HT and Block Ack
 
