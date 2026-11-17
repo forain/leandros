@@ -173,7 +173,8 @@ def launch_firefox(n_brush0):
     (x86_64 KVM + virgl: the window maps seconds after the cosmic-term
     process exists; the run then sat at "brush$  /tm" for 9 min with no
     Firefox). So: wait for the terminal's shell, type, confirm /tmp/ff.log
-    exists; if not, record a task dump + screenshot and retype the line."""
+    exists; if not, record a task dump + screenshot and retype the line.
+    Both outcomes also save a Ctrl-T baseline and a session-log summary."""
     if n_brush0 is not None:
         wait_for("term_shell", lambda: brush_count() > n_brush0, 60 * SCALE)
         SER.pump(2 * SCALE)
@@ -185,11 +186,14 @@ def launch_firefox(n_brush0):
             SER.pump(5)
             if "FFLOG2" in sh("[ -e /tmp/ff.log ] && echo FFLOG$((1 + 1))", 30):
                 STEPS["ff_retypes"] = n
+                ctrl_t("launch-ok-ctrlt")
+                session_diag("launch-ok-slog")
                 return
         log(f"LAUNCH LOST: /tmp/ff.log missing {30 * SCALE:.0f}s after typing (try {n})")
         drv("screenshot", f"{OUT}/launch-lost-{n}.ppm", t=90)
         if n == 0:
             ctrl_t("launch-lost-ctrlt")
+            session_diag("launch-lost-slog")
         key("ctrl-u")    # clear whatever part of the line arrived
     STEPS["ff_retypes"] = "failed"
 
@@ -384,6 +388,21 @@ def ctrl_t(name):
         if b"run queue busy" not in got or b"[TASKS] pid=" in got:
             break
     open(f"{OUT}/{name}.txt", "wb").write(SER.buf[m:])
+
+
+def session_diag(name):
+    """Save a focus/keystroke summary of the COSMIC session log to OUT/<name>.txt."""
+    c = ("L=/tmp/cosmic-session-1000.log; echo bytes=$(wc -c <$L); "
+         "for p in 'Handling keystroke' 'Input forwarded to client' "
+         "'No client currently focused' 'Input was intercepted by filter' "
+         "'Focus set to new surface' 'Focus unset' 'Focus unchanged' "
+         "'focus fixup' 'Restoring focus'; do "
+         "echo \"$p=$(grep -c \"$p\" $L)\"; done; "
+         "grep -E 'Focus set|Focus unset|focus fixup|Restoring focus|Focusing window' $L | tail -n 20 | cut -c1-300; "
+         "echo ---warn; "
+         "grep -iE 'warn|error|panic' $L | grep -v 'Handling keystroke' | tail -n 40 | cut -c1-300; "
+         "echo ---tail; tail -n 25 $L | cut -c1-300")
+    open(f"{OUT}/{name}.txt", "w").write(sh(c, 90))
 
 
 def main():
