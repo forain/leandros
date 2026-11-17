@@ -6,7 +6,7 @@
  * an attached program is ENFORCED on device open and mknod for tasks in the
  * cgroup, and only for them.
  * Output: "<name>: PASS|FAIL ..." per case and a summary line.
- * Builds for the host (cc) and LeandrOS (zig cc -target <arch>-linux-musl -static).
+ * Builds for the host (cc) and LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  */
 #define _GNU_SOURCE
 #include <errno.h>

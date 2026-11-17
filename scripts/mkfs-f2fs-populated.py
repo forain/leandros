@@ -567,7 +567,8 @@ def main():
         bin_files.append(("btm", p, 0o100755))
         bin_files.append(("bottom", p, 0o100755))
 
-    p = f"../mame/mame-{arch}"
+    mame_dir = os.environ.get("LEANDROS_MAME_DIR", "../mame")
+    p = f"{mame_dir}/mame-{arch}"
     if os.path.exists(p):
         bin_files.append(("mame", p, 0o100755))
 
@@ -610,7 +611,7 @@ def main():
     # MAME ROM sets as zips in / — run with `mame -rompath / <game>`.
     # A zip sidesteps this script's flat directory model (no nested
     # /roms/<game>/ dirs needed); MAME's util/unzip.cpp reads it directly.
-    p = "../mame/roms/captcomm.zip"
+    p = f"{os.environ.get('LEANDROS_MAME_DIR', '../mame')}/roms/captcomm.zip"
     if os.path.exists(p):
         root_files.append(("captcomm.zip", p, 0o100644))
 
@@ -846,7 +847,7 @@ def main():
     for so in ("libEGL.so.1", "libGLESv2.so.2", "libgbm.so.1", "libdrm.so.2",
                "libgallium-25.3.6.so", "libexpat.so.1", "libz.so.1",
                # New DT_NEEDEDs of the virgl-enabled megadriver. The previous
-               # softpipe-only build (zig cross-musl) needed only z/expat/drm;
+               # softpipe-only build (cross-musl) needed only z/expat/drm;
                # the Alpine-native build that adds virgl pulls in zstd for its
                # shader cache and the C++ runtime that gallium's C++ sources
                # require. Missing them is not a soft failure: the Mesa loader
@@ -915,7 +916,7 @@ def main():
     # wired into the normal build via scripts/build-all.sh. Prefer that fresh
     # output over the m4-input-ship blob so a tracked-source edit can never
     # again be silently absent from the image; fall back to the blob if the
-    # shim wasn't rebuilt this run (e.g. zig unavailable). The other libraries
+    # shim wasn't rebuilt this run (e.g. toolchain unavailable). The other libraries
     # here (libxkbcommon, libinput, ...) are upstream C, not built from this
     # repo, and always come from the blob.
     shim_build_dir = f"target/input-stack-sysroot/{arch}/usr/lib"
@@ -927,7 +928,7 @@ def main():
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
         elif so in ("libseat.so.1", "libudev.so.1"):
-            _image_missing(f"{so} (neither {built} nor {p}; run ports/input-stack/build-shims.sh, needs zig)")
+            _image_missing(f"{so} (neither {built} nor {p}; run ports/input-stack/build-shims.sh, needs the clang toolchain)")
     # Recursively enumerate the /usr/share data tree. m4_share_files holds
     # (image_dir_abspath, name, hostpath); m4_share_dirs holds every directory
     # (and its ancestors down to /usr/share) that must be created. Directory
@@ -1243,7 +1244,7 @@ def main():
         _nvk_staged.append(f"/bin/nvgltest ({os.path.getsize(_nvgltest)} bytes)")
     # i915gltest — deterministic 3D on the real i915 (lane gpuctx); init
     # runs it after `i915test coh` for i915.autotest=1.
-    # Built by ports/nvk-tests/build-i915gltest.sh (zig cc, no container).
+    # Built by ports/nvk-tests/build-i915gltest.sh (clang musl wrapper, no container).
     _i915gl = os.path.join(_nvkt_art, "i915gltest", f"stage-{arch}", "i915gltest")
     if os.path.isfile(_i915gl) and os.path.exists(f"{gpu_lib_dir}/libEGL.so.1"):
         bin_files.append(("i915gltest", _i915gl, 0o100755))

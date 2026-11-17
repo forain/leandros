@@ -1,5 +1,5 @@
 /*
- * idmaptest -- user-namespace uid/gid map behaviour. Static zig-cc build,
+ * idmaptest -- user-namespace uid/gid map behaviour. Static clang-musl build,
  * runs as root; each case prints "case: PASS|FAIL|SKIP". Non-identity map
  * cases SKIP when the map write returns EPERM (kernel booted without
  * idmap=off) and must PASS by default. Lanes append cases as separate functions.

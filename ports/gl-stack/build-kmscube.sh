@@ -1,7 +1,7 @@
 #!/bin/sh
 # Rung 1: build kmscube (GLES2-over-GBM + legacy KMS) as a DYNAMIC musl ELF.
-# Compile .c with the zig-cc musl wrapper; LINK with musl-dyn-link.sh (zig ld.lld
-# -pie) so we get ET_DYN + PT_INTERP against our merged Mesa sysroot (NOT zig cc,
+# Compile .c with the clang musl wrapper; LINK with musl-dyn-link.sh (ld.lld
+# -pie) so we get ET_DYN + PT_INTERP against our merged Mesa sysroot (NOT the cc driver,
 # which would emit ET_EXEC / static — see musl-dynamic NOTES landmine 1).
 # Usage: build-kmscube.sh <x86_64|aarch64>
 set -e
@@ -19,7 +19,7 @@ drm-legacy.c drm-offscreen.c esTransform.c frame-512x512-NV12.c frame-512x512-RG
 kmscube.c perfcntrs.c cube-shadertoy.c"
 
 CFLAGS="-O2 -fPIC -fno-sanitize=all -std=gnu99 -DHAVE_GLES3 -Wno-unused-parameter"
-# Mesa/EGL/GLES/gbm/drm headers from the merged sysroot (explicit -I, zig supplies libc headers)
+# Mesa/EGL/GLES/gbm/drm headers from the merged sysroot (explicit -I; the wrapper supplies libc headers)
 INCS="-I$S/usr/include -I$S/usr/include/libdrm"
 
 objs=""

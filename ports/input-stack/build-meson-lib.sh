@@ -1,6 +1,6 @@
 #!/bin/sh
 # Generic meson cross-build into the merged m3 sysroot (installs .so + headers + .pc).
-# Produces dynamic .so via zig cc (shared-lib path is fine; only *executables* need the
+# Produces dynamic .so via the clang wrapper (shared-lib path is fine; only *executables* need the
 # musl-dyn-link.sh workaround). Usage: build-meson-lib.sh <component> <arch>
 set -e
 D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack

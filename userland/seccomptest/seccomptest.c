@@ -1,7 +1,6 @@
 /*
  * seccomptest — seccomp(2) / prctl(PR_*_SECCOMP) behaviour, with the results
- * Linux gives. Builds for the host (cc) and LeandrOS (zig cc -target
- * <arch>-linux-musl -static).
+ * Linux gives. Builds for the host (cc) and LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  *
  * Group S1 (historic; the kernel now installs filters, see the S3 cases below):
  *   get_seccomp_disabled   PR_GET_SECCOMP == 0

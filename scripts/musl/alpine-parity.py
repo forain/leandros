@@ -6,7 +6,7 @@ loader against the golden list scripts/musl/alpine-parity.<arch>.golden.
 
 --update rewrites the golden list from the pinned Alpine libc (or from the
 --against file); --against compares an arbitrary libc.so instead (used to prove
-the golden list equals our zig-linked libc). Host-only, stdlib only. Exits 1 on
+the golden list equals a known-good libc). Host-only, stdlib only. Exits 1 on
 any drift.
 """
 import os

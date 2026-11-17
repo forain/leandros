@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # musl-dyn-cc.sh <aarch64|x86_64> <c|c++> args...  -- clang for the DYNAMIC musl world (COSMIC/GL stack).
-# Replaces the old `zig cc -target <a>-linux-musl` wrappers in $ART/{m3-gl-stack,m6-session-bins}/toolchain.
+# Dynamic-musl cc/c++ wrappers installed (as forwarders) into $ART/{m3-gl-stack,m6-session-bins}/toolchain.
 # Compile/link against the merged m3 sysroot (libc.so, crt*.o, GL stack); the L0 sysroot only supplies the
 # Linux UAPI headers (linux/, asm*/), compiler-rt builtins and libc++ headers, placed AFTER the m3 dirs.
 # Default link is clang's dynamic PIE (PT_INTERP /lib/ld-musl-<arch>.so.1); the static world uses scripts/toolchain/<a>-linux-musl-cc.

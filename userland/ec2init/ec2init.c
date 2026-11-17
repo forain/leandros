@@ -20,7 +20,7 @@
  * hostname (first label of local-hostname) is set and written to
  * /etc/hostname. Exit 0 done / already done / not EC2, 1 IMDS unreachable or
  * a step failed (the stamp is only written when every step worked).
- * Plain C, static musl (zig cc), POSIX sockets only.
+ * Plain C, static musl (clang musl wrapper), POSIX sockets only.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>

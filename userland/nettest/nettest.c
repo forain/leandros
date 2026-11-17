@@ -1,7 +1,7 @@
 /*
  * nettest — IPv4 networking basics through the net server, with the results
  * Linux gives. Like privtest, the same file builds for the host
- * (cc nettest.c) and for LeandrOS (zig cc -target <arch>-linux-musl -static).
+ * (cc nettest.c) and for LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  *
  *   nettest [-g GATEWAY] [-d DNS_SERVER] [-n NAME] [-t IP:PORT]
  *

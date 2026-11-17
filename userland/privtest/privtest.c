@@ -2,7 +2,7 @@
  * privtest — privilege checks that must hold for an unprivileged process,
  * with the results Linux gives (credentials(7), kill(2), mount(2),
  * capabilities(7)). The same file builds for the host (cc privtest.c) and for
- * LeandrOS (zig cc -target <arch>-linux-musl -static), so every expectation
+ * LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static), so every expectation
  * below is checked against a real Linux kernel first.
  *
  *   privtest            as a normal user: the unprivileged cases only

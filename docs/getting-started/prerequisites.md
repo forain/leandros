@@ -58,15 +58,15 @@ Without a GPU-capable QEMU the system still boots and the serial login works; th
 sudo apt install lld    # ld.lld is used for both targets
 ```
 
-## zig and the musl cross toolchain
+## The clang/lld musl cross toolchain
 
-Third-party userspace (Mesa, COSMIC, brush, coreutils) is built for `{x86_64,aarch64}-unknown-linux-musl` and dynamically linked against a real `ld-musl`. The wrappers in `scripts/` drive that cross-build through **zig** (0.16.0 is the version in use):
+Third-party userspace (Mesa, COSMIC, brush, coreutils) is built for `{x86_64,aarch64}-unknown-linux-musl`. The host needs LLVM 21 or newer: macOS `brew install llvm lld`; Linux `clang lld llvm` from the distribution. The target side (Alpine musl sysroot, Linux UAPI headers, compiler-rt builtins, libc++) comes from locked Alpine packages: `scripts/toolchain/mk-sysroot.sh <arch>` builds it, `scripts/toolchain/check.sh` verifies it (see [scripts/toolchain/README.md](../../scripts/toolchain/README.md)). The wrappers in `scripts/` drive the cross-build:
 
-- `scripts/cc-<arch>-musl.sh` — `zig cc -target <arch>-linux-musl`, stripping the `--target=` spelling that `cc-rs` appends and zig rejects.
+- `scripts/cc-<arch>-musl.sh` — the static musl C compiler, stripping the `--target=` spelling that `cc-rs` appends.
 - `scripts/linker-<arch>-musl.sh` — the Rust linker wrapper for the musl targets.
-- `scripts/ar-musl.sh` — needed because `cc-rs` otherwise uses the host macOS `ar`, whose Mach-O archives `ld.lld` cannot read: the objects compile and every symbol in them comes back undefined at link time.
+- `scripts/ar-musl.sh` — `llvm-ar`; needed because `cc-rs` otherwise uses the host macOS `ar`, whose Mach-O archives `ld.lld` cannot read: the objects compile and every symbol in them comes back undefined at link time.
 
-Without zig, the input-stack shims and the C conformance tests are skipped with a warning.
+Without the toolchain, `build-all.sh` fails with a fix-it message instead of skipping the shims and C conformance tests.
 
 ## Container tooling
 

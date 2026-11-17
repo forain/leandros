@@ -35,7 +35,7 @@ fi
 
 # Programs that need a real libc (TLS, sigaction/pthread/timer, stdio-less C
 # ABI): no_std crates linked against static musl (<arch>-unknown-linux-musl)
-# through the zig linker wrapper, the same path as spawnwedge/killmt. Their
+# through the clang/lld linker wrapper, the same path as spawnwedge/killmt. Their
 # start-up is musl's crt1 -> `main`; userland/muslrt holds the shared pieces.
 MUSL_LINKED=(polltest fdmaxtest mqtest pipebw ptytest forktest shmtest racetest mmapbench ping waittest sigchldtest jobtest exectest smpwaketest idletest drmsmoke gpuqtest evtest2 uinputtest evsplit vttest venustest uptrtest i915test strtest pthreadtest timertest sigtest sigtest2 epolltest wakepolltest)
 

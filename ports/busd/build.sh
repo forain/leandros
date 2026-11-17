@@ -110,7 +110,7 @@ rmdir "$SRC.new"
 printf '\n[workspace]\n' >> "$SRC/Cargo.toml"
 
 # The repo-root .cargo/config.toml sets link-self-contained=no for musl targets
-# (zig linker wrappers); config rustflags are concatenated, so without the explicit
+# (clang/lld linker wrappers); config rustflags are concatenated, so without the explicit
 # =yes here rust-lld cannot find -lunwind/-lc (box build failure 2026-11-11).
 mkdir -p "$SRC/.cargo"
 cat > "$SRC/.cargo/config.toml" <<'CFG'

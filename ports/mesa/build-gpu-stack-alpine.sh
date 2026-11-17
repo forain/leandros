@@ -2,7 +2,7 @@
 # build-gpu-stack-alpine.sh — the GPU Mesa ship-set for LeandrOS COSMIC sessions.
 #
 # Runs INSIDE an Alpine 3.21 container of the TARGET architecture (native
-# musl toolchain, no zig, no LLVM). Driven by ports/mesa/build-gpu-stack.sh,
+# musl toolchain, no cross-compiler, no LLVM). Driven by ports/mesa/build-gpu-stack.sh,
 # which picks podman/docker and mounts:
 #   /work/mesa   Mesa 25.3.6 source (read-only is fine)
 #   /src         this directory (for ssp_guard.c)

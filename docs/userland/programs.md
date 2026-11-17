@@ -246,7 +246,7 @@ architectures: `vfstest`, `f2fstest`, `permtest`, `privtest`, `memtest`, `uptrte
 `evsplit`. The table of what each covers, how to run them, and the rules for trusting a result
 are in [../development/testing.md](../development/testing.md).
 
-`privtest`, `nettest` and `udptest` are single C files built both for the guest (`zig cc` static musl) and
+`privtest`, `nettest` and `udptest` are single C files built both for the guest (clang static musl) and
 for a Linux host, so the two runs' result lines can be diffed — Linux is the oracle.
 
 ## Limitations & open work

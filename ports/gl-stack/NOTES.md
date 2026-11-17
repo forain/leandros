@@ -190,3 +190,5 @@ sh build-meson-lib.sh libevdev <arch>
 sh build-mtdev.sh <arch>
 sh build-meson-lib.sh libinput <arch>   # aarch64: tools fail, lib ok -> manual install (see above)
 ```
+
+> zig recipe retired 2026-11: the wrappers and scripts in this directory now drive clang/lld (scripts/toolchain); the zig-specific text below is historical.

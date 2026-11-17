@@ -1,8 +1,7 @@
 /*
  * syscalltest — splice(2)/tee(2)/vmsplice(2), rseq(2) and the pidfd family,
  * with the results Linux gives. Like nettest, the same file builds for the
- * host (cc syscalltest.c -lpthread) and for LeandrOS (zig cc -target
- * <arch>-linux-musl -static).
+ * host (cc syscalltest.c -lpthread) and for LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  *
  *   syscalltest [-d DIR]...   extra directories for the file-backed splice
  *                             cases (default: /tmp, plus /root when root)

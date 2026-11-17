@@ -1,8 +1,8 @@
 #!/bin/sh
 # build-i915gltest.sh [x86_64|aarch64|all] — build /bin/i915gltest (lane
-# gpuctx: deterministic 3D on the real i915) with `zig cc` against the GPU
-# Mesa stage's libEGL/libGLESv2/libgbm. No container needed: zig's musl
-# target already names libc.so and /lib/ld-musl-<arch>.so.1 like LeandrOS.
+# gpuctx: deterministic 3D on the real i915) with the clang musl wrapper (scripts/toolchain) against the GPU
+# Mesa stage's libEGL/libGLESv2/libgbm. No container needed: the Alpine musl sysroot
+# names libc.so and /lib/ld-musl-<arch>.so.1 like LeandrOS.
 # Output: ${LEANDROS_ARTIFACTS:-~/code/leandros-artifacts}/i915gltest/stage-<arch>/i915gltest
 # (scripts/mkfs-f2fs-populated.py stages it as /bin/i915gltest).
 set -eu
@@ -16,7 +16,7 @@ build_one() {
   st="${LEANDROS_GPU_STAGE:-$st}"
   out="$ART/i915gltest/stage-$a"
   mkdir -p "$out"
-  zig cc -target "$a-linux-musl" -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
+  "$HERE/../../scripts/toolchain/$a-linux-musl-cc" -O2 -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
     -fno-stack-protector -D_FORTIFY_SOURCE=0 -I"$st/usr/include" -L"$st/usr/lib" \
     -Wl,--allow-shlib-undefined -s -o "$out/i915gltest.tmp" "$HERE/i915gltest.c" -lEGL -lGLESv2 -lgbm
   mv "$out/i915gltest.tmp" "$out/i915gltest"

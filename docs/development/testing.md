@@ -57,7 +57,7 @@ Not suites but test tools the lanes added:
 
 Programs link against **static musl** (the `MUSL_LINKED` list in `scripts/build-userland.sh`) for full POSIX behaviour (real `pthread`/`errno`/`sigaction`/`epoll`), against the lighter `leandros-libc` shim for `no_std` Rust programs, or against **musl** for ported software. `spawnwedge` and `killmt` are std/musl crates with their own `build.sh`, because they must exercise musl's own `pthread_create`/`fork` protocol.
 
-`privtest`, `nettest`, `udptest` and `syscalltest` are deliberately C: the same source builds for a Linux host (`cc privtest.c`) and for LeandrOS (`zig cc -target <arch>-linux-musl -static`), so every expectation is checked against a real Linux kernel first. They are the only C tests in the tree; new tests are Rust ([conventions](conventions.md#rust-only)).
+`privtest`, `nettest`, `udptest` and `syscalltest` are deliberately C: the same source builds for a Linux host (`cc privtest.c`) and for LeandrOS (`scripts/toolchain/<arch>-linux-musl-cc -static`), so every expectation is checked against a real Linux kernel first. They are the only C tests in the tree; new tests are Rust ([conventions](conventions.md#rust-only)).
 
 Some suites need particular conditions:
 

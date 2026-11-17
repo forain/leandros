@@ -1,6 +1,6 @@
 /*
  * nstest — namespace syscalls. Builds for the host (cc nstest.c) and for
- * LeandrOS (zig cc -target <arch>-linux-musl -static).
+ * LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  *
  * L0 (nsreject): clone/clone3/unshare with a CLONE_NEW* flag the kernel does
  * not implement must fail with EINVAL instead of silently creating nothing.

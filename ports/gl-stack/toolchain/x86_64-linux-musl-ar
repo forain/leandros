@@ -1,2 +1,3 @@
 #!/bin/sh
-exec zig ar "$@"
+# Historical recipe wrapper: forwards to the versioned clang/lld wrapper.
+exec "$(dirname "$0")/../../../scripts/toolchain/dyn/x86_64-linux-musl-ar" "$@"

@@ -508,7 +508,7 @@ build_memcpybench() {
 build_mame() {
     local arch="$1"
     echo "🕹️  Building $arch MAME..."
-    local mame_dir="$(sibling_dir mame)"
+    local mame_dir="${LEANDROS_MAME_DIR:-$(sibling_dir mame)}"
     if [[ ! -d "$mame_dir" ]]; then
         echo "⚠️  MAME source not found at $mame_dir, skipping"
         return 0

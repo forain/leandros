@@ -14,7 +14,7 @@ case "${1:-both}" in
 esac
 [[ -x "$M6/build-rust.sh" ]] || { echo "leandros-installer: no m6 toolchain at $M6" >&2; exit 1; }
 [[ -e "$HERE/target" ]] || ln -s "$M6/src/cosmic-files/target" "$HERE/target"
-[[ -f "$HERE/.cargo/config.toml" ]] || sh "$M6/gen-cargo-config.sh" "$HERE" > /dev/null
+sh "$M6/gen-cargo-config.sh" "$HERE" > /dev/null
 for arch in "${ARCHES[@]}"; do
   if ! "$M6/build-rust.sh" "$HERE" "$arch" --no-default-features --features wgpu,wayland > /dev/null; then
     echo "leandros-installer: build failed for $arch (log: $M6/logs/leandros-installer-$arch.log)" >&2

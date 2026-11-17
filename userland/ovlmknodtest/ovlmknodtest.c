@@ -1,6 +1,6 @@
 /*
  * ovltest -- overlayfs groundwork and (later) overlay semantics. Builds for
- * LeandrOS (zig cc -target <arch>-linux-musl -static) and for a Linux host.
+ * LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static) and for a Linux host.
  *
  * Group O (lane ovlmknod): mknod(2) for chr/blk/fifo/sock nodes on f2fs and
  * tmpfs. Whiteouts (char 0:0) are open to everyone, other devices need
