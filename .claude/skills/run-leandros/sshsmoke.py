@@ -1082,7 +1082,7 @@ def privsep_stalled_monitor(ssh, user, pw):
     procs = sshd_procs(ssh, user, pw)
     pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
     if pre:
-        sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]} {pre[0][0]}")  # monitor and child both hung
+        sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]}")  # only the monitor hangs; the child stays live
     ok = bool(pre) and probe_eof(s, 40)
     if pre:
         sudo_sh(ssh, user, pw, f"kill -KILL {pre[0][1]} {pre[0][0]} 2>/dev/null; true")
