@@ -72,7 +72,7 @@ for app in "${APPS[@]}"; do
   if [[ "$app" != cosmic-files && ! -e "$SRC/$app/target" ]]; then
     ln -s ../cosmic-files/target "$SRC/$app/target"
   fi
-  [[ -f "$SRC/$app/.cargo/config.toml" ]] || sh "$M6/gen-cargo-config.sh" "$SRC/$app" > /dev/null
+  sh "$M6/gen-cargo-config.sh" "$SRC/$app" > /dev/null
   for arch in "${ARCHES[@]}"; do
     if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" $(feat_for "$app") $(extra_for "$app" "$arch") > /dev/null; then
       echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
