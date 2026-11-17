@@ -29,6 +29,7 @@ Options:
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
+                             audio-session|video|clickmove|udevhot|coreutils  host:virglsessiontest.py <name> (virgl COSMIC session suites, own boot; coreutils = brush guest; `virgl` = the first four)
                              portalshot host:portalshottest.py alone (live COSMIC session: portal Screenshot returns response 0 and a non-empty PNG)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -397,6 +398,15 @@ SUITES = {
     "a64acpi": ["host:a64acpitest.py"],
     "blank": ["host:blanktest.py"],
     "portalshot": ["host:portalshottest.py"],
+    # lane virglsuites: virgl COSMIC-session suites, each in its own boot (need a host GPU QEMU:
+    # Mac GPU QEMU or the box); coreutils = uutils behaviour in a fresh brush guest (no GPU).
+    "audio-session": ["host:virglsessiontest.py audio"],
+    "video": ["host:virglsessiontest.py video"],
+    "clickmove": ["host:virglsessiontest.py clickmove"],
+    "udevhot": ["host:virglsessiontest.py udevhot"],
+    "coreutils": ["host:virglsessiontest.py coreutils"],
+    "virgl": ["host:virglsessiontest.py audio", "host:virglsessiontest.py video",
+              "host:virglsessiontest.py clickmove", "host:virglsessiontest.py udevhot"],
     "blkhang": ["host:blkhangtest.py"],
     "espreset": ["host:espresettest.py"],
     "evbtn": ["host:evbtntest.py"],
@@ -510,7 +520,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
+HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 

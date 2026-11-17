@@ -37,7 +37,7 @@ def type_marker(name, tag):
     cb.typ(f"touch /tmp/{tag}"); cb.key("ret", 0); time.sleep(4)
     return "MISSING" not in cb.SER.cmd(f"ls /tmp/{tag} || echo MIS''SING", 20)
 try:
-    cb.log("start", cb.drv("start", "aarch64", "--virgl")[-200:].replace("\n", " | "))
+    cb.log("start", cb.drv("start", os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), "--virgl")[-200:].replace("\n", " | "))
     cb.log("login", cb.drv("login", "root", "root", timeout=240)[-80:].replace("\n", " | "))
     cb.SER = cb.Serial()
     time.sleep(100); cb.log("quiet", cb.settle_quiet(120))

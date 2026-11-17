@@ -5,7 +5,7 @@ Wayland client under COSMIC (virgl)? Logs in via the greeter, starts
 counts wl_pointer.button lines per phase (cosmic-term binds 3 wl_pointers: 3 lines per event).
     CS_REPO=<repo> CS_OUT=<dir> LEANDROS_RUN_ID=x python3 clickmovetest.py   (CM_N=50)
 """
-import os, sys, time
+import os, re, sys, time
 R = os.environ["CS_REPO"]
 sys.path.insert(0, R + "/.claude/skills/run-leandros")
 import importlib.util
@@ -19,8 +19,12 @@ def a(px, py): return [{"type": "abs", "data": {"axis": "x", "value": int(px*327
                        {"type": "abs", "data": {"axis": "y", "value": int(py*32767/H)}}]
 def btn(d): return [{"type": "btn", "data": {"down": d, "button": "left"}}]
 COUNT = "cut -d'(' -f1 /tmp/wd.log | tr -d '0-9 []' | sort | uniq -c"
+ARCH = os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
+COUNTS = {}
 def count(tag):
     o = cb.SER.cmd(COUNT, 60); cb.log("COUNT", tag, o[-12000:].replace("\n", " | "))
+    m = re.search(r"(\d+)\s+\S*wl_pointer\S*\.button", o)
+    COUNTS[tag] = int(m.group(1)) if m else 0
 def phase(tag, fn):
     so = driver._qmp_open()
     send = lambda ev: driver._qmp_command(so, "input-send-event", {"events": ev})
@@ -39,7 +43,7 @@ def interleaved(send, i):
     for k in range(4): send(a(CX + 40 - 10*k, CY + 24)); time.sleep(0.008)
     time.sleep(0.2)
 try:
-    cb.log("start", cb.drv("start", "aarch64", "--virgl")[-200:].replace("\n", " | "))
+    cb.log("start", cb.drv("start", ARCH, "--virgl")[-200:].replace("\n", " | "))
     cb.log("login", cb.drv("login", "root", "root", timeout=240)[-80:].replace("\n", " | "))
     cb.SER = cb.Serial()
     time.sleep(100); cb.log("quiet", cb.settle_quiet(120))
@@ -60,3 +64,10 @@ try:
         phase(tag, fn)
 finally:
     cb.log("stop", cb.drv("stop")[-100:])
+# Verdict: every phase must deliver all N press+release pairs (>= 2N button lines, one
+# wl_pointer binding at least), and batched/interleaved must match the still phase.
+order = ["base", "still", "batched", "interleaved", "still2"]
+d = [COUNTS.get(b, 0) - COUNTS.get(a, 0) for a, b in zip(order, order[1:])]
+ok = len(COUNTS) == 5 and all(x >= 2 * N for x in d) and len(set(d)) == 1
+cb.log("DELTAS", d, "RESULT", "PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)
