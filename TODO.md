@@ -54,7 +54,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **iwlwifi**: HT40 on 2.4 GHz (`iwlwifi.ht40_24`, coexistence check in `wifi_ht::coex_40_24`) is implemented but unverified on hardware (no 40 MHz 2.4 GHz AP seen; the only reachable AP advertises 20 MHz). 5 GHz is untested (needs the user's 5 GHz SSID/passphrase on the stick). Throughput vs Linux not measured. Rate-control idea: column re-entry hysteresis / stay-in-column timer in `iwl_rs.rs`.
 
 ### Desktop / apps
-- **xdg-desktop-portal gaps**: non-interactive Screenshot works once the permission store holds a "screenshot" grant for the caller (probe grants it; capture verified, 1280x800 PNG in 148 ms). Without a grant xdg-desktop-portal shows Access.AccessDialog and cosmic's dialog is never answered headless (response 2 after 25 s) - by design, not a bug. (timedate1, SwitcherooControl and the a11y bus are activatable since lane portaldbus.)
 - **`cosmic-store` backend** (PackageKit service or libflatpak); **`cosmic-player`** (needs GStreamer closure, ~1-2 days).
 - **VRR hardware path**: `VRR_ENABLED` (CRTC) and `vrr_capable` (connector, immutable, always 0) exist and round-trip (atomic + legacy OBJ_SETPROPERTY) but nothing programs adaptive sync. i915 still needs EDID range-descriptor / DP `MSA_TIMING_PAR_IGNORED` parsing to report capable=1, then the VRR timing registers.
 - **Mesa v3d / Pi 5 acceleration** wiring (`GET_PARAM`+`CREATE_BO` first; single-device design).
@@ -75,6 +74,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Notes (not work items: by design, upstream-blocked, out of scope, or deferred by the user)
 
+- **xdg-desktop-portal Screenshot needs a permission-store grant** (by design): non-interactive Screenshot works once the permission store holds a "screenshot" grant for the caller (probe grants it; capture verified, 1280x800 PNG in 148 ms). Without a grant xdg-desktop-portal shows Access.AccessDialog and cosmic's dialog is never answered headless (response 2 after 25 s) - by design, not a bug. (timedate1, SwitcherooControl and the a11y bus are activatable since lane portaldbus.)
 - **virtio-snd TX is reaped by the 100 Hz tick pump, not an interrupt** (by design): the pump must run anyway to top the queue up with silence (QEMU 11.x loses the refill wakeup for good on an empty stream queue), so an IRQ would add nothing.
 - **smoltcp "handle does not refer to a valid socket" panic (watch)**: hardened at the source (lane smolpanic2: vendored SocketSet get/get_mut resolve a stale handle to an inert stand-in, remove() of one is a no-op; brtest `stale_race` guards it); the 2026-11-14 recurrence on lane/ip6dnat was never reproduced. If a panic with this text shows again, the stale access is in a caller that kept a handle across a stack reap.
 - **Interrupt-context serial diagnostics can drop under back-pressure** (by design).
