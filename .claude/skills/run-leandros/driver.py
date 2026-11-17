@@ -1989,6 +1989,29 @@ def _paste_body(raw: bytes) -> str:
     return _lrc_clean(raw, False)
 
 
+# brush repaints the WHOLE edit line for every input burst, so typing an N-char
+# line costs O(N^2) serial output (a 3.7 KB line is ~2 MB of repaint): on a
+# loaded KVM box the echo does not catch up within echo_timeout, the line is
+# cancelled and retried, and the command never runs. Lines longer than this
+# are staged into a guest file in short typed pieces and run with `.`.
+_LONG_LINE = 600
+_STAGE_PIECE = 300
+
+
+def _stage_long(ser, text, nonce, echo_timeout):
+    """Write `text` to a guest file via short typed lines; return the short
+    command line that sources it."""
+    import shlex
+    path = f"/tmp/.lrline-{nonce}"
+    pieces = [text[i:i + _STAGE_PIECE] for i in range(0, len(text), _STAGE_PIECE)]
+    for n, piece in enumerate(pieces):
+        redir = ">" if n == 0 else ">>"
+        _type_line(ser, f"printf %s {shlex.quote(piece)} {redir}{path}", echo_timeout)
+        start = ser.submit_at
+        ser.pump(echo_timeout, until=lambda b: _at_prompt(b[start:]))
+    return f". {path}; rm -f {path}"
+
+
 def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
     """Run `command` in the serial shell; return a dict
     {rc, status, output, secs}. status: 'ok' (sentinel seen), 'rc-file'
@@ -2005,6 +2028,8 @@ def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
     if own:
         ser = _Serial()
     try:
+        if len(wrapped) > _LONG_LINE:
+            wrapped = _stage_long(ser, wrapped, nonce, echo_timeout)
         ser.pump(0.2)
         echo_ok = _type_line(ser, wrapped, echo_timeout)
         # The drain thread may already hold a fast command's output: count

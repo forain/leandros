@@ -9,7 +9,7 @@
 # by an empty libpam.a so the linker finds the name and pulls nothing.
 #
 # Toolchain as ports/mkfs-fat and userland/claude-run: the pinned nightly, the
-# zig-cc linker wrapper, link-self-contained=no, relocation-model=static (ET_EXEC).
+# clang/lld linker wrapper, link-self-contained=no, relocation-model=static (ET_EXEC).
 #
 # Output: ports/sudo-rs/out/<arch>/{sudo,su}; scripts/mkfs-f2fs-populated.py
 # installs both set-user-ID root (04755).

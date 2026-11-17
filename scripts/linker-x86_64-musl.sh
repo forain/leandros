@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Link with zig's static musl, overriding its byte-loop memset with musl's asm
-# one (see musl-mem-obj.sh).
-obj="$("$(dirname "$0")/musl-mem-obj.sh" x86_64)" || exit 1
-exec zig cc -target x86_64-linux-musl "$@" "$obj"
+# Link with the clang/lld musl toolchain (scripts/toolchain): static ET_EXEC by
+# default, Alpine musl libc.a (asm memset/memcpy), compiler-rt builtins, and
+# libunwind.a for Rust std (rustc passes -lunwind itself).
+exec "$(dirname "$0")/toolchain/x86_64-linux-musl-cc" "$@"

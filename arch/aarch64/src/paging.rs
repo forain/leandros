@@ -461,21 +461,11 @@ pub unsafe extern "C" fn arch_prune_user_tables(
     n
 }
 
-/// The identity pages every TTBR0 root carries (see
-/// `arch_alloc_page_table_root`): the mmap address search must not hand them
-/// out, since no VMA records them.
+/// No range of a user address space is reserved by the architecture: the
+/// TTBR0 roots carry no device identity pages any more (see
+/// `arch_alloc_page_table_root`).
 #[no_mangle]
-pub unsafe extern "C" fn arch_user_reserved_range(i: usize, out: *mut usize) -> bool {
-    let base = match i {
-        0 => crate::uart::phys_base(),
-        1 => crate::gic::gicd_base(),
-        2 => crate::gic::gicc_base(),
-        _ => return false,
-    } & !0xFFF;
-    *out = base;
-    *out.add(1) = base + 0x1000;
-    true
-}
+pub unsafe extern "C" fn arch_user_reserved_range(_i: usize, _out: *mut usize) -> bool { false }
 
 // ── arch_alloc_page_table_root ────────────────────────────────────────────────
 
@@ -490,18 +480,14 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
             let virt = mm::phys_to_virt(phys) as *mut u8;
             virt.write_bytes(0, mm::buddy::PAGE_SIZE);
 
-            // Map critical device regions (UART for debug output, GIC for interrupts)
-            // Identity mapping for early boot/ret_to_user debug prints and IRQ handlers
-            let device_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR | PageDescFlags::ATTR_DEV;
-            
-            // 1. UART
-            map_4k(phys as *mut u64, crate::uart::phys_base(), crate::uart::phys_base(), device_flags);
-            
-            // 2. GIC Distributor
-            map_4k(phys as *mut u64, crate::gic::gicd_base(), crate::gic::gicd_base(), device_flags);
-            
-            // 3. GIC CPU Interface
-            map_4k(phys as *mut u64, crate::gic::gicc_base(), crate::gic::gicc_base(), device_flags);
+            // No device identity pages: the kernel reaches the UART and the
+            // GIC through the HHDM alias in TTBR1. An identity page at the
+            // QEMU virt UART/GICD/GICC addresses (0x09000000, 0x08000000,
+            // 0x08010000) used to sit here; being present (kernel-only) in
+            // every root, it silently shadowed a user mapping of the same
+            // address, so a >128 MiB static image whose text covers
+            // 0x8010000 (MAME at lld's default base) took a permission fault
+            // there forever (lane execfault).
 
             phys
         }

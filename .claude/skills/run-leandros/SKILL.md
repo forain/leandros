@@ -101,6 +101,10 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
   kernel lines cut out), read until that sentinel only, fall back to a status
   file `/tmp/.lrc-<nonce>` in the guest, and type the command only after its
   echo is seen intact (^C and retype otherwise).
+- `--suite slow` (not part of `regress`, which stays ~10 min): f2fsorphan, f2fscp,
+  f2fscrash, pagecache-crash, usbunplug, each booting its own VM (2-6 min each,
+  ~25 min total). Per-suite timeouts are `HOST_TIMEOUTS` in runtests.py (seconds
+  before scaling, used when above `--timeout`). Box: `$SP/box/regress2.sh <ref> <arch> --suite slow`.
 - `runtests.py <arch> <tag> [--suite regress|drm] [--virgl] [--repeat N]
   [--timeout S] [cmd ...]`: boot, root login, run, one
   `=== cmd: RC=n [status, secs] fails=k` line each, summary + `summary.json`

@@ -152,6 +152,36 @@ pub fn install_seccomp(log_only: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Close every fd from 3 up, whatever its number, except those in `keep`.
+/// close_range(2) per gap between kept fds; without it, walk up to the fd limit.
+#[cfg(target_os = "linux")]
+pub fn close_except(keep: &[i32]) {
+    let mut ks: Vec<u32> = keep.iter().filter(|f| **f >= 3).map(|f| *f as u32).collect();
+    ks.sort_unstable();
+    let mut ok = true;
+    let mut next = 3u32;
+    for k in ks.iter().copied().chain(std::iter::once(u32::MAX)) {
+        if k > next {
+            let hi = if k == u32::MAX { u32::MAX } else { k - 1 };
+            if unsafe { libc::syscall(libc::SYS_close_range, next, hi, 0u32) } != 0 {
+                ok = false;
+                break;
+            }
+        }
+        next = k.saturating_add(1);
+    }
+    if !ok {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+        let top = (lim.rlim_cur.min(1 << 20) as i32).max(1024);
+        for fd in 3..top {
+            if !keep.contains(&fd) {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+}
+
 /// Drop to `uid`/`gid`, chroot into `dir`, set NNP, non-dumpable and rlimits.
 /// Order matters: close every fd not in `keep` first, so the startup pipe and
 /// the root log never survive into the unprivileged process.
@@ -159,11 +189,7 @@ pub fn install_seccomp(log_only: bool) -> std::io::Result<()> {
 pub fn confine(uid: u32, gid: u32, dir: &str, keep: &[i32]) -> Result<(), String> {
     let e = |what: &str| format!("{what}: {}", std::io::Error::last_os_error());
     unsafe {
-        for fd in 3..1024 {
-            if !keep.contains(&fd) {
-                libc::close(fd);
-            }
-        }
+        close_except(keep);
         let d = std::ffi::CString::new(dir).map_err(|_| "dir".to_string())?;
         // chroot while still root; ids last (chroot needs CAP_SYS_CHROOT).
         if libc::chroot(d.as_ptr()) != 0 {

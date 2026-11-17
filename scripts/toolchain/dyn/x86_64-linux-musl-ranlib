@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/../env.sh" || exit 1
+exec "$LLVM_RANLIB" "$@"
