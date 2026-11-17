@@ -128,6 +128,10 @@ SYSFS_CHECK = (
     "t drm_card_links 'c=$(realpath /sys/dev/char/226:0) && test -L $c/device && test -L $c/subsystem && test \"$(readlink $c/subsystem | grep -c class/drm)\" = 1 && test \"$(realpath $c/subsystem)\" = /sys/class/drm && test \"$(realpath $c/device)\" = \"$(realpath /sys/dev/char/226:0/device)\" && grep -qx 226:0 $c/dev'; "
     "t drm_parent_dev 'p=$(realpath /sys/dev/char/226:0/device) && case $p in /sys/devices/*) ;; *) exit 1;; esac && test -d $p/drm/card0 && test -d $p/drm/renderD128 && ls $p/drm | grep -qx card0 && ls $p/drm | grep -qx renderD128 && test -L $p/subsystem && readlink $p/subsystem | grep -Eq \"bus/(pci|platform)$\"'; "
     "t drm_conn_under_card 'c=$(realpath /sys/dev/char/226:0) && grep -qx connected $c/card0-HDMI-A-1/status && test -d $c/card0-HDMI-A-1 && grep -q x $c/card0-HDMI-A-1/modes'; "
+    "t drm_conn_class_link 'test -L /sys/class/drm/card0-HDMI-A-1 && readlink /sys/class/drm/card0-HDMI-A-1 | grep -Eq \"^../../devices/.*/drm/card0/card0-HDMI-A-1$\" && test \"$(realpath /sys/class/drm/card0-HDMI-A-1)\" = \"$(realpath /sys/dev/char/226:0)/card0-HDMI-A-1\"'; "
+    "t drm_card_lists_conn 'c=$(realpath /sys/dev/char/226:0) && ls $c | grep -qx card0-HDMI-A-1 && ls $c | grep -qx uevent && ls $c | grep -qx device && ls /sys/dev/char/226:0/ | grep -qx card0-HDMI-A-1'; "
+    "t drm_class_card_conn 'ls /sys/class/drm/card0/ | grep -qx card0-HDMI-A-1 && grep -qx connected /sys/class/drm/card0/card0-HDMI-A-1/status && test -d /sys/class/drm/card0/card0-HDMI-A-1 && test -s /sys/class/drm/card0/card0-HDMI-A-1/modes && grep -qx 226:0 /sys/class/drm/card0/dev'; "
+    "t drm_class_list_lnk 'ls -l /sys/class/drm | grep \"^l.* card0-HDMI-A-1 ->\" && ls -l /sys/class/drm | grep -q \"^l.* card0 ->\"'; "
     "t sys_input_links 'test -L /sys/class/input/event0/device && test -L /sys/class/input/event0/subsystem && test -L /sys/class/input/input0/subsystem && test -L /sys/dev/char/13:64 && test \"$(readlink /sys/class/input/event0/subsystem)\" = ../../../class/input && test \"$(readlink /sys/class/input/event0/device)\" = ../input0 && test -d /sys/class/input/event0/subsystem && grep -q Keyboard /sys/dev/char/13:64/device/name && ls -F /sys/class/input/event0 | grep -q device@ && ls -F /sys/dev/char | grep -q ^13:64@'; "
     "t input_class 'test -d /sys/class/input/event0 && test -d /sys/class/input/event1 && test -d /sys/class/input/input0'; "
     "t input_uevent 'grep -q DEVNAME=input/event1 /sys/class/input/event1/uevent && grep -q MAJOR=13 /sys/class/input/event0/uevent'; "
@@ -416,7 +420,8 @@ SUITES = {
     # which stays ~10 min); gate with `--suite slow` (box: regress2.sh <ref> <arch> --suite slow).
     # Per-suite timeouts live in HOST_TIMEOUTS.
     "slow": ["host:f2fsorphantest.py", "host:f2fscptest.py", "host:f2fscrashtest.py",
-             "host:pagecache-crashtest.py", "host:usbunplugtest.py"],
+             "host:pagecache-crashtest.py", "host:usbunplugtest.py", "host:powerctltest.py",
+             "host:f2fsfulltest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -506,7 +511,7 @@ SUITES = {
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
 HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
-                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
 

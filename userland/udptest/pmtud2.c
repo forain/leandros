@@ -209,6 +209,62 @@ static void udp6_pmtud(void) {
     if (why[0]) fail(N, "%s", why); else pass(N);
 }
 
+/* Lane leftovers: the cached v6 path MTU expires after net.ipv6.route.mtu_expires
+ * (default 600 s, so the test shortens it to 2 s and restores it). */
+static int sysctl_write(const char *path, const char *val) {
+    int f = open(path, O_WRONLY); if (f < 0) return -1;
+    int r = write(f, val, strlen(val)) == (ssize_t)strlen(val) ? 0 : -1; close(f); return r;
+}
+static void udp6_pmtud_expiry(void) {
+    const char *N = "udp6_pmtud_expiry";
+    if (skipped(N)) return;
+    char why[200] = "", cur[32] = "";
+    static char d[2000];
+    memset(d, 3, sizeof d);
+    int f = open("/proc/sys/net/ipv6/route/mtu_expires", O_RDONLY);
+    ssize_t n = f >= 0 ? read(f, cur, sizeof cur - 1) : -1; if (f >= 0) close(f);
+    if (n <= 0 || strncmp(cur, "600\n", 4)) { fail(N, "mtu_expires default %.*s, want 600", (int)(n > 0 ? n : 0), cur); return; }
+    if (sysctl_write("/proc/sys/net/ipv6/route/mtu_expires", "2") || sysctl_write("/proc/sys/net/ipv4/route/mtu_expires", "2")) {
+        fail(N, "cannot shorten mtu_expires: %s", strerror(errno)); return;
+    }
+    int r = socket(AF_INET6, SOCK_DGRAM, 0), s = socket(AF_INET6, SOCK_DGRAM, 0);
+    struct sockaddr_in6 ra = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    if (r < 0 || s < 0 || bind(r, (struct sockaddr *)&ra, sizeof ra)) { fail(N, "socket/bind: %s", strerror(errno)); goto restore; }
+    socklen_t rl = sizeof ra; getsockname(r, (struct sockaddr *)&ra, &rl);
+    int v = 0; socklen_t vl = sizeof v;
+    if (connect(s, (struct sockaddr *)&ra, sizeof ra)) { snprintf(why, sizeof why, "connect: %s", strerror(errno)); goto out; }
+    struct sockaddr_in6 la; socklen_t ll = sizeof la; getsockname(s, (struct sockaddr *)&la, &ll);
+    int raw = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (raw < 0) { snprintf(why, sizeof why, "raw icmpv6 socket: %s", strerror(errno)); goto out; }
+    uint8_t m[8 + 40 + 8];
+    memset(m, 0, sizeof m);
+    m[0] = 2; /* packet too big */
+    uint32_t mtu = htonl(1300); memcpy(m + 4, &mtu, 4);
+    uint8_t *ip = m + 8;
+    ip[0] = 0x60; ip[4] = (1300 >> 8); ip[5] = 1300 & 255; ip[6] = 17; ip[7] = 64;
+    memcpy(ip + 8, &in6addr_loopback, 16); memcpy(ip + 24, &ra.sin6_addr, 16);
+    memcpy(ip + 40, &la.sin6_port, 2); memcpy(ip + 42, &ra.sin6_port, 2);
+    uint16_t c = csum6(&in6addr_loopback, &in6addr_loopback, m, sizeof m); m[2] = c >> 8; m[3] = c & 255;
+    struct sockaddr_in6 to = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    int on2 = 2; setsockopt(raw, IPPROTO_IPV6, IPV6_CHECKSUM, &on2, sizeof on2);
+    if (sendto(raw, m, sizeof m, 0, (struct sockaddr *)&to, sizeof to) != (ssize_t)sizeof m) snprintf(why, sizeof why, "inject packet-too-big: %s", strerror(errno));
+    msleep(200);
+    close(raw);
+    if (!why[0] && (getsockopt(s, IPPROTO_IPV6, IPV6_MTU, &v, &vl) || v != 1300)) snprintf(why, sizeof why, "IPV6_MTU after PTB %d, want 1300", v);
+    if (!why[0]) {
+        msleep(3000); /* past the shortened 2 s lifetime */
+        v = 0;
+        if (getsockopt(s, IPPROTO_IPV6, IPV6_MTU, &v, &vl) || v != 65536) snprintf(why, sizeof why, "IPV6_MTU after expiry %d, want 65536", v);
+        else if (send(s, d, 1400, 0) != 1400) snprintf(why, sizeof why, "1400-byte send after expiry: %s", strerror(errno));
+    }
+out:
+    close(r); close(s);
+    if (why[0]) fail(N, "%s", why); else pass(N);
+restore:
+    sysctl_write("/proc/sys/net/ipv6/route/mtu_expires", "600");
+    sysctl_write("/proc/sys/net/ipv4/route/mtu_expires", "600");
+}
+
 /* Lane udppmtu: a WANT-mode (default) datagram larger than the cached path
  * MTU leaves the host as IP fragments cut to that MTU (DF clear, MF on all
  * but the last, one ident, offsets contiguous), read off an IFF_TUN wire in

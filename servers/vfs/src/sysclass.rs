@@ -365,6 +365,11 @@ pub fn dirent_link(dev: u16, level: u8, idx: usize) -> bool {
 
 /// Target of the generated symlink at `path` (readlink body); `None` when it is not one.
 pub fn link(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    if let Some(t) = super::sysdrm::link(path) {
+        if t.len() > out.len() { return None; }
+        out[..t.len()].copy_from_slice(&t);
+        return Some(t.len());
+    }
     let t = super::sysinput::link(path)?;
     let b = t.as_bytes();
     if b.len() > out.len() { return None; }
@@ -375,10 +380,30 @@ pub fn link(path: &[u8], out: &mut [u8]) -> Option<usize> {
 /// Expand generated symlinks inside `path` (all components, and the last one
 /// only when `follow`). `Ok(None)` when none is met. The result is normalised.
 pub fn expand(path: &[u8], follow: bool) -> Result<Option<alloc::vec::Vec<u8>>, i32> {
-    if !(path.starts_with(b"/sys/dev/char/13:") || path.starts_with(b"/sys/class/input/")) { return Ok(None); }
+    if !(path.starts_with(b"/sys/dev/char/13:") || path.starts_with(b"/sys/class/input/")
+        || path.starts_with(b"/sys/class/drm/card0") || path.starts_with(b"/sys/dev/char/226:0")) { return Ok(None); }
     let mut cur = path.to_vec();
     let mut hops = 0;
     let mut changed = false;
+    // The staged card links (`/sys/class/drm/card0`, `/sys/dev/char/226:0`)
+    // are followed here so the generated card directory (connectors) is seen
+    // through them as well; the filesystem server would resolve them itself,
+    // out of reach of the overlay.
+    if super::sysdrm::present() {
+        for (pfx, base) in [(&b"/sys/class/drm/card0"[..], &b"/sys/class/drm"[..]), (&b"/sys/dev/char/226:0"[..], &b"/sys/dev/char"[..])] {
+            if !cur.starts_with(pfx) { continue; }
+            let rest = &cur[pfx.len()..];
+            if rest.is_empty() { if !follow { continue; } } else if rest[0] != b'/' { continue; }
+            let Some(t) = super::sys_readlink(pfx) else { continue };
+            let mut next = base.to_vec();
+            next.push(b'/');
+            next.extend_from_slice(&t);
+            next.extend_from_slice(rest);
+            cur = normalize(&next);
+            changed = true;
+            break;
+        }
+    }
     'again: loop {
         let mut end = 1;
         while end < cur.len() {
