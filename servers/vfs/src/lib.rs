@@ -8174,10 +8174,11 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         p = write_u32(buf, p, sched::nr_running().max(1));
         p = write_lit(buf, p, b"\nprocs_blocked 0\n");
         // Diagnostic (usbstalltest): `timerstat <ticks> <timer irqs>
-        // <deadline-only irqs that returned early> <uart rx drains>`.
+        // <deadline-only irqs that returned early> <uart rx drains>
+        // <uart rx bytes>`.
         {
             extern "C" { fn arch_timer_stats(out: *mut u64); }
-            let mut st = [0u64; 4];
+            let mut st = [0u64; 5];
             unsafe { arch_timer_stats(st.as_mut_ptr()); }
             p = write_lit(buf, p, b"timerstat");
             for v in st { p = write_lit(buf, p, b" "); p = write_u64(buf, p, v); }

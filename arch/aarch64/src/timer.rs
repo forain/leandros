@@ -57,6 +57,7 @@ pub extern "C" fn arch_timer_stats(out: *mut u64) {
         out.add(2).write(CPU0_DEADLINE_EARLY.load(Ordering::Relaxed));
         out.add(3).write(TICK_DRAINS.load(Ordering::Relaxed)
             + super::uart::UART_RX_IRQS.load(Ordering::Relaxed));
+        out.add(4).write(evdev_server::SERIAL_RX_BYTES.load(Ordering::Relaxed));
     }
 }
 

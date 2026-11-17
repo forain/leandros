@@ -59,6 +59,8 @@ pub fn init(info: &boot::BootInfo) {
     gdt::init();
     idt::init();
     #[cfg(target_arch = "x86_64")]
+    unsafe { uart_fifo_init(); }
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         enable_sse(true);
         boot::earlyfb::mark(3);
@@ -382,6 +384,51 @@ static USER_TX_WEDGED: core::sync::atomic::AtomicBool =
 /// CPU's interrupt handler making progress.
 pub static UART_TX_DROPPED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// Program the COM1 16550 FCR (0xC7: FIFOs on, both cleared, RX trigger level
+/// 14 bytes) and say once on the console what IIR reported before and after.
+///
+/// Nothing in the kernel ever wrote FCR, so the UART kept what the firmware
+/// left: FIFOs on (IIR 0xc1 on QEMU) with the 1-byte RX trigger level. QEMU's
+/// 16550 advertises receive room only up to that trigger level
+/// (`serial_can_receive`: `itl - count`, else 1), so it took ONE byte from its
+/// chardev per host main-loop pass, and only after the guest had read the
+/// previous one; x86 drains the UART only from the cpu0 tick
+/// (`timer::on_tick`, 100 Hz), stopping at the first empty LSR. Serial input
+/// thus arrived at a few bytes per tick, a few hundred B/s, and less on a
+/// loaded KVM host whose QEMU main loop runs late -- below the harness's own
+/// paced typing rate (8 bytes per 20 ms = 400 B/s). A 3-4 KB typed line piled
+/// up in the host socket and needed tens of seconds to reach the shell, which
+/// (reedline repaints once input pauses) echoed nothing meanwhile; the harness
+/// saw "8 bytes echoed, then silence", cancelled and retyped the line twice
+/// behind the still-queued first copy, and the suite timed out minutes later
+/// with the guest idle in the scheduler loop the whole time (lane conrx). With
+/// the 14-byte trigger QEMU hands over up to 14 bytes per pass and the tick
+/// drains them all: a 4.4 KB unpaced line now arrives in under a second. A
+/// real 16550A behaves the same; with no UART decoding COM1 nothing is written.
+#[cfg(target_arch = "x86_64")]
+unsafe fn uart_fifo_init() {
+    use core::arch::asm;
+    let lsr: u8;
+    asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+    if lsr == 0xFF { return; }
+    let iir: u8;
+    asm!("in al, dx", out("al") iir, in("dx") 0x3FAu16, options(nomem, nostack));
+    asm!("out dx, al", in("dx") 0x3FAu16, in("al") 0xC7u8, options(nomem, nostack));
+    let after: u8;
+    asm!("in al, dx", out("al") after, in("dx") 0x3FAu16, options(nomem, nostack));
+    UART_FIFO_IIR.store(((iir as u32) << 8) | after as u32, core::sync::atomic::Ordering::Relaxed);
+    let hex = |v: u8| [b"0123456789abcdef"[(v >> 4) as usize], b"0123456789abcdef"[(v & 15) as usize]];
+    for &c in b"[uart] 16550 FCR=0xc7, 14-byte RX trigger (IIR before 0x" { putc(c); }
+    for c in hex(iir) { putc(c); }
+    for &c in b", after 0x" { putc(c); }
+    for c in hex(after) { putc(c); }
+    for &c in b")\n" { putc(c); }
+}
+
+/// `(IIR before << 8) | IIR after` from `uart_fifo_init` (0: no UART / not run).
+/// IIR bits 7:6 = 11 means the FIFOs are on.
+pub static UART_FIFO_IIR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Compatibility wrapper for serial output.
 pub fn arch_serial_putc(c: u8) {
