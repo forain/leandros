@@ -231,7 +231,7 @@ impl InterfaceInner {
                     &self.checksum_caps(),
                 ) {
                     Ok(r) => r,
-                    Err(_) => { crate::v6dbg(7); return None; }
+                    Err(_) => { crate::v6dbg(8); return None; }
                 };
 
                 crate::v6dbg(5);
