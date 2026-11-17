@@ -33,7 +33,7 @@ post = (f"su leandro -c 'DBUS_SESSION_BUS_ADDRESS={bus} DBUS_SYSTEM_BUS_ADDRESS=
 # runtests gives this script HOST_TIMEOUTS["portalshottest.py"] (900) * driver.wait_scale(arch);
 # finish ~30 s under it so ffsession is killed here (log kept, QEMU stopped).
 budget = float(os.environ.get("PORTALSHOT_BUDGET", 900 * driver.wait_scale(arch) - 30))
-rc, flines, secs = ffsdiag.run(arch, tag, ["--nofirefox", "--post", post, "--post-timeout", "240"], budget)
+rc, flines, secs = ffsdiag.run(arch, tag, ["--nofirefox", "--noterm", "--post", post, "--post-timeout", "240"], budget)
 try:
     text = open(f"{out}/run-{tag}/post.txt").read()
 except OSError:

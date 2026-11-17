@@ -28,7 +28,7 @@ post = ("XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 /bin/blanktest
 # (blanktest.py is not in HOST_TIMEOUTS); finish ~30 s under it so ffsession is killed
 # here (log kept, QEMU stopped) instead of by runtests' timeout.
 budget = float(os.environ.get("BLANKTEST_BUDGET", 280 * driver.wait_scale(arch) - 30))
-rc, flines, secs = ffsdiag.run(arch, tag, ["--nofirefox", "--post", post], budget)
+rc, flines, secs = ffsdiag.run(arch, tag, ["--nofirefox", "--noterm", "--post", post], budget)
 try:
     text = open(f"{out}/run-{tag}/post.txt").read()
 except OSError:

@@ -72,6 +72,14 @@ def _tail(path, n):
 
 def diag(lines, out_dir, ok):
     if ok:
+        import re
+        t = {}
+        for l in lines:
+            m = re.search(r"(greeter|desktop|terminal): (?:ready after ([\d.]+)s|NOT ready|skipped)", l)
+            if m:
+                t[m.group(1)] = m.group(2) or ("skipped" if "skipped" in l else "NOT")
+        print("TIMING " + " ".join(f"{k}={v}" for k, v in t.items()))
+        sys.stdout.flush()
         return
     hits = [l[:200] for l in lines if KEY.search(l)][:40]
     for l in hits:
