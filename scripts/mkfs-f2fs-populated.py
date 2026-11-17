@@ -1483,7 +1483,7 @@ def main():
                 hp = os.path.join(dirpath, fn)
                 if not os.path.isfile(hp):
                     continue
-                if fn in ("busd", "dbus-run-session", "leandros-sysbus", "busctl"):  # must be executable
+                if fn in ("busd", "dbus-run-session", "leandros-sysbus", "busctl", "pkcon", "leandros-pk-helper"):  # must be executable
                     m5_exec_files.append((image_dir, fn, hp))
                 else:                                       # session.conf etc. = data
                     m4_share_files.append((image_dir, fn, hp))
@@ -2910,6 +2910,35 @@ def main():
 
     _ap_world += [n for n in alpinepkgs.world_names(arch) if n != "musl"]
     m4_share_dirs.add("/etc/apk")
+    # Alpine appstream snapshot for cosmic-store (ports/appstream-alpine/build.sh):
+    # /var/lib/swcatalog/xml/alpinelinux-<branch>-<repo>.xml.gz and the 64x64
+    # icons under icons/alpinelinux-<branch>-<repo>/64x64/, the layout of
+    # alpine-appstream-downloader. Missing = no catalog (store shows no
+    # Alpine apps), so it is a warning, not a refusal.
+    _as_out = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "..", "ports", "appstream-alpine", "out", arch))
+    _as_branch = alpinepkgs.lk.REL
+    _as_n = 0
+    for _repo in ("main", "community"):
+        _x = os.path.join(_as_out, f"Components-{_repo}.xml.gz")
+        _i = os.path.join(_as_out, f"icons-{_repo}.tar.gz")
+        if not (os.path.isfile(_x) and os.path.isfile(_i)):
+            print(f"  WARNING appstream {_repo}: {_x} missing (./ports/appstream-alpine/build.sh {arch})")
+            continue
+        _origin = f"alpinelinux-{_as_branch}-{_repo}"
+        _idir = f"/var/lib/swcatalog/icons/{_origin}/64x64"
+        for _d in ("/var", "/var/lib", "/var/lib/swcatalog", "/var/lib/swcatalog/xml",
+                   "/var/lib/swcatalog/icons", f"/var/lib/swcatalog/icons/{_origin}", _idir):
+            m4_share_dirs.add(_d)
+        m4_share_files.append(("/var/lib/swcatalog/xml", f"{_origin}.xml.gz", _x))
+        import tarfile as _tf
+        with _tf.open(_i) as _t:
+            for _m in _t.getmembers():
+                if _m.isfile() and "/" not in _m.name.lstrip("./"):
+                    m4_share_files.append((_idir, _m.name.lstrip("./"), _t.extractfile(_m).read()))
+                    _as_n += 1
+    if _as_n:
+        print(f"appstream: {_as_branch} catalog + {_as_n} icons staged in /var/lib/swcatalog")
     m4_share_files.append(("/etc/apk", "world", ("\n".join(_ap_world) + "\n").encode()))
     _ap_rel = alpinepkgs.lk.REL
     m4_share_files.append(("/etc/apk", "repositories", "".join(
@@ -3296,7 +3325,10 @@ def main():
         m5_exec_by_ino = {}
         for image_dir, name, hostpath in m5_exec_files:
             ino = _path_to_ino[image_dir]
-            m5_exec_by_ino.setdefault(ino, []).append((name, hostpath, 0o100755))
+            # leandros-pk-helper is the set-user-ID-root half of the PackageKit
+            # facade (ports/sysbus): it authorises the real uid itself.
+            m5_exec_by_ino.setdefault(ino, []).append(
+                (name, hostpath, 0o104755 if name == "leandros-pk-helper" else 0o100755))
         for ino in sorted(m5_exec_by_ino):
             add_files_to_dir(ino, m5_exec_by_ino[ino])
 

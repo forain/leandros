@@ -1082,6 +1082,10 @@ stage_dbus_session() {
     # .service files the step above staged (ports/dbus/session-pkg/services).
     ./ports/sysbus/build.sh "$arch" || \
         port_failed sysbus "$arch" "a .service file would name a binary that is not there"
+    # Alpine appstream snapshot for cosmic-store's PackageKit backend (kept
+    # when fresh or offline; mkfs stages it under /var/lib/swcatalog).
+    ./ports/appstream-alpine/build.sh "$arch" || \
+        port_failed appstream-alpine "$arch" "cosmic-store would list no Alpine apps"
     # The panel's Network applet (talks to `leandros-sysbus networkmanager`).
     # Needs the m6 cross toolchain; without it the panel has no Network entry.
     ./ports/cosmic-applet-network/build.sh "$arch" || \

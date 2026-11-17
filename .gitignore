@@ -50,3 +50,5 @@ artifacts/remote-logs/
 ports/gstreamer/out/
 *_vars.bootdisk.fd
 /build/
+# Alpine appstream snapshot (ports/appstream-alpine/build.sh).
+ports/appstream-alpine/out/

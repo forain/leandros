@@ -1,0 +1,10 @@
+# org.freedesktop.PackageKit for cosmic-store: ports/sysbus (leandros-sysbus
+# packagekit), a PackageKit facade over apk. LeandrOS has no system bus;
+# start-cosmic-leandros aliases DBUS_SYSTEM_BUS_ADDRESS to the session busd,
+# so this "system" service is activated there, as the session user, on the
+# first message to the name. Reads run apk.static as that user; installs,
+# removals and updates go through the set-user-ID helper
+# /usr/libexec/leandros-pk-helper, which authorises root and wheel members.
+[D-BUS Service]
+Name=org.freedesktop.PackageKit
+Exec=/usr/libexec/leandros-sysbus packagekit

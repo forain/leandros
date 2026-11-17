@@ -32,7 +32,13 @@ for arch in "${ARCHES[@]}"; do
   install -d "$SHIP/$arch/usr/libexec"
   install -m 0755 "$HERE/target/$target/release/leandros-sysbus" \
     "$SHIP/$arch/usr/libexec/leandros-sysbus"
+  # The setuid-root half of the PackageKit facade (mkfs packs it 04755).
+  install -m 0755 "$HERE/target/$target/release/leandros-pk-helper" \
+    "$SHIP/$arch/usr/libexec/leandros-pk-helper"
   install -d "$SHIP/$arch/usr/bin"
+  # /usr/bin/pkcon: the PackageKit client, as a tiny sh wrapper.
+  printf '#!/bin/sh\nexec /usr/libexec/leandros-sysbus pkcon "$@"\n' > "$SHIP/$arch/usr/bin/pkcon"
+  chmod 0755 "$SHIP/$arch/usr/bin/pkcon"
   install -m 0755 "$HERE/target/$target/release/busctl" "$SHIP/$arch/usr/bin/busctl"
-  echo "staged $arch: usr/libexec/leandros-sysbus usr/bin/busctl"
+  echo "staged $arch: usr/libexec/leandros-sysbus usr/libexec/leandros-pk-helper usr/bin/busctl usr/bin/pkcon"
 done
