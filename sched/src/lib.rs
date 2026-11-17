@@ -676,6 +676,32 @@ fn exit_logged_unconsumed(tgid: Pid) -> bool {
     EXIT_LOG.lock().any_pending(|e| e.pid == tgid)
 }
 
+/// `(parent_tgid, pgid, sid)` of process `tgid` when it is a zombie whose
+/// run-queue slot the dispatch loop already recycled: its exit record is
+/// logged and no wait has consumed it. Call with RUN_QUEUE held (lock order
+/// RUN_QUEUE -> EXIT_LOG, as in `log_exit`).
+///
+/// Lane exitorder: such a process is still a zombie to every observer. Its
+/// pidfd reads ready and waitid reports it, so /proc/<pid>/stat must read Z
+/// and kill(pid, 0) must succeed, as on Linux, where a task is EXIT_ZOMBIE
+/// before do_notify_pidfd publishes the exit. Before this, the vfs fell back
+/// to "R (running)" for a pid absent from the run queue (syscalltest
+/// pidfd_wake_conmon "proc_state=R" on x86_64 KVM).
+fn exit_logged_zombie(tgid: Pid) -> Option<(Pid, Pid, Pid)> {
+    let mut hit = None;
+    EXIT_LOG.lock().any_pending(|e| {
+        if e.pid == tgid && e.is_process && !e.consumed { hit = Some((e.parent_tgid, e.pgid, e.sid)); true } else { false }
+    });
+    hit
+}
+
+/// kill(2) target check for a process absent from the run queue: true when
+/// it is an unreaped zombie (see `exit_logged_zombie`), which Linux signals
+/// successfully (the signal is discarded).
+pub(crate) fn absent_zombie(tgid: Pid) -> bool {
+    exit_logged_zombie(tgid).is_some()
+}
+
 /// True when an exited, not yet waited-for process of group `pgid` is in
 /// `EXIT_LOG` — a zombie that still anchors its group (see
 /// `cred::set_pgid_checked`). Call with RUN_QUEUE held.
@@ -1607,7 +1633,10 @@ pub fn pgrp_in_session(pgid: Pid, sid: Pid) -> bool {
 /// process whose leader happens to be mid-park still reads `T`.
 pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
     let rq = RUN_QUEUE.lock();
-    let t = rq.find_pid(pid)?;
+    let t = match rq.find_pid(pid) {
+        Some(t) => t,
+        None => return exit_logged_zombie(pid).map(|(pp, pg, sid)| (pp, pg, sid, b'Z')),
+    };
     if reaped_zombie(t) { return None; }
     let leader = rq.find_pid(t.tgid);
     let leader_stopped = leader.map(|l| l.stop_signal != 0).unwrap_or(false);
