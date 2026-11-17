@@ -1131,7 +1131,9 @@ def privsep_perf(ssh, user, pw, tmp):
                                 env=ssh.env(pw), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL) for _ in range(4)]
     time.sleep(6)
-    _, out, _ = sudo_sh(ssh, user, pw, "sh /tmp/sshrss.sh")
+    rc_, out, err_ = sudo_sh(ssh, user, pw, "sh /tmp/sshrss.sh")
+    if not out.strip():
+        print(f"PERF rss script empty: rc={rc_} err={err_.strip()[-200:]!r}", flush=True)
     rows = [ln.split("|") for ln in out.splitlines() if ln.count("|") == 3]
     pids = {r[0] for r in rows}
     lis = [r for r in rows if r[2] == "sshd" and r[1] not in pids]
@@ -1157,11 +1159,6 @@ def privsep_perf(ssh, user, pw, tmp):
     down = time.time() - t0
     ok = r1.returncode == 0 and r2.returncode == 0 and len(r2.stdout) == mb << 20
     print(f"PERF ssh_pipe MiB/s up={mb / up:.2f} down={mb / down:.2f} size={mb}MiB ok={ok}", flush=True)
-    t0 = time.time()
-    r3 = subprocess.run(["scp", "-O", *ssh.pw_opts(), "-P", str(ssh.port), src, f"{user}@{ssh.host}:/tmp/perf2.bin"],
-                        env=ssh.env(pw), stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
-    sc = time.time() - t0
-    print(f"PERF scp(-O) MiB/s up={mb / sc:.2f} rc={r3.returncode} {r3.stderr.decode()[-80:]!r}", flush=True)
     t0 = time.time()
     r4 = subprocess.run(["scp", *ssh.pw_opts(), "-P", str(ssh.port), src, f"{user}@{ssh.host}:/tmp/perf3.bin"],
                         env=ssh.env(pw), stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
