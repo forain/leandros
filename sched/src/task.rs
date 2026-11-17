@@ -615,6 +615,10 @@ pub struct Task {
     /// while it was still a zombie on the run queue, so the exit-log record
     /// created at slot recycling is born consumed (no double reporting).
     pub wait_reported: bool,
+    /// `exit` passed its Zombie transition. Its tail takes sleeping locks, and a
+    /// park overwrites `state` with Blocked; this flag keeps the task a zombie to
+    /// /proc, wait and pidfd meanwhile (`eff_state`).
+    pub zombie_marked: bool,
 
     /// CLONE_VFORK: true from creation until this child execve()s or exits.
     /// The parent's clone() call spins on this flag â vfork semantics require
@@ -738,8 +742,16 @@ impl Task {
     /// R4, see `slot::note_state`), so the caller must not hold an RQ lock.
     #[inline]
     #[track_caller]
+    /// State as user space sees it: a task whose `exit` already marked it
+    /// Zombie stays one while a late sleeping lock has it parked Blocked.
+    #[inline]
+    pub fn eff_state(&self) -> TaskState {
+        if self.zombie_marked { TaskState::Zombie } else { self.state }
+    }
+
     pub fn set_state(&mut self, new: TaskState) {
         let old = self.state;
+        if old == TaskState::Zombie && new == TaskState::Blocked { crate::percpu::bump(&crate::percpu::ZOMB_BLOCKED); }
         // A new park is no listener park until `listen_park` says so.
         if new == TaskState::Blocked { self.listen.parked = false; }
         // Lane percpu4: a parked listener made Ready gets its ring handed
@@ -770,6 +782,7 @@ impl Task {
     pub(crate) fn set_state_held(&mut self, new: TaskState) {
         debug_assert!(new != TaskState::Ready);
         let old = self.state;
+        if old == TaskState::Zombie && new == TaskState::Blocked { crate::percpu::bump(&crate::percpu::ZOMB_BLOCKED); }
         if new == TaskState::Blocked || old == TaskState::Blocked { self.listen.parked = false; }
         self.state = new;
         if old == TaskState::Zombie || new == TaskState::Zombie {
@@ -951,6 +964,7 @@ impl Task {
             altstack_size: 0,
             altstack_flags: 2, // SS_DISABLE
             wait_reported: false,
+            zombie_marked: false,
             vfork_pending: false,
             mm_borrowed: false,
             stop_pending: false,
@@ -1398,6 +1412,7 @@ impl Task {
             altstack_size: 0,
             altstack_flags: 2, // SS_DISABLE
             wait_reported: false,
+            zombie_marked: false,
             vfork_pending: false,
             mm_borrowed: false,
             stop_pending: false,
