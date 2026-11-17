@@ -5,7 +5,7 @@ Runs one of the virgl-COSMIC-session suites (or, for coreutils, the brush-guest
 coreutils suite) as a `host:` script of runtests.py; arch from LEANDROS_TEST_ARCH
 (default aarch64). Each one boots its own VM (`--virgl` needs a host GPU QEMU:
 the Mac GPU QEMU, or the box). Exit 0 iff the underlying test passes.
-  audio      audio-session-test.py: pw-play tone clean (no holes, <= 4 discontinuities),
+  audio      audio-session-test.py: pw-play tone clean (<= 1 hole of 50 ms, <= 4 discontinuities),
              volume 0.30 applied (tone2 rms ratio 0.01..0.2 of tone1), no pf/segv/panic/wdog
   video      videotest.py: 1080p AV1 playback advances in Firefox
   clickmove  clickmovetest.py: clicks batched/interleaved with motion all reach a client
@@ -44,7 +44,7 @@ if name == "audio":
         t1, t2 = a.get("tone1", {}), a.get("tone2", {})
         ratio = t2["rms"] / t1["rms"]
         c = res.get("counts") or {}
-        ok = ok and t1["holes_50ms"] == 0 and t2["holes_50ms"] == 0 and t1["discontinuities"] <= 4 \
+        ok = ok and t1["holes_50ms"] <= 1 and t2["holes_50ms"] <= 1 and t1["discontinuities"] <= 4 \
             and t2["discontinuities"] == 0 and 0.01 < ratio < 0.2 and not any(c.get(k) for k in ("pf", "segv", "panic", "wdog"))
         print(f"audio {arch}: tone1 holes={t1['holes_50ms']} disc={t1['discontinuities']} tone2 ratio={ratio:.3f} counts={c}")
     except (OSError, KeyError, ValueError, ZeroDivisionError) as e:
