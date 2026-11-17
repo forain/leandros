@@ -80,7 +80,7 @@ export SYSTEM_DEPS_LIBSPA_NO_PKG_CONFIG=1 SYSTEM_DEPS_LIBSPA_SEARCH_NATIVE="$STU
        SYSTEM_DEPS_LIBSPA_LIB="pipewire-0.3" SYSTEM_DEPS_LIBSPA_INCLUDE="$PG/inc/spa-0.2"
 export BINDGEN_EXTRA_CLANG_ARGS="--target=$arch-linux-musl --sysroot=$S -isystem $S/usr/include"
 tus=$(echo "$triple" | tr - _)
-export CC_${tus}="$PG/cc/$arch-cc" CXX_${tus}="$D/toolchain/$arch-linux-musl-c++" AR_${tus}="$D/toolchain/$arch-linux-musl-ar"
+export CC_${tus}="$D/toolchain/$arch-linux-musl-cc" CXX_${tus}="$D/toolchain/$arch-linux-musl-c++" AR_${tus}="$D/toolchain/$arch-linux-musl-ar"
 export CFLAGS_${tus}="-fno-sanitize=all -I$PG/inc/pipewire-0.3 -I$PG/inc/spa-0.2"
 export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
 # Shared by every worktree (cargo locks the dir itself): ~2.4 GiB, kept out of
