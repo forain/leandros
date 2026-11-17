@@ -216,6 +216,8 @@ SUITES = {
                 "/bin/epolltest churn 20",
                 # + a non-leader thread forking in a loop (lane tforkhang).
                 "/bin/epolltest churn 20 tfork",
+                # Nested-epoll lost-wakeup stress, panel shape (lane nestep).
+                "/bin/epolltest nest",
                 # 5000 spawn/join + 2500 detached threads: VMAs/VmSize/RSS stay flat (lane threadleak).
                 "/bin/pthreadtest churn 5000",
                 # kmscube on the v3d UAPI stub (lane kmscube2, openbugs L11.8):
