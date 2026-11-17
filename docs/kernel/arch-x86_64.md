@@ -81,6 +81,12 @@ Measured benefit: a 1 MiB `memcpy` into a host-visible virtio-gpu blob, WC media
 
 The LAPIC timer gives each CPU a 100 Hz tick on an absolute TSC grid, plus one-shot countdowns for the per-CPU deadline timer (never a shortened period: QEMU mishandles that). `timer::init` resolves the TSC frequency once, in order of preference: the hypervisor timing leaf `0x40000010`; CPUID `0x15` with the crystal enumerated; `0x15` × `0x16` with the implied crystal snapped to a standard part; a PIT channel-2 measurement (three 10 ms windows, shortest kept, each bounded so a board without an 8254 cannot hang the boot). A stated value wins when the PIT agrees within 5 %; otherwise the measurement wins. It is printed once as `[TSC] <MHz> (<source>)`. Every kernel clock, including the driver-side microsecond clock, derives from it; the old `_rdtsc() / 1000` assumed 1 GHz and made audio stall thresholds 1.9–4.5× too short (lane tsccal, 2026-09-18). Clock semantics are in [time.md](time.md).
 
+The PIT is optional. `timer::init` tolerates a stub port `0x61` with no 8254 behind it (QEMU `pit=off`, AWS Nitro), and when no stated frequency exists it falls back to the KVM pvclock (kvmclock) source, printed as `[TSC] <MHz> (kvmclock)`; that closes the old "pvclock not needed" gap. The LAPIC timer is then calibrated against the TSC (shortest of three windows, as the PIT path does) rather than assumed, with a 625 MHz default only when no TSC source exists (suite `nitrox86`).
+
+### COM1 receive trigger level
+
+`serial` programs the 16550 FIFO control register so the RX trigger level is 14 bytes. FCR used to be left as firmware set it (1 byte), and QEMU's 16550 then delivers one byte per host main-loop pass: the 100 Hz tick drain got a few bytes per tick, so a 3-4 KB typed line arrived slower than a test harness typed it and the echo missed its timeout. A 4.4 KB unpaced line now arrives in under a second. Received bytes and timer/UART interrupt counts appear under `timerstat` in `/proc/stat` (both arches count cpu0 timer IRQs in `on_tick`), which is how a stall is told apart from a lost interrupt.
+
 ### Interrupt vectors, MSI and MSI-X
 
 Every vector 0x21–0xEF except 0x40 enters a 16-byte stub, `push v; jmp irq_dyn_common`, which saves caller-saved registers, does `swapgs` for an interrupt from ring 3, and calls `irq_dyn_dispatch(v)`: **EOI first, centrally**, then `irq_enter` → handler → `irq_exit`. Vectors are allocated from 0x41 upward (`drivers::irq::alloc_vector`); an unregistered vector is counted and logged once. MSI messages target the LAPIC window `0xFEE0_0000` with the **BSP's** APIC ID (not 0 — it usually but not necessarily is 0), fixed delivery, edge; a BSP APIC ID above 255 is refused because it would need interrupt remapping. `MsixTable` programs per-entry vectors and masks; virtio-gpu's control-queue vector comes from the allocator (`[GPU] MSI-X armed: control queue -> vector 0x41`). Driver-facing API: [hardware/drivers.md](../hardware/drivers.md).
@@ -109,7 +115,7 @@ Context switches save the 512-byte `FXSAVE64` area. When CPUID reports XSAVE, AV
 - No AVX-512 / XSAVE-managed state (above); ptrace and core dumps expose only the FXSAVE area.
 - MSI always targets the BSP; no interrupt affinity, no multi-vector MSI (MSI-X has per-entry vectors). Legacy INTx (`IrqSource::Line`) returns `Unsupported`: there is no ACPI `_PRT` parser.
 - More than 64 CPUs would need a wider shootdown acknowledgement mask; firmware-enabled x2APIC on the *BSP* is handled by code but has not been exercised (OVMF hands the BSP over in xAPIC mode even with 288 vCPUs).
-- KVM pvclock would give the host's exact TSC frequency without a PIT window; at 0.02 % error it has not been needed. Bare-metal CPUID `0x15`/`0x16` paths are unverified on real hardware.
+- kvmclock is now consulted when no CPUID leaf states the TSC frequency; the PIT window remains the last resort. Bare-metal CPUID `0x15`/`0x16` paths are unverified on real hardware.
 
 ## Code and tests
 

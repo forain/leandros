@@ -121,7 +121,8 @@ Covered above: both ID-register methods were measured to give the wrong answer o
 ## Limitations and open work
 
 - **PAN is on** (`SCTLR_EL1.SPAN = 0`, so every exception entry sets `PSTATE.PAN`; `[MMU] PAN on (strict)`; `pan=audit|off` relax it, see [memory.md](memory.md#smepsmap-and-pan-are-on-uaccess-is-the-only-way-in)). Executable user pages still clear PXN as well as UXN, so the kernel could execute user code ([memory.md](memory.md#limitations-and-open-work)).
-- **No MSI/MSI-X**: `request_msi` and `MsixTable::enable` return `Unsupported` until a GICv3 ITS driver exists.
+- **MSI/MSI-X needs the ITS**: on GICv2, rpi5/raspi4b builds, or after an ITS init failure, `request_msi` and `MsixTable::enable` still return `Unsupported` and drivers stay on INTx (see the ITS section above).
+- **No device identity pages in user roots** (2026-11-16): every TTBR0 root used to carry kernel-only identity mappings at the QEMU virt UART, GICD and GICC addresses, which silently shadowed a user mapping at the same address (a static ET_EXEC above 128 MiB, such as MAME, faulted for ever at `0x8010000`). The kernel reaches those devices through the HHDM alias, so the pages and the matching `mmap` reserved-range special case are gone; `execdev` pins it.
 - `AT_HWCAP` is 0, so userspace selects baseline (non-crypto, non-atomics-extension) code paths.
 - The direct-boot park loop still elects on `MPIDR.Aff0` (the `raspi4b` path).
 - AArch64 direct boot under HVF hangs (an upstream QEMU class); UEFI/Limine is the default under HVF ([boot.md](boot.md#limitations-and-open-work)).
