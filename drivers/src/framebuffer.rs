@@ -745,7 +745,10 @@ impl Framebuffer {
     /// Place a decoded code point at the cursor and advance by its width.
     fn put_unicode(&mut self, u: u32) {
         let mut w = crate::wcwidth::width(u);
-        if w == 0 { return; }
+        if w == 0 {
+            if crate::wcwidth::is_combining(u) { self.overlay_mark(u); }
+            return;
+        }
         let cols = self.cols();
         if w == 2 && cols < 2 { w = 1; }
         if w == 2 && self.col() + 2 > cols {
@@ -766,6 +769,34 @@ impl Framebuffer {
         }
     }
 
+    /// Draw combining mark `m` over the cell just before the cursor without
+    /// moving it. The console font has no precomposed accented letters, so the
+    /// mark is overlaid; capitals (ink in cell row 2) take it two rows higher.
+    /// A mark with no bitmap, or at column 0, is ignored.
+    fn overlay_mark(&mut self, m: u32) {
+        let (cw, ch) = (self.char_width, self.char_height);
+        let (col, row) = (self.col(), self.row());
+        if col == 0 || ch < 16 { return; }
+        let Some((bits, below)) = crate::glyphs::mark_overlay(m) else { return };
+        let wide = col >= 2 && self.wide_bit(row, col - 2);
+        let x0 = if wide { (col - 2) * cw + cw / 2 } else { (col - 1) * cw };
+        let y0 = self.cursor_y;
+        let tall = !below && (0..cw.min(8)).any(|gx| self.get_pixel(x0 + gx, y0 + 2) != 0);
+        let top = if below { 13 } else if tall { 0 } else { 2 };
+        let fg = self.fg;
+        for (gy, &r) in bits.iter().enumerate() {
+            for gx in 0..8.min(cw) {
+                if r & (0x80 >> gx) != 0 { self.set_pixel(x0 + gx, y0 + top + gy, fg); }
+            }
+        }
+    }
+
+    fn get_pixel(&self, x: usize, y: usize) -> u32 {
+        if x < self.width && y < self.height {
+            unsafe { self.surface().add(y * (self.pitch / 4) + x).read_volatile() & 0xFFFFFF }
+        } else { 0 }
+    }
+
     /// Draw a non-ASCII code point: a generated glyph from [`crate::glyphs`]
     /// (box drawing, blocks, shades, common UI symbols), else an ASCII
     /// stand-in, else `?`.
@@ -778,6 +809,18 @@ impl Framebuffer {
                     if row & (0x80 >> gx) != 0 { self.set_pixel(x + gx, y + gy, color); }
                 }
             }
+            return;
+        }
+        if let Some((base, mark)) = crate::wcwidth::decompose(u) {
+            self.draw_char_vector(x, y, base as char, color);
+            // overlay_mark works at the cursor; position it by hand here.
+            let (cw, _) = (self.char_width, 0);
+            let (sx, sy) = (self.cursor_x, self.cursor_y);
+            self.cursor_x = x + cw;
+            self.cursor_y = y;
+            self.overlay_mark(mark);
+            self.cursor_x = sx;
+            self.cursor_y = sy;
             return;
         }
         let c = match crate::glyphs::fallback_ascii(u) {

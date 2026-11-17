@@ -293,3 +293,22 @@ pub fn wide(u: u32) -> bool {
 /// console's cell layout and must agree on which characters take two cells.
 #[no_mangle]
 pub extern "C" fn glyph_wide(u: u32) -> bool { wide(u) }
+
+/// Bitmap for a combining mark drawn over the previous cell: `(rows, below)`.
+/// Marks above the letter are two rows tall; `below` marks (cedilla) go under
+/// the baseline instead.
+pub fn mark_overlay(mark: u32) -> Option<(&'static [u8], bool)> {
+    Some(match mark {
+        0x300 => (&[0x30, 0x18], false),
+        0x301 => (&[0x0C, 0x18], false),
+        0x302 => (&[0x18, 0x24], false),
+        0x303 => (&[0x2C, 0x34], false),
+        0x304 => (&[0x3C, 0x00], false),
+        0x306 => (&[0x22, 0x1C], false),
+        0x308 => (&[0x24, 0x24], false),
+        0x30A => (&[0x1C, 0x1C], false),
+        0x30C => (&[0x24, 0x18], false),
+        0x327 => (&[0x08, 0x10, 0x0C], true),
+        _ => return None,
+    })
+}

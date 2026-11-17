@@ -1134,14 +1134,26 @@ unsafe fn t_tabs_wide(tty0: c_int) -> bool {
     let emoji = cpr(fd, "\u{1f600}".as_bytes()) == (1, 3);
     write(fd, reset.as_ptr() as *const c_void, reset.len());
     let wrap = cpr(fd, b"\x1b[1;1H\x1b[999C\xe4\xb8\xad") == (2, 3);
+    // Mixed run: a(1) + wide(2) + b(1) = 4 cells, cursor at col 5.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let mixed = cpr(fd, "a\u{6f22}b".as_bytes()) == (1, 5);
+    // Combining marks never take a cell: e+U+0301 is one cell, a+U+0300+U+0323
+    // (unknown/unprecomposed marks) one cell, CJK + mark still two.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let comb1 = cpr(fd, "e\u{301}".as_bytes()) == (1, 2);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let comb2 = cpr(fd, "a\u{300}\u{323}b".as_bytes()) == (1, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let comb3 = cpr(fd, "\u{6f22}\u{301}".as_bytes()) == (1, 3);
     write(fd, reset.as_ptr() as *const c_void, reset.len());
     login_resume(sid);
     close(fd);
+    out(b" mixed="); out_int(mixed as c_int); out(b" comb="); out_int((comb1 && comb2 && comb3) as c_int);
     out(b"  tab1="); out_int(tab1 as c_int); out(b" tab2="); out_int(tab2 as c_int);
     out(b" cht="); out_int(cht as c_int); out(b" cbt="); out_int(cbt as c_int);
     out(b" wide="); out_int(wide as c_int); out(b" narrow="); out_int(narrow as c_int);
     out(b" emoji="); out_int(emoji as c_int); out(b" wrap="); out_int(wrap as c_int); out(b"\n");
-    report(b"tabs_wide", tab1 && tab2 && cht && cbt && wide && narrow && emoji && wrap)
+    report(b"tabs_wide", tab1 && tab2 && cht && cbt && wide && narrow && emoji && wrap && mixed && comb1 && comb2 && comb3)
 }
 
 unsafe fn t_session_node(tty0: c_int) -> bool {

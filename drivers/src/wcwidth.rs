@@ -49,6 +49,48 @@ pub fn width(u: u32) -> usize {
     if in_table(ZERO, u) { 0 } else if in_table(WIDE, u) { 2 } else { 1 }
 }
 
+/// True for the combining marks (Mn/Me blocks) that attach to the previous
+/// cell rather than taking one.
+pub fn is_combining(u: u32) -> bool {
+    matches!(u, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
+}
+
+/// Latin-1 capital letters with one accent: (precomposed, ASCII base, mark).
+/// The lowercase forms (U+00E0..U+00FD) are the same table, 0x20 higher.
+const LATIN1: &[(u32, u8, u32)] = &[
+    (0xC0, b'A', 0x300), (0xC1, b'A', 0x301), (0xC2, b'A', 0x302), (0xC3, b'A', 0x303),
+    (0xC4, b'A', 0x308), (0xC5, b'A', 0x30A), (0xC7, b'C', 0x327), (0xC8, b'E', 0x300),
+    (0xC9, b'E', 0x301), (0xCA, b'E', 0x302), (0xCB, b'E', 0x308), (0xCC, b'I', 0x300),
+    (0xCD, b'I', 0x301), (0xCE, b'I', 0x302), (0xCF, b'I', 0x308), (0xD1, b'N', 0x303),
+    (0xD2, b'O', 0x300), (0xD3, b'O', 0x301), (0xD4, b'O', 0x302), (0xD5, b'O', 0x303),
+    (0xD6, b'O', 0x308), (0xD9, b'U', 0x300), (0xDA, b'U', 0x301), (0xDB, b'U', 0x302),
+    (0xDC, b'U', 0x308), (0xDD, b'Y', 0x301),
+];
+
+/// Split a precomposed Latin-1 letter into (ASCII base, combining mark).
+pub fn decompose(u: u32) -> Option<(u8, u32)> {
+    if u == 0xFF { return Some((b'y', 0x308)); }
+    let (key, lower) = if (0xE0..=0xFD).contains(&u) { (u - 0x20, true) } else { (u, false) };
+    for &(p, b, m) in LATIN1 {
+        if p == key { return Some((if lower { b | 0x20 } else { b }, m)); }
+    }
+    None
+}
+
+/// NFC for the common Latin case: the precomposed code point for `base`
+/// followed by combining `mark`, if there is one.
+pub fn compose(base: u32, mark: u32) -> Option<u32> {
+    if base > 0x7F { return None; }
+    let b = base as u8;
+    if !b.is_ascii_alphabetic() { return None; }
+    if b == b'y' && mark == 0x308 { return Some(0xFF); }
+    let (ub, lower) = (b & !0x20, b & 0x20 != 0);
+    for &(p, pb, m) in LATIN1 {
+        if pb == ub && m == mark { return Some(if lower { p + 0x20 } else { p }); }
+    }
+    None
+}
+
 /// Tab stops for up to 256 columns, one bit per column.
 #[derive(Clone, Copy)]
 pub struct TabStops(pub [u64; 4]);
