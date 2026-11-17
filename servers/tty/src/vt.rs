@@ -219,9 +219,6 @@ impl Screen {
         self.split_wide(row, col, col + 1);
         let fg = self.fg_enc;
         let i = row * VT_COLS + col;
-        // Overwriting either half of a wide glyph erases the other half.
-        if col > 0 && is_wide_cell(self.cells[i - 1]) { self.cells[i - 1] = BLANK; }
-        if is_wide_cell(self.cells[i]) && col + 1 < VT_COLS { self.cells[i + 1] = BLANK; }
         self.cells[i] = cell(ch, fg);
     }
 
@@ -434,11 +431,6 @@ impl Screen {
             b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }
             b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),
             b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),
-            b'I' => col = ((col / 8 + p(0, 1)) * 8).min(cols - 1),
-            b'Z' => {
-                let n = p(0, 1);
-                col = if col % 8 == 0 { col.saturating_sub(8 * n) } else { (col / 8).saturating_sub(n - 1) * 8 };
-            }
             b'H' | b'f' => {
                 row = p(0, 1).saturating_sub(1).min(rows - 1);
                 col = p(1, 1).saturating_sub(1).min(cols - 1);

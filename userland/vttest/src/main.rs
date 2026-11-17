@@ -1702,7 +1702,8 @@ unsafe fn t_emu_tab_stops() -> bool {
 unsafe fn t_emu_wide_advance() -> bool {
     let fd = open_emu_vt();
     if fd < 0 { return report(b"emu_wide_advance", false); }
-    // A, CJK (2 cells), B, emoji, fullwidth 'a', e + combining acute, e-acute.
+    // A, CJK (2 cells), B, emoji, fullwidth 'a', e + combining acute (folds into
+    // the precomposed e-acute in the cell before the cursor), e-acute.
     let s = emu(fd, "A\u{4e16}B\u{1F600}\u{ff41}e\u{301}\u{e9}".as_bytes());
     close(fd);
     dump(b"adv", &s);
@@ -1711,7 +1712,7 @@ unsafe fn t_emu_wide_advance() -> bool {
             let r = &s.cells[0];
             r[0] == b'A' as u32 && r[1] == 0x4e16 && r[2] == WIDE_CONT && r[3] == b'B' as u32
                 && r[4] == 0x1F600 && r[5] == WIDE_CONT && r[6] == 0xff41 && r[7] == WIDE_CONT
-                && r[8] == b'e' as u32 && r[9] == 0xe9 && s.col == 10 && s.row == 0
+                && r[8] == 0xe9 && r[9] == 0xe9 && s.col == 10 && s.row == 0
         }
         None => false,
     };
