@@ -37,6 +37,7 @@ mod cost;
 mod abi;
 mod stat;
 mod churn;
+mod share;
 
 type c_int = i32;
 type c_long = i64;
@@ -199,6 +200,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         // `abi` / `pollbench` (lane epollabi, see abi.rs).
         if !arg.is_null() && *arg == b'a' { return abi::abi_main(); }
         if !arg.is_null() && *arg == b'p' { return abi::pollbench(); }
+        // `share` (lane epref, see share.rs).
+        if !arg.is_null() && *arg == b's' && *arg.add(1) == b'h' { return share::share_main(); }
         // `stat` (lane epattr, see stat.rs).
         if !arg.is_null() && *arg == b's' { return stat::stat_main(); }
         // `xwake`: the exit-wake guard alone (wake attribution reruns).
@@ -258,7 +261,9 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if !test_nested_inner_add_while_away() { failures += 1; }
     if !test_alternating_instances_cached() { failures += 1; }
 
-    write_summary(27, failures);
+    failures += share::share_main();
+
+    write_summary(27 + share::SHARE_CHECKS, failures);
     puts(b"--- epolltest done ---\n\0".as_ptr());
     failures
 }
