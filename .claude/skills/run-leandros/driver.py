@@ -1970,7 +1970,7 @@ def _paste_body(raw: bytes) -> str:
 # loaded KVM box the echo does not catch up within echo_timeout, the line is
 # cancelled and retried, and the command never runs. Lines longer than this
 # are staged into a guest file in short typed pieces and run with `.`.
-_LONG_LINE = 600
+_LONG_LINE = int(os.environ.get("LEANDROS_LONG_LINE", "600"))
 _STAGE_PIECE = 300
 
 
