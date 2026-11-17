@@ -336,7 +336,7 @@ pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: 
     let mut st = STATE.lock();
     let st = &mut *st;
     let i = match st.insts.get_mut(&inst) { Some(i) if i.fan => i, _ => return Err(-22) };
-    let found = i.watches.iter().position(|w| w.mount == mount && if mount { w.fs == fs && if fs { w.dev == dev } else { w.path == path } } else { w.ino == id && id != (0, 0) });
+    let found = i.watches.iter().position(|w| w.mount == mount && if mount { w.fs == fs && w.dev == dev } else { w.ino == id && id != (0, 0) });
     if remove {
         let p = found.ok_or(-2)?;
         let w = &mut i.watches[p];
@@ -401,7 +401,7 @@ pub fn fan_read(inst: u32, max: usize) -> Result<Vec<(u32, Vec<u8>, u32, u32, Id
 /// Does mount mark `w` cover an object whose mount is rooted at `root` on
 /// filesystem `dev`? MOUNT = that mount only; FILESYSTEM = every mount of the
 /// superblock.
-fn mnt_match(w: &Watch, root: &[u8], dev: u64) -> bool { if w.fs { w.dev == dev } else { w.path == root } }
+fn mnt_match(w: &Watch, _root: &[u8], dev: u64) -> bool { w.dev == dev }
 
 /// Mount marks: an event on `path` reaches every mark whose mount root is a
 /// prefix of it.
