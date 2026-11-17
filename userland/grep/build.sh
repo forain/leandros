@@ -2,7 +2,7 @@
 # Build the grep regression test -- static musl, one arch per
 # invocation: ./build.sh aarch64 | ./build.sh x86_64
 #
-# Mirrors ports/mkfs-fat/build.sh: the pinned nightly toolchain, the zig-cc
+# Mirrors ports/mkfs-fat/build.sh: the pinned nightly toolchain, the clang/lld
 # linker wrapper, link-self-contained=no so rustc's own musl CRT objects are
 # linked in, relocation-model=static so the loader gets an ET_EXEC.
 set -euo pipefail

@@ -3,18 +3,17 @@
 # correct soname and version script, for both arches, and install into a
 # per-arch sysroot (usr/lib + usr/include + usr/lib/pkgconfig).
 #
-# Toolchain: scripts/linker-<arch>-musl.sh, the same zig-cc musl wrapper
-# scripts/build-all.sh already uses to cross-build coreutils/brush/bottom/
-# relibc. If `zig` isn't on PATH, skip with a warning instead of failing the
-# whole build — matches the "source not found, skipping" idiom build-all.sh
-# uses for its other out-of-repo build dependencies.
+# Toolchain: scripts/linker-<arch>-musl.sh, the same clang/lld musl wrapper
+# (scripts/toolchain) scripts/build-all.sh already uses to cross-build
+# coreutils/brush/bottom. If the toolchain sysroot is missing, skip with a
+# warning instead of failing the whole build.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OUT_ROOT="$ROOT_DIR/target/input-stack-sysroot"
 
-if ! command -v zig >/dev/null 2>&1; then
-  echo "⚠️  zig not found on PATH; skipping input-stack shim build (libseat/libudev)"
+if ! "$ROOT_DIR/scripts/toolchain/check.sh" >/dev/null 2>&1; then
+  echo "⚠️  musl toolchain not ready (run scripts/toolchain/mk-sysroot.sh); skipping input-stack shim build (libseat/libudev)"
   exit 0
 fi
 
