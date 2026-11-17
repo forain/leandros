@@ -60,7 +60,7 @@ sudo apt install lld    # ld.lld is used for both targets
 
 ## The clang/lld musl cross toolchain
 
-Third-party userspace (Mesa, COSMIC, brush, coreutils, MAME) and every in-tree C program are built for `{x86_64,aarch64}-unknown-linux-musl` with **clang and lld**; **zig is not needed and must not be installed for this tree** (it used to provide `zig cc`; the migration finished on 2026-11-17 and a poison-zig build gate keeps every script from calling it again). Why the change: `zig cc` always injected its own `compiler_rt`, whose hidden-local `memcpy`/`memset`/`libm` symbols poisoned musl's, and its sysroot could not be pinned to the one the image ships. The replacement links against the **same musl the image runs**.
+Third-party userspace (Mesa, COSMIC, brush, coreutils, MAME) and every in-tree C program are built for `{x86_64,aarch64}-unknown-linux-musl` with **clang and lld**; **zig is not needed and must not be installed for this tree** (it used to provide `zig cc`; the migration finished on 2026-11-17 and a full build on both arches with a poisoned `zig` on `PATH`, which logs every call, recorded none). Why the change: `zig cc` always injected its own `compiler_rt`, whose hidden-local `memcpy`/`memset`/`libm` symbols poisoned musl's, and its sysroot could not be pinned to the one the image ships. The replacement links against the **same musl the image runs**.
 
 The host needs LLVM 21 or newer: macOS `brew install llvm lld` (without `lld`, `mk-sysroot.sh` writes a `ld.lld` shim around Rust's bundled `rust-lld -flavor gnu` into `$LEANDROS_TOOLCHAIN/bin`, so the Rust toolchain alone is enough); Linux `clang lld llvm` from the distribution.
 
