@@ -46,9 +46,10 @@ The sandboxing work adds two more `lib/` crates: [`lib/seccomp-bpf`](../../lib/s
 | [`ports/`](../../ports) | Build recipes and integration files for third-party software: Mesa, D-Bus/busd and the system-bus services, COSMIC components, greetd and `pam-leandros`, input-stack shims (libseat, libudev), PipeWire, Firefox, the desktop portal, brush, mkfs.fat, mkfs.xfs, OpenRM. Each has its own README. See [ports](../userland/ports.md). |
 | [`Kconfig`](../../Kconfig) and `drivers/Kconfig` | The kernel configuration tree (symbols map to `drv-*` cargo features); edit with `scripts/menuconfig.sh`, which uses the vendored kconfiglib in `scripts/kconfig/`. |
 | [`modules/`](../../modules) | Loadable kernel module crates, built by `scripts/kmod/` (`kmod-build.sh`, `kmodpost.py`, `bidcheck.py`). |
-| [`scripts/`](../../scripts) | Build, image, run and deploy scripts (`build-all.sh`, `run-qemu.sh`, `mkfs-f2fs-populated.py`, the musl cross wrappers, Raspberry Pi and USB-stick writers, benchmarks). |
+| [`scripts/`](../../scripts) | Build, image, run and deploy scripts (`build-all.sh`, `run-qemu.sh`, `mkfs-f2fs-populated.py`, the Raspberry Pi and USB-stick writers, benchmarks). |
 | [`artifacts/`](../../artifacts) | Versioned investigation instruments — session drivers, capture harnesses — and `artifacts/notes/`, the lane notes each measured claim in this handbook rests on. Authored sources, notes and harnesses only; large binaries live outside the repository. |
 | [`.claude/skills/run-leandros/`](../../.claude/skills/run-leandros) | The scriptable QEMU driver (`driver.py`) and the test and session runners built on it. See [workflow](../development/workflow.md). |
+| [`scripts/toolchain/`](../../scripts/toolchain) | The clang/lld musl cross toolchain: static `<arch>-linux-musl-{cc,c++}` wrappers, `mk-sysroot.sh`/`ensure.sh` over the locked Alpine sysroot (`ports/alpine/toolchain.lock`), `dyn/` for the dynamic COSMIC toolchain. |
 | [`linkers/`](../../linkers) | Kernel linker scripts: Limine and direct-boot variants per architecture. |
 | [`targets/`](../../targets) | Custom target specs: `*-unknown-kernel.json` for the kernel, `x86_64-unknown-leandros.json` for the hard-float leandros-libc (DOOM). |
 | [`limine/`](../../limine) | `limine.conf` copied into the boot image. |
@@ -68,7 +69,7 @@ Large dependencies live outside this tree, as siblings of the repository root (`
 | `../coreutils` | uutils coreutils |
 | `../cosmic-epoch` | COSMIC desktop sources (built unmodified) and the source of `xdg-desktop-portal-cosmic` |
 | `../doomgeneric` | DOOM port; also triggers the SoundFont download |
-| `../mame` | MAME |
+| `../mame` | MAME (or the directory in `$LEANDROS_MAME_DIR`) |
 | `../bottom-leandros` | The `bottom` process monitor |
 | `../disks-rs` | AerynOS's disk provisioning crates (`disktester`), built unmodified |
 

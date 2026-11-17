@@ -8,7 +8,7 @@ The kernel core provides scheduling, IPC and memory management. Everything else 
 
 The goal is that a Linux program cannot tell the difference. When LeandrOS and Linux disagree, LeandrOS is wrong, and the fix belongs in the kernel, not in the program (see [design principles](design-principles.md)).
 
-## Current state (October 2026)
+## Current state (November 2026)
 
 - **Graphical login by default, on both architectures.** PID 1 (`userland/init`) supervises `greetd` + `cosmic-greeter` on the display, a serial `login:` getty on the serial console, and text logins on virtual terminals 2–6. The greeter runs unprivileged (uid 990), authenticates against `/etc/shadow` (`root`/`root` or `leandro`/`leandro`), and hands off to a full **COSMIC desktop**: `cosmic-session` → `cosmic-comp` → `busd` (D-Bus) → `cosmic-bg`, `cosmic-panel`, the panel and dock applets, `cosmic-term` on a kernel PTY, COSMIC Settings, D-Bus service activation and an xdg-desktop-portal; Ctrl+Alt+F1–F6 switches virtual terminals, with display and input arbitrated per VT. See [Logging in](../getting-started/logging-in.md) and [the desktop stack](../desktop/README.md).
 - **COSMIC is unmodified** apart from one narrowly scoped correctness patch (a closed-window texture leak in `cosmic-comp`, `ports/cosmic-comp/`). Every other incompatibility was fixed on the kernel side.
@@ -17,6 +17,8 @@ The goal is that a Linux program cannot tell the difference. When LeandrOS and L
 - **Real hardware**: a real x86-64 PC boots from a USB stick with the root file system on it; NVIDIA's open GPU kernel modules drive an RTX 3070 (COSMIC, Firefox with YouTube and sound). An HP EliteBook (all-Intel) boots COSMIC on i915 with Wi-Fi, a touchpad, a webcam, external displays, battery and backlight, USB Bluetooth and microphone capture. The Raspberry Pi 5 has Wi-Fi, Ethernet (RP1), USB, Bluetooth, HDMI audio and a V3D GPU driver that Mesa renders on. See [hardware](../hardware/README.md).
 - **kexec**: a running LeandrOS can boot another kernel image, on both architectures and on the real laptop and Pi, which is also how kernels are updated over the network.
 - **Loadable kernel modules**: drivers are configured Y/M/N with `scripts/menuconfig.sh`; many (network, block, sound, USB, Wi-Fi, Bluetooth) build as modules loaded by alias. See [kernel modules](../kernel/modules.md).
+- **Toolchain**: all host-side C and C++ (Mesa, COSMIC, MAME, the in-tree tests) builds with clang and lld against a locked Alpine musl sysroot, the same musl the image ships; zig is no longer used or needed ([prerequisites](../getting-started/prerequisites.md#the-clanglld-musl-cross-toolchain)).
+- **Test farm**: a Linux desktop runs the full regression on both architectures in parallel, detached from the submitting machine ([workflow](../development/workflow.md#locks-the-regress-farm-and-lane-discipline)); long suites live in a separate `slow` group ([testing](../development/testing.md#running-the-suites)).
 - **Bluetooth**: `btd` and `bthid` in userland over a raw HCI node, with an `org.bluez` shim for the COSMIC Bluetooth applet.
 
 The dated record of how it got here is in [History](history.md); the live list of open work is [TODO.md](../../TODO.md).

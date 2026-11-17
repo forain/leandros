@@ -60,13 +60,18 @@ sudo apt install lld    # ld.lld is used for both targets
 
 ## The clang/lld musl cross toolchain
 
-Third-party userspace (Mesa, COSMIC, brush, coreutils) is built for `{x86_64,aarch64}-unknown-linux-musl`. The host needs LLVM 21 or newer: macOS `brew install llvm lld`; Linux `clang lld llvm` from the distribution. The target side (Alpine musl sysroot, Linux UAPI headers, compiler-rt builtins, libc++) comes from locked Alpine packages: `scripts/toolchain/mk-sysroot.sh <arch>` builds it, `scripts/toolchain/check.sh` verifies it (see [scripts/toolchain/README.md](../../scripts/toolchain/README.md)). The wrappers in `scripts/` drive the cross-build:
+Third-party userspace (Mesa, COSMIC, brush, coreutils, MAME) and every in-tree C program are built for `{x86_64,aarch64}-unknown-linux-musl` with **clang and lld**; **zig is not needed and must not be installed for this tree** (it used to provide `zig cc`; the migration finished on 2026-11-17 and a full build on both arches with a poisoned `zig` on `PATH`, which logs every call, recorded none). Why the change: `zig cc` always injected its own `compiler_rt`, whose hidden-local `memcpy`/`memset`/`libm` symbols poisoned musl's, and its sysroot could not be pinned to the one the image ships. The replacement links against the **same musl the image runs**.
 
-- `scripts/cc-<arch>-musl.sh` — the static musl C compiler, stripping the `--target=` spelling that `cc-rs` appends.
-- `scripts/linker-<arch>-musl.sh` — the Rust linker wrapper for the musl targets.
-- `scripts/ar-musl.sh` — `llvm-ar`; needed because `cc-rs` otherwise uses the host macOS `ar`, whose Mach-O archives `ld.lld` cannot read: the objects compile and every symbol in them comes back undefined at link time.
+The host needs LLVM 21 or newer: macOS `brew install llvm lld` (without `lld`, `mk-sysroot.sh` writes a `ld.lld` shim around Rust's bundled `rust-lld -flavor gnu` into `$LEANDROS_TOOLCHAIN/bin`, so the Rust toolchain alone is enough); Linux `clang lld llvm` from the distribution.
 
-Without the toolchain, `build-all.sh` fails with a fix-it message instead of skipping the shims and C conformance tests.
+The target side comes from **locked Alpine packages**, never from the host: [`ports/alpine/toolchain.lock`](../../ports/alpine/toolchain.lock) pins musl-dev (identical to the musl in the image), `linux-headers`, the compiler-rt builtins, `llvm-libunwind` and libc++. `scripts/toolchain/mk-sysroot.sh <arch>` unpacks them into `$LEANDROS_TOOLCHAIN/<arch>/{sysroot,resource}` (default `<artifacts>/llvm-musl`), `scripts/toolchain/ensure.sh <arch>` is what the build calls to create it when missing or stale (a clang upgrade or a lock change), and `check.sh` / `selftest.sh <arch> [--guest]` verify it, the latter by running the produced binaries natively, under qemu user mode, or inside the guest. `toolchain-lock.py refresh` re-pins the lock after `alpine-lock.py refresh`. Details: [scripts/toolchain/README.md](../../scripts/toolchain/README.md).
+
+Two families of wrappers drive the cross-build:
+
+- **Static** - `scripts/toolchain/<arch>-linux-musl-{cc,c++}`: static non-PIE musl executables, no aarch64 outline atomics, `cc-rs`'s `--target=` spelling stripped; C++ is static libc++, libc++abi and libunwind. `-shared`, `-pie` and `-dynamic` links stay dynamic. The older `scripts/cc-<arch>-musl.sh`, `scripts/linker-<arch>-musl.sh` and `scripts/ar-musl.sh` are thin entry points into them; `ar-musl.sh` is `llvm-ar`, needed because `cc-rs` otherwise picks macOS `ar`, whose Mach-O archives `ld.lld` cannot read (the objects compile and every symbol comes back undefined at link time).
+- **Dynamic** - `scripts/toolchain/dyn/`: the wrappers for the COSMIC and GL stack, which links against the merged `m3-gl-stack/sysroot-<arch>` and so produces the dynamic musl binaries the desktop needs. `dyn/install.sh` rewrites the forwarders under `<artifacts>/{m6-session-bins,m3-gl-stack}/toolchain`, so run it from the checkout that should be canonical.
+
+Without the toolchain, `build-all.sh` fails with a fix-it message instead of skipping the shims and C conformance tests. The MAME sibling is found at `../mame`, or at `$LEANDROS_MAME_DIR` when set (the box farm uses this).
 
 ## Container tooling
 
