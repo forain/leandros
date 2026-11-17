@@ -1138,11 +1138,12 @@ def privsep_perf(ssh, user, pw, tmp):
     pids = {r[0] for r in rows}
     lis = [r for r in rows if r[2] == "sshd" and r[1] not in pids]
     mon = [r for r in rows if r[2] == "sshd" and r[1] in {x[0] for x in lis}]
-    pre = [r for r in rows if r[2] == "sshd-preauth"]
+    pre = [r for r in rows if r[2] in ("sshd-preauth", "sshd-net")]
     def kb(rs):
         v = [int(r[3].split()[0]) for r in rs if r[3].split()]
         return f"{min(v)}..{max(v)}" if v else "n/a"
     print(f"PERF rss_kB listener={kb(lis)} monitor_or_session={kb(mon)} netchild={kb(pre)} connections=4 rows={len(rows)}", flush=True)
+    print("PERF rows " + " ".join(f"{r[0]}:{r[1]}:{r[2]}:{r[3].split()[0] if r[3].split() else 0}" for r in rows), flush=True)
     for h in holders:
         stop(h)
     mb = 16
