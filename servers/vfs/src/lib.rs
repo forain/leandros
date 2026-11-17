@@ -5332,11 +5332,27 @@ fn inotify_fd_event(pid: u32, fd: usize, mask: u32) {
     inotify::note_event(o, mask);
 }
 
+/// The mount `path` lies on: (its backing root prefix, its `st_dev`). A
+/// tmpfs space is its own mount; otherwise the longest registered mount
+/// prefix, else the root.
+pub fn fan_mount_of(path: &[u8]) -> (Vec<u8>, u64) {
+    let p = tmpfs_path(path).unwrap_or(path);
+    if let Some(r) = tmpfs_root_of(p) { return (r.to_vec(), tmpfs_dev_of(p).unwrap_or(VFS_ANON_DEV)); }
+    let m = MOUNTS.lock();
+    let mut best: Option<(&[u8], u64)> = None;
+    for e in m.iter() {
+        if !e.in_use { continue; }
+        let pb = e.prefix.as_bytes();
+        if p.starts_with(pb) && (pb == b"/" || p.len() == pb.len() || p.get(pb.len()) == Some(&b'/')) && best.map_or(true, |(b, _)| pb.len() >= b.len()) { best = Some((pb, e.dev)); }
+    }
+    match best { Some((b, d)) => (b.to_vec(), d), None => (b"/".to_vec(), VFS_ANON_DEV) }
+}
+
 /// FAN_OPEN_EXEC_PERM gate of execve(`path`): 0 to go ahead, else -errno.
 pub fn fan_exec_perm(path: &[u8]) -> i32 {
     if !inotify::armed() { return 0; }
     let p = tmpfs_path(path).unwrap_or_else(|| strip_trailing_slash(path)).to_vec();
-    if inotify_kind(&p) == Some(false) { inotify::fan_open_exec(&p); }
+    if inotify_kind(&p) == Some(false) { inotify::fan_open_exec(&p); inotify::inode(&p, inotify::IN_OPEN); }
     if !inotify::perm_watched() { return 0; }
     match inotify_kind(&p) { Some(false) => inotify::fan_perm(&p, inotify::FAN_OPEN_EXEC_PERM, false), _ => 0 }
 }
@@ -13478,7 +13494,9 @@ fn handle_fanotify_mark(pid: u32, fd: usize, path_ptr: usize, flags: u32, mask: 
     };
     if flags & 8 != 0 && !isdir { return err_reply(-20); }
     let remove = op == inotify::FAN_MARK_REMOVE;
-    match inotify::fan_mark(inst, remove, &path, mask as u32, id, nlink, isdir, mount, ignore, surv) {
+    // A MOUNT / FILESYSTEM mark is on the mount (superblock) the path is on, not on the path.
+    let (mpath, mdev) = if mount { fan_mount_of(&path) } else { (path.clone(), 0) };
+    match inotify::fan_mark(inst, remove, &mpath, mask as u32, id, nlink, isdir, mount, fs, mdev, ignore, surv) {
         Ok(()) => ok_reply(),
         Err(e) => err_reply(e),
     }

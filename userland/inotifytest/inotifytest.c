@@ -1602,6 +1602,61 @@ static void t_fan_open_exec(void)
     if (ffd >= 0) close(ffd);
 }
 
+/* MOUNT = the whole mount the path is on (a sibling dir counts, another tmpfs does not);
+ * FILESYSTEM = every mount of the superblock (a bind mount included); FAN_OPEN_EXEC also raises FAN_OPEN. */
+static void t_fan_mount_scope(void)
+{
+    mkd("ms1"); mkd("ms2"); touch("ms2/sib");
+    char d1[128]; path(d1, "ms1");
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, d1);
+    wr("ms2/sib", "z");
+    int other = open("/tmp/.fanmnt-other", O_CREAT | O_WRONLY, 0644);
+    if (other >= 0) { write(other, "z", 1); close(other); }
+    struct fev g[32]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 32);
+    int sib = 0, oth = 0;
+    for (int i = 0; i < n; i++) { if (ends_with(g[i].link, "/ms2/sib")) sib++; if (ends_with(g[i].link, "/.fanmnt-other")) oth++; }
+    fan_closeall(g, n);
+    unlink("/tmp/.fanmnt-other");
+    if (!(mr == 0 && sib >= 1 && oth == 0)) printf("  fan_mount_scope: mr=%d sib=%d oth=%d\n", mr, sib, oth);
+    report("t_fan_mount_scope", mr == 0 && sib >= 1 && oth == 0);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_fs_scope(void)
+{
+    mkd("fs1"); mkd("fs2"); mkd("fsb"); touch("fs2/sib");
+    char d1[128], d2[128], db[128]; path(d1, "fs1"); path(d2, "fs2"); path(db, "fsb");
+    int bound = mount(d2, db, NULL, MS_BIND, NULL) == 0;
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, FAN_OPEN | FAN_CLOSE_WRITE, AT_FDCWD, bound ? db : d1);
+    wr("fs2/sib", "z");
+    struct fev g[32]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 32);
+    int sib = 0;
+    for (int i = 0; i < n; i++) if (ends_with(g[i].link, "/sib")) sib++;
+    fan_closeall(g, n);
+    if (bound) umount(db);
+    if (!(mr == 0 && sib >= 1)) printf("  fan_fs_scope: bound=%d mr=%d sib=%d\n", bound, mr, sib);
+    report("t_fan_fs_scope", mr == 0 && sib >= 1);
+    if (ffd >= 0) close(ffd);
+}
+
+static void t_fan_exec_open(void)
+{
+    int ffd = fan_new();
+    int mr = ffd < 0 ? -1 : fanotify_mark(ffd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, "/bin/true");
+    pid_t c = fork();
+    if (c == 0) { char *av[] = { "true", NULL }; execv("/bin/true", av); _exit(127); }
+    int st = 0; waitpid(c, &st, 0);
+    struct fev g[8]; int n = ffd < 0 ? 0 : fan_drain(ffd, g, 8);
+    int hit = 0;
+    for (int i = 0; i < n; i++) if ((g[i].mask & FAN_OPEN) && g[i].pid == c && ends_with(g[i].link, "/true")) hit++;
+    fan_closeall(g, n);
+    if (!(mr == 0 && hit >= 1)) printf("  fan_exec_open: mr=%d n=%d hit=%d\n", mr, n, hit);
+    report("t_fan_exec_open", mr == 0 && hit >= 1);
+    if (ffd >= 0) close(ffd);
+}
+
 /* Linux raises FAN_OPEN_PERM for the O_CREAT that creates the file (after creation); DENY keeps the file, fails the open. */
 static void t_fanperm_create(void)
 {
@@ -1649,7 +1704,7 @@ static void t_hl_cases(void)
     t_fanperm_deny(); t_fanperm_allow(); t_fanperm_access(); t_fanperm_close_allows(); t_fanperm_self(); t_fanperm_einval(); t_fan_ignore();
     t_fan_hardlink();
     t_fanfid_einval(); t_fanfid_dfid_name(); t_fanfid_dir_fid(); t_fanfid_self(); t_fhandle(); t_fanperm_exec(); t_fanperm_deny_errno();
-    t_fan_rename(); t_fan_open_exec(); t_fanperm_create(); t_fan_fs_fid();
+    t_fan_rename(); t_fan_open_exec(); t_fan_mount_scope(); t_fan_fs_scope(); t_fan_exec_open(); t_fanperm_create(); t_fan_fs_fid();
 }
 
 static void l2_l3_cases(void)
