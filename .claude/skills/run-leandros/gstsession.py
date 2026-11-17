@@ -182,6 +182,7 @@ def main():
         log(f"{name}: NOT ready after {timeout * scale:.0f} s")
         return False
 
+    rc = 0
     wait_for("greeter", lambda: have("cosmic-greeter"), 150)
     ser.pump(4 * scale)
     typ("leandro")
@@ -208,10 +209,24 @@ def main():
             ser.pump(wait * scale)
             log("S3 " + tag + ": " + sh(PLP + "; /usr/bin/pw-top -b -n 1 2>&1 | grep -E 'player|gst|pipewiresink' | cut -c1-90; " + CNT + "; echo", 60))
         log("S3 alive: " + sh("P=$(" + PLP + "); echo pid=$P; head -n 3 /proc/$P/status | tr '\\n' ' '; wc -l < /tmp/player.log; grep -ciE 'panic' /tmp/player.log; grep -iE 'gst|pipewire|audio' /tmp/player.log | tail -n 5 | cut -c1-200", 60))
+        # Gate: the player must still be running (pipeline PLAYING, not exited)
+        # after ~40 s, with no panic and no GStreamer ERROR line in its log.
+        chk = sh("P=$(" + PLP + "); A=0; [ -n \"$P\" ] && A=1; "
+                 "N=$(grep -ciE 'panic' /tmp/player.log); E=$(grep -ciE 'gstreamer error|pipeline error|streaming stopped|not-linked|not-negotiated' /tmp/player.log); "
+                 "L=$(grep -iE 'gstreamer error|pipeline error|streaming stopped|not-linked|not-negotiated' /tmp/player.log | head -n 4 | cut -c1-140 | tr -c 'A-Za-z0-9:._/ =\\n-' '_' | tr '\\n' '|'); echo GATE-alive=$A-panic=${N:-0}-err=${E:-0}-END $L", 60)
+        chk = re.sub(r"\[\s*\d+\.\d+\] \[FORK\][^\n]*", "", chk)
+        log("S3 gate raw: " + " | ".join(l for l in chk.splitlines() if "GERR" in l or "GATE" in l))
+        m = re.search(r"GATE-alive=(\d)-panic=(\d+)-err=(\d+)-END", chk)
+        ok = bool(m) and m.group(1) == "1" and m.group(2) == "0" and m.group(3) == "0"
+        log("S3 gate: " + ("PASS" if ok else "FAIL") + " " + (m.group(0) if m else chk[-200:]))
+        steps["cosmic_player_playing"] = ok
+        if not ok:
+            rc = 1
     json.dump(steps, open(f"{out}/steps.json", "w"), indent=1)
     open(f"{out}/serial-live.log", "w").write(ser.text() if hasattr(ser, "text") else "")
     if "--keep" not in A:
         drv("stop", t=60)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
