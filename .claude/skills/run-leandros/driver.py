@@ -1753,6 +1753,9 @@ def _serial_send(command, timeout=8):
             except BlockingIOError:
                 pass
     s.close()
+    if os.environ.get("LEANDROS_SERIAL_RAW"):
+        with open(os.environ["LEANDROS_SERIAL_RAW"], "a") as f:
+            f.write(repr(buf) + "\n")
 
     # Slice the command's own stdout out on the bracketed-paste toggles. This
     # is what a line-based slice could not do: brush writes ESC[?2004l with no
