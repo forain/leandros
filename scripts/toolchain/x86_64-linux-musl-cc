@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec "$(dirname "${BASH_SOURCE[0]}")/musl-driver.sh" x86_64 c "$@"
