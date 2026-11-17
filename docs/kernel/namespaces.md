@@ -42,6 +42,8 @@ Credentials in the kernel are host (kernel) ids; namespaces only change how ids 
 - `ns_capable(cap)` asks "does this thread hold `cap` in its own user namespace". The new-mount, chroot, `CLONE_NEW*` and `setns` gates use it, evaluated against the namespace that **owns** the object (the mount namespace's owner, the netns's owner), as Linux's `cap_capable` walk does.
 - `host_capable(cap)` asks "is this euid 0 in the *initial* user namespace". Host-wide effects (loading kernel modules, `bpf(2)` program load and attach, `settimeofday`, device nodes) use it, so root inside a container cannot reach them. `crun` sees the resulting `EPERM` on `bpf` and treats the container as rootless.
 
+Host-wide syscalls are gated on the specific capability, not on blanket "host root" (lanes capclock/capaudit, 2026-11-15): `host_capable(CAP_SYS_TIME)` for `clock_settime`/`settimeofday`, `CAP_SYS_BOOT` for `reboot`/`kexec`, `CAP_SYS_MODULE` for the module syscalls, `CAP_SYS_RAWIO` for `iopl`/`ioperm`, and `CAP_WAKE_ALARM` for the `CLOCK_*_ALARM` timers. The remaining `host_root()` tests in the kernel and servers were converted the same way, so dropping one capability from a host-root process now removes exactly that power (`captest`).
+
 Capability transitions follow Linux: `capget`/`capset` subset rules, `PR_CAPBSET_READ/DROP`, `cap_emulate_setxuid` on the setuid family, `execve` recomputing sets (set-id bits and file capabilities are ignored when the task's user namespace is not the initial one). `/proc/<pid>/status` prints `CapInh/CapPrm/CapEff/CapBnd/CapAmb`, `NoNewPrivs` and `Seccomp`/`Seccomp_filters`.
 
 ## User namespaces
