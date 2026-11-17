@@ -62,7 +62,8 @@ static UART_DRAINS: AtomicU64 = AtomicU64::new(0);
 /// too once 1 ms has passed, so RX latency does not depend on the LAPIC mode.
 static LAST_DRAIN_TSC: AtomicU64 = AtomicU64::new(0);
 
-/// `[ticks, timer irqs, deadline-only irqs that returned early, uart drains]`.
+/// `[ticks, timer irqs, deadline-only irqs that returned early, uart drains,
+/// uart rx bytes]`.
 #[no_mangle]
 pub extern "C" fn arch_timer_stats(out: *mut u64) {
     unsafe {
@@ -70,6 +71,7 @@ pub extern "C" fn arch_timer_stats(out: *mut u64) {
         out.add(1).write(CPU0_TIMER_IRQS.load(Ordering::Relaxed));
         out.add(2).write(CPU0_DEADLINE_EARLY.load(Ordering::Relaxed));
         out.add(3).write(UART_DRAINS.load(Ordering::Relaxed));
+        out.add(4).write(evdev_server::SERIAL_RX_BYTES.load(Ordering::Relaxed));
     }
 }
 

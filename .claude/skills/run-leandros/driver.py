@@ -1931,7 +1931,7 @@ def _echo_seen(buf: bytes, line: str) -> bool:
     return want in re.sub(r"\s", "", _lrc_clean(buf[-(8 * len(line) + 8192):], True))
 
 
-def _type_line(ser, line, echo_timeout, attempts=3):
+def _type_line(ser, line, echo_timeout, attempts=3, pace=True):
     """Type `line` at the prompt and submit it once its echo is intact.
     Returns True when submitted after a verified echo."""
     for attempt in range(attempts):
@@ -1943,7 +1943,7 @@ def _type_line(ser, line, echo_timeout, attempts=3):
             mark = len(ser.buf)
             ser.pump(echo_timeout, until=lambda b: _at_prompt(b[mark:]))
         mark = len(ser.buf)
-        ser.send(("  " + line).encode())
+        ser.send(("  " + line).encode(), pace=pace)
         if ser.pump(echo_timeout, until=lambda b: _echo_seen(b[mark:], line)):
             ser.submit_at = len(ser.buf)
             ser.send(b"\r")
@@ -1970,7 +1970,7 @@ def _paste_body(raw: bytes) -> str:
 # loaded KVM box the echo does not catch up within echo_timeout, the line is
 # cancelled and retried, and the command never runs. Lines longer than this
 # are staged into a guest file in short typed pieces and run with `.`.
-_LONG_LINE = 600
+_LONG_LINE = int(os.environ.get("LEANDROS_LONG_LINE", "600"))
 _STAGE_PIECE = 300
 
 
@@ -1988,12 +1988,14 @@ def _stage_long(ser, text, nonce, echo_timeout):
     return f". {path}; rm -f {path}"
 
 
-def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
+def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None, raw=False):
     """Run `command` in the serial shell; return a dict
     {rc, status, output, secs}. status: 'ok' (sentinel seen), 'rc-file'
     (status read back from the guest file), 'timeout' (still running at the
     deadline; it was interrupted with ^C), 'lost' (no status anywhere).
-    `ser`: a held `_Serial` to run over (left open); default: a fresh one."""
+    `ser`: a held `_Serial` to run over (left open); default: a fresh one.
+    `raw`: type the line as one unpaced burst and never stage it through a
+    guest file, however long (the rawline suite: serial input throughput)."""
     if echo_timeout is None:
         echo_timeout = 10.0 * (wait_scale(arch) if arch else 1.0)
     nonce = os.urandom(4).hex()
@@ -2004,10 +2006,10 @@ def serial_run(command, timeout=120, echo_timeout=None, arch=None, ser=None):
     if own:
         ser = _Serial()
     try:
-        if len(wrapped) > _LONG_LINE:
+        if len(wrapped) > _LONG_LINE and not raw:
             wrapped = _stage_long(ser, wrapped, nonce, echo_timeout)
         ser.pump(0.2)
-        echo_ok = _type_line(ser, wrapped, echo_timeout)
+        echo_ok = _type_line(ser, wrapped, echo_timeout, attempts=1 if raw else 3, pace=not raw)
         # The drain thread may already hold a fast command's output: count
         # from the submit, not from now.
         start = ser.submit_at

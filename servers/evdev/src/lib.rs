@@ -798,6 +798,11 @@ static SERIAL_RX: Mutex<SerialBacklog> =
 pub static SERIAL_RX_THROTTLED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Bytes the drain has taken from the UART since boot (`/proc/stat`
+/// `timerstat` field 5): serial input throughput, independent of the shell.
+pub static SERIAL_RX_BYTES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Free slots in the console tap's keyboard queue (CLIENT_EVENTS if absent).
 fn console_room() -> usize {
     let f = unsafe { arch_interrupt_save() };
@@ -931,6 +936,7 @@ pub fn serial_rx_drain(read: &mut dyn FnMut() -> Option<u8>) -> bool {
             return true;
         }
         let b = match read() { Some(b) => b, None => return false };
+        SERIAL_RX_BYTES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Line-discipline ISIG intercept: ^C/^\/^Z become signals to the
         // foreground process group instead of input bytes.
         if tty_server::console_intercept_byte(b) { continue; }
