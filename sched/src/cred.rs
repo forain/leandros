@@ -76,7 +76,7 @@ fn kill_check_ns(tgid: Pid, sig: u32) -> (isize, crate::ns::NsId, crate::ns::NsI
     let rq = RUN_QUEUE.lock();
     let c = match caller(&rq) { Some(c) => c, None => return (ESRCH, 0, 0) };
     match rq.find_pid(tgid) {
-        Some(t) if t.pid == t.tgid => {
+        Some(t) if t.pid == t.tgid && !crate::reaped_zombie(t) => {
             let tn = t.pidns.id();
             if !crate::pidns::is_ancestor_or_eq(c.pidns, tn) { return (ESRCH, tn, c.pidns); }
             let r = if may_signal(&c, t, sig) { 0 } else { EPERM };
@@ -105,6 +105,7 @@ pub fn kill_thread(tgid: Option<Pid>, tid: Pid, sig: u32, info: task::SigInfo) -
         let rq = RUN_QUEUE.lock();
         let c = match caller(&rq) { Some(c) => c, None => return ESRCH };
         let t = match rq.find_pid(tid) { Some(t) => t, None => return ESRCH };
+        if crate::reaped_zombie(t) { return ESRCH; }
         if let Some(g) = tgid { if t.tgid != g { return ESRCH; } }
         if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { return ESRCH; }
         let owner = rq.find_pid(t.tgid).unwrap_or(t);
@@ -133,7 +134,7 @@ pub fn kill_pgrp_checked(pgid: Pid, sig: u32, info: task::SigInfo) -> isize {
         sn = c.pidns;
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.pgid != pgid || t.pid != t.tgid { continue; }
+                if t.pgid != pgid || t.pid != t.tgid || crate::reaped_zombie(t) { continue; }
                 if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { continue; }
                 found = true;
                 if may_signal(&c, t, sig) && sig != 0 && crate::pidns::init_drops(c.pidns, t, sig) {
@@ -171,7 +172,7 @@ pub fn kill_all_checked(sig: u32, info: task::SigInfo) -> isize {
         sn = c.pidns;
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.pid != t.tgid || t.tgid == init || t.tgid == c.tgid { continue; }
+                if t.pid != t.tgid || t.tgid == init || t.tgid == c.tgid || crate::reaped_zombie(t) { continue; }
                 if !crate::pidns::is_ancestor_or_eq(c.pidns, t.pidns.id()) { continue; }
                 // The caller namespace's own init is skipped like the global one.
                 if c.pidns != 0 && t.tgid == crate::ns::pid_init(c.pidns) { continue; }

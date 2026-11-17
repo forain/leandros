@@ -78,7 +78,13 @@ DRIVER = os.path.join(HERE, "driver.py")
 # "ESC[?2004lGOOD" — and this pattern then deleted it. driver.py now slices the
 # stdout out on those toggles and strips escapes, so nothing here should ever
 # see one again; matching on "2004" would only risk eating a legitimate line.
-NOISE_RE = re.compile(r"^\[|Task::|brush-0|^\s*$")
+#
+# Kernel lines are matched exactly as driver.py's _KLOG_START does (printk
+# timestamp, or an upper-case "[TAG]"), not as "any line starting with [":
+# that also ate real output glued to a kernel fragment whose '\n' the UART
+# dropped under back-pressure (x86_64/KVM, lane x86virgl; the kernel now ends
+# such a line before the next write).
+NOISE_RE = re.compile(r"^(?:\[ *[0-9]+\.[0-9]{6}\] |\[[A-Z][A-Z0-9_-]*\])|Task::|brush-0|^\s*$")
 
 
 def guest(line, timeout=20):

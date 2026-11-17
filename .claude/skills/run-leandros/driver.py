@@ -1414,6 +1414,7 @@ def _read_serial_until(sentinel, timeout=120, at_prompt=False):
                 try:
                     chunk = s.recv(4096)
                     if not chunk:
+                        print("serial EOF (QEMU closed the socket)", file=sys.stderr)
                         break
                     buf += chunk
                     lf.write(chunk)
@@ -1560,14 +1561,17 @@ def cmd_start(arch="aarch64", mode="uefi", venus=False, virgl=False):
             tail = "(no log)"
         print("WARNING: shell prompt not seen. Serial tail:", file=sys.stderr)
         print(tail, file=sys.stderr)
-        if _qemu_pid() is None:
+        # proc.poll() reaps a dead child; _qemu_pid()'s kill(pid, 0) succeeds
+        # on an unreaped zombie and would hide the exit.
+        rc = proc.poll()
+        if rc is not None or _qemu_pid() is None:
             # QEMU itself exited (e.g. another VM holds the image's write lock).
             try:
                 with open(QEMU_STDERR_LOG, "rb") as ef:
                     err = ef.read()[-1024:].decode(errors="replace")
             except Exception:
                 err = "(no stderr log)"
-            print(f"QEMU exited. QEMU stderr:\n{err}", file=sys.stderr)
+            print(f"QEMU exited (code {rc}). QEMU stderr:\n{err}", file=sys.stderr)
         sys.exit(1)
 
     if "login: " in text:
@@ -1753,6 +1757,9 @@ def _serial_send(command, timeout=8):
             except BlockingIOError:
                 pass
     s.close()
+    if os.environ.get("LEANDROS_SERIAL_RAW"):
+        with open(os.environ["LEANDROS_SERIAL_RAW"], "a") as f:
+            f.write(repr(buf) + "\n")
 
     # Slice the command's own stdout out on the bracketed-paste toggles. This
     # is what a line-based slice could not do: brush writes ESC[?2004l with no

@@ -649,6 +649,13 @@ fn send_group_exit_notice(tgid: Pid, n: (Pid, ExitStatus, u32, u8)) {
     }
 }
 
+/// A zombie a wait has already reaped: its slot lingers in the run queue until
+/// the dispatch loop removes it, but the pid is gone for every user-visible
+/// lookup (kill, /proc, pidfd_open), as on Linux.
+pub(crate) fn reaped_zombie(t: &Task) -> bool {
+    t.state == TaskState::Zombie && t.wait_reported
+}
+
 /// pidfd_open's target check: `Ok(())` for a process that can still be named
 /// (live, or a zombie no waiter has consumed), ESRCH for one that is gone,
 /// EINVAL for a thread that is not a group leader.
@@ -657,7 +664,7 @@ pub fn pidfd_target_check(pid: Pid) -> Result<(), isize> {
     match rq.find_pid(pid) {
         None => if exit_logged_unconsumed(pid) { Ok(()) } else { Err(-3) },
         Some(t) if t.tgid != pid => Err(-22),
-        Some(t) if t.state == TaskState::Zombie && t.wait_reported => Err(-3),
+        Some(t) if reaped_zombie(t) => Err(-3),
         Some(_) => Ok(()),
     }
 }
@@ -1601,6 +1608,7 @@ pub fn pgrp_in_session(pgid: Pid, sid: Pid) -> bool {
 pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
     let rq = RUN_QUEUE.lock();
     let t = rq.find_pid(pid)?;
+    if reaped_zombie(t) { return None; }
     let leader = rq.find_pid(t.tgid);
     let leader_stopped = leader.map(|l| l.stop_signal != 0).unwrap_or(false);
     let letter = match t.state {
@@ -1782,7 +1790,7 @@ pub fn process_pids_from(from: Pid, out: &mut [Pid]) -> usize {
         let rq = RUN_QUEUE.lock();
         for i in rq.live_slots() {
             if let Some(t) = rq.get(i) {
-                if t.pid == t.tgid && t.pid >= from && t.pid != 0 {
+                if t.pid == t.tgid && t.pid >= from && t.pid != 0 && !reaped_zombie(t) {
                     if n < out.len() { out[n] = t.pid; n += 1; }
                 }
             }

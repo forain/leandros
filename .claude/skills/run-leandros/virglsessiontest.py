@@ -59,6 +59,7 @@ elif name == "udevhot":
     ok = run([py, f"{HERE}/udevhottest.py"]).returncode == 0
 elif name == "coreutils":
     env["LEANDROS_GPU"] = "none"
+    env["LEANDROS_SERIAL_RAW"] = os.path.join(out, "serial-raw.txt")
     ok = drv("start", arch).returncode == 0
     if ok:
         ok = drv("login", "root", "root").returncode == 0
