@@ -211,6 +211,7 @@ const IPV6_MULTICAST_HOPS: usize = 18;
 const IPV6_MULTICAST_LOOP: usize = 19;
 const MCAST_MSFILTER: usize = 48;
 const IPV6_RECVERR: usize = 25;
+const IPV6_DONTFRAG: usize = 62;
 const IPV6_MTU_DISCOVER: usize = 23;
 const IPV6_MTU: usize = 24;
 const IPV6_RECVPKTINFO: usize = 49;
@@ -1331,6 +1332,8 @@ struct SockOpts {
     tos:       u8,
     /// IP_MTU_DISCOVER + 1 (0 = never set: Linux's default, IP_PMTUDISC_WANT).
     pmtud1:    u8,
+    /// IPV6_DONTFRAG: a datagram over the path MTU is EMSGSIZE, not fragmented.
+    dontfrag:  bool,
     /// Ancillary data recvmsg adds (`RECV_*`): IP_PKTINFO, IP_RECVTOS,
     /// IP_RECVTTL, UDP_GRO; and IP_RECVERR (accepted, read back).
     recv:      u8,
@@ -1415,7 +1418,7 @@ impl SockOpts {
     fn pmtud_mode(&self) -> u8 { if self.pmtud1 == 0 { 1 } else { self.pmtud1 - 1 } }
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
-                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0,
+                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0, dontfrag: false,
                                  recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, dg_peer: 0, dg_wait: 0, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
@@ -4617,9 +4620,11 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 // another interface was refused with a port unreachable and
                 // its sends left by the first stack's route (lane udp2).
                 let server = ip.is_unspecified();
-                // A non-initial netns has only a down loopback: its UDP bind
-                // stays a pure table entry, no host-stack socket (unreachable).
-                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() {
+                // A non-initial netns with neither a loopback that is up nor a
+                // tun/tap: its UDP bind stays a pure table entry, no host-stack
+                // socket (unreachable). With a tun/tap it receives from the
+                // first datagram on, as on Linux (not only from the first read).
+                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() || tunbe::has_vifs(me.netns()) {
                     if let Err(e) = udp_materialize(pid, slot, None, 0, server) { return err_reply(e); }
                 }
             }
@@ -6030,10 +6035,10 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                             return err_reply(-90); // EMSGSIZE
                         }
                     }
-                    // IPv6 never fragments in the path and this stack does not
-                    // fragment at the source: DO / PROBE refuse a datagram
-                    // larger than the path (RFC 8201).
-                    if let (IpAddress::Ipv6(_), true) = (endpoint.addr, pd >= 2) {
+                    // IPv6 is fragmented at the source (smoltcp, Fragment
+                    // header) unless IPV6_DONTFRAG or DO / PROBE refuse a
+                    // datagram larger than the path (RFC 8201).
+                    if let (IpAddress::Ipv6(_), true) = (endpoint.addr, pd >= 2 || opts.dontfrag) {
                         if data.len() + 48 > path_mtu_ip(sid, endpoint.addr) as usize {
                             if opts.recv6 & RECV6_ERR != 0 { udp_local_emsgsize(s, socket_handle, endpoint, path_mtu_ip(sid, endpoint.addr)); }
                             return err_reply(-90);
@@ -8176,6 +8181,7 @@ fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optle
         IPV6_RECVHOPLIMIT => flag(&mut o, RECV6_HOPLIMIT),
         IPV6_RECVTCLASS => flag(&mut o, RECV6_TCLASS),
         IPV6_RECVERR => { flag(&mut o, RECV6_ERR); udp_set_recverr(pid, fd, o.recv6 & RECV6_ERR != 0); }
+        IPV6_DONTFRAG => o.dontfrag = v != 0,
         IPV6_MTU_DISCOVER => match v {
             0..=3 => o.pmtud1 = v as u8 + 1,
             _ => return err_reply(-22),
@@ -8621,6 +8627,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                     IPV6_RECVTCLASS => Some((o.recv6 & RECV6_TCLASS != 0) as u32),
                     IPV6_RECVERR => Some((o.recv6 & RECV6_ERR != 0) as u32),
                     IPV6_MTU_DISCOVER => Some(o.pmtud_mode() as u32),
+                    IPV6_DONTFRAG => Some(o.dontfrag as u32),
                     IPV6_MTU => match e.state {
                         SockState::InetConnected { socket_handle, sid, .. } if is_udp_entry(&e) => {
                             let peer = stack_for(sid).as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).peer());
