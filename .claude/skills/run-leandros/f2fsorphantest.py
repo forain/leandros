@@ -21,6 +21,7 @@ Exit 0 iff every step passes.
 """
 import importlib.util
 import os
+import hostclean
 import struct
 import subprocess
 import sys
@@ -76,6 +77,7 @@ def main(argv):
             sys.exit(__doc__)
     out = os.environ.get("F2FSORPH_OUT", f"/tmp/f2fsorph-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fsorph-*")
     img = os.path.join(out, "orph.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -172,4 +174,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

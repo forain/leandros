@@ -140,6 +140,7 @@ fn nic(w: &mut Out) {
     });
     let _ = writeln!(w);
     let _ = writeln!(w, "fwd: conntrack {}", super::fwd::ct_len());
+    super::fwd::dump_stats(w);
     {
         let mut ports = alloc::vec::Vec::new();
         super::fwd::live_tcp_nat_ports(&mut ports);
@@ -196,6 +197,11 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"igmp"  => {
             let mut t = alloc::string::String::new();
             crate::mcast::proc_igmp(&mut t);
+            let _ = w.write_str(&t);
+        }
+        b"igmp6" => {
+            let mut t = alloc::string::String::new();
+            crate::mcast::proc_igmp6(&mut t);
             let _ = w.write_str(&t);
         }
         b"wifi"  => {

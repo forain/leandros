@@ -18,7 +18,7 @@ These are development credentials, well known by design. `cosmic-greeter` is a s
 
 ### /etc/shadow
 
-The hash format is `$sha256$<salt>$<hex>`, where `<hex>` is the lowercase SHA-256 of the salt bytes followed by the password bytes. It is verified by `/bin/login`'s embedded SHA-256 ([`userland/login`](../../userland/login), no libc `crypt`) and by `pam-leandros` for the graphical login, and produced by Python's `hashlib` in the image builder with a fixed per-user salt. The three must stay byte-for-byte in sync; `pam-leandros` has a host test asserting root's field is identical to what `shadow_hash` writes. `/etc/shadow` is mode `0600`. There is no `passwd(1)`.
+The hash format is sha512-crypt `$6$[rounds=N$]<salt>$<hash>` (the image builder writes `rounds=65536` with a fixed per-user salt); legacy `$sha256$<salt>$<hex>` fields still verify. It is verified by `/bin/login`, sshd and `pam-leandros` through one shared source, [`lib/shadowhash`](../../lib/shadowhash/shadowhash.rs) (no libc `crypt`), and produced by `shadow_hash` in the image builder. `/etc/shadow` is mode `0600`. There is no `passwd(1)`.
 
 ## Logging in
 
@@ -33,6 +33,7 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 **SSH** is a fourth way in. `/usr/sbin/sshd` ([../userland/programs.md](../userland/programs.md#sshd)) listens on `0.0.0.0:22` from boot.
 - It checks passwords against the same `/etc/shadow` hash as `/bin/login`, and keys against `~/.ssh/authorized_keys`.
 - It allows root to log in with a key but not with a password.
+- It forwards TCP (`-L`, `-R`) unless the key line has `no-port-forwarding`/`restrict`; `permitopen=`/`permitlisten=` restrict the destinations. The listener and monitor run as root, but the russh network code runs in a per-connection child (uid 22, chroot `/var/empty`, no_new_privs, seccomp allow-list) that holds no host key; see [../design/sshd-privsep.md](../design/sshd-privsep.md).
 - Its children drop privilege the way `login` does (setgroups, then setresgid, then setresuid) and read the ids back.
 - The development passwords above are therefore reachable from the network wherever the VM's port 22 is. With SLIRP that is only the host's loopback, but with `socket_vmnet` or on real hardware it is the LAN. Change them, or disable sshd with `touch /etc/ssh/sshd_not_to_be_run`, before exposing a machine.
 
@@ -120,7 +121,7 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 | Gap | Notes |
 |---|---|
 | No real PAM stack | `pam-leandros` implements the application ABI greetd needs (including the environment table, which *is* greetd's session `envp`); `open_session`/`setcred` are stubs, which is correct for greetd. Whether to keep extending it or port Linux-PAM (which `dlopen`s its modules) is undecided. |
-| No utmpx | Nothing writes `utmp`/`wtmp`; no shipped program is known to read them. |
+| utmpx is plain files | `/run/utmps/utmp`, `/var/log/wtmp` and `/var/log/lastlog` are written directly by `login`, init, sshd and the PAM shim (all root) with no locking beyond `flock`; the `utmpd` socket accepts `putline` only from uid 0. See [../userland/programs.md](../userland/programs.md#utmpx). |
 | Private IPC syscalls unchecked | `SYS_IPC_SEND` to any port id, `SYS_SPAWN` and the debug serial-write syscall carry no credential checks. |
 | Coarse host privilege | Capabilities and user namespaces exist ([../kernel/namespaces.md](../kernel/namespaces.md)), but most host-wide checks (module load, device nodes, raw sockets, rlimit raises) test euid 0 in the initial namespace rather than an individual capability. |
 | rlimits stored, mostly not enforced | Only `RLIMIT_NICE` and `RLIMIT_RTPRIO` act; all others default to unlimited. |

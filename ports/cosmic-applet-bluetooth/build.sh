@@ -12,6 +12,7 @@
 #
 # Usage: build.sh [aarch64|x86_64|both]   (default: both)
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
@@ -35,7 +36,6 @@ for arch in "${ARCHES[@]}"; do
     echo "cosmic-applet-bluetooth: build failed for $arch (log: $M6/logs/cosmic-applets-$arch.log)" >&2
     exit 1
   fi
-  install -m 0755 "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-bluetooth" \
-    "$M6/out/cosmic-applet-bluetooth-$arch"
+  stage_file 0755 "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-bluetooth" "$M6/out/cosmic-applet-bluetooth-$arch"
   echo "staged $arch: $M6/out/cosmic-applet-bluetooth-$arch"
 done

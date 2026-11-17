@@ -31,6 +31,7 @@ impl InterfaceInner {
         sockets: &mut SocketSet,
         meta: PacketMeta,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+        frag: &'frame mut FragmentsBuffer,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
         // LEANDROS: the traffic class, for IPV6_RECVTCLASS (see udp::Socket::process).
@@ -59,6 +60,44 @@ impl InterfaceInner {
             return None;
         }
 
+        // LEANDROS: reassemble a fragmented datagram (RFC 8200 4.5); the
+        // payload that follows is the upper layer of the whole.
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let (next_header, ip_payload) = if next_header == IpProtocol::Ipv6Frag {
+            let fh = check!(Ipv6FragmentHeader::new_checked(check!(ip_payload.get(2..).ok_or(crate::wire::Error))));
+            let first_nh = ip_payload[0];
+            let (fr, data) = (check!(Ipv6FragmentRepr::parse(&fh)), &ip_payload[8..]);
+            let off = fr.frag_offset as usize * 8;
+            if fr.more_frags && (data.is_empty() || data.len() % 8 != 0) {
+                return None;
+            }
+            if data.is_empty() && !(fr.more_frags) && off == 0 {
+                return None;
+            }
+            let key = FragKey::Ipv6(Ipv6FragKey { src: ipv6_repr.src_addr, dst: ipv6_repr.dst_addr, ident: fr.ident });
+            let f = match frag.assembler.get(&key, self.now + frag.reassembly_timeout) {
+                Ok(f) => f,
+                Err(_) => {
+                    net_debug!("No available packet assembler for fragmented packet");
+                    return None;
+                }
+            };
+            if !fr.more_frags {
+                check!(f.set_total_size(off + data.len()));
+            }
+            if let Err(e) = f.add(data, off) {
+                net_debug!("fragmentation error: {:?}", e);
+                f.reset();
+                return None;
+            }
+            match f.assemble() {
+                Some(payload) => (IpProtocol::from(first_nh), payload),
+                None => return None,
+            }
+        } else {
+            (next_header, ip_payload)
+        };
+
         #[cfg(feature = "socket-raw")]
         let handled_by_raw_socket = self.raw_socket_filter(sockets, &ipv6_repr.into(), ip_payload);
         #[cfg(not(feature = "socket-raw"))]
@@ -72,6 +111,40 @@ impl InterfaceInner {
             handled_by_raw_socket,
             ip_payload,
         )
+    }
+
+    /// LEANDROS: the next IPv6 fragment of the packet the fragmenter holds.
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    pub(super) fn dispatch_ipv6_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+        let mtu_max = if frag.ipv6.mtu != 0 { frag.ipv6.mtu } else { self.ip_mtu() };
+        let left = frag.packet_len - frag.sent_bytes;
+        let offset = frag.sent_bytes - 40;
+        // every fragment but the last carries a multiple of 8 bytes
+        let payload_len = if 40 + 8 + left <= mtu_max { left } else { (mtu_max - 40 - 8) & !7 };
+        let more = left != payload_len;
+        let mut tx_len = 40 + 8 + payload_len;
+        #[cfg(feature = "medium-ethernet")]
+        if matches!(self.caps.medium, Medium::Ethernet) {
+            tx_len += EthernetFrame::<&[u8]>::header_len();
+        }
+        let src = self.hardware_addr;
+        let repr = frag.ipv6.repr;
+        let (ident, tclass) = (frag.ipv6.ident, frag.ipv6.tclass);
+        let data = &frag.buffer[40 + offset..40 + offset + payload_len];
+        #[cfg(feature = "medium-ethernet")]
+        let dst_hw = frag.ipv6.dst_hardware_addr;
+        tx_token.consume(tx_len, |mut tx_buffer| {
+            #[cfg(feature = "medium-ethernet")]
+            if matches!(self.caps.medium, Medium::Ethernet) {
+                let mut frame = EthernetFrame::new_unchecked(&mut tx_buffer[..]);
+                frame.set_src_addr(src.ethernet_or_panic());
+                frame.set_dst_addr(dst_hw);
+                frame.set_ethertype(EthernetProtocol::Ipv6);
+                tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+            }
+            emit_ipv6_fragment(&repr, &mut tx_buffer[..], ident, offset, more, tclass, data);
+        });
+        frag.sent_bytes += payload_len;
     }
 
     fn process_hopbyhop<'frame>(
@@ -187,6 +260,60 @@ impl InterfaceInner {
         }
     }
 
+    /// LEANDROS: IPV6_RECVERR (Linux __udp6_lib_err -> ipv6_icmp_error).
+    #[cfg(feature = "socket-udp")]
+    fn icmpv6_error_q(&mut self, sockets: &mut SocketSet, errno: u8, ty: u8, code: u8, info: u32, offender: IpAddress, header: &Ipv6Repr, data: &[u8]) {
+        if header.next_header != IpProtocol::Udp || data.len() < 8 {
+            return;
+        }
+        let sport = u16::from_be_bytes([data[0], data[1]]);
+        let dport = u16::from_be_bytes([data[2], data[3]]);
+        let local = IpAddress::Ipv6(header.src_addr);
+        let remote = IpEndpoint::new(IpAddress::Ipv6(header.dst_addr), dport);
+        for u in sockets.items_mut().filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket)) {
+            let ep = u.endpoint();
+            if u.recverr()
+                && ep.port == sport
+                && ep.addr.map_or(true, |a| a == local)
+                && u.peer().map_or(true, |p| p == remote)
+            {
+                u.push_err(crate::socket::udp::ErrEntry {
+                    errno,
+                    origin: 3,
+                    ty,
+                    code,
+                    info,
+                    offender,
+                    dst: remote,
+                    payload: data[8..].to_vec(),
+                });
+                u.set_error(errno);
+            }
+        }
+    }
+    #[cfg(not(feature = "socket-udp"))]
+    fn icmpv6_error_q(&mut self, _: &mut SocketSet, _: u8, _: u8, _: u8, _: u32, _: IpAddress, _: &Ipv6Repr, _: &[u8]) {}
+
+    /// A fatal ICMPv6 error reaches a connected UDP socket as its pending error.
+    #[cfg(feature = "socket-udp")]
+    fn icmpv6_error_fatal(&mut self, sockets: &mut SocketSet, errno: u8, header: &Ipv6Repr, data: &[u8]) {
+        if header.next_header != IpProtocol::Udp || data.len() < 8 {
+            return;
+        }
+        let sport = u16::from_be_bytes([data[0], data[1]]);
+        let dport = u16::from_be_bytes([data[2], data[3]]);
+        let local = IpAddress::Ipv6(header.src_addr);
+        let remote = IpEndpoint::new(IpAddress::Ipv6(header.dst_addr), dport);
+        for u in sockets.items_mut().filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket)) {
+            let ep = u.endpoint();
+            if ep.port == sport && ep.addr.map_or(true, |a| a == local) && u.peer() == Some(remote) {
+                u.set_error(errno);
+            }
+        }
+    }
+    #[cfg(not(feature = "socket-udp"))]
+    fn icmpv6_error_fatal(&mut self, _: &mut SocketSet, _: u8, _: &Ipv6Repr, _: &[u8]) {}
+
     pub(super) fn process_icmpv6<'frame>(
         &mut self,
         _sockets: &mut SocketSet,
@@ -252,6 +379,39 @@ impl InterfaceInner {
                 _ => unreachable!(),
             },
 
+            // LEANDROS: Linux icmpv6_err_convert -- (errno, fatal).
+            Icmpv6Repr::DstUnreachable { reason, header, data } => {
+                let code: u8 = reason.into();
+                const TABLE: [(u8, bool); 7] = [
+                    (101, false), // no route: ENETUNREACH
+                    (13, true),   // administratively prohibited: EACCES
+                    (113, false), // (reserved): EHOSTUNREACH
+                    (113, false), // address unreachable: EHOSTUNREACH
+                    (111, true),  // port unreachable: ECONNREFUSED
+                    (13, true),   // source address failed policy: EACCES
+                    (13, true),   // reject route: EACCES
+                ];
+                let (errno, fatal) = TABLE.get(code as usize).copied().unwrap_or((113, false));
+                self.icmpv6_error_q(_sockets, errno, 1, code, 0, ip_repr.src_addr(), &header, data);
+                if fatal {
+                    self.icmpv6_error_fatal(_sockets, errno, &header, data);
+                }
+                None
+            }
+            Icmpv6Repr::TimeExceeded { reason, header, data } => {
+                self.icmpv6_error_q(_sockets, 113, 3, reason.into(), 0, ip_repr.src_addr(), &header, data);
+                None
+            }
+
+            // LEANDROS: RFC 8201 -- a "packet too big" teaches the path MTU
+            // towards the quoted datagram's destination.
+            Icmpv6Repr::PktTooBig { mtu, header, data } => {
+                self.icmpv6_error_q(_sockets, 90, 2, 0, mtu, ip_repr.src_addr(), &header, data);
+                let m = mtu.min(u16::MAX as u32) as u16;
+                crate::pmtu::update(self.pmtu_scope, header.dst_addr.0, m, crate::pmtu::MIN_PMTU6, self.now.total_millis() as u64);
+                None
+            }
+
             // Don't report an error if a packet with unknown type
             // has been handled by an ICMP socket
             #[cfg(feature = "socket-icmp")]
@@ -274,7 +434,10 @@ impl InterfaceInner {
                 target_addr,
                 flags,
             } => {
-                let ip_addr = ip_repr.src_addr.into();
+                // LEANDROS: the resolved address is the NA's target (RFC 4861 7.2.5), not its IP source:
+                // a proxy (pasta) answers for ::2 from its own link-local address.
+                let _ = &ip_repr;
+                let ip_addr = target_addr.into();
                 if let Some(lladdr) = lladdr {
                     let lladdr = check!(lladdr.parse(self.caps.medium));
                     if !lladdr.is_unicast() || !target_addr.is_unicast() {

@@ -14,10 +14,9 @@ this page is the explanation.
   The FileChooser, Screenshot, Settings and Access portals work; applications receive plain
   `file://` URIs, and the portal frontend logs one `unknown destination
   org.freedesktop.portal.Documents` warning per login.
-- **Some system services are absent**: `org.freedesktop.timedate1` (Settings' Date & time
-  page), `net.hadess.SwitcherooControl`, and the accessibility bus `org.a11y.Bus`. Calls to
-  them fail fast with `ServiceUnknown`. `locale -a` does not exist, so Settings' "Add
-  language" list is empty.
+- **No `locale -a`**, so Settings' "Add language" list is empty. timedate1, SwitcherooControl and
+  the a11y bus exist but are minimal ([session.md](session.md#system-services-leandros-sysbus)): no
+  NTP, no PRIME, no at-spi registry.
 - **Services run as the session user.** There is no system bus and no setuid helper, so the
   login1/locale1/UPower implementations cannot do anything that needs root. `SetLocale` as a
   normal user answers `AccessDenied` (`/etc` is root's); power-off is the one root operation
@@ -39,8 +38,10 @@ this page is the explanation.
   confirmed; other machines' keys appear as `kbd: unmapped sc` lines until mapped.
 - **cosmic-monitor has no disk or network data.** `/proc/diskstats`, `/sys/class/net`, `/sys/class/drm` and `/sys/devices/system/cpu` (cpufreq) do not exist, so the disk/network graphs and GPU/frequency readouts stay empty; CPU, memory, load and the process list work. CPU is shown as user time (no user/system split is kept).
 - **cosmic-initial-setup's Network pages need the system bus.** They `unwrap()` `zbus::Connection::system()`; it works only with `DBUS_SYSTEM_BUS_ADDRESS` set as in the session, not from a bare shell.
-- **cosmic-screenshot's capture path is unverified.** The app starts, but the
-  portal/screencopy capture has not produced a PNG in a test.
+- **Headless portal Screenshot needs a stored grant.** The portal asks the user through an
+  Access dialog first; without an answer (or a "screenshot" entry in the permission store) the
+  non-interactive call returns response 2 after 25 s. With the grant the cosmic backend's
+  screencopy capture works (`leandros-sysbus portal screenshot`, 1280x800 PNG).
 - **Firefox is still heavy during YouTube** (about 310 % total CPU on the laptop, Firefox
   decoding in software unless hardware decode is enabled) and a first greetd login after boot
   once failed on the laptop and was not reproduced (diagnostics are in
@@ -48,12 +49,12 @@ this page is the explanation.
 
 ### Login and privilege
 
-- **No PAM stack and no utmpx.** greetd authenticates through `pam-leandros`, a Rust
+- **No PAM stack.** greetd authenticates through `pam-leandros`, a Rust
   implementation of the libpam application ABI backed by `/etc/shadow`
   ([login.md](login.md#no-pam-stack-pam-leandros)); the greeter's lock-screen role links an
   older C shim from outside the repository. Whether to grow the shim or port Linux-PAM (which
-  `dlopen`s modules) is undecided. Nothing shipped reads utmpx — upstream greetd has no utmpx
-  code at all — so implementing it waits on a consumer that would make it testable.
+  `dlopen`s modules) is undecided. greetd sessions are recorded in utmpx by `pam_open_session`/`pam_close_session`
+  (line `greetd`).
 - **The greeter's compositor runs as root.** In the user session every COSMIC process,
   cosmic-comp included, runs as the user. In the *greeter* session cosmic-comp stays root,
   because `libseat` is a shim with no seatd behind it to broker revocable device fds; only the

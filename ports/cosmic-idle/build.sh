@@ -5,6 +5,7 @@
 #
 # Usage: build.sh <aarch64|x86_64> ...   (Mac: uses the m6-session-bins toolchain)
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 ART=${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}
 D=$ART/m6-session-bins
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -33,6 +34,6 @@ for arch in "$@"; do
     rm -f "$bin"   # build-rust.sh's exit status does not reflect cargo's
     sh "$D/build-rust.sh" "$CI" "$arch"
     [ -x "$bin" ] || { echo "cosmic-idle build failed for $arch" >&2; exit 1; }
-    cp "$bin" "$D/out/cosmic-idle-$arch"
+    stage_file 0755 "$bin" "$D/out/cosmic-idle-$arch"
     echo "staged $D/out/cosmic-idle-$arch"
 done

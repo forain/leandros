@@ -136,6 +136,27 @@ const AU_MAX_OPEN: usize = 16;
 // guest the way it does for a stick that stopped answering. One shot.
 static STALL_LBA: AtomicU64 = AtomicU64::new(u64::MAX);
 static STALL_MS: AtomicU64 = AtomicU64::new(0);
+/// `usbms.stall_dump=1`: while the stall window is open, dump every task's
+/// state (`sched::dump_tasks`) from the stalled reader's poll loop every 4 s,
+/// so a shell that stops answering shows where it is parked.
+static STALL_DUMP: AtomicBool = AtomicBool::new(false);
+static STALL_DUMP_NEXT_NS: AtomicU64 = AtomicU64::new(0);
+static STALL_DUMPS: AtomicU32 = AtomicU32::new(0);
+
+/// Called from the USB poll loop; a no-op unless `usbms.stall_dump=1` and the
+/// stall window is open.
+pub fn stall_dump_tick() {
+    if !STALL_DUMP.load(Ordering::Relaxed) { return; }
+    let until = usb::xhci::FAULT_STALL_UNTIL_NS.load(Ordering::Relaxed);
+    if until == 0 { return; }
+    let now = sched::monotonic_ns();
+    if now >= until || STALL_DUMPS.load(Ordering::Relaxed) >= 5 { return; }
+    let next = STALL_DUMP_NEXT_NS.load(Ordering::Relaxed);
+    if now < next { return; }
+    if STALL_DUMP_NEXT_NS.compare_exchange(next, now + 4_000_000_000, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+    STALL_DUMPS.fetch_add(1, Ordering::Relaxed);
+    sched::dump_tasks();
+}
 
 fn maybe_arm_stall(lba: u64, nsec: u64) {
     let l = STALL_LBA.load(Ordering::Relaxed);
@@ -165,6 +186,8 @@ pub fn set_cmdline(cmdline: &str) {
             if let Ok(n) = v.parse::<u64>() { AU_MERGE_US.store(n, Ordering::Relaxed); }
         } else if let Some(v) = tok.strip_prefix("usbms.stall_lba=") {
             if let Ok(n) = v.parse::<u64>() { STALL_LBA.store(n, Ordering::Relaxed); }
+        } else if tok == "usbms.stall_dump=1" {
+            STALL_DUMP.store(true, Ordering::Relaxed);
         } else if let Some(v) = tok.strip_prefix("usbms.stall_ms=") {
             if let Ok(n) = v.parse::<u64>() { STALL_MS.store(n, Ordering::Relaxed); }
         } else if let Some(v) = tok.strip_prefix("usbms.notready_ms=") {

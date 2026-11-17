@@ -98,6 +98,16 @@ Secondary CPUs are enumerated from the ACPI MADT GICC entries, else the device t
 
 The **conduit** is HVC unless the kernel was entered at EL2 (QEMU then registers PSCI on SMC) or is an `rpi5` build (TF-A at EL3, reached by SMC; HVC would fault with no hypervisor). `SYSTEM_OFF` (`0x8400_0008`) and `SYSTEM_RESET` (`0x8400_0009`) implement `reboot(2)`. On `raspi4b` SMP is skipped: that board releases all cores at reset and its SMC dispatch hangs on `CPU_ON` for an already-running core.
 
+### ACPI-only boot (`acpi=force`)
+
+With `acpi=force` on the kernel command line the kernel ignores any DTB and takes the platform from the ACPI tables handed over by Limine (`boot/src/acpi_a64.rs`): MADT (GICD/GICC/GICR bases, GIC version, CPU list, ITS list feeds `its::set_acpi_bases`), GTDT (timer PPIs), SPCR (console UART; interface types 0x03, 0x0D and 0x0E are PL011, 16550 types use the MMIO 16550 backend, which is untested in QEMU), MCFG (single ECAM segment only) and FADT (PSCI conduit HVC/SMC). The runtime values reach `gic::set_platform`, `uart::set_platform` and `smp`. Without the flag the DTB path is unchanged. Test: `.claude/skills/run-leandros/a64acpitest.py` (QEMU virt + edk2, 7 checks). Open: multi-segment PCI.
+
+### MSI / MSI-X through the GICv3 ITS
+
+`arch/aarch64/src/its.rs` drives one ITS (frame from the MADT ITS entry, else the DTB `arm,gic-v3-its` node) after the allocator and KVA window exist (`a64_its_init` in `kernel/src/main.rs`). It programs the device and collection `GITS_BASER` tables, a 4 KiB command queue (MAPD/MAPC/MAPTI/INV/SYNC/DISCARD, issued synchronously), and the boot CPU's redistributor LPI tables (`GICR_PROPBASER`/`PENDBASER`, IDbits 13, 256 LPIs from INTID 8192). All LPIs target collection 0 = the boot CPU. DeviceID = PCI RID (`bus<<8|dev<<3|func`) unless an IORT PCI root-complex ID mapping to an ITS group was found (`boot::acpi_a64::parse_iort`, `its::set_rid_map`). `drivers::irq` then allocates an LPI per vector (`request_msi`, `MsixTable::request`); the message address is `GITS_TRANSLATER` (ITS base + 0x10040) and the data is the EventID. `dispatch_line` routes INTIDs >= 8192 to the LPI table. `/proc/interrupts` lists registered sources (`ITS-MSI` for LPIs). Users: virtio-net RX (MSI-X, else INTx), NVMe I/O CQ with `nvme.msix=1` (completion stays polled; the vector only counts).
+
+`gic.its=0` keeps INTx. Without an ITS (GICv2, rpi5/raspi4b builds, ITS init failure) nothing changes. A kernel entered by kexec that finds LPIs still enabled in the redistributor refuses the ITS and keeps INTx; `kexec_quiesce` disables the ITS and tries to clear EnableLPIs. Limits: flat device table with DeviceIDs < 65536 (no Indirect tables), one ITS, BSP-only delivery, no GICv4. Test: `runtests.py aarch64 <tag> a64its` (`a64itstest.py`, QEMU TCG `its=on`). Real Graviton is unverified.
+
 ## Design decisions
 
 ### Detect the GIC version by behaviour, not by ID register

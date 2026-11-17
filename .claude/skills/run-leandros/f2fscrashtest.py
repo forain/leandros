@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--cmdline "k=v ..."] [--keep]
+"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--crashpt N] [--wseed N] [--cmdline "k=v ..."] [--keep] [--linux]
 
 Crash consistency of f2fs (lane f2fsync), on a fresh 64 MiB volume attached
 as an extra disk (run id `<caller>-f2fscr`). Every iteration:
@@ -27,8 +27,20 @@ as an extra disk (run id `<caller>-f2fscr`). Every iteration:
             whole; every r<k> a whole version; then umount and fsck again
             with --strict-leaks.
 Exit 0 iff every iteration passes.
+
+--linux (lane f2fsp2): the whole run uses `f2fs.lxchain=1` (Linux-format fsync
+node chains) and, between the crash and the LeandrOS recovery boot, the crashed
+image is handed to Linux on the box (scripts/f2fslx/interop.py push/fetch/box;
+hold F2FSINTEROP_LOCK=$SP/lock.sh): `fsck.f2fs --dry-run` of the crashed image
+(informational), a rw loop mount (Linux's own roll-forward recovery, dmesg
+recover_* lines logged), umount, `fsck.f2fs --dry-run` of the result (must be
+rc 0), and the recovered image is fetched back and checked by the usual
+crashscan against the claims (every fsynced file's content and size).
+Re-run one failure with the params printed per iteration
+(`--wseed W --crashpt C --mode crashpt|kill --iters 1`).
 """
 import os
+import hostclean
 import random
 import re
 import shutil
@@ -62,7 +74,73 @@ def fsck(img, strict_leaks):
         args.append("--strict-leaks")
     r = subprocess.run(args, capture_output=True, text=True, timeout=600)
     tail = [l for l in r.stdout.splitlines() if l.startswith(("ERROR", "warning", "checkpoint", "fsck", "note"))]
+    fsck.full = r.stdout + r.stderr
     return r.returncode == 0, "\n    ".join(tail[-8:])
+
+
+def keep_failed(out, img, tag, seed, params, arch):
+    """Keep the image as the failure left it plus the full fsck output; at most 2 sets."""
+    kd = f"/tmp/f2fscr-failed-{arch}"   # bounded: one fixed path per arch, the next failure replaces it
+    os.makedirs(kd, exist_ok=True)
+    sets = sorted({f.rsplit(".", 1)[0] for f in os.listdir(kd)}, key=lambda n: os.path.getmtime(os.path.join(kd, n + ".txt")))
+    for old in sets[:max(0, len(sets) - 1)]:
+        for ext in (".img", ".txt"):
+            if os.path.exists(os.path.join(kd, old + ext)):
+                os.unlink(os.path.join(kd, old + ext))
+    base = os.path.join(kd, f"{arch}-seed{seed}-{tag}")
+    subprocess.run(["cp", "-c", img, base + ".img"], check=False, stderr=subprocess.DEVNULL)
+    if not os.path.exists(base + ".img"):
+        shutil.copyfile(img, base + ".img")
+    with open(base + ".txt", "w") as f:
+        f.write(f"seed {seed} {tag} params: {params}\n" + getattr(fsck, "full", ""))
+    print(f"    kept {base}.img (+ .txt)", flush=True)
+
+
+def linux_recover(img, out, it):
+    """Hand the crashed image to Linux on the box; returns (ok, detail). The image is
+    replaced by Linux's recovered + unmounted result."""
+    sys.path.insert(0, os.path.join(REPO, "scripts", "f2fslx"))
+    import interop
+    interop.LOCK = os.environ.get("F2FSINTEROP_LOCK", interop.LOCK)
+    rd = f"/tmp/f2fscrlx-{os.getpid()}-{it}"
+    try:
+        interop.box(f"mkdir -p {rd}")
+        if not interop.push(img, f"{rd}/c.img"):
+            return False, "push failed"
+        rc, o = interop.box(f"""cd {rd}; cp --sparse=always c.img f0.img; timeout 300 fsck.f2fs --dry-run f0.img </dev/null >f0.txt 2>&1; echo FSCK0_RC=$?
+mkdir -p m; echo LXMARK_{os.getpid()}_{it} | sudo tee /dev/kmsg >/dev/null
+if sudo mount -o loop c.img m; then echo LX_MOUNT_OK; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+sudo dmesg | sed -n '/LXMARK_{os.getpid()}_{it}/,$p' > dm.txt; grep -E 'recover_|f2fs.*(error|corrupt|invalid|Failed)' dm.txt | head -6
+timeout 300 fsck.f2fs --dry-run c.img </dev/null >f1.txt 2>&1; echo FSCK1_RC=$?; grep -E '^\[FSCK\]|Fail|\[ASSERT\]' f1.txt | head -4""", 900)
+        print("    linux:", " | ".join(l.strip()[:110] for l in o.splitlines() if l.strip())[-420:], flush=True)
+        with open(os.path.join(out, f"linux-{it}.txt"), "w") as f:
+            f.write(o)
+        if "LX_MOUNT_OK" not in o or "LX_UMOUNT_OK" not in o:
+            return False, "Linux mount/umount failed"
+        if "FSCK1_RC=0" not in o:
+            return False, "fsck.f2fs after Linux recovery rc != 0"
+        if not interop.fetch(f"{rd}/c.img", img):
+            return False, "fetch failed"
+        return True, ""
+    finally:
+        interop.box(f"rm -rf {rd}")
+
+
+def unsplice(s):
+    """Drop kernel log lines ("[IRQ] ...", "[F2FS] ...") from guest output; the
+    console is shared, so one can land inside a claim line ("U 6" + log + "99")
+    and the line used to be lost, giving a false "fsynced but missing"."""
+    tag = r"\[[A-Z][A-Z0-9_]*\][^\n]*\n"
+    junk = r"(?:\x1b\[[0-9;?]*[A-Za-z]|[ \t\r\[\]0-9.])*"
+    s = re.sub(r"(?m)^" + junk + tag, "", s)
+    return re.sub(r"(?:\[ *[0-9.]+\] ?)?" + tag, "", s)
+
+
+def selftest():
+    for a, b in (("U 6[F2FS] x\n99\n", "U 699"), ("N 6[   31.2] [IRQ] y\n99 4096\n", "N 699 4096"),
+                 ("[IRQ] z\nN 5 7\n", "N 5 7")):
+        assert b in unsplice(a), (a, unsplice(a))
+    print("selftest: PASS")
 
 
 class Claims:
@@ -81,7 +159,7 @@ class Claims:
 
     def parse(self, text):
         for raw in text.splitlines():
-            m = re.match(r"^\s*(A|W|O|N|U|T|R|SETUP)\b(.*)$", raw)
+            m = re.match(r"^\s*(?:\[\s*\d+\.\d+\]\s*)?(A|W|O|N|U|T|R|SETUP)\b(.*)$", raw)  # a kernel log prefix can land in front of a workload line
             if not m:
                 continue
             tag, rest = m.group(1), m.group(2).split()
@@ -171,8 +249,12 @@ class Claims:
 
 
 def main(argv):
+    if "--selftest" in argv:
+        return selftest()
     arch, iters, mode, seed, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 6, "mix", None, False
     extra_cmd = ""
+    linux = False
+    fixed_cp = fixed_ws = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -186,16 +268,25 @@ def main(argv):
             mode = argv[i + 1]; i += 1
         elif a == "--seed":
             seed = int(argv[i + 1]); i += 1
+        elif a == "--crashpt":
+            fixed_cp = int(argv[i + 1]); i += 1
+        elif a == "--wseed":
+            fixed_ws = int(argv[i + 1]); i += 1
         elif a == "--keep":
             keep = True
+        elif a == "--linux":
+            linux = True
         else:
             sys.exit(__doc__)
         i += 1
+    if linux:
+        extra_cmd = (extra_cmd + " f2fs.lxchain=1").strip()
     seed = seed if seed is not None else int(time.time())
     rnd = random.Random(seed)
     print(f"f2fscrashtest: seed {seed}, {iters} iterations, mode {mode}", flush=True)
     out = os.environ.get("F2FSCR_OUT", f"/tmp/f2fscr-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fscr-*")
     img = os.path.join(out, "cr.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -243,7 +334,9 @@ def main(argv):
         if not last:
             how = mode if mode != "mix" else ("crashpt" if it % 2 else "kill")
             if how == "crashpt":
-                cmdline = (f"f2fs.crashpt={rnd.randint(50, 6000)} "
+                cp = rnd.randint(50, 6000)
+                cp = fixed_cp if fixed_cp is not None else cp
+                cmdline = (f"f2fs.crashpt={cp} "
                            f"f2fs.crashpt_mount={2 if prev is not None else 1}")
         cmdline = " ".join(x for x in (cmdline, extra_cmd) if x) or None
         boot(cmdline)
@@ -258,7 +351,7 @@ def main(argv):
             if "F2FS" in l:
                 print("  log:", l.strip()[:160], flush=True)
         if prev is not None:
-            pdir, claims = prev
+            pdir, claims, ppre = prev
             r = run(f"/bin/f2fstest crashscan {pdir}", 300)
             scan = r["output"]
             if "SCAN_DONE" not in scan:
@@ -276,12 +369,15 @@ def main(argv):
                     print("    ", e, flush=True)
                 if errs:
                     fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
+                    if ppre and os.path.exists(ppre):
+                        keep_failed(out, ppre, f"it{it - 1}-prelinux", seed, "image before Linux recovery", arch)
             run(f"rm -rf {pdir}", 300)
             r = run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
             ok, detail = fsck(img, strict_leaks=True)
             print(f"iter {it - 1}: fsck after recovery + umount: {'PASS' if ok else 'FAIL'}\n    {detail}", flush=True)
             if not ok:
                 fails.append(f"iter {it - 1}: fsck after recovery failed")
+                keep_failed(out, img, f"it{it - 1}-recovered", seed, "see log", arch)
             if last:
                 driver.cmd_stop()
                 break
@@ -296,6 +392,8 @@ def main(argv):
         # The workload, until the crash.
         d = f"/mnt/cr/w{it}"
         wseed = rnd.randint(1, 10 ** 9)
+        wseed = fixed_ws if fixed_ws is not None else wseed
+        print(f"iter {it}: params seed={seed} how={how} wseed={wseed} cmdline={cmdline!r}", flush=True)
         ser = driver._Serial()
         try:
             ser.pump(0.2)
@@ -307,15 +405,15 @@ def main(argv):
             else:
                 ser.pump(180, until=lambda b: b"FSYNC_FAIL" in b[start:] or b"WRITE_FAIL" in b[start:]
                          or b"CRASH " in b[start:])
-            text = driver._lrc_clean(ser.buf[start:], True)
+            text = unsplice(driver._lrc_clean(ser.buf[start:], True))
             if os.environ.get("F2FSCR_OUT"):
                 with open(os.path.join(os.environ["F2FSCR_OUT"], f"raw-{it}.bin"), "wb") as f:
                     f.write(bytes(ser.buf[max(0, start - 400):]))
         finally:
             ser.close()
         hard_kill()
-        if os.environ.get("F2FSCR_OUT"):
-            with open(os.path.join(os.environ["F2FSCR_OUT"], f"work-{it}.txt"), "w") as f:
+        if os.environ.get("F2FSCR_OUT") or linux:
+            with open(os.path.join(os.environ.get("F2FSCR_OUT") or out, f"work-{it}.txt"), "w") as f:
                 f.write(text)
         claims = Claims()
         claims.parse(text)
@@ -329,7 +427,20 @@ def main(argv):
         print(f"iter {it}: fsck of the crashed image: {'PASS' if ok else 'FAIL'}\n    {detail}", flush=True)
         if not ok:
             fails.append(f"iter {it}: fsck of the crashed image failed")
-        prev = (d, claims)
+            keep_failed(out, img, f"it{it}-crashed", seed, f"how={how} wseed={wseed} cmdline={cmdline!r}", arch)
+        pre = None
+        if linux:
+            pre = os.path.join(out, f"pre-linux-{it}.img")
+            subprocess.run(["cp", "-c", img, pre], check=False, stderr=subprocess.DEVNULL)
+            if not os.path.exists(pre):
+                shutil.copyfile(img, pre)
+            lok, ldet = linux_recover(img, out, it)
+            print(f"iter {it}: Linux recovery + fsck.f2fs: {'PASS' if lok else 'FAIL ' + ldet}", flush=True)
+            if not lok:
+                fails.append(f"iter {it}: Linux recovery: {ldet} (seed={seed} wseed={wseed} how={how} cmdline={cmdline!r})")
+                keep_failed(out, img, f"it{it}-linux", seed, f"how={how} wseed={wseed} cmdline={cmdline!r}", arch)
+                break
+        prev = (d, claims, pre)
     if not keep and os.path.exists(boot_copy):
         os.unlink(boot_copy)
     print(f"f2fscrashtest: {'PASS' if not fails else 'FAIL'} {fails}")
@@ -337,4 +448,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

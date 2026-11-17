@@ -18,6 +18,7 @@ lanes espdur/espdur2). On a copy of the boot image:
 Exit 0 iff every case PASSes. Run id `<caller run id>-espreset`.
 """
 import os, re, subprocess, sys, tempfile, time
+import hostclean
 import imgclone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -58,11 +59,12 @@ def main(argv):
         return None
 
     tmp = tempfile.mkdtemp(prefix="espreset-")
+
+    hostclean.track(tmp)
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
-    subprocess.run(["cp", "-c", src, img], check=False)
-    if not os.path.exists(img):
-        imgclone.clone_file(src, img)
+    imgclone.clone_file(src, img)
+    imgclone.ensure_remote_key(img)
     env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}")
     os.environ["LEANDROS_DISK_IMAGE"] = img
 
@@ -134,4 +136,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

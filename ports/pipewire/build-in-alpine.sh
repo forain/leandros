@@ -78,6 +78,7 @@ esac
      $(pkg-config --cflags --libs libpipewire-0.3) -lm
   $CC -O2 -Wall -o "$S/usr/bin/leandros-snd-source" /src/leandros-snd-source.c \
      $(pkg-config --cflags --libs libpipewire-0.3)
+  $CC -O2 -Wall -o "$S/usr/bin/gfilemon" /src/gfilemon.c $(pkg-config --cflags --libs gio-2.0)
   if [ -f /src/pw-screencast-probe.c ]; then
     $CC -O2 -Wall -o "$S/usr/bin/pw-screencast-probe" /src/pw-screencast-probe.c \
        $(pkg-config --cflags --libs libpipewire-0.3 gio-2.0 gio-unix-2.0) -lm

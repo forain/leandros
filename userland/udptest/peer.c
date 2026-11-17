@@ -14,6 +14,7 @@
  *                    (IP fragmentation out, reassembly in); the peer saw >= 3
  *                    fragmented datagrams, frames <= 1514, fragment payloads a
  *                    multiple of 8, DF clear, no overlaps
+ *   peer_df          IP_MTU_DISCOVER DONT/WANT datagrams leave with DF clear, DO/PROBE with DF set
  *   peer_frag_rx     3000-byte datagram sent as shuffled fragments (one twice)
  *                    arrives once and whole; an incomplete set and a ping of
  *                    death deliver nothing
@@ -435,7 +436,7 @@ static void peer_bcast(void) {
     const char *N = "peer_bcast";
     if (skipped(N)) return;
     peer_begin(N);
-    const uint16_t Q = 40123;
+    const uint16_t Q = 20123;
     int one = 1;
     int s = socket(AF_INET, SOCK_DGRAM, 0), r = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0 || r < 0) { fail(N, "socket: %s", strerror(errno)); return; }
@@ -515,6 +516,36 @@ out:
     else pass(N);
 }
 
+/* IP_MTU_DISCOVER on the wire: DONT and WANT datagrams leave with DF clear
+ * (the stack may fragment them), DO and PROBE with DF set (Linux
+ * ip_dont_fragment / ip_sk_ignore_df). The peer reports the DF bit of the
+ * last datagram it saw from a source port. */
+static void peer_df(void) {
+    const char *N = "peer_df";
+    if (skipped(N)) return;
+    peer_begin(N);
+    static const char *nm[4] = { "DONT", "WANT", "DO", "PROBE" };
+    struct sockaddr_in echo = sin4(pc_peer, 7);
+    char why[160] = "";
+    for (int mode = 0; mode < 4 && !why[0]; mode++) {
+        struct sockaddr_in a;
+        int s = udp_bound("0.0.0.0", 0, &a);
+        if (s < 0) { snprintf(why, sizeof why, "socket: %s", strerror(errno)); break; }
+        if (setsockopt(s, IPPROTO_IP, IP_MTU_DISCOVER, &mode, sizeof mode)) snprintf(why, sizeof why, "%s: %s", nm[mode], strerror(errno));
+        else if (sendto(s, "df", 2, 0, (struct sockaddr *)&echo, sizeof echo) != 2) snprintf(why, sizeof why, "%s: send %s", nm[mode], strerror(errno));
+        else if (!(wait_ev(s, POLLIN, 3000) & POLLIN)) snprintf(why, sizeof why, "%s: no echo", nm[mode]);
+        else {
+            char cmd[48], rep[48];
+            snprintf(cmd, sizeof cmd, "DFQ %u", ntohs(a.sin_port));
+            int want = mode >= 2;
+            if (peer_ctl(cmd, rep, sizeof rep) < 0) snprintf(why, sizeof why, "%s: no DFQ reply", nm[mode]);
+            else if (strncmp(rep, "DF ", 3) || atoi(rep + 3) != want) snprintf(why, sizeof why, "IP_PMTUDISC_%s left with DF=%s (want %d)", nm[mode], rep, want);
+        }
+        close(s);
+    }
+    if (why[0]) fail(N, "%s", why); else pass(N);
+}
+
 /* ── weak host ──────────────────────────────────────────────────────────── */
 
 static void peer_weakhost(void) {
@@ -576,6 +607,7 @@ static int peer_main(int argc, char **argv) {
     peer_frag_echo();
     peer_frag_rx();
     peer_tos();
+    peer_df();
     peer_refused();
     peer_tcp_icmp();
     peer_bcast();

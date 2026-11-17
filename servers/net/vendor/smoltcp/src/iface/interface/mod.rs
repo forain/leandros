@@ -30,6 +30,8 @@ use heapless::{LinearMap, Vec};
 
 #[cfg(feature = "_proto-fragmentation")]
 use super::fragmentation::FragKey;
+#[cfg(feature = "proto-ipv6")]
+use super::fragmentation::Ipv6FragKey;
 #[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
 use super::fragmentation::PacketAssemblerSet;
 use super::fragmentation::{Fragmenter, FragmentsBuffer};
@@ -103,6 +105,9 @@ pub struct InterfaceInner {
     pan_id: Option<Ieee802154Pan>,
     #[cfg(feature = "proto-ipv4-fragmentation")]
     ipv4_id: u16,
+    /// LEANDROS: the next IPv6 Fragment-header identification.
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_id: u32,
     #[cfg(feature = "proto-sixlowpan")]
     sixlowpan_address_context:
         Vec<SixlowpanAddressContext, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT>,
@@ -111,9 +116,14 @@ pub struct InterfaceInner {
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
     #[cfg(feature = "proto-ipv4")]
     any_ip: bool,
+    /// LEANDROS: the path-MTU cache scope (the stack / network namespace).
+    pmtu_scope: u16,
     routes: Routes,
     #[cfg(feature = "proto-igmp")]
     ipv4_multicast_groups: LinearMap<Ipv4Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
+    /// LEANDROS: IPv6 groups joined by sockets (no MLD reports on the wire).
+    #[cfg(feature = "proto-ipv6")]
+    ipv6_multicast_groups: LinearMap<Ipv6Address, (), IFACE_MAX_MULTICAST_GROUP_COUNT>,
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
@@ -226,11 +236,14 @@ impl Interface {
                 ip_addrs: Vec::new(),
                 #[cfg(feature = "proto-ipv4")]
                 any_ip: false,
+                pmtu_scope: 0,
                 routes: Routes::new(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
                 #[cfg(feature = "proto-igmp")]
                 ipv4_multicast_groups: LinearMap::new(),
+                #[cfg(feature = "proto-ipv6")]
+                ipv6_multicast_groups: LinearMap::new(),
                 #[cfg(feature = "proto-igmp")]
                 igmp_report_state: IgmpReportState::Inactive,
                 #[cfg(feature = "medium-ieee802154")]
@@ -241,6 +254,8 @@ impl Interface {
                 tag,
                 #[cfg(feature = "proto-ipv4-fragmentation")]
                 ipv4_id,
+                #[cfg(feature = "proto-ipv6")]
+                ipv6_id: 1,
                 #[cfg(feature = "proto-sixlowpan")]
                 sixlowpan_address_context: Vec::new(),
                 rand,
@@ -372,6 +387,11 @@ impl Interface {
     /// This option is not available or required for IPv6 as packets sent to
     /// the interface are not filtered by IPv6 address.
     #[cfg(feature = "proto-ipv4")]
+    /// LEANDROS: tag this interface's path-MTU cache entries.
+    pub fn set_pmtu_scope(&mut self, scope: u16) {
+        self.inner.pmtu_scope = scope;
+    }
+
     pub fn set_any_ip(&mut self, any_ip: bool) {
         self.inner.any_ip = any_ip;
     }
@@ -398,6 +418,12 @@ impl Interface {
         &mut self,
     ) -> &mut Vec<SixlowpanAddressContext, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT> {
         &mut self.inner.sixlowpan_address_context
+    }
+
+    /// LEANDROS: the IPv6 multicast groups joined (`join_multicast_group`).
+    #[cfg(feature = "proto-ipv6")]
+    pub fn ipv6_multicast_groups(&self) -> impl Iterator<Item = Ipv6Address> + '_ {
+        self.inner.ipv6_multicast_groups.iter().map(|(a, _)| *a)
     }
 
     /// LEANDROS: the IPv4 multicast groups joined (`join_multicast_group`).
@@ -701,7 +727,7 @@ impl Interface {
                 {
                     while self.fragmenter.packet_len > self.fragmenter.sent_bytes {
                         match device.transmit(inner.now) {
-                            Some(t) => inner.dispatch_ipv4_frag(t, &mut self.fragmenter),
+                            Some(t) => inner.dispatch_frag(t, &mut self.fragmenter),
                             None => break,
                         }
                     }
@@ -821,7 +847,7 @@ impl Interface {
             match device.transmit(self.inner.now) {
                 Some(tx_token) => {
                     self.inner
-                        .dispatch_ipv4_frag(tx_token, &mut self.fragmenter);
+                        .dispatch_frag(tx_token, &mut self.fragmenter);
                     sent = true;
                 }
                 None => break,
@@ -886,6 +912,33 @@ impl InterfaceInner {
         self.caps.ip_mtu()
     }
 
+    /// LEANDROS: the next fragment of the packet the fragmenter holds.
+    #[cfg(feature = "proto-ipv4-fragmentation")]
+    fn dispatch_frag<Tx: TxToken>(&mut self, tx_token: Tx, frag: &mut Fragmenter) {
+        #[cfg(feature = "proto-ipv6")]
+        if frag.is_v6 {
+            return self.dispatch_ipv6_frag(tx_token, frag);
+        }
+        self.dispatch_ipv4_frag(tx_token, frag)
+    }
+
+    /// LEANDROS: the IP MTU towards `dst`: the link's, or a smaller one an
+    /// ICMP "fragmentation needed" / "packet too big" taught the cache.
+    #[allow(unused)]
+    pub(crate) fn path_ip_mtu(&self, dst: &IpAddress) -> usize {
+        let key = match dst {
+            #[cfg(feature = "proto-ipv4")]
+            IpAddress::Ipv4(a) => crate::pmtu::v4(a.0),
+            #[cfg(feature = "proto-ipv6")]
+            IpAddress::Ipv6(a) => a.0,
+        };
+        let link = self.caps.ip_mtu();
+        match crate::pmtu::lookup(self.pmtu_scope, key, self.now.total_millis() as u64) {
+            Some(m) => link.min(m as usize),
+            None => link,
+        }
+    }
+
     #[allow(unused)] // unused depending on which sockets are enabled, and in tests
     pub(crate) fn rand(&mut self) -> &mut Rand {
         &mut self.rand
@@ -904,6 +957,10 @@ impl InterfaceInner {
     #[cfg(feature = "proto-ipv4")]
     #[allow(unused)]
     pub(crate) fn get_source_address_ipv4(&self, _dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
+        // LEANDROS: a loopback destination is its own source (Linux lo).
+        if _dst_addr.is_loopback() && self.has_ip_addr(*_dst_addr) {
+            return Some(*_dst_addr);
+        }
         for cidr in self.ip_addrs.iter() {
             #[allow(irrefutable_let_patterns)] // if only ipv4 is enabled
             if let IpCidr::Ipv4(cidr) = cidr {
@@ -1058,6 +1115,17 @@ impl InterfaceInner {
         ipv4_id
     }
 
+    #[cfg(feature = "proto-ipv6")]
+    fn get_ipv6_ident(&mut self) -> u32 {
+        if self.ipv6_id == 1 {
+            // first use: start somewhere unpredictable (RFC 7739 spirit)
+            self.ipv6_id = self.rand.rand_u32() | 1;
+        }
+        self.ipv6_id = self.ipv6_id.wrapping_add(1);
+        if self.ipv6_id == 0 { self.ipv6_id = 1; }
+        self.ipv6_id
+    }
+
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     fn get_sixlowpan_fragment_tag(&mut self) -> u16 {
         let tag = self.tag;
@@ -1087,6 +1155,16 @@ impl InterfaceInner {
     /// Check whether the interface has the given IP address assigned.
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
+        // LEANDROS: an interface holding an IPv4 address in 127.0.0.0/8 owns
+        // the whole block, as Linux's lo does (127.0.0.3 is local).
+        #[cfg(feature = "proto-ipv4")]
+        if let IpAddress::Ipv4(a) = addr {
+            if a.is_loopback()
+                && self.ip_addrs.iter().any(|p| matches!(p.address(), IpAddress::Ipv4(q) if q.is_loopback()))
+            {
+                return true;
+            }
+        }
         self.ip_addrs.iter().any(|probe| probe.address() == addr)
     }
 
@@ -1126,7 +1204,7 @@ impl InterfaceInner {
             #[cfg(feature = "proto-rpl")]
             IpAddress::Ipv6(Ipv6Address::LINK_LOCAL_ALL_RPL_NODES) => true,
             #[cfg(feature = "proto-ipv6")]
-            IpAddress::Ipv6(addr) => self.has_solicited_node(addr),
+            IpAddress::Ipv6(addr) => self.ipv6_multicast_groups.get(&addr).is_some() || self.has_solicited_node(addr),
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -1150,7 +1228,7 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv6")]
             Ok(IpVersion::Ipv6) => {
                 let ipv6_packet = check!(Ipv6Packet::new_checked(ip_payload));
-                self.process_ipv6(sockets, meta, &ipv6_packet)
+                self.process_ipv6(sockets, meta, &ipv6_packet, frag)
             }
             // Drop all other traffic.
             _ => None,
@@ -1337,6 +1415,7 @@ impl InterfaceInner {
                 let payload_len =
                     icmp_reply_payload_len(ip_payload.len(), IPV4_MIN_MTU, ipv4_repr.buffer_len());
                 let icmpv4_reply_repr = Icmpv4Repr::DstUnreachable {
+                    mtu: 0,
                     reason: Icmpv4DstUnreachable::PortUnreachable,
                     header: ipv4_repr,
                     data: &ip_payload[0..payload_len],
@@ -1689,6 +1768,8 @@ impl InterfaceInner {
 
         #[cfg(feature = "proto-ipv4-fragmentation")]
         let ipv4_id = self.get_ipv4_ident();
+        #[cfg(feature = "proto-ipv6")]
+        let ipv6_id = self.get_ipv6_ident();
 
         // First we calculate the total length that we will have to emit.
         let mut total_len = ip_repr.buffer_len();
@@ -1749,7 +1830,8 @@ impl InterfaceInner {
             #[cfg(feature = "proto-ipv4")]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
-                if total_ip_len > self.caps.max_transmission_unit {
+                let path_mtu = self.path_ip_mtu(&IpAddress::Ipv4(repr.dst_addr));
+                if total_ip_len > self.caps.max_transmission_unit - (self.caps.ip_mtu() - path_mtu) {
                     #[cfg(feature = "proto-ipv4-fragmentation")]
                     {
                         net_debug!("start fragmentation");
@@ -1759,7 +1841,7 @@ impl InterfaceInner {
                         // multiple of 8 payload bytes (RFC 791); upstream
                         // used the whole IP MTU.
                         let first_frag_ip_len =
-                            ip_header_len + ((self.caps.ip_mtu() - ip_header_len) & !7);
+                            ip_header_len + ((path_mtu - ip_header_len) & !7);
 
                         // Calculate how much we will send now (including the Ethernet header).
                         #[allow(unused_mut)]
@@ -1821,6 +1903,7 @@ impl InterfaceInner {
                         ipv4_packet.set_dscp(meta.tos >> 2);
                         ipv4_packet.set_ecn(meta.tos & 3);
                         frag.ipv4.tos = meta.tos;
+                        frag.ipv4.mtu = path_mtu;
 
                         if caps.checksum.ipv4.tx() {
                             ipv4_packet.fill_checksum();
@@ -1863,10 +1946,11 @@ impl InterfaceInner {
 
                         emit_ip(&ip_repr, tx_buffer);
                         // LEANDROS: IP_TOS.
-                        if meta.tos != 0 {
+                        if meta.tos != 0 || meta.nodf {
                             let mut p = Ipv4Packet::new_unchecked(&mut tx_buffer[..]);
                             p.set_dscp(meta.tos >> 2);
                             p.set_ecn(meta.tos & 3);
+                            if meta.nodf { p.set_dont_frag(false); }
                             if caps.checksum.ipv4.tx() {
                                 p.fill_checksum();
                             }
@@ -1875,24 +1959,114 @@ impl InterfaceInner {
                     })
                 }
             }
-            // We don't support IPv6 fragmentation yet.
             #[cfg(feature = "proto-ipv6")]
-            IpRepr::Ipv6(_) => tx_token.consume(total_len, |mut tx_buffer| {
-                #[cfg(feature = "medium-ethernet")]
-                if matches!(self.caps.medium, Medium::Ethernet) {
-                    emit_ethernet(&ip_repr, tx_buffer)?;
-                    tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                }
+            IpRepr::Ipv6(repr) => {
+                // LEANDROS: a packet over the path MTU leaves as fragments
+                // (RFC 8200 4.5), as a Linux source does; ICMPv6 PTB taught
+                // the cache, minimum 1280.
+                let path_mtu = self.path_ip_mtu(&IpAddress::Ipv6(repr.dst_addr));
+                if total_ip_len > path_mtu {
+                    #[cfg(feature = "proto-ipv4-fragmentation")]
+                    {
+                        let ident = ipv6_id;
+                        // fragmentable part per fragment: a multiple of 8
+                        let first = (path_mtu - 40 - 8) & !7;
+                        let mut tx_len = 40 + 8 + first;
+                        #[cfg(feature = "medium-ethernet")]
+                        if matches!(self.caps.medium, Medium::Ethernet) {
+                            tx_len += EthernetFrame::<&[u8]>::header_len();
+                        }
+                        if !frag.finished() {
+                            net_debug!("fragmenter busy, dropping");
+                            return Ok(());
+                        }
+                        #[cfg(feature = "alloc")]
+                        if frag.buffer.len() < total_ip_len {
+                            frag.buffer.resize(total_ip_len, 0);
+                        }
+                        if frag.buffer.len() < total_ip_len {
+                            return Ok(());
+                        }
+                        #[cfg(feature = "medium-ethernet")]
+                        {
+                            frag.ipv6.dst_hardware_addr = dst_hardware_addr;
+                        }
+                        // The whole packet: header, then payload.
+                        emit_ip(&ip_repr, &mut frag.buffer);
+                        let repr = match &ip_repr { IpRepr::Ipv6(r) => *r, _ => unreachable!() };
+                        frag.is_v6 = true;
+                        frag.packet_len = total_ip_len;
+                        frag.sent_bytes = 40 + first;
+                        frag.ipv6.repr = repr;
+                        frag.ipv6.ident = ident;
+                        frag.ipv6.tclass = meta.tos;
+                        frag.ipv6.mtu = path_mtu;
+                        tx_token.consume(tx_len, |mut tx_buffer| {
+                            #[cfg(feature = "medium-ethernet")]
+                            if matches!(self.caps.medium, Medium::Ethernet) {
+                                emit_ethernet(&ip_repr, tx_buffer)?;
+                                tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+                            }
+                            emit_ipv6_fragment(&repr, &mut tx_buffer[..], ident, 0, true, meta.tos, &frag.buffer[40..40 + first]);
+                            Ok(())
+                        })
+                    }
+                    #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+                    {
+                        Ok(())
+                    }
+                } else {
+                    tx_token.consume(total_len, |mut tx_buffer| {
+                        #[cfg(feature = "medium-ethernet")]
+                        if matches!(self.caps.medium, Medium::Ethernet) {
+                            emit_ethernet(&ip_repr, tx_buffer)?;
+                            tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
+                        }
 
-                emit_ip(&ip_repr, tx_buffer);
-                // LEANDROS: IPV6_TCLASS.
-                if meta.tos != 0 {
-                    Ipv6Packet::new_unchecked(&mut tx_buffer[..]).set_traffic_class(meta.tos);
+                        emit_ip(&ip_repr, tx_buffer);
+                        // LEANDROS: IPV6_TCLASS.
+                        if meta.tos != 0 {
+                            Ipv6Packet::new_unchecked(&mut tx_buffer[..]).set_traffic_class(meta.tos);
+                        }
+                        Ok(())
+                    })
                 }
-                Ok(())
-            }),
+            }
         }
     }
+}
+
+/// LEANDROS: one IPv6 fragment into `out`: the base header (next header
+/// Fragment), the Fragment header and `data`. `offset` is in bytes.
+#[cfg(all(feature = "proto-ipv6", feature = "proto-ipv4-fragmentation"))]
+pub(crate) fn emit_ipv6_fragment(
+    repr: &Ipv6Repr,
+    out: &mut [u8],
+    ident: u32,
+    offset: usize,
+    more: bool,
+    tclass: u8,
+    data: &[u8],
+) {
+    let mut h = *repr;
+    h.next_header = IpProtocol::Ipv6Frag;
+    h.payload_len = 8 + data.len();
+    {
+        let mut p = Ipv6Packet::new_unchecked(&mut out[..]);
+        h.emit(&mut p);
+        if tclass != 0 {
+            p.set_traffic_class(tclass);
+        }
+    }
+    let fr = Ipv6FragmentRepr { frag_offset: (offset / 8) as u16, more_frags: more, ident };
+    {
+        let mut fh = Ipv6FragmentHeader::new_unchecked(&mut out[42..48]);
+        fr.emit(&mut fh);
+        // smoltcp's header starts after the next-header and reserved bytes
+    }
+    out[41] = 0;
+    out[40] = u8::from(repr.next_header);
+    out[48..48 + data.len()].copy_from_slice(data);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

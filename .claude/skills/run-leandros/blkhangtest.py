@@ -57,35 +57,49 @@ def main():
         rc, out = drv("qmp", "human-monitor-command",
                       json.dumps({"command-line": 'qemu-io hang "break read_aio r1"'}))
         print("break armed:", out.strip()[-200:])
-        t0 = time.time()
-        rc, out = drv("run", f"dd if={dev} of=/dev/null bs=4096 count=1 skip=3001 iflag=direct; echo DDRC=$?", "120",
-                      timeout=180)
-        secs = time.time() - t0
-        print(out.strip()[-400:])
-        mrc = re.search(r"DDRC=(\d+)", out)
-        if not mrc or mrc.group(1) == "0":
-            ok = False; print("FAIL: read of the hung disk did not fail")
-        elif secs > 100:
-            ok = False; print(f"FAIL: read took {secs:.0f} s")
-        else:
-            print(f"read failed after {secs:.0f} s as expected")
-        # Still alive: a fresh command answers, and the dead disk fails fast.
-        t1 = time.time()
-        rc, out = drv("run", f"dd if={dev} of=/dev/null bs=4096 count=1 skip=2000; echo DDRC=$?; echo ALIVE", "60")
+        # Since 2026-10-25 (80fc911e) a slow request is never abandoned: like
+        # Linux virtio-blk the driver warns at 30 s and keeps waiting. So the
+        # hung read must stay pending, the system must stay responsive, the
+        # driver must log the slow request, and the read must complete once
+        # the backend resumes.
+        sfull = f"/tmp/leandros-{os.environ.get('LEANDROS_RUN_ID', 'x')}-serial-full.log"
+        def slowlines():
+            try: txt = open(sfull, errors="replace").read()
+            except OSError: return []
+            return [l for l in txt.splitlines() if "VIRTIO-BLK" in l and "slow request" in l and "still waiting" in l]
+        rc, out = drv("run", f"rm -f /tmp/dd.rc; (dd if={dev} of=/dev/null bs=4096 count=1 skip=3001 iflag=direct; echo $? > /tmp/dd.rc) >/tmp/dd.out 2>&1 </dev/null & sleep 2; echo STARTED", "30")
+        if "STARTED" not in out:
+            ok = False; print("FAIL: could not start background read\n" + out[-300:])
+        rc, out = drv("run", "cat /tmp/dd.rc 2>/dev/null; echo ALIVE", "30")
         if "ALIVE" not in out:
-            ok = False; print("FAIL: system unresponsive after the hang\n" + out[-400:])
-        elif time.time() - t1 > 20:
-            ok = False; print("FAIL: dead disk did not fail fast")
+            ok = False; print("FAIL: system unresponsive during the hang\n" + out[-300:])
+        elif re.search(r"^\d+\s*$", out.replace("ALIVE", "").strip(), re.M):
+            ok = False; print("FAIL: read of the hung disk completed without the backend\n" + out[-300:])
         else:
-            print("system alive, dead disk fails fast")
+            print("system alive while the disk is hung")
+        t0 = time.time()
+        while time.time() - t0 < 75 and not slowlines():
+            time.sleep(3)
+        sl = slowlines()
+        print("\n".join(sl[-1:]) or "(no slow request line)")
+        if not sl:
+            ok = False; print("FAIL: driver never reported the slow request")
+        rc, out = drv("run", "echo ALIVE2", "30")
+        if "ALIVE2" not in out:
+            ok = False; print("FAIL: system unresponsive after the slow warning\n" + out[-300:])
+        drv("qmp", "human-monitor-command", json.dumps({"command-line": 'qemu-io hang "resume r1"'}), timeout=30)
+        got = ""
+        for _ in range(10):
+            rc, out = drv("run", "cat /tmp/dd.rc 2>/dev/null; echo END", "30")
+            m2 = re.search(r"^(\d+)\s*$", out, re.M)
+            if m2: got = m2.group(1); break
+            time.sleep(2)
+        if got != "0":
+            ok = False; print(f"FAIL: read did not complete after resume (rc={got!r})")
+        else:
+            print("read completed after the backend resumed")
+        wd = []
         _, log = drv("log", timeout=30)
-        # serial.log is trimmed; the dead line may have rotated out of it.
-        try: log += open(f"/tmp/leandros-{os.environ.get('LEANDROS_RUN_ID', 'x')}-serial-full.log", errors="replace").read()
-        except OSError: pass
-        hit = [l for l in log.splitlines() if "VIRTIO-BLK" in l and "dead" in l]
-        print("\n".join(hit[-2:]) or "(no VIRTIO-BLK dead line in log)")
-        if not hit: ok = False
-        # The wait must take timer ticks (IRQ window), not spin masked.
         wd = [l for l in log.splitlines() if "[WDOG]" in l and "/bin/dd" in l]
         if wd:
             ok = False; print("FAIL: dd spun IRQ-masked\n" + wd[-1])

@@ -82,6 +82,8 @@ const FG_XOR: u32 = 0x00FF_FFFF;
 const BLANK: u64 = 0;
 
 #[inline]
+fn is_wide_cell(c: u64) -> bool { let ch = c as u32; ch >= 0x1100 && unsafe { glyph_wide(ch) } }
+
 fn cell(ch: u32, fg_enc: u32) -> u64 { ((fg_enc as u64) << 32) | ch as u64 }
 
 // ── Framebuffer bridge ────────────────────────────────────────────────────────
@@ -106,6 +108,8 @@ extern "C" {
     fn fb_vt_console_gate(enabled: bool);
     /// True while a DRM open holds the scanout.
     fn fb_vt_scanout_owned() -> bool;
+    /// East-Asian Wide / emoji: two cells (drivers::glyphs::wide).
+    fn glyph_wide(u: u32) -> bool;
     /// Drop any DRM scanout claim, unconditionally.
     fn fb_vt_scanout_revoke();
     fn drm_vt_graphics_restore(vt: u32);
@@ -191,7 +195,16 @@ impl Screen {
     fn put_cell(&mut self, col: usize, row: usize, ch: u32) {
         if col >= VT_COLS || row >= VT_ROWS { return; }
         let fg = self.fg_enc;
-        self.cells[row * VT_COLS + col] = cell(ch, fg);
+        let i = row * VT_COLS + col;
+        // Overwriting either half of a wide glyph erases the other half.
+        if col > 0 && is_wide_cell(self.cells[i - 1]) { self.cells[i - 1] = BLANK; }
+        if is_wide_cell(self.cells[i]) && col + 1 < VT_COLS { self.cells[i + 1] = BLANK; }
+        self.cells[i] = cell(ch, fg);
+    }
+
+    /// The right half of a wide glyph: blank, so a repaint draws nothing there.
+    fn put_cell_blank(&mut self, col: usize, row: usize) {
+        if col < VT_COLS && row < VT_ROWS { self.cells[row * VT_COLS + col] = BLANK; }
     }
 
     /// Blank `[c0, c1)` of `row`.
@@ -280,6 +293,8 @@ impl Screen {
             self.cur_row += 1;
         } else if c == b'\r' {
             self.cur_col = 0;
+        } else if c == b'\t' {
+            self.cur_col = ((self.cur_col as usize / 8 + 1) * 8).min(cols - 1) as u32;
         } else if c == 0x08 {
             if self.cur_col > 0 {
                 self.cur_col -= 1;
@@ -312,9 +327,17 @@ impl Screen {
             // (the console drawing side skips them too: drivers::glyphs).
             let ch = ch.filter(|&u| !matches!(u, 0x200B..=0x200D | 0x2060 | 0xFE00..=0xFE0F));
             if let Some(ch) = ch {
+                let wide = unsafe { glyph_wide(ch) };
+                if wide && self.cur_col as usize + 2 > cols {
+                    // Only one cell left: the glyph wraps whole.
+                    self.cur_col = 0;
+                    self.cur_row += 1;
+                    if self.cur_row as usize >= rows { self.scroll(rows, scroll_rows); }
+                }
                 let (col, row) = (self.cur_col as usize, self.cur_row as usize);
                 self.put_cell(col, row, ch);
-                self.cur_col += 1;
+                if wide { self.put_cell_blank(col + 1, row); }
+                self.cur_col += if wide { 2 } else { 1 };
                 if self.cur_col as usize >= cols {
                     self.cur_col = 0;
                     self.cur_row += 1;
@@ -369,6 +392,11 @@ impl Screen {
             b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }
             b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),
             b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),
+            b'I' => col = ((col / 8 + p(0, 1)) * 8).min(cols - 1),
+            b'Z' => {
+                let n = p(0, 1);
+                col = if col % 8 == 0 { col.saturating_sub(8 * n) } else { (col / 8).saturating_sub(n - 1) * 8 };
+            }
             b'H' | b'f' => {
                 row = p(0, 1).saturating_sub(1).min(rows - 1);
                 col = p(1, 1).saturating_sub(1).min(cols - 1);
@@ -1094,6 +1122,16 @@ fn complete_switch(to: usize) {
     // broadcast reaches every non-zero mask, so it also wakes the waiters
     // parked on `POLL_TAG_VT_SWITCH` (VT_WAITACTIVE, DevVt polls).
     sched::wake_poll();
+}
+
+/// True while a `VT_PROCESS` release is outstanding: the outgoing console has
+/// been asked to let go of the display and has not yet answered. [`ACTIVE`]
+/// still names the outgoing VT in that window, so anything derived from it (DRM
+/// master) would still let the outgoing client present — onto a display the
+/// user has already asked to leave, and, once the handshake completes, over the
+/// incoming console. The DRM layer treats the window as "no master".
+pub fn release_pending() -> bool {
+    PHASE.load(Ordering::Acquire) == PHASE_WAIT_REL
 }
 
 /// `VT_RELDISP` — the client's half of the handshake.

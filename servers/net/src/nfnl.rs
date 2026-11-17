@@ -837,10 +837,14 @@ pub struct Pkt {
     pub local: bool,
     /// IPv6 source/destination (a v6 packet: `src`/`dst` unused, family ip6/inet).
     pub v6: Option<([u8; 16], [u8; 16])>,
+    /// `ct state`: true = the packet belongs to an established flow (reply seen), else NEW.
+    pub est: bool,
+    /// `ct state related`: an ICMP/ICMPv6 error quoting a tracked flow.
+    pub rel: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Nat { None, Dnat([u8; 4], u16), Masq }
+pub enum Nat { None, Dnat([u8; 4], u16), Dnat6([u8; 16], u16), Masq }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Flow { Fall, Ret, Accept, Drop }
@@ -925,8 +929,8 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
                     }
                 }
             }
-            // New flows only: state is always NEW (8).
-            b"ct" => { let dreg = g(1)?; rset(&mut regs, dreg, &8u32.to_ne_bytes())?; }
+            // ct state: ESTABLISHED (2) for a flow whose reply was seen, else NEW (8).
+            b"ct" => { let dreg = g(1)?; let st: u32 = if cx.m.rel { 4 } else if cx.m.est { 2 } else { 8 }; rset(&mut regs, dreg, &st.to_ne_bytes())?; }
             b"fib" => {
                 let dreg = g(1)?;
                 let local = g(3)? & 2 != 0 && cx.m.local;
@@ -985,9 +989,18 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
             }
             b"nat" => {
                 if g(1)? != 1 { return None; }
+                // An inet-table chain mixes ip and ip6 DNAT targets: a nat expr of the other family never applies.
+                if (g(2) == Some(10)) != cx.m.v6.is_some() { return None; }
+                let port = match g(5) { Some(r) => { let p = rget(&regs, r, 2)?; u16::from_be_bytes([p[0], p[1]]) } None => 0 };
+                if g(2) == Some(10) {
+                    let a = rget(&regs, g(3)?, 16)?;
+                    let mut addr = [0u8; 16];
+                    addr.copy_from_slice(a);
+                    cx.nat = Nat::Dnat6(addr, port);
+                    return Some(Flow::Accept);
+                }
                 let a = rget(&regs, g(3)?, 4)?;
                 let addr = [a[0], a[1], a[2], a[3]];
-                let port = match g(5) { Some(r) => { let p = rget(&regs, r, 2)?; u16::from_be_bytes([p[0], p[1]]) } None => 0 };
                 cx.nat = Nat::Dnat(addr, port);
                 return Some(Flow::Accept);
             }

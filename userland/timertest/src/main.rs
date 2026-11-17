@@ -1153,11 +1153,28 @@ unsafe fn test_gettimeofday_matches_realtime() -> bool {
 //     battery-clock (PL031 / CMOS) the kernel reads at boot, so REALTIME
 //     reads as a date after 2020, and REALTIME - MONOTONIC is a constant
 //     offset (no drift between the two sources).
+/// REALTIME - MONOTONIC from the narrowest of 16 bracketed samples
+/// (mono, realtime, mono): the two clock reads are separate syscalls, so a vCPU
+/// preemption between them (a loaded TCG host) shifts one sample by far more
+/// than the bound below without any clock drift. The tightest bracket is the
+/// sample not hit by that; real drift survives all 16.
+unsafe fn realtime_offset_best() -> i64 {
+    let mut best_w = i64::MAX;
+    let mut best_off = 0;
+    for _ in 0..16 {
+        let a = now_ns();
+        let r = realtime_ns();
+        let b = now_ns();
+        if b - a < best_w { best_w = b - a; best_off = r - (a + (b - a) / 2); }
+    }
+    best_off
+}
+
 unsafe fn test_realtime_is_not_uptime() -> bool {
     let name = b"realtime_is_not_uptime\0";
-    let off0 = realtime_ns() - now_ns();
+    let off0 = realtime_offset_best();
     busy_ns(20_000_000);
-    let off1 = realtime_ns() - now_ns();
+    let off1 = realtime_offset_best();
     let drift = (off1 - off0).abs();
     let sec = realtime_ns() / 1_000_000_000;
     print_kv(b"  realtime_sec=\0", sec.max(0) as u64);

@@ -41,6 +41,24 @@ static EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Total grid points the BSP's handler found already elapsed beyond the one it
 /// was servicing (each is a tick accounted without its own interrupt).
 static CATCH_UP_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Diagnostics for `/proc/stat` `timerstat` (same layout as x86_64): cpu0 timer
+/// interrupts, pure-deadline ones that returned early, UART RX drains (the
+/// tick fallback plus the RX interrupt).
+static CPU0_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+static CPU0_DEADLINE_EARLY: AtomicU64 = AtomicU64::new(0);
+static TICK_DRAINS: AtomicU64 = AtomicU64::new(0);
+
+/// `[ticks, timer irqs, deadline-only irqs that returned early, uart drains]`.
+#[no_mangle]
+pub extern "C" fn arch_timer_stats(out: *mut u64) {
+    unsafe {
+        out.add(0).write(ticks());
+        out.add(1).write(CPU0_TIMER_IRQS.load(Ordering::Relaxed));
+        out.add(2).write(CPU0_DEADLINE_EARLY.load(Ordering::Relaxed));
+        out.add(3).write(TICK_DRAINS.load(Ordering::Relaxed)
+            + super::uart::UART_RX_IRQS.load(Ordering::Relaxed));
+    }
+}
 
 const TIMER_MAX_CPUS: usize = sched::MAX_CPUS;
 
@@ -311,6 +329,7 @@ pub fn on_tick() {
         super::uart::IRQ_LATE_MAX_TICKS.fetch_max(now.wrapping_sub(due), Ordering::Relaxed);
     }
     LAST_TICK_CNT_CPU[cpu].store(now, Ordering::Relaxed);
+    if cpu == 0 { CPU0_TIMER_IRQS.fetch_add(1, Ordering::Relaxed); }
 
     // One-shot deadline: service it if due (any CPU), then fold the next
     // pending deadline back into the compare value (advance_grid just set it
@@ -330,7 +349,10 @@ pub fn on_tick() {
     }
     // A pure deadline interrupt (no grid point passed) is not a tick: no
     // device polling, no tick hooks, no timeslice accounting.
-    if passed == 0 { return; }
+    if passed == 0 {
+        if cpu == 0 { CPU0_DEADLINE_EARLY.fetch_add(1, Ordering::Relaxed); }
+        return;
+    }
 
     if cpu == 0 {
         if passed > 1 {
@@ -349,6 +371,7 @@ pub fn on_tick() {
         // is masked while the backlog is full; once a drain gets through
         // without throttling, unmask it again.
         super::gic::uart_irq_diag_tick();
+        TICK_DRAINS.fetch_add(1, Ordering::Relaxed);
         let throttled = evdev_server::serial_rx_drain(&mut || {
             let b = unsafe { super::uart::getc() };
             if b.is_some() {

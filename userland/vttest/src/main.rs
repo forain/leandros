@@ -64,6 +64,7 @@ type size_t = usize;
 type ssize_t = isize;
 
 const O_RDWR: c_int = 0o2;
+const TCSETS: c_ulong = 0x5402;
 const O_NONBLOCK: c_int = 0o4000;
 
 const EAGAIN: c_int = 11;
@@ -78,6 +79,7 @@ const VT_GETMODE: c_ulong = 0x5601;
 const VT_SETMODE: c_ulong = 0x5602;
 const VT_GETSTATE: c_ulong = 0x5603;
 const VT_ACTIVATE: c_ulong = 0x5606;
+const VT_RELDISP: c_ulong = 0x5605;
 const VT_WAITACTIVE: c_ulong = 0x5607;
 
 // KD* — <linux/kd.h>
@@ -225,6 +227,7 @@ extern "C" {
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
     pub fn close(fd: c_int) -> c_int;
+    pub fn kill(pid: c_int, sig: c_int) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int;
     pub fn pipe(fds: *mut c_int) -> c_int;
     pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
@@ -237,6 +240,7 @@ extern "C" {
     pub fn __errno_location() -> *mut c_int;
     pub fn readlink(path: *const u8, buf: *mut u8, len: size_t) -> ssize_t;
     pub fn fork() -> c_int;
+    pub fn signal(sig: c_int, handler: usize) -> usize;
     pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 }
 
@@ -770,6 +774,71 @@ unsafe fn t_master_follows_vt(tty0: c_int) -> bool {
     report(b"master_follows_vt", grant && on_vt1 && moved && suspended && back && rearmed)
 }
 
+/// A present issued while a `VT_PROCESS` release is outstanding is refused.
+///
+/// This is the window the VT-switch flash lived in: `VT_ACTIVATE` sends the
+/// release signal but the display has not moved (`ACTIVE` still names the
+/// outgoing VT) until `VT_RELDISP(1)`, so a compositor that flips from inside
+/// its release handler was still master and reached the scanout — and the flip
+/// that lands just before the handover is what shows over the incoming console.
+/// The probe is the same DIRTYFB-with-no-framebuffer as the other master tests:
+/// permitted returns 0 and touches nothing, so only the permission moves. A
+/// refused release (`VT_RELDISP(0)`) must give master back.
+unsafe fn t_present_in_release_window(tty0: c_int) -> bool {
+    const SIGUSR1: c_int = 10;
+    const SIG_IGN: usize = 1;
+    let fd = card0();
+    let t1 = open(b"/dev/tty1\0".as_ptr(), O_RDWR);
+    if fd < 0 || t1 < 0 || active_vt(tty0) != 1 {
+        if fd >= 0 { close(fd); }
+        if t1 >= 0 { close(t1); }
+        return report(b"present_in_release_window", false);
+    }
+    // Both the release (USR1) and acquire (USR2) signals must be ignored: the
+    // default action of either kills the test.
+    let old = signal(SIGUSR1, SIG_IGN);
+    let old2 = signal(12, SIG_IGN);
+    let grant = set_master(fd) == 0;
+    let before = dirtyfb(fd) == 0;
+    let pm = vt_mode { mode: VT_PROCESS, waitv: 0, relsig: 10, acqsig: 12, frsig: 0, _guard: 0 };
+    let armed = ioctl(t1, VT_SETMODE, &pm as *const vt_mode as *mut c_void) == 0;
+
+    // Refused release first: the display must not move and master must return.
+    let req = ioctl(tty0, VT_ACTIVATE, 2usize as *mut c_void) == 0;
+    let still1 = active_vt(tty0) == 1;
+    let in_rc = dirtyfb(fd);
+    let in_errno = errno();
+    let refused_in_window = in_rc < 0 && in_errno == EACCES;
+    let nack = ioctl(t1, VT_RELDISP, 0usize as *mut c_void) == 0;
+    let back_after_nack = dirtyfb(fd) == 0;
+
+    // Granted release: refused during the window and after the switch.
+    let req2 = ioctl(tty0, VT_ACTIVATE, 2usize as *mut c_void) == 0;
+    let win2 = dirtyfb(fd) < 0 && errno() == EACCES;
+    let grant_rel = ioctl(t1, VT_RELDISP, 1usize as *mut c_void) == 0;
+    let moved = ioctl(tty0, VT_WAITACTIVE, 2usize as *mut c_void) == 0 && active_vt(tty0) == 2;
+    let bg = dirtyfb(fd) < 0 && errno() == EACCES;
+
+    // Return: switch_to completes at once (VT 2 is VT_AUTO) and asks VT 1 to
+    // acknowledge the acquire.
+    let ret = switch_to(tty0, 1);
+    let ack = ioctl(t1, VT_RELDISP, 2usize as *mut c_void) == 0;
+    let auto = vt_mode { mode: VT_AUTO, waitv: 0, relsig: 0, acqsig: 0, frsig: 0, _guard: 0 };
+    ioctl(t1, VT_SETMODE, &auto as *const vt_mode as *mut c_void);
+    let rearmed = dirtyfb(fd) == 0;
+
+    drop_master(fd);
+    close(fd);
+    close(t1);
+    signal(SIGUSR1, old);
+    signal(12, old2);
+    out(b"  in_window_rc="); out_int(in_rc); out(b" errno="); out_int(in_errno); out(b"\n");
+    report(b"present_in_release_window",
+           grant && before && armed && req && still1 && refused_in_window && nack
+           && back_after_nack && req2 && win2 && grant_rel && moved && bg
+           && ret && ack && rearmed)
+}
+
 /// SET_MASTER from the holder while its VT is off screen is EACCES — and does
 /// NOT move the grant to the VT now on screen. If it did, a background client
 /// could take a console back just by asking.
@@ -943,6 +1012,137 @@ unsafe fn t_grab_dies_on_close() -> bool {
 // What a getty and a shell need from it, read back through second syscalls:
 // it is a tty (TCGETS), it names itself `/dev/ttyN` (what ttyname() reads),
 // it knows the console's size, and the VT/KD set still addresses THAT VT.
+
+// ── Tabs and double-width cells ──────────────────────────────────────────────
+//
+// Cursor position is observable without a framebuffer: ESC[6n answers from
+// the VT's own text plane, which is what a repaint puts back on screen.
+
+/// Every VT 2..6 runs a login (userland/init), blocked reading the very pty
+/// this suite drives. A reader that wakes first steals bytes of our CPR reply
+/// (the "lost ESC"), so stop the session leader while the test owns the VT.
+/// Returns the stopped pid (0 = none) for [`login_resume`].
+unsafe fn login_pause(fd: c_int) -> c_int {
+    let mut sid: c_int = 0;
+    if ioctl(fd, 0x5429, &mut sid as *mut c_int as *mut c_void) != 0 || sid <= 1 { return 0; }
+    kill(sid, 19); // SIGSTOP
+    sleep_ms(200);
+    sid
+}
+unsafe fn login_resume(sid: c_int) { if sid > 1 { kill(sid, 18); } } // SIGCONT
+
+unsafe fn cpr(fd: c_int, seq: &[u8]) -> (u32, u32) {
+    // Drop anything left over from the previous query.
+    let mut junk = [0u8; 32];
+    while read(fd, junk.as_mut_ptr() as *mut c_void, junk.len()) > 0 {}
+    write(fd, seq.as_ptr() as *const c_void, seq.len());
+    write(fd, b"\x1b[6n".as_ptr() as *const c_void, 4);
+    let mut buf = [0u8; 24];
+    let mut n = 0usize;
+    // Non-blocking fd: wait up to ~1.5 s for the reply, then take what is there.
+    let mut spins = 0;
+    while n < buf.len() && spins < 300 {
+        let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+        if r > 0 {
+            n += r as usize;
+            if buf[..n].contains(&b'R') { break; }
+        } else {
+            spins += 1;
+            sleep_ms(5);
+        }
+    }
+    // ESC [ row ; col R — a reply that lost its leading ESC is a failure.
+    if n < 2 || buf[0] != 0x1b || buf[1] != b'[' { return (0, 0); }
+    let (mut row, mut col, mut in_col) = (0u32, 0u32, false);
+    for &b in &buf[..n] {
+        match b {
+            b'0'..=b'9' => { let d = (b - b'0') as u32; if in_col { col = col * 10 + d } else { row = row * 10 + d } }
+            b';' => in_col = true,
+            _ => {}
+        }
+    }
+    (row, col)
+}
+
+/// Regression: the CPR reply must always start with ESC. A pty read once
+/// delivered it without the leading 0x1B now and then.
+unsafe fn t_cpr_esc(tty0: c_int) -> bool {
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { out(b"  open failed\n"); return report(b"cpr_esc", false); }
+    let mut tio = [0u8; 64];
+    ioctl(fd, TCGETS, tio.as_mut_ptr() as *mut c_void);
+    for i in 0..4 { if i != 2 { for k in 0..4 { tio[i * 4 + k] = 0; } } }
+    tio[12..16].fill(0);
+    ioctl(fd, TCSETS, tio.as_mut_ptr() as *mut c_void);
+    let sid = login_pause(fd);
+    let (mut bad, mut empty) = (0u32, 0u32);
+    for _ in 0..200 {
+        let mut junk = [0u8; 32];
+        let mut dn = 0usize; loop { let r = read(fd, junk.as_mut_ptr() as *mut c_void, junk.len()); if r <= 0 { break; } dn += r as usize; }
+        write(fd, b"\x1b[6n".as_ptr() as *const c_void, 4);
+        let mut buf = [0u8; 24];
+        let mut n = 0usize;
+        let mut spins = 0; let mut chunks = 0usize; let mut c0 = 0usize;
+        while n < buf.len() && spins < 300 {
+            let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+            if r > 0 { if chunks == 0 { c0 = r as usize; } chunks += 1; n += r as usize; if buf[..n].contains(&b'R') { break; } }
+            else { spins += 1; sleep_ms(5); }
+        }
+        if n == 0 { empty += 1; } else if buf[0] != 0x1b { bad += 1; if bad == 1 { out(b"  drained="); out_num(dn); out(b" chunks="); out_num(chunks); out(b" c0="); out_num(c0); out(b" spins="); out_num(spins as usize); out(b" first byte="); out_num(buf[0] as usize); out(b" n="); out_num(n); out(b"\n"); } }
+    }
+    login_resume(sid);
+    close(fd);
+    out(b"  cpr_esc sid="); out_num(sid as usize); out(b" bad="); out_num(bad as usize); out(b" empty="); out_num(empty as usize); out(b"\n");
+    report(b"cpr_esc", bad == 0 && empty == 0)
+}
+
+unsafe fn t_tabs_wide(tty0: c_int) -> bool {
+    // The VT's login is stopped below, or it would eat the reply.
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { out(b"  open failed\n"); return report(b"tabs_wide", false); }
+    let sid = login_pause(fd);
+    // Raw, so the CPR reply is delivered without a newline.
+    let mut tio = [0u8; 64];
+    ioctl(fd, TCGETS, tio.as_mut_ptr() as *mut c_void);
+    for i in 0..4 { if i != 2 { for k in 0..4 { tio[i * 4 + k] = 0; } } }
+    tio[12..16].fill(0);
+    ioctl(fd, TCSETS, tio.as_mut_ptr() as *mut c_void);
+    let reset = b"\x1b[2J\x1b[H";
+    // HT from col 3 lands on the stop at col 9 (1-based); from a stop, the next.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let tab1 = cpr(fd, b"ab\t") == (1, 9);
+    let tab2 = cpr(fd, b"\t") == (1, 17);
+    // CHT 2 from col 1, then CBT 1 back one stop.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let cht = cpr(fd, b"\x1b[2I") == (1, 17);
+    let cbt = cpr(fd, b"\x1b[Z") == (1, 9);
+    // U+4E2D (CJK, East-Asian Wide) takes two cells; U+00E9 takes one.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let wide = cpr(fd, "\u{4e2d}".as_bytes()) == (1, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let narrow = cpr(fd, "\u{e9}".as_bytes()) == (1, 2);
+    // Emoji (U+1F600) is wide too; a wide glyph that cannot fit wraps whole.
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let emoji = cpr(fd, "\u{1f600}".as_bytes()) == (1, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    let wrap = cpr(fd, b"\x1b[1;1H\x1b[999C\xe4\xb8\xad") == (2, 3);
+    write(fd, reset.as_ptr() as *const c_void, reset.len());
+    login_resume(sid);
+    close(fd);
+    out(b"  tab1="); out_int(tab1 as c_int); out(b" tab2="); out_int(tab2 as c_int);
+    out(b" cht="); out_int(cht as c_int); out(b" cbt="); out_int(cbt as c_int);
+    out(b" wide="); out_int(wide as c_int); out(b" narrow="); out_int(narrow as c_int);
+    out(b" emoji="); out_int(emoji as c_int); out(b" wrap="); out_int(wrap as c_int); out(b"\n");
+    report(b"tabs_wide", tab1 && tab2 && cht && cbt && wide && narrow && emoji && wrap)
+}
 
 unsafe fn t_session_node(tty0: c_int) -> bool {
     let fd = open(b"/dev/tty5\0".as_ptr(), O_RDWR | O_NOCTTY);
@@ -1377,7 +1577,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 32usize;
+    let total = 35usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1396,12 +1596,15 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_master_gates_present() { passed += 1; }
     if t_master_follows_vt(tty0) { passed += 1; }
     if t_setmaster_background(tty0) { passed += 1; }
+    if t_present_in_release_window(tty0) { passed += 1; }
     if t_master_per_vt(tty0) { passed += 1; }
     if t_grab_roundtrip() { passed += 1; }
     if t_grab_is_exclusive() { passed += 1; }
     if t_grab_dies_on_vt_switch(tty0) { passed += 1; }
     if t_grab_dies_on_close() { passed += 1; }
     if t_session_node(tty0) { passed += 1; }
+    if t_tabs_wide(tty0) { passed += 1; }
+    if t_cpr_esc(tty0) { passed += 1; }
     if t_revoke() { passed += 1; }
     if t_revoke_releases_grab() { passed += 1; }
     if t_kd_graphics_owner_death() { passed += 1; }

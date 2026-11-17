@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "sshd-unit"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side unit tests for sshd modules that do not need Linux (userauth.rs): cd userland/sshd/unit && cargo test"
+
+[dependencies]
+russh = { path = "../vendor/russh", default-features = false, features = ["ring", "flate2", "rsa"] }
+signature = "3"
+libc = "0.2"
+seccomp-bpf = { path = "../../../lib/seccomp-bpf" }
+ssh-encoding = "0.3"

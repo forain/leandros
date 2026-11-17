@@ -44,6 +44,8 @@
 //! PAM only from the forked session worker, which is single-threaded, and real
 //! libpam handles are not thread-safe either.
 
+// A copy of lib/utmpx/utmpx.rs (see shadowhash below for why). Keep the two identical.
+mod utmpx;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
@@ -108,6 +110,8 @@ pub struct PamHandle {
     /// `NAME=VALUE` entries, in insertion order. Replacing a name keeps its
     /// original position, which is what Linux-PAM does.
     env: Vec<CString>,
+    /// Microseconds to stall a failed `pam_authenticate` (`pam_fail_delay`).
+    fail_delay_us: u32,
 }
 
 /// Turn a raw handle back into a reference, or bail out with `err`.
@@ -127,6 +131,12 @@ fn dup_cstr(s: *const c_char) -> Option<CString> {
         Some(unsafe { CStr::from_ptr(s) }.to_owned())
     }
 }
+
+/// Linux-PAM's `pam_unix` stalls a failed authentication ~2 s; one second
+/// keeps a guess loop slow without making a mistyped login screen feel hung.
+const FAIL_DELAY_DEFAULT_US: u32 = 1_000_000;
+/// Upper bound for an application-requested delay.
+const FAIL_DELAY_MAX_US: u32 = 10_000_000;
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
@@ -151,6 +161,7 @@ pub unsafe extern "C" fn pam_start(
             None => PamConv { conv: None, appdata_ptr: ptr::null_mut() },
         },
         env: Vec::new(),
+        fail_delay_us: FAIL_DELAY_DEFAULT_US,
     });
     *pamh = Box::into_raw(h);
     PAM_SUCCESS
@@ -225,6 +236,11 @@ pub unsafe extern "C" fn pam_authenticate(pamh: *mut PamHandle, _flags: c_int) -
     // Diagnostic only (lane lapgreet): outcome and timing, never the secret.
     eprintln!("pam-leandros: auth user={} rc={} in {} ms", user, verdict, t0.elapsed().as_millis());
     free_responses(resp, 1);
+    if verdict != PAM_SUCCESS {
+        // Rate limit: every failure (wrong password, unknown user) costs the
+        // same stall, so guessing is slow and user existence is not timed.
+        std::thread::sleep(std::time::Duration::from_micros(h.fail_delay_us as u64));
+    }
     verdict
 }
 
@@ -304,6 +320,9 @@ pub unsafe extern "C" fn pam_open_session(pamh: *mut PamHandle, _flags: c_int) -
     if matches!(h.service.as_deref().map(CStr::to_bytes), Some(b"greetd")) {
         if let Some(user) = h.user.as_ref() {
             join_session_cgroup(user);
+            if user.to_bytes() != b"cosmic-greeter" {
+                utmpx::login(libc::getpid(), b"greetd", user.to_bytes(), b"", libc::getpwnam(user.as_ptr()).as_ref().map(|p| p.pw_uid).unwrap_or(0));
+            }
         }
         return PAM_SUCCESS;
     }
@@ -352,7 +371,12 @@ unsafe fn join_session_cgroup(user: &CStr) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_close_session(_pamh: *mut PamHandle, _flags: c_int) -> c_int {
+pub unsafe extern "C" fn pam_close_session(pamh: *mut PamHandle, _flags: c_int) -> c_int {
+    if let Some(h) = pamh.as_ref() {
+        if matches!(h.service.as_deref().map(CStr::to_bytes), Some(b"greetd")) {
+            utmpx::logout_pid(libc::getpid());
+        }
+    }
     PAM_SUCCESS
 }
 
@@ -366,7 +390,11 @@ pub unsafe extern "C" fn pam_chauthtok(_pamh: *mut PamHandle, _flags: c_int) -> 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pam_fail_delay(_pamh: *mut PamHandle, _usec: u32) -> c_int {
+pub unsafe extern "C" fn pam_fail_delay(pamh: *mut PamHandle, usec: u32) -> c_int {
+    let h = handle!(pamh, PAM_ABORT);
+    // Like Linux-PAM the largest requested delay wins, so an application can
+    // lengthen the stall but a module-free caller cannot switch it off.
+    h.fail_delay_us = h.fail_delay_us.max(usec.min(FAIL_DELAY_MAX_US));
     PAM_SUCCESS
 }
 

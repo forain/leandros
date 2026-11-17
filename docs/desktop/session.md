@@ -142,6 +142,9 @@ the service, and busd activates each from a `.service` file in
 | power-profiles | claims both `org.freedesktop.UPower.PowerProfiles` and `net.hadess.PowerProfiles`; Settings' Power page shows three modes | a placeholder driver |
 | `org.freedesktop.PolicyKit1` | authentication-agent registry, so cosmic-osd's agent registers | only root is authorised |
 | `org.freedesktop.RealtimeKit1` | answers, so PipeWire does not warn three times per start | zero limits; `NotSupported` for every request |
+| `org.freedesktop.timedate1` | Timezone, LocalRTC (false), CanNTP/NTP (false), TimeUSec, `ListTimezones`; `SetTimezone` writes `/etc/timezone` and the `/etc/localtime` symlink | `AccessDenied` as a normal user; `SetNTP(true)`, `SetLocalRTC(true)`, `SetTime` are `NotSupported`; zones validate against `/usr/share/zoneinfo` (Alpine `tzdata`, ~1.4 MB); `/etc/localtime` ships as a symlink to `UTC` |
+| `net.hadess.SwitcherooControl` | `GPUs` from `/sys/class/drm/card*` (driver name, Default on the first), `NumGPUs`, `HasDualGpu` = false | no PRIME environment: `Environment` is empty |
+| `org.a11y.Bus` | `GetAddress` answers with the session bus address, so GTK/libcosmic stop waiting for the activation timeout; `org.a11y.Status` IsEnabled / ScreenReaderEnabled (false) | no at-spi registry or screen reader exists, so toolkits find no accessibility tree |
 
 Anything that needs root fails with an error and never pretends to succeed.
 `leandros-sysbus probe` exercises the services the way COSMIC components do and prints
@@ -345,8 +348,7 @@ the timed-futex wake race, `accept4` flags). Read that section as history.
 
 - No document portal (needs FUSE): one `unknown destination
   org.freedesktop.portal.Documents` warning per login.
-- Not implemented: `timedate1` (Settings' Date & time page), `SwitcherooControl`, the a11y
-  bus, `locale -a` (so "Add language" lists nothing); `SetLocale` as a normal user is
+- Not implemented: `locale -a` (so "Add language" lists nothing); `SetLocale` as a normal user is
   `AccessDenied`.
 - logind "block" inhibitors for shutdown are not enforced; Ctrl-Alt-Del does not reach init;
   sleep states are unsupported.

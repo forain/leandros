@@ -57,7 +57,8 @@ Satellite crates:
 | `usb` | [drivers/usb](../../drivers/usb/src/lib.rs) | xHCI host controller (`xhci/`), bulk-only mass storage + SCSI (`msc/`), boot-protocol HID (`hid/`), `DmaBuf`, the `BulkTransport` seam. `descriptor`, `device`, `endpoint`, `transfer`, `hub` and `hcd` are protocol types and an older hub/HCD model that is not wired up. |
 | `nvidia-rm` | [drivers/nvidia](../../drivers/nvidia/src/lib.rs) | NVIDIA OpenRM OS shim and bring-up thread; optional, x86_64 only, feature `nvidia` |
 | `wifi` | [drivers/wifi](../../drivers/wifi/src/lib.rs) | A port of Linux's `cfg80211`/`mac80211`/`nl80211` layering with a simulated driver |
-| host tests | [drivers/partscan-tests](../../drivers/partscan-tests/Cargo.toml), [drivers/usb/msc-tests](../../drivers/usb/msc-tests/Cargo.toml), `drivers/r8169-tests`, `drivers/uapi-tests` | Host-side unit tests for the partition scanner, the BOT/SCSI layer, the r8169 chip table/ring/firmware interpreter, and the DRM sync-object and VM_BIND bookkeeping |
+| [ena.rs](../../drivers/src/ena.rs), [ena_hw.rs](../../drivers/src/ena_hw.rs) | Amazon ENA (AWS EC2 Nitro NIC, PCI 1d0f:ec20): polled admin queue + AENQ, readless MMIO (PCI revision bit 0), one host-placement TX/RX queue pair, keep-alive/fatal/admin-timeout watchdog with reset + re-init, registered as `ethN`; `ena.disable=1` skips the probe. Core is host-tested against a mock device in `drivers/ena-tests`; LLQ and MSI-X are separate work, not tested on real EC2 yet | [design-ec2](../../TODO.md) |
+| host tests | [drivers/partscan-tests](../../drivers/partscan-tests/Cargo.toml), [drivers/usb/msc-tests](../../drivers/usb/msc-tests/Cargo.toml), `drivers/r8169-tests`, `drivers/ena-tests` (mock ENA device), `drivers/uapi-tests` | Host-side unit tests for the partition scanner, the BOT/SCSI layer, the r8169 chip table/ring/firmware interpreter, and the DRM sync-object and VM_BIND bookkeeping |
 
 Cargo features on `drivers`: `rpi5` and `raspi4b` select the SDHCI driver as `drivers::blkdev` instead
 of virtio-blk; `usb-debug` turns on verbose xHCI tracing and a boot-time bulk-transport self-test.
@@ -146,6 +147,21 @@ The block layer has a stable seam and two compile-time shapes:
   also renders PARTUUIDs in Linux's text forms.
 - **On `rpi5`/`raspi4b`** `drivers::blkdev` is the SDHCI driver instead, re-exported with the same API;
   runtime registration returns `Unsupported`.
+
+- **virtio-blk completion wait** is hybrid: the waiter polls the used ring for `virtio_blk.spin_us`
+  microseconds (default 50) and only then parks (`wfi`/`hlt`) until the completion interrupt (MSI-X on
+  x86_64, the shared INTx SPI on aarch64). Parking straight away was measured slower on aarch64 HVF
+  (wake latency of about 0.35 ms per request). Page-fault and IRQs-masked callers open their own
+  interrupt window. After 64 consecutive parked waits with no interrupt (line masked by the storm
+  guard, broken routing) the driver goes back to pure polling and logs it.
+  On aarch64 an INTx line has at most 4 sharers; virtio-blk registers one handler per INTID
+  (shared by all its disks), so it costs one slot per line, and a refused registration leaves that
+  disk polling (`line registration refused` in the boot log).
+
+  | Knob | Effect |
+  |---|---|
+  | `virtio_blk.irq=0` | never park: spin on the used ring (pre-IRQ behaviour) |
+  | `virtio_blk.spin_us=N` | spin window before parking, default 50 |
 
 `/dev/root` selection, the `ENODEV`/`ENOTUNIQ` semantics and the boot-disk tie-break are described in
 [pc.md](pc.md#choosing-the-root-devroot). How the VFS mirrors the registry into `/dev` and
@@ -253,6 +269,7 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 | `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
 | `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
 | `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
+| `iwlwifi.ht40_24=0` | on | do not use 40 MHz on 2.4 GHz; by default 20/40 is used only when the AP offers it and no 40 MHz-intolerant BSS is seen in the span |
 | `iwlwifi.txagg=0` | on | no TX aggregation (no ADDBA request from us) |
 | `iwlwifi.ht40=0` | on | 20 MHz only, also on 5 GHz |
 | `iwlwifi.txant=a\|b` | automatic | transmit on one antenna only: no comparison, no toggling |
@@ -324,7 +341,7 @@ These come from bugs, each of which cost days:
 ## Limitations and open work
 
 - No shared virtio transport; each driver repeats the capability walk.
-- No interrupt-driven block I/O; a slow device holds its CPU while polling (the USB disk lock now sleeps between polls and spins only 300 us, but virtio-blk still polls). Network RX is interrupt-driven on r8169 (MSI) and kick-driven on virtio-net.
+- virtio-blk waits are hybrid (spin, then park on the completion interrupt); a slow USB or NVMe device still holds its CPU while polling (the USB disk lock sleeps between polls and spins only 300 us). Network RX is interrupt-driven on r8169 (MSI) and kick-driven on virtio-net.
 - No MSI on aarch64 (needs a GICv3 ITS); no legacy INTx routing on x86_64.
 - No IOMMU support; DMA addresses are physical addresses.
 - No UAS (bulk-only transport only). USB hubs and mass-storage/HID hot-plug work; xHCI endpoint recovery disables only the failing slot (`quarantine_slot`), and a controller that disappears (Thunderbolt power-down) is guarded by `usb.tbxhci`. See [pc.md](pc.md#usb-c-and-thunderbolt).

@@ -74,6 +74,7 @@ def main(argv):
     subprocess.run(["cp", "-c", src, img], check=False)
     if not os.path.exists(img):
         imgclone.clone_file(src, img)
+        imgclone.ensure_remote_key(img)
     env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}")
     os.environ["LEANDROS_DISK_IMAGE"] = img
 

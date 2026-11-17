@@ -123,7 +123,10 @@ pub unsafe fn churn(dir: &[u8], factor: u64) -> i32 {
         Some(v) => v,
         None => { out(b"churn: statfs failed\n"); return 1; }
     };
-    let cap = blocks * 4096;
+    let _ = blocks;
+    // The fillable capacity is what statfs reports free on the empty volume
+    // (f_blocks includes metadata, overprovision and the allocator reserve).
+    let cap = bfree0 * 4096;
     let budget = cap * 65 / 100;
     let goal = cap * factor;
     out(b"churn: capacity "); out_dec(cap >> 10); out(b" KiB, free "); out_dec(bfree0 * 4); out(b" KiB, writing ");

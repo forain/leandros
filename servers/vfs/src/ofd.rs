@@ -145,7 +145,11 @@ pub fn put_deferred(id: u32) -> (bool, bool) {
     if e.refs != 0 { return (false, false); }
     e.gen = e.gen.wrapping_add(1) & GEN_MASK;
     let w = core::mem::replace(&mut e.watched, false);
+    let m = if e.mns == u16::MAX && e.mnt != 0 { Some(e.mnt) } else { None };
+    e.mnt = 0; e.mns = 0;
     t.live -= 1;
+    drop(t);
+    if let Some(m) = m { crate::mnt::ns0::mnt_unref(m); }
     (true, w)
 }
 
@@ -217,8 +221,18 @@ pub fn census() -> Option<(usize, usize)> {
 /// fchmod/fchown/futimens can refuse on a read-only mount.
 pub fn set_mnt(id: u32, ns: u16, mnt: u32, mfl: u8) {
     if let Some((i, g)) = split(id) {
-        let mut t = OFDS.lock();
-        if let Some(e) = t.s.get_mut(i) { if e.gen == g && e.refs != 0 { e.mnt = mnt; e.mns = ns; e.mfl = mfl; } }
+        let mut old = None;
+        let mut took = false;
+        {
+            let mut t = OFDS.lock();
+            if let Some(e) = t.s.get_mut(i) { if e.gen == g && e.refs != 0 {
+                if e.mnt != 0 && e.mns == u16::MAX { old = Some(e.mnt); }
+                e.mnt = mnt; e.mns = ns; e.mfl = mfl; took = ns == u16::MAX;
+            } }
+        }
+        // An ns-0 mount lives as long as a description opened under it.
+        if took { crate::mnt::ns0::mnt_ref_at(mnt, mfl); }
+        if let Some(o) = old { crate::mnt::ns0::mnt_unref(o); }
     }
 }
 

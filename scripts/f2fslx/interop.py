@@ -25,13 +25,13 @@ passes while still listed is UNEXPECTED-PASS, so stale entries are caught).
 Guest images/disks are scratch under $TMPDIR; box scratch is /tmp/f2fsinterop-$$
 and always removed.
 """
-import fnmatch, hashlib, json, os, shutil, struct, subprocess, sys, tempfile, zlib
+import fnmatch, hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 BOX = os.environ.get("F2FSINTEROP_BOX", "forain@172.16.158.150")
 LOCK = os.environ.get("F2FSINTEROP_LOCK", "")
-SSH = ["ssh", "-o", "BatchMode=yes", BOX]
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", BOX]
 # name -> (mkfs options, mount options used while populating[, image size])
 VARIANTS = {
     "lxdef": ("", ""),
@@ -174,9 +174,28 @@ def sha(path):
     return h.hexdigest()
 
 
-def guest(imgs, cmds, tag):
+_BOOT = {}
+
+
+def boot_image(cmdline):
+    """A copy of the aarch64 boot image with `cmdline` baked in (cached per cmdline)."""
+    if cmdline not in _BOOT:
+        d = tempfile.mkdtemp(prefix="f2fsinterop-boot-")
+        dst = os.path.join(d, "boot.img")
+        if subprocess.run(["cp", "-c", os.path.join(REPO, "leandros-limine-aarch64.img"), dst], capture_output=True).returncode != 0:
+            shutil.copyfile(os.path.join(REPO, "leandros-limine-aarch64.img"), dst)
+        subprocess.run([os.path.join(REPO, "scripts/set-image-cmdline.sh"), dst, cmdline], check=True, capture_output=True)
+        _BOOT[cmdline] = dst
+    return _BOOT[cmdline]
+
+
+def guest(imgs, cmds, tag, cmdline=None):
     """Boot aarch64 with imgs attached, run cmds, return list of outputs."""
     env = dict(os.environ, LEANDROS_RUN_ID=os.environ.get("LEANDROS_RUN_ID", "f2fsinterop-aarch64"))
+    if cmdline:
+        env["LEANDROS_DISK_IMAGE"] = boot_image(cmdline)
+    else:
+        env.pop("LEANDROS_DISK_IMAGE", None)
     r = subprocess.run(locked("qemu", [sys.executable, os.path.abspath(__file__), "--guest", json.dumps(imgs)]),
                        input=json.dumps(cmds), capture_output=True, text=True, env=env, timeout=3000)
     for l in r.stdout.splitlines():
@@ -577,6 +596,162 @@ timeout 180 fsck.f2fs --dry-run f.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?"
 
 
 
+# ---- direction E: LeandrOS fsync -> crash (QEMU quit, no umount) -> Linux (design f2fsnodelog T2) ----
+# (name, guest ops run in /mnt/h after mounting; they print "EXP <md5>  <path>" lines, files the
+#  chain must carry, min chain nodes marked FSYNC/DENT, chain-only: a no-recovery Linux mount must miss the content)
+XV = "XV $(xattr -p user.big t/k 2>/dev/null | tr -d '\\n' | md5sum | cut -c1-32)"
+# name, ops (all fsyncs are real fsync(2): `f2fstest fsync` or dd conv=fsync, never `sync FILE`), minmark (chain nodes
+# chaindump must see), cponly (P-b: what a norecovery mount of the CP shows), cpd (P-a: cp_total delta, None = any),
+# chained (P-a: minimum lx_chained delta), files (inode numbers printed, P-c), pc (per file: "inode" | "data" = also recover_data),
+# absent (files whose ino must NOT be replayed), xv (xattr digest compared on Linux)
+ESCEN = [
+    dict(name="append", ops="dd if=/dev/urandom bs=4k count=20 conv=notrunc,fsync oflag=append of=t/big 2>/dev/null; md5sum t/big",
+         minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/big": "data"}),
+    dict(name="newfile", ops="dd if=/dev/urandom of=t/nf bs=1k count=300 conv=fsync 2>/dev/null; md5sum t/nf",
+         minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/nf": "data"}),
+    dict(name="inline", ops="echo inl > t/ni; f2fstest fsync t/ni >/dev/null; md5sum t/ni",
+         minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/ni": "inode"}),
+    dict(name="overwrite", ops="dd if=/dev/urandom of=t/big bs=4k count=10 seek=5 conv=notrunc,fsync 2>/dev/null; md5sum t/big",
+         minmark=1, cponly="PRESENT", cpd=0, chained=1, pc={"t/big": "inode"}),
+    dict(name="overwrite-ext", ops="dd if=/dev/urandom of=t/big bs=4k count=10 seek=5 conv=notrunc 2>/dev/null; "
+         "dd if=/dev/urandom bs=3k count=1 conv=notrunc,fsync oflag=append of=t/big 2>/dev/null; md5sum t/big",
+         minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/big": "data"}),
+    dict(name="indirect", ops="dd if=/dev/urandom of=t/huge bs=1M count=40 conv=fsync 2>/dev/null; md5sum t/huge",
+         minmark=1, cponly="MISS", cpd=None, chained=1, pc={"t/huge": "data"}),
+    dict(name="xattr", ops="V=$(printf 'x%.0s' $(seq 1 700)); xattr -w user.big \"$V\" t/k && f2fstest fsync t/k >/dev/null; md5sum t/k; echo " + XV,
+         minmark=1, cponly=None, cpd=0, chained=1, pc={"t/k": "inode"}, xv=True),
+    dict(name="ab", ops="dd if=/dev/urandom of=t/A bs=1k count=100 conv=fsync 2>/dev/null; dd if=/dev/urandom of=t/B bs=1k count=100 2>/dev/null; md5sum t/A",
+         minmark=1, cponly="MISS", cpd=0, chained=1, pc={"t/A": "data"}, absent=["t/B"]),
+    dict(name="era", ops="dd if=/dev/urandom of=t/A bs=1k count=100 conv=fsync 2>/dev/null; dd if=/dev/urandom of=t/A bs=1k count=100 conv=notrunc 2>/dev/null; "
+         "sync; dd if=/dev/urandom of=t/B bs=1k count=100 conv=fsync 2>/dev/null; md5sum t/A t/B",
+         minmark=1, cponly="MISS", cpd=None, chained=2, pc={"t/B": "data"}, absent=["t/A"]),
+    dict(name="full", ops="for i in $(seq 1 600); do echo $i > t/f$i; f2fstest fsync t/f$i >/dev/null; done; md5sum t/f*",
+         minmark=1, cponly=None, cpd=None, chained=1, pc={}, cpmin=1),
+    dict(name="rename", ops="echo m > t/r0; sync; mv t/r0 t/r1; sync t/r1; md5sum t/r1",
+         minmark=0, cponly=None, cpd=None, chained=0, pc={}),
+    dict(name="trunc", ops="dd if=/dev/urandom of=t/tr bs=1M count=2 2>/dev/null; sync; truncate -s 100K t/tr; f2fstest fsync t/tr >/dev/null; md5sum t/tr",
+         minmark=0, cponly=None, cpd=None, chained=0, pc={}),
+    dict(name="xattrrm", ops="V=$(printf 'x%.0s' $(seq 1 700)); xattr -w user.big \"$V\" t/k; sync; xattr -d user.big t/k; f2fstest fsync t/k >/dev/null; md5sum t/k; echo " + XV,
+         minmark=0, cponly=None, cpd=None, chained=0, pc={}, xv=True),
+]
+
+ECMD = os.environ.get("F2FSINTEROP_CMDLINE", "f2fs.lxchain=1")
+STAT = "echo $(grep -E '^(cp_total|lx_chained|lx_fallback) ' /proc/f2fsstat | tr '\\n' ' ')"
+
+
+def direction_e(tmp, only=None):
+    for sc in ESCEN:
+        if only and sc["name"] not in only:
+            continue
+        e_scenario(tmp, sc)
+
+
+def stat_map(line):
+    m = re.findall(r"(cp_total|lx_chained|lx_fallback) (\d+)", line)
+    return {k: int(v) for k, v in m}
+
+
+def e_scenario(tmp, sc):
+    name, ops, minmark = sc["name"], sc["ops"], sc["minmark"]
+    v = f"E-{name}"
+    img, snap = os.path.join(tmp, f"e-{name}.img"), os.path.join(tmp, f"e-{name}.crash")
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home.py"), "create", img, "--size", "256M"], capture_output=True, text=True)
+    if not step(v, "E.mkfs", r.returncode == 0, "mkfs-f2fs-home create"):
+        return
+    base = ("mkdir -p t; dd if=/dev/urandom of=t/big bs=4k count=150 2>/dev/null; echo keepme > t/k; sync; cd /; "
+            "umount /mnt/h; echo UMOUNT_RC=$?")
+    outs = guest([img], [MNTH, "cd /mnt/h && " + base], "E1", ECMD)
+    if outs is None or "MNT_RW" not in outs[0] or "UMOUNT_RC=0" not in outs[1]:
+        step(v, "E.boot1", False, "base volume failed"); return
+    # boot 2: scenario, then the harness stops QEMU without umount (driver.cmd_stop = monitor quit)
+    inos = sorted(set(list(sc["pc"]) + sc.get("absent", [])))
+    ino_cmd = "; ".join(f"echo INO {f} $(stat -c %i {f})" for f in inos)
+    outs = guest([img], [MNTH, "cd /mnt/h && (" + STAT.replace("echo ", "echo STAT0 ", 1) + "; " + ops + ") 2>&1; "
+                         + STAT.replace("echo ", "echo STAT1 ", 1) + "; " + (ino_cmd + "; " if ino_cmd else "") + "echo SCEN_DONE; cd /"], "E2", ECMD)
+    if outs is None or "MNT_RW" not in outs[0] or "SCEN_DONE" not in outs[1]:
+        step(v, "E.boot2", False, (outs[1].strip()[-500:].replace("\n", " | ") if outs else "no guest")); return
+    out2 = outs[1]
+    exp = [l.strip().replace("t/", "") for l in out2.splitlines()
+           if len(l.strip()) > 36 and l.strip()[32:34] == "  " and l.strip()[:32].isalnum() and l.strip()[34:36] == "t/"]
+    if not exp:
+        step(v, "E.boot2", False, "no md5 lines from the scenario: " + out2.strip()[-100:]); return
+    # P-a: no checkpoint during the fsyncs, and the chain was used
+    s0 = next((stat_map(l) for l in out2.splitlines() if l.startswith("STAT0")), {})
+    s1 = next((stat_map(l) for l in out2.splitlines() if l.startswith("STAT1")), {})
+    if s0 and s1 and ECMD:
+        d = {k: s1.get(k, 0) - s0.get(k, 0) for k in s0}
+        ok = d.get("lx_chained", 0) >= sc["chained"] and (sc["cpd"] is None or d.get("cp_total", -1) == sc["cpd"]) \
+            and d.get("cp_total", 0) >= sc.get("cpmin", 0)
+        step(v, "E.stat", ok, f"cp_total +{d.get('cp_total')} (want {sc['cpd']}), lx_chained +{d.get('lx_chained')} (want >= {sc['chained']}), lx_fallback +{d.get('lx_fallback')}")
+    elif ECMD:
+        step(v, "E.stat", False, "no /proc/f2fsstat lines")
+    ino_of = {m[0]: int(m[1]) for m in re.findall(r"INO (\S+) (\d+)", out2)}
+    xv = re.search(r"XV ([0-9a-f]{32})", out2)
+    shutil.copyfile(img, snap)
+    fl = cp_flags(snap)
+    cd = subprocess.run([sys.executable, os.path.join(HERE, "chaindump.py"), snap, "--quiet"] + (["--strict"] if ECMD else []), capture_output=True, text=True)
+    m = [int(x.split("=")[1]) for x in cd.stdout.split() if x.startswith("marked=")]
+    marked = m[0] if m else -1
+    step(v, "E.chain", not fl & 1 and marked >= minmark and (marked >= 1 or minmark == 0) and cd.returncode == 0,
+         f"chain marked={marked} (want >= {minmark}) cp_umount={fl & 1} dump rc={cd.returncode}"
+         + ("" if cd.returncode == 0 else " " + "; ".join(l.strip() for l in (cd.stderr + cd.stdout).splitlines() if "chaindump:" in l or ": " in l)[:300]))
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    mf = os.path.join(tmp, f"e-{name}.md5")
+    open(mf, "w").write("\n".join(exp) + "\n")
+    xchk = f"; echo XVL $(getfattr --only-values -n user.big {{m}}/t/k 2>/dev/null | md5sum | cut -c1-32)" if sc.get("xv") else ""
+    xsh = (xchk.replace('{m}', 'm').lstrip('; ') + "; ") if xchk else ""
+    try:
+        box(f"mkdir -p {rd}")
+        if not push(snap, f"{rd}/c.img") or not push(mf, f"{rd}/MANIFEST"):
+            step(v, "E.ship", False, "push failed"); return
+        # P-b: the checkpoint alone (norecovery) must lack what only the chain holds.
+        rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img ro.img; if sudo mount -o loop,ro,norecovery ro.img m; then (cd m/t && md5sum -c ../../MANIFEST >/tmp/cp.$$ 2>&1; echo CPONLY_RC=$?); {xsh}sudo umount m; else echo CPONLY_MNTFAIL; fi""")
+        if sc["cponly"]:
+            miss = "CPONLY_RC=" in out and "CPONLY_RC=0" not in out
+            if sc.get("xv") and xv:
+                miss = miss or (re.search(r"XVL ([0-9a-f]{32})", out) or [None, ""])[1] != xv.group(1)
+            ok = miss if sc["cponly"] == "MISS" else ("CPONLY_RC=0" in out)
+            step(v, "E.cponly", ok, f"norecovery mount of the CP: {'content missing' if miss else 'content present'} (want {sc['cponly']})")
+        rc, out = box(f"""cd {rd}; cp --sparse=always c.img f.img; timeout 180 fsck.f2fs --dry-run -d 1 f.img </dev/null >fk.txt 2>&1; echo FSCK_RC=$?; grep -c 'do_record_fsync_data: \\[node\\]' fk.txt""")
+        nrec = int(out.strip().splitlines()[-1]) if out.strip().splitlines()[-1].isdigit() else -1
+        step(v, "E.fsck0", "FSCK_RC=0" in out and nrec >= max(1, minmark) * (minmark > 0), f"fsck rc0, {nrec} node records (want >= {minmark})")
+        # P-c / P-d: Linux rw mount replays the chain (marker in dmesg), then content + fsck
+        rc, out = box(f"""cd {rd}; mkdir -p m; cp --sparse=always c.img l.img; echo LXMARK_{os.getpid()} | sudo tee /dev/kmsg >/dev/null
+if sudo mount -o loop l.img m; then (cd m/t && md5sum -c ../../MANIFEST 2>&1 | grep -c FAILED; ); {xsh}sudo dmesg | sed -n '/LXMARK_{os.getpid()}/,$p' > dm.txt; sync; sudo umount m && echo LX_UMOUNT_OK; else echo LX_MOUNT_FAIL; fi
+timeout 180 fsck.f2fs --dry-run l.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?; grep -E 'recover_(inode|data)' dm.txt | head -40""")
+        ok = "LX_UMOUNT_OK" in out and out.strip().splitlines()[0].strip() == "0" and "FSCK2_RC=0" in out
+        if ok and sc.get("xv") and xv:
+            xl = re.search(r"XVL ([0-9a-f]{32})", out)
+            ok = bool(xl) and xl.group(1) == xv.group(1)
+        step(v, "E.linux", ok, "Linux recovery: content present, fsck rc 0" if ok else out.strip()[-140:].replace("\n", " "))
+        if ECMD and sc["pc"] is not None and (sc["pc"] or sc.get("absent")):
+            bad = []
+            for f, kind in sc["pc"].items():
+                h = "%x" % ino_of.get(f, -1)
+                if not re.search(rf"recover_inode: ino = {h}\b", out): bad.append(f"{f}: no recover_inode")
+                if kind == "data" and not re.search(rf"recover_data: ino = {h}\b.*recovered = [1-9]", out): bad.append(f"{f}: no recover_data")
+            for f in sc.get("absent", []):
+                if re.search(rf"recover_(inode|data): ino = {'%x' % ino_of.get(f, -1)}\b", out): bad.append(f"{f}: replayed")
+            step(v, "E.replay", not bad, "dmesg shows the chain replayed per file" if not bad else "; ".join(bad) + " | want " + str(ino_of) + " got " + " ".join(sorted(set(re.findall(r"recover_(?:inode|data): ino = (\w+)", out)))) + " " + " / ".join(l[-60:] for l in out.splitlines() if "recover_" in l)[-120:])
+        back = os.path.join(tmp, f"e-{name}.back")
+        if ok and fetch(f"{rd}/l.img", back):
+            ok2 = e_guest_check(back, exp, "E3")
+            step(v, "E.back", ok2, "LeandrOS mounts Linux's recovered image, content ok" if ok2 else "guest check failed")
+        else:
+            skip(v, "E.back", "Linux recovery failed")
+    finally:
+        box(f"rm -rf {rd}")
+    ok3 = e_guest_check(snap, exp, "E4")
+    step(v, "E.ours", ok3, "LeandrOS recovers its own crash image (LRF1), content ok" if ok3 else "guest check failed")
+
+
+def e_guest_check(image, exp, tag):
+    """Mount image in the guest, re-create the manifest from the harness's md5 lines, verify."""
+    mf = "; ".join(f"echo '{l}' >> /tmp/MF" for l in exp)
+    outs = guest([image], [MNTH, "rm -f /tmp/MF; " + mf + "; cd /mnt/h/t && md5sum -c /tmp/MF 2>&1 | grep -c ': OK'; echo CHK_DONE; cd /"], tag)
+    return bool(outs) and "MNT_FAIL" not in outs[0] and "CHK_DONE" in outs[1] and str(len(exp)) in [x.strip() for x in outs[1].splitlines()]
+
+
 def direction_b(tmp):
     v = "home"
     img = os.path.join(tmp, "home.img")
@@ -622,13 +797,74 @@ else echo LX_MOUNT_FAIL; sudo dmesg | tail -n 3 | cut -c1-150; fi"""
     if outs is None or "MNT_FAIL" in outs[0]:
         step(v, "B.back-verify", False, "LeandrOS cannot mount the Linux-written volume"); return
     ok = outs is not None and "fromlinux" in outs[1] and "FAILED" not in outs[1] and "WARNING" not in outs[1] and outs[1].count(": OK") >= 4
-    step(v, "B.back-verify", ok, "LeandrOS reads Linux's files" if ok else "verify failed: " + (outs[1].strip()[-100:] if outs else "no guest"))
+    step(v, "B.back-verify", ok, "LeandrOS reads Linux's files" if ok else "verify failed: " + (outs[1].strip()[-500:].replace("\n", " | ") if outs else "no guest"))
+
+
+def skew_valid_count(path):
+    """Make fsck.f2fs find something to fix: valid_block_count + 1 in the newest pack's commit
+    block and in its footer copy (CRC resealed). A clean volume is left alone by `fsck.f2fs -f`."""
+    with open(path, "r+b") as f:
+        f.seek(1024)
+        sb = f.read(256)
+        cp_blk = struct.unpack_from("<I", sb, 76)[0]
+        bps = 1 << struct.unpack_from("<I", sb, 20)[0]
+        best = None
+        for pack in (0, 1):
+            f.seek((cp_blk + pack * bps) * 4096)
+            ver = struct.unpack("<Q", f.read(8))[0]
+            if best is None or ver > best[0]:
+                best = (ver, cp_blk + pack * bps)
+        f.seek(best[1] * 4096)
+        h = bytearray(f.read(4096))
+        total = struct.unpack_from("<I", h, 136)[0]
+        for blk in (best[1], best[1] + total - 1):
+            f.seek(blk * 4096)
+            b = bytearray(f.read(4096))
+            struct.pack_into("<Q", b, 16, struct.unpack_from("<Q", b, 16)[0] + 1)
+            struct.pack_into("<I", b, 4092, f2fs_crc(bytes(b[:4092])))
+            f.seek(blk * 4096)
+            f.write(b)
+
+
+def direction_fsckfix(tmp):
+    """Review M5: `fsck.f2fs -f` rewrites our checkpoint with the same version. We write, Linux
+    fsck -f, we mount again: the checkpoint must be detected as foreign (kernel log) and the data intact."""
+    v = "fsckfix"
+    img = os.path.join(tmp, "fsckfix.img")
+    r = subprocess.run([sys.executable, os.path.join(REPO, "scripts/mkfs-f2fs-home.py"), "create", img, "--size", "256M"],
+                       capture_output=True, text=True)
+    if not step(v, "F.lx-mkfs", r.returncode == 0, "mkfs-f2fs-home create" if r.returncode == 0 else r.stderr.strip()[-100:]):
+        return
+    W = ("cd /mnt/h && mkdir -p w && dd if=/dev/urandom of=w/big bs=4096 count=1500 2>/dev/null && "
+         "for i in $(seq 1 50); do echo f$i > w/n$i; done && (cd w && md5sum big n1 n50 > ours.md5); sync; cd /; echo WORK_OK")
+    outs = guest([img], [MNTH, W, "umount /mnt/h; echo UMOUNT_RC=$?"], "F1")
+    if outs is None or "MNT_RW" not in outs[0] or "WORK_OK" not in outs[1] or "UMOUNT_RC=0" not in outs[2]:
+        step(v, "F.work", False, "LeandrOS mount/workload/umount failed"); return
+    step(v, "F.work", True, "workload + umount ok")
+    skew_valid_count(img)
+    rd = f"/tmp/f2fsinterop-{os.getpid()}"
+    try:
+        box(f"mkdir -p {rd}")
+        if not push(img, f"{rd}/fsckfix.img"):
+            step(v, "F.ship", False, "push failed"); return
+        rc, out = box(f"cd {rd}; timeout 300 fsck.f2fs -f fsckfix.img </dev/null >ff.txt 2>&1; echo FSCKF_RC=$?; "
+                      "cp fsckfix.img fsckfix.orig; timeout 180 fsck.f2fs --dry-run fsckfix.img </dev/null >f2.txt 2>&1; echo FSCK2_RC=$?")
+        step(v, "F.fsck-f", "FSCKF_RC=" in out, "fsck.f2fs -f ran: " + out.strip()[-60:].replace("\n", " "))
+        if not fetch(f"{rd}/fsckfix.img", img):
+            step(v, "F.ship-back", False, "fetch failed"); return
+    finally:
+        box(f"rm -rf {rd}")
+    outs = guest([img], [MNTH, "cd /mnt/h/w && md5sum -c ours.md5 2>&1; echo END; cd /; dmesg | grep 'foreign check' | cut -c1-120; umount /mnt/h"], "F2")
+    if outs is None or "MNT_FAIL" in outs[0]:
+        step(v, "F.mount", False, "LeandrOS cannot mount the fsck-fixed volume"); return
+    step(v, "F.data", outs[1].count(": OK") >= 3 and "FAILED" not in outs[1], "data intact after fsck -f")
+    step(v, "F.detected", "journal dropped" in outs[1], "checkpoint detected as foreign" if "journal dropped" in outs[1] else repr(outs[1][-400:]) + " LEN=" + str(len(outs[1])))
 
 
 def main(argv):
     if argv[:1] == ["--guest"]:
         return guest_main(argv[1])
-    allv = list(VARIANTS) + ["home", "orph", "fsync"]
+    allv = list(VARIANTS) + ["home", "orph", "fsync", "fsynce", "fsckfix"]
     if not argv or argv[0] in ("-h", "--help", "--list"):
         print(__doc__ if argv[:1] != ["--list"] else " ".join(allv)); return 0
     vs = allv if argv == ["all"] else argv
@@ -642,10 +878,14 @@ def main(argv):
             direction_a(a, tmp)
         if "home" in vs:
             direction_b(tmp)
+        if "fsckfix" in vs:
+            direction_fsckfix(tmp)
         if "orph" in vs:
             direction_orph(tmp)
         if "fsync" in vs:
             direction_fsync(tmp)
+        if "fsynce" in vs:
+            direction_e(tmp, os.environ.get("F2FSINTEROP_E", "").split() or None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     bad = sum(1 for r in results if r in ("FAIL", "UNEXPECTED-PASS"))

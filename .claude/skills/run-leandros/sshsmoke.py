@@ -23,6 +23,7 @@ import os
 import pty
 import re
 import select
+import socket
 import shutil
 import signal
 import struct
@@ -64,11 +65,12 @@ class Ssh:
         os.chmod(self.askpass, 0o700)
         self.known = os.path.join(tmp, "known_hosts")
         self.key = os.path.join(tmp, "id_ed25519")
+        self.proxy = None  # ProxyCommand reaching a second sshd through the first one
 
     def base_opts(self):
         return ["-F", "/dev/null", "-o", "StrictHostKeyChecking=no",
                 "-o", f"UserKnownHostsFile={self.known}", "-o", "ConnectTimeout=20",
-                "-o", "LogLevel=ERROR"]
+                "-o", "LogLevel=ERROR", *(["-o", f"ProxyCommand={self.proxy}"] if self.proxy else [])]
 
     def pw_opts(self):
         return self.base_opts() + ["-o", "PreferredAuthentications=password,keyboard-interactive",
@@ -77,6 +79,10 @@ class Ssh:
     def key_opts(self):
         return self.base_opts() + ["-o", "PreferredAuthentications=publickey", "-o", "BatchMode=yes",
                                    "-o", "IdentitiesOnly=yes", "-i", self.key]
+
+    def kbd_opts(self):
+        return self.base_opts() + ["-o", "PreferredAuthentications=keyboard-interactive", "-o", "PubkeyAuthentication=no",
+                                   "-o", "KbdInteractiveAuthentication=yes", "-o", "NumberOfPasswordPrompts=1"]
 
     def env(self, password):
         e = dict(os.environ)
@@ -171,9 +177,47 @@ def quick(ssh, user, pw):
     for tag, dev in (("v4", "127.0.0.1"), ("v6", "::1")):
         rc, out, err = ssh.run(user, f"/bin/ip6test banner {dev} 22", password=pw)
         step(f"loopback_banner_{tag}", rc == 0 and out.startswith("SSH-"), f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    utmp(ssh, user, pw)
     rc, out, err = ssh.run(user, "cat /proc/self/cgroup", password=pw)
     step("session_cgroup", rc == 0 and "/user.slice/user-" in out and "/session-" in out,
          f"rc={rc} out={out.strip()!r}")
+
+
+def utmp(ssh, user, pw):
+    """utmpx/wtmp/lastlog (lane utmp). Alpine busybox reads them: `who` through
+    the utmps socket (served by /bin/utmpd), `last` straight from wtmp."""
+    bb = "/bin/busybox.static"
+    # An ssh pty session is a login: `who` run inside it lists itself, and the
+    # console root session the harness logged in on is listed too (/bin/login).
+    rc, out, err = ssh.run(user, f"{bb} who", password=pw, extra=("-tt",))
+    who = [l.split() for l in out.replace("\r", "").splitlines() if l.strip()]
+    step("utmp_who_ssh", any(w[0] == user and w[1].startswith("pts/") for w in who),
+         f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    # Native readers (lane utmpread): w / users inside a pty session list it.
+    rc, out, err = ssh.run(user, "/bin/w; /bin/users", password=pw, extra=("-tt",))
+    o = out.replace("\r", "")
+    step("utmp_w_users_ssh", rc == 0 and "load average:" in o and "LOGIN@" in o
+         and any(l.split()[:2] and l.split()[0] == user and l.split()[1].startswith("pts/") for l in o.splitlines())
+         and o.strip().splitlines()[-1].split().count(user) >= 1, f"rc={rc} out={o.strip()[-400:]!r}")
+    step("utmp_who_console_login", any(w[0] == "root" and (w[1].startswith("tty") or w[1] == "console") for w in who),
+         f"out={out.strip()!r}")
+    # The first session has ended: DEAD_PROCESS, so a plain exec (no pty, never
+    # recorded) sees only the current console and ssh-less state.
+    rc, out, err = ssh.run(user, f"{bb} who", password=pw)
+    lines = [l.split() for l in out.splitlines() if l.strip()]
+    step("utmp_dead_after_exit", rc == 0 and not any(w[0] == user for w in lines),
+         f"rc={rc} out={out.strip()!r}")
+    rc, out, err = ssh.run(user, f"{bb} last", password=pw)
+    # busybox `last` lists logins only (no boot rows); the BOOT_TIME record
+    # (type 2, first word of wtmp) is checked on the raw file.
+    rc2, wt, _ = ssh.run(user, f"{bb} od -An -tx2 -N2 /var/log/wtmp", password=pw)
+    step("utmp_last_history", rc == 0 and any(l.split()[:1] == [user] and "pts/" in l for l in out.splitlines())
+         and wt.split() == ["0002"], f"rc={rc} out={out.strip()[-300:]!r} wtmp0={wt.strip()!r}")
+    rc, out, err = ssh.run(user, f"/bin/lastlog -u {user}", password=pw)
+    step("utmp_lastlog_reader", rc == 0 and any(l.split()[:1] == [user] and "pts/" in l and "Never" not in l
+         for l in out.splitlines()), f"rc={rc} out={out.strip()!r}")
+    rc, out, err = ssh.run(user, "ls -l /var/log/lastlog /var/log/wtmp /run/utmps/utmp", password=pw)
+    step("utmp_files", rc == 0 and out.count("/var/log/") == 2, f"rc={rc} out={out.strip()!r}")
 
 
 def full(ssh, user, pw, tmp):
@@ -260,6 +304,817 @@ def full(ssh, user, pw, tmp):
              f"rc={r.returncode} log={out.strip()!r} {r.stderr.decode(errors='replace')[-300:]!r}")
 
 
+def set_keys(ssh, user, pw, line):
+    """Install `line` as the user's whole authorized_keys (over a password login)."""
+    rc, out, err = ssh.run(user, "umask 077; mkdir -p .ssh && cat > .ssh/authorized_keys && echo ok",
+                           password=pw, stdin=line.encode() + b"\n")
+    return rc == 0 and "ok" in out
+
+
+def options(ssh, user, pw, tmp):
+    """authorized_keys options (command=, from=, no-pty, restrict) and MaxStartups."""
+    if not os.path.exists(ssh.key):
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ssh.key], check=True)
+    pub = open(ssh.key + ".pub").read().strip()
+
+    def with_opts(opts):
+        return set_keys(ssh, user, pw, f"{opts} {pub}" if opts else pub)
+
+    # command=: forced, the client's command arrives in SSH_ORIGINAL_COMMAND
+    ok = with_opts('command="echo FORCED[$SSH_ORIGINAL_COMMAND]"')
+    rc, out, err = ssh.run(user, "echo hi there", key=True)
+    step("akopt_command", ok and rc == 0 and out.strip() == "FORCED[echo hi there]", f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    # sftp is refused for a command= key
+    rc, out, err = ssh.run(user, "true", key=True, extra=("-s",))
+    # (ssh -s sftp: the forced command key must not hand out the subsystem)
+    step("akopt_command_no_subsystem", rc != 0 or "FORCED" not in out, f"rc={rc}")
+
+    # from=: a non-matching list refuses the key, a matching/negated one accepts it
+    ok = with_opts('from="192.0.2.*,198.51.100.0/24"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_from_refused", ok and rc == 255, f"rc={rc}")
+    ok = with_opts('from="!192.0.2.1,*"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_from_allowed", ok and rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-120:]!r}")
+    ok = with_opts('from="0.0.0.0/0,::/0"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_from_cidr", ok and rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-120:]!r}")
+
+    # no-pty / restrict: -tt gets no tty
+    for opt in ("no-pty", "restrict"):
+        ok = with_opts(opt)
+        rc, out, err = ssh.run(user, "tty", key=True, extra=("-tt",))
+        step(f"akopt_{opt.replace('-', '_')}", ok and "/dev/pts/" not in out
+             and "PTY allocation request failed" in err, f"rc={rc} out={out.strip()!r} err={err.strip()[-120:]!r}")
+    # an option this server does not implement: the line is ignored, never half-applied
+    ok = with_opts('tunnel="0"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_unknown_skipped", ok and rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, pub)
+
+    # MaxStartups (default 10:30:100): 130 idle connections cannot all be held
+    import socket
+    socks, banners = [], 0
+    for _ in range(130):
+        try:
+            c = socket.create_connection((ssh.host, ssh.port), timeout=10)
+            c.settimeout(3)
+            socks.append(c)
+        except OSError:
+            continue
+    for c in socks:
+        try:
+            if c.recv(4).startswith(b"SSH-"):
+                banners += 1
+        except OSError:
+            pass
+    for c in socks:
+        c.close()
+    step("maxstartups_cap", 0 < banners <= 100, f"banners={banners}/{len(socks)}")
+    time.sleep(2)
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("maxstartups_recovers", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-120:]!r}")
+
+
+def free_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def fwd_client(ssh, user, *fwd):
+    """ssh -N with -L/-R specs; ExitOnForwardFailure so a refused forward ends it."""
+    argv = ["ssh", *ssh.key_opts(), "-N", "-o", "ExitOnForwardFailure=yes", *fwd,
+            "-p", str(ssh.port), f"{user}@{ssh.host}"]
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def stop(p):
+    if p.poll() is None:
+        p.terminate()
+    try:
+        p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+
+
+def tcp_exchange(port, payload=b"", want=b"", wait=25):
+    """Connect to 127.0.0.1:port until `want` shows up in the reply (or timeout)."""
+    import socket
+    end = time.time() + wait
+    got = b""
+    while time.time() < end:
+        try:
+            c = socket.create_connection(("127.0.0.1", port), timeout=5)
+            c.settimeout(5)
+            if payload:
+                c.sendall(payload)
+            got = b""
+            try:
+                while want not in got:
+                    d = c.recv(256)
+                    if not d:
+                        break
+                    got += d
+            except OSError:
+                pass
+            c.close()
+            if want in got:
+                return got
+        except OSError:
+            pass
+        time.sleep(1)
+    return got
+
+
+def forwarding(ssh, user, pw, tmp):
+    """TCP forwarding: -L (direct-tcpip), -R (tcpip-forward), no-port-forwarding, permitopen, permitlisten."""
+    import socket
+    import threading
+    pub = open(ssh.key + ".pub").read().strip()
+
+    def with_opts(opts):
+        return set_keys(ssh, user, pw, f"{opts} {pub}" if opts else pub)
+
+    # host-side echo server, the target of the -R tests
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    echo_port = srv.getsockname()[1]
+
+    def serve():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            def one(c=c):
+                try:
+                    c.settimeout(10)
+                    c.sendall(c.recv(256))
+                except OSError:
+                    pass
+                c.close()
+            threading.Thread(target=one, daemon=True).start()
+    threading.Thread(target=serve, daemon=True).start()
+
+    # -L to the guest's own sshd banner
+    with_opts("")
+    lp = free_port()
+    p = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:22")
+    got = tcp_exchange(lp, want=b"SSH-")
+    stop(p)
+    step("fwd_local", got.startswith(b"SSH-"), f"got={got[:20]!r}")
+
+    # -R back to the host echo server, read through a second -L to the guest's remote port
+    rp = free_port() % 1000 + 17100
+    p1 = fwd_client(ssh, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
+    lp2 = free_port()
+    p2 = fwd_client(ssh, user, "-L", f"{lp2}:127.0.0.1:{rp}")
+    got = tcp_exchange(lp2, payload=b"ping-R\n", want=b"ping-R")
+    stop(p1)
+    stop(p2)
+    step("fwd_remote", b"ping-R" in got, f"got={got[:20]!r}")
+
+    # -R with port 0: the server picks a port and reports it
+    p = fwd_client(ssh, user, "-R", f"0:127.0.0.1:{echo_port}", "-v")
+    time.sleep(6)
+    alive = p.poll() is None
+    stop(p)
+    err = p.stderr.read().decode(errors="replace")
+    step("fwd_remote_dynamic_port", alive and "Allocated port" in err, f"alive={alive} err={err.strip()[-120:]!r}")
+
+    # -R on a privileged port as a non-root user: refused (OpenSSH rule); a high port still works
+    p = fwd_client(ssh, user, "-R", f"127.0.0.1:1023:127.0.0.1:{echo_port}")
+    try:
+        rc = p.wait(timeout=25)
+    except subprocess.TimeoutExpired:
+        rc = None
+    stop(p)
+    step("fwd_remote_privport_refused", rc not in (None, 0), f"rc={rc}")
+
+    # no-port-forwarding / restrict: both directions refused
+    for opt in ("no-port-forwarding", "restrict"):
+        with_opts(opt)
+        lp = free_port()
+        p = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:22")
+        got = tcp_exchange(lp, want=b"SSH-", wait=12)
+        stop(p)
+        step(f"fwd_local_denied_{opt.replace('-', '_')}", not got.startswith(b"SSH-"), f"got={got[:20]!r}")
+        p = fwd_client(ssh, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
+        try:
+            rc = p.wait(timeout=25)
+        except subprocess.TimeoutExpired:
+            rc = None
+        stop(p)
+        step(f"fwd_remote_denied_{opt.replace('-', '_')}", rc not in (None, 0), f"rc={rc}")
+
+    # permitopen: only the listed destination
+    with_opts('permitopen="127.0.0.1:22"')
+    lp = free_port()
+    p = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:22")
+    got = tcp_exchange(lp, want=b"SSH-")
+    stop(p)
+    step("fwd_permitopen_allowed", got.startswith(b"SSH-"), f"got={got[:20]!r}")
+    lp = free_port()
+    p = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:{echo_port}")
+    got = tcp_exchange(lp, payload=b"x\n", want=b"x", wait=12)
+    stop(p)
+    step("fwd_permitopen_refused", b"x" not in got, f"got={got[:20]!r}")
+
+    # permitlisten: only the listed remote port
+    with_opts(f'permitlisten="{rp}"')
+    p = fwd_client(ssh, user, "-R", f"127.0.0.1:{rp + 1}:127.0.0.1:{echo_port}")
+    try:
+        rc = p.wait(timeout=25)
+    except subprocess.TimeoutExpired:
+        rc = None
+    stop(p)
+    step("fwd_permitlisten_refused", rc not in (None, 0), f"rc={rc}")
+    p = fwd_client(ssh, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
+    lp2 = free_port()
+    p2 = fwd_client(ssh, user, "-L", f"{lp2}:127.0.0.1:{rp}")
+    got = tcp_exchange(lp2, payload=b"ping-P\n", want=b"ping-P")
+    stop(p)
+    stop(p2)
+    step("fwd_permitlisten_allowed", b"ping-P" in got, f"got={got[:20]!r}")
+    srv.close()
+    set_keys(ssh, user, pw, pub)
+
+
+def sudo_sh(ssh, user, pw, script):
+    # key login: a password login would itself trigger the rehash being tested
+    return ssh.run(user, f"sudo -S -p '' sh -c \"{script}\"", key=True, stdin=(pw + "\n").encode())
+
+
+def sudo_write(ssh, user, pw, path, text):
+    """Replace `path` with `text` as root (single-quoted printf args; '$' escaped for the outer double quotes)."""
+    args = " ".join("'" + l.replace("'", "'\\''") + "'" for l in text.splitlines())
+    return sudo_sh(ssh, user, pw, ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$"))
+
+
+def accounts_extra(ssh, user, pw, tmp):
+    """keyboard-interactive, legacy $sha256$ rehash on login, expiry-time=, environment=."""
+    import hashlib
+    pub = open(ssh.key + ".pub").read().strip()
+
+    def with_opts(opts):
+        return set_keys(ssh, user, pw, f"{opts} {pub}" if opts else pub)
+
+    # keyboard-interactive: one hidden Password prompt through the conversation
+    argv = ["ssh", *ssh.kbd_opts(), "-p", str(ssh.port), f"{user}@{ssh.host}", "id -un"]
+    r = subprocess.run(argv, capture_output=True, timeout=60, env=ssh.env(pw), stdin=subprocess.DEVNULL)
+    step("kbdint_login", r.returncode == 0 and r.stdout.decode().strip() == user,
+         f"rc={r.returncode} err={r.stderr.decode()[-120:]!r}")
+    r = subprocess.run(argv, capture_output=True, timeout=60, env=ssh.env("wrong-" + pw), stdin=subprocess.DEVNULL)
+    step("kbdint_wrong_password", r.returncode == 255, f"rc={r.returncode}")
+
+    # expiry-time=
+    ok = with_opts('expiry-time="20200101"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_expired", ok and rc == 255, f"rc={rc}")
+    ok = with_opts('expiry-time="20990101Z"')
+    rc, out, err = ssh.run(user, "id -un", key=True)
+    step("akopt_not_expired", ok and rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    # environment= is ignored while PermitUserEnvironment is no (the default)
+    ok = with_opts('environment="SSHSMOKE_ENV=leaked"')
+    rc, out, err = ssh.run(user, "echo [$SSHSMOKE_ENV]", key=True)
+    step("akopt_environment_default_no", ok and rc == 0 and out.strip() == "[]", f"rc={rc} out={out.strip()!r}")
+    set_keys(ssh, user, pw, pub)
+
+    # legacy $sha256$ shadow field: verifies, and a successful login rewrites it to $6$
+    rc, orig, err = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+    if rc != 0 or f"\n{user}:" not in "\n" + orig:
+        step("rehash_legacy", False, f"cannot read /etc/shadow via sudo rc={rc} err={err.strip()[-100:]!r}")
+        return
+    legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
+    lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
+    rc, wout, err = sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
+    rc2, mid, _ = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+    primed = rc == 0 and f"{user}:$sha256$" in mid
+    rc, out, err = ssh.run(user, "id -un", password=pw)
+    login_ok = rc == 0 and out.strip() == user
+    time.sleep(1)
+    rc3, after, _ = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+    new = [l for l in after.splitlines() if l.startswith(user + ":")]
+    others_same = [l for l in after.splitlines() if not l.startswith(user + ":")] == \
+                  [l for l in orig.splitlines() if not l.startswith(user + ":")]
+    step("rehash_legacy", primed and login_ok and new and new[0].split(":")[1].startswith("$6$") and others_same,
+         f"primed={primed} login={login_ok} field={(new[0][:30] if new else None)!r} others_same={others_same}")
+    rc, out, err = ssh.run(user, "id -un", password=pw)
+    step("rehash_login_again", rc == 0 and out.strip() == user, f"rc={rc}")
+    sudo_write(ssh, user, pw, "/etc/shadow", orig)
+
+
+SSHD2_PORT = 2222
+SSHD2_BIN = os.environ.get("SSHDCFG_BIN", "/usr/sbin/sshd")
+
+
+def sshd2_start(ssh, user, pw, conf, env=""):
+    """(Re)start a second sshd (root, port 2222, config `conf`) in the guest; True when it listens."""
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", conf)
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg-start.sh", "\n".join([
+        "trap '' HUP",  # the ssh session's hangup must not take the daemon down (no setsid in the guest)
+        "kill $(cat /tmp/sshdcfg.pid 2>/dev/null) 2>/dev/null; sleep 1",
+        ": > /tmp/sshdcfg.log",
+        f"{env} {SSHD2_BIN} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
+        "echo $! > /tmp/sshdcfg.pid",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do grep -q ready /tmp/sshdcfg.log && exit 0; sleep 1; done; exit 1",
+    ]))
+    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshdcfg-start.sh")
+    if rc != 0:
+        _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log /tmp/sshdcfg-start.sh")
+        print(f"sshdcfg: second sshd did not start: rc={rc} out={out.strip()[-200:]!r} err={err.strip()[-200:]!r} log={lg[-600:]!r}", flush=True)
+    return rc == 0
+
+
+def cert_run(ssh2, user, ukey, cert, cmd, extra=()):
+    argv = ["ssh", *ssh2.base_opts(), "-o", "PreferredAuthentications=publickey", "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes", "-i", ukey, *(["-o", f"CertificateFile={cert}"] if cert else []), *extra,
+            "-p", str(ssh2.port), f"{user}@{ssh2.host}", cmd]
+    r = subprocess.run(argv, capture_output=True, timeout=90, stdin=subprocess.DEVNULL)
+    return r.returncode, r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
+
+
+def sshdcfg(ssh, user, pw, tmp):
+    """sshd_config Match blocks, ForceCommand, AllowTcpForwarding and user certificates
+    (TrustedUserCAKeys, authorized_keys cert-authority), on a second sshd (port 2222) reached
+    through the first one with ProxyCommand -W."""
+    import socket
+    import threading
+    pub = open(ssh.key + ".pub").read().strip()
+    set_keys(ssh, user, pw, pub)
+    global SSHD2_BIN
+    if os.environ.get("SSHDCFG_UPLOAD"):  # fail-first runs: test another sshd build as the second daemon
+        with open(os.environ["SSHDCFG_UPLOAD"], "rb") as f:
+            ssh.run(user, "cat > /tmp/sshd-under-test && chmod 755 /tmp/sshd-under-test", key=True, stdin=f.read(), timeout=300)
+        SSHD2_BIN = "/tmp/sshd-under-test"
+    ssh2 = Ssh("127.0.0.1", SSHD2_PORT, tmp)
+    ssh2.key = ssh.key
+    ssh2.known = os.path.join(tmp, "known_hosts2")
+    ssh2.askpass = ssh.askpass
+    ssh2.proxy = " ".join(["ssh", *ssh.key_opts(), "-p", str(ssh.port), "-W", "%h:%p", f"{user}@{ssh.host}"])
+    base = "HostKey /etc/ssh/ssh_host_ed25519_key\nPermitRootLogin no\nPasswordAuthentication yes\nPubkeyAuthentication yes\n"
+
+    def conf(extra):
+        ok = sshd2_start(ssh, user, pw, base + extra)
+        if not ok:
+            step("cfg_second_sshd_starts", False, extra[:80].replace("\n", "|"))
+        return ok
+
+    def login(cmd="id -un", password=False):
+        if password:
+            return ssh2.run(user, cmd, password=pw)
+        return ssh2.run(user, cmd, key=True)
+
+    rc, gname, _ = ssh.run(user, "id -gn", key=True)
+    gname = gname.strip() or user
+
+    # --- Match blocks, ForceCommand ---------------------------------------
+    if not conf("Match User nobody-such\n  PasswordAuthentication no\n"):
+        return
+    rc, out, err = login(password=True)
+    step("cfg_match_user_other_keeps_password", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("Match User " + user + "\n  PasswordAuthentication no\n")
+    rc, out, err = login(password=True)
+    step("cfg_match_user_disables_password", rc == 255, f"rc={rc}")
+    rc, out, err = login()
+    step("cfg_match_user_pubkey_still_ok", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("Match User !" + user + "\n  PasswordAuthentication no\n")
+    rc, out, err = login(password=True)
+    step("cfg_match_user_negation", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("PasswordAuthentication no\nMatch User " + user + "\n  PasswordAuthentication yes\n")
+    rc, out, err = login(password=True)
+    step("cfg_match_overrides_global", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("PubkeyAuthentication no\nMatch User " + user + "\n  PubkeyAuthentication yes\n")
+    rc, out, err = login()
+    step("cfg_match_enables_pubkey", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    conf(f"Match Group {gname}\n  ForceCommand echo grp-forced\n")
+    rc, out, err = login()
+    step("cfg_match_group", out.strip() == "grp-forced", f"rc={rc} out={out.strip()!r}")
+    conf("Match Address 127.0.0.0/8\n  ForceCommand echo addr-forced\n")
+    rc, out, err = login()
+    step("cfg_match_address", out.strip() == "addr-forced", f"rc={rc} out={out.strip()!r}")
+    conf("Match Address 10.99.*,!10.99.1.1\n  ForceCommand echo addr-forced\n")
+    rc, out, err = login()
+    step("cfg_match_address_miss", rc == 0 and out.strip() == user, f"rc={rc} out={out.strip()!r}")
+    conf(f"Match User {user} LocalPort {SSHD2_PORT}\n  ForceCommand echo lp-forced\nMatch User {user} LocalPort 1\n  ForceCommand echo wrong\n")
+    rc, out, err = login()
+    step("cfg_match_localport_all_criteria", out.strip() == "lp-forced", f"rc={rc} out={out.strip()!r}")
+    conf(f"Match User {user} LocalPort 1\n  ForceCommand echo wrong\nMatch all\n  ForceCommand echo all-forced\n")
+    rc, out, err = login()
+    step("cfg_match_all", out.strip() == "all-forced", f"rc={rc} out={out.strip()!r}")
+    conf(f"Match User {user}\n  ForceCommand echo first\nMatch all\n  ForceCommand echo second\n")
+    rc, out, err = login()
+    step("cfg_match_first_value_wins", out.strip() == "first", f"rc={rc} out={out.strip()!r}")
+    conf("ForceCommand echo orig=$SSH_ORIGINAL_COMMAND\n")
+    rc, out, err = login("hello world")
+    step("cfg_forcecommand_original_command", out.strip() == "orig=hello world", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = sudo_sh(ssh, user, pw, f"printf 'Match Bogus x\\\\n' > /tmp/sshdcfg-bad.conf; {SSHD2_BIN} -t -f /tmp/sshdcfg-bad.conf")
+    step("cfg_match_bad_criterion_rejected", rc != 0, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    # --- AllowTcpForwarding -----------------------------------------------
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    echo_port = srv.getsockname()[1]
+
+    def echo():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                c.sendall(c.recv(256))
+            except OSError:
+                pass
+            c.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+
+    def can_local():  # -L to the guest's own port 22 (the target is resolved by the guest)
+        lp = free_port()
+        p = fwd_client(ssh2, user, "-L", f"{lp}:127.0.0.1:22")
+        got = tcp_exchange(lp, want=b"SSH-", wait=15)
+        stop(p)
+        return got.startswith(b"SSH-")
+
+    def can_remote():  # -R on the second sshd, read back through a -L on the first
+        rp, lp = free_port(), free_port()
+        p = fwd_client(ssh2, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
+        p2 = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:{rp}")
+        got = tcp_exchange(lp, payload=b"ping-R\n", want=b"ping-R", wait=15)
+        stop(p)
+        stop(p2)
+        return b"ping-R" in got
+
+    for mode, want_l, want_r in (("yes", True, True), ("all", True, True), ("local", True, False),
+                                 ("remote", False, True), ("no", False, False)):
+        conf(f"AllowTcpForwarding {mode}\n")
+        l, r = can_local(), can_remote()
+        step(f"cfg_allowtcpforwarding_{mode}", (l, r) == (want_l, want_r), f"local={l} remote={r}")
+    conf(f"AllowTcpForwarding yes\nMatch User {user}\n  AllowTcpForwarding local\n")
+    l, r = can_local(), can_remote()
+    step("cfg_allowtcpforwarding_match", (l, r) == (True, False), f"local={l} remote={r}")
+    set_keys(ssh, user, pw, pub)
+    conf("AllowTcpForwarding no\n")  # the key allows forwarding, the config does not
+    l, r = can_local(), can_remote()
+    set_keys(ssh, user, pw, f"no-port-forwarding {pub}")
+    conf("AllowTcpForwarding yes\n")  # the key forbids it, the config allows
+    l2 = can_local()
+    set_keys(ssh, user, pw, pub)
+    step("cfg_allowtcpforwarding_most_restrictive", not l and not r and not l2, f"cfg_no: l={l} r={r} key_no: l={l2}")
+    srv.close()
+
+    # --- user certificates --------------------------------------------------
+    def keygen(*a):
+        return subprocess.run(["ssh-keygen", "-q", "-N", "", *a], capture_output=True).returncode == 0
+
+    ca, ca2, uk = (os.path.join(tmp, n) for n in ("ca", "ca2", "ukey"))
+    ok = keygen("-t", "ed25519", "-f", ca) and keygen("-t", "ed25519", "-f", ca2) and keygen("-t", "ed25519", "-f", uk)
+
+    def sign(n, caf=ca, principals=user, *opts):
+        cp = os.path.join(tmp, f"{n}.pub")
+        shutil.copy(uk + ".pub", cp)
+        r = subprocess.run(["ssh-keygen", "-q", "-s", caf, "-I", n, "-n", principals, *opts, cp], capture_output=True)
+        return os.path.join(tmp, f"{n}-cert.pub") if r.returncode == 0 else None
+
+    if not ok:
+        step("cert_keygen", False, "ssh-keygen failed")
+        return
+    cap = open(ca + ".pub").read().strip()
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg-ca.pub", cap)
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ok"), "id -un")
+    step("cert_trusted_ca_login", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, None, "id -un")
+    step("cert_bare_key_refused", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("badp", ca, "someoneelse"), "id -un")
+    step("cert_wrong_principal", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("two", ca, f"x,{user},y"), "id -un")
+    step("cert_principal_in_list", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("exp", ca, user, "-V", "20200101:20200102"), "id -un")
+    step("cert_expired", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("future", ca, user, "-V", "20990101:20991231"), "id -un")
+    step("cert_not_yet_valid", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("other", ca2), "id -un")
+    step("cert_untrusted_ca", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("fc", ca, user, "-O", "force-command=echo cert-forced"), "id -un")
+    step("cert_force_command", out.strip() == "cert-forced", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("srcno", ca, user, "-O", "source-address=10.99.0.0/16"), "id -un")
+    step("cert_source_address_refused", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("srcok", ca, user, "-O", "source-address=127.0.0.0/8"), "id -un")
+    step("cert_source_address_allowed", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("unk", ca, user, "-O", "critical:xyz=1"), "id -un")
+    step("cert_unknown_critical_option", rc == 255, f"rc={rc}")
+    c = sign("hostc", ca, user, "-h")
+    rc, out, err = cert_run(ssh2, user, uk, c, "id -un") if c else (255, "", "")
+    step("cert_host_cert_refused", rc == 255, f"rc={rc}")
+    for kt in ("ecdsa", "rsa"):
+        k2 = os.path.join(tmp, "uk-" + kt)
+        if keygen("-t", kt, "-f", k2):
+            subprocess.run(["ssh-keygen", "-q", "-s", ca, "-I", kt, "-n", user, k2 + ".pub"], capture_output=True)
+            rc, out, err = cert_run(ssh2, user, k2, k2 + "-cert.pub", "id -un")
+            step(f"cert_{kt}_user_key", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    # authorized_keys cert-authority
+    conf("")
+    set_keys(ssh, user, pw, f"{pub}\ncert-authority {cap}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak1"), "id -un")
+    step("cert_authority_line_login", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, ca, None, "id -un")
+    step("cert_authority_key_is_not_a_login_key", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak2", ca2), "id -un")
+    step("cert_authority_other_ca_refused", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, f'{pub}\ncert-authority,principals="deploy,ops-*" {cap}')
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak3", ca, "deploy"), "id -un")
+    step("cert_authority_principals_option", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak4", ca, user), "id -un")
+    step("cert_authority_principals_excludes_username", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, f'{pub}\ncert-authority,from="10.99.*" {cap}')
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak5"), "id -un")
+    step("cert_authority_from_option", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, f'{pub}\ncommand="echo line-forced",cert-authority {cap}')
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak6"), "id -un")
+    step("cert_authority_command_option", out.strip() == "line-forced", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("ak7", ca, user, "-O", "force-command=echo other"), "id -un")
+    step("cert_force_command_conflict", rc == 255, f"rc={rc}")
+    set_keys(ssh, user, pw, pub)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
+
+
+PS_SSHD = r"""for p in /proc/[0-9]*; do
+read k n < $p/status
+m=${n#sshd}
+if [ x$m != x$n ]; then pp=$(grep PPid $p/status); echo ${p#/proc/} $pp $n; fi
+done"""
+
+
+def sshd_procs(ssh, user, pw):
+    """[(pid, ppid, comm)] of every sshd* process in the guest."""
+    sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
+    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
+    res = []
+    if not out.strip():
+        print(f"sshd_procs: empty listing rc={rc} out={out[-200:]!r} err={err.strip()[-200:]!r}", flush=True)
+    for ln in out.splitlines():
+        p = ln.split()
+        if len(p) == 4 and p[1] == "PPid:" and p[0].isdigit() and p[2].isdigit():
+            res.append((int(p[0]), int(p[2]), p[3]))
+    return res
+
+
+def listener_pid(procs):
+    pids = {p for p, _, _ in procs}
+    c = [p for p, pp, n in procs if n == "sshd" and pp not in pids]
+    return c[0] if c else None
+
+
+def probe_open(ssh):
+    s = socket.create_connection((ssh.host, ssh.port), timeout=10)
+    banner = s.recv(256)
+    s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
+    return s, banner.startswith(b"SSH-")
+
+
+def probe_eof(s, secs):
+    """True when the peer closes the probe socket within `secs`."""
+    end = time.time() + secs
+    while time.time() < end:
+        s.settimeout(max(0.2, end - time.time()))
+        try:
+            if s.recv(4096) == b"":
+                return True
+        except socket.timeout:
+            pass
+        except OSError:
+            return True
+    return False
+
+
+def new_preauth(ssh, user, pw, before):
+    """Open a probe; return (sock, pid owning it): the new sshd-preauth if one exists, else the listener."""
+    s, ok = probe_open(ssh)
+    time.sleep(1)
+    procs = sshd_procs(ssh, user, pw)
+    known = {p for p, _, _ in before}
+    pre = [p for p, _, n in procs if n == "sshd-preauth" and p not in known]
+    return s, (pre[0] if pre else listener_pid(procs)), bool(pre)
+
+
+PS_DETAIL = r"""for p in /proc/[0-9]*; do
+read k n < $p/status
+m=${n#sshd}
+if [ x$m != x$n ]; then
+pp=; uid=; nnp=; sc=
+while read k v w; do
+case $k in PPid:) pp=$v;; Uid:) uid=$v,$w;; NoNewPrivs:) nnp=$v;; Seccomp:) sc=$v;; esac
+done < $p/status
+rt=$(readlink $p/root)
+kf=0
+for f in $p/fd/*; do case $(readlink $f) in /etc/ssh*|/etc/shadow*) kf=$((kf+1));; esac; done
+echo ${p#/proc/}\\|$pp\\|$n\\|$uid\\|$nnp\\|$sc\\|$rt\\|$kf
+fi
+done"""
+
+
+def sshd_detail(ssh, user, pw):
+    """[dict(pid, ppid, comm, uid, nnp, seccomp, root, keyfds)] for every sshd* process."""
+    sudo_write(ssh, user, pw, "/tmp/sshdet.sh", PS_DETAIL)
+    _, out, _ = sudo_sh(ssh, user, pw, "sh /tmp/sshdet.sh")
+    res = []
+    for ln in out.splitlines():
+        f = ln.split("|")
+        if len(f) == 8 and f[0].isdigit():
+            res.append(dict(pid=int(f[0]), ppid=int(f[1] or 0), comm=f[2], uid=f[3], nnp=f[4], seccomp=f[5],
+                            root=f[6], keyfds=int(f[7] or 0)))
+    return res
+
+
+def privsep_isolation(ssh, user, pw):
+    """The pre-auth network child is unprivileged, jailed, NNP and seccomp'd, and holds no host-key fd."""
+    s, ok = probe_open(ssh)
+    time.sleep(1)
+    d = sshd_detail(ssh, user, pw)
+    pre = [p for p in d if p["comm"] == "sshd-preauth"]
+    det = f"preauth={[(p['pid'], p['uid']) for p in pre]} all={[(p['pid'], p['comm'], p['uid']) for p in d]}"
+    step("privsep_preauth_uid", ok and bool(pre) and all(
+        all(u != "0" for u in p["uid"].split(",")) for p in pre), det)
+    step("privsep_preauth_chroot_nnp", bool(pre) and all(p["nnp"] == "1" and p["root"] == "/var/empty" for p in pre),
+         str([(p["nnp"], p["root"]) for p in pre]))
+    step("privsep_preauth_seccomp", bool(pre) and all(p["seccomp"] == "2" for p in pre),
+         str([p["seccomp"] for p in pre]))
+    step("privsep_no_hostkey_fd", bool(pre) and all(p["keyfds"] == 0 for p in d if p["comm"].startswith("sshd-")),
+         str([(p["comm"], p["keyfds"]) for p in d]))
+    s.close()
+    # Post-auth: the network process stays uid 22; a root monitor (not the listener) is its parent.
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("ssh", ["ssh", *ssh.pw_opts(), "-tt", "-p", str(ssh.port), f"{user}@{ssh.host}", "cat"], ssh.env(pw))
+    try:
+        time.sleep(4)
+        d = sshd_detail(ssh, user, pw)
+        byp = {p["pid"]: p for p in d}
+        nets = [p for p in d if p["comm"] == "sshd-net"]
+        good = [p for p in nets if p["uid"].split(",")[0] == "22" and byp.get(p["ppid"], {}).get("uid", "x").split(",")[0] == "0"
+                and byp.get(p["ppid"], {}).get("comm") == "sshd" and byp[p["ppid"]]["ppid"] in byp]
+        step("privsep_postauth_uid", bool(good), f"nets={[(p['pid'], p['uid'], p['ppid']) for p in nets]}")
+    finally:
+        try:
+            os.write(fd, b"\x04")
+            os.close(fd)
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+def privsep_hooks(ssh, user, pw, tmp):
+    """Test-only hooks (env SSHD_TEST_HOOK, honoured by the net child): a forbidden syscall kills only that
+    connection, and a forged 'auth OK' from the child is refused by the monitor."""
+    conf = "PasswordAuthentication yes\nPubkeyAuthentication yes\n"
+    for hook, name in (("badsyscall", "privsep_forbidden_syscall_kills_conn"), ("forgeauth", "privsep_forged_auth_refused")):
+        if not sshd2_start(ssh, user, pw, conf, env=f"SSHD_TEST_HOOK={hook}"):
+            step(name, False, "second sshd did not start")
+            continue
+        lp = free_port()
+        tun = subprocess.Popen(["ssh", *ssh.pw_opts(), "-N", "-L", f"{lp}:127.0.0.1:{SSHD2_PORT}", "-p", str(ssh.port),
+                                f"{user}@{ssh.host}"], env=ssh.env(pw), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3)
+        key = os.path.join(tmp, "hookkey")
+        if not os.path.exists(key):
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        # The key must be authorized so the child reaches the signature step (where forgeauth tampers).
+        set_keys(ssh, user, pw, open(key + ".pub").read().strip() + "\n" + open(ssh.key + ".pub").read().strip())
+        r = subprocess.run(["ssh", "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=20", "-p", str(lp), f"{user}@127.0.0.1", "id -u"],
+                           capture_output=True, text=True, timeout=60)
+        _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log")
+        procs = sshd_procs(ssh, user, pw)
+        listener_up = listener_pid(procs) is not None
+        if hook == "badsyscall":
+            ok = r.returncode != 0 and "uid=" not in r.stdout and listener_up and ssh.run(user, "id -un", pw, timeout=30)[0] == 0
+        else:
+            ok = r.returncode != 0 and r.stdout.strip() != "0" and "forged" in lg
+        step(name, ok, f"rc={r.returncode} out={r.stdout.strip()!r} listener={listener_up} log={lg[-200:]!r}")
+        stop(tun)
+        sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+    if os.path.exists(ssh.key + ".pub"):
+        set_keys(ssh, user, pw, open(ssh.key + ".pub").read().strip())
+
+
+def privsep_grace(ssh, user, pw, tmp):
+    """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
+    conf = "LoginGraceTime 4\nPasswordAuthentication yes\n"
+    if not sshd2_start(ssh, user, pw, conf):
+        step("privsep_grace_kill", False, "second sshd did not start")
+        return
+    lp = free_port()
+    tun = subprocess.Popen(["ssh", *ssh.pw_opts(), "-N", "-L", f"{lp}:127.0.0.1:{SSHD2_PORT}", "-p", str(ssh.port),
+                            f"{user}@{ssh.host}"], env=ssh.env(pw), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        try:
+            s = socket.create_connection(("127.0.0.1", lp), timeout=5)
+            if s.recv(256).startswith(b"SSH-"):
+                break
+            s.close()
+        except OSError:
+            time.sleep(0.5)
+    else:
+        stop(tun)
+        step("privsep_grace_kill", False, "cannot reach the second sshd through the tunnel")
+        return
+    s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
+    time.sleep(1)
+    procs = sshd_procs(ssh, user, pw)
+    pre = [p for p, _, n in procs if n == "sshd-preauth"]
+    if pre:
+        sudo_sh(ssh, user, pw, f"kill -STOP {pre[0]}")  # hung: it cannot disconnect itself
+    ok = bool(pre) and probe_eof(s, 25)
+    if pre:
+        sudo_sh(ssh, user, pw, f"kill -KILL {pre[0]} 2>/dev/null; true")
+    s.close()
+    stop(tun)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
+    step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within 25 s")
+
+
+def privsep_crash(ssh, user, pw):
+    """Crash isolation: a SEGV in one connection's process must not take the listener or other sessions down."""
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("ssh", ["ssh", *ssh.pw_opts(), "-tt", "-p", str(ssh.port), f"{user}@{ssh.host}", "cat"], ssh.env(pw))
+
+    def say(line, want, secs=10):
+        os.write(fd, line.encode() + b"\n")
+        end, got = time.time() + secs, b""
+        while time.time() < end and want.encode() not in got:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    got += os.read(fd, 4096)
+                except OSError:
+                    break
+        return want.encode() in got
+
+    try:
+        b_ok = say("hello-b", "hello-b", 20)
+        before = sshd_procs(ssh, user, pw)
+        lpid = listener_pid(before)
+        a, victim, isolated = new_preauth(ssh, user, pw, before)
+        if victim:
+            sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
+        t0 = time.time()
+        a_eof = probe_eof(a, 8)
+        eof_s = time.time() - t0
+        a.close()
+        after = sshd_procs(ssh, user, pw)
+        gone = victim not in {p for p, _, _ in after}
+        same = listener_pid(after) == lpid and lpid is not None
+        b_still = say("hello-b2", "hello-b2")
+        rc, out, _ = ssh.run(user, "id -un", pw, timeout=30)
+        login = rc == 0 and user in out
+        step("privsep_crash_isolated", b_ok and isolated and same and b_still and login,
+             f"procs={after} victim={victim} gone={gone} eof_s={eof_s:.1f} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof}{'' if a_eof else ' (KNOWN-OPEN: see TODO.md sshd item)'} listener_unchanged={same} b_survives={b_still} new_login={login}")
+    finally:
+        try:
+            os.write(fd, b"\x04")
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+def privsep_count(ssh, user, pw):
+    """Six crashes (init gives up after 5 restarts in 60 s): the listener must outlive them all. Run LAST."""
+    procs = sshd_procs(ssh, user, pw)
+    lpid = listener_pid(procs)
+    for _ in range(6):
+        s, victim, _iso = new_preauth(ssh, user, pw, sshd_procs(ssh, user, pw))
+        if victim:
+            sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
+        probe_eof(s, 5)
+        s.close()
+        time.sleep(0.5)
+    time.sleep(2)
+    r = subprocess.run(["ssh-keyscan", "-T", "5", "-p", str(ssh.port), ssh.host], capture_output=True, timeout=30)
+    same = listener_pid(sshd_procs(ssh, user, pw)) == lpid and lpid is not None
+    step("privsep_listener_survives_count", b"ssh-" in r.stdout and same,
+         f"keyscan={b'ssh-' in r.stdout} listener_unchanged={same}")
+
+
 def main(argv):
     full_mode = "--full" in argv
     user, pw = "leandro", "leandro"
@@ -282,8 +1137,17 @@ def main(argv):
             break
         time.sleep(2)
     quick(ssh, user, pw)
+    options(ssh, user, pw, tmp)
+    forwarding(ssh, user, pw, tmp)
+    accounts_extra(ssh, user, pw, tmp)
+    sshdcfg(ssh, user, pw, tmp)
     if full_mode:
         full(ssh, user, pw, tmp)
+    privsep_isolation(ssh, user, pw)
+    privsep_hooks(ssh, user, pw, tmp)
+    privsep_grace(ssh, user, pw, tmp)
+    privsep_crash(ssh, user, pw)
+    privsep_count(ssh, user, pw)  # last: on a tree without per-connection processes it leaves the guest without sshd
     shutil.rmtree(tmp, ignore_errors=True)
     bad = [n for n, ok in RESULTS if not ok]
     print(f"SSHSMOKE summary: {len(RESULTS) - len(bad)}/{len(RESULTS)} passed"

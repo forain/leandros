@@ -50,6 +50,8 @@ extern crate mm;
 /// sysfs is generated on demand rather than stored.
 pub mod block;
 pub mod sysclass;
+pub mod sysinput;
+pub mod sysdrm;
 pub mod cgroupfs;
 
 /// Open file descriptions (see the module docs): what epoll keys by.
@@ -208,6 +210,10 @@ pub const VFS_INOTIFY_CREATE:  u64 = 0x4B;
 pub const VFS_INOTIFY_ADD:     u64 = 0x4C;
 /// inotify_rm_watch(fd, wd) → 0 or -errno (only sent unless `vfs.inotify=0`).
 pub const VFS_INOTIFY_RM:      u64 = 0x53;
+/// fanotify_init(flags, event_f_flags) → fd or -errno.
+pub const VFS_FANOTIFY_INIT:   u64 = 0x54;
+/// fanotify_mark(fd, path_ptr (0 = the fd named by dirfd), flags, mask, dirfd) → 0 or -errno.
+pub const VFS_FANOTIFY_MARK:   u64 = 0x55;
 /// utimensat: `VFS_UTIMENS(path_ptr, atime_sec, atime_nsec, mtime_sec,
 /// mtime_nsec, flags)` / `VFS_LUTIMENS` (final symlink not followed) /
 /// `VFS_FUTIMENS(fd, ...)` → 0 or -errno. The kernel has already turned
@@ -437,6 +443,12 @@ use tmppool::{TmpFileEntry, TmpPool, MAX_TMP_FILES, MAX_TMP_PATH, TMP_LINK_MAX};
 const MAX_TMP_FILE_SIZE: usize = 16 << 30;
 
 static TMP_FILES: Mutex<TmpPool> = Mutex::new(TmpPool::new());
+
+/// The `/proc` path each `/tmp/.psys_<idx>` snapshot of a generated system file
+/// was opened from, so the open descriptor names that path (readlink of
+/// `/proc/self/fd/N`, and the mount(2) targets crun passes that way) and not
+/// the synthetic one. Entries die with `gen_proc_system_file` reusing the slot.
+static PSYS_ORIGIN: Mutex<alloc::vec::Vec<(usize, alloc::vec::Vec<u8>)>> = Mutex::new(alloc::vec::Vec::new());
 
 // ── Shared VMO store (K1 shared file-backed mmap) ────────────────────────────
 //
@@ -4522,7 +4534,6 @@ static RAMFS: &[RamEntry] = &[
     // user-namespace limit (ns::NS_MAX - 1 usable). Read-only.
     RamEntry { path: b"/proc/sys/kernel/overflowuid", data: b"65534\n" },
     RamEntry { path: b"/proc/sys/kernel/overflowgid", data: b"65534\n" },
-    RamEntry { path: b"/proc/sys/user/max_user_namespaces", data: b"32\n" },
     // Highest capability number the caps implementation knows (CAP_LAST,
     // asserted below): podman and crun read it to size capability sets.
     RamEntry { path: b"/proc/sys/kernel/cap_last_cap", data: b"40\n" },
@@ -4565,6 +4576,9 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/net/ipv6/conf/all/autoconf", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/default/autoconf", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/autoconf", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/all/dad_transmits", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/default/dad_transmits", data: b"1\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/dad_transmits", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/bindv6only", data: b"0\n" },
 ];
 const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
@@ -4915,6 +4929,7 @@ fn path_args(msg: &Message) -> (Option<(usize, bool)>, Option<(usize, bool)>) {
         VFS_RENAME | VFS_LINK                                   => (Some((0, false)), Some((1, false))),
         // inotify_add_watch(fd, path, mask): the path is arg1; IN_DONT_FOLLOW keeps a final symlink.
         VFS_INOTIFY_ADD                                         => (Some((1, arg(msg, 2) as u32 & inotify::IN_DONT_FOLLOW == 0)), None),
+        VFS_FANOTIFY_MARK if arg(msg, 1) != 0                   => (Some((1, arg(msg, 2) as u32 & 4 == 0)), None),
         // arg0 of VFS_SYMLINK is the link *body*, stored verbatim — resolving
         // it here would turn `ln -s ../x l` into an absolute link.
         VFS_SYMLINK                                             => (None, Some((1, false))),
@@ -5116,6 +5131,14 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
         }
         }
     }
+    if path.starts_with(b"/sys/") {
+        if let Some(r) = sysclass::expand(path, follow)? {
+            *buf = r;
+            buf.push(0);
+            msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(buf.as_ptr() as u64).to_le_bytes());
+            return Ok(());
+        }
+    }
     if !is_tmp_path(path) { return Ok(()); }
 
     let resolved = tmp_resolve_links(path, follow)?;
@@ -5207,20 +5230,46 @@ fn inotify_arg(msg: &Message, n: usize) -> Option<Vec<u8>> {
     Some(tmpfs_path(raw).unwrap_or_else(|| strip_trailing_slash(raw)).to_vec())
 }
 
-/// `Some(is_dir)` if `path` exists (tmpfs: the pool; other filesystems: an
-/// lstat, so callers gate it on `inotify::may_watch`).
-fn inotify_kind(path: &[u8]) -> Option<bool> {
+/// Inode identity of an existing path: `(st_dev, st_ino)`, link count, kind.
+struct InoIdent { id: inotify::Id, nlink: u64, isdir: bool }
+
+#[cfg(target_arch = "x86_64")]
+const ST_NLINK_OFF: usize = 16;
+#[cfg(target_arch = "aarch64")]
+const ST_NLINK_OFF: usize = 20;
+
+/// Identity of `path` (tmpfs: the pool; other filesystems: an lstat, so
+/// callers gate it on `inotify::may_watch`).
+fn inotify_ident(path: &[u8]) -> Option<InoIdent> {
     {
         let tmp = TMP_FILES.lock();
-        if let Some(i) = tmp_find(&tmp, path) { return Some(tmp[i].is_dir); }
+        if let Some(i) = tmp_find(&tmp, path) {
+            let o = tmp_owner(&tmp, i);
+            let dev = tmpfs_dev_of(path).unwrap_or(0);
+            return Some(InoIdent { id: (dev, tmp[o].ino as u64), nlink: if tmp[i].is_dir { 1 } else { tmp_nlink(&tmp, i) }, isdir: tmp[i].is_dir });
+        }
     }
     if tmpfs_path(path).is_some() { return None; }
     let mut z = path.to_vec();
     z.push(0);
     let mut st = [0u8; STAT_SIZE];
     if reply_val(&stat_common(z.as_ptr() as usize, st.as_mut_ptr() as usize, false)) < 0 { return None; }
+    let rd64 = |o: usize| unsafe { ((st.as_ptr() as usize + o) as *const u64).read_unaligned() };
     let mode = unsafe { ((st.as_ptr() as usize + ST_MODE_OFF) as *const u32).read_unaligned() };
-    Some(mode & 0o170000 == 0o040000)
+    #[cfg(target_arch = "x86_64")]
+    let nlink = rd64(ST_NLINK_OFF);
+    #[cfg(target_arch = "aarch64")]
+    let nlink = unsafe { ((st.as_ptr() as usize + ST_NLINK_OFF) as *const u32).read_unaligned() } as u64;
+    Some(InoIdent { id: (rd64(0), rd64(8)), nlink, isdir: mode & 0o170000 == 0o040000 })
+}
+
+fn inotify_kind(path: &[u8]) -> Option<bool> { inotify_ident(path).map(|i| i.isdir) }
+
+/// Identity for `inotify.rs` (its hooks resolve names to inodes with this).
+pub fn inotify_id(path: &[u8]) -> Option<inotify::Id> { inotify_ident(path).map(|i| i.id) }
+
+fn inotify_id_if(path: &[u8]) -> inotify::Id {
+    if inotify::multi_watched() { inotify_id(path).unwrap_or((0, 0)) } else { (0, 0) }
 }
 
 /// `Some(kind)` when a watch could match `path` (or its parent) and the path
@@ -5248,7 +5297,7 @@ fn inotify_fd_ofd(pid: u32, fd: usize) -> Option<(u32, bool)> {
 
 /// Start remembering the path behind `ofd` (and have its last put report back).
 fn inotify_note(ofd: u32, path: &[u8], writable: bool, isdir: bool) {
-    if ofd::mark_watched(ofd) { inotify::note_set(ofd, path, writable, isdir); }
+    if ofd::mark_watched(ofd) { inotify::note_set(ofd, path, inotify_id_if(path), writable, isdir); }
 }
 
 /// An inode event on the file behind `fd` (writes, reads, fchmod ...).
@@ -5267,6 +5316,28 @@ fn inotify_fd_event(pid: u32, fd: usize, mask: u32) {
     inotify::note_event(o, mask);
 }
 
+/// FAN_OPEN_EXEC_PERM gate of execve(`path`): 0 to go ahead, else -errno.
+pub fn fan_exec_perm(path: &[u8]) -> i32 {
+    if !inotify::armed() { return 0; }
+    let p = tmpfs_path(path).unwrap_or_else(|| strip_trailing_slash(path)).to_vec();
+    if inotify_kind(&p) == Some(false) { inotify::fan_open_exec(&p); }
+    if !inotify::perm_watched() { return 0; }
+    match inotify_kind(&p) { Some(false) => inotify::fan_perm(&p, inotify::FAN_OPEN_EXEC_PERM, false), _ => 0 }
+}
+
+/// FAN_ACCESS_PERM gate of a read on `fd` (regular files and directories).
+fn fan_access_gate(pid: u32, fd: usize) -> i32 {
+    if inotify_fd_ofd(pid, fd).is_none() { return 0; }
+    let mut buf = alloc::vec![0u8; 4096];
+    let r = reply_val(&handle_fd_path(pid, fd, buf.as_mut_ptr() as usize, buf.len()));
+    if r <= 0 { return 0; }
+    buf.truncate(r as usize);
+    if buf.ends_with(b" (deleted)") { return 0; }
+    let p = tmpfs_path(&buf).unwrap_or_else(|| strip_trailing_slash(&buf)).to_vec();
+    let isdir = inotify_kind(&p) == Some(true);
+    inotify::fan_perm(&p, inotify::FAN_ACCESS_PERM, isdir)
+}
+
 /// Run `dispatch_inner` and, when a watch exists anywhere, emit the events a
 /// successful operation implies (design §2). Only reached when
 /// `inotify::armed()`. Events come from the VFS's own routing points, so one
@@ -5281,8 +5352,24 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
                 Some(p) if flags & (O_CREAT | O_TRUNC) != 0 => inotify_kind_if_watched(p),
                 _ => None,
             };
+            // Linux raises FAN_OPEN_PERM for an O_CREAT that creates the file too,
+            // after the creation: a deny leaves the new file and fails the open.
+            let mut perm_after = false;
+            if perm_watched() && flags & O_PATH == 0 {
+                if let Some(p) = &path {
+                    if let Some(isdir) = inotify_kind(p) {
+                        let pr = fan_perm(p, FAN_OPEN_PERM, isdir); if pr != 0 { return err_reply(pr); }
+                    } else if flags & O_CREAT != 0 { perm_after = true; }
+                }
+            }
             let r = dispatch_inner(msg, pid);
             let v = reply_val(&r);
+            if perm_after && v >= 0 {
+                if let Some(p) = &path {
+                    let pr = fan_perm(p, FAN_OPEN_PERM, false);
+                    if pr != 0 { let _ = handle_close(pid, v as usize); return err_reply(pr); }
+                }
+            }
             if let Some(p) = path {
                 if v >= 0 {
                     let created = flags & O_CREAT != 0 && pre.is_none() && may_watch(&p);
@@ -5317,12 +5404,17 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
                 if let Some(p) = path {
                     if let Some((par, nm)) = inotify_split(&p) { dirent(par, nm, mask, 0); }
                 }
-                if let Some(t) = target { inode(&t, IN_ATTRIB); }
+                if let Some(t) = target {
+                    if may_watch(&t) {
+                        if let Some(i) = inotify_ident(&t) { promote(i.id, &t); inode_id(&t, Some(i.id), IN_ATTRIB); }
+                    }
+                }
             }
             r
         }
         VFS_UNLINK | VFS_RMDIR => {
             let path = inotify_arg(msg, 0);
+            let pre = match &path { Some(p) if msg.tag == VFS_UNLINK && may_watch(p) => inotify_ident(p), _ => None };
             let r = dispatch_inner(msg, pid);
             if let Some(p) = path {
                 if reply_val(&r) >= 0 {
@@ -5333,10 +5425,13 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
                     if isdir {
                         removed(&p, true);
                     } else if may_watch(&p) {
-                        inode(&p, IN_ATTRIB);
-                        if !note_unlink(&p) { removed(&p, false); }
+                        let id = pre.as_ref().map(|i| i.id);
+                        inode_id(&p, id, IN_ATTRIB);
+                        // Other names remain: the inode lives on (link count change only).
+                        if pre.as_ref().map_or(false, |i| i.nlink > 1) {
+                        } else if !note_unlink(&p, id) { removed_id(&p, false, id); }
                     } else {
-                        note_unlink(&p);
+                        note_unlink(&p, None);
                     }
                 }
             }
@@ -5345,20 +5440,24 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
         VFS_RENAME => {
             let (old, new) = (inotify_arg(msg, 0), inotify_arg(msg, 1));
             let looked = old.as_deref().map_or(false, |o| may_watch(o)) || new.as_deref().map_or(false, |n| may_watch(n));
-            let src = if looked { old.as_deref().and_then(inotify_kind) } else { None };
-            let dst = if looked { new.as_deref().and_then(inotify_kind) } else { None };
+            let src = if looked { old.as_deref().and_then(inotify_ident) } else { None };
+            let dst = if looked { new.as_deref().and_then(inotify_ident) } else { None };
             let r = dispatch_inner(msg, pid);
             if let (Some(o), Some(n)) = (old, new) {
                 if o != n && reply_val(&r) >= 0 {
-                    if let Some(isdir) = src {
+                    if let Some(si) = src {
+                        let isdir = si.isdir;
                         let cookie = new_cookie();
                         let dir = if isdir { IN_ISDIR } else { 0 };
                         if let (Some((op, on)), Some((np, nn))) = (inotify_split(&o), inotify_split(&n)) {
                             dirent(op, on, IN_MOVED_FROM | dir, cookie);
                             dirent(np, nn, IN_MOVED_TO | dir, cookie);
+                            fan_rename(&o, &n, isdir);
                         }
-                        if let Some(dd) = dst { removed(&n, dd); }
-                        dirent(&o, b"", IN_MOVE_SELF | dir, 0);
+                        if let Some(di) = dst {
+                            if di.nlink > 1 && !di.isdir { inode_id(&n, Some(di.id), IN_ATTRIB); } else { removed_id(&n, di.isdir, Some(di.id)); }
+                        }
+                        dirent_id(&o, b"", IN_MOVE_SELF | dir, 0, Some(si.id));
                     }
                     renamed(&o, &n);
                 }
@@ -5373,9 +5472,10 @@ fn inotify_hooks(msg: &Message, pid: u32) -> Message {
             }
             r
         }
-        VFS_READ | VFS_PREAD if access_watched() => {
+        VFS_READ | VFS_PREAD if access_watched() || perm_watched() => {
+            if perm_watched() { let gr = fan_access_gate(pid, arg(msg, 0) as usize); if gr != 0 { return err_reply(gr); } }
             let r = dispatch_inner(msg, pid);
-            if reply_val(&r) > 0 { inotify_fd_event(pid, arg(msg, 0) as usize, IN_ACCESS); }
+            if access_watched() && reply_val(&r) > 0 { inotify_fd_event(pid, arg(msg, 0) as usize, IN_ACCESS); }
             r
         }
         VFS_CHMOD | VFS_LCHMOD | VFS_CHOWN | VFS_LCHOWN | VFS_UTIMENS | VFS_LUTIMENS
@@ -5468,6 +5568,8 @@ fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
         VFS_SIGNALFD_CREATE  => handle_signalfd_create(caller_pid, arg(msg,0) as usize, arg(msg,1) as u64, arg(msg,2) as u32),
         VFS_INOTIFY_CREATE   => handle_inotify_create(caller_pid, arg(msg,0) as u32),
         VFS_INOTIFY_ADD      => handle_inotify_add(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize, arg(msg,2) as u32),
+        VFS_FANOTIFY_INIT    => handle_fanotify_init(caller_pid, arg(msg,0) as u32, arg(msg,1) as u32),
+        VFS_FANOTIFY_MARK    => handle_fanotify_mark(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize, arg(msg,2) as u32, arg(msg,3), arg(msg,4) as usize),
         VFS_INOTIFY_RM       => handle_inotify_rm(caller_pid, arg(msg,0) as usize, arg(msg,1) as i32),
         VFS_TIMERFD_CREATE   => handle_timerfd_create(caller_pid, arg(msg,0) as u32, arg(msg,1) as u32),
         VFS_TIMERFD_SETTIME  => handle_timerfd_settime(caller_pid, arg(msg,0) as usize,
@@ -6895,6 +6997,7 @@ fn gen_proc_system_file(buf: &[u8; TMP_BUF_SIZE], len: usize) -> Option<VnodeKin
         for i in (0..di).rev() { fake_path[fpl] = digits[i]; fpl += 1; }
     }
     let fl = fpl.min(MAX_TMP_PATH - 1);
+    PSYS_ORIGIN.lock().retain(|e| e.0 != idx);
     tmp.set_path(idx, &fake_path[..fl]);
     let copy = len.min(TMP_BUF_SIZE);
     if !tmp_fill_kernel(&mut tmp, idx, &buf[..copy]) { tmp.release(idx); return None; }
@@ -7111,6 +7214,7 @@ fn gen_mntselftest() -> Option<VnodeKind> {
         }
     }
     let _ = writeln!(s, "bindpin_checks={} bindpin_stale={}", BINDPIN_STATS_CHECKS.load(core::sync::atomic::Ordering::Relaxed), BINDPIN_STATS_STALE.load(core::sync::atomic::Ordering::Relaxed));
+    let _ = writeln!(s, "ns0_mrefs={}", mnt::ns0::mrefs_len());
     let _ = writeln!(s, "ns_live={} ns_dying={} sb_count={}", sched::ns::live_count(), sched::ns::dying_count(), mnt::sb_count());
     let _ = write!(s, "sb_devs=");
     for d in mnt::sb_devs() { let _ = write!(s, "{},", d); }
@@ -7706,6 +7810,12 @@ fn gen_kmod_initrd() -> Option<VnodeKind> {
 /// `name value` per line; counters are cumulative pages since boot.
 /// f2fs no-I/O request reruns / requests that gave up (cumulative), and the
 /// request to drop the clean block cache (`/proc/f2fsdropcache`, test knob).
+/// /proc/f2fsstat counters of the f2fs server's checkpoint and fsync paths (lane f2fsnlog1).
+pub static F2FS_CP_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_RF_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_LX_CHAINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_LX_FALLBACK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static F2FS_LX_NODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_NOIO_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_NOIO_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_DROP_CLEAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -7727,6 +7837,11 @@ fn gen_f2fsstat(drop: bool) -> Option<VnodeKind> {
     if drop { F2FS_DROP_CLEAN.store(true, Relaxed); }
     put("noio_rounds", F2FS_NOIO_ROUNDS.load(Relaxed));
     put("noio_gave_up", F2FS_NOIO_GAVE_UP.load(Relaxed));
+    put("cp_total", F2FS_CP_TOTAL.load(Relaxed));
+    put("rf_count", F2FS_RF_COUNT.load(Relaxed));
+    put("lx_chained", F2FS_LX_CHAINED.load(Relaxed));
+    put("lx_fallback", F2FS_LX_FALLBACK.load(Relaxed));
+    put("lx_nodes", F2FS_LX_NODES.load(Relaxed));
     proc_snapshot(b"/tmp/.f2fsstat", &out, false)
 }
 
@@ -7886,6 +8001,10 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     // nr_open is the ceiling RLIMIT_NOFILE's hard limit can be raised to;
     // file-max the system-wide count of open file descriptions (`ofd`), and
     // file-nr those in use, Linux's "<allocated> 0 <max>".
+    if let Some(c) = nslimit_sysctl(path) {
+        let p = write_u32(buf, 0, sched::ns::limit_get(c));
+        return Some(write_lit(buf, p, b"\n"));
+    }
     if let Some(k) = inotify_sysctl(path) {
         let p = write_u32(buf, 0, inotify::limit_get(k) as u32);
         return Some(write_lit(buf, p, b"\n"));
@@ -8054,6 +8173,16 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         p = write_lit(buf, p, b"\nprocs_running ");
         p = write_u32(buf, p, sched::nr_running().max(1));
         p = write_lit(buf, p, b"\nprocs_blocked 0\n");
+        // Diagnostic (usbstalltest): `timerstat <ticks> <timer irqs>
+        // <deadline-only irqs that returned early> <uart rx drains>`.
+        {
+            extern "C" { fn arch_timer_stats(out: *mut u64); }
+            let mut st = [0u64; 4];
+            unsafe { arch_timer_stats(st.as_mut_ptr()); }
+            p = write_lit(buf, p, b"timerstat");
+            for v in st { p = write_lit(buf, p, b" "); p = write_u64(buf, p, v); }
+            p = write_lit(buf, p, b"\n");
+        }
         return Some(p);
     }
 
@@ -8062,6 +8191,13 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         let mut p = 0;
         p = write_u32(buf, p, pv(sched::tgid_of(sched::current_pid())));
         return Some(p);
+    }
+
+    if path == b"/proc/interrupts" {
+        // One line per registered interrupt source (GIC SPI, ITS MSI LPI,
+        // x86_64 IDT MSI vector): `INTID: count kind`.
+        extern "C" { fn drivers_irq_report(buf: *mut u8, cap: usize) -> usize; }
+        return Some(unsafe { drivers_irq_report(buf.as_mut_ptr(), buf.len()) });
     }
 
     if path == b"/proc/cpuinfo" {
@@ -8662,6 +8798,13 @@ const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc
                                      b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups"];
+/// The regular files `handle_open` generates through `gen_proc_system` (and
+/// the `/proc/sys/fs` ones), none of which is a RAMFS entry: stat must answer
+/// for them or they cannot be a bind-mount target.
+const PROC_SYSTEM_FILES: &[&[u8]] = &[b"/proc/meminfo", b"/proc/uptime", b"/proc/cmdline", b"/proc/nvrm_state",
+                                      b"/proc/loadavg", b"/proc/stat", b"/proc/mounts", b"/proc/interrupts",
+                                      b"/proc/sys/fs/nr_open", b"/proc/sys/fs/file-max", b"/proc/sys/fs/file-nr",
+                                      b"/proc/sys/fs/ovl_selftest", b"/proc/kmod_initrd", b"/proc/kmod_buildid"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj", b"cgroup",
                                    b"mountinfo", b"mounts"];
@@ -8910,6 +9053,8 @@ fn gen_proc_self_content(pid: u32, path: &[u8], buf: &mut [u8; TMP_BUF_SIZE]) ->
             p = write_u32(buf, p, mode);
             p = write_lit(buf, p, b"\nSeccomp_filters:\t");
             p = write_u32(buf, p, nf);
+            p = write_lit(buf, p, b"\nSeccomp_irq_windows:\t");
+            p = write_u64(buf, p, sched::seccomp::IRQ_WINDOWS.load(core::sync::atomic::Ordering::Relaxed));
             p = write_lit(buf, p, b"\n");
         }
         let kb = |pages: usize| pages as u64 * KB_PER_PAGE;
@@ -9643,6 +9788,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if let Some(c) = nslimit_sysctl(lookup_path) {
+            // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_proc_nslimit(c, write) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if let Some(k) = inotify_sysctl(lookup_path) {
             // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
             let write = flags & 0o3 != 0;
@@ -9700,12 +9853,22 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/cmdline" || lookup_path == b"/proc/nvrm_state"
                || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
-               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/etc/resolv.conf"
+               || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/proc/interrupts" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
                || lookup_path == b"/proc/sys/fs/file-nr"
                || lookup_path == b"/proc/sys/fs/ovl_selftest" {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
-                Some(v) => v,
+                Some(v) => {
+                    if let VnodeKind::TmpFile { idx, .. } = v {
+                        // Same lock order as everywhere: TMP_FILES, then PSYS_ORIGIN. Drop the
+                        // entries of snapshots that were closed since (their slot is free or reused).
+                        let tmp = TMP_FILES.lock();
+                        let mut o = PSYS_ORIGIN.lock();
+                        o.retain(|e| e.0 != idx && e.0 < tmp.len() && tmp[e.0].in_use() && tmp[e.0].path().starts_with(b"/tmp/.psys_"));
+                        o.push((idx, lookup_path.to_vec()));
+                    }
+                    v
+                }
                 None    => return err_reply(-2),
             }
         } else if lookup_path == b"/etc/mtab" {
@@ -10367,6 +10530,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
             let inst = *inst;
             drop(tbls);
             if inst == 0 { return err_reply(-11); } // silent stub: never any events
+            if inotify::is_fan(inst) { return handle_fan_read(pid, inst, buf, count); }
             let mut out: Vec<u8> = Vec::new();
             match inotify::read(inst, count, &mut out) {
                 Err(e) => err_reply(e),
@@ -10416,6 +10580,17 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
         VnodeKind::DevFull => err_reply(-28), // ENOSPC
         VnodeKind::DevUrandom | VnodeKind::DevNull | VnodeKind::DevZero =>
             val_reply(count as u64),
+        // fanotify permission verdict: struct fanotify_response { s32 fd; u32 response }.
+        VnodeKind::Inotify { inst } if inotify::is_perm_group(*inst) => {
+            let inst = *inst;
+            drop(tbls);
+            if count < 8 { return err_reply(-22); }
+            let mut b = [0u8; 8];
+            if !sched::with_current_address_space(|as_| as_.read_user_buf(buf_ptr, &mut b)).unwrap_or(false) { return err_reply(-14); }
+            let fdv = i32::from_le_bytes(b[0..4].try_into().unwrap());
+            let resp = u32::from_le_bytes(b[4..8].try_into().unwrap());
+            match inotify::fan_verdict(inst, fdv, resp) { Ok(()) => val_reply(8), Err(e) => err_reply(e) }
+        }
         // See the read arm: locks dropped before I/O and before the user
         // buffer is read.
         VnodeKind::BlockDev { dev, pos } => {
@@ -10601,6 +10776,25 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let mut b = [0u8; 63];
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let r = sched::ns::netctl_set(ns, k, &b[..n]);
+                return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
+            let nsl_k = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                if e.in_use() && e.ephemeral() && e.path().starts_with(PROC_NSLIM_W) {
+                    Some((e.path()[PROC_NSLIM_W.len()] - b'0') as usize)
+                } else { None }
+            };
+            if let Some(c) = nsl_k {
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                if s.is_empty() || !s.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
+                let mut v = 0u32;
+                for &d in s { v = v.saturating_mul(10).saturating_add((d - b'0') as u32); }
+                let r = sched::ns::limit_set(c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let inot_k = {
@@ -12193,7 +12387,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 core::ptr::write(p as *mut u64, ino);
                 core::ptr::write(p.add(8) as *mut u64, 0u64);
                 core::ptr::write(p.add(16) as *mut u16, reclen as u16);
-                *p.add(18) = if is_dir { 4 } else { 8 }; // DT_DIR / DT_REG
+                *p.add(18) = if is_dir { 4 } else if dev >= sysclass::SC_BASE && sysclass::dirent_link(dev, level, cur - 2) { 10 } else { 8 }; // DT_DIR / DT_LNK / DT_REG
                 core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), nlen);
                 *p.add(19 + nlen) = 0;
             }
@@ -13091,6 +13285,33 @@ fn inotify_chain(pid: u32) -> Vec<inotify::UKey> {
     v
 }
 
+/// `/proc/sys/user/max_<kind>_namespaces` -> ns slot class (sched::ns::limit_*).
+fn nslimit_sysctl(path: &[u8]) -> Option<usize> {
+    let n = path.strip_prefix(b"/proc/sys/user/")?;
+    (1..sched::ns::LIMIT_N).find(|&c| sched::ns::LIMIT_NAMES[c] == n)
+}
+const PROC_NSLIM_W: &[u8] = b"/tmp/.proc_nslim_";
+
+fn gen_proc_nslimit(c: usize, write: bool) -> Option<VnodeKind> {
+    let mut data = [0u8; 12];
+    let l = oom_text(sched::ns::limit_get(c) as i32, &mut data);
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    if !write {
+        buf[..l].copy_from_slice(&data[..l]);
+        return gen_proc_system_file(&buf, l);
+    }
+    let mut fake = [0u8; 32];
+    fake[..PROC_NSLIM_W.len()].copy_from_slice(PROC_NSLIM_W);
+    fake[PROC_NSLIM_W.len()] = b'0' + c as u8;
+    let n = PROC_NSLIM_W.len() + 1;
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, &fake[..n]);
+    if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 /// `/proc/sys/fs/inotify/<name>` -> limit index.
 fn inotify_sysctl(path: &[u8]) -> Option<usize> {
     match path.strip_prefix(b"/proc/sys/fs/inotify/")? {
@@ -13170,10 +13391,220 @@ fn handle_inotify_add(pid: u32, fd: usize, path_ptr: usize, mask: u32) -> Messag
         }
         path = strip_trailing_slash(raw).to_vec();
     }
-    match inotify::add(inst, &path, mask, 0) {
+    let ident = inotify_ident(&path);
+    let (id, nlink, isdir) = ident.map_or(((0, 0), 1, false), |i| (i.id, i.nlink, i.isdir));
+    match inotify::add(inst, &path, mask, id, nlink, isdir) {
         Ok(wd) => val_reply(wd as u64),
         Err(e) => err_reply(e),
     }
+}
+
+/// fanotify_init: a notification-class group is an inotify instance whose
+/// marks are watches and whose read format is `struct fanotify_event_metadata`.
+fn handle_fanotify_init(pid: u32, flags: u32, evflags: u32) -> Message {
+    if !inotify_enabled() { return err_reply(-38); }
+    // CLOEXEC | NONBLOCK, class NOTIF (0), UNLIMITED_QUEUE | UNLIMITED_MARKS.
+    // FAN_REPORT_FID 0x200, DIR_FID 0x400, NAME 0x800 (NAME needs DIR_FID; FID groups are notification-class only).
+    let cls = flags & 0xc; // FAN_CLASS_NOTIF 0, CONTENT 4, PRE_CONTENT 8
+    let fid = flags & 0x1e00;
+    if flags & !0x1e3f != 0 || cls == 0xc || evflags & 3 == 3 { return err_reply(-22); }
+    if fid != 0 && cls != 0 { return err_reply(-22); }
+    if fid & inotify::FAN_REPORT_NAME != 0 && fid & inotify::FAN_REPORT_DIR_FID == 0 { return err_reply(-22); }
+    // FAN_REPORT_TARGET_FID needs FAN_REPORT_FID and FAN_REPORT_DFID_NAME.
+    if fid & inotify::FAN_REPORT_TARGET_FID != 0 && fid & 0xe00 != 0xe00 { return err_reply(-22); }
+    if !sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN) { return err_reply(-1); }
+    let f = (if flags & 1 != 0 { O_CLOEXEC } else { 0 }) | (if flags & 2 != 0 { O_NONBLOCK_FL } else { 0 });
+    let r = handle_inotify_create(pid, f);
+    let fd = reply_val(&r);
+    if fd < 0 { return r; }
+    if let Ok(inst) = inotify_inst_of(pid, fd as usize) { inotify::fan_set(inst, evflags & (3 | O_CLOEXEC | O_NONBLOCK_FL), cls != 0, sched::tgid_of(pid) as u32, fid); }
+    r
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, path): ADD / REMOVE / FLUSH on an
+/// inode, or on the mount rooted at the path with FAN_MARK_MOUNT.
+fn handle_fanotify_mark(pid: u32, fd: usize, path_ptr: usize, flags: u32, mask: u64, dirfd: usize) -> Message {
+    let inst = match inotify_inst_of(pid, fd) { Ok(i) => i, Err(e) => return err_reply(e) };
+    if inst == 0 || !inotify::is_fan(inst) { return err_reply(-22); }
+    let op = flags & (inotify::FAN_MARK_ADD | inotify::FAN_MARK_REMOVE | inotify::FAN_MARK_FLUSH);
+    // DONT_FOLLOW 4, ONLYDIR 8, MOUNT 0x10, FILESYSTEM 0x100 (treated as MOUNT).
+    if op.count_ones() != 1 || flags & !(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100) != 0 { return err_reply(-22); }
+    let ignore = flags & inotify::FAN_MARK_IGNORED_MASK != 0;
+    let surv = flags & inotify::FAN_MARK_IGNORED_SURV_MODIFY != 0;
+    if surv && !ignore { return err_reply(-22); }
+    let mount = flags & (inotify::FAN_MARK_MOUNT | 0x100) != 0;
+    if op == inotify::FAN_MARK_FLUSH { inotify::fan_flush(inst, mount); return ok_reply(); }
+    let perm = inotify::is_perm_group(inst);
+    let gfid = inotify::fan_fid(inst);
+    // FID groups add ATTRIB / DELETE_SELF / MOVE_SELF; DIR_FID groups also the
+    // directory-entry events. Neither is valid on a mount mark.
+    let fs = flags & 0x100 != 0;
+    let fid_ev = if mount && !fs { 0 } else if gfid & inotify::FAN_REPORT_DIR_FID != 0 { inotify::FAN_FID_EVENTS | if gfid & inotify::FAN_REPORT_NAME != 0 { inotify::FAN_RENAME } else { 0 } }
+        else if gfid != 0 { inotify::IN_ATTRIB | inotify::IN_DELETE_SELF | inotify::IN_MOVE_SELF } else { 0 };
+    let ok_mask = (inotify::FAN_EVENTS | inotify::FAN_OPEN_EXEC | fid_ev | inotify::FAN_ONDIR | inotify::FAN_ON_CHILD | if perm { inotify::FAN_PERM } else { 0 }) as u64;
+    if mask & !ok_mask != 0 || mask & (inotify::FAN_EVENTS | inotify::FAN_OPEN_EXEC | fid_ev | inotify::FAN_PERM) as u64 == 0 { return err_reply(-22); }
+    let path: Vec<u8> = if path_ptr == 0 {
+        let mut buf = alloc::vec![0u8; 4096];
+        let r = reply_val(&handle_fd_path(pid, dirfd, buf.as_mut_ptr() as usize, buf.len()));
+        if r <= 0 { return err_reply(if r < 0 { r as i32 } else { -9 }); }
+        buf.truncate(r as usize);
+        tmpfs_path(&buf).unwrap_or_else(|| strip_trailing_slash(&buf)).to_vec()
+    } else {
+        let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
+        let raw = &pbuf[..plen];
+        tmpfs_path(raw).unwrap_or_else(|| strip_trailing_slash(raw)).to_vec()
+    };
+    let (id, nlink, isdir) = match inotify_ident(&path) {
+        Some(i) => (i.id, i.nlink, i.isdir),
+        None if tmpfs_path(&path).map_or(false, |t| is_tmpfs_root(t)) || is_tmpfs_root(&path) => (inotify::path_id(&path), 1, true),
+        None => return err_reply(-2),
+    };
+    if flags & 8 != 0 && !isdir { return err_reply(-20); }
+    let remove = op == inotify::FAN_MARK_REMOVE;
+    match inotify::fan_mark(inst, remove, &path, mask as u32, id, nlink, isdir, mount, ignore, surv) {
+        Ok(()) => ok_reply(),
+        Err(e) => err_reply(e),
+    }
+}
+
+
+/// Handles issued so far (name_to_handle_at, fanotify FID records): (dev, ino)
+/// -> the path it was issued for. open_by_handle_at reopens through it and
+/// answers ESTALE when the path no longer names the same inode. Supported on
+/// every filesystem `inotify::may_watch` accepts (tmpfs, f2fs, ...).
+static FH_TABLE: Mutex<alloc::vec::Vec<((u64, u64), alloc::vec::Vec<u8>)>> = Mutex::new(alloc::vec::Vec::new());
+
+pub fn fh_remember(id: (u64, u64), path: &[u8]) {
+    let mut t = FH_TABLE.lock();
+    if let Some(e) = t.iter_mut().find(|e| e.0 == id) { e.1 = path.to_vec(); return; }
+    if t.len() >= 4096 { t.remove(0); }
+    t.push((id, path.to_vec()));
+}
+
+/// (dev, ino) of `path` and the path recorded for the handle; `None` when the
+/// filesystem cannot be watched (EOPNOTSUPP).
+pub fn fh_ident(path: &[u8]) -> Option<(u64, u64)> {
+    if !inotify::may_watch(path) && tmpfs_path(path).is_none() { return None; }
+    let p = tmpfs_path(path).unwrap_or(path);
+    inotify_ident(p).map(|i| i.id)
+}
+
+/// Path recorded for `id` provided it still names the same inode.
+/// `Err(true)` = unknown or gone (ESTALE).
+pub fn fh_lookup(dev: Option<u64>, ino: u64) -> Option<alloc::vec::Vec<u8>> {
+    let (id, p) = FH_TABLE.lock().iter().find(|e| e.0 .1 == ino && dev.map_or(true, |d| d == e.0 .0)).map(|e| (e.0, e.1.clone()))?;
+    if fh_ident(&p) == Some(id) { Some(p) } else { None }
+}
+
+/// st_dev of the object `path` names (no watchability gate).
+pub fn fh_dev(path: &[u8]) -> Option<u64> {
+    inotify_ident(tmpfs_path(path).unwrap_or(path)).map(|i| i.id.0)
+}
+
+pub fn fh_known(id: (u64, u64)) -> bool { FH_TABLE.lock().iter().any(|e| e.0 == id) }
+
+/// One `struct fanotify_event_info_fid` record: header, fsid, `struct
+/// file_handle`. The handle is the LeandrOS object identity that
+/// name_to_handle_at also returns (reopened through open_by_handle_at): handle_type
+/// FILEID_LEANDROS (0x4c), 12 bytes = st_ino (u64) + generation (u32, 0);
+/// fsid = the st_dev halves. Pushes nothing when `id` is unknown.
+fn fan_fid_record(out: &mut Vec<u8>, ty: u8, id: (u64, u64), name: Option<&[u8]>) {
+    let nlen = name.map_or(0, |n| n.len() + 1);
+    let len = (4 + 8 + 8 + 12 + nlen + 3) & !3;
+    out.push(ty);
+    out.push(0);
+    out.extend_from_slice(&(len as u16).to_le_bytes());
+    out.extend_from_slice(&(id.0 as u32).to_le_bytes());
+    out.extend_from_slice(&((id.0 >> 32) as u32).to_le_bytes());
+    out.extend_from_slice(&12u32.to_le_bytes());
+    out.extend_from_slice(&0x4ci32.to_le_bytes());
+    out.extend_from_slice(&id.1.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    if let Some(n) = name { out.extend_from_slice(n); out.push(0); }
+    while (out.len()) % 4 != 0 { out.push(0); }
+}
+
+/// Info records of a FID group event on `path`: DFID_NAME (2) / DFID (3) of the
+/// directory, then FID (1) of the object. `eino` is the watched inode of a
+/// self event (or the watched directory of a named one).
+fn fan_fid_records(out: &mut Vec<u8>, gfid: u32, path: &[u8], eino: (u64, u64), named: bool, isdir: bool) {
+    let (dir, base) = match path.iter().rposition(|&b| b == b'/') {
+        Some(0) => (&path[..1], &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (&path[..0], path),
+    };
+    // Mount / filesystem marks carry no watched inode: resolve it from the path.
+    let eino = if eino == (0, 0) && !named { inotify_ident(path).map_or((0, 0), |i| i.id) } else { eino };
+    let eino = if eino == (0, 0) && named { inotify_ident(dir).map_or((0, 0), |i| i.id) } else { eino };
+    let obj: Option<(u64, u64)> = if named { inotify_ident(path).map(|i| i.id) } else if eino == (0, 0) { None } else { Some(eino) };
+    if let Some(o) = obj { fh_remember(o, path); }
+    if gfid & inotify::FAN_REPORT_DIR_FID != 0 {
+        let (did, nm): (Option<(u64, u64)>, &[u8]) = if named { (if eino == (0, 0) { None } else { Some(eino) }, base) }
+            else if isdir { (Some(eino), b".") } else { (inotify_ident(dir).map(|i| i.id), base) };
+        if let Some(d) = did {
+            fh_remember(d, if named || !isdir { dir } else { path });
+            if gfid & inotify::FAN_REPORT_NAME != 0 { fan_fid_record(out, 2, d, Some(nm)); } else { fan_fid_record(out, 3, d, None); }
+        }
+    }
+    if gfid & inotify::FAN_REPORT_FID != 0 { if let Some(o) = obj { fan_fid_record(out, 1, o, None); } }
+}
+
+/// FAN_RENAME records: OLD_DFID_NAME (10), NEW_DFID_NAME (12) and, with
+/// FAN_REPORT_TARGET_FID, the FID (1) of the renamed object. `blob` is `old NUL new`.
+fn fan_rename_records(out: &mut Vec<u8>, gfid: u32, blob: &[u8]) {
+    let z = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+    let (old, new) = (&blob[..z], if z < blob.len() { &blob[z + 1..] } else { &blob[..0] });
+    for (ty, p) in [(10u8, old), (12u8, new)] {
+        let (dir, base) = match p.iter().rposition(|&b| b == b'/') {
+            Some(0) => (&p[..1], &p[1..]),
+            Some(i) => (&p[..i], &p[i + 1..]),
+            None => (&p[..0], p),
+        };
+        if let Some(d) = inotify_ident(dir).map(|i| i.id) { fh_remember(d, dir); fan_fid_record(out, ty, d, Some(base)); }
+    }
+    if gfid & inotify::FAN_REPORT_TARGET_FID != 0 {
+        if let Some(o) = inotify_ident(new).map(|i| i.id) { fh_remember(o, new); fan_fid_record(out, 1, o, None); }
+    }
+}
+
+/// read() on a fanotify group: `struct fanotify_event_metadata` records, each
+/// with an fd opened on the object in the reader's table.
+fn handle_fan_read(pid: u32, inst: u32, buf: *mut u8, count: usize) -> Message {
+    const MD: usize = 24;
+    if count < MD { return err_reply(-22); }
+    let evs = match inotify::fan_read(inst, if inotify::fan_fid(inst) != 0 { (count / 512).max(1) } else { count / MD }) { Ok(v) => v, Err(e) => return err_reply(e) };
+    let evflags = inotify::fan_evflags(inst);
+    let gfid = inotify::fan_fid(inst);
+    let mut out: Vec<u8> = Vec::with_capacity(evs.len() * MD);
+    let mut fds: Vec<i32> = Vec::new();
+    for (mask, path, epid, permid, eino, named) in evs {
+        let mut efd: i32 = -1;
+        let mut info: Vec<u8> = Vec::new();
+        if gfid != 0 && mask & inotify::FAN_RENAME != 0 {
+            fan_rename_records(&mut info, gfid, &path);
+        } else if gfid != 0 {
+            fan_fid_records(&mut info, gfid, &path, eino, named, mask & inotify::IN_ISDIR != 0);
+        } else if !path.is_empty() {
+            let mut z = path.clone();
+            z.push(0);
+            let r = reply_val(&handle_open(pid, z.as_ptr() as usize, evflags, 0));
+            if r >= 0 { efd = r as i32; fds.push(efd); }
+        }
+        if permid != 0 { inotify::fan_bind(inst, permid, efd); }
+        out.extend_from_slice(&((MD + info.len()) as u32).to_le_bytes());
+        out.push(3); // FANOTIFY_METADATA_VERSION
+        out.push(0);
+        out.extend_from_slice(&(MD as u16).to_le_bytes());
+        out.extend_from_slice(&(mask as u64).to_le_bytes());
+        out.extend_from_slice(&efd.to_le_bytes());
+        out.extend_from_slice(&(epid as i32).to_le_bytes());
+        out.extend_from_slice(&info);
+    }
+    if unsafe { sched::uaccess::copy_raw(buf, out.as_ptr(), out.len()) } != 0 {
+        for f in fds { let _ = handle_close(pid, f as usize); }
+        return err_reply(-14);
+    }
+    val_reply(out.len() as u64)
 }
 
 /// inotify_rm_watch(fd, wd).
@@ -14759,6 +15190,15 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
         return val_reply(n as u64);
     }
 
+    if raw.starts_with(b"/sys/") {
+        let mut lb = [0u8; 96];
+        if let Some(n) = sysclass::link(raw, &mut lb) {
+            let n = n.min(buf_len);
+            unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, lb.as_ptr(), n); }
+            return val_reply(n as u64);
+        }
+        if sysclass::is_path(raw) { return err_reply(-22); } // generated, not a link
+    }
     if let Some(path) = tmpfs_path(raw) {
         let tmp = TMP_FILES.lock();
         return match tmp_find(&tmp, path) {
@@ -15736,7 +16176,10 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Messag
     // would ask the root filesystem, which answers ENOENT, so `[ -r
     // /proc/meminfo ]` failed while `cat` worked. The kernel's stat-based
     // fallback answers from the mode stat reports.
-    if raw == b"/proc" || raw.starts_with(b"/proc/") {
+    if raw == b"/proc" || raw.starts_with(b"/proc/")
+        // /etc/resolv.conf is generated too (DHCP lease), absent on the root
+        // mount: inotify_add_watch (aardvark-dns) needs access to say yes.
+        || raw == b"/etc/resolv.conf" {
         return err_reply(-38);
     }
     if let Some(port) = find_mount_port(raw) {
@@ -16601,6 +17044,12 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
         return ok_reply();
     }
+    // The generated system files (`gen_proc_system`) exist for stat too:
+    // mount(2) of a bind onto one (OCI masked paths, lxcfs) stats its target.
+    if PROC_SYSTEM_FILES.contains(&strip_trailing_slash(path)) {
+        write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
+        return ok_reply();
+    }
 
     if let Some(lookup_path) = should_lookup_ramfs(path) {
         // A GPU backend's DRM PCI identity file (see `drm_sysfs_attr`).
@@ -16712,6 +17161,13 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 Some((m, nl, ino, u, g)) => { write_stat_full(stat_ptr, m, nl as u64, 0, ino, u, g); ok_reply() }
                 None => err_reply(-2),
             };
+        }
+        if !follow && lookup_path.starts_with(b"/sys/") {
+            let mut lb = [0u8; 96];
+            if let Some(n) = sysclass::link(lookup_path, &mut lb) {
+                write_stat(stat_ptr, 0o120777, n as u64, path_ino(lookup_path, 6));
+                return ok_reply();
+            }
         }
         if sysclass::is_path(lookup_path) {
             if let Some((dev, level)) = sysclass::dir(lookup_path) {
@@ -16990,7 +17446,10 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
                 // "<path> (deleted)" (Linux d_path); tmpfs paths are the
                 // names, so a rename is followed already.
                 let suffix: &[u8] = if tmp[i].unlinked() { b" (deleted)" } else { b"" };
-                let path = tmp[i].path();
+                let origin = if tmp[i].path().starts_with(b"/tmp/.psys_") {
+                    PSYS_ORIGIN.lock().iter().find(|e| e.0 == i).map(|e| e.1.clone())
+                } else { None };
+                let path = match &origin { Some(o) => &o[..], None => tmp[i].path() };
                 let mut l = 0usize;
                 for &c in path.iter().chain(suffix.iter()) {
                     if l == buf_len || l == st.len() { break; }

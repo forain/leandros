@@ -24,7 +24,8 @@
 //! Access points: `wifisim.aps=<ap>,<ap>,...` with
 //! `<ssid>:<sec>[:<secret>[:<dBm>[:<channel>[:<bssid>[:<flags>]]]]]`,
 //! `%XX` escapes in every field, `<sec>` one of open, psk (WPA2-Personal),
-//! sae (WPA3-Personal only, MFP required), psk+sae (transition), `<bssid>`
+//! sae (WPA3-Personal only, MFP required; SAE on group 19 with hash-to-element
+//! and PMKSA caching), psk+sae (transition: SAE preferred, PSK fallback), `<bssid>`
 //! as 12 hex digits (separators `-` or none), `<flags>`: `h` hidden SSID,
 //! `r` refuses association (status 17), `1`..`4` the AP's data path (see
 //! below), and RSN variants a WPA2 network can come in that this station
@@ -33,7 +34,8 @@
 //! FT-PSK as the only AKM; `d` the AP deauthenticates (reason 6) during
 //! every 4-way handshake, as a flaky real AP did; `l` a legacy AP (no WMM,
 //! no HT; every other AP is an HT AP, see "HT access point emulation"
-//! below). Default set:
+//! below); SAE APs: `p` hunt-and-peck only (no H2E), `c` anti-clogging token
+//! required, `q` SAE broken (a transition AP then falls back to PSK). Default set:
 //!
 //! | SSID      | security | secret          | dBm | ch |
 //! |-----------|----------|-----------------|-----|----|
@@ -74,6 +76,7 @@ use crate::wifi_api::{ConnectParams, Secret, WifiBackend, WifiCmd, WifiEvent};
 use crate::wifi_crypto as wc;
 use crate::wifi_frame as wf;
 use crate::wifi_ht as wh;
+use crate::wifi_sae as sae;
 use crate::wifi_mgr::{self as wm, ConnCtx, Fail, Mgr, Radio, ScanHit};
 
 /// MAC prefix that marks a virtio-net NIC as the sim's data path.
@@ -118,6 +121,14 @@ struct SimAp {
     secret: Vec<u8>,
     hidden: bool,
     refuse_assoc: bool,
+    /// SAE: hash-to-element (flag `p` clears it: hunt-and-peck only).
+    h2e: bool,
+    /// SAE: demands an anti-clogging token (flag `c`).
+    clog: bool,
+    /// SAE authentication always fails (flag `q`).
+    sae_broken: bool,
+    /// The PMKSA the AP holds from the last SAE: (PMKID, PMK).
+    sae_pmk: Option<([u8; 16], [u8; 32])>,
     on_air: bool,
     /// The AP's PMK, derived on first use.
     pmk: Option<[u8; 32]>,
@@ -216,7 +227,7 @@ fn default_bssid(i: usize) -> [u8; 6] { [0x0a, 0x57, 0x53, 0xa0, 0x00, (i + 1) a
 fn ap(i: usize, ssid: &str, sec: Sec, secret: &str, dbm: i8, chan: u8, flags: &str) -> SimAp {
     let mut a = SimAp {
         ssid: ssid.as_bytes().to_vec(), bssid: default_bssid(i), chan, dbm, sec, secret: secret.as_bytes().to_vec(),
-        hidden: false, refuse_assoc: false, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain, deauth_hs: false,
+        hidden: false, refuse_assoc: false, h2e: true, clog: false, sae_broken: false, sae_pmk: None, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain, deauth_hs: false,
         ht: true,
     };
     apply_flags(&mut a, flags);
@@ -236,6 +247,9 @@ fn apply_flags(a: &mut SimAp, flags: &str) {
             'm' => a.rsn_var = RsnVar::MfpRequired,
             'x' => a.rsn_var = RsnVar::FtOnly,
             'd' => a.deauth_hs = true,
+            'p' => a.h2e = false,
+            'c' => a.clog = true,
+            'q' => a.sae_broken = true,
             'l' => a.ht = false,
             _ => {}
         }
@@ -273,7 +287,7 @@ fn parse_aps(spec: &str) -> Vec<SimAp> {
         let mut a = SimAp {
             ssid, bssid: default_bssid(i), chan: 6, dbm: -50, sec,
             secret: f.get(2).map(|s| percent_decode(s)).unwrap_or_default(),
-            hidden: false, refuse_assoc: false, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain,
+            hidden: false, refuse_assoc: false, h2e: true, clog: false, sae_broken: false, sae_pmk: None, on_air: true, pmk: None, path: 0, rsn_var: RsnVar::Plain,
             deauth_hs: false, ht: true,
         };
         if let Some(d) = f.get(3).and_then(|s| s.parse::<i8>().ok()) { a.dbm = d; }
@@ -540,7 +554,16 @@ fn set_link(up: bool) {
 /// Returns the pairwise key both sides installed.
 /// The supplicant of the current association with the AP's side of its keys,
 /// so the self-test can run a group rekey (EAPOL group message 1).
-struct SimHs { sup: wc::Supplicant, kek: [u8; 16], kck: [u8; 16], rc: u64, tkip: bool }
+struct SimHs {
+    sup: wc::Supplicant, kek: [u8; 16], kck: [u8; 16], rc: u64, tkip: bool,
+    /// EAPOL-Key descriptor version (2: HMAC-SHA1, 3: AES-CMAC / SHA-256 KDF).
+    ver: u16,
+    /// Management frame protection: the IGTK and its key id.
+    igtk: Option<([u8; 16], u16)>,
+    /// Highest BIP packet number the station accepted / the AP sent.
+    bip_rx: u64,
+    ap_ipn: u64,
+}
 static HS: Mutex<Option<SimHs>> = Mutex::new(None);
 /// Key index + 1 of a group message 1 the next connected scan receives.
 static M1_DURING_SCAN: AtomicU32 = AtomicU32::new(0);
@@ -567,7 +590,7 @@ fn sim_group_m1(key_id: u8) -> Result<Vec<u8>, String> {
     if kd.len() % 8 != 0 { kd.push(0xdd); while kd.len() % 8 != 0 { kd.push(0); } }
     let wrapped = wc::aes_key_wrap(&h.kek, &kd);
     h.rc += 1;
-    let mut m1 = wc::build_eapol_key(2, 2 | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA, 0, &h.rc.to_be_bytes(), &[0u8; 32], &wrapped);
+    let mut m1 = wc::build_eapol_key(2, h.ver | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA, 0, &h.rc.to_be_bytes(), &[0u8; 32], &wrapped);
     wc::eapol_set_mic(&h.kck, &mut m1);
     Ok(m1)
 }
@@ -587,59 +610,79 @@ fn sim_group_deliver(m1: &[u8]) -> Result<(), String> {
     if done { Ok(()) } else { Err(String::from("no GTK install event")) }
 }
 
-fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], group_tkip: bool, cx: &ConnCtx) -> Result<[u8; 16], Fail> {
+/// What the station's RSN element in the association request says.
+struct HsCfg { tkip: bool, akm: u8, caps: u16, pmkid: Option<[u8; 16]> }
+
+fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], cfg: &HsCfg, cx: &ConnCtx) -> Result<[u8; 16], Fail> {
     use wc::key_info as ki;
+    let group_tkip = cfg.tkip;
+    let mfp = cfg.caps & wc::RSN_CAP_MFPC != 0;
+    let ver: u16 = if cfg.akm == 8 { 3 } else { 2 };
     let mut anonce = [0u8; 32];
     sched::random::fill(&mut anonce);
     let mut snonce = [0u8; 32];
     sched::random::fill(&mut snonce);
-    let own_rsn = wc::rsn_ie_psk(if group_tkip { wm::SUITE_TKIP } else { wm::SUITE_CCMP });
-    let mut sup = wc::Supplicant::new(*sta_pmk, spa, aa, own_rsn.to_vec(), snonce);
+    let own_rsn = wc::rsn_ie_build(if group_tkip { wm::SUITE_TKIP } else { wm::SUITE_CCMP }, cfg.akm, cfg.caps, cfg.pmkid.as_ref());
+    let mut sup = wc::Supplicant::new(*sta_pmk, spa, aa, own_rsn.clone(), snonce);
     sup.set_group_tkip(group_tkip);
+    sup.set_akm(cfg.akm);
     let mut rc: u64 = 1;
     let mut msg2_sent = false;
     for _try in 0..M1_TRIES {
-        let m1 = wc::build_eapol_key(2, 2 | ki::TYPE_PAIRWISE | ki::ACK, 16, &rc.to_be_bytes(), &anonce, &[]);
+        let m1 = wc::build_eapol_key(2, ver | ki::TYPE_PAIRWISE | ki::ACK, 16, &rc.to_be_bytes(), &anonce, &[]);
         rc += 1;
         let m2 = sup.on_eapol(&m1).into_iter().find_map(|e| if let wc::HsEvent::Send(p) = e { Some(p) } else { None });
         let m2 = match m2 { Some(m) => m, None => return Err(Fail::new(reason::FW_ERROR, "supplicant did not answer message 1")) };
         msg2_sent = true;
         let k2 = match wc::parse_eapol_key(&m2) { Some(k) => k, None => return Err(Fail::new(reason::FW_ERROR, "malformed message 2")) };
-        let ptk = wc::derive_ptk(ap_pmk, &aa, &spa, &anonce, &k2.nonce);
+        let ptk = if ver == 3 { wc::derive_ptk_sha256(ap_pmk, &aa, &spa, &anonce, &k2.nonce) } else { wc::derive_ptk(ap_pmk, &aa, &spa, &anonce, &k2.nonce) };
         if wc::eapol_mic_ok(&ptk.kck, &m2) {
-            // Message 3: GTK KDE (and our RSN IE) wrapped with the KEK.
-            // A mixed-mode AP hands out a 32-byte TKIP GTK.
+            // Message 3: GTK KDE (and our RSN IE, and with PMF the IGTK KDE)
+            // wrapped with the KEK. A mixed-mode AP hands out a 32-byte TKIP GTK.
             let mut gtk_buf = [0u8; 32];
             sched::random::fill(&mut gtk_buf);
             let gtk = &gtk_buf[..if group_tkip { 32 } else { 16 }];
+            let mut igtk = [0u8; 16];
+            sched::random::fill(&mut igtk);
             let mut kd = Vec::new();
             kd.extend_from_slice(&own_rsn);
             kd.extend_from_slice(&[0xdd, 6 + gtk.len() as u8, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00]);
             kd.extend_from_slice(&gtk);
+            if mfp {
+                kd.extend_from_slice(&[0xdd, 28, 0x00, 0x0f, 0xac, 0x09, 4, 0, 0, 0, 0, 0, 0, 0]);
+                kd.extend_from_slice(&igtk);
+            }
             // Key data padding (IEEE 802.11 12.7.2): 0xdd then zeros to a multiple of 8.
             if kd.len() % 8 != 0 { kd.push(0xdd); while kd.len() % 8 != 0 { kd.push(0); } }
             let wrapped = wc::aes_key_wrap(&ptk.kek, &kd);
-            let mut m3 = wc::build_eapol_key(2, 2 | ki::TYPE_PAIRWISE | ki::INSTALL | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA,
+            let mut m3 = wc::build_eapol_key(2, ver | ki::TYPE_PAIRWISE | ki::INSTALL | ki::ACK | ki::MIC | ki::SECURE | ki::ENCRYPTED_KEY_DATA,
                                              16, &rc.to_be_bytes(), &anonce, &wrapped);
             wc::eapol_set_mic(&ptk.kck, &mut m3);
             let mut m4 = None;
             let mut tk = None;
+            let mut got_igtk = false;
             for e in sup.on_eapol(&m3) {
                 match e {
                     wc::HsEvent::Send(p) => m4 = Some(p),
                     wc::HsEvent::InstallPtk(k) => tk = Some(k),
                     wc::HsEvent::InstallGtk { key, .. } if key[..] != gtk[..] =>
                         return Err(Fail::new(reason::FW_ERROR, "the station installed a different group key")),
+                    wc::HsEvent::InstallIgtk { key, key_id, .. } => {
+                        if key != igtk || key_id != 4 { return Err(Fail::new(reason::FW_ERROR, "the station installed a different integrity group key")); }
+                        got_igtk = true;
+                    }
                     wc::HsEvent::Error(e) => return Err(Fail::new(reason::FW_ERROR, alloc::format!("supplicant: {}", e))),
                     wc::HsEvent::InstallGtk { key_id, .. } => wm::gk::note_install(key_id, group_tkip),
                     _ => {}
                 }
             }
+            if mfp && !got_igtk { return Err(Fail::new(reason::FW_ERROR, "no IGTK installed although management frame protection is on")); }
             let m4 = m4.ok_or_else(|| Fail::new(reason::FW_ERROR, "no message 4"))?;
             if !wc::eapol_mic_ok(&ptk.kck, &m4) { return Err(Fail::new(reason::FW_ERROR, "message 4 MIC failure")); }
             let tk = tk.ok_or_else(|| Fail::new(reason::FW_ERROR, "no pairwise key"))?;
             if tk != ptk.tk { return Err(Fail::new(reason::FW_ERROR, "the two sides derived different keys")); }
-            *HS.lock() = Some(SimHs { sup, kek: ptk.kek, kck: ptk.kck, rc: rc + 1, tkip: group_tkip });
+            *HS.lock() = Some(SimHs { sup, kek: ptk.kek, kck: ptk.kck, rc: rc + 1, tkip: group_tkip, ver,
+                                      igtk: if mfp { Some((igtk, 4)) } else { None }, bip_rx: 0, ap_ipn: 0 });
             return Ok(tk);
         }
         // Message 2's MIC does not verify: a different PMK. The AP drops it
@@ -650,11 +693,174 @@ fn four_way(ap_pmk: &[u8; 32], sta_pmk: &[u8; 32], aa: [u8; 6], spa: [u8; 6], gr
     Err(wm::handshake_failure(msg2_sent, Some(wm::IEEE_REASON_4WAY_TIMEOUT)))
 }
 
+// ── WPA3: SAE, PMKSA cache, management frame protection ────────────────────
+
+/// A cached pairwise master key (station side): per BSS, valid for the
+/// secret it came from.
+struct Pmksa { bssid: [u8; 6], ssid: Vec<u8>, key_hash: [u8; 32], pmk: [u8; 32], pmkid: [u8; 16] }
+static PMKSA: Mutex<Vec<Pmksa>> = Mutex::new(Vec::new());
+/// Full SAE exchanges, PMKSA-cache reuses, H2E / hunt-and-peck derivations,
+/// anti-clogging tokens, rejected / accepted protected frames, SA Queries.
+pub static ST_SAE_FULL: AtomicU32 = AtomicU32::new(0);
+pub static ST_PMKSA_HIT: AtomicU32 = AtomicU32::new(0);
+pub static ST_H2E: AtomicU32 = AtomicU32::new(0);
+pub static ST_HNP: AtomicU32 = AtomicU32::new(0);
+pub static ST_CLOG: AtomicU32 = AtomicU32::new(0);
+pub static ST_BIP_OK: AtomicU32 = AtomicU32::new(0);
+pub static ST_BIP_BAD: AtomicU32 = AtomicU32::new(0);
+pub static ST_SAQ: AtomicU32 = AtomicU32::new(0);
+
+/// Management frame protection capabilities the AP's RSN element carries.
+fn ap_rsn_caps(a: &SimAp) -> u16 {
+    match (a.sec, a.rsn_var) {
+        (Sec::Sae, _) => wm::RSN_CAP_MFPC | wm::RSN_CAP_MFPR,
+        (Sec::PskSae, _) => wm::RSN_CAP_MFPC,
+        (Sec::Psk, RsnVar::MfpRequired) => wm::RSN_CAP_MFPC | wm::RSN_CAP_MFPR,
+        _ => 0,
+    }
+}
+
+/// The SAE exchange, both roles, through the real auth-frame encodings:
+/// [anti-clogging token round,] commit, commit, confirm, confirm. Returns
+/// the PMK and PMKID both sides derived.
+fn sae_auth(a: &SimAp, ssid: &[u8], secret: &[u8], sta: [u8; 6], cx: &ConnCtx) -> Result<([u8; 32], [u8; 16]), Fail> {
+    let rej = |m: alloc::string::String| Fail::new(reason::AUTH_REJECTED, m).status(1);
+    macro_rules! step { () => { if !cx.sleep(MGMT_MS) { return Err(Fail::superseded()); } } }
+    step!();
+    if a.sae_broken { return Err(rej(String::from("SAE authentication rejected by the AP: status 1"))); }
+    let ap_mac = a.bssid;
+    let h2e = a.h2e;
+    let t0 = now_ms();
+    let mk = |ss: &[u8], pw: &[u8], me: &[u8; 6], other: &[u8; 6]| {
+        if h2e { sae::pwe_from_pt(&sae::pt_h2e(ss, pw, None), me, other) } else { sae::pwe_hunt_and_peck(pw, me, other, None) }
+    };
+    let sta_pwe = mk(ssid, secret, &sta, &ap_mac);
+    if cx.aborted() { return Err(Fail::superseded()); }
+    let ap_pwe = mk(&a.ssid, &a.secret, &ap_mac, &sta);
+    (if h2e { &ST_H2E } else { &ST_HNP }).fetch_add(1, Ordering::Relaxed);
+    let mut rng = |b: &mut [u8]| sched::random::fill(b);
+    let mut s = sae::Sae::new(sta_pwe, &mut rng);
+    let mut p = sae::Sae::new(ap_pwe, &mut rng);
+    let status = if h2e { sae::STATUS_H2E } else { sae::STATUS_SUCCESS };
+    let mut frame = sae::commit_frame(status, &[], &s.commit_body());
+    let mut token_len = 0usize;
+    if a.clog {
+        // The AP is under load: it answers the commit with a token request.
+        let mut secret_t = [0u8; 32];
+        sched::random::fill(&mut secret_t);
+        step!();
+        let req = sae::anti_clogging_frame(&sae::make_token(&secret_t, &sta));
+        let ab = sae::parse_auth(&req).ok_or_else(|| rej(String::from("malformed token request")))?;
+        if ab.status != sae::STATUS_ANTI_CLOGGING || ab.rest.len() < 2 { return Err(rej(String::from("malformed token request"))); }
+        let token = ab.rest[2..].to_vec();
+        ST_CLOG.fetch_add(1, Ordering::Relaxed);
+        token_len = token.len();
+        frame = sae::commit_frame(status, &token, &s.commit_body());
+        step!();
+        let ab = sae::parse_auth(&frame).ok_or_else(|| rej(String::from("malformed commit")))?;
+        if ab.rest.len() < 2 + token_len || ab.rest[2..2 + token_len] != sae::make_token(&secret_t, &sta)[..] {
+            return Err(rej(String::from("the AP rejected the anti-clogging token")));
+        }
+    }
+    step!();
+    let ab = sae::parse_auth(&frame).ok_or_else(|| rej(String::from("malformed commit")))?;
+    if ab.rest.len() < 2 + token_len { return Err(rej(String::from("malformed commit"))); }
+    p.process_commit(&ab.rest[2 + token_len..]).map_err(|e| rej(alloc::format!("the AP rejected the SAE commit: {:?}", e)))?;
+    step!();
+    let f2 = sae::commit_frame(status, &[], &p.commit_body());
+    let ab = sae::parse_auth(&f2).ok_or_else(|| rej(String::from("malformed commit")))?;
+    s.process_commit(&ab.rest[2..]).map_err(|e| rej(alloc::format!("the station rejected the AP's SAE commit: {:?}", e)))?;
+    step!();
+    let cf = sae::confirm_frame(&s.confirm_body().map_err(|_| rej(String::from("no confirm")))?);
+    let ab = sae::parse_auth(&cf).ok_or_else(|| rej(String::from("malformed confirm")))?;
+    if p.verify_confirm(ab.rest).is_err() {
+        return Err(Fail::new(reason::WRONG_KEY, "SAE confirm mismatch: wrong password").status(1));
+    }
+    step!();
+    let cf2 = sae::confirm_frame(&p.confirm_body().map_err(|_| rej(String::from("no confirm")))?);
+    let ab = sae::parse_auth(&cf2).ok_or_else(|| rej(String::from("malformed confirm")))?;
+    if s.verify_confirm(ab.rest).is_err() { return Err(Fail::new(reason::WRONG_KEY, "SAE confirm mismatch: wrong password").status(1)); }
+    if s.pmk != p.pmk { return Err(Fail::new(reason::FW_ERROR, "the two sides derived different SAE keys")); }
+    slog!("SAE ({}) with {} in {} ms", if h2e { "H2E" } else { "hunt-and-peck" }, wm::fmt_mac(&ap_mac), now_ms() - t0);
+    Ok((s.pmk, s.pmkid))
+}
+
+/// How a management frame the "attacker" or the AP injects is protected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Spoof { Valid, ForgedMic, Unprotected, Replay }
+
+/// Queue of group-addressed deauthentication bodies for the station (reason
+/// LE16 [+ MMIE]).
+static MGMT_Q: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
+
+/// Send the station a broadcast deauthentication from the associated AP.
+/// `Valid` is protected with the real IGTK and the next packet number;
+/// `ForgedMic` has an MMIE made with another key; `Unprotected` has none;
+/// `Replay` is correctly signed but reuses an already seen packet number.
+pub fn inject_deauth(kind: Spoof, reason: u16) -> bool {
+    let bssid = match with_sim(|s| s.assoc.map(|i| s.aps[i].bssid)).flatten() { Some(b) => b, None => return false };
+    let body = reason.to_le_bytes();
+    let bc = [0xff; 6];
+    let mut g = HS.lock();
+    let h = match g.as_mut() { Some(h) => h, None => return false };
+    let b = match (h.igtk, kind) {
+        (Some((k, id)), Spoof::Valid) => { h.ap_ipn = h.ap_ipn.max(h.bip_rx) + 1; wc::bip_protect(&k, id, h.ap_ipn, 0x00c0, &bc, &bssid, &bssid, &body) }
+        (Some((k, id)), Spoof::Replay) => {
+            h.bip_rx = h.bip_rx.max(1000);
+            let n = h.bip_rx;
+            wc::bip_protect(&k, id, n, 0x00c0, &bc, &bssid, &bssid, &body)
+        }
+        (Some((k, id)), Spoof::ForgedMic) => { let mut f = k; f[0] ^= 0xff; h.ap_ipn += 1; wc::bip_protect(&f, id, h.ap_ipn, 0x00c0, &bc, &bssid, &bssid, &body) }
+        _ => body.to_vec(),
+    };
+    drop(g);
+    MGMT_Q.lock().push_back(b);
+    true
+}
+
+/// A queued deauthentication reaches the station. With PMF only a frame with
+/// a valid MMIE counts; an unprotected or forged one is dropped (the link
+/// stays up).
+fn process_mgmt(body: &[u8]) -> Option<Fail> {
+    let bssid = with_sim(|s| s.assoc.map(|i| s.aps[i].bssid)).flatten()?;
+    let bc = [0xff; 6];
+    let reason = u16::from_le_bytes([*body.first()?, *body.get(1)?]);
+    let mut g = HS.lock();
+    if let Some(h) = g.as_mut() {
+        if let Some((k, id)) = h.igtk {
+            if !wc::bip_verify(&k, id, &mut h.bip_rx, 0x00c0, &bc, &bssid, &bssid, body) {
+                ST_BIP_BAD.fetch_add(1, Ordering::Relaxed);
+                slog!("ignored a deauthentication (reason {}) without a valid BIP MIC (management frame protection)", reason);
+                return None;
+            }
+            ST_BIP_OK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Some(Fail::new(reason::DEAUTH_BY_AP, alloc::format!("deauthenticated by the AP (reason {})", reason)).ieee_reason(reason))
+}
+
+/// The AP sends an SA Query request; the station answers with the same
+/// transaction id. True when it did.
+pub fn sa_query() -> bool {
+    let mut b = [0u8; 2];
+    sched::random::fill(&mut b);
+    let txn = u16::from_le_bytes(b);
+    if HS.lock().as_ref().map_or(true, |h| h.igtk.is_none()) { return false; }
+    let req = wc::sa_query_frame(false, txn);
+    let ok = wc::sa_query_response(&req) == Some(wc::sa_query_frame(true, txn));
+    if ok { ST_SAQ.fetch_add(1, Ordering::Relaxed); }
+    ok
+}
+
+/// Management frame protection is on for the current association.
+pub fn pmf_active() -> bool { HS.lock().as_ref().map_or(false, |h| h.igtk.is_some()) }
+
 impl Radio for SimRadio {
     fn caps(&self) -> u32 {
-        // Mirrors what iwlwifi can do today (WPA2-PSK/CCMP; SAE deferred),
+        // WPA2-PSK and WPA3-SAE with management frame protection, roaming,
         // plus scanning while associated.
-        wifi_caps::PSK | wifi_caps::BAND_2GHZ | wifi_caps::BAND_5GHZ | wifi_caps::SCAN_CONNECTED | wifi_caps::DIRECTED_SCAN
+        wifi_caps::PSK | wifi_caps::SAE | wifi_caps::SAE_H2E | wifi_caps::PMF | wifi_caps::ROAM
+            | wifi_caps::BAND_2GHZ | wifi_caps::BAND_5GHZ | wifi_caps::SCAN_CONNECTED | wifi_caps::DIRECTED_SCAN
     }
 
     fn scan(&mut self, ssids: &[Vec<u8>], connected: bool) -> Result<Vec<ScanHit>, Fail> {
@@ -693,19 +899,42 @@ impl Radio for SimRadio {
                 slog!("{} deauthenticated us during the handshake (reason 6)", wm::fmt_mac(&bssid));
                 return Err(wm::handshake_failure(false, Some(6)));
             }
-            let ap_pmk = match a.pmk {
-                Some(p) => p,
-                None => {
-                    let p = wm::pmk_for(&a.ssid, &a.secret);
-                    with_sim(|s| s.aps[i].pmk = Some(p));
-                    p
+            let caps = ap_rsn_caps(&a);
+            let (ap_pmk, sta_pmk, pmkid) = if akm_ == akm::SAE {
+                let kh = wc::sha256(secret);
+                let cached = PMKSA.lock().iter().find(|e| e.bssid == bssid && e.ssid == ssid && e.key_hash == kh).map(|e| (e.pmk, e.pmkid));
+                let reuse = cached.filter(|(pmk, id)| a.sae_pmk == Some((*id, *pmk)));
+                if let Some((pmk, id)) = reuse {
+                    ST_PMKSA_HIT.fetch_add(1, Ordering::Relaxed);
+                    slog!("PMKSA cache hit for {}: no SAE exchange", wm::fmt_mac(&bssid));
+                    (pmk, pmk, Some(id))
+                } else {
+                    let (pmk, id) = sae_auth(&a, ssid, secret, *MAC.lock(), cx)?;
+                    ST_SAE_FULL.fetch_add(1, Ordering::Relaxed);
+                    with_sim(|s| s.aps[i].sae_pmk = Some((id, pmk)));
+                    let mut c = PMKSA.lock();
+                    c.retain(|e| !(e.bssid == bssid && e.ssid == ssid));
+                    if c.len() >= 8 { c.remove(0); }
+                    c.push(Pmksa { bssid, ssid: ssid.to_vec(), key_hash: kh, pmk, pmkid: id });
+                    (pmk, pmk, Some(id))
                 }
+            } else {
+                let ap_pmk = match a.pmk {
+                    Some(p) => p,
+                    None => {
+                        let p = wm::pmk_for(&a.ssid, &a.secret);
+                        with_sim(|s| s.aps[i].pmk = Some(p));
+                        p
+                    }
+                };
+                let t0 = now_ms();
+                let sta_pmk = wm::pmk_for(ssid, secret);
+                slog!("PMK derived (PBKDF2-SHA1, 4096 iterations) in {} ms", now_ms() - t0);
+                (ap_pmk, sta_pmk, None)
             };
-            let t0 = now_ms();
-            let sta_pmk = wm::pmk_for(ssid, secret);
-            slog!("PMK derived (PBKDF2-SHA1, 4096 iterations) in {} ms", now_ms() - t0);
             if cx.aborted() { return Err(Fail::superseded()); }
-            four_way(&ap_pmk, &sta_pmk, bssid, *MAC.lock(), a.rsn_var == RsnVar::TkipGroup, cx)?;
+            let cfg = HsCfg { tkip: a.rsn_var == RsnVar::TkipGroup, akm: if akm_ == akm::SAE { 8 } else { 2 }, caps, pmkid };
+            four_way(&ap_pmk, &sta_pmk, bssid, *MAC.lock(), &cfg, cx)?;
             slog!("4-way handshake complete with {} (pairwise key agreed by both sides)", wm::fmt_mac(&bssid));
         }
         with_sim(|s| { s.assoc = Some(i); s.pending_deauth = None; });
@@ -722,6 +951,10 @@ impl Radio for SimRadio {
         while let Some(m1) = SIM_HELD.pop() {
             if let Err(e) = sim_group_deliver(&m1) { log(&alloc::format!("held group message 1: {}", e)); }
         }
+        loop {
+            let m = MGMT_Q.lock().pop_front();
+            match m { Some(b) => { if let Some(f) = process_mgmt(&b) { return Some(f); } } None => break }
+        }
         msleep(budget_ms.min(50));
         with_sim(|s| {
             let i = s.assoc?;
@@ -734,6 +967,8 @@ impl Radio for SimRadio {
     }
 
     fn leave(&mut self, _deauth: bool) {
+        *HS.lock() = None;
+        MGMT_Q.lock().clear();
         set_link(false);
         stop_ht();
         with_sim(|s| s.assoc = None);
@@ -1125,6 +1360,11 @@ pub fn set_on_air(ssid: &[u8], on: bool) {
 /// The associated AP deauthenticates us with `reason`.
 pub fn deauth(reason: u16) { with_sim(|s| s.pending_deauth = Some(reason)); }
 
+/// Set one AP's (by BSSID) signal level.
+pub fn set_signal_bssid(bssid: [u8; 6], dbm: i8) {
+    with_sim(|s| for a in s.aps.iter_mut().filter(|a| a.bssid == bssid) { a.dbm = dbm; });
+}
+
 /// Set an AP's signal level.
 pub fn set_signal(ssid: &[u8], dbm: i8) {
     with_sim(|s| for a in s.aps.iter_mut().filter(|a| a.ssid == ssid) { a.dbm = dbm; });
@@ -1262,8 +1502,8 @@ fn selftest_main(level: u32) {
     t.check("bss-psk", home.map_or(false, |b| b.ext & (bss_ext::AKM_PSK | bss_ext::JOINABLE | bss_ext::RSN) == (bss_ext::AKM_PSK | bss_ext::JOINABLE | bss_ext::RSN)
             && b.rsn_flags == nm_sec::KEY_MGMT_PSK | nm_sec::PAIR_CCMP | nm_sec::GROUP_CCMP && b.nm_flags == nm_ap_flags::PRIVACY && b.freq_mhz == 2437),
             alloc::format!("{:?}", home.map(|b| (b.ext, b.rsn_flags, b.freq_mhz, b.signal_dbm, b.quality))));
-    t.check("bss-sae-only-not-joinable", wpa3.map_or(false, |b| b.ext & bss_ext::AKM_SAE != 0 && b.ext & bss_ext::MFPR != 0
-            && b.ext & bss_ext::JOINABLE == 0 && b.rsn_flags & nm_sec::KEY_MGMT_SAE != 0),
+    t.check("bss-sae-joinable", wpa3.map_or(false, |b| b.ext & bss_ext::AKM_SAE != 0 && b.ext & bss_ext::MFPR != 0
+            && b.ext & bss_ext::JOINABLE != 0 && b.rsn_flags & nm_sec::KEY_MGMT_SAE != 0),
             alloc::format!("{:?}", wpa3.map(|b| (b.ext, b.rsn_flags))));
     t.check("bss-transition", mixed.map_or(false, |b| b.ext & (bss_ext::TRANSITION | bss_ext::JOINABLE | bss_ext::AKM_SAE | bss_ext::AKM_PSK)
             == (bss_ext::TRANSITION | bss_ext::JOINABLE | bss_ext::AKM_SAE | bss_ext::AKM_PSK)), alloc::format!("{:?}", mixed.map(|b| b.ext)));
@@ -1407,16 +1647,20 @@ fn selftest_main(level: u32) {
 
     // 9. Failure reasons.
     let r = do_connect(connect_params(13, "SimWPA3", akm::AUTO, "wpa3-pass-123", 2));
-    t.check("sae-only-unsupported", matches!(r, Err((_, reason::UNSUPPORTED_SECURITY, _))), alloc::format!("{:?}", r));
+    t.check("sae-connect", r.is_ok() && mgr().state().akm == akm::SAE && pmf_active() && link_up(), alloc::format!("{:?} akm {} pmf {}", r, mgr().state().akm, pmf_active()));
+    let _ = disconnect(true);
     let r = do_connect(connect_params(14, "NoSuchNetwork", akm::AUTO, "whatever-123", 3));
     t.check("no-ap", matches!(r, Err((_, reason::NO_AP, _))), alloc::format!("{:?}", r));
     let r = do_connect(connect_params(15, "SimFull", akm::AUTO, "full-pass-123", 4));
     t.check("assoc-rejected", matches!(r, Err((_, reason::ASSOC_REJECTED, _))) && mgr().state().ieee_status == 17, alloc::format!("{:?} status {}", r, mgr().state().ieee_status));
     let r = do_connect(connect_params(16, "SimHome", akm::NONE, "", 0));
     t.check("open-profile-on-psk-ap", matches!(r, Err((_, reason::UNSUPPORTED_SECURITY, _))), alloc::format!("{:?}", r));
-    t.check("submit-sae-eopnotsupp", mgr().submit(WifiCmd::Connect(connect_params(17, "SimWPA3", akm::SAE, "wpa3-pass-123", 2))) == Err(netctl_abi::errno::EOPNOTSUPP), String::new());
+    t.check("submit-sae-accepted", mgr().submit(WifiCmd::Connect(connect_params(17, "SimWPA3", akm::SAE, "wpa3-pass-123", 2))).is_ok(), String::new());
+    let _ = wait(10_000, || mgr().state().state == wifi_state::CONNECTED);
     let r = do_connect(connect_params(18, "SimMixed", akm::AUTO, "mixed-pass-123", 5));
-    t.check("transition-joins-as-psk", r.is_ok() && mgr().state().akm == akm::PSK, alloc::format!("{:?} akm {}", r, mgr().state().akm));
+    t.check("transition-prefers-sae", r.is_ok() && mgr().state().akm == akm::SAE, alloc::format!("{:?} akm {}", r, mgr().state().akm));
+    let r = do_connect(connect_params(18, "SimMixed", akm::PSK, "mixed-pass-123", 5));
+    t.check("transition-psk-explicit", r.is_ok() && mgr().state().akm == akm::PSK, alloc::format!("{:?} akm {}", r, mgr().state().akm));
 
     // 10. A new CONNECT while connected replaces the link (no disconnect first).
     let seq = mgr().event_seq();
@@ -1513,6 +1757,8 @@ fn selftest_main(level: u32) {
     let ms = disconnect(true);
     t.check("disconnect-preempts-attempt", ms.map_or(false, |m| m < netctl_abi::DISCONNECT_DEADLINE_MS as u64), alloc::format!("{:?} ms", ms));
 
+    wpa3_selftest(&mut t);
+
     // Level 2: stay associated (autoconnect to SimHome) so the boot's
     // userland can check the net server's DHCP lease and traffic on wifi0.
     if level >= 2 {
@@ -1522,6 +1768,83 @@ fn selftest_main(level: u32) {
         t.check("left-associated", up.is_some(), alloc::format!("wifi0 -> SimHome for the userland checks ({:?} ms)", up));
     }
     finish(t);
+}
+
+fn add_aps(list: &[(usize, &str, Sec, &str, i8, u8, &str)]) {
+    with_sim(|s| for (i, ssid, sec, pw, dbm, ch, fl) in list { s.aps.push(ap(*i, ssid, *sec, pw, *dbm, *ch, fl)); });
+}
+
+/// WPA3-Personal, PMF and roaming against extra simulated APs.
+fn wpa3_selftest(t: &mut T) {
+    let mut rng = |b: &mut [u8]| sched::random::fill(b);
+    PMKSA.lock().clear();
+    let kat = sae::selftest(&mut rng);
+    t.check("sae-known-answers", kat.is_ok(), alloc::format!("{:?}", kat));
+    add_aps(&[(20, "SimHnP", Sec::Sae, "hnp-pass-12", -52, 6, "p"), (21, "SimClog", Sec::Sae, "clog-pass-12", -53, 6, "c"),
+              (22, "SimQ", Sec::PskSae, "q-pass-1234", -54, 6, "q"), (23, "SimMfp", Sec::Psk, "mfp-pass-123", -55, 6, "m"),
+              (24, "SimRoam", Sec::Sae, "roam-pass-12", -50, 1, ""), (25, "SimRoam", Sec::Sae, "roam-pass-12", -85, 11, "")]);
+    msleep(2_100);
+    let _ = scan(true, &[]);
+    let _ = disconnect(true);
+    let (h2e0, hnp0, full0, hit0, clog0) = (ST_H2E.load(Ordering::Relaxed), ST_HNP.load(Ordering::Relaxed), ST_SAE_FULL.load(Ordering::Relaxed),
+                                           ST_PMKSA_HIT.load(Ordering::Relaxed), ST_CLOG.load(Ordering::Relaxed));
+    // Wrong password: the confirm does not verify.
+    let r = do_connect(connect_params(30, "SimWPA3", akm::AUTO, "not-the-wpa3-pass", 2));
+    t.check("sae-wrong-password", matches!(r, Err((_, reason::WRONG_KEY, _))), alloc::format!("{:?}", r));
+    // Hash-to-element, then PMKSA reuse on reconnecting to the same BSS.
+    let r = do_connect(connect_params(31, "SimWPA3", akm::AUTO, "wpa3-pass-123", 2));
+    t.check("sae-h2e-connect", r.is_ok() && mgr().state().akm == akm::SAE && ST_H2E.load(Ordering::Relaxed) > h2e0 + 1, alloc::format!("{:?}", r));
+    let _ = disconnect(true);
+    let full1 = ST_SAE_FULL.load(Ordering::Relaxed);
+    let r = do_connect(connect_params(32, "SimWPA3", akm::AUTO, "wpa3-pass-123", 2));
+    t.check("sae-pmksa-reuse", r.is_ok() && ST_PMKSA_HIT.load(Ordering::Relaxed) == hit0 + 1 && ST_SAE_FULL.load(Ordering::Relaxed) == full1,
+            alloc::format!("{:?} hits {} full {}", r, ST_PMKSA_HIT.load(Ordering::Relaxed) - hit0, ST_SAE_FULL.load(Ordering::Relaxed) - full1));
+    // Protected management frames: spoofs are ignored, a signed one counts.
+    let bad0 = ST_BIP_BAD.load(Ordering::Relaxed);
+    let mut inj = true;
+    for k in [Spoof::ForgedMic, Spoof::Unprotected, Spoof::Replay] { inj &= inject_deauth(k, 7); }
+    msleep(600);
+    let st = mgr().state();
+    t.check("deauth-spoof-ignored", inj && st.state == wifi_state::CONNECTED && link_up() && ST_BIP_BAD.load(Ordering::Relaxed) == bad0 + 3,
+            alloc::format!("injected {} state {} ignored {}", inj, wm::state_name(st.state), ST_BIP_BAD.load(Ordering::Relaxed) - bad0));
+    t.check("sa-query", sa_query(), String::new());
+    let seq = mgr().event_seq();
+    let t0 = now_ms();
+    inject_deauth(Spoof::Valid, 7);
+    let d = wait_event(seq, t0, 3_000, |e| state_ev(e, wifi_state::DISCONNECTED).map_or(false, |s| s.reason == reason::DEAUTH_BY_AP && s.ieee_reason == 7));
+    t.check("deauth-signed-honoured", d.is_some(), alloc::format!("{:?} ms", d.map(|x| x.0)));
+    let _ = disconnect(true);
+    // Hunt-and-peck AP, anti-clogging AP.
+    let r = do_connect(connect_params(33, "SimHnP", akm::AUTO, "hnp-pass-12", 3));
+    t.check("sae-hunt-and-peck", r.is_ok() && ST_HNP.load(Ordering::Relaxed) > hnp0, alloc::format!("{:?}", r));
+    let r = do_connect(connect_params(34, "SimClog", akm::AUTO, "clog-pass-12", 4));
+    t.check("sae-anti-clogging", r.is_ok() && ST_CLOG.load(Ordering::Relaxed) == clog0 + 1, alloc::format!("{:?}", r));
+    // Transition AP whose SAE is broken: joined as PSK.
+    let r = do_connect(connect_params(35, "SimQ", akm::AUTO, "q-pass-1234", 5));
+    t.check("transition-psk-fallback", r.is_ok() && mgr().state().akm == akm::PSK, alloc::format!("{:?} akm {}", r, mgr().state().akm));
+    // PSK network requiring management frame protection.
+    let r = do_connect(connect_params(36, "SimMfp", akm::AUTO, "mfp-pass-123", 6));
+    t.check("mfp-required-connect", r.is_ok() && mgr().state().akm == akm::PSK && pmf_active(), alloc::format!("{:?} pmf {}", r, pmf_active()));
+    let _ = disconnect(true);
+    // Roaming: the ESS "SimRoam" has two BSSs; the serving one fades.
+    let (a, b) = (default_bssid(24), default_bssid(25));
+    crate::wifi_pure::ROAM_SCAN_MS.store(1_000, Ordering::Relaxed);
+    let r = do_connect(connect_params(37, "SimRoam", akm::AUTO, "roam-pass-12", 7));
+    let on_a = mgr().state().bssid == a;
+    set_signal_bssid(a, -85);
+    set_signal_bssid(b, -45);
+    let to_b = wait(15_000, || { let s = mgr().state(); s.state == wifi_state::CONNECTED && s.bssid == b });
+    let hit1 = ST_PMKSA_HIT.load(Ordering::Relaxed);
+    set_signal_bssid(a, -45);
+    set_signal_bssid(b, -85);
+    let back = wait(15_000, || { let s = mgr().state(); s.state == wifi_state::CONNECTED && s.bssid == a });
+    t.check("roam-to-stronger-bss", r.is_ok() && on_a && to_b.is_some() && link_up(), alloc::format!("{:?} first on A {} to B {:?} ms", r, on_a, to_b));
+    t.check("roam-back-pmksa-reuse", back.is_some() && ST_PMKSA_HIT.load(Ordering::Relaxed) == hit1 + 1,
+            alloc::format!("back {:?} ms, hits {}", back, ST_PMKSA_HIT.load(Ordering::Relaxed) - hit1));
+    crate::wifi_pure::ROAM_SCAN_MS.store(crate::wifi_pure::CONNECTED_SCAN_MS, Ordering::Relaxed);
+    let _ = disconnect(true);
+    with_sim(|s| s.aps.retain(|a| a.bssid[5] < 21));
+    let _ = full0;
 }
 
 fn finish(t: T) {

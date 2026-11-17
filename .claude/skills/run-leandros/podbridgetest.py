@@ -47,6 +47,10 @@ class _H(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def fails6_publish(out):
+    return "hello-pb6srv" not in out
+
+
 def main():
     arch = os.environ.get("LEANDROS_TEST_ARCH")
     ser = driver._Serial()
@@ -182,6 +186,14 @@ def main():
         check("podman_publish_range", rc == 0 and "hello-pbrng" in out and "18100-18102" in rs, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
         run("podman rm -f pbrng >/dev/null 2>&1")
 
+        # Cross-network: a client on network pbx1 reaches pbx2's published port through the NIC address.
+        # netavark sets no masquerade mark for it, so the flow is DNATed and routed with the client's source kept.
+        run("podman network rm -f pbx1 pbx2 >/dev/null 2>&1; podman network create pbx1 >/dev/null 2>&1; podman network create pbx2 >/dev/null 2>&1")
+        srv_tcp("pbxsrv", "--network=pbx2 -p 18083:80", 80)
+        rc, out = run(f"podman run --rm --network=pbx1 {IMG} wget -T 10 -qO- http://{nicip}:18083/ 2>&1")
+        check("podman_publish_crossnet", rc == 0 and "hello-pbxsrv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        run("podman rm -f pbxsrv >/dev/null 2>&1; podman network rm -f pbx1 pbx2 >/dev/null 2>&1")
+
         # --internal: a default route added by hand must still not leave the network.
         run("podman network rm -f pbint2 >/dev/null 2>&1; podman network create --internal pbint2 2>&1")
         rc, out = run(f"gwi=$(podman network inspect pbint2 -f '{{{{(index .Subnets 0).Gateway}}}}'); "
@@ -224,13 +236,35 @@ def main():
 
         run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns pb6 2>&1")
         ct0 = ctn()
-        rc, out = run(f"podman run --rm --network pb6 {IMG} ping -6 -c3 -W 5 {gw6} 2>&1")
+        # the 1 s IPv6 DAD on the container veth (tentative address is held out of the stack, as on Linux): wait it out
+        rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; ping -6 -c3 -W 5 {gw6}' 2>&1")
         check6("podman_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
         check6("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         if port6 and v6ok:
-            rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
+            rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; wget -T 10 -qO- http://[{gw6}]:{port6}/ | grep -q hello-from-host-podbridge' 2>&1")
             check6("podman_v6_tcp", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        rc, out = run(f"podman run --rm --network pb6 --cap-add=NET_RAW {IMG} sh -c 'sleep 2; traceroute6 -n -m 1 -q 1 -w 4 2001:4860:4860::8888' 2>&1")
+        # Time Exceeded for a forwarded flow (fwd6::time_exceeded) reaches traceroute6's raw ICMPv6 socket,
+        # which never sent anything itself: the first hop prints an address.
+        te_ok = re.search(r"^\s*1\s+[0-9a-f]+:[0-9a-f:]+\s", out, re.M) is not None
+        check6("podman_v6_time_exceeded", te_ok, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        # ---- L9 phase 2 (ip6dnat): DNAT66 for a published port -----------------------------
+        rc, o6 = run("cat /proc/net/if_inet6")
+        m6 = re.search(r"^([0-9a-f]{32}) 02 40 00 \w+\s+eth0", o6, re.M)
+        nic6 = ":".join(m6.group(1)[i:i + 4] for i in range(0, 32, 4)) if m6 else gw6
+        run("podman rm -af >/dev/null 2>&1; true")
+        rc, out = run(f"podman run -d --rm --network pb6 --name pb6srv -p 18082:80 {IMG} sh -c "
+                      "'while :; do printf \"HTTP/1.0 200 OK\\r\\n\\r\\nhello-pb6srv\\n\\n\" | nc -l -p 80 -s ::; done' 2>&1; sleep 3")
+        for nm, u in (("lo", "::1"), ("nicip", nic6)):
+            rc, out = hostwget(f"http://[{u}]:18082/")
+            check6(f"podman_v6_publish_{nm}", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; wget -T 10 -qO- http://[{nic6}]:18082/' 2>&1")
+        check6("podman_v6_publish_ctr", rc == 0 and "hello-pb6srv" in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
+        if fails6_publish(out):
+            rc, rs = run("nft list ruleset 2>&1 | grep -n -B3 -A3 18082; podman ps -a 2>&1; podman logs pb6srv 2>&1 | tail -n 5")
+            print("DIAG v6 publish:\n" + rs[-1800:])
+        run("podman rm -f pb6srv >/dev/null 2>&1")
         run("podman network rm -f pb6 >/dev/null 2>&1; podman network create --ipv6 --disable-dns --internal pb6i 2>&1")
         rc, out = run(f"podman run --rm --network pb6i {IMG} ping -6 -c1 -W 4 {gw6} 2>&1")
         check6("podman_v6_internal_blocked", rc != 0 and "1 packets received" not in out, f"rc={rc} " + out.strip()[-120:].replace("\n", " | "))
@@ -240,6 +274,19 @@ def main():
         ct1 = ctn()
         check6("podman_v6_leaks", ct0 >= 0 and ct1 <= ct0, f"conntrack {ct0} -> {ct1}")
 
+        # ---- aardvark-dns: a DNS-enabled custom network (the other cases use --disable-dns) ----------
+        run("podman rm -af >/dev/null 2>&1; podman network rm -f pbdns >/dev/null 2>&1; podman network create pbdns 2>&1")
+        rc, out = run(f"podman run -d --network pbdns --name dnssrv {IMG} sleep 120 2>&1; sleep 2")
+        check("podman_dns_start", rc == 0, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        rc, out = run(f"podman run --rm --network pbdns {IMG} nslookup dnssrv 2>&1")
+        dns_ok = rc == 0 and re.search(r"Address.*\d+\.\d+\.\d+\.\d+", out) is not None
+        check("podman_dns_resolve", dns_ok, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        if not dns_ok:
+            rc2, dg = run("ps | grep [a]ardvark; cat /run/containers/networks/aardvark-dns/pbdns 2>&1; netstat -lnu 2>&1 | grep ':53 '; ip -4 addr show 2>&1 | grep -A1 podman; ls /run/containers/networks/aardvark-dns 2>&1; cat /run/containers/networks/aardvark-dns/aardvark.pid; ls -l /proc/$(cat /run/containers/networks/aardvark-dns/aardvark.pid)/exe 2>&1; ls /var/log/aardvark* 2>&1; (RUST_LOG=trace timeout 4 /usr/libexec/podman/aardvark-dns --config /run/containers/networks/aardvark-dns -p 53 run 2>&1 | tail -n 14); netstat -lnu 2>&1 | grep ':53 '")
+            print("DIAG dns:\n" + dg[-1500:])
+        rc, out = run(f"podman run --rm --network pbdns {IMG} true 2>&1")
+        check("podman_dns_rm_teardown", rc == 0 and "rror" not in out, f"rc={rc} " + out.strip()[-300:].replace("\n", " | "))
+        run("podman rm -f dnssrv >/dev/null 2>&1; podman network rm -f pbdns >/dev/null 2>&1")
         rc, out = run("grep -c ' /run/netns/' /proc/self/mountinfo")
         bl = out.strip().splitlines()[-1:] 
         base_mnt = int(bl[0]) if bl and bl[0].isdigit() else 0

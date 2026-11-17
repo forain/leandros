@@ -11,6 +11,7 @@ manifest: every pre-existing file must be unchanged (before the fix, new
 symlinks reused live nids and overwrote them). Then fsck-f2fs.py. Exit 0 iff PASS.
 """
 import os
+import hostclean
 import shutil
 import struct
 import subprocess
@@ -86,8 +87,9 @@ def main(argv):
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     gc.stop_caller_vm(caller)
     run_id = f"{caller}-f2fsnid" if caller else "f2fsnid"
-    out = os.environ.get("F2FSNID_OUT", f"/tmp/f2fsnid-{arch}")
+    out = os.environ.get("F2FSNID_OUT", f"/tmp/f2fsnid-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fsnid-*")
     img = os.path.join(out, "nid.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -123,7 +125,15 @@ def main(argv):
 
     def boot():
         drv("stop", timeout=60)
-        if drv("start", arch, timeout=600).returncode != 0 or \
+        for attempt in (1, 2):
+            r = drv("start", arch, timeout=600)
+            if r.returncode == 0:
+                break
+            # surface QEMU's own error (image lock, bad drive, ...) instead of a bare "boot FAIL"
+            print(f"[boot-start-failed attempt {attempt}] rc={r.returncode}\n"
+                  + "\n".join((r.stdout + r.stderr).strip().splitlines()[-15:]), flush=True)
+            drv("stop", timeout=60)
+        if r.returncode != 0 or \
            drv("login", "root", "root", "180", timeout=400).returncode != 0:
             verdict("boot", False)
             return False
@@ -176,4 +186,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))
