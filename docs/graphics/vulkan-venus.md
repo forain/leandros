@@ -54,7 +54,7 @@ Mesa's Venus ICD is built in the same tree as the Zink megadriver, so the two ar
 Enumerating a device is not putting a pixel on a screen, so both ends of the path were checked separately, and by photograph rather than by return code:
 
 - **`vkrender --present`** draws with Vulkan straight to the scanout with no compositor in the way.
-- **`vkwl`** is a Vulkan Wayland client that reaches `vkQueuePresentKHR → VK_SUCCESS` against cosmic-comp inside the guest (300/300 presents sustained on x86_64; 28/28 on aarch64).
+- **`vkwl`** is a Vulkan Wayland client that reaches `vkQueuePresentKHR → VK_SUCCESS` against cosmic-comp inside the guest (300/300 presents sustained on x86_64; 28/28 on aarch64). It is also a permanent regress suite (`vkwltest.py`, source in [`ports/vkwl-test`](../../ports/vkwl-test)), so the path is gated on every run rather than photographed once.
 
 Both were photographed on **both** architectures against pass criteria committed *before* the first capture — a criterion written after seeing the image is a description, not a test. The aarch64 vkwl census matched x86_64's to the pixel (151,868 px of the predicted colour, a 478×318 bounding box at 99.91% fill), with a control capture containing none of the predicted colours and the panel clock proving the captures were distinct live frames. The same run refuted the recorded belief that COSMIC on aarch64 under TCG was impractically slow: the session bound its Wayland socket 2 s after launch.
 

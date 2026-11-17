@@ -76,6 +76,8 @@ absent its systemd calls reduce to logged warnings
   registers no handler for it, so a child's diagnostics reach the log only through
   cosmic-session's relay — when cosmic-session dies, the session log goes quiet even though
   the desktop keeps running.
+- **Session stderr is kept in `/tmp`.** `start-cosmic-leandros` redirects its own stderr (inherited by cosmic-comp, the panel, applets and notifications) to `/tmp/cosmic-session-<uid>.log`, and the greeter launcher sends greetd's, the greeter's and its compositor's to `/tmp/greeter.log`. One previous generation is kept as `.1`, rotated at start. They are plain redirects because there is no `tee` or FIFO to pipe through; before this the output went to pipes nobody read.
+- **Login sessions join the session cgroup.** sshd, greetd and the greeter-launch sessions create `/sys/fs/cgroup/user.slice/user-<uid>.slice/session-<name>.scope`, owned by the user, as `/bin/login` does for console logins, so per-session accounting and logind's view of the processes match. The step is best effort: on failure the session stays in the parent's cgroup.
 
 The kernel surfaces this choreography depends on are all ours and all guarded by
 `userland/scmtest`: `F_SETFD` on socket fds (launch-pad clears `FD_CLOEXEC` on inherited
@@ -149,7 +151,7 @@ the service, and busd activates each from a `.service` file in
 Anything that needs root fails with an error and never pretends to succeed.
 `leandros-sysbus probe` exercises the services the way COSMIC components do and prints
 PASS/FAIL lines (it never calls `PowerOff`/`Reboot`), which makes it the in-guest check;
-`leandros-sysbus portal …` probes the portal. mkfs refuses to build an image whose staged
+`leandros-sysbus svc-test` is the compositor-free variant: it runs under `dbus-run-session` in the regress suite and checks, per line, the portal frontend (activation, Screenshot and FileChooser interfaces, the cosmic backend registered as activatable), timedate1, SwitcherooControl and the a11y bus, ending in `SVC_TEST pass=N fail=M`. `leandros-sysbus portal …` probes the portal; the `portalshot` suite runs `portal screenshot` in a live session, records the PermissionStore grant first (otherwise the Access dialog nobody answers headless gives response 2 after 25 s), and requires response 0 and a non-empty PNG at the returned URI. mkfs refuses to build an image whose staged
 sysbus binary is missing or older than its sources, or whose `.service` `Exec=` names a
 binary that is not there.
 
