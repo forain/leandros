@@ -103,7 +103,19 @@ def serial_log(run_id):
     return log
 
 
+# Captured 2026-11-17 (lane usbstall6): the ladder's timestamped kernel line
+# glued to a fresh prompt. driver.py must still see the prompt under it, or
+# every echo that meets such a line waits out a prompt timeout (3 s / 2x10 s).
+_GLUED = (b'PONG\n\n<<LRC:cfe2869e:0>>\n\x1b[?2004h\x1b[0m\x1b[?25l\x1b[66;1H\x1b[J\x1b[39mbrush-0.5# '
+          b'\x1b[38;5;14m\x1b[0m\x1b7\x1b8\x1b[?25h[   26.096999] [USB-MSC] lun 0 cmd 0x28: attempt 2 failed: '
+          b'Transport(Timeout) (10056 ms into the command)\n[   26.024708] [pcache] 5 s: hits 1158\n')
+
+
 def main():
+    sys.path.insert(0, HERE)
+    import driver
+    if not driver._at_prompt(_GLUED):
+        print("FAIL: driver.py does not see a prompt followed by timestamped kernel lines"); return 1
     arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     run_id = os.environ.get("LEANDROS_RUN_ID", "x")
     global MAX_RTT
