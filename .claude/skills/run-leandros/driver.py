@@ -599,10 +599,17 @@ _PROMPT_TAIL_RE = re.compile(r"\n\S*[#$>] \Z")
 # its prompt in reedline's blocking key read the whole time. Drop whole
 # trailing kernel lines (raw bytes, before _strip_ansi, which would eat the
 # "[T" of "[TLBSTAT]") so the prompt underneath is seen.
-_KLOG_TAIL_RE = re.compile(rb"(?:\[[A-Z][A-Z0-9_]*\][^\n\x1b]*\n+)+\Z")
+# A kernel line starts with its printk timestamp ("[   26.096999] [USB-MSC] ...",
+# any tag, any case) or, untimestamped, with an upper-case tag ("[TLBSTAT]",
+# "[USB-MSC]"). The timestamp form was missing until lane usbstall6: every
+# timestamped line glued to a prompt hid it, so serial_run waited out its 3 s
+# post-command prompt pump and _type_line its 10 s prompt waits (usbstalltest's
+# "3.5 s" / "20.5 s" echoes: the ladder's "attempt N failed" line).
+_KLOG_START = rb"(?:\[ *[0-9]+\.[0-9]{6}\] |\[[A-Z][A-Z0-9_-]*\])"
+_KLOG_TAIL_RE = re.compile(rb"(?:" + _KLOG_START + rb"[^\n\x1b]*\n+)+\Z")
 
 
-_KLOG_LINE_RE = re.compile(rb"\[[A-Z][A-Z0-9_-]*\][^\n\x1b]*(?:\n|\Z)")
+_KLOG_LINE_RE = re.compile(_KLOG_START + rb"[^\n\x1b]*(?:\n|\Z)")
 
 
 def _login_prompt_seen(buf: bytes) -> bool:
