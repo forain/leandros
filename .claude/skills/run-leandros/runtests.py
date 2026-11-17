@@ -158,7 +158,7 @@ SUITES = {
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
-                SYNCFILE_CHECK,
+                SYNCFILE_CHECK, LONGLINE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
