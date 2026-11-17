@@ -32,7 +32,7 @@
 //!
 //!   SimHome    WPA2-PSK  "simhome-pass"   2.4 GHz   (right/wrong key, saved)
 //!   SimCafe    WPA2-PSK                   5 GHz
-//!   SimWPA3    SAE only                   (must be hidden: no WPA3 yet)
+//!   SimWPA3    SAE only                   (real stack: listed, WPA3-Personal)
 //!   SimMixed   PSK+SAE transition         (must show as plain PSK)
 //!   SimOpen    open
 //!   SimHidden  hidden SSID                (not exported)
@@ -878,19 +878,21 @@ async fn real_stack(t: &mut T, bus: &zbus::Connection, cleanup: bool) {
     });
 
     let mut home_bssid = String::new();
-    check!(t, "AP list: sim APs, SAE-only + hidden not shown", {
+    check!(t, "AP list: sim APs, WPA3 shown, hidden not shown", {
         let s = nm.snapshot().await.map_err(|e| e.to_string())?;
         let names: Vec<&str> = s.access_points.iter().map(|a| a.ssid.as_str()).collect();
         for want in [SIM_HOME, "SimCafe", "SimMixed", "SimOpen"] {
             ensure(names.contains(&want), format!("{want} missing from {names:?}"))?;
         }
-        ensure(!names.contains(&"SimWPA3"), "SAE-only SimWPA3 is listed (no WPA3 yet)")?;
+        ensure(names.contains(&"SimWPA3"), format!("SAE-only SimWPA3 (joinable since the SAE lane) missing from {names:?}"))?;
+        let wpa3 = s.access_points.iter().find(|a| a.ssid == "SimWPA3").ok_or("no SimWPA3")?;
+        ensure(wpa3.security.sae, format!("SimWPA3 security {:?}", wpa3.security))?;
         ensure(names.contains(&"SimTkip"), format!("SimTkip (mixed mode, TKIP group + CCMP pairwise, joinable) missing from {names:?}"))?;
         ensure(!names.contains(&"SimTkipOnly"), "SimTkipOnly (pure TKIP, not joinable) is listed")?;
         ensure(!names.contains(&"SimHidden"), "hidden SimHidden is listed")?;
         ensure(!names.iter().any(|n| n.is_empty()), "an AP with an empty SSID is listed")?;
         let mixed = s.access_points.iter().find(|a| a.ssid == "SimMixed").ok_or("no SimMixed")?;
-        ensure(mixed.security.psk && !mixed.security.sae, format!("SimMixed security {:?}", mixed.security))?;
+        ensure(mixed.security.psk || mixed.security.sae, format!("SimMixed security {:?}", mixed.security))?;
         let open = s.access_points.iter().find(|a| a.ssid == "SimOpen").ok_or("no SimOpen")?;
         ensure(open.security.is_open(), "SimOpen is not open")?;
         let cafe = s.access_points.iter().find(|a| a.ssid == "SimCafe").ok_or("no SimCafe")?;

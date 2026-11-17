@@ -646,6 +646,39 @@ unsafe fn atomic_plane_commit(fd: c_int, fb_id: u32, w: u32, h: u32, flags: u32)
     ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &mut req as *mut _)
 }
 
+/// Read `/sys/class/drm/card0-<TYPE>-<id>/<file>` into `buf`; length or -1.
+fn read_conn_attr(ty: u32, id: u32, file: &[u8], buf: &mut [u8]) -> isize {
+    let name: &[u8] = match ty { 10 => b"DP", 11 => b"HDMI-A", 14 => b"eDP", 15 => b"Virtual", _ => return -1 };
+    let mut p = [0u8; 96];
+    let mut n = 0;
+    for part in [&b"/sys/class/drm/card0-"[..], name, b"-"] { p[n..n + part.len()].copy_from_slice(part); n += part.len(); }
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = id;
+    loop { digits[d] = b'0' + (v % 10) as u8; d += 1; v /= 10; if v == 0 { break; } }
+    while d > 0 { d -= 1; p[n] = digits[d]; n += 1; }
+    p[n] = b'/'; n += 1;
+    p[n..n + file.len()].copy_from_slice(file); n += file.len();
+    p[n] = 0;
+    unsafe {
+        let fd = open(p.as_ptr(), 0);
+        if fd < 0 { return -1; }
+        let r = read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+        close(fd);
+        r
+    }
+}
+
+fn sysfs_connector_matches(ty: u32, id: u32, connection: u32, count_modes: u32) -> bool {
+    let mut b = [0u8; 1024];
+    let n = read_conn_attr(ty, id, b"status", &mut b);
+    if n <= 0 { return false; }
+    let want: &[u8] = if connection == 1 { b"connected\n" } else { b"disconnected\n" };
+    if &b[..n as usize] != want { return false; }
+    let n = read_conn_attr(ty, id, b"modes", &mut b);
+    n >= 0 && b[..n as usize].iter().filter(|&&c| c == b'\n').count() as u32 == count_modes.min(if connection == 1 { 99 } else { 0 })
+}
+
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
         write(1, name.as_ptr() as *const c_void, name.len());
@@ -1174,6 +1207,72 @@ unsafe fn fb_lifetime_cases(fd: c_int, kms: bool, restore_fb: u32,
         if !report(b"FB_RMFB_SCANOUT_DISABLES_PLANE", ok) { failures += 1; }
     }
     (failures, skips)
+}
+
+/// Lane vrr: the Linux VRR KMS properties. Linux's atomic core stores
+/// VRR_ENABLED without checking the sink (drivers just leave adaptive sync
+/// off), so a 1 on our non-capable connector is accepted; out-of-range values
+/// and writes to the immutable vrr_capable are EINVAL.
+unsafe fn vrr_props(fd: c_int, obj: u32, ty: u32) -> ([u32; 16], [u64; 16], usize) {
+    let mut ids = [0u32; 16];
+    let mut vals = [0u64; 16];
+    let mut g: [u64; 4] = [ids.as_mut_ptr() as u64, vals.as_mut_ptr() as u64, 16, 0];
+    g[2] = 16 | ((obj as u64) << 32);
+    g[3] = ty as u64;
+    let rc = ioctl(fd, 0xC02064B9, &mut g as *mut _);
+    (ids, vals, if rc == 0 { (g[2] & 0xFFFF_FFFF) as usize } else { 0 })
+}
+
+/// (id, flags, min, max) of the property named `name` on the object, or None.
+unsafe fn vrr_find(fd: c_int, obj: u32, ty: u32, name: &[u8]) -> Option<(u32, u32, u64, u64, u64)> {
+    let (ids, vals, n) = vrr_props(fd, obj, ty);
+    for i in 0..n.min(16) {
+        let mut rng = [0u64; 2];
+        let mut g = [0u64; 8];
+        g[0] = rng.as_mut_ptr() as u64;
+        *(g.as_mut_ptr() as *mut u32).add(4) = ids[i];
+        *(g.as_mut_ptr() as *mut u32).add(14) = 2;
+        if ioctl(fd, 0xC04064AA, &mut g as *mut _) != 0 { continue; }
+        let flags = *(g.as_ptr() as *const u32).add(5);
+        let nm = (g.as_ptr() as *const u8).add(24);
+        let mut eq = true;
+        for (j, &b) in name.iter().enumerate() { if *nm.add(j) != b { eq = false; } }
+        if eq && *nm.add(name.len()) == 0 { return Some((ids[i], flags, rng[0], rng[1], vals[i])); }
+    }
+    None
+}
+
+unsafe fn vrr_cases(fd: c_int) -> i32 {
+    let mut failures = 0i32;
+    const CRTC_T: u32 = 0xcccc_cccc;
+    const CONN_T: u32 = 0xc0c0_c0c0;
+    let en = vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED");
+    let cap = vrr_find(fd, 1, CONN_T, b"vrr_capable");
+    let props_ok = matches!(en, Some((_, fl, 0, 1, 0)) if fl & 4 == 0 && fl & 2 != 0)
+        && matches!(cap, Some((_, fl, 0, 1, 0)) if fl & 4 != 0 && fl & 2 != 0);
+    if !report(b"VRR_PROPS_ENUMERATE", props_ok) { failures += 1; return failures; }
+    let (en_id, cap_id) = (en.unwrap().0, cap.unwrap().0);
+    let a = |flags: u32, obj: u32, p: u32, v: u64| c2_atomic(fd, flags, &[obj], &[1], &[p], &[v]);
+    let t_ok = a(DRM_MODE_ATOMIC_TEST_ONLY, 1, en_id, 1) == 0 && a(DRM_MODE_ATOMIC_TEST_ONLY, 1, en_id, 0) == 0;
+    if !report(b"VRR_ENABLED_TEST_ONLY_ACCEPTED", t_ok) { failures += 1; }
+    let still0 = matches!(vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED"), Some((_, _, _, _, 0)));
+    if !report(b"VRR_TEST_ONLY_DOES_NOT_STICK", still0) { failures += 1; }
+    let r2 = a(DRM_MODE_ATOMIC_TEST_ONLY, 1, en_id, 2) != 0 && errno() == EINVAL;
+    if !report(b"VRR_ENABLED_OUT_OF_RANGE_EINVAL", r2) { failures += 1; }
+    let r3 = a(DRM_MODE_ATOMIC_TEST_ONLY, 1, cap_id, 1) != 0 && errno() == EINVAL;
+    if !report(b"VRR_CAPABLE_IMMUTABLE_EINVAL", r3) { failures += 1; }
+    // Legacy OBJ_SETPROPERTY: {value, prop_id, obj_id, obj_type}.
+    let mut sp: [u64; 3] = [1, (en_id as u64) | (1u64 << 32), CRTC_T as u64];
+    let set1 = ioctl(fd, 0xC01864BA, &mut sp as *mut _) == 0
+        && matches!(vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED"), Some((_, _, _, _, 1)));
+    sp[0] = 0;
+    let set0 = ioctl(fd, 0xC01864BA, &mut sp as *mut _) == 0
+        && matches!(vrr_find(fd, 1, CRTC_T, b"VRR_ENABLED"), Some((_, _, _, _, 0)));
+    if !report(b"VRR_LEGACY_SETPROPERTY_ROUNDTRIP", set1 && set0) { failures += 1; }
+    sp[0] = 1; sp[1] = (cap_id as u64) | (1u64 << 32);
+    let bad = ioctl(fd, 0xC01864BA, &mut sp as *mut _) != 0 && errno() == EINVAL;
+    if !report(b"VRR_LEGACY_IMMUTABLE_EINVAL", bad) { failures += 1; }
+    failures
 }
 
 /// The out-fence atomicity cases. Run on a fresh open, so the context they
@@ -2263,6 +2362,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         && modes[0].hdisplay > 0 && modes[0].vdisplay > 0;
     let conn_errno = errno();
     if !report_errno(b"GETCONNECTOR", conn_ok, conn_errno) { failures += 1; }
+    // /sys/class/drm/card0-<TYPE>-<n>/{status,modes} agree with GETCONNECTOR.
+    if conn_ok && !report(b"SYSFS_CONNECTOR", sysfs_connector_matches(conn2.connector_type, conn2.connector_type_id, conn2.connection, conn2.count_modes)) { failures += 1; }
 
     let w = if modes[0].hdisplay > 0 { modes[0].hdisplay as u32 } else { 256 };
     let h = if modes[0].vdisplay > 0 { modes[0].vdisplay as u32 } else { 256 };
@@ -3750,6 +3851,9 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         let (f, sk) = out_fence_cases(false);
         failures += f; skips += sk;
     }
+
+    // Lane vrr: VRR_ENABLED / vrr_capable properties.
+    failures += vrr_cases(fd);
 
     // Lane ffmagenta: virgl transfers and VIRTGPU_WAIT's busy errno.
     {

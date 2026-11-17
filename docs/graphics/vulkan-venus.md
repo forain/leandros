@@ -67,7 +67,7 @@ A further trap affects every pixel check of a GL scanout: once GL scanout engage
 
 ### Test binaries
 
-`vktest`, `vkrender` and `vkwl` are C probes built against the Mesa port and staged into images; they are not version-controlled, because the repository is Rust-only. They delivered their findings; capabilities worth guarding permanently are rewritten as Rust tests under `userland/`. The in-tree guard is `venustest`.
+`vktest` and `vkrender` are C probes built against the Mesa port and staged into images; they are not version-controlled. `vkwl` is: `ports/vkwl-test/` (dynamic musl, `build.sh`), run by `host:vkwltest.py` (suite `vkwl`, x86_64 `--venus` only; it counts the compositor's frame callbacks). They delivered their findings; capabilities worth guarding permanently are rewritten as Rust tests under `userland/`. The in-tree guard is `venustest`.
 
 ## Design decisions
 

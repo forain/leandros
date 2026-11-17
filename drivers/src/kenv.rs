@@ -13,6 +13,9 @@ extern "C" {
 /// Raw serial line (the module build routes this through `kapi_log`).
 pub fn serial_raw(s: &str) { unsafe { serial_print_str_raw(s.as_ptr(), s.len()); } }
 
+/// Interrupt-to-task wake-up: the ISR calls `notify`, the I/O path `wait`s with a timeout.
+pub use crate::netdev::LinkMon as IrqWait;
+
 /// Park until `deadline` (`monotonic_ns`). Task context that may sleep only.
 pub fn sleep_until(deadline: u64) {
     while sched::monotonic_ns() < deadline {
@@ -54,6 +57,23 @@ pub mod input {
     pub fn set_device_caps(node: u32, rel: &[u8], key: &[u8]) { ::evdev_server::set_device_caps(node, rel, key) }
     pub fn register_stats_hook(f: fn(&mut dyn core::fmt::Write)) { ::tty_server::vt::register_stats_hook(f) }
     pub fn vt_handoff_stats() -> (u64, u64) { crate::drm_device_interface::vt_handoff_stats() }
+}
+
+/// CPU identity and reschedule IPIs, for interrupt handlers that must wake a parked waiter on
+/// another CPU (the module build calls `kapi_cpu_id` / `kapi_kick_cpus`).
+pub mod ipi {
+    extern "C" { fn arch_send_resched_ipi(cpu: usize); }
+    pub fn cpu_id() -> usize { unsafe { ::sched::cpu_id() } }
+    /// Reschedule-IPI every CPU in `mask` except the caller's.
+    pub fn kick_cpus(mut mask: u64) {
+        let me = cpu_id();
+        if me < 64 { mask &= !(1u64 << me); }
+        while mask != 0 {
+            let c = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            unsafe { arch_send_resched_ipi(c); }
+        }
+    }
 }
 
 /// Hand a radio table to the kernel's Wi-Fi class (the module build calls `kapi_wifi_register`).

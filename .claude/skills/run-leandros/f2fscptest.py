@@ -23,6 +23,7 @@ Exit 0 iff every scenario passes.
 import hashlib
 import importlib.util
 import os
+import hostclean
 import struct
 import subprocess
 import sys
@@ -101,6 +102,7 @@ def main(argv):
             sys.exit(__doc__)
     out = os.environ.get("F2FSCP_OUT", f"/tmp/f2fscp-{arch}{('-' + caller) if caller else ''}")
     os.makedirs(out, exist_ok=True)
+    hostclean.track(out, glob="/tmp/f2fscp-*")
     img = os.path.join(out, "cp.img")
     if os.path.exists(img):
         os.unlink(img)
@@ -229,4 +231,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

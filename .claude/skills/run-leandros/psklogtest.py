@@ -16,6 +16,7 @@ command line, so the knob really was on the line.
 Usage: psklogtest.py [aarch64|x86_64]    (REPO=<checkout> to test another tree)
 """
 import os
+import hostclean
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ def main(argv):
     caller = os.environ.get("LEANDROS_RUN_ID", "")
     run_id = f"{caller}-psklog" if caller else "psklog"
     tmp = tempfile.mkdtemp(prefix="psklog-")
+    hostclean.track(tmp)
     img = os.path.join(tmp, f"boot-{arch}.img")
     root = os.path.join(tmp, f"root-{arch}.img")
     for src, dst in ((os.path.join(REPO, f"leandros-limine-{arch}.img"), img),
@@ -101,4 +103,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

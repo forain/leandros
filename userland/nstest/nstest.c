@@ -927,7 +927,7 @@ static int sendfam_child(void)
 {
     int bad = 0;
     unsigned char pkt[8] = { 8, 0, 0, 0, 0x12, 0x34, 0, 1 };
-    struct sockaddr_in a = { .sin_family = AF_UNIX, .sin_port = htons(41047) };
+    struct sockaddr_in a = { .sin_family = AF_UNIX, .sin_port = htons(30047) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     unsigned short fams[3] = { AF_UNIX, AF_INET6, 0 };
     int u = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1320,7 +1320,7 @@ static int t_procsysnet_ping_range(void)
 static int t_netns_sendfam(void)
 {
     int h = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41047) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(30047) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     CHECK(h >= 0 && bind(h, (void *)&a, sizeof a) == 0);
     pid_t c = fork();
@@ -1822,16 +1822,16 @@ static int sockcap_child_inherited(void)
 {
     /* the fd was created by the parent: parent netns, may reach the host listener */
     extern int g_cap_sock;
-    CHECK(inet_connect_fd(g_cap_sock, 41011) == 0);
+    CHECK(inet_connect_fd(g_cap_sock, 30011) == 0);
     int fresh = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(inet_connect_fd(fresh, 41011) == -ENETUNREACH);
+    CHECK(inet_connect_fd(fresh, 30011) == -ENETUNREACH);
     return 0;
 }
 int g_cap_sock;
 static int t_sock_netns_inherited(void)
 {
     CHECK(drop_to(1000) == 0);
-    int l; CHECK(inet_listener(41011, &l) == 0);
+    int l; CHECK(inet_listener(30011, &l) == 0);
     g_cap_sock = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(ns_child_netns(sockcap_child_inherited) == 0);
     return 0;
@@ -1839,7 +1839,7 @@ static int t_sock_netns_inherited(void)
 static int t_sock_netns_scm(void)
 {
     CHECK(drop_to(1000) == 0);
-    int l; CHECK(inet_listener(41012, &l) == 0);
+    int l; CHECK(inet_listener(30012, &l) == 0);
     int sv[2]; CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
@@ -1850,9 +1850,9 @@ static int t_sock_netns_scm(void)
         struct cmsghdr *cm = CMSG_FIRSTHDR(&m);
         if (!cm || cm->cmsg_type != SCM_RIGHTS) _exit(2);
         int fd; memcpy(&fd, CMSG_DATA(cm), sizeof fd);
-        if (inet_connect_fd(fd, 41012) != 0) _exit(3);
+        if (inet_connect_fd(fd, 30012) != 0) _exit(3);
         int fresh = socket(AF_INET, SOCK_STREAM, 0);
-        _exit(inet_connect_fd(fresh, 41012) == -ENETUNREACH ? 0 : 4);
+        _exit(inet_connect_fd(fresh, 30012) == -ENETUNREACH ? 0 : 4);
     }
     CHECK(c > 0);
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -1954,14 +1954,14 @@ static int t_sock_ns_leak(void)
 static int t_sock_before_unshare(void)
 {
     CHECK(drop_to(1000) == 0);
-    int l; CHECK(inet_listener(41013, &l) == 0);
+    int l; CHECK(inet_listener(30013, &l) == 0);
     pid_t c = fork();
     if (c == 0) {
         int old = socket(AF_INET, SOCK_STREAM, 0);
         if (unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0) _exit(1);
-        if (inet_connect_fd(old, 41013) != 0) _exit(2);
+        if (inet_connect_fd(old, 30013) != 0) _exit(2);
         int fresh = socket(AF_INET, SOCK_STREAM, 0);
-        _exit(inet_connect_fd(fresh, 41013) == -ENETUNREACH ? 0 : 3);
+        _exit(inet_connect_fd(fresh, 30013) == -ENETUNREACH ? 0 : 3);
     }
     int st = 0; waitpid(c, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
@@ -1982,12 +1982,12 @@ static int wild_listener(unsigned port, int *fdout)
 static int t_netns_portspace(void)
 {
     CHECK(drop_to(1000) == 0);
-    int hp; CHECK(wild_listener(41021, &hp) == 0);       /* host holds P */
+    int hp; CHECK(wild_listener(30021, &hp) == 0);       /* host holds P */
     int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
         int a, b;
-        char ok = wild_listener(41021, &a) == 0 && wild_listener(41022, &b) == 0;
+        char ok = wild_listener(30021, &a) == 0 && wild_listener(30022, &b) == 0;
         write(pfd[1], &ok, 1);
         char x; read(qfd[0], &x, 1);
         _exit(0);
@@ -1995,8 +1995,8 @@ static int t_netns_portspace(void)
     CHECK(c > 0);
     char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);  /* child bound P too, and Q */
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(inet_connect_fd(s, 41022) == -ECONNREFUSED);    /* child's listener unreachable */
-    int h2; CHECK(wild_listener(41022, &h2) == 0);        /* and Q is free on the host */
+    CHECK(inet_connect_fd(s, 30022) == -ECONNREFUSED);    /* child's listener unreachable */
+    int h2; CHECK(wild_listener(30022, &h2) == 0);        /* and Q is free on the host */
     write(qfd[1], "x", 1);
     int st; waitpid(c, &st, 0);
     return 0;
@@ -2008,7 +2008,7 @@ static int t_netns_udp_bind(void)
     int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
     pid_t c = syscall(SYS_clone, SIGCHLD | NSALL, 0, 0, 0, 0);
     if (c == 0) {
-        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(30031) };
         int u = socket(AF_INET, SOCK_DGRAM, 0);
         struct timeval tv = { 0, 300000 };
         setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -2024,13 +2024,13 @@ static int t_netns_udp_bind(void)
     CHECK(c > 0);
     char ok = 0; CHECK(read(pfd[0], &ok, 1) == 1 && ok);
     int h = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(30031) };
     d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sendto(h, "hi", 2, 0, (void *)&d, sizeof d);
     write(qfd[1], "x", 1);
     char res = 0; CHECK(read(pfd[0], &res, 1) == 1 && res);   /* child got nothing */
     int hb = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41031) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(30031) };
     CHECK(bind(hb, (void *)&a, sizeof a) == 0);               /* P free on the host */
     int st; waitpid(c, &st, 0);
     return 0;
@@ -2091,11 +2091,11 @@ static int lo_traffic(unsigned port)
 }
 static int lo_updown_body(void)
 {
-    struct sockaddr_in a = lo_addr(41600);
+    struct sockaddr_in a = lo_addr(30600);
     int t = socket(AF_INET, SOCK_STREAM, 0);
     if (!(connect(t, (void *)&a, sizeof a) == -1 && errno == ENETUNREACH)) return 1;   /* lo down */
     if (ns_lo_set(1)) return 2;
-    int r = lo_traffic(41600);
+    int r = lo_traffic(30600);
     if (r) return r;
     if (ns_lo_set(0)) return 3;
     int t2 = socket(AF_INET, SOCK_STREAM, 0);
@@ -2110,7 +2110,7 @@ static int t_netns_lo_echo(void)
 static int lo_same_port_body(void)
 {
     if (ns_lo_set(1)) return 2;
-    int l; struct sockaddr_in a = lo_addr(41610);
+    int l; struct sockaddr_in a = lo_addr(30610);
     l = socket(AF_INET, SOCK_STREAM, 0);
     if (bind(l, (void *)&a, sizeof a) || listen(l, 4)) return 3;
     int c = socket(AF_INET, SOCK_STREAM, 0);
@@ -2119,7 +2119,7 @@ static int lo_same_port_body(void)
 }
 static int t_netns_lo_two_ns_same_port(void)
 {
-    int hp; CHECK(wild_listener(41610, &hp) == 0);       /* the host holds the port too */
+    int hp; CHECK(wild_listener(30610, &hp) == 0);       /* the host holds the port too */
     int pfd[2], qfd[2]; CHECK(pipe(pfd) == 0 && pipe(qfd) == 0);
     pid_t cs[2];
     for (int i = 0; i < 2; i++) {
@@ -2144,12 +2144,12 @@ static int lo_host_unreach_body(void)
 {
     if (ns_lo_set(1)) return 2;
     int c = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in a = lo_addr(41620);
+    struct sockaddr_in a = lo_addr(30620);
     if (!(connect(c, (void *)&a, sizeof a) == -1 && errno == ECONNREFUSED)) return 3;   /* host's service is not here */
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     struct timeval tv = { 0, 300000 };
     setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    struct sockaddr_in b = lo_addr(41621);
+    struct sockaddr_in b = lo_addr(30621);
     if (sendto(u, "x", 1, 0, (void *)&b, sizeof b) < 0) return 4;
     char buf[4];
     if (recv(u, buf, sizeof buf, 0) >= 0) return 5;     /* nothing echoes back from the host */
@@ -2157,9 +2157,9 @@ static int lo_host_unreach_body(void)
 }
 static int t_netns_lo_host_unreachable(void)
 {
-    int hp; CHECK(wild_listener(41620, &hp) == 0);
+    int hp; CHECK(wild_listener(30620, &hp) == 0);
     int hu = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in a = lo_addr(41621);
+    struct sockaddr_in a = lo_addr(30621);
     CHECK(bind(hu, (void *)&a, sizeof a) == 0);
     CHECK(ns_child_netns(lo_host_unreach_body) == 0);
     /* and the host saw no datagram from the netns */
@@ -2173,7 +2173,7 @@ static int t_netns_lo_host_unreachable(void)
 static int lo_slot_body(void)
 {
     if (ns_lo_set(1)) return 2;
-    return lo_traffic(41630) ? 3 : 0;
+    return lo_traffic(30630) ? 3 : 0;
 }
 static int t_netns_lo_slots_reclaimed(void)
 {
@@ -2562,6 +2562,491 @@ static int t_scm_cred_unmapped(void)
 }
 
 /* Unprivileged: only its own credentials may be claimed. */
+/* An accepted socket inherits SO_PASSCRED from its listener (Linux unix_sock_inherit_flags). */
+static int t_scm_cred_accept_inherit(void)
+{
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    memcpy(a.sun_path + 1, "nst-pcinh", 9);
+    socklen_t al = offsetof(struct sockaddr_un, sun_path) + 1 + 9;
+    int l = socket(AF_UNIX, SOCK_STREAM, 0), c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(l >= 0 && c >= 0 && set_passcred(l) == 0);
+    CHECK(bind(l, (struct sockaddr *)&a, al) == 0 && listen(l, 1) == 0);
+    CHECK(connect(c, (struct sockaddr *)&a, al) == 0);
+    int s = accept(l, 0, 0); CHECK(s >= 0);
+    struct ucred u;
+    CHECK(cred_send(c, 0) == 0 && cred_recv(s, &u) == 0);
+    CHECK(u.pid == getpid());
+    close(s); close(c); close(l);
+    return 0;
+}
+
+/* Linux attaches the sender's creds to every message the receiver wants them for, whatever the send call. */
+static int t_scm_cred_plain_send(void)
+{
+    int sp[2], types[2] = { SOCK_STREAM, SOCK_DGRAM };
+    struct ucred u;
+    for (int i = 0; i < 2; i++) {
+        CHECK(socketpair(AF_UNIX, types[i], 0, sp) == 0 && set_passcred(sp[0]) == 0);
+        memset(&u, 0, sizeof u);
+        CHECK(send(sp[1], "x", 1, 0) == 1 && cred_recv(sp[0], &u) == 0 && u.pid == getpid());
+        memset(&u, 0, sizeof u);
+        CHECK(write(sp[1], "x", 1) == 1 && cred_recv(sp[0], &u) == 0 && u.pid == getpid());
+        close(sp[0]); close(sp[1]);
+    }
+    return 0;
+}
+
+/* Data queued before SO_PASSCRED is switched on still reports the sender's creds. */
+static int t_scm_cred_late_enable(void)
+{
+    int sp[2], types[2] = { SOCK_STREAM, SOCK_DGRAM };
+    struct ucred u;
+    for (int i = 0; i < 2; i++) {
+        CHECK(socketpair(AF_UNIX, types[i], 0, sp) == 0);
+        CHECK(send(sp[1], "x", 1, 0) == 1 && set_passcred(sp[0]) == 0);
+        memset(&u, 0, sizeof u);
+        CHECK(cred_recv(sp[0], &u) == 0 && u.pid == getpid());
+        close(sp[0]); close(sp[1]);
+    }
+    return 0;
+}
+
+/* AF_UNIX SOCK_DGRAM sendto()/sendmsg(msg_name) on unconnected senders:
+ * one bound receiver, many senders, per-message sender address + creds. */
+#include <sys/un.h>
+static socklen_t un_addr(struct sockaddr_un *a, const char *n, int abs_)
+{
+    memset(a, 0, sizeof *a); a->sun_family = AF_UNIX;
+    if (abs_) { strcpy(a->sun_path + 1, n); return offsetof(struct sockaddr_un, sun_path) + 1 + strlen(n); }
+    strcpy(a->sun_path, n);
+    return offsetof(struct sockaddr_un, sun_path) + strlen(n) + 1;
+}
+static int t_unix_dgram_sendto(void)
+{
+    struct sockaddr_un ra, sa[3], from;
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        const char *rn = abs_ ? "udgtest-recv" : "/tmp/udgtest-recv";
+        unlink("/tmp/udgtest-recv");
+        socklen_t rl = un_addr(&ra, rn, abs_);
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0);
+        CHECK(r >= 0 && bind(r, (struct sockaddr *)&ra, rl) == 0 && set_passcred(r) == 0);
+        int s[3];
+        const char *names[3] = { abs_ ? "udgtest-s0" : "/tmp/udgtest-s0", abs_ ? "udgtest-s1" : "/tmp/udgtest-s1", NULL };
+        socklen_t sl[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; i++) {
+            s[i] = socket(AF_UNIX, SOCK_DGRAM, 0);
+            CHECK(s[i] >= 0);
+            if (names[i]) {
+                if (!abs_) unlink(names[i]);
+                sl[i] = un_addr(&sa[i], names[i], abs_);
+                CHECK(bind(s[i], (struct sockaddr *)&sa[i], sl[i]) == 0);
+            }
+        }
+        /* sendto from all three, interleaved with a sendmsg(msg_name). */
+        for (int i = 0; i < 3; i++) {
+            char m = (char)('a' + i);
+            CHECK(sendto(s[i], &m, 1, 0, (struct sockaddr *)&ra, rl) == 1);
+        }
+        {
+            char m = 'd'; struct iovec iov = { &m, 1 };
+            struct msghdr h; memset(&h, 0, sizeof h);
+            h.msg_name = &ra; h.msg_namelen = rl; h.msg_iov = &iov; h.msg_iovlen = 1;
+            CHECK(sendmsg(s[1], &h, 0) == 1);
+        }
+        char exp[4] = { 'a', 'b', 'c', 'd' }; int from_i[4] = { 0, 1, 2, 1 };
+        for (int k = 0; k < 4; k++) {
+            char d, cb[64];
+            struct iovec iov = { &d, 1 };
+            struct msghdr h; memset(&h, 0, sizeof h);
+            memset(&from, 0, sizeof from);
+            h.msg_name = &from; h.msg_namelen = sizeof from;
+            h.msg_iov = &iov; h.msg_iovlen = 1; h.msg_control = cb; h.msg_controllen = sizeof cb;
+            CHECK(recvmsg(r, &h, 0) == 1 && d == exp[k]);
+            int i = from_i[k];
+            if (i == 2) CHECK(h.msg_namelen <= offsetof(struct sockaddr_un, sun_path));
+            else CHECK(h.msg_namelen == sl[i] && !memcmp(from.sun_path, sa[i].sun_path, sl[i] - offsetof(struct sockaddr_un, sun_path)));
+            int got = 0;
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&h); c; c = CMSG_NXTHDR(&h, c))
+                if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_CREDENTIALS) {
+                    struct ucred u; memcpy(&u, CMSG_DATA(c), sizeof u);
+                    got = u.pid == getpid() && u.uid == getuid();
+                }
+            CHECK(got);
+        }
+        /* Nothing missing for a dead / unbound destination. */
+        struct sockaddr_un na; socklen_t nl = un_addr(&na, abs_ ? "udgtest-none" : "/tmp/udgtest-none", abs_);
+        unlink("/tmp/udgtest-none");
+        errno = 0; CHECK(sendto(s[0], "x", 1, 0, (struct sockaddr *)&na, nl) == -1 && errno == (abs_ ? ECONNREFUSED : ENOENT));
+        for (int i = 0; i < 3; i++) close(s[i]);
+        close(r);
+        if (!abs_) { unlink("/tmp/udgtest-recv"); unlink("/tmp/udgtest-s0"); unlink("/tmp/udgtest-s1"); }
+        else {
+            /* A closed pathname receiver: ECONNREFUSED. */
+        }
+    }
+    /* Backpressure: a nonblocking sender to a receiver nobody reads gets EAGAIN. */
+    {
+        socklen_t rl = un_addr(&ra, "udgtest-bp", 1);
+        int r = socket(AF_UNIX, SOCK_DGRAM, 0), s = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        CHECK(bind(r, (struct sockaddr *)&ra, rl) == 0);
+        static char big[8192];
+        int n = 0, e = 0;
+        for (; n < 4096; n++) { if (sendto(s, big, sizeof big, 0, (struct sockaddr *)&ra, rl) < 0) { e = errno; break; } }
+        CHECK(n > 0 && n < 4096 && e == EAGAIN);
+        close(s); close(r);
+    }
+    return 0;
+}
+
+/* ---- AF_UNIX SOCK_DGRAM: connect, filter, peer gone, trunc/peek, poll, rights, types, autobind ---- */
+#include <poll.h>
+static int udg_bound(const char *n, int abs_, struct sockaddr_un *a, socklen_t *l)
+{
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    if (!abs_) unlink(n);
+    *l = un_addr(a, n, abs_);
+    if (bind(s, (struct sockaddr *)a, *l)) { close(s); return -1; }
+    return s;
+}
+static void udg_to(int s, int ms) { struct timeval tv = { ms / 1000, (ms % 1000) * 1000 }; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+
+static int t_unix_dgram_connect(void)
+{
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        struct sockaddr_un a1, a2, got; socklen_t l1, l2, gl;
+        int r1 = udg_bound(abs_ ? "udgc-1" : "/tmp/udgc-1", abs_, &a1, &l1);
+        int r2 = udg_bound(abs_ ? "udgc-2" : "/tmp/udgc-2", abs_, &a2, &l2);
+        CHECK(r1 >= 0 && r2 >= 0);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        char b[8];
+        gl = sizeof got;
+        CHECK(getpeername(c, (struct sockaddr *)&got, &gl) == -1 && errno == ENOTCONN);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ENOTCONN);
+        CHECK(connect(c, (struct sockaddr *)&a1, l1) == 0);
+        gl = sizeof got;
+        CHECK(getpeername(c, (struct sockaddr *)&got, &gl) == 0 && gl == l1 && !memcmp(&got, &a1, l1));
+        CHECK(send(c, "one", 3, 0) == 3 && recv(r1, b, sizeof b, 0) == 3 && !memcmp(b, "one", 3));
+        CHECK(connect(c, (struct sockaddr *)&a2, l2) == 0);       /* reconnect replaces */
+        CHECK(write(c, "two", 3) == 3 && recv(r2, b, sizeof b, 0) == 3 && !memcmp(b, "two", 3));
+        struct sockaddr un = { AF_UNSPEC };
+        CHECK(connect(c, &un, sizeof un) == 0);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ENOTCONN);
+        close(c); close(r1); close(r2);
+    }
+    return 0;
+}
+
+static int t_unix_dgram_filter(void)
+{
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        struct sockaddr_un ar, aa, ab; socklen_t lr, la, lb;
+        int r = udg_bound(abs_ ? "udgf-r" : "/tmp/udgf-r", abs_, &ar, &lr);
+        int a = udg_bound(abs_ ? "udgf-a" : "/tmp/udgf-a", abs_, &aa, &la);
+        int b = udg_bound(abs_ ? "udgf-b" : "/tmp/udgf-b", abs_, &ab, &lb);
+        CHECK(r >= 0 && a >= 0 && b >= 0);
+        CHECK(connect(r, (struct sockaddr *)&aa, la) == 0);       /* r only hears a */
+        char m;
+        CHECK(sendto(a, "A", 1, 0, (struct sockaddr *)&ar, lr) == 1);
+        CHECK(sendto(b, "B", 1, 0, (struct sockaddr *)&ar, lr) == -1 && errno == EPERM);
+        CHECK(recv(r, &m, 1, 0) == 1 && m == 'A');
+        close(r); close(a); close(b);
+    }
+    return 0;
+}
+
+static int t_unix_dgram_peer_gone(void)
+{
+    for (int abs_ = 0; abs_ < 2; abs_++) {
+        const char *rn = abs_ ? "udgg-r" : "/tmp/udgg-r";
+        struct sockaddr_un ar; socklen_t lr;
+        int r = udg_bound(rn, abs_, &ar, &lr);
+        CHECK(r >= 0);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        CHECK(connect(c, (struct sockaddr *)&ar, lr) == 0 && send(c, "x", 1, 0) == 1);
+        close(r);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ECONNREFUSED);
+        CHECK(send(c, "x", 1, 0) == -1 && errno == ENOTCONN);
+        CHECK(sendto(c, "x", 1, 0, (struct sockaddr *)&ar, lr) == -1 && errno == ECONNREFUSED);
+        if (!abs_) {
+            unlink(rn);
+            CHECK(sendto(c, "x", 1, 0, (struct sockaddr *)&ar, lr) == -1 && errno == ENOENT);
+        }
+        close(c);
+    }
+    return 0;
+}
+
+static int t_unix_dgram_trunc_peek(void)
+{
+    struct sockaddr_un ar; socklen_t lr;
+    int r = udg_bound("udgt-r", 1, &ar, &lr);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    char big[100], small[10], b[200];
+    memset(big, 'z', sizeof big);
+    CHECK(r >= 0 && sendto(c, big, 100, 0, (struct sockaddr *)&ar, lr) == 100);
+    int q = 0; CHECK(ioctl(r, FIONREAD, &q) == 0 && q == 100);
+    CHECK(recv(r, small, sizeof small, MSG_PEEK) == 10);
+    CHECK(recv(r, small, sizeof small, MSG_TRUNC) == 100);        /* real length, rest discarded */
+    CHECK(sendto(c, big, 100, 0, (struct sockaddr *)&ar, lr) == 100);
+    struct iovec iov = { small, sizeof small }; struct msghdr h = { .msg_iov = &iov, .msg_iovlen = 1 };
+    CHECK(recvmsg(r, &h, 0) == 10 && (h.msg_flags & MSG_TRUNC));
+    CHECK(sendto(c, "", 0, 0, (struct sockaddr *)&ar, lr) == 0);  /* zero-length record */
+    CHECK(recv(r, b, sizeof b, 0) == 0);
+    CHECK(recv(r, b, sizeof b, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(r); close(c);
+    return 0;
+}
+
+static int t_unix_dgram_poll_block(void)
+{
+    struct sockaddr_un ar; socklen_t lr;
+    int r = udg_bound("udgp-r", 1, &ar, &lr);
+    CHECK(r >= 0);
+    struct pollfd p = { r, POLLIN, 0 };
+    CHECK(poll(&p, 1, 100) == 0);
+    pid_t k = fork();
+    if (k == 0) {
+        usleep(200 * 1000);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        _exit(sendto(c, "w", 1, 0, (struct sockaddr *)&ar, lr) == 1 ? 0 : 1);
+    }
+    p.revents = 0;
+    CHECK(poll(&p, 1, 3000) == 1 && (p.revents & POLLIN));
+    char m;
+    CHECK(recv(r, &m, 1, 0) == 1);
+    int st; waitpid(k, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* a blocking recv wakes on a later sendto */
+    udg_to(r, 2000);
+    k = fork();
+    if (k == 0) {
+        usleep(200 * 1000);
+        int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+        _exit(sendto(c, "w", 1, 0, (struct sockaddr *)&ar, lr) == 1 ? 0 : 1);
+    }
+    CHECK(recv(r, &m, 1, 0) == 1);
+    waitpid(k, &st, 0);
+    /* a blocking sender on a full inbox wakes when the receiver drains */
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    udg_to(c, 2000);
+    int n = 0;
+    while (sendto(c, "f", 1, MSG_DONTWAIT, (struct sockaddr *)&ar, lr) == 1) n++;
+    CHECK(errno == EAGAIN && n >= 10 && n < 1000);
+    k = fork();
+    if (k == 0) { usleep(200 * 1000); char x; _exit(recv(r, &x, 1, 0) == 1 ? 0 : 1); }
+    CHECK(sendto(c, "g", 1, 0, (struct sockaddr *)&ar, lr) == 1);   /* blocked, then freed */
+    waitpid(k, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* ... and gets ECONNREFUSED when the receiver closes */
+    while (sendto(c, "f", 1, MSG_DONTWAIT, (struct sockaddr *)&ar, lr) == 1) {}
+    k = fork();
+    if (k == 0) {
+        close(r);                                                 /* only the parent's copy keeps the inbox alive */
+        int x = (int)sendto(c, "h", 1, 0, (struct sockaddr *)&ar, lr);
+        _exit(x == -1 && errno == ECONNREFUSED ? 0 : 1);
+    }
+    usleep(300 * 1000);
+    close(r);
+    waitpid(k, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(c);
+    return 0;
+}
+
+static int t_unix_dgram_rights(void)
+{
+    struct sockaddr_un ar; socklen_t lr;
+    int r = udg_bound("udgr-r", 1, &ar, &lr);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0), pp[2];
+    CHECK(r >= 0 && pipe(pp) == 0);
+    char cb[CMSG_SPACE(sizeof(int))] = {0}, d = 'd';
+    struct iovec iov = { &d, 1 };
+    struct msghdr h = { .msg_name = &ar, .msg_namelen = lr, .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = sizeof cb };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&h);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &pp[1], sizeof(int));
+    CHECK(sendmsg(c, &h, 0) == 1);
+    char rb[CMSG_SPACE(sizeof(int))] = {0}, e;
+    struct iovec iv2 = { &e, 1 };
+    struct msghdr g = { .msg_iov = &iv2, .msg_iovlen = 1, .msg_control = rb, .msg_controllen = sizeof rb };
+    CHECK(recvmsg(r, &g, 0) == 1);
+    cm = CMSG_FIRSTHDR(&g);
+    CHECK(cm && cm->cmsg_type == SCM_RIGHTS);
+    int nfd; memcpy(&nfd, CMSG_DATA(cm), sizeof nfd);
+    CHECK(write(nfd, "p", 1) == 1);
+    char pb; CHECK(read(pp[0], &pb, 1) == 1 && pb == 'p');
+    close(nfd);
+    /* receiver closes with an fd still queued: the pipe's write end is released */
+    CHECK(sendmsg(c, &h, 0) == 1);
+    close(pp[1]);
+    close(r);
+    CHECK(read(pp[0], &pb, 1) == 0);                              /* every write end gone: EOF */
+    close(pp[0]); close(c);
+    return 0;
+}
+
+/* ---- AF_UNIX dgram inbox: GC of SCM_RIGHTS fds queued in an inbox, and
+ * the per-sender wmem budget ---- */
+static int udg_send_fds(int s, struct sockaddr_un *a, socklen_t l, const int *fds, int n)
+{
+    char cb[CMSG_SPACE(sizeof(int) * 4)] = {0}, d = 'g';
+    struct iovec iov = { &d, 1 };
+    struct msghdr h = { .msg_name = a, .msg_namelen = l, .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cb, .msg_controllen = CMSG_SPACE(sizeof(int) * n) };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&h);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int) * n);
+    memcpy(CMSG_DATA(cm), fds, sizeof(int) * n);
+    return (int)sendmsg(s, &h, 0);
+}
+
+/* A socket cycle through inboxes (A's inbox holds A, or A holds B and B holds
+ * A) is garbage once every fd is closed: the pipe write end riding along is
+ * released, and the names are free to bind again. */
+static int t_unix_dgram_gc_cycle(void)
+{
+    struct sockaddr_un aa, ab, x; socklen_t la, lb, lx;
+    int pp[2];
+    CHECK(pipe2(pp, O_NONBLOCK) == 0);
+    int a = udg_bound("udgg-a", 1, &aa, &la), b = udg_bound("udgg-b", 1, &ab, &lb);
+    CHECK(a >= 0 && b >= 0);
+    int f1[2] = { a, pp[1] }, f2[1] = { b }, f3[1] = { a };
+    CHECK(udg_send_fds(a, &aa, la, f1, 2) == 1);        /* A's inbox holds A and the pipe */
+    CHECK(udg_send_fds(a, &ab, lb, f1, 2) == 1);        /* B's inbox holds A too: B is reachable only via A */
+    CHECK(udg_send_fds(b, &aa, la, f2, 1) == 1);        /* A's inbox holds B: A <-> B cycle */
+    close(pp[1]);
+    char c;
+    CHECK(read(pp[0], &c, 1) == -1 && errno == EAGAIN); /* still queued, nothing freed early */
+    close(a);
+    CHECK(read(pp[0], &c, 1) == -1 && errno == EAGAIN); /* B still open: A is live through B */
+    close(b);
+    usleep(100 * 1000);
+    CHECK(read(pp[0], &c, 1) == 0);                     /* cycle collected: every write end gone */
+    int a2 = udg_bound("udgg-a", 1, &x, &lx), b2 = udg_bound("udgg-b", 1, &x, &lx);
+    CHECK(a2 >= 0 && b2 >= 0);                          /* names are free again */
+    (void)f3;
+    close(a2); close(b2); close(pp[0]);
+    return 0;
+}
+
+/* The collector never frees what is still reachable: an fd queued in a live
+ * inbox keeps its socket (and the datagrams in it) alive, and is receivable. */
+static int t_unix_dgram_gc_live(void)
+{
+    struct sockaddr_un aa, ab; socklen_t la, lb;
+    int a = udg_bound("udgl-a", 1, &aa, &la), b = udg_bound("udgl-b", 1, &ab, &lb);
+    CHECK(a >= 0 && b >= 0);
+    int fa[1] = { a }, fb[1] = { b };
+    CHECK(udg_send_fds(a, &ab, lb, fa, 1) == 1);        /* B's inbox holds A */
+    CHECK(udg_send_fds(b, &aa, la, fb, 1) == 1);        /* A's inbox holds B */
+    close(a);                                           /* B is still open here: nothing may be freed */
+    int s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(sendto(s, "live", 4, 0, (struct sockaddr *)&aa, la) == 4);   /* A still bound and accepting */
+    char rb[CMSG_SPACE(sizeof(int))] = {0}, e;
+    struct iovec iv = { &e, 1 };
+    struct msghdr g = { .msg_iov = &iv, .msg_iovlen = 1, .msg_control = rb, .msg_controllen = sizeof rb };
+    CHECK(recvmsg(b, &g, 0) == 1);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&g);
+    CHECK(cm && cm->cmsg_type == SCM_RIGHTS);
+    int na; memcpy(&na, CMSG_DATA(cm), sizeof na);      /* A, reborn as an fd */
+    char m[8];
+    CHECK(recv(na, m, sizeof m, 0) == 1);               /* the datagram A queued earlier: B's fd message */
+    CHECK(recv(na, m, sizeof m, 0) == 4 && memcmp(m, "live", 4) == 0);
+    close(na); close(b); close(s);
+    return 0;
+}
+
+/* A sender's SO_SNDBUF bounds what it has queued in other sockets' inboxes:
+ * nonblocking sends get EAGAIN with both inboxes nearly empty, a blocking one
+ * waits for a receiver to drain. */
+static int t_unix_dgram_wmem(void)
+{
+    struct sockaddr_un a1, a2; socklen_t l1, l2;
+    int r1 = udg_bound("udgw-1", 1, &a1, &l1), r2 = udg_bound("udgw-2", 1, &a2, &l2);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(r1 >= 0 && r2 >= 0 && c >= 0);
+    int sb = 4096; socklen_t sl = sizeof sb;
+    CHECK(setsockopt(c, SOL_SOCKET, SO_SNDBUF, &sb, sizeof sb) == 0);
+    CHECK(getsockopt(c, SOL_SOCKET, SO_SNDBUF, &sb, &sl) == 0 && sb < 100000);
+    char buf[1000]; memset(buf, 'w', sizeof buf);
+    int n = 0;
+    for (;;) {
+        struct sockaddr_un *a = (n & 1) ? &a2 : &a1; socklen_t l = (n & 1) ? l2 : l1;
+        if (sendto(c, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)a, l) != (ssize_t)sizeof buf) break;
+        if (++n > 100) break;
+    }
+    CHECK(errno == EAGAIN && n >= 1 && n <= 12);       /* inboxes alone (11 each) would have taken 22 */
+    udg_to(c, 3000);
+    pid_t k = fork();
+    if (k == 0) { usleep(200 * 1000); char x[1000]; _exit(recv(r1, x, sizeof x, 0) == (ssize_t)sizeof x ? 0 : 1); }
+    CHECK(sendto(c, buf, sizeof buf, 0, (struct sockaddr *)&a2, l2) == (ssize_t)sizeof buf);   /* parks, then wakes */
+    int st; waitpid(k, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    /* an unrelated sender has its own budget */
+    int d = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(sendto(d, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&a1, l1) == (ssize_t)sizeof buf);
+    /* draining everything gives the budget back */
+    char x[1000];
+    while (recv(r1, x, sizeof x, MSG_DONTWAIT) > 0) {}
+    while (recv(r2, x, sizeof x, MSG_DONTWAIT) > 0) {}
+    CHECK(sendto(c, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&a1, l1) == (ssize_t)sizeof buf);
+    close(r1); close(r2); close(c); close(d);
+    return 0;
+}
+
+static int t_unix_dgram_types(void)
+{
+    struct sockaddr_un ad, as; socklen_t ld, ls;
+    int d = udg_bound("udgy-d", 1, &ad, &ld);
+    CHECK(d >= 0);
+    int st = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(connect(st, (struct sockaddr *)&ad, ld) == -1 && errno == EPROTOTYPE);
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    ls = un_addr(&as, "udgy-s", 1);
+    CHECK(bind(l, (struct sockaddr *)&as, ls) == 0 && listen(l, 1) == 0);
+    CHECK(sendto(d, "x", 1, 0, (struct sockaddr *)&as, ls) == -1 && errno == EPROTOTYPE);
+    CHECK(accept(d, NULL, NULL) == -1 && errno == EOPNOTSUPP);
+    CHECK(listen(d, 1) == -1 && errno == EOPNOTSUPP);
+    close(d); close(l); close(st);
+    return 0;
+}
+
+static int t_unix_dgram_autobind(void)
+{
+    struct sockaddr_un ar, got; socklen_t lr, gl = sizeof got;
+    int r = udg_bound("udga-r", 1, &ar, &lr);
+    int c = socket(AF_UNIX, SOCK_DGRAM, 0);
+    sa_family_t fam = AF_UNIX;
+    CHECK(r >= 0 && bind(c, (struct sockaddr *)&fam, sizeof fam) == 0);
+    CHECK(getsockname(c, (struct sockaddr *)&got, &gl) == 0 && gl == offsetof(struct sockaddr_un, sun_path) + 6 && got.sun_path[0] == 0);
+    /* an unbound sender with SO_PASSCRED is autobound and the receiver can reply */
+    int u = socket(AF_UNIX, SOCK_DGRAM, 0);
+    CHECK(set_passcred(u) == 0 && sendto(u, "q", 1, 0, (struct sockaddr *)&ar, lr) == 1);
+    char m; struct sockaddr_un from; socklen_t fl = sizeof from;
+    CHECK(recvfrom(r, &m, 1, 0, (struct sockaddr *)&from, &fl) == 1);
+    CHECK(fl == offsetof(struct sockaddr_un, sun_path) + 6 && from.sun_path[0] == 0);
+    CHECK(sendto(r, "a", 1, 0, (struct sockaddr *)&from, fl) == 1 && recv(u, &m, 1, 0) == 1 && m == 'a');
+    close(r); close(c); close(u);
+    return 0;
+}
+
+/* libc syslog(3) -> /dev/log, the path syslogd/logger take: a bound dgram
+ * server on /dev/log hears openlog+syslog (musl: connect + send). No busybox
+ * ships in the image, so this stands in for the logger/syslogd smoke. */
+#include <syslog.h>
+static int t_unix_dgram_syslog(void)
+{
+    struct sockaddr_un a; socklen_t l;
+    int r = udg_bound("/dev/log", 0, &a, &l);
+    if (r < 0) { printf("  skip: cannot bind /dev/log (errno %d)\n", errno); return 0; }
+    udg_to(r, 3000);
+    openlog("udgsyslog", LOG_NDELAY, LOG_USER);
+    syslog(LOG_INFO, "hello-unixdg");
+    char b[256] = {0};
+    ssize_t n = recv(r, b, sizeof b - 1, 0);
+    closelog();
+    close(r);
+    unlink("/dev/log");
+    CHECK(n > 0 && strstr(b, "hello-unixdg") && strstr(b, "udgsyslog"));
+    return 0;
+}
+
 static int t_scm_cred_forge(void)
 {
     int sp[2];
@@ -2648,8 +3133,15 @@ PCASE(timer_sig_in_pidns, ub_timer_sig)
 #define NR_PIDFD_OPEN 434
 static long sys_setns(int fd, int t) { return syscall(NR_SETNS, fd, t); }
 
+/* The port the setns cases bind. It must sit BELOW ip_local_port_range
+ * (32768..60999): a client socket anywhere earlier in a long run that was
+ * handed this port as its ephemeral one (live, or 60 s in TIME_WAIT) makes a
+ * plain bind() answer EADDRINUSE, as on Linux (setns_net flaked this way
+ * at 41500, which is inside the range). */
+#define NS_PORT 30500
+
 /* Fork a child that unshares `fl` (as `uid` when non-zero), listens on
- * 127.0.0.1:41500 when it has a new netns, then parks until *hold_w closes. */
+ * 127.0.0.1:NS_PORT when it has a new netns, then parks until *hold_w closes. */
 static pid_t ns_spawn(unsigned long fl, int uid, int *hold_w)
 {
     int rdy[2], hold[2];
@@ -2661,7 +3153,7 @@ static pid_t ns_spawn(unsigned long fl, int uid, int *hold_w)
         if (unshare(fl)) _exit(2);
         if (fl & CLONE_NEWNET) {
             int s = socket(AF_INET, SOCK_STREAM, 0);
-            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
+            struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(NS_PORT) };
             if (s < 0 || bind(s, (void *)&a, sizeof a) || listen(s, 4)) _exit(3);
         }
         char b = 'r'; (void)!write(rdy[1], &b, 1);
@@ -2697,7 +3189,7 @@ static unsigned long ns_link_ino(pid_t pid, const char *nm)
 static unsigned long fd_ino(int fd) { struct stat st; return fstat(fd, &st) ? 0 : st.st_ino; }
 static struct sockaddr_in ns_lo(void)
 {
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(41500) };
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(NS_PORT) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     return a;
 }
@@ -2708,9 +3200,16 @@ static int t_setns_net(void)
     CHECK(c > 0);
     int fd = ns_open(c, "net");
     CHECK(fd >= 0);
-    struct sockaddr_in a = ns_lo(), w = { .sin_family = AF_INET, .sin_port = htons(41500) };
+    struct sockaddr_in a = ns_lo(), w = { .sin_family = AF_INET, .sin_port = htons(NS_PORT) };
     int s = socket(AF_INET, SOCK_STREAM, 0);
-    CHECK(bind(s, (void *)&w, sizeof w) == 0);   /* host namespace: port is free */
+    if (bind(s, (void *)&w, sizeof w) != 0) {   /* host namespace: port is free */
+        int e = errno, one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        printf("  DIAG setns_net: host bind %d errno %d; with SO_REUSEADDR %s (ok = TIME_WAIT, EADDRINUSE = live socket)\n",
+               NS_PORT, e, bind(s, (void *)&w, sizeof w) == 0 ? "ok" : strerror(errno));
+        errno = e;
+        CHECK(0);
+    }
     close(s);
     CHECK(sys_setns(fd, CLONE_NEWNET) == 0);
     s = socket(AF_INET, SOCK_STREAM, 0);
@@ -2719,6 +3218,28 @@ static int t_setns_net(void)
     (void)a;   /* a non-initial netns has a down loopback: no connect to check */
     close(fd);
     ns_release(c, hw);
+    return 0;
+}
+
+/* Guard: the setns cases' fixed port must not be an ephemeral one. */
+static int t_setns_port_not_ephemeral(void)
+{
+    char b[64] = {0};
+    int f = open("/proc/sys/net/ipv4/ip_local_port_range", O_RDONLY);
+    CHECK(f >= 0 && read(f, b, sizeof b - 1) > 0);
+    close(f);
+    int lo = 0, hi = 0;
+    CHECK(sscanf(b, "%d %d", &lo, &hi) == 2);
+    CHECK(NS_PORT < lo || NS_PORT > hi);
+    /* every other fixed port the netns cases bind (keep in sync with the literals) */
+    static const int fixed[] = { 30011, 30012, 30013, 30021, 30022, 30031, 30047,
+                                 30600, 30610, 30620, 30621, 30630,
+                                 /* other suites (moved from 47xxx/406xx/40123, all below the range): */
+                                 27661, 27662, 27301, 27302, 27303, 27304, 27305, 27306, 27307, 27320,
+                                 27400, 27401, 27402, 27403, 27520, 20611, 20612, 27031, 27032, 27033,
+                                 27041, 27042, 27011, 27013, 27015, 27017, 27021, 20123 };
+    for (unsigned i = 0; i < sizeof fixed / sizeof fixed[0]; i++)
+        CHECK(fixed[i] < lo || fixed[i] > hi);
     return 0;
 }
 
@@ -3106,6 +3627,11 @@ static int t_quota_hier(void)
     if (strstr(cl, "idmap=off")) { printf("  quota_hier: SKIP (idmap=off)\n"); return 0; }
     int ready[2], go[2], res[2];
     CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(res) == 0);
+    /* per-uid limit = /proc/sys/user/max_user_namespaces (Linux ucounts): pin it to 100 (restored before the other-user check) */
+    char old[32] = "2048\n"; int lf = open("/proc/sys/user/max_user_namespaces", O_RDWR);
+    if (lf >= 0) { int k = read(lf, old, sizeof old - 1); if (k > 0) old[k] = 0; }
+    int pinned = lf >= 0 && pwrite(lf, "100", 3, 0) == 3;
+    if (!pinned) { printf("  quota_hier: SKIP (cannot set max_user_namespaces)\n"); if (lf >= 0) close(lf); return 0; }
     pid_t c = fork();
     if (c == 0) {
         setpgid(0, 0);
@@ -3151,10 +3677,11 @@ static int t_quota_hier(void)
         ok = ok && f >= 0 && write(f, "0 1000 1\n1 100000 16\n", 21) == 21; if (f >= 0) close(f);
         if (ok) { (void)!write(go[1], "g", 1); ok = read(res[0], &total, sizeof total) == sizeof total; }
     }
+    { size_t ol = strlen(old); while (ol && old[ol - 1] == '\n') old[--ol] = 0; (void)!pwrite(lf, old, strlen(old), 0); close(lf); }
     if (!ok) { printf("  quota_hier: setup failed\n"); rc = 1; }
     else {
-        printf("  quota_hier: created %d userns via subuids (owner limit %d)\n", total, 32);
-        if (total < 1 || total > 32) { printf("  quota_hier: FAIL total %d not within 1..32\n", total); rc = 1; }
+        printf("  quota_hier: created %d userns via subuids (owner limit %d)\n", total, 100);
+        if (total < 1 || total > 100) { printf("  quota_hier: FAIL total %d not within 1..100\n", total); rc = 1; }
         /* another host user must still be able to unshare */
         pid_t d = fork();
         if (d == 0) _exit(drop_to(2000) == 0 && unshare(CLONE_NEWUSER) == 0 ? 0 : 1);
@@ -3165,6 +3692,10 @@ static int t_quota_hier(void)
     waitpid(c, 0, 0);
     return rc;
 }
+
+/* `nstest --case NAME [N]`: run only the userns case NAME, N times back to back (flake hunting). */
+static const char *only_case;
+static int only_reps = 1;
 
 static int run_userns_cases(void)
 {
@@ -3195,24 +3726,28 @@ static int run_userns_cases(void)
         { "sock_ns_reuse", t_sock_ns_reuse }, { "sock_ns_leak", t_sock_ns_leak },
         { "map_deputy", t_map_deputy }, { "map_race", t_map_race }, { "chroot_newuser_eperm", t_chroot_newuser },
         { "fdinfo_other_uid", t_fdinfo_other_uid },
-        { "setns_net", t_setns_net }, { "setns_stat", t_setns_stat }, { "setns_eperm", t_setns_eperm },
+        { "setns_net", t_setns_net }, { "setns_port_not_ephemeral", t_setns_port_not_ephemeral }, { "setns_stat", t_setns_stat }, { "setns_eperm", t_setns_eperm },
         { "setns_userns_owner", t_setns_userns_owner }, { "setns_userns_root", t_setns_userns_root },
         { "setns_userns_threaded", t_setns_userns_threaded }, { "setns_userns_chroot", t_setns_userns_chroot },
         { "setns_misc", t_setns_misc }, { "setns_pid_children", t_setns_pid_children },
         { "setns_ioctl", t_setns_ioctl }, { "setns_pidfd", t_setns_pidfd }, { "setns_fd_holds", t_setns_fd_holds }, { "setns_uts", t_setns_uts },
         { "scm_cred_into_pidns", t_scm_cred_into_pidns }, { "scm_cred_from_pidns", t_scm_cred_from_pidns },
         { "scm_cred_self_in_pidns", t_scm_cred_self_in_pidns }, { "scm_cred_unmapped", t_scm_cred_unmapped },
-        { "scm_cred_forge", t_scm_cred_forge }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
+        { "scm_cred_forge", t_scm_cred_forge }, { "scm_cred_accept_inherit", t_scm_cred_accept_inherit },
+        { "scm_cred_plain_send", t_scm_cred_plain_send }, { "scm_cred_late_enable", t_scm_cred_late_enable }, { "unix_dgram_sendto", t_unix_dgram_sendto }, { "unix_dgram_connect", t_unix_dgram_connect }, { "unix_dgram_filter", t_unix_dgram_filter }, { "unix_dgram_peer_gone", t_unix_dgram_peer_gone }, { "unix_dgram_trunc_peek", t_unix_dgram_trunc_peek }, { "unix_dgram_poll_block", t_unix_dgram_poll_block }, { "unix_dgram_rights", t_unix_dgram_rights }, { "unix_dgram_gc_cycle", t_unix_dgram_gc_cycle }, { "unix_dgram_gc_live", t_unix_dgram_gc_live }, { "unix_dgram_wmem", t_unix_dgram_wmem }, { "unix_dgram_types", t_unix_dgram_types }, { "unix_dgram_autobind", t_unix_dgram_autobind }, { "unix_dgram_syslog", t_unix_dgram_syslog }, { "sigsys_in_pidns", t_sigsys_in_pidns }, { "timer_sig_in_pidns", t_timer_sig_in_pidns },
         { "uts_unpriv", t_uts_unpriv }, { "uts_copy_inherit", t_uts_copy_inherit }, { "uts_host_userns_eperm", t_uts_in_host_userns },
         { "prio_user_scoped", t_prio_user_scoped }, { "timer_thread_id", t_timer_thread_id }, { "tty_pgrp_view", t_tty_pgrp_view },
         { "cgns_unshare", t_cgns_unshare }, { "cgns_clone", t_cgns_clone }, { "cgns_eperm", t_cgns_eperm },
         { "cgns_in_userns", t_cgns_in_userns }, { "cgns_leak", t_cgns_leak },
     };
     for (unsigned i = 0; i < sizeof cs / sizeof *cs; i++) {
-        pid_t c = fork();
-        if (c == 0) _exit(cs[i].f());
-        int st = 0; waitpid(c, &st, 0);
-        check(cs[i].n, WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        if (only_case && strcmp(only_case, cs[i].n)) continue;
+        for (int rep = 0; rep < (only_case ? only_reps : 1); rep++) {
+            pid_t c = fork();
+            if (c == 0) _exit(cs[i].f());
+            int st = 0; waitpid(c, &st, 0);
+            check(cs[i].n, WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        }
     }
     return 0;
 }
@@ -3533,6 +4068,144 @@ static void nsforge_bind_regression(void)
     check("nsforge_bound_nsfs_open_and_setns", ok);
 }
 
+
+/* --- per-kind namespace limits (/proc/sys/user/max_<kind>_namespaces) --- */
+#define NSLIM_MAXKIDS 1100
+static pid_t nslim_kid[NSLIM_MAXKIDS];
+static int nslim_nkid;
+
+static long nslim_get(const char *kind)
+{
+    char p[96], b[32];
+    snprintf(p, sizeof p, "/proc/sys/user/max_%s_namespaces", kind);
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) return -1;
+    int n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    b[n] = 0;
+    return atol(b);
+}
+static int nslim_put(const char *kind, long v)
+{
+    char p[96], b[32];
+    snprintf(p, sizeof p, "/proc/sys/user/max_%s_namespaces", kind);
+    int fd = open(p, O_WRONLY);
+    if (fd < 0) return -1;
+    int n = snprintf(b, sizeof b, "%ld\n", v);
+    int r = write(fd, b, n);
+    int e = errno;
+    close(fd);
+    errno = e;
+    return r == n ? 0 : -1;
+}
+/* Fork a child that unshares `flag` and keeps the namespace alive. 0 = held,
+ * else the errno of the failed unshare (or -1 on fork failure). */
+static int nslim_hold(unsigned long flag)
+{
+    int pp[2];
+    if (nslim_nkid >= NSLIM_MAXKIDS || pipe(pp)) return -1;
+    pid_t c = fork();
+    if (c < 0) { close(pp[0]); close(pp[1]); return -1; }
+    if (c == 0) {
+        close(pp[0]);
+        char r = unshare((int)flag) == 0 ? 0 : (char)errno;
+        write(pp[1], &r, 1);
+        if (r) _exit(0);
+        for (;;) pause();
+    }
+    close(pp[1]);
+    char r = -1;
+    if (read(pp[0], &r, 1) != 1) r = -1;
+    close(pp[0]);
+    if (r) { waitpid(c, 0, 0); return r; }
+    nslim_kid[nslim_nkid++] = c;
+    return 0;
+}
+static void nslim_release(void)
+{
+    for (int i = 0; i < nslim_nkid; i++) { kill(nslim_kid[i], SIGKILL); waitpid(nslim_kid[i], 0, 0); }
+    nslim_nkid = 0;
+}
+/* Hold namespaces of `flag` until the kernel refuses; returns how many were
+ * taken and the refusing errno in *err (0 if the safety cap was hit). */
+static int nslim_fill(unsigned long flag, int *err)
+{
+    int n = 0, r;
+    *err = 0;
+    while (n < 280) {
+        r = nslim_hold(flag);
+        if (r) { *err = r; break; }
+        n++;
+    }
+    return n;
+}
+
+static void nslimit_cases(void)
+{
+    /* Namespace table is large enough for Linux-like per-kind budgets: 1000
+     * children each holding a fresh user AND net namespace (2000 slots). */
+    {
+        int n = 0, r = 0;
+        while (n < 1000 && (r = nslim_hold(CLONE_NEWUSER | CLONE_NEWNET)) == 0) n++;
+        if (n < 1000) printf("  nstable: held only %d (err %d)\n", n, r);
+        check("nslimit_1000_user_net", n == 1000);
+        nslim_release();
+    }
+    static const char *kinds[] = { "user", "mnt", "net", "pid", "time", "cgroup", "ipc", "uts" };
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+        long v = nslim_get(kinds[i]);
+        if (v < 0) { printf("  max_%s_namespaces unreadable\n", kinds[i]); ok = 0; }
+    }
+    check("nslimit_sysctl_readable", ok);
+
+    /* Writable, and the sum of the budgets is bounded by the shared table. */
+    long old_net = nslim_get("net");
+    ok = nslim_put("net", 5) == 0 && nslim_get("net") == 5;
+    check("nslimit_sysctl_write_readback", ok);
+    errno = 0;
+    ok = nslim_put("net", 100000) == -1 && errno == EINVAL;
+    check("nslimit_sysctl_sum_overflow_einval", ok);
+    ok = nslim_put("net", old_net) == 0 && nslim_get("net") == old_net;
+    check("nslimit_sysctl_restore", ok);
+
+    /* The limit is enforced: ENOSPC exactly at the kind's budget. */
+    long old_ipc = nslim_get("ipc");
+    int err, n, base;
+    nslim_put("ipc", 3);
+    n = nslim_fill(CLONE_NEWIPC, &err);
+    ok = err == ENOSPC && n >= 1 && n <= 3;
+    if (!ok) printf("  ipc fill n=%d err=%d\n", n, err);
+    check("nslimit_enospc_at_limit", ok);
+    /* Other kinds are unaffected by a full ipc budget. */
+    ok = nslim_hold(CLONE_NEWUTS) == 0;
+    check("nslimit_other_kind_unaffected", ok);
+    nslim_release();
+    ok = nslim_hold(CLONE_NEWIPC) == 0;
+    check("nslimit_freed_slot_reusable", ok);
+    nslim_release();
+    nslim_put("ipc", old_ipc);
+
+    /* No starvation: exhausting uts leaves netns, ipc and mount creation working. */
+    long old_uts = nslim_get("uts");
+    nslim_put("uts", 40);
+    n = nslim_fill(CLONE_NEWUTS, &err);
+    base = n;
+    ok = err == ENOSPC && n <= nslim_get("uts");
+    if (!ok) printf("  uts fill n=%d err=%d limit=%ld\n", n, err, nslim_get("uts"));
+    check("nslimit_uts_exhausted_enospc", ok);
+    int rn = nslim_hold(CLONE_NEWNET), ri = nslim_hold(CLONE_NEWIPC), rm = nslim_hold(CLONE_NEWNS);
+    ok = rn == 0 && ri == 0 && rm == 0;
+    if (!ok) printf("  after uts exhaustion (%d held): net=%d ipc=%d mnt=%d\n", base, rn, ri, rm);
+    check("nslimit_uts_exhaustion_does_not_starve_net", ok);
+    nslim_release();
+    ok = nslim_hold(CLONE_NEWUTS) == 0;
+    check("nslimit_uts_reusable_after_release", ok);
+    nslim_release();
+    nslim_put("uts", old_uts);
+}
+
 static void nsforge_cases(void)
 {
     nsforge_detached_theft();
@@ -3540,6 +4213,65 @@ static void nsforge_cases(void)
     nsforge_live_other_user();
     nsforge_freed_slot_cycles();
     nsforge_oob();
+}
+
+/* ---- pidns zap timeout (cmdline pidns.zaptest=1; suite pidnszap) --------
+ * The hook makes the kernel skip the SIGKILL of a dying ns init's survivors and
+ * use a 300 ms deadline, so a victim "survives" and zap must log the timeout
+ * and give up instead of hanging the init's exit. */
+static int klog_has(const char *needle)
+{
+    int fd = open("/proc/klog", O_RDONLY);
+    if (fd < 0) return 0;
+    static char buf[1 << 20];
+    size_t n = 0; ssize_t r;
+    while (n < sizeof buf - 1 && (r = read(fd, buf + n, sizeof buf - 1 - n)) > 0) n += (size_t)r;
+    close(fd);
+    buf[n] = 0;
+    return strstr(buf, needle) != NULL;
+}
+static int zaptmo_ns(void);
+static int zaptmo(void)
+{
+    char cl[1024] = {0};
+    int cf = open("/proc/cmdline", O_RDONLY);
+    if (cf >= 0) { if (read(cf, cl, sizeof cl - 1) < 0) cl[0] = 0; close(cf); }
+    if (!strstr(cl, "pidns.zaptest=1")) { printf("nstest zaptmo: SKIP (needs pidns.zaptest=1)\n"); return 0; }
+    alarm(60);
+    /* The ns part runs in a child: once the ns init is gone, fork() in the
+     * unsharing process fails (ENOMEM), so recovery is checked from here. */
+    pid_t body = fork();
+    if (body == 0) _exit(zaptmo_ns());
+    int st = 0;
+    check("zaptmo_body", body > 0 && waitpid(body, &st, 0) == body && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    pid_t c = fork();
+    if (c == 0) _exit(0);
+    check("zaptmo_system_recovers", c > 0 && waitpid(c, &st, 0) == c && WIFEXITED(st));
+    printf("nstest: %d passed, %d failed\n", npass, nfail);
+    return nfail != 0;
+}
+static int zaptmo_ns(void)
+{
+    int p[2];
+    check("zaptmo_pipe", pipe(p) == 0);
+    pid_t init = -1;
+    check("zaptmo_unshare", unshare(CLONE_NEWPID) == 0);
+    init = fork();
+    if (init == 0) {
+        if (fork() == 0) { close(p[1]); char c; (void)!read(p[0], &c, 1); _exit(0); }
+        usleep(100000);
+        _exit(0);   /* init dies with a live child: zap runs */
+    }
+    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    int st = 0;
+    check("zaptmo_init_reaped", init > 0 && waitpid(init, &st, 0) == init);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    long ms = (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
+    printf("zaptmo: init reaped after %ld ms\n", ms);
+    check("zaptmo_returns_bounded", ms < 5000);
+    check("zaptmo_logged", klog_has("[pidns] zap timeout: ns "));
+    close(p[1]);   /* the victim sees EOF and exits on its own */
+    return nfail != 0;
 }
 
 int main(int argc, char **argv)
@@ -3552,7 +4284,14 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc > 1 && !strcmp(argv[1], "--euid")) return print_euid();
+    if (argc > 1 && !strcmp(argv[1], "--zaptmo")) return zaptmo();
     if (getenv("NSTEST_HOST")) { printf("nstest: SKIP (host)\n"); return 0; }
+    if (argc > 2 && !strcmp(argv[1], "--case")) {
+        only_case = argv[2]; only_reps = argc > 3 ? atoi(argv[3]) : 1;
+        run_userns_cases();
+        printf("nstest: %d passed, %d failed\n", npass, nfail);
+        return nfail != 0;
+    }
     for (unsigned i = 0; i < sizeof flags / sizeof flags[0]; i++) {
         char nm[64];
         long r;
@@ -3567,7 +4306,7 @@ int main(int argc, char **argv)
         snprintf(nm, sizeof nm, "unshare_%s_einval", flags[i].n);
         check(nm, r == -1 && e == EINVAL);
     }
-    if (geteuid() == 0) { nsforge_cases(); run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
+    if (geteuid() == 0) { nslimit_cases(); nsforge_cases(); run_userns_cases(); nobody_drop_child_ns_denied(); user_opens_child_ns(); sibling_nondumpable_denied(); userns_cap_case("userns_cap_nondumpable_denied", 0); userns_cap_case("userns_cap_exec_in_ns_allowed", 1); } else printf("SKIP userns cases: not root\n");
     /* A plain fork-style clone still works. */
     long r = do_clone(0);
     int ok = r >= 0;

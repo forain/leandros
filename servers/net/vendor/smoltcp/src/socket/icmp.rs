@@ -87,12 +87,14 @@ pub enum Endpoint {
     Unspecified,
     Ident(u16),
     Udp(IpListenEndpoint),
+    /// LEANDROS: a raw ICMPv6 socket takes every echo and error message (Linux raw(7)).
+    Raw,
 }
 
 impl Endpoint {
     pub fn is_specified(&self) -> bool {
         match *self {
-            Endpoint::Ident(_) => true,
+            Endpoint::Ident(_) | Endpoint::Raw => true,
             Endpoint::Udp(endpoint) => endpoint.port != 0,
             Endpoint::Unspecified => false,
         }
@@ -282,6 +284,11 @@ impl<'a> Socket<'a> {
 
     /// Check whether the transmit buffer is full.
     #[inline]
+    /// LEANDROS: packets still queued for transmission.
+    pub fn send_pending(&self) -> bool {
+        !self.tx_buffer.is_empty()
+    }
+
     pub fn can_send(&self) -> bool {
         !self.tx_buffer.is_full()
     }
@@ -479,6 +486,19 @@ impl<'a> Socket<'a> {
                 &Endpoint::Ident(bound_ident),
                 &IcmpRepr::Ipv6(Icmpv6Repr::EchoReply { ident, .. }),
             ) => ident == bound_ident,
+            // LEANDROS: a raw socket sees echo and every error (traceroute reads Time Exceeded here).
+            #[cfg(feature = "proto-ipv6")]
+            (
+                &Endpoint::Raw,
+                &IcmpRepr::Ipv6(
+                    Icmpv6Repr::EchoRequest { .. }
+                    | Icmpv6Repr::EchoReply { .. }
+                    | Icmpv6Repr::DstUnreachable { .. }
+                    | Icmpv6Repr::TimeExceeded { .. }
+                    | Icmpv6Repr::PktTooBig { .. }
+                    | Icmpv6Repr::ParamProblem { .. },
+                ),
+            ) => true,
             _ => false,
         }
     }
@@ -878,6 +898,7 @@ mod test_ipv4 {
         let data = &*packet.into_inner();
 
         let icmp_repr = Icmpv4Repr::DstUnreachable {
+            mtu: 0,
             reason: Icmpv4DstUnreachable::PortUnreachable,
             header: Ipv4Repr {
                 src_addr: LOCAL_IPV4,

@@ -12,8 +12,10 @@ this page.
 |---|---|
 | `init` | PID 1; mounts the root filesystem, supervises the graphical login, the serial getty and the VT 2..6 logins, and handles power-off ([below](#init)) |
 | `login` | Authenticates against `/etc/shadow`, sets supplementary groups, drops privilege via `setresgid`/`setresuid`, sets `XDG_RUNTIME_DIR`, execs the account's shell |
+| `utmpd` | Serves `/run/utmps/utmp` on `/run/utmps/.utmpd-socket` using the skarnet `utmps` protocol, which is what Alpine's busybox `who` speaks; started and respawned by init ([below](#utmpx)) |
 | `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter ([../desktop/login.md](../desktop/login.md)) |
 | `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable. As a non-root user with a D-Bus session in the environment it execs `leandros-sysbus power`, so the request goes through login1 like `systemctl poweroff` on Linux |
+| `w`, `users`, `lastlog` | utmp/lastlog readers ([below](#utmpx)) |
 | `ps` | Process status from `/proc`, procps-compatible ([below](#ps)) |
 | `meminfo` | One-line `sysinfo` sample of buddy-allocator total/free, so a session script can read a series rather than a point |
 | `shell` | The original built-in CLI with Unix-style commands and VFS integration, on leandros-libc |
@@ -64,12 +66,24 @@ authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shu
 ### sshd
 
 [userland/sshd](../../userland/sshd/src/main.rs) is the SSH server: russh 0.64 (ring
-crypto) on tokio, one root process for every connection.
+crypto) on tokio. The root listener only accepts: it re-execs `sshd -R` once per
+connection (socket on fd 3, startup pipe on fd 4), so a crash in one connection kills only
+that connection, never the listener or other sessions (and init's restart limit cannot trip).
+Each connection is then split into a root monitor and an unprivileged, chrooted, seccomp'd net child (see [../design/sshd-privsep.md](../design/sshd-privsep.md)). The vendored russh (`userland/sshd/vendor/russh`, see its
+`LEANDROS-PATCH.md`): the kex signature goes through a host-key signer callback that records
+the session id, and every publickey/certificate login has its raw signature re-verified
+against that session id (`src/userauth.rs`) before the authorized_keys check. SHA-1 `ssh-rsa` publickey signatures are refused (as OpenSSH 8.8+ does by default); use `rsa-sha2-256`/`rsa-sha2-512`. This is the
+groundwork for splitting the pre-auth code into an unprivileged child.
 
 - **Start.** init starts it at boot when `/usr/sbin/sshd` exists, unless
   `/etc/ssh/sshd_not_to_be_run` exists or the kernel command line has `sshd=0`. It runs in
   its own session; init restarts it with a 1, 2, 4, 8, 16 s backoff and gives up after five
   exits within 60 s. It logs to `/var/log/sshd.log`.
+- **Per-connection process.** `ps` shows `sshd-preauth` until the client authenticates and
+  `sshd-net` after. The listener enforces `MaxStartups` (a connection counts until its
+  process writes to the startup pipe or exits) and kills a process still unauthenticated 2 s
+  after `LoginGraceTime`, even if it is hung. Children do not inherit the listener's fds
+  (fds 3/4 are close-on-exec in the child so shells do not get them).
 - **Listening.** `0.0.0.0:22`. It also tries `[::]:22`, which fails with `EAFNOSUPPORT`
   because there is no IPv6 yet; it logs that and goes on.
 - **Host key.** An ed25519 key is generated on first boot into
@@ -77,13 +91,35 @@ crypto) on tokio, one root process for every connection.
 - **Configuration.** `/etc/ssh/sshd_config` uses an OpenSSH keyword subset: `Port`,
   `ListenAddress`, `HostKey`, `PermitRootLogin`, `PasswordAuthentication`,
   `PubkeyAuthentication`, `PermitEmptyPasswords no`, `AuthorizedKeysFile`, `MaxAuthTries`,
-  `LoginGraceTime`, `Subsystem sftp`. `sshd -t` checks the file and the key.
+  `LoginGraceTime`, `PermitUserEnvironment` (default `no`), `MaxStartups` (`start:rate:full`, default `10:30:100`: unauthenticated connections beyond `start` are dropped with rising probability, all beyond `full`), `Subsystem sftp`. `sshd -t` checks the file and the key.
+  Also `AllowTcpForwarding yes|all|no|local|remote` (`local` = `-L`/`-D`, `remote` = `-R`; combined with
+  the key's `no-port-forwarding`, the most restrictive wins), `ForceCommand` (wins over a key's
+  `command=`; the client's command goes to `SSH_ORIGINAL_COMMAND`; `internal-sftp` allows only the sftp
+  subsystem) and `TrustedUserCAKeys`. **`Match`** blocks (criteria `User`, `Group`, `Address`,
+  `LocalPort`, or `all`; comma pattern lists with `*`/`?` and `!` negation, CIDR for `Address`) are
+  evaluated per connection once the login name is known and may set `PasswordAuthentication`,
+  `PubkeyAuthentication`, `PermitRootLogin`, `AllowTcpForwarding`, `ForceCommand`,
+  `PermitUserEnvironment`, `AuthorizedKeysFile` and `DevPasswordAuthentication` (other keywords
+  inside a block are logged and ignored; `X11Forwarding`/`Banner` do not exist here). A matching
+  block overrides the global section; among matching blocks the first value of a keyword wins.
+- **User certificates.** `ssh-*-cert-v01@openssh.com` user certificates (ed25519, ecdsa, rsa) are accepted
+  when signed by a CA listed in `TrustedUserCAKeys` (principal must include the login name) or by
+  a `cert-authority` key in the user's `authorized_keys` (the line may carry `principals="a,b*"`,
+  `from=`, `command=`, `expiry-time=`). Checked: signature, validity window, user (not host)
+  certificate, principals (a certificate with none is refused), `force-command` (conflicting
+  `command=` refuses) and `source-address` critical options; any other critical option refuses the
+  login; without the `permit-port-forwarding` / `permit-pty` extensions those are denied. A
+  `cert-authority` key itself is never a login key. Not implemented: `AuthorizedPrincipalsFile`,
+  `RevokedKeys`.
 - **Authentication.** Passwords are checked against `/etc/shadow` in the system's
-  `$sha256$salt$hex` format, as `/bin/login` checks them. Public keys come from
-  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks; lines with
-  options are skipped. root may log in with a key but not with a password
+  sha512-crypt `$6$` format (legacy `$sha256$` fields still verify and are rewritten to `$6$rounds=65536` on the next successful login, atomically via `/etc/shadow.sshd-new` + rename), as `/bin/login` checks them. `keyboard-interactive` is offered with one hidden `Password:` prompt and the same checks as `password` (sshd implements the conversation itself; it does not load `pam-leandros`). Public keys come from
+  `~/.ssh/authorized_keys`, with OpenSSH's StrictModes ownership and mode checks. Key options `from=` (globs, `!`
+  negation, CIDR), `command=` (forced command; the client's command goes to
+  `SSH_ORIGINAL_COMMAND`; sftp is refused), `no-pty`, `no-port-forwarding`, `restrict`, `permitopen="host:port"`, `permitlisten="[host:]port"`, `expiry-time="YYYYMMDD[HHMM[SS]][Z]"` (UTC) and `environment="N=v"` (only with `PermitUserEnvironment yes`) are
+  enforced; a line with any other option is skipped, never half-applied. root may log in with a key but not with a password
   (`PermitRootLogin prohibit-password`). Empty passwords, locked (`!`) accounts and
   `false`/`nologin` shells are refused.
+- **TCP forwarding.** `ssh -L` (direct-tcpip) connects from the server; `ssh -R` (tcpip-forward, port 0 allocates) listens on the server's loopback only (GatewayPorts no) and opens forwarded-tcpip channels back. `no-port-forwarding`/`restrict` refuse both; `permitopen`/`permitlisten` limit them to the listed destinations. Streamlocal (unix sockets) and `-D` dynamic forwarding clients work only as far as they use direct-tcpip.
 - **Sessions.** Each session is a child process. Between fork and exec the child calls
   `setsid`, then (with a pty) `TIOCSCTTY`, then `setgroups`, `setresgid` and `setresuid`.
   It reads the ids back and checks that `setuid(0)` fails before it execs.
@@ -215,7 +251,7 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 
 ## Limitations & open work
 
-- No `passwd`, `who`/`w`/`last` (and no utmpx for them to read).
+- No `passwd`; `who`/`last` come from Alpine busybox, `w`/`users`/`lastlog` are native (utmpx below).
 - `shell` is legacy; new interactive work goes into brush.
 
 ## Code & tests
@@ -232,3 +268,51 @@ for a Linux host, so the two runs' result lines can be diffed — Linux is the o
 - [README.md](README.md), [libc.md](libc.md), [ports.md](ports.md)
 - [../getting-started/logging-in.md](../getting-started/logging-in.md)
 - [../development/testing.md](../development/testing.md)
+
+## ec2init (EC2 first boot)
+
+`/bin/ec2init` (`userland/ec2init/ec2init.c`) is started in the background by
+init at every boot and exits at once unless this is EC2: the kernel command
+line has `ec2=1` (or `ec2init.endpoint=HOST:PORT`) or the DMI vendor
+(`/sys/class/dmi/id/sys_vendor`, `bios_vendor`) contains "Amazon". On EC2 it
+waits for the network (`ec2init.wait=N`, default 90 s), asks the instance
+metadata service for an IMDSv2 token (`PUT /latest/api/token`, 6 h TTL; every
+later `GET` carries it) and, once per instance id (`/var/lib/ec2-init/instance-id`),
+appends the instance's `public-keys/0/openssh-key` to `~/.ssh/authorized_keys`
+of `root` and `leandro` (deduplicated, so the russh sshd accepts it), sets the
+hostname from `local-hostname` (first label, also written to `/etc/hostname`)
+and, with `ec2init.userdata=1`, saves and runs `user-data` when it starts with
+`#!`. `ec2init=0` disables it; `ec2init.endpoint=` overrides 169.254.169.254:80.
+It never blocks boot, and a failed step leaves no stamp, so the next boot retries.
+
+## utmpx
+
+Login records follow the Alpine/musl `struct utmpx` (400 bytes) so Alpine's busybox
+(`/bin/busybox.static who`, `... last`) reads them unmodified. The shared writer is
+`lib/utmpx/utmpx.rs` (`core` only, raw syscalls; `#[path]`-included by init, login, utmpd,
+sshd and `pam-leandros`).
+
+| File | Content | Reader |
+|---|---|---|
+| `/run/utmps/utmp` | current sessions; truncated at boot | `who` through `utmpd` |
+| `/var/log/wtmp` | append-only history (BOOT_TIME, RUN_LVL, USER_PROCESS, DEAD_PROCESS) | `last` |
+| `/var/log/lastlog` | `struct lastlog` (292 bytes) at `uid * 292` | `lastlog` |
+
+Writers: init writes BOOT_TIME and RUN_LVL and closes a session (DEAD_PROCESS) when it reaps
+the session leader; `login` records the console/VT login (the shell keeps login's pid);
+sshd records pty sessions with the client address as `ut_host`; the PAM shim records greetd
+sessions. `su` and `sudo` write nothing, as on Linux (pam_unix records no utmp entry;
+only login, sshd, getty and display managers do); `sudotest` guards that.
+
+Native readers (`userland/utmptools`, Linux formats, times in UTC):
+
+| Program | Output |
+|---|---|
+| `users` | sorted names of the logged-in users on one line |
+| `w [-h] [user]` | uptime/load header (`/proc/uptime`, `/proc/loadavg`), then `USER TTY FROM LOGIN@ IDLE WHAT`; IDLE is the tty's atime, WHAT the cmdline of the tty's foreground process |
+| `lastlog [-u user]` | `Username Port From Latest` for each `/etc/passwd` account, `**Never logged in**` if the uid has no record |
+
+Writers coordinate with an exclusive `flock` on utmp (readers take a shared one); wtmp is
+`O_APPEND` (atomic per record) and each lastlog record is one positional write. `utmptest`
+(regress suite `utmp`) runs 20 concurrent login/logout sessions through the shared writer
+and checks whole records, no lost sessions, and the readers' output.

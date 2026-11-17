@@ -91,11 +91,14 @@ fn split(path: &[u8]) -> Option<Split<'_>> {
 
 /// True when `path` is inside an active overlay class directory.
 pub fn is_path(path: &[u8]) -> bool {
-    cpu_split(path).is_some() || split(path).is_some()
+    is_chardir(path) || super::sysinput::is_path(path) || super::sysdrm::is_path(path) || cpu_split(path).is_some() || split(path).is_some()
 }
 
 /// Resolve `path` to an overlay directory as `(dev, level)`.
 pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
+    if is_chardir(path) { return Some((CHAR_DEV, LVL_CHAR)); }
+    if super::sysinput::is_path(path) { return super::sysinput::dir(path); }
+    if super::sysdrm::is_path(path) { return super::sysdrm::dir(path); }
     if let Some(c) = cpu_split(path) { return cpu_dir(c); }
     let s = split(path)?;
     if s.cls == POWER { return if s.attr.is_none() { Some((SC_BASE | (POWER as u16) << 8 | 0xFF, LVL_SC_CLASS)) } else { None }; }
@@ -111,6 +114,8 @@ pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
 
 /// Read an attribute file.
 pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    if super::sysinput::is_path(path) { return super::sysinput::attr(path, out); }
+    if super::sysdrm::is_path(path) { return super::sysdrm::attr(path, out); }
     if let Some(c) = cpu_split(path) { return cpu_attr(c, out); }
     let s = split(path)?;
     if s.cls == POWER { return (s.o.read)("power", "", s.attr?, out); }
@@ -179,6 +184,9 @@ pub fn write(path: &[u8], data: &[u8]) -> i32 {
 /// The `idx`-th entry of an overlay directory: `(name length, is_dir)`.
 pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
     if dev == SC_TABLES { return tables_dirent(idx, out); }
+    if dev == CHAR_DEV { return chardir_dirent(idx, out); }
+    if (dev >> 8) & 0xF == super::sysinput::SI_CLS { return super::sysinput::dirent(dev, level, idx, out); }
+    if (dev >> 8) & 0xF == super::sysdrm::SD_CLS { return super::sysdrm::dirent(dev, level, idx, out); }
     if (dev >> 8) & 0xF == CPU_CLS as u16 { return cpu_dirent(dev, idx, out); }
     let o = ops()?;
     let cls = ((dev >> 8) & 0xF) as usize;
@@ -318,4 +326,94 @@ fn cpu_dirent(dev: u16, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, 
     let b = name.as_bytes();
     out[..b.len()].copy_from_slice(b);
     Some((b.len(), dir))
+}
+
+// ---------------------------------------------------------------------------
+// `/sys/dev/char`: the directory itself is generated so its listing shows the
+// DRM nodes (226:*, staged on disk) next to the evdev nodes (13:*, symlinks to
+// the class entries). Children other than `13:*` stay on disk.
+
+const CHAR_CLS: u16 = 0xB;
+pub const LVL_CHAR: u8 = 0xB0;
+pub const CHAR_DEV: u16 = SC_BASE | CHAR_CLS << 8 | 0xFF;
+
+fn is_chardir(path: &[u8]) -> bool {
+    let mut p = path;
+    while p.len() > 1 && p[p.len() - 1] == b'/' { p = &p[..p.len() - 1]; }
+    p == b"/sys/dev/char" && (super::sysdrm::present() || super::sysinput::present())
+}
+
+fn chardir_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    let mut idx = idx;
+    if super::sysdrm::present() {
+        let names: [&str; 2] = ["226:0", "226:128"];
+        if idx < 2 { out[..names[idx].len()].copy_from_slice(names[idx].as_bytes()); return Some((names[idx].len(), true)); }
+        idx -= 2;
+    }
+    super::sysinput::char_dirent(idx, out)
+}
+
+/// Is entry `idx` of overlay directory `(dev, level)` a symlink (DT_LNK)?
+pub fn dirent_link(dev: u16, level: u8, idx: usize) -> bool {
+    if dev == CHAR_DEV { return idx >= if super::sysdrm::present() { 2 } else { 0 }; }
+    match (dev >> 8) & 0xF {
+        c if c == super::sysinput::SI_CLS => super::sysinput::dirent_link(level, idx),
+        c if c == super::sysdrm::SD_CLS => super::sysdrm::dirent_link(level, idx),
+        _ => false,
+    }
+}
+
+/// Target of the generated symlink at `path` (readlink body); `None` when it is not one.
+pub fn link(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    let t = super::sysinput::link(path)?;
+    let b = t.as_bytes();
+    if b.len() > out.len() { return None; }
+    out[..b.len()].copy_from_slice(b);
+    Some(b.len())
+}
+
+/// Expand generated symlinks inside `path` (all components, and the last one
+/// only when `follow`). `Ok(None)` when none is met. The result is normalised.
+pub fn expand(path: &[u8], follow: bool) -> Result<Option<alloc::vec::Vec<u8>>, i32> {
+    if !(path.starts_with(b"/sys/dev/char/13:") || path.starts_with(b"/sys/class/input/")) { return Ok(None); }
+    let mut cur = path.to_vec();
+    let mut hops = 0;
+    let mut changed = false;
+    'again: loop {
+        let mut end = 1;
+        while end < cur.len() {
+            let mut e = end;
+            while e < cur.len() && cur[e] != b'/' { e += 1; }
+            let last = e >= cur.len();
+            if !(last && !follow) {
+                let mut tb = [0u8; 96];
+                if let Some(n) = link(&cur[..e], &mut tb) {
+                    hops += 1;
+                    if hops > 8 { return Err(-40); }
+                    let parent_end = cur[..e].iter().rposition(|&c| c == b'/').unwrap_or(0);
+                    let mut next = cur[..parent_end].to_vec();
+                    next.push(b'/');
+                    next.extend_from_slice(&tb[..n]);
+                    next.extend_from_slice(&cur[e..]);
+                    cur = normalize(&next);
+                    changed = true;
+                    continue 'again;
+                }
+            }
+            end = e + 1;
+        }
+        break;
+    }
+    Ok(if changed { Some(cur) } else { None })
+}
+
+fn normalize(p: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut comps: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    for c in p.split(|&b| b == b'/') {
+        match c { b"" | b"." => {}, b".." => { comps.pop(); }, c => comps.push(c) }
+    }
+    let mut out = alloc::vec::Vec::new();
+    for c in comps { out.push(b'/'); out.extend_from_slice(c); }
+    if out.is_empty() { out.push(b'/'); }
+    out
 }

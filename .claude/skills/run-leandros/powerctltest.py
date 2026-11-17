@@ -20,6 +20,7 @@ cosmic-osd reach. Boots its own image clones; LEANDROS_RUN_ID must be set.
 Prints `powerctl_<step>: PASS|FAIL` and a summary; exit 0 iff all passed.
 """
 import os
+import hostclean
 import re
 import subprocess
 import sys
@@ -29,6 +30,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import driver  # noqa: E402
+import imgclone  # noqa: E402
 import nmsession as nms  # noqa: E402  (key/typ/drv/clone_path helpers)
 import sshsmoke  # noqa: E402
 
@@ -58,7 +60,7 @@ def log_since(mark):
 
 
 def main():
-    arch = sys.argv[1] if len(sys.argv) > 1 else "aarch64"
+    arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
     scale = driver.wait_scale(arch)
     REPO = nms.REPO
     for what, src, var in (("boot", f"leandros-limine-{arch}.img", "LEANDROS_DISK_IMAGE"),
@@ -66,8 +68,7 @@ def main():
         img = nms.clone_path(arch, what)
         if os.path.exists(img):
             os.unlink(img)
-        if subprocess.run(["cp", "-c", os.path.join(REPO, src), img], capture_output=True).returncode != 0:
-            subprocess.run(["cp", os.path.join(REPO, src), img], check=True)
+        imgclone.clone_file(os.path.join(REPO, src), img)
         os.environ[var] = img
     try:
         if nms.drv("start", arch, "--virgl", t=900) != 0:
@@ -112,6 +113,7 @@ def run(arch, scale):
     # 1. a non-session caller (ssh) is refused
     host, port = sshsmoke.target()
     tmp = tempfile.mkdtemp(prefix="powerctl-")
+    hostclean.track(tmp)
     ssh = sshsmoke.Ssh(host, port, tmp)
     mark = log_size()
     rc, out, err = ssh.run("leandro", "/bin/reboot; echo rc=$?; /bin/systemctl poweroff; echo rc=$?",
@@ -198,4 +200,4 @@ def run(arch, scale):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(hostclean.run(main))

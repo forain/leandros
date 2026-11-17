@@ -3683,6 +3683,15 @@ pub mod poll_class {
     pub const MQ: u32 = 27;
     /// A V4L2 capture node (kernel/src/v4l2.rs), index 0.
     pub const VIDEO: u32 = 26;
+    /// A bound AF_UNIX datagram socket's inbox, indexed by its `sock_id`
+    /// (servers/net `unixdg::rd_key`): a datagram was queued.
+    pub const UNIX_DG: u32 = 28;
+    /// Same inbox, write side (`unixdg::wr_key`): the receiver drained a
+    /// datagram or went away, so a sender parked on a full inbox re-probes.
+    pub const UNIX_DGW: u32 = 29;
+    /// A datagram sender's own wmem budget (`unixdg::snd_key`, indexed by its
+    /// ofd): a datagram it queued in some inbox was consumed or dropped.
+    pub const UNIX_DGS: u32 = 30;
 }
 
 /// Bumped by every producer whose object's poll tag itself changes (a
@@ -6992,16 +7001,51 @@ pub fn take_fault_sigbus() -> bool {
 /// a CPU holding the VT lock while waiting on either deadlocks with the dump
 /// (observed: the census wedged all four CPUs at its first digit).
 mod dump_raw {
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     extern "C" { fn arch_serial_putc_dump(c: u8); }
+    /// Capture buffer for `dump_tasks`: the task rows are formatted into it
+    /// while RUN_QUEUE is held and written to the (slow) UART only after the
+    /// lock and IF are back, so a dump no longer freezes a one-CPU guest for
+    /// the tens of ms the UART takes. Static (no allocation in IRQ context);
+    /// the RUN_QUEUE holder is the only writer while CAP_ON is set. On
+    /// overflow the buffer is flushed and the rest prints directly.
+    const CAP_SIZE: usize = 96 * 1024;
+    static mut CAP_BUF: [u8; CAP_SIZE] = [0; CAP_SIZE];
+    static CAP_LEN: AtomicUsize = AtomicUsize::new(0);
+    static CAP_ON: AtomicBool = AtomicBool::new(false);
+    pub fn putc(c: u8) {
+        if CAP_ON.load(Ordering::Acquire) {
+            let n = CAP_LEN.load(Ordering::Relaxed);
+            if n < CAP_SIZE {
+                unsafe { (&raw mut CAP_BUF as *mut u8).add(n).write(c); }
+                CAP_LEN.store(n + 1, Ordering::Relaxed);
+                return;
+            }
+            flush();
+            CAP_ON.store(false, Ordering::Release);
+        }
+        unsafe { arch_serial_putc_dump(c); }
+    }
+    /// Start capturing (caller holds RUN_QUEUE).
+    pub fn capture_begin() { CAP_LEN.store(0, Ordering::Relaxed); CAP_ON.store(true, Ordering::Release); }
+    /// Stop capturing and write what was captured to the UART.
+    pub fn capture_end() {
+        CAP_ON.store(false, Ordering::Release);
+        flush();
+    }
+    fn flush() {
+        let n = CAP_LEN.swap(0, Ordering::Relaxed);
+        for i in 0..n { unsafe { arch_serial_putc_dump((&raw const CAP_BUF as *const u8).add(i).read()); } }
+    }
     pub fn ph(n: usize) {
         let d = b"0123456789ABCDEF";
-        for i in (0..16).rev() { unsafe { arch_serial_putc_dump(d[(n >> (i * 4)) & 0xF]); } }
+        for i in (0..16).rev() { putc(d[(n >> (i * 4)) & 0xF]); }
     }
     pub fn pn(n: u32) {
-        if n == 0 { unsafe { arch_serial_putc_dump(b'0'); } return; }
+        if n == 0 { putc(b'0'); return; }
         let mut buf = [0u8; 10]; let mut i = 0; let mut v = n;
         while v > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i += 1; }
-        for j in (0..i).rev() { unsafe { arch_serial_putc_dump(buf[j]); } }
+        for j in (0..i).rev() { putc(buf[j]); }
     }
 }
 
@@ -7020,8 +7064,7 @@ const DUMP_X86_RET: bool = false;
 
 pub fn dump_tasks() {
     fn print_str(s: &str) {
-        extern "C" { fn arch_serial_putc_dump(c: u8); }
-        for &b in s.as_bytes() { unsafe { arch_serial_putc_dump(b); } }
+        for &b in s.as_bytes() { dump_raw::putc(b); }
     }
     use dump_raw::{ph, pn};
     pcsample::request_drain();
@@ -7030,6 +7073,7 @@ pub fn dump_tasks() {
         Some(rq) => rq,
         None => { print_str("[TASKS] run queue busy, try again\n"); return; }
     };
+    dump_raw::capture_begin();
     print_str("[TASKS] tick="); pn(ticks() as u32);
     print_str(" len="); pn(rq.len() as u32);
     print_str(" quiesce_tgid="); pn(QUIESCE_TGID.load(Ordering::Relaxed));
@@ -7204,6 +7248,7 @@ pub fn dump_tasks() {
         print_str("\n");
     }
     drop(rq);
+    dump_raw::capture_end();
     // Subsystem dumps (the net server's socket tables) run after the run
     // queue is released: they take their own locks, by try_lock only.
     for h in DUMP_HOOKS.iter() {

@@ -581,7 +581,7 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
     if idx >= MAX_NET_DEVICES { return; }
     core::ptr::addr_of_mut!((*d.tx_queue.avail).flags).write_volatile(1); // NO_INTERRUPT
     let pci = &d._pci;
-    #[cfg(target_arch = "x86_64")]
+    // x86_64 always; aarch64 when an ITS is up (`irq::msi_supported`).
     if let Ok(tab) = irq::MsixTable::enable(pci.function()) {
         const NO_VECTOR: u16 = 0xFFFF;
         if let Ok(h) = tab.request(0, virtio_net_irq, idx) {
@@ -599,7 +599,10 @@ unsafe fn arm_rx_irq(idx: usize, d: &VirtioNetDevice) {
                 crate::kenv::pci::serial_debug("\n");
                 return;
             }
+            irq::free_irq(h);
         }
+        // Vector refused or not accepted by the device: back to INTx / polling.
+        tab.disable();
     }
     #[cfg(target_arch = "aarch64")]
     {

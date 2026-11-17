@@ -15,6 +15,12 @@ use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, I
 /// bound socket wins" unicast demultiplexing).
 static BIND_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
+/// LEANDROS: multicast source filter hook (IP_ADD_SOURCE_MEMBERSHIP & co):
+/// a `fn(owner: u32, group: [u8; 16], src: [u8; 16]) -> bool` (IPv4 as ::ffff:a.b.c.d) stored as usize
+/// (0 = none), set by the net server. Called under the stack lock, so it
+/// may only take leaf locks.
+pub static MCAST_SRC_FILTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Metadata for a sent or received UDP packet.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +75,26 @@ pub type PacketMetadata = crate::storage::PacketMetadata<UdpMetadata>;
 
 /// A UDP packet ring buffer.
 pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, UdpMetadata>;
+
+/// LEANDROS: one entry of the socket error queue (Linux sock_exterr_skb).
+#[derive(Debug, Clone)]
+pub struct ErrEntry {
+    pub errno: u8,
+    /// SO_EE_ORIGIN_LOCAL 1, _ICMP 2, _ICMP6 3.
+    pub origin: u8,
+    pub ty: u8,
+    pub code: u8,
+    /// ee_info: the MTU for "fragmentation needed" / "packet too big".
+    pub info: u32,
+    /// The ICMP sender (SO_EE_OFFENDER); unspecified for a local error.
+    pub offender: IpAddress,
+    /// The destination of the datagram that failed (msg_name).
+    pub dst: IpEndpoint,
+    /// What the ICMP error quoted after the UDP header.
+    pub payload: alloc::vec::Vec<u8>,
+}
+
+pub const ERRQ_MAX: usize = 32;
 
 /// Error returned by [`Socket::bind`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -153,11 +179,18 @@ pub struct Socket<'a> {
     /// LEANDROS: SO_REUSEPORT: unicast to a group of such sockets sharing a
     /// port is spread over them by a hash of the flow.
     reuseport: bool,
+    /// LEANDROS: the owner token (open file description) handed to
+    /// `MCAST_SRC_FILTER`.
+    owner: Option<u32>,
     /// LEANDROS: when the socket was bound (`BIND_SEQ`).
     bind_seq: u64,
     /// LEANDROS: a pending socket error (errno, 0 = none) from an ICMP
     /// error about a datagram this connected socket sent (sk_err).
     error: u8,
+    /// LEANDROS: IP_RECVERR / IPV6_RECVERR: errors are queued on `errq`.
+    recverr: bool,
+    /// LEANDROS: the socket error queue (MSG_ERRQUEUE), oldest first.
+    errq: alloc::collections::VecDeque<ErrEntry>,
     /// LEANDROS: since when the head datagram has failed to dispatch (its
     /// next hop unresolved). Dropped after `TX_STALL_MS`, so one
     /// unreachable on-link peer cannot block every later send (Linux drops
@@ -180,8 +213,11 @@ impl<'a> Socket<'a> {
             hop_limit: None,
             peer: None,
             reuseport: false,
+            owner: None,
             bind_seq: 0,
             error: 0,
+            recverr: false,
+            errq: alloc::collections::VecDeque::new(),
             tx_stall_since: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -309,6 +345,11 @@ impl<'a> Socket<'a> {
         self.peer = peer;
     }
 
+    /// LEANDROS: owner token for the multicast source filter.
+    pub fn set_owner(&mut self, owner: u32) {
+        self.owner = Some(owner);
+    }
+
     /// LEANDROS: SO_REUSEPORT.
     pub fn set_reuseport(&mut self, on: bool) {
         self.reuseport = on;
@@ -322,6 +363,44 @@ impl<'a> Socket<'a> {
     /// LEANDROS: the order of binds (larger = bound later).
     pub fn bind_seq(&self) -> u64 {
         self.bind_seq
+    }
+
+    /// LEANDROS: IP_RECVERR on / off.
+    pub fn set_recverr(&mut self, on: bool) {
+        self.recverr = on;
+    }
+
+    pub fn recverr(&self) -> bool {
+        self.recverr
+    }
+
+    /// LEANDROS: queue a socket error (at most `ERRQ_MAX`; Linux drops past
+    /// SO_RCVBUF) and wake the reader. Linux ip_local_error / ip_icmp_error.
+    pub fn push_err(&mut self, e: ErrEntry) {
+        if self.errq.len() < ERRQ_MAX {
+            self.errq.push_back(e);
+        }
+        #[cfg(feature = "async")]
+        self.rx_waker.wake();
+    }
+
+    pub fn errq_len(&self) -> usize {
+        self.errq.len()
+    }
+
+    /// LEANDROS: the oldest queued error; `take` dequeues it. Dequeuing
+    /// re-arms `sk_err` from the next entry, or clears it when the queue
+    /// runs dry (sock_dequeue_err_skb).
+    pub fn recv_err(&mut self, take: bool) -> Option<ErrEntry> {
+        if !take {
+            return self.errq.front().cloned();
+        }
+        let e = self.errq.pop_front()?;
+        self.error = match self.errq.front() {
+            Some(n) if n.origin >= 2 => n.errno,
+            _ => 0,
+        };
+        Some(e)
     }
 
     /// LEANDROS: the pending socket error (errno; 0 = none).
@@ -601,6 +680,30 @@ impl<'a> Socket<'a> {
                 return None;
             }
             score += 8;
+        }
+        if let Some(owner) = self.owner {
+            let (dst, src) = (ip_repr.dst_addr(), ip_repr.src_addr());
+            let f = MCAST_SRC_FILTER.load(core::sync::atomic::Ordering::Relaxed);
+            if dst.is_multicast() && f != 0 {
+                let m = |a: IpAddress| -> [u8; 16] {
+                    match a {
+                        IpAddress::Ipv4(a) => {
+                            let mut b = [0u8; 16];
+                            b[10] = 0xff;
+                            b[11] = 0xff;
+                            b[12..].copy_from_slice(&a.0);
+                            b
+                        }
+                        IpAddress::Ipv6(a) => a.0,
+                    }
+                };
+                // SAFETY: only ever stored from a `fn(u32, [u8; 16], [u8; 16]) -> bool`.
+                #[allow(unsafe_code)]
+                let f: fn(u32, [u8; 16], [u8; 16]) -> bool = unsafe { core::mem::transmute(f) };
+                if !f(owner, m(dst), m(src)) {
+                    return None;
+                }
+            }
         }
         Some(score)
     }

@@ -555,6 +555,11 @@ impl Framebuffer {
             b'E' => { row = (row + p(0, 1)).min(rows - 1); col = 0; }        // CNL
             b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }          // CPL
             b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),    // CHA
+            b'I' => col = ((col / 8 + p(0, 1)) * 8).min(cols - 1),           // CHT
+            b'Z' => {                                                        // CBT
+                let n = p(0, 1);
+                col = if col % 8 == 0 { col.saturating_sub(8 * n) } else { (col / 8).saturating_sub(n - 1) * 8 };
+            }
             b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),           // VPA
             b'H' | b'f' => {                                                 // CUP
                 row = p(0, 1).saturating_sub(1).min(rows - 1);

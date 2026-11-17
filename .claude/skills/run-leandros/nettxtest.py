@@ -13,6 +13,7 @@ Run id `<caller run id>-nettx`.
 """
 import http.server
 import os
+import hostclean
 import re
 import socketserver
 import subprocess
@@ -97,6 +98,7 @@ def main(argv):
             # Guest -> host bulk (scp pull's direction): sshd streams zeros.
             import sshsmoke, tempfile
             tmp = tempfile.mkdtemp(prefix="nettx-")
+            hostclean.track(tmp)
             h, p = sshsmoke.target()
             ssh = sshsmoke.Ssh(h, p, tmp)
             for _ in range(30):
@@ -171,4 +173,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(hostclean.run(main, sys.argv[1:]))

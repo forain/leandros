@@ -41,6 +41,8 @@ const DRM_IOCTL_MODE_DIRTYFB: u32 = 0xC01864B1;
 // _IOWR('d', 0xB9, drm_mode_obj_get_properties) — struct is 28 data bytes,
 // padded to 32 by its u64 members, hence size 0x20 in the request code.
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = 0xC02064B9;
+// _IOWR('d', 0xBA, drm_mode_obj_set_property {u64 value; u32 prop_id; u32 obj_id; u32 obj_type}).
+const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = 0xC01864BA;
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u32 = 0xC01064B5; // _IOWR('d',0xB5, drm_mode_get_plane_res=16)
 const DRM_IOCTL_MODE_GETPLANE: u32 = 0xC02064B6;          // _IOWR('d',0xB6, drm_mode_get_plane=32)
 const DRM_IOCTL_MODE_GETPROPERTY: u32 = 0xC04064AA;       // _IOWR('d',0xAA, drm_mode_get_property=64)
@@ -260,6 +262,14 @@ const PROP_IN_FORMATS: u32 = 52;
 const PROP_IN_FENCE_FD: u32 = 53;
 const PROP_ACTIVE: u32 = 60;
 const PROP_MODE_ID: u32 = 61;
+/// CRTC `VRR_ENABLED` (range 0..1, mutable). Stored and read back as Linux's
+/// core does (the core never rejects a 1 on a non-capable sink; drivers just
+/// leave adaptive sync off), but no backend programs variable refresh yet.
+const PROP_VRR_ENABLED: u32 = 62;
+/// Connector `vrr_capable` (immutable range 0..1). Always 0: virtio-gpu has no
+/// variable-refresh scanout, and i915 does not yet parse the EDID range
+/// descriptor / DP MSA_TIMING_PAR_IGNORED (TODO.md "VRR").
+const PROP_VRR_CAPABLE: u32 = 71;
 const PROP_CONN_CRTC_ID: u32 = 70;
 
 // drm_mode_object types (used as OBJECT-property value types).
@@ -271,6 +281,7 @@ const DRM_MODE_OBJECT_CONNECTOR_T: u32 = 0xc0c0_c0c0;
 
 // drm_mode_property flags.
 const DRM_MODE_PROP_RANGE: u32 = 1 << 1;
+const DRM_MODE_PROP_IMMUTABLE: u32 = 1 << 2;
 const DRM_MODE_PROP_ENUM: u32 = 1 << 3;
 const DRM_MODE_PROP_BLOB: u32 = 1 << 4;
 const DRM_MODE_PROP_OBJECT: u32 = 1 << 6; // DRM_MODE_PROP_TYPE(1)
@@ -280,6 +291,7 @@ const DRM_MODE_PROP_SIGNED_RANGE: u32 = 2 << 6; // DRM_MODE_PROP_TYPE(2)
 const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x0100;
 const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x0200;
 const EBUSY: i32 = 16;
+const EACCES: i32 = 13;
 const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x0400;
 
 /// How a property's value array must be reported. The compositor's drm-rs
@@ -331,6 +343,8 @@ static PROPS: &[PropDef] = &[
     prop(PROP_ACTIVE, b"ACTIVE\0", PropKind::Range(0, 1)),
     prop(PROP_MODE_ID, b"MODE_ID\0", PropKind::Blob),
     prop(PROP_CONN_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
+    prop(PROP_VRR_ENABLED, b"VRR_ENABLED\0", PropKind::Range(0, 1)),
+    prop(PROP_VRR_CAPABLE, b"vrr_capable\0", PropKind::Range(0, 1)),
 ];
 
 fn prop_def(id: u32) -> Option<&'static PropDef> {
@@ -398,8 +412,8 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         PROP_CRTC_W,
         PROP_CRTC_H,
     ];
-    const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID];
-    const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID];
+    const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID, PROP_VRR_ENABLED];
+    const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID, PROP_VRR_CAPABLE];
     // With a KMS backend (gpu_kms): IN_FORMATS on the primary (so smithay
     // allocates with the modifiers the backend can scan out), and a cursor
     // plane only when the backend has a hardware cursor (`gpu_kms::cursor`).
@@ -747,6 +761,98 @@ struct drm_mode_modeinfo {
     flags: u32,
     type_: u32,
     name: [u8; 32],
+}
+
+/// Mode sizes of the primary connector: the native mode first, then the common
+/// sizes that fit inside it. Shared by GETCONNECTOR and `/sys/class/drm`.
+fn primary_modes() -> ([(u32, u32); 17], usize) {
+        // The native mode is the boot console's size, i.e. the host's preferred
+        // scanout from GET_DISPLAY_INFO. It never changes after boot, so the
+        // list below is stable across a mode switch.
+        extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
+        let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+        unsafe { vfs_get_framebuffer_info(&mut info); }
+        let (nw, nh) = if let Some((w, h, _)) = crate::gpu_kms::fixed_mode() {
+            (w, h)
+        } else if info.width > 0 && info.height > 0 {
+            (info.width, info.height)
+        } else {
+            (1280, 800)
+        };
+
+        // Mode list: the native mode first (PREFERRED, and index 0 for callers
+        // that read only one), then the common VESA/CEA sizes that fit inside
+        // it, like Linux virtio-gpu (drm_add_modes_noedid up to the preferred
+        // size). Only one mode used to be listed, so Settings > Displays had
+        // no resolution to switch to. Every mode is 60 Hz; a virtio-gpu
+        // scanout takes its size from the framebuffer bound to it, so a mode
+        // switch is the compositor allocating buffers of the new size.
+        let mut sizes: [(u32, u32); 17] = [(0, 0); 17];
+        let mut n = 0usize;
+        sizes[n] = (nw, nh);
+        n += 1;
+        // A KMS backend's scanout has exactly its own mode (no modeset).
+        let extra = !crate::gpu_kms::active();
+        for &(w, h) in STANDARD_MODES.iter() {
+            if extra && w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
+                sizes[n] = (w, h);
+                n += 1;
+            }
+        }
+
+    (sizes, n)
+}
+
+
+/// One connector as `/sys/class/drm/card0-<TYPE>-<n>` shows it (the VFS
+/// `sysdrm` overlay). Built from the same state GETCONNECTOR answers.
+#[derive(Clone, Copy)]
+pub struct SysConn {
+    pub conn_type: u32,
+    pub type_id: u32,
+    pub connected: bool,
+    pub nmodes: usize,
+    /// width, height, refresh Hz
+    pub modes: [(u32, u32, u32); 17],
+}
+
+/// Is there a DRM device whose GETCONNECTOR works?
+fn sysfs_drm_present() -> bool {
+    extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
+    let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
+    unsafe { vfs_get_framebuffer_info(&mut info); }
+    crate::gpu_uapi::active() || crate::gpu_kms::active() || (info.width > 0 && info.height > 0)
+}
+
+/// Connector `i` (0 = the primary, 1.. = the backend's extras), `None` past the end.
+pub fn sysfs_connector(i: usize) -> Option<SysConn> {
+    if !sysfs_drm_present() { return None; }
+    let mut c = SysConn { conn_type: 0, type_id: 0, connected: false, nmodes: 0, modes: [(0, 0, 0); 17] };
+    if i == 0 {
+        c.conn_type = if crate::gpu_kms::internal_panel() { 14 } else { 11 };
+        c.type_id = 1;
+        c.connected = true;
+        let (sizes, n) = primary_modes();
+        for k in 0..n { c.modes[k] = (sizes[k].0, sizes[k].1, 60); }
+        c.nmodes = n;
+        return Some(c);
+    }
+    let e = i - 1;
+    if e >= crate::gpu_kms::ext_count() { return None; }
+    let inf = crate::gpu_kms::outputs().and_then(|o| (o.cached)(e))?;
+    let hidden = crate::gpu_kms::ext_crtc_mask(e) == 0 && crate::nvidia_probe::cmdline_opt("i915.extout_show") != Some(1);
+    c.conn_type = inf.conn_type;
+    c.type_id = inf.type_id;
+    c.connected = inf.connected && !hidden;
+    if c.connected {
+        for (k, t) in inf.modes[..inf.nmodes.min(4)].iter().enumerate() {
+            let tot = t.h[3] as u64 * t.v[3] as u64;
+            let hz = if tot > 0 { ((t.clock_khz as u64 * 1000 + tot / 2) / tot) as u32 } else { 60 };
+            c.modes[k] = (t.h[0] as u32, t.v[0] as u32, hz);
+            c.nmodes = k + 1;
+        }
+    }
+    Some(c)
 }
 
 /// Common sizes offered below the native mode (largest first), see
@@ -2265,6 +2371,19 @@ fn out_fence_service() -> bool {
     complete
 }
 
+/// Signal every out-fence fd whose fence the floor has already passed, now,
+/// from task context. A CPU wait on a fence (FENCE_FD_IN) returns as soon as
+/// the floor passes it, but the fence's own fd is only signalled by the next
+/// `gpu_fence_event` tick, so without this the fd could still read "pending"
+/// after the wait that proved it done (seen on Venus, where the host retires
+/// instantly: FENCE_FD_IN_WAITS). Retries a few times if the VFS is contended.
+pub fn out_fence_flush() {
+    for _ in 0..8 {
+        if out_fence_service() { return; }
+        ::core::hint::spin_loop();
+    }
+}
+
 // ── Fence waiters (VIRTGPU_WAIT without NOWAIT) ──────────────────────────────
 //
 // Parked with the poll-channel protocol on this tag; `gpu_fence_event` wakes
@@ -3502,6 +3621,7 @@ const MAX_DAMAGE_RECTS: usize = 64;
 
 // Committed crtc/connector state. Only used to decide whether an incoming
 // atomic request needs ALLOW_MODESET.
+static CRTC_VRR: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CRTC_ACTIVE: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CRTC_MODE_BLOB: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static CONN_CRTC: AtomicU32 = AtomicU32::new(0);
@@ -5916,6 +6036,7 @@ fn master_vt_of(open_id: u32) -> Option<usize> {
 
 /// Grant the active VT's slot to `open_id` if it is free.
 fn master_grant_active(open_id: u32) -> bool {
+    if tty_server::vt::release_pending() { return false; }
     let vt = tty_server::vt::active().clamp(1, tty_server::vt::VT_COUNT);
     if MASTER_BY_VT[vt - 1]
         .compare_exchange(0, open_id, Ordering::SeqCst, Ordering::SeqCst)
@@ -5953,7 +6074,14 @@ fn requires_master(cmd: u32) -> bool {
 /// screen. Two relaxed-ish atomic loads and nothing else — this is on the path
 /// of every present.
 fn master_ok(open_id: u32) -> bool {
-    open_id != 0 && active_slot().load(Ordering::SeqCst) == open_id
+    // A VT_PROCESS release in flight suspends master for everyone: ACTIVE still
+    // names the outgoing VT until the owner answers VT_RELDISP, so without this
+    // a present issued from inside the release handler reached the scanout
+    // (the VT-switch flash). PHASE is stored before the release signal is sent,
+    // so the handler always observes it.
+    open_id != 0
+        && !tty_server::vt::release_pending()
+        && active_slot().load(Ordering::SeqCst) == open_id
 }
 
 /// Gate one master-only ioctl, granting master implicitly on first use.
@@ -6315,6 +6443,7 @@ impl DrmDeviceInterface {
             DRM_IOCTL_MODE_GETPLANERESOURCES => self.std_handle_get_plane_resources(arg),
             DRM_IOCTL_MODE_GETPLANE => self.std_handle_get_plane(arg),
             DRM_IOCTL_MODE_GETPROPERTY => self.std_handle_get_property(arg),
+            DRM_IOCTL_MODE_OBJ_SETPROPERTY => Self::std_handle_obj_set_property(arg, open_id),
 
             // ── Atomic KMS ──
             DRM_IOCTL_MODE_ATOMIC => self.std_handle_atomic(arg, open_id),
@@ -6969,20 +7098,8 @@ impl DrmDeviceInterface {
         conn.connector_type_id = 1;
         conn.connection = 1; // Connected
 
-        // The native mode is the boot console's size, i.e. the host's preferred
-        // scanout from GET_DISPLAY_INFO. It never changes after boot, so the
-        // list below is stable across a mode switch.
-        extern "C" { fn vfs_get_framebuffer_info(info: &mut FramebufferInfo); }
-        let mut info = FramebufferInfo { width: 0, height: 0, pitch: 0 };
-        unsafe { vfs_get_framebuffer_info(&mut info); }
-        let (nw, nh) = if let Some((w, h, _)) = crate::gpu_kms::fixed_mode() {
-            (w, h)
-        } else if info.width > 0 && info.height > 0 {
-            (info.width, info.height)
-        } else {
-            (1280, 800)
-        };
-
+        let (sizes, n) = primary_modes();
+        let (nw, nh) = (sizes[0].0, sizes[0].1);
         // Physical size at 100 DPI, the same figure QEMU's generated EDID uses
         // (hw/display/edid-generate.c, dpi=100). It used to be a fixed 320x200
         // mm whatever the resolution, so any other resolution got a skewed DPI
@@ -6995,26 +7112,6 @@ impl DrmDeviceInterface {
             unsafe { sched::uaccess::copy_to_user(conn.encoders_ptr as usize, encoders.as_ptr() as *const u8, (1) * 4); }
         }
         conn.count_encoders = 1;
-
-        // Mode list: the native mode first (PREFERRED, and index 0 for callers
-        // that read only one), then the common VESA/CEA sizes that fit inside
-        // it, like Linux virtio-gpu (drm_add_modes_noedid up to the preferred
-        // size). Only one mode used to be listed, so Settings > Displays had
-        // no resolution to switch to. Every mode is 60 Hz; a virtio-gpu
-        // scanout takes its size from the framebuffer bound to it, so a mode
-        // switch is the compositor allocating buffers of the new size.
-        let mut sizes: [(u32, u32); 17] = [(0, 0); 17];
-        let mut n = 0usize;
-        sizes[n] = (nw, nh);
-        n += 1;
-        // A KMS backend's scanout has exactly its own mode (no modeset).
-        let extra = !crate::gpu_kms::active();
-        for &(w, h) in STANDARD_MODES.iter() {
-            if extra && w <= nw && h <= nh && (w, h) != (nw, nh) && n < sizes.len() {
-                sizes[n] = (w, h);
-                n += 1;
-            }
-        }
 
         if conn.modes_ptr != 0 {
             let fit = (conn.count_modes as usize).min(n);
@@ -7659,6 +7756,7 @@ impl DrmDeviceInterface {
             },
             PROP_IN_FORMATS => in_formats_blob() as u64,
             PROP_IN_FENCE_FD => -1i64 as u64,
+            PROP_VRR_ENABLED => CRTC_VRR[(obj_id == DRM_CRTC2_ID) as usize].load(Ordering::Relaxed) as u64,
             PROP_CONN_CRTC_ID if two => {
                 if obj_id == DRM_CONNECTOR_ID { CONN_CRTC.load(Ordering::Relaxed) as u64 }
                 else { crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE)
@@ -7746,6 +7844,24 @@ impl DrmDeviceInterface {
     /// counts at 0 makes drm-ffi's get_property a single-pass call (no array fetch).
     /// struct drm_mode_get_property { u64 values_ptr@0; u64 enum_blob_ptr@8; u32 prop_id@16;
     ///   u32 flags@20; char name[32]@24; u32 count_values@56; u32 count_enum_blobs@60; }.
+    /// DRM_IOCTL_MODE_OBJ_SETPROPERTY: the legacy single-property write. Only
+    /// the CRTC `VRR_ENABLED` property is settable this way (everything else a
+    /// legacy client toggles goes through its own ioctl); an immutable or
+    /// unknown property is EINVAL, as Linux, and the caller must be master.
+    fn std_handle_obj_set_property(arg: usize, open_id: u32) -> Result<usize, DriverError> {
+        if arg == 0 { return Err(DriverError::InvalidParameter); }
+        let value = uread::<u64>(arg)?;
+        let prop_id = unsafe { ptr::read_unaligned((arg + 8) as *const u32) };
+        let obj_id = unsafe { ptr::read_unaligned((arg + 12) as *const u32) };
+        if open_id != 0 && !master_ok(open_id) { return Err(DriverError::Errno(EACCES)); }
+        if prop_id != PROP_VRR_ENABLED || value > 1 { return Err(DriverError::InvalidParameter); }
+        let idx = if obj_id == DRM_CRTC_ID { 0 }
+            else if obj_id == DRM_CRTC2_ID && crate::gpu_kms::extra_crtcs() > 0 { 1 }
+            else { return Err(DriverError::InvalidParameter) };
+        CRTC_VRR[idx].store(value as u32, Ordering::Relaxed);
+        Ok(0)
+    }
+
     fn std_handle_get_property(&mut self, arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
         let prop_id = unsafe { ptr::read_unaligned((arg + 16) as *const u32) };
@@ -7760,7 +7876,8 @@ impl DrmDeviceInterface {
         let in_count = unsafe { ptr::read_unaligned((arg + 56) as *const u32) };
 
         unsafe {
-            ptr::write_unaligned((arg + 20) as *mut u32, prop_flags(def.kind));
+            ptr::write_unaligned((arg + 20) as *mut u32, prop_flags(def.kind)
+                | if def.id == PROP_VRR_CAPABLE { DRM_MODE_PROP_IMMUTABLE } else { 0 });
             // name[32] — zero the field first so a shorter name never inherits
             // the caller's stack bytes.
             ptr::write_bytes((arg + 24) as *mut u8, 0, 32);
@@ -7910,6 +8027,7 @@ impl DrmDeviceInterface {
         let mut ext_conn: [Option<u64>; crate::gpu_kms::EXT_MAX] = [None; crate::gpu_kms::EXT_MAX];
         let mut touch_b = false;
         let mut a_obj = false;
+        let mut want_vrr: [Option<u32>; 2] = [None; 2];
 
         let mut k = 0usize;
         for (i, &obj) in objs.iter().enumerate() {
@@ -7920,6 +8038,15 @@ impl DrmDeviceInterface {
 
                 match pid {
                     // ── crtc ──
+                    // Linux: a value outside the 0..1 range is EINVAL; vrr_capable
+                    // is immutable (EINVAL); an unknown object is ENOENT-ish EINVAL.
+                    PROP_VRR_ENABLED => {
+                        if val > 1 { return Err(DriverError::InvalidParameter); }
+                        if obj == DRM_CRTC_ID { want_vrr[0] = Some(val as u32); }
+                        else if b_on && obj == DRM_CRTC2_ID { want_vrr[1] = Some(val as u32); }
+                        else { return Err(DriverError::InvalidParameter); }
+                    }
+                    PROP_VRR_CAPABLE => return Err(DriverError::InvalidParameter),
                     PROP_ACTIVE if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_active_b = Some(val); }
                     PROP_MODE_ID if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_mode_b = Some(val); }
                     PROP_ACTIVE => {
@@ -8127,6 +8254,7 @@ impl DrmDeviceInterface {
         };
         let mut hw_ev_owned = hw_ev != 0;
 
+        for i in 0..2 { if let Some(v) = want_vrr[i] { CRTC_VRR[i].store(v, Ordering::Relaxed); } }
         if let Some(v) = want_active { CRTC_ACTIVE[0].store(v as u32, Ordering::Relaxed); }
         if let Some(v) = want_mode { CRTC_MODE_BLOB[0].store(v as u32, Ordering::Relaxed); }
 

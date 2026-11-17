@@ -31,7 +31,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use ipc::Message;
 use spin::Mutex;
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
-use smoltcp::socket::{tcp, udp, icmp};
+use smoltcp::socket::{tcp, udp, icmp, raw};
 use smoltcp::time::Instant;
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint};
@@ -206,8 +206,14 @@ pub const IPPROTO_ICMPV6: usize = 58;
 /// Level 58 (SOL_ICMPV6) option: the 256-bit block mask of a raw ICMPv6 socket.
 const ICMP6_FILTER: usize = 1;
 const IPV6_UNICAST_HOPS: usize = 16;
+const IPV6_MULTICAST_IF: usize = 17;
 const IPV6_MULTICAST_HOPS: usize = 18;
+const IPV6_MULTICAST_LOOP: usize = 19;
+const MCAST_MSFILTER: usize = 48;
 const IPV6_RECVERR: usize = 25;
+const IPV6_DONTFRAG: usize = 62;
+const IPV6_MTU_DISCOVER: usize = 23;
+const IPV6_MTU: usize = 24;
 const IPV6_RECVPKTINFO: usize = 49;
 const IPV6_PKTINFO: usize = 50;
 const IPV6_RECVHOPLIMIT: usize = 51;
@@ -240,7 +246,9 @@ const IPV6_V6ONLY:   usize = 26;
 const IP_TOS:        usize = 1;
 const IP_TTL:        usize = 2;
 const IP_PKTINFO:    usize = 8;
+const IP_MTU_DISCOVER: usize = 10;
 const IP_RECVERR:    usize = 11;
+const IP_MTU:        usize = 14;
 const IP_RECVTTL:    usize = 12;
 const IP_RECVTOS:    usize = 13;
 const IP_MULTICAST_IF:   usize = 32;
@@ -249,6 +257,20 @@ const IP_MULTICAST_LOOP: usize = 34;
 const IP_ADD_MEMBERSHIP: usize = 35;
 const IP_DROP_MEMBERSHIP: usize = 36;
 const IP_MULTICAST_ALL:  usize = 49;
+const IP_UNBLOCK_SOURCE: usize = 37;
+const IP_BLOCK_SOURCE: usize = 38;
+const IP_ADD_SOURCE_MEMBERSHIP: usize = 39;
+const IP_DROP_SOURCE_MEMBERSHIP: usize = 40;
+const IP_MSFILTER: usize = 41;
+const IPV6_JOIN_GROUP: usize = 20;
+const IPV6_LEAVE_GROUP: usize = 21;
+const IPV6_MULTICAST_ALL: usize = 29;
+const MCAST_JOIN_GROUP: usize = 42;
+const MCAST_BLOCK_SOURCE: usize = 43;
+const MCAST_UNBLOCK_SOURCE: usize = 44;
+const MCAST_LEAVE_GROUP: usize = 45;
+const MCAST_JOIN_SOURCE_GROUP: usize = 46;
+const MCAST_LEAVE_SOURCE_GROUP: usize = 47;
 
 /// First socket *handle*: `SOCK_FD_BASE + slot` names slot `slot` of a
 /// process's socket table. Since lane fdmax a handle is not a descriptor: a
@@ -1067,6 +1089,8 @@ struct BoundPath {
     /// True for a Linux abstract-namespace address (sun_path[0] == 0): matched
     /// by bytes here, never backed by a VFS node.
     is_abstract: bool,
+    /// `SOCK_*` type of the socket that bound this address (EPROTOTYPE checks).
+    sock_type:  u8,
     /// Network namespace of the binder: abstract names are scoped by it.
     netns:      u16,
     /// How many things still hold this bound address: one per `UnixListening`
@@ -1087,7 +1111,7 @@ struct BoundPath {
 impl BoundPath {
     const fn new() -> Self {
         Self { in_use: false, path: [0u8; PATH_MAX], path_len: 0,
-               sock_id: 0, is_abstract: false, netns: 0, refs: 0,
+               sock_id: 0, is_abstract: false, sock_type: 0, netns: 0, refs: 0,
                _owner_pid: 0, _owner_sock: 0 }
     }
 }
@@ -1306,6 +1330,10 @@ struct SockOpts {
     /// IP_TTL (0 = default, 64) and IP_TOS (recorded and read back).
     ttl:       u8,
     tos:       u8,
+    /// IP_MTU_DISCOVER + 1 (0 = never set: Linux's default, IP_PMTUDISC_WANT).
+    pmtud1:    u8,
+    /// IPV6_DONTFRAG: a datagram over the path MTU is EMSGSIZE, not fragmented.
+    dontfrag:  bool,
     /// Ancillary data recvmsg adds (`RECV_*`): IP_PKTINFO, IP_RECVTOS,
     /// IP_RECVTTL, UDP_GRO; and IP_RECVERR (accepted, read back).
     recv:      u8,
@@ -1323,6 +1351,11 @@ struct SockOpts {
     sndbuf:    u32,
     /// SO_PASSCRED: recvmsg returns the sender's SCM_CREDENTIALS.
     passcred:  bool,
+    /// AF_UNIX SOCK_DGRAM: `sock_id` of the default destination set by
+    /// connect() (0 = none), and of the inbox a send last got EAGAIN from
+    /// (what a blocked sender parks on).
+    dg_peer:   u64,
+    dg_wait:   u64,
     /// IPV6_V6ONLY on an AF_INET6 socket: it hears and reaches only v6.
     v6only:    bool,
     /// IPv6 ancillary data recvmsg adds (`RECV6_*`).
@@ -1356,11 +1389,37 @@ const RECV6_ERR: u8 = 8;
 const BIND_ADDR_LOCK: u8 = 1;
 const BIND_PORT_LOCK: u8 = 2;
 
+/// The path MTU towards `d` over stack `sid`: the link's, or what an ICMP
+/// "fragmentation needed" / ICMPv6 "packet too big" taught the cache (scoped
+/// to the stack, hence the network namespace), if smaller.
+fn path_mtu_ip(sid: Sid, d: IpAddress) -> u32 {
+    let link: u32 = if sid == iface::LO { 65536 } else {
+        // A namespace's own loopback (a dynamic sid) is as big as lo.
+        match vif::VIFS.lock().get(sid as usize).and_then(|x| x.as_ref()) {
+            Some(x) if matches!(x.kind, vif::VifKind::Lo) => x.mtu as u32,
+            _ => 1500,
+        }
+    };
+    let now = sched::monotonic_ns() / 1_000_000;
+    let key = match d {
+        IpAddress::Ipv4(a) => smoltcp::pmtu::v4(a.0),
+        IpAddress::Ipv6(a) => a.0,
+    };
+    match smoltcp::pmtu::lookup(sid as u16, key, now) {
+        Some(m) => link.min(m as u32),
+        None => link,
+    }
+}
+
+fn path_mtu(sid: Sid, d: smoltcp::wire::Ipv4Address) -> u32 { path_mtu_ip(sid, IpAddress::Ipv4(d)) }
+
 impl SockOpts {
+    /// IP_MTU_DISCOVER as Linux reports it (default IP_PMTUDISC_WANT).
+    fn pmtud_mode(&self) -> u8 { if self.pmtud1 == 0 { 1 } else { self.pmtud1 - 1 } }
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
-                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0,
-                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, v6only: false, recv6: 0, icmp6f: [0; 8] };
+                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0, dontfrag: false,
+                                 recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, dg_peer: 0, dg_wait: 0, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
 /// Rows for live descriptions with a non-default `SockOpts`. Leaf lock: taken
@@ -2064,6 +2123,20 @@ fn stack_src_addr(s: &NetStack, sid: Sid) -> Option<IpAddress> {
         .find(|a| matches!(a, IpAddress::Ipv4(_)) && !a.is_unspecified())
 }
 
+/// A v6 source for a datagram to multicast `d` out of `s`: link-local for a
+/// link-scoped group, else a global one when there is one.
+fn stack_src_addr6(s: &NetStack, d: smoltcp::wire::Ipv6Address) -> Option<IpAddress> {
+    let mut ll = None; let mut gl = None;
+    for c in s.interface.ip_addrs() {
+        if let IpAddress::Ipv6(a) = c.address() {
+            if a.is_unspecified() { continue; }
+            if a.is_link_local() { ll = ll.or(Some(a)); } else if !a.is_loopback() { gl = gl.or(Some(a)); }
+        }
+    }
+    let link_scope = d.0[1] & 0x0f <= 2;
+    (if link_scope { ll.or(gl) } else { gl.or(ll) }).map(IpAddress::Ipv6)
+}
+
 /// The remote endpoint of a connected AF_INET socket, for getpeername.
 fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
     let (state, sock_type, _) = inet_sock_info(pid, fd)?;
@@ -2101,6 +2174,10 @@ fn inet_remote_endpoint(pid: u32, fd: usize) -> Option<IpEndpoint> {
 /// case each boot (the bit follows the socket's key).
 pub fn fd_wake_tag(pid: u32, fd: usize) -> Option<sched::PollTag> {
     let e = sock_entry(sched::tgid_of(pid), fd)?;
+    if e.domain as usize == AF_UNIX && e.sock_type & 0xf == SOCK_DGRAM as u8
+        && matches!(e.state, SockState::Unbound { .. } | SockState::UnixListening { .. }) {
+        return Some(unixdg::wake_tag(&e));
+    }
     match e.state {
         SockState::UnixConnected { conn_idx, is_a } => Some(unix_end_keys(conn_idx, is_a, 0)),
         SockState::UnixPendingAccept { conn_idx, .. } => Some(unix_end_keys(conn_idx, true, 0)),
@@ -2145,7 +2222,7 @@ fn free_bound_idx(bound_idx: usize) {
             }
         }
     }
-    if let Some(sock_id) = gone { unix_listener_gone(sock_id); }
+    if let Some(sock_id) = gone { unixdg::destroy(sock_id); unix_listener_gone(sock_id); }
 }
 
 /// The last reference to the listener bound as `sock_id` went away: every
@@ -2484,10 +2561,20 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
         }
     }
     let bound = if listeners { Some(BOUND_PATHS.lock()) } else { None };
+    // Sockets queued in bound datagram inboxes (the inbox owner is a node
+    // with outgoing edges). Only visible when BOUND_PATHS is held; without a
+    // listener in flight no inbox can be part of a cycle.
+    let inbox_edges: alloc::vec::Vec<(usize, alloc::vec::Vec<usize>)> = match bound.as_ref() {
+        Some(bp) => unixdg::gc_edges(&bp[..]),
+        None => alloc::vec::Vec::new(),
+    };
 
     // 1. In-flight copies per node.
     let mut inflight = alloc::vec![0u32; GC_NODES];
     let mut any = false;
+    for (_, ts) in inbox_edges.iter() {
+        for &t in ts { inflight[t] += 1; any = true; }
+    }
     for c in conns.iter().filter(|c| c.in_use) {
         for b in c.fdq_ab.iter().chain(c.fdq_ba.iter()) {
             for x in b.fds.iter() {
@@ -2536,10 +2623,14 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
 
     // 2. Mark everything reachable from a root.
     fn reach(n: usize, conns: &[UnixConn], embryos: &[(usize, usize)],
+             inbox: &[(usize, alloc::vec::Vec<usize>)],
              st: &mut [u8], stack: &mut alloc::vec::Vec<usize>) {
         let mut visit = |m: usize, st: &mut [u8]| { if st[m] == 1 { st[m] = 2; stack.push(m); } };
         if n >= GC_LISTENER_BASE {
             for &(ln, en) in embryos.iter() { if ln == n { visit(en, st); } }
+            for (bi, ts) in inbox.iter() {
+                if GC_LISTENER_BASE + *bi == n { for &m in ts { visit(m, st); } }
+            }
             return;
         }
         let c = &conns[n / 2];
@@ -2554,13 +2645,20 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     for ci in (0..conns.len()).filter(|&ci| conns[ci].in_use) {
         for is_a in [true, false] {
             let n = gc_node(ci, is_a);
-            if st[n] == 0 { reach(n, &*conns, &embryos, &mut st, &mut stack); }
+            if st[n] == 0 { reach(n, &*conns, &embryos, &inbox_edges, &mut st, &mut stack); }
+        }
+    }
+    // A bound datagram socket that is itself a root (or not a node at all)
+    // keeps whatever sits in its inbox alive.
+    for (bi, ts) in inbox_edges.iter() {
+        if st[GC_LISTENER_BASE + *bi] != 1 {
+            for &m in ts { if st[m] == 1 { st[m] = 2; stack.push(m); } }
         }
     }
     // A root listener's embryos are roots already (see above), so listeners
     // need no seeding of their own.
     while let Some(n) = stack.pop() {
-        reach(n, &*conns, &embryos, &mut st, &mut stack);
+        reach(n, &*conns, &embryos, &inbox_edges, &mut st, &mut stack);
     }
 
     // 3. Purge the receive queues of the ends nothing reached. An unreached
@@ -2568,6 +2666,11 @@ fn unix_gc_collect() -> alloc::vec::Vec<XferFd> {
     // here, which drops the copies that kept it alive.
     for n in 0..GC_LISTENER_BASE {
         if st[n] == 1 { out.append(&mut conns[n / 2].take_rx_fds(n % 2 == 0)); }
+    }
+    if let Some(bp) = bound.as_ref() {
+        for (bi, _) in inbox_edges.iter() {
+            if st[GC_LISTENER_BASE + *bi] == 1 { out.append(&mut unixdg::gc_take(bp[*bi].sock_id)); }
+        }
     }
     drop(bound);
     drop(conns);
@@ -2843,6 +2946,14 @@ fn release_inet_socket(s: &mut NetStack, handle: SocketHandle) {
         if let Some(u) = udp::Socket::downcast_mut(sock) {
             if u.send_pending() { orphan = true; }
         }
+        // Same for a raw/ICMP socket: close() right after sendto must still
+        // transmit the queued packet (Linux sends synchronously).
+        if let Some(i) = icmp::Socket::downcast_mut(sock) {
+            if i.send_pending() { orphan = true; }
+        }
+        if let Some(r) = raw::Socket::downcast_mut(sock) {
+            if r.send_pending() { orphan = true; }
+        }
         if let Some(t) = tcp::Socket::downcast_mut(sock) {
             match t.state() {
                 tcp::State::Established | tcp::State::CloseWait | tcp::State::SynReceived => {
@@ -2956,7 +3067,10 @@ fn reap_orphans(s: &mut NetStack) {
         let done = match set.iter().find(|(hh, _)| *hh == h).map(|(_, sk)| sk) {
             Some(sk) => match tcp::Socket::downcast(sk) {
                 Some(t) => matches!(t.state(), tcp::State::Closed | tcp::State::TimeWait),
-                None => udp::Socket::downcast(sk).map_or(true, |u| !u.send_pending()),
+                None => if let Some(u) = udp::Socket::downcast(sk) { !u.send_pending() }
+                    else if let Some(i) = icmp::Socket::downcast(sk) { !i.send_pending() }
+                    else if let Some(r) = raw::Socket::downcast(sk) { !r.send_pending() }
+                    else { true },
             },
             None => return false,
         } || now >= deadline;
@@ -3213,7 +3327,37 @@ fn local_delivery(from: u8, buf: &[u8]) -> bool {
         inject_frame(from as Sid + 1, r);
         return true;
     }
-    if proto == 0x0800 && buf[0] & 1 == 0 {
+    // IPv6: a neighbour solicitation for an address a local interface holds
+    // is answered here (the same shortcut as ARP above), and a unicast frame
+    // for a local interface's MAC is that interface's own, as for IPv4.
+    if proto == 0x86dd && buf.len() >= 78 && buf[20] == 58 && buf[54] == 135 {
+        let tgt: [u8; 16] = buf[62..78].try_into().unwrap();
+        let src: [u8; 16] = buf[22..38].try_into().unwrap();
+        if src == [0; 16] { return false; }
+        let Some(a) = ip6::addrs6().into_iter().find(|a| a.addr == tgt && a.index >= 2) else { return false };
+        let Some(hmac) = drivers::netdev::get((a.index - 2) as usize).and_then(|n| n.mac()) else { return false };
+        let mut r = alloc::vec![0u8; 14 + 40 + 32];
+        r[0..6].copy_from_slice(&buf[6..12]);
+        r[6..12].copy_from_slice(&hmac);
+        r[12..14].copy_from_slice(&[0x86, 0xdd]);
+        r[14] = 0x60;
+        r[18..20].copy_from_slice(&32u16.to_be_bytes());
+        r[20] = 58;
+        r[21] = 255;
+        r[22..38].copy_from_slice(&tgt);
+        r[38..54].copy_from_slice(&src);
+        r[54] = 136;
+        r[58] = 0x60; // solicited | override
+        r[62..78].copy_from_slice(&tgt);
+        r[78] = 2;
+        r[79] = 1;
+        r[80..86].copy_from_slice(&hmac);
+        let mut ic = smoltcp::wire::Icmpv6Packet::new_unchecked(&mut r[54..]);
+        ic.fill_checksum(&IpAddress::Ipv6(smoltcp::wire::Ipv6Address(tgt)), &IpAddress::Ipv6(smoltcp::wire::Ipv6Address(src)));
+        inject_frame(from as Sid + 1, r);
+        return true;
+    }
+    if (proto == 0x0800 || proto == 0x86dd) && buf[0] & 1 == 0 {
         for i in 0..drivers::netdev::count() {
             if drivers::netdev::get(i).and_then(|n| n.mac()).map_or(false, |m| m[..] == buf[0..6]) {
                 inject_frame(i as Sid + 1, buf.to_vec());
@@ -3250,18 +3394,40 @@ const INJECT_MAX: usize = 256;
 fn loop_frame(s: &NetStack, src: IpAddress, sport: u16, dst: IpEndpoint, ttl: u8, tos: u8, payload: &[u8])
     -> Option<alloc::vec::Vec<u8>>
 {
-    use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
-    #[allow(irrefutable_let_patterns)]
-    let (IpAddress::Ipv4(s4), IpAddress::Ipv4(d4)) = (src, dst.addr) else { return None };
+    use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr};
     #[allow(irrefutable_let_patterns)]
     let HardwareAddress::Ethernet(mac) = s.interface.hardware_addr() else { return None };
+    let caps = smoltcp::phy::ChecksumCapabilities::default();
+    if let (IpAddress::Ipv6(s6), IpAddress::Ipv6(d6)) = (src, dst.addr) {
+        if 40 + 8 + payload.len() > 65535 || !d6.is_multicast() { return None; }
+        let b = d6.0;
+        let mut buf = alloc::vec![0u8; 14 + 40 + 8 + payload.len()];
+        {
+            let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
+            eth.set_dst_addr(EthernetAddress([0x33, 0x33, b[12], b[13], b[14], b[15]]));
+            eth.set_src_addr(mac);
+            eth.set_ethertype(EthernetProtocol::Ipv6);
+        }
+        let ip = Ipv6Repr { src_addr: s6, dst_addr: d6, next_header: IpProtocol::Udp,
+                            payload_len: 8 + payload.len(), hop_limit: ttl.max(1) };
+        {
+            let mut p = Ipv6Packet::new_unchecked(&mut buf[14..]);
+            ip.emit(&mut p);
+            p.set_traffic_class(tos);
+        }
+        let udp = UdpRepr { src_port: sport, dst_port: dst.port };
+        udp.emit(&mut UdpPacket::new_unchecked(&mut buf[54..]), &src, &dst.addr, payload.len(),
+                 |x| x.copy_from_slice(payload), &caps);
+        return Some(buf);
+    }
+    #[allow(irrefutable_let_patterns)]
+    let (IpAddress::Ipv4(s4), IpAddress::Ipv4(d4)) = (src, dst.addr) else { return None };
     if 20 + 8 + payload.len() > 65535 { return None; }
     let dst_mac = if d4.is_multicast() {
         EthernetAddress([0x01, 0x00, 0x5e, d4.0[1] & 0x7f, d4.0[2], d4.0[3]])
     } else {
         EthernetAddress::BROADCAST
     };
-    let caps = smoltcp::phy::ChecksumCapabilities::default();
     let mut buf = alloc::vec![0u8; 14 + 20 + 8 + payload.len()];
     {
         let mut eth = EthernetFrame::new_unchecked(&mut buf[..]);
@@ -3308,9 +3474,10 @@ fn take_injected(id: u8) -> Option<alloc::vec::Vec<u8>> {
 /// IP_MULTICAST_IF's stack for a datagram to `dst` (multicast or the
 /// limited broadcast) from description `ofd`, if one is set and exists.
 fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
-    #[allow(irrefutable_let_patterns)]
-    let IpAddress::Ipv4(d) = dst else { return None };
-    if !d.is_multicast() && d.0 != [255; 4] { return None; }
+    match dst {
+        IpAddress::Ipv4(d) => if !d.is_multicast() && d.0 != [255; 4] { return None; },
+        IpAddress::Ipv6(d) => if !d.is_multicast() { return None; },
+    }
     let ifx = sock_opts(ofd).mc_if;
     if ifx == 0 { return None; }
     let sid = ifx - 1;
@@ -3318,6 +3485,7 @@ fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
 }
 
 mod listen;
+mod unixdg;
 pub mod rxpolicy;
 pub mod latestack;
 mod mcast;
@@ -3326,6 +3494,7 @@ mod syngate;
 mod sa;
 
 pub fn init() {
+    mcast::init();
     sched::register_dump_hook(dump_sockets);
     vfs::set_proc_net_gen(procnet::generate);
     seed_ephemeral();
@@ -3385,6 +3554,9 @@ fn init_nic(nif: drivers::netdev::Netif) {
         inet_seq: alloc::collections::BTreeMap::new(),
     };
     let sid = iface::sid_of(nif.id);
+    let mut stack = stack;
+    stack.interface.set_pmtu_scope(sid as u16);
+    smoltcp::pmtu::clear_scope(sid as u16);
     *stack_for(sid) = Some(stack);
     // A stack built after sockets that belong on every stack (wifi0: the
     // MAC comes late) takes them over; at boot there are none yet.
@@ -3401,7 +3573,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
 /// Stand up the loopback stack. Unconditional, unlike the NICs': 127.0.0.1 has
 /// to work on a guest with no network device at all.
 fn init_loopback() {
-    *stack_for(LO) = Some(make_loopback_stack());
+    { let mut st = make_loopback_stack(); st.interface.set_pmtu_scope(LO as u16); *stack_for(LO) = Some(st); }
     extern "C" { fn arch_serial_putc(b: u8); }
     let msg = b"[NET] Loopback interface 127.0.0.1/8 up\r\n";
     for &b in msg { unsafe { arch_serial_putc(b); } }
@@ -3661,6 +3833,7 @@ pub fn net_daemon() -> ! {
     let (mut prev_tx, mut prev_rx) = (0u64, 0u64);
     loop {
         vif::daemon_pass();
+        nlsock::poll_notify();
         // This task runs with IRQs masked between parks: let the tick in on
         // every pass, so a pass that keeps restarting cannot starve the CPU
         // and the wedge scan / watchdog can still run on it (1-CPU boots).
@@ -3972,7 +4145,7 @@ fn readiness_sig(sock: &smoltcp::socket::Socket<'static>) -> u8 {
             st | (((t.can_recv() || tcp_rx_eof(t)) as u8) << 4) | ((t.can_send() as u8) << 5)
                | ((t.is_active() as u8) << 6) | ((t.may_recv() as u8) << 7)
         }
-        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1) | (((u.error() != 0) as u8) << 2),
+        Socket::Udp(u) => (u.can_recv() as u8) | ((u.can_send() as u8) << 1) | ((((u.error() != 0) || u.errq_len() != 0) as u8) << 2),
         Socket::Icmp(i) => (i.can_recv() as u8) | ((i.can_send() as u8) << 1),
         #[allow(unreachable_patterns)]
         _ => 0,
@@ -4100,7 +4273,7 @@ pub fn force_bind_unix(path_str: &str, _port: u32) {
             path,
             path_len,
             sock_id: alloc_sock_id(),
-            is_abstract: false, netns: 0,
+            is_abstract: false, sock_type: 0, netns: 0,
             // No fd names this one — it is bound on behalf of the system, and
             // the single reference is what keeps it alive for good.
             refs: 1,
@@ -4150,6 +4323,10 @@ pub fn handle(msg: &Message, caller_pid: u32) -> Message {
                                handle_connect(caller_pid, arg(msg,0) as usize,
                                               arg(msg,1) as usize, arg(msg,2) as usize,
                                               host_path_arg(msg))),
+        NET_SEND if arg(msg,6) != 0 && unixdg::dg_entry(caller_pid, arg(msg,0) as usize).is_some()
+                        => unixdg::handle_send(caller_pid, msg).unwrap_or_else(|| err_reply(-9)),
+        NET_SENDMSG if arg(msg,6) != 0 && arg(msg,1) != 0 && unixdg::dg_entry(caller_pid, arg(msg,0) as usize).is_some()
+                        => unixdg::handle_sendmsg(caller_pid, msg).unwrap_or_else(|| err_reply(-9)),
         NET_SEND        => handle_send(caller_pid, arg(msg,0) as usize,
                                         arg(msg,1) as usize, arg(msg,2) as usize,
                                         arg(msg,4) as usize, arg(msg,5) as usize),
@@ -4266,6 +4443,36 @@ fn handle_socket(pid: u32, domain: usize, sock_type: usize, protocol: usize) -> 
         set_sock_opts(ofd, o);
     }
     if domain == AF_NETLINK { nlsock::create(tbl.socks[slot].ofd, sched::tgid_of(pid), sched::ns::netns_of(pid), protocol); }
+    // A raw ICMPv6 socket receives every echo and error message without having sent first (traceroute6 reads
+    // Time Exceeded from one it never wrote to): bind a wildcard socket on the stack of the default route.
+    if domain == AF_INET6 && sock_type & 0xf == SOCK_RAW && protocol == IPPROTO_ICMPV6 {
+        drop(tbls);
+        let ns = sched::ns::netns_of(pid);
+        let dflt = IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0x2000, 0, 0, 0, 0, 0, 0, 1));
+        if let Some(sid) = iface::route_select(ns, dflt) {
+            let mut stack = stack_for(sid);
+            let mut made = None;
+            if let Some(s) = stack.as_mut() {
+                let rx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 16], alloc::vec![0; 16384]);
+                let tx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
+                let mut socket = icmp::Socket::new(rx_buffer, tx_buffer);
+                if socket.bind(icmp::Endpoint::Raw).is_ok() { made = Some(s.socket_set.add(socket)); }
+            }
+            drop(stack);
+            if let Some(socket_handle) = made {
+                let mut tbls = SOCK_TABLES.lock();
+                let mut ok = false;
+                if let Some(tbl) = find_tbl(pid, &mut *tbls) {
+                    if slot < tbl.socks.len() && tbl.socks[slot].in_use && matches!(tbl.socks[slot].state, SockState::IcmpUnbound) {
+                        tbl.socks[slot].state = SockState::IcmpBound { socket_handle, sid };
+                        ok = true;
+                    }
+                }
+                drop(tbls);
+                if !ok { let mut stack = stack_for(sid); if let Some(ref mut s) = *stack { release_inet_socket(s, socket_handle); } }
+            }
+        }
+    }
     val_reply((slot + SOCK_FD_BASE) as u64)
 }
 
@@ -4413,15 +4620,21 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 // another interface was refused with a port unreachable and
                 // its sends left by the first stack's route (lane udp2).
                 let server = ip.is_unspecified();
-                // A non-initial netns has only a down loopback: its UDP bind
-                // stays a pure table entry, no host-stack socket (unreachable).
-                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() {
+                // A non-initial netns with neither a loopback that is up nor a
+                // tun/tap: its UDP bind stays a pure table entry, no host-stack
+                // socket (unreachable). With a tun/tap it receives from the
+                // first datagram on, as on Linux (not only from the first read).
+                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() || tunbe::has_vifs(me.netns()) {
                     if let Err(e) = udp_materialize(pid, slot, None, 0, server) { return err_reply(e); }
                 }
             }
             ok_reply()
         }
         AF_UNIX | _ => {
+            // bind(addrlen == 2) on a datagram socket: Linux autobind.
+            if addrlen == 2 && sa_family == AF_UNIX && unixdg::dg_entry(pid, fd).is_some() {
+                return match unixdg::autobind(pid, fd) { Ok(()) => ok_reply(), Err(e) => err_reply(e) };
+            }
             if addrlen < 3 || addrlen > 2 + PATH_MAX { return err_reply(-22); }
             let path_len = addrlen - 2;
             let path_ptr = (addr_ptr + 2) as *const u8;
@@ -4459,6 +4672,9 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 }
             }
 
+            let bind_e = sock_entry(pid, fd);
+            let bind_ty = bind_e.as_ref().map_or(0, |e| e.sock_type & 0xf);
+            let bind_ofd = bind_e.as_ref().map_or(0, |e| e.ofd);
             let mut bound = BOUND_PATHS.lock();
             let idx = match bound.iter().position(|b| !b.in_use) {
                 Some(i) => i,
@@ -4467,9 +4683,14 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 None => return err_reply(-12),
             };
             bound[idx] = BoundPath { in_use: true, path: pbytes, path_len,
-                                     sock_id, is_abstract, netns: if is_abstract { nsid_b } else { 0 }, refs: 1,
+                                     sock_id, is_abstract, sock_type: bind_ty, netns: if is_abstract { nsid_b } else { 0 }, refs: 1,
                                      _owner_pid: pid, _owner_sock: slot };
             drop(bound);
+            // A datagram socket receives into an inbox keyed by its sock_id,
+            // published before the state that makes the name connectable.
+            if bind_ty == SOCK_DGRAM as u8 && bind_e.as_ref().map_or(false, |e| e.domain as usize == AF_UNIX) {
+                unixdg::create(sock_id, sock_opts(bind_ofd).dg_peer);
+            }
 
             // Scope the SOCK_TABLES lock so it is released before any
             // free_bound_idx (which takes BOUND_PATHS) — the two are never held
@@ -4700,6 +4921,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
 
             val_reply((new_slot + SOCK_FD_BASE) as u64)
         }
+        SockState::UnixListening { .. } if sock_type & 0xf == SOCK_DGRAM as u8 => err_reply(-EOPNOTSUPP),
         SockState::UnixListening { bound_idx } => {
             // Only pair a pending connect that targeted *this* listener's
             // address (matched by its unique sock_id), so multiple concurrent
@@ -4711,6 +4933,7 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                 }
                 bound[bound_idx].sock_id
             };
+            let l_pc = sock_opts(listen_ofd).passcred;
             let mut tbls = SOCK_TABLES.lock();
             // The oldest connection on this listener's backlog, including one
             // whose connector has closed meanwhile (see `pending_sid`).
@@ -4739,6 +4962,8 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                             return err_reply(-11);
                         }
                         c[conn_idx].cred_b = cred_b;
+                        // Linux unix_sock_inherit_flags: the accepted end inherits SO_PASSCRED.
+                        c[conn_idx].pc_b = l_pc;
                         c[conn_idx].pending_sid = 0;
                         // Connection established: the connector's poll becomes
                         // writable/connected (an edge for it).
@@ -4760,6 +4985,12 @@ fn handle_accept(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize, flags
                         ns:         sched::ns::NsRef::get(lnetns),
                         connecting: false,
                     };
+                    if l_pc {
+                        let mut o = sock_opts(tbl.socks[new_slot].ofd);
+                        o.passcred = true;
+                        PASSCRED_USED.store(true, Ordering::Relaxed);
+                        set_sock_opts(tbl.socks[new_slot].ofd, o);
+                    }
 
                     // EVERY alias of this connection flips, in every table —
                     // no `break`. One connect() is now nameable by several
@@ -4859,6 +5090,8 @@ fn udp_migrate(pid: u32, fd: usize, handle: SocketHandle, from: Sid, to: Sid) ->
         if socket.bind(port).is_err() { return false; }
         socket.set_peer(remote);
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        socket.set_owner(tbl.socks[slot].ofd);
+        { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
         s.socket_set.add(socket)
     };
     {
@@ -4910,6 +5143,13 @@ fn udp_stack(ns: u16, local: Option<IpAddress>, dest: Option<IpAddress>, scope: 
     if local.map_or(false, is_loopback_addr) || dest.map_or(false, is_loopback_addr) { return Ok(LO); }
     if let Some(a) = local.filter(|a| !a.is_unspecified()) {
         if let Some(sid) = iface::holder_of(a) { return Ok(sid); }
+        // An address a bridge (or other vif) of the initial netns holds, e.g.
+        // aardvark-dns on 10.89.0.1:53: the socket lives on that stack, not
+        // the default NIC's, or the containers' datagrams never reach it.
+        if let Some(sid) = vif::ns_sids_dyn(0).into_iter().find(|&sid| match *stack_for(sid) {
+            Some(ref s) => s.interface.ip_addrs().iter().any(|c| c.address() == a),
+            None => false,
+        }) { return Ok(sid); }
     }
     if let Some(d) = dest.filter(|d| ip6::needs_scope(*d)) { return ip6::scope_sid(ns, scope); }
     match dest {
@@ -4974,6 +5214,8 @@ fn udp_materialize(pid: u32, slot: usize, dest: Option<IpAddress>, scope: u32, s
         if socket.bind(ep).is_err() { return Err(-22); }
         if fam.is_some() { socket.set_family(fam); }
         socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+        socket.set_owner(tbl.socks[slot].ofd);
+        { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
         s.socket_set.add(socket)
     };
     tbl.socks[slot].bound_port = port;
@@ -5108,21 +5350,33 @@ static ORIG_PEER: Mutex<alloc::vec::Vec<(u32, usize, IpEndpoint, IpEndpoint)>> =
 /// nftables OUTPUT chain for a host-local connect (podnat L2): `fib daddr type local` + DNAT redirects
 /// 127.0.0.1:H / nicip:H to the container. getpeername keeps the original (see `ORIG_PEER`).
 fn nft_output_dnat(pid: u32, fd: usize, slot: usize, ip: IpAddress, ep: IpEndpoint) -> (IpAddress, IpEndpoint) {
-    let IpAddress::Ipv4(a) = ip else { return (ip, ep) };
     if !nfnl::has_tables(0) || sock_netns(pid, slot) != 0 { return (ip, ep) }
     let l4 = match sock_entry(pid, fd).map(|e| e.sock_type) {
         Some(t) if t == SOCK_STREAM as u8 => 6u8,
         Some(t) if t == SOCK_DGRAM as u8 => 17u8,
         _ => return (ip, ep),
     };
-    let d = a.0;
-    if !fwd::host_local(d) { return (ip, ep) }
-    let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
-    let mut m = nfnl::Pkt { l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None };
+    let (mut m, v6) = match ip {
+        IpAddress::Ipv4(a) => {
+            let d = a.0;
+            if !fwd::host_local(d) { return (ip, ep) }
+            let src = if d[0] == 127 { [127, 0, 0, 1] } else { d };
+            (nfnl::Pkt { rel: false, est: false, l4, src, dst: d, sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: None }, false)
+        }
+        IpAddress::Ipv6(a) => {
+            let d = a.0;
+            let lo = d == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            if !lo && !ip6::is_host6(&d) { return (ip, ep) }
+            (nfnl::Pkt { rel: false, est: false, l4, src: [0; 4], dst: [0; 4], sport: 0, dport: ep.port, oif: [0; 16], mark: 0, local: true, v6: Some((d, d)) }, true)
+        }
+    };
     let (acc, nat) = nfnl::eval(0, nfnl::H_OUT, &mut m);
     let _ = acc;
-    let nfnl::Nat::Dnat(c, cp) = nat else { return (ip, ep) };
-    let real = IpEndpoint::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(c[0], c[1], c[2], c[3])), if cp == 0 { ep.port } else { cp });
+    let real = match (nat, v6) {
+        (nfnl::Nat::Dnat(c, cp), false) => IpEndpoint::new(IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(c[0], c[1], c[2], c[3])), if cp == 0 { ep.port } else { cp }),
+        (nfnl::Nat::Dnat6(c, cp), true) => IpEndpoint::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address(c)), if cp == 0 { ep.port } else { cp }),
+        _ => return (ip, ep),
+    };
     let mut t = ORIG_PEER.lock();
     t.retain(|x| !(x.0 == pid && x.1 == slot));
     if t.len() >= 256 { t.remove(0); }
@@ -5294,6 +5548,8 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
                 if socket.bind(local_port).is_err() { return err_reply(-22); }
                 socket.set_peer(Some(remote_endpoint));
                 socket.set_reuseport(sock_opts(tbl.socks[slot].ofd).reuseport);
+                socket.set_owner(tbl.socks[slot].ofd);
+        { let so = sock_opts(tbl.socks[slot].ofd); socket.set_recverr(so.recv & RECV_ERR != 0 || so.recv6 & RECV6_ERR != 0); }
                 let handle = s.socket_set.add(socket);
                 tbl.socks[slot].state = SockState::InetConnected {
                     socket_handle: handle, remote_endpoint: Some(remote_endpoint), sid };
@@ -5314,42 +5570,24 @@ fn handle_connect(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Op
         reply
     } else {
         // AF_UNIX Connect
+        if sa_family == AF_UNSPEC {
+            if let Some(r) = unixdg::disconnect(pid, fd) { return r; }
+        }
         if addrlen < 3 || addrlen > 2 + PATH_MAX { return err_reply(-22); }
         let path_len = addrlen - 2;
         let path_ptr = (addr_ptr + 2) as *const u8;
         let mut pbytes = [0u8; PATH_MAX];
         if !ucopy_in(&mut pbytes[..path_len], path_ptr as usize) { return err_reply(-14); }
         let is_abstract = pbytes[0] == 0;
-
-        // Resolve the address to the sock_id of a live listener. Abstract
-        // names byte-match here; pathnames resolve through the VFS (symlinks,
-        // the /dev/shm and /run/user tmpfs mounts, S_IFSOCK check).
-        let sock_id = if is_abstract {
-            let nsid = sock_netns(pid, slot);
-            let bound = BOUND_PATHS.lock();
-            let mut found = None;
-            for bp in bound.iter() {
-                if bp.in_use && bp.is_abstract && bp.netns == nsid && bp.path_len == path_len
-                   && bp.path[..path_len] == pbytes[..path_len] {
-                    found = Some(bp.sock_id);
-                    break;
-                }
-            }
-            match found { Some(id) => id, None => return err_reply(-111) } // ECONNREFUSED
-        } else {
-            let name_end = pbytes[..path_len].iter().position(|&b| b == 0).unwrap_or(path_len);
-            let name = &pbytes[..name_end];
-            if name.is_empty() { return err_reply(-22); }
-            let r = vfs::unix_resolve_node(pid, host.unwrap_or(name)); // sock_id (>=0) or -errno
-            if r < 0 { return make_reply(r); }
-            let sock_id = r as u64;
-            // The node resolved, but its listener may have since closed (Linux
-            // leaves the socket file behind) — connecting then is ECONNREFUSED.
-            let live = BOUND_PATHS.lock().iter()
-                .any(|bp| bp.in_use && !bp.is_abstract && bp.sock_id == sock_id);
-            if !live { return err_reply(-111); }
-            sock_id
+        if let Some(e) = unixdg::dg_entry(pid, fd) {
+            return unixdg::connect(pid, fd, &e, &pbytes, path_len, host);
+        }
+        let (sock_id, tgt_ty) = match unixdg::resolve(pid, slot, &pbytes, path_len, host) {
+            Ok(v) => v, Err(e) => return err_reply(e),
         };
+        // A stream or seqpacket connect to another kind of socket (a datagram
+        // name) is EPROTOTYPE, before any embryo exists.
+        if tgt_ty != 0 && sock_entry(pid, fd).map_or(false, |e| e.sock_type & 0xf != tgt_ty) { return err_reply(-91); }
 
         // The connecting socket becomes end A at accept time; capture its creds.
         let cred = Ucred { pid, uid: sched::euid_of(pid), gid: sched::egid_of(pid) };
@@ -5462,8 +5700,23 @@ fn handle_send(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
             return udp_send_gso(pid, fd, addr_ptr, addrlen, data, seg);
         }
     }
+    // A plain send()/write() to a peer with SO_PASSCRED carries the sender's
+    // credentials, as sendmsg does (Linux scm_send/maybe_add_creds).
+    if PASSCRED_USED.load(Ordering::Relaxed) && addr_ptr == 0 && len > 0 {
+        let end = unix_stream_end(pid, fd)
+            .or_else(|| if unix_dgram_connected(pid, fd) { unix_conn_end(pid, fd) } else { None });
+        if let Some((ci, ia)) = end {
+            if send_cred(pid, ci, ia, None).is_some() {
+                return handle_sendmsg_x(pid, fd, 0, 0, None, Some((buf_ptr, len)));
+            }
+        }
+    }
     handle_send_k(pid, fd, buf_ptr, len, addr_ptr, addrlen, None)
 }
+
+/// Set once any AF_UNIX socket enables SO_PASSCRED (or inherits it at
+/// accept): until then no send needs the credential lookup.
+static PASSCRED_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Some socket set UDP_SEGMENT once: only then does a send look it up.
 static GSO_USED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -5534,7 +5787,17 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
     let state = tbl.socks[slot].state;
     let sock_type = tbl.socks[slot].sock_type;
     let sock_domain = tbl.socks[slot].domain as usize;
+    let sock_is_raw = tbl.socks[slot].sock_type & 0xf == SOCK_RAW as u8;
     let ofd = tbl.socks[slot].ofd;
+
+    // An AF_UNIX datagram socket that is not a socketpair end (bound or not):
+    // the inbox path (`unixdg`).
+    if sock_domain == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8
+        && matches!(state, SockState::Unbound { .. } | SockState::UnixListening { .. }) {
+        let e = tbl.socks[slot].clone();
+        drop(tbls);
+        return unixdg::send_k(pid, fd, e, buf_ptr, len, addr_ptr, addrlen, kdata, None);
+    }
 
     match state {
         SockState::UnixConnected { conn_idx, is_a } => {
@@ -5762,12 +6025,34 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     meta.hop_limit = if mcast { Some(opts.mc_ttl) }
                                      else if opts.ttl != 0 { Some(opts.ttl) } else { None };
                     meta.meta.tos = opts.tos;
+                    // Path-MTU discovery (IP_MTU_DISCOVER): DONT sends without
+                    // DF; DO / PROBE refuse a datagram larger than the path.
+                    let pd = opts.pmtud_mode();
+                    if pd <= 1 { meta.meta.nodf = true; } // DONT and WANT: DF clear (ip_sk_ignore_df)
+                    if let (IpAddress::Ipv4(d), true) = (endpoint.addr, pd >= 2) {
+                        if data.len() + 28 > path_mtu(sid, d) as usize {
+                            if opts.recv & RECV_ERR != 0 { udp_local_emsgsize(s, socket_handle, endpoint, path_mtu(sid, d)); }
+                            return err_reply(-90); // EMSGSIZE
+                        }
+                    }
+                    // IPv6 is fragmented at the source (smoltcp, Fragment
+                    // header) unless IPV6_DONTFRAG or DO / PROBE refuse a
+                    // datagram larger than the path (RFC 8201).
+                    if let (IpAddress::Ipv6(_), true) = (endpoint.addr, pd >= 2 || opts.dontfrag) {
+                        if data.len() + 48 > path_mtu_ip(sid, endpoint.addr) as usize {
+                            if opts.recv6 & RECV6_ERR != 0 { udp_local_emsgsize(s, socket_handle, endpoint, path_mtu_ip(sid, endpoint.addr)); }
+                            return err_reply(-90);
+                        }
+                    }
                     // A copy for this host: multicast unless IP_MULTICAST_LOOP
                     // is off, broadcast always (Linux ip_mc_output). Built
                     // before the send, while the socket's port and the
                     // interface's addresses are at hand.
                     let looped = if sid != LO && ((mcast && !opts.mc_noloop) || iface::is_broadcast(endpoint.addr)) {
-                        let src = bound.addr.or_else(|| stack_src_addr(s, sid));
+                        let src = bound.addr.or_else(|| match endpoint.addr {
+                            IpAddress::Ipv6(d) => stack_src_addr6(s, d),
+                            _ => stack_src_addr(s, sid),
+                        });
                         let ttl = if mcast { opts.mc_ttl } else if opts.ttl != 0 { opts.ttl } else { 64 };
                         src.and_then(|src| loop_frame(s, src, bound.port, endpoint, ttl, opts.tos, &data))
                     } else { None };
@@ -5843,7 +6128,8 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             let mut socket = icmp::Socket::new(rx_buffer, tx_buffer);
             let ttl = sock_opts(ofd).ttl;
             if ttl != 0 { socket.set_hop_limit(Some(ttl)); }
-            if socket.bind(icmp::Endpoint::Ident(ident)).is_err() { return err_reply(-22); }
+            let raw6 = sock_domain == AF_INET6 && sock_is_raw;
+            if socket.bind(if raw6 { icmp::Endpoint::Raw } else { icmp::Endpoint::Ident(ident) }).is_err() { return err_reply(-22); }
             let socket_handle = s.socket_set.add(socket);
             let result = s.socket_set.get_mut::<icmp::Socket>(socket_handle).send_slice(&data, dest_ip);
             drop(stack);
@@ -5894,6 +6180,47 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
             };
             drop(tbls);
 
+            // A raw ICMPv6 socket was bound on the default route's stack at socket(); a destination on another
+            // stack (::1, a scoped link-local) moves it there.
+            let (mut sid, mut socket_handle) = (sid, socket_handle);
+            if sock_domain == AF_INET6 && sock_is_raw {
+                if let Some(sid2) = iface::route_select(sock_netns(pid, slot), dest_ip) {
+                    if sid2 != sid {
+                        let mut st2 = stack_for(sid2);
+                        let mut made = None;
+                        if let Some(s2) = st2.as_mut() {
+                            let rx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 16], alloc::vec![0; 16384]);
+                            let tx_buffer = icmp::PacketBuffer::new(alloc::vec![icmp::PacketMetadata::EMPTY; 4], alloc::vec![0; 2048]);
+                            let mut ns2 = icmp::Socket::new(rx_buffer, tx_buffer);
+                            if ns2.bind(icmp::Endpoint::Raw).is_ok() { made = Some(s2.socket_set.add(ns2)); }
+                        }
+                        drop(st2);
+                        if let Some(h2) = made {
+                            let mut t3 = SOCK_TABLES.lock();
+                            let mut ok = false;
+                            if let Some(tb) = find_tbl(pid, &mut *t3) {
+                                if slot < tb.socks.len() && tb.socks[slot].in_use && matches!(tb.socks[slot].state, SockState::IcmpBound { .. }) {
+                                    tb.socks[slot].state = SockState::IcmpBound { socket_handle: h2, sid: sid2 };
+                                    share_state(&mut *t3, pid, slot);
+                                    ok = true;
+                                }
+                            }
+                            drop(t3);
+                            if ok {
+                                sock_state_moved(&[sock_state_key(ofd)]);
+                                let mut old = stack_for(sid);
+                                if let Some(ref mut so) = *old { release_inet_socket(so, socket_handle); }
+                                drop(old);
+                                sid = sid2; socket_handle = h2;
+                            } else {
+                                let mut st4 = stack_for(sid2);
+                                if let Some(ref mut s4) = *st4 { release_inet_socket(s4, h2); }
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut stack = stack_for(sid);
             if stack.is_none() { return err_reply(-100); }
             let s = stack.as_mut().unwrap();
@@ -5914,6 +6241,7 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
 }
 
 const MSG_PEEK: usize = 0x02;
+const MSG_ERRQUEUE: usize = 0x2000;
 
 /// What one AF_UNIX stream read took from an end's inbound direction.
 struct StreamRead {
@@ -6121,6 +6449,15 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
                flags: usize) -> Message {
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::recv(o, buf_ptr, len, addr_ptr, addrlen_ptr, flags); }
     let peek = flags & MSG_PEEK != 0;
+    if flags & MSG_ERRQUEUE != 0 && inet_dgram(pid, fd) {
+        // recv/recvfrom(MSG_ERRQUEUE): the quoted payload and the failed
+        // destination as the source address, no cmsgs (Linux ip_recv_error).
+        let e = match udp_recv_err(pid, fd, !peek) { Ok(e) => e, Err(x) => return err_reply(x) };
+        let n = e.payload.len().min(len);
+        if n > 0 && !ucopy_out(buf_ptr, &e.payload[..n]) { return err_reply(-14); }
+        if addr_ptr != 0 && addrlen_ptr != 0 { sa::write(sock_dom(pid, fd), addr_ptr, addrlen_ptr, e.dst); }
+        return val_reply((if flags & MSG_TRUNC as usize != 0 { e.payload.len() } else { n }) as u64);
+    }
     let slot = match fd_to_slot(fd) { Some(s) => s, None => return err_reply(-9) };
     let tbls = SOCK_TABLES.read();
     let tbl = match tbls.iter().find(|t| t.in_use && t.pid == tk(pid)) {
@@ -6140,6 +6477,11 @@ fn handle_recv(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usize,
         // A UDP socket bound in a non-initial netns has no stack socket: nothing
         // can ever arrive, so a read just reports no data (blocking waits on its key).
         SockState::InetBound { .. } if sock_type == SOCK_DGRAM as u8 => err_reply(-11),
+        SockState::UnixListening { bound_idx }
+            if sock_domain == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8 =>
+        {
+            unixdg::recv(unixdg::sid_of(bound_idx), buf_ptr, len, addr_ptr, addrlen_ptr, flags)
+        }
         SockState::InetConnected { .. } if sock_type == SOCK_DGRAM as u8 => {
             match udp_recv_k(pid, fd, len, peek, false) {
                 Ok((data, full, m)) => {
@@ -6529,7 +6871,15 @@ fn unix_dgram_send_fds(pid: u32, fd: usize, conn_idx: usize, is_a: bool, data: &
     val_reply(data.len() as u64)
 }
 
-fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Option<(usize, usize)>) -> Message {
+fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Option<(usize, usize)>) -> Message {
+    handle_sendmsg_x(pid, fd, msghdr_ptr, flags, syn, None)
+}
+
+/// `handle_sendmsg`; `one` = a single buffer `(base, len)` in place of the
+/// iovec array (a plain send()/write() that must carry SCM_CREDENTIALS).
+fn handle_sendmsg_x(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Option<(usize, usize)>,
+                    one: Option<(usize, usize)>) -> Message {
+    let syn = if one.is_some() { Some((0, 1)) } else { syn };
     if msghdr_ptr == 0 && syn.is_none() { return err_reply(-14); }
     if let Some(o) = nlsock::of(pid, fd) {
         // A netlink writev stays one send per iovec (the caller's fallback).
@@ -6542,6 +6892,10 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Op
                  rd_or_efault!(msghdr_ptr + 32), rd_or_efault!(msghdr_ptr + 40)),
     };
     if ctrl_ptr != 0 && ctrl_len > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_len) { return err_reply(-14); }
+
+    if let Some(e) = unixdg::dg_entry(pid, fd) {
+        return unixdg::sendmsg(pid, fd, e, msghdr_ptr, syn.is_some(), one, iov_ptr, iovcnt, ctrl_ptr, ctrl_len, None);
+    }
 
     let unix_end = unix_stream_end(pid, fd);
 
@@ -6610,8 +6964,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Op
         let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         for i in 0..iovcnt.min(UIO_MAXIOV) {
             let iov  = iov_ptr + i * 16;
-            let base = rd_or_efault!(iov);
-            let len  = rd_or_efault!(iov + 8);
+            let (base, len) = match one { Some(o) => o, None => (rd_or_efault!(iov), rd_or_efault!(iov + 8)) };
             if len > 0 && !sched::uaccess::user_range_ok(base, len) { return err_reply(-14); } // EFAULT: kernel iov_base
             if data.len() + len > UNIX_DGRAM_MAX { return err_reply(-90); } // EMSGSIZE
             let at = data.len();
@@ -6665,7 +7018,7 @@ fn handle_sendmsg(pid: u32, fd: usize, msghdr_ptr: usize, _flags: usize, syn: Op
     let mut requested = 0usize;
     for i in 0..n_iov {
         let iov = iov_ptr + i * 16;
-        iovs[i] = match (rd_usize(iov), rd_usize(iov + 8)) {
+        iovs[i] = match (one.map_or_else(|| rd_usize(iov), |o| Ok(o.0)), one.map_or_else(|| rd_usize(iov + 8), |o| Ok(o.1))) {
             (Ok(b), Ok(l)) if l == 0 || sched::uaccess::user_range_ok(b, l) => (b, l),
             _ => { for tf in batch { xfer_drop(tf); } return err_reply(-14); }
         };
@@ -7012,6 +7365,14 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
     };
     if ctrl_ptr != 0 && ctrl_cap > 0 && !sched::uaccess::user_range_ok(ctrl_ptr, ctrl_cap) { return err_reply(-14); }
 
+    if let Some(e) = unixdg::dg_entry(pid, fd) {
+        if let SockState::UnixListening { bound_idx } = e.state {
+            return unixdg::recvmsg(pid, &e, unixdg::sid_of(bound_idx), msghdr_ptr, syn.is_some(),
+                                   iov_ptr, iovcnt, ctrl_ptr, ctrl_cap, flags);
+        }
+        return err_reply(-11);
+    }
+
     let unix_end = unix_stream_end(pid, fd);
 
     // AF_INET datagram: one datagram scattered over the iovecs, its source
@@ -7028,6 +7389,51 @@ fn handle_recvmsg(pid: u32, fd: usize, msghdr_ptr: usize, flags: usize, syn: Opt
             cap += l;
         }
         let (recv, recv6) = fd_ofd(pid, fd).map_or((0, 0), |o| { let so = sock_opts(o); (so.recv, so.recv6) });
+        if flags & MSG_ERRQUEUE != 0 {
+            // The socket error queue (Linux ip_recv_error / ipv6_recv_error):
+            // the quoted payload, the failed destination in msg_name and an
+            // IP_RECVERR cmsg: sock_extended_err + the ICMP sender.
+            let e = match udp_recv_err(pid, fd, flags & MSG_PEEK == 0) { Ok(e) => e, Err(x) => return err_reply(x) };
+            let mut off = 0usize;
+            for &(b, l) in iovs.iter() {
+                if off >= e.payload.len() { break; }
+                let k = l.min(e.payload.len() - off);
+                if !ucopy_out(b, &e.payload[off..off + k]) { return err_reply(-14); }
+                off += k;
+            }
+            if name_ptr != 0 { sa::write(sock_dom(pid, fd), name_ptr, msghdr_ptr + 8, e.dst); }
+            let v6 = sock_dom(pid, fd) == AF_INET6;
+            let mut c = alloc::vec::Vec::new();
+            c.extend_from_slice(&(e.errno as u32).to_ne_bytes());
+            c.extend_from_slice(&[e.origin, e.ty, e.code, 0]);
+            c.extend_from_slice(&e.info.to_ne_bytes());
+            c.extend_from_slice(&0u32.to_ne_bytes());
+            if v6 {
+                let mut sin6 = [0u8; 28];
+                sin6[0..2].copy_from_slice(&10u16.to_ne_bytes());
+                if let IpAddress::Ipv6(a) = e.offender { sin6[8..24].copy_from_slice(&a.0); }
+                else if let IpAddress::Ipv4(a) = e.offender { sin6[18] = 0xff; sin6[19] = 0xff; sin6[20..24].copy_from_slice(&a.0); }
+                c.extend_from_slice(&sin6);
+            } else {
+                let mut sin = [0u8; 16];
+                if let IpAddress::Ipv4(a) = e.offender { sin[0..2].copy_from_slice(&2u16.to_ne_bytes()); sin[4..8].copy_from_slice(&a.0); }
+                c.extend_from_slice(&sin);
+            }
+            let clen = CMSG_HDR_LEN + c.len();
+            let mut m = alloc::vec::Vec::new();
+            m.extend_from_slice(&(clen as u64).to_ne_bytes());
+            m.extend_from_slice(&(if v6 { 41i32 } else { 0i32 }).to_ne_bytes());
+            m.extend_from_slice(&(if v6 { IPV6_RECVERR as i32 } else { IP_RECVERR as i32 }).to_ne_bytes());
+            m.extend_from_slice(&c);
+            let mut ctrunc = false;
+            let mut written = 0usize;
+            if ctrl_ptr == 0 || clen > ctrl_cap { ctrunc = true; }
+            else if !ucopy_out(ctrl_ptr, &m) { return err_reply(-14); }
+            else { written = clen; }
+            let tr = e.payload.len() > off;
+            unsafe { write_msg_tail(msghdr_ptr, written, MSG_ERRQUEUE as i32 | (if ctrunc { MSG_CTRUNC } else { 0 }) | (if tr { MSG_TRUNC } else { 0 })); }
+            return val_reply(off as u64);
+        }
         let (data, full, meta) = match udp_recv_k(pid, fd, cap, flags & MSG_PEEK != 0, recv & RECV_GRO != 0) {
             Ok(r) => r,
             // shutdown(SHUT_RD): end of file, as in handle_recv.
@@ -7353,6 +7759,8 @@ fn handle_shutdown(pid: u32, fd: usize, how: usize) -> Message {
         (tbl.socks[slot].state, tbl.socks[slot].sock_type, tbl.socks[slot].ofd)
     };
 
+    if let Some(e) = unixdg::dg_entry(pid, fd) { return unixdg::shutdown(&e, how); }
+
     let unix_end = match state {
         SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
         // A connect() not yet accepted is end A of its connection, and accept
@@ -7472,6 +7880,7 @@ fn put_sockaddr_un(addr_ptr: usize, addrlen_ptr: usize, name: &[u8]) -> bool {
 fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) -> Message {
     if addr_ptr == 0 || addrlen_ptr == 0 { return err_reply(-14); }
     if let Some(o) = nlsock::of(pid, fd) { return nlsock::getpeername(o, addr_ptr, addrlen_ptr); }
+    if let Some(r) = unixdg::getpeername(pid, fd, addr_ptr, addrlen_ptr) { return r; }
     let endpoint = inet_remote_endpoint(pid, fd).map(|ep| {
         let slot = fd_to_slot(fd).unwrap_or(usize::MAX);
         ORIG_PEER.lock().iter().find(|x| x.0 == pid && x.1 == slot && x.3 == ep).map_or(ep, |x| x.2)
@@ -7506,8 +7915,14 @@ fn handle_getpeername(pid: u32, fd: usize, addr_ptr: usize, addrlen_ptr: usize) 
 /// unrelated behaviour change.
 fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                      optval_ptr: usize, optlen: usize) -> Message {
-    // Netlink: buffer sizes and the like are accepted and ignored.
-    if nlsock::of(pid, fd).is_some() { return ok_reply(); }
+    // Netlink: group membership is honoured, buffer sizes and the like are accepted and ignored.
+    if let Some(o) = nlsock::of(pid, fd) {
+        if level == 270 && (optname == 1 || optname == 2) && optlen >= 4 {
+            if let Some(g) = sched::uaccess::read_user::<u32>(optval_ptr) { return nlsock::membership(o, optname, g); }
+            return err_reply(-14);
+        }
+        return ok_reply();
+    }
     const SO_REUSEADDR: usize = 2;
     if level == SOL_SOCKET as usize && optname == SO_REUSEADDR {
         // The int is read out of user memory before any server lock is taken:
@@ -7588,6 +8003,7 @@ fn handle_setsockopt(pid: u32, fd: usize, level: usize, optname: usize,
         if e.domain as usize != AF_UNIX { return err_reply(-ENOPROTOOPT); }
         let mut o = sock_opts(e.ofd);
         o.passcred = v != 0;
+        if v != 0 { PASSCRED_USED.store(true, Ordering::Relaxed); }
         set_sock_opts(e.ofd, o);
         let end = match e.state {
             SockState::UnixConnected { conn_idx, is_a } => Some((conn_idx, is_a)),
@@ -7704,6 +8120,23 @@ fn sock_entry(pid: u32, fd: usize) -> Option<SockEntry> {
 fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
     let Some(e) = sock_entry(pid, fd) else { return err_reply(-9) };
     if e.domain as usize != AF_INET6 { return if optname == IPV6_V6ONLY { err_reply(-ENOPROTOOPT) } else { ok_reply() }; }
+    match optname {
+        MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP | MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP
+        | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => return mcast_group_req(&e, true, optname, optval_ptr, optlen),
+        // struct ipv6_mreq: group, interface index.
+        MCAST_MSFILTER => return mcast_msfilter_set(&e, true, optval_ptr, optlen),
+        IPV6_JOIN_GROUP | IPV6_LEAVE_GROUP => {
+            if optlen < 20 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 16]>(optval_ptr) else { return err_reply(-14) };
+            let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr + 16) else { return err_reply(-14) };
+            if is_tcp_entry(&e) { return err_reply(-71); }
+            if !mcast::is_mcast(&group) { return err_reply(-22); }
+            let r = if optname == IPV6_JOIN_GROUP { mcast::join(e.ofd, group, [0; 4], ifindex) }
+                    else { mcast::leave(e.ofd, group, [0; 4], ifindex) };
+            return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        _ => {}
+    }
     let v = match (if optlen < 4 { None } else { sched::uaccess::read_user::<i32>(optval_ptr) }) {
         Some(v) => v,
         None => return err_reply(if optlen < 4 { -22 } else { -14 }),
@@ -7731,10 +8164,28 @@ fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optle
             0..=255 => o.tos = v as u8,
             _ => return err_reply(-22),
         },
+        IPV6_MULTICAST_ALL => { mcast::set_all(e.ofd, v != 0); return ok_reply(); }
+        IPV6_MULTICAST_LOOP => match v {
+            0 | 1 => o.mc_noloop = v == 0,
+            _ => return err_reply(-22),
+        },
+        IPV6_MULTICAST_IF => {
+            if v == 0 { o.mc_if = 0; o.mc_addr = [0; 4]; }
+            else {
+                let sid = v - 1;
+                if v < 0 || sid as usize >= MAX_STACKS || stack_for(sid as Sid).is_none() { return err_reply(-19); }
+                o.mc_if = sid as u8 + 1;
+            }
+        }
         IPV6_RECVPKTINFO => flag(&mut o, RECV6_PKTINFO),
         IPV6_RECVHOPLIMIT => flag(&mut o, RECV6_HOPLIMIT),
         IPV6_RECVTCLASS => flag(&mut o, RECV6_TCLASS),
-        IPV6_RECVERR => flag(&mut o, RECV6_ERR),
+        IPV6_RECVERR => { flag(&mut o, RECV6_ERR); udp_set_recverr(pid, fd, o.recv6 & RECV6_ERR != 0); }
+        IPV6_DONTFRAG => o.dontfrag = v != 0,
+        IPV6_MTU_DISCOVER => match v {
+            0..=3 => o.pmtud1 = v as u8 + 1,
+            _ => return err_reply(-22),
+        },
         // Sticky pktinfo (source address / interface choice) is accepted, not used.
         IPV6_PKTINFO => if optlen < 20 { return err_reply(-22) },
         _ => return ok_reply(),
@@ -7780,10 +8231,18 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
             Ok(_) => return err_reply(-22),
             Err(x) => return err_reply(x),
         },
+        IP_MTU_DISCOVER => match int_val() {
+            Ok(v) if (0..=3).contains(&v) => o.pmtud1 = v as u8 + 1,
+            Ok(_) => return err_reply(-22),
+            Err(x) => return err_reply(x),
+        },
         IP_PKTINFO | IP_RECVTTL | IP_RECVTOS | IP_RECVERR => match int_val() {
-            Ok(v) => flag(&mut o, match optname {
-                IP_PKTINFO => RECV_PKTINFO, IP_RECVTTL => RECV_TTL, IP_RECVTOS => RECV_TOS, _ => RECV_ERR,
-            }, v != 0),
+            Ok(v) => {
+                flag(&mut o, match optname {
+                    IP_PKTINFO => RECV_PKTINFO, IP_RECVTTL => RECV_TTL, IP_RECVTOS => RECV_TOS, _ => RECV_ERR,
+                }, v != 0);
+                if optname == IP_RECVERR { udp_set_recverr(pid, fd, v != 0); }
+            }
             Err(x) => return err_reply(x),
         },
         IP_MULTICAST_TTL => match int_val() {
@@ -7795,7 +8254,7 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
         IP_MULTICAST_LOOP => match int_val() { Ok(v) => o.mc_noloop = v == 0, Err(x) => return err_reply(x) },
         // Always on here: a socket hears every group joined on the host
         // for its port (Linux's default).
-        IP_MULTICAST_ALL => if let Err(x) = int_val() { return err_reply(x) },
+        IP_MULTICAST_ALL => match int_val() { Ok(v) => { mcast::set_all(e.ofd, v != 0); return ok_reply(); } Err(x) => return err_reply(x) },
         IP_MULTICAST_IF => {
             // struct ip_mreqn, struct ip_mreq or struct in_addr (Linux).
             let (addr, ifindex) = if optlen >= 12 {
@@ -7839,16 +8298,134 @@ fn ip_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optlen:
             if is_tcp_entry(&e) { return err_reply(-71); } // EPROTO
             if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
             let r = if optname == IP_ADD_MEMBERSHIP {
-                mcast::join(e.ofd, group, addr, ifindex)
+                mcast::join(e.ofd, mcast::m4(group), addr, ifindex)
             } else {
-                mcast::leave(e.ofd, group, addr, ifindex)
+                mcast::leave(e.ofd, mcast::m4(group), addr, ifindex)
             };
             return match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        IP_ADD_SOURCE_MEMBERSHIP | IP_DROP_SOURCE_MEMBERSHIP | IP_BLOCK_SOURCE | IP_UNBLOCK_SOURCE => {
+            // struct ip_mreq_source: multiaddr, interface address, source.
+            if optlen < 12 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let Some(src) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 8) else { return err_reply(-14) };
+            if is_tcp_entry(&e) { return err_reply(-71); }
+            if group[0] & 0xf0 != 0xe0 { return err_reply(-22); }
+            let op = match optname {
+                IP_ADD_SOURCE_MEMBERSHIP => mcast::SrcOp::Add,
+                IP_DROP_SOURCE_MEMBERSHIP => mcast::SrcOp::Drop,
+                IP_BLOCK_SOURCE => mcast::SrcOp::Block,
+                _ => mcast::SrcOp::Unblock,
+            };
+            return match mcast::source(e.ofd, op, mcast::m4(group), addr, 0, mcast::m4(src)) { Ok(()) => ok_reply(), Err(x) => err_reply(x) };
+        }
+        MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP | MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP
+        | MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => return mcast_group_req(&e, false, optname, optval_ptr, optlen),
+        MCAST_MSFILTER => return mcast_msfilter_set(&e, false, optval_ptr, optlen),
+        IP_MSFILTER => {
+            // struct ip_msfilter: multiaddr, interface address, fmode, numsrc, slist[].
+            if optlen < 16 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let Some(fmode) = sched::uaccess::read_user::<u32>(optval_ptr + 8) else { return err_reply(-14) };
+            let Some(n) = sched::uaccess::read_user::<u32>(optval_ptr + 12) else { return err_reply(-14) };
+            if is_tcp_entry(&e) { return err_reply(-71); }
+            if group[0] & 0xf0 != 0xe0 || fmode > 1 { return err_reply(-22); }
+            if n as usize > 1024 || optlen < 16 + 4 * n as usize { return err_reply(-22); }
+            let mut srcs = alloc::vec::Vec::new();
+            for i in 0..n as usize {
+                let Some(a) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 16 + 4 * i) else { return err_reply(-14) };
+                srcs.push(mcast::m4(a));
+            }
+            return match mcast::msfilter_set(e.ofd, mcast::m4(group), addr, 0, fmode == 1, &srcs) {
+                Ok(()) => ok_reply(), Err(x) => err_reply(x) };
         }
         _ => return ok_reply(),
     }
     set_sock_opts(e.ofd, o);
     ok_reply()
+}
+
+/// MCAST_MSFILTER set (struct group_filter): u32 interface, sockaddr_storage
+/// group at 8, fmode at 136, numsrc at 140, sockaddr_storage list at 144.
+fn mcast_msfilter_set(e: &SockEntry, v6: bool, optval_ptr: usize, optlen: usize) -> Message {
+    if optlen < 144 { return err_reply(-22); }
+    let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr) else { return err_reply(-14) };
+    let group = match mcast_read_sa(optval_ptr + 8, v6) { Ok(g) => g, Err(x) => return err_reply(x) };
+    let Some(fmode) = sched::uaccess::read_user::<u32>(optval_ptr + 136) else { return err_reply(-14) };
+    let Some(n) = sched::uaccess::read_user::<u32>(optval_ptr + 140) else { return err_reply(-14) };
+    if is_tcp_entry(e) { return err_reply(-71); }
+    if !mcast::is_mcast(&group) || fmode > 1 { return err_reply(-22); }
+    if n as usize > 1024 || optlen < 144 + 128 * n as usize { return err_reply(-22); }
+    let mut srcs = alloc::vec::Vec::new();
+    for i in 0..n as usize {
+        match mcast_read_sa(optval_ptr + 144 + 128 * i, v6) { Ok(a) => srcs.push(a), Err(x) => return err_reply(x) }
+    }
+    match mcast::msfilter_set(e.ofd, group, [0; 4], ifindex, fmode == 1, &srcs) { Ok(()) => ok_reply(), Err(x) => err_reply(x) }
+}
+
+/// A sockaddr_in / sockaddr_in6 at `ptr` as a 16-byte group key.
+fn mcast_read_sa(ptr: usize, v6: bool) -> Result<mcast::G, i32> {
+    let fam = sched::uaccess::read_user::<u16>(ptr).ok_or(-14i32)?;
+    match (fam as usize, v6) {
+        (2, false) => Ok(mcast::m4(sched::uaccess::read_user::<[u8; 4]>(ptr + 4).ok_or(-14i32)?)),
+        (10, true) => sched::uaccess::read_user::<[u8; 16]>(ptr + 8).ok_or(-14i32),
+        _ => Err(-22),
+    }
+}
+
+/// MCAST_MSFILTER get: in = interface, group and room; out = the filter.
+fn mcast_msfilter_get(e: &SockEntry, v6: bool, optval_ptr: usize, optlen_ptr: usize) -> Message {
+    let Some(cap) = sched::uaccess::read_user::<u32>(optlen_ptr) else { return err_reply(-14) };
+    if (cap as usize) < 144 { return err_reply(-22); }
+    let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr) else { return err_reply(-14) };
+    let group = match mcast_read_sa(optval_ptr + 8, v6) { Ok(g) => g, Err(x) => return err_reply(x) };
+    let Some(room) = sched::uaccess::read_user::<u32>(optval_ptr + 140) else { return err_reply(-14) };
+    let (inc, srcs) = match mcast::msfilter_get(e.ofd, group, [0; 4], ifindex) { Ok(r) => r, Err(x) => return err_reply(x) };
+    let n = srcs.len().min(room as usize).min((cap as usize - 144) / 128);
+    let mut b = alloc::vec![0u8; 144 + 128 * n];
+    b[..4].copy_from_slice(&ifindex.to_ne_bytes());
+    let put = |b: &mut [u8], g: &mcast::G| {
+        if v6 { b[..2].copy_from_slice(&10u16.to_ne_bytes()); b[8..24].copy_from_slice(g); }
+        else { b[..2].copy_from_slice(&2u16.to_ne_bytes()); b[4..8].copy_from_slice(&g[12..]); }
+    };
+    put(&mut b[8..136], &group);
+    b[136..140].copy_from_slice(&(inc as u32).to_ne_bytes());
+    b[140..144].copy_from_slice(&(srcs.len() as u32).to_ne_bytes());
+    for (i, sr) in srcs.iter().take(n).enumerate() { put(&mut b[144 + 128 * i..272 + 128 * i], sr); }
+    if !ucopy_out(optval_ptr, &b) || !wr_user(optlen_ptr, b.len() as u32) { return err_reply(-14); }
+    ok_reply()
+}
+
+/// MCAST_* (struct group_req / group_source_req) at either level: u32
+/// interface, then a 128-byte sockaddr_storage group (at 8) and source (at
+/// 136). `v6` is the IPPROTO_IPV6 level (AF_INET6 sockaddrs), else IPPROTO_IP.
+fn mcast_group_req(e: &SockEntry, v6: bool, optname: usize, optval_ptr: usize, optlen: usize) -> Message {
+    let with_src = !matches!(optname, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP);
+    if optlen < if with_src { 264 } else { 136 } { return err_reply(-22); }
+    let Some(ifindex) = sched::uaccess::read_user::<i32>(optval_ptr) else { return err_reply(-14) };
+    let sa = |off: usize| -> Result<mcast::G, i32> {
+        let fam = sched::uaccess::read_user::<u16>(optval_ptr + off).ok_or(-14i32)?;
+        match (fam as usize, v6) {
+            (2, false) => Ok(mcast::m4(sched::uaccess::read_user::<[u8; 4]>(optval_ptr + off + 4).ok_or(-14i32)?)),
+            (10, true) => sched::uaccess::read_user::<[u8; 16]>(optval_ptr + off + 8).ok_or(-14i32),
+            _ => Err(-22),
+        }
+    };
+    let group = match sa(8) { Ok(g) => g, Err(x) => return err_reply(x) };
+    let src = if with_src { match sa(136) { Ok(g) => g, Err(x) => return err_reply(x) } } else { [0u8; 16] };
+    if is_tcp_entry(e) { return err_reply(-71); }
+    if !mcast::is_mcast(&group) { return err_reply(-22); }
+    let r = match optname {
+        MCAST_JOIN_GROUP => mcast::join(e.ofd, group, [0; 4], ifindex),
+        MCAST_LEAVE_GROUP => mcast::leave(e.ofd, group, [0; 4], ifindex),
+        MCAST_JOIN_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Add, group, [0; 4], ifindex, src),
+        MCAST_LEAVE_SOURCE_GROUP => mcast::source(e.ofd, mcast::SrcOp::Drop, group, [0; 4], ifindex, src),
+        MCAST_BLOCK_SOURCE => mcast::source(e.ofd, mcast::SrcOp::Block, group, [0; 4], ifindex, src),
+        _ => mcast::source(e.ofd, mcast::SrcOp::Unblock, group, [0; 4], ifindex, src),
+    };
+    match r { Ok(()) => ok_reply(), Err(x) => err_reply(x) }
 }
 
 /// getsockopt(IPPROTO_IP, ...) for what `ip_setsockopt` keeps; `None` for
@@ -7858,17 +8435,61 @@ fn ip_getsockopt(e: &SockEntry, optname: usize) -> Option<u32> {
     Some(match optname {
         IP_TOS => o.tos as u32,
         IP_TTL => if o.ttl == 0 { 64 } else { o.ttl as u32 },
+        IP_MTU_DISCOVER => o.pmtud_mode() as u32,
+        // Connected sockets only (Linux: ENOTCONN, which this reports as ENOPROTOOPT).
+        IP_MTU => match e.state {
+            SockState::InetConnected { socket_handle, sid, .. } if is_udp_entry(e) => {
+                let peer = stack_for(sid).as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).peer());
+                match peer {
+                    Some(IpEndpoint { addr: IpAddress::Ipv4(d), .. }) => path_mtu(sid, d),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
         IP_PKTINFO => (o.recv & RECV_PKTINFO != 0) as u32,
         IP_RECVTTL => (o.recv & RECV_TTL != 0) as u32,
         IP_RECVTOS => (o.recv & RECV_TOS != 0) as u32,
         IP_RECVERR => (o.recv & RECV_ERR != 0) as u32,
         IP_MULTICAST_TTL => o.mc_ttl as u32,
         IP_MULTICAST_LOOP => (!o.mc_noloop) as u32,
-        IP_MULTICAST_ALL => 1,
+        IP_MULTICAST_ALL => mcast::all(e.ofd) as u32,
         // struct in_addr: the address it was set by.
         IP_MULTICAST_IF => u32::from_ne_bytes(o.mc_addr),
         _ => return None,
     })
+}
+
+/// Linux ip_local_error: a DF datagram larger than the path with IP_RECVERR
+/// fails with EMSGSIZE and leaves an SO_EE_ORIGIN_LOCAL entry (ee_info = MTU).
+fn udp_local_emsgsize(s: &mut NetStack, h: SocketHandle, dst: IpEndpoint, mtu: u32) {
+    let unspec = if matches!(dst.addr, IpAddress::Ipv6(_)) { IpAddress::Ipv6(smoltcp::wire::Ipv6Address::UNSPECIFIED) }
+                 else { IpAddress::Ipv4(smoltcp::wire::Ipv4Address::UNSPECIFIED) };
+    s.socket_set.get_mut::<udp::Socket>(h).push_err(udp::ErrEntry {
+        errno: 90, origin: 1, ty: 0, code: 0, info: mtu, offender: unspec, dst, payload: alloc::vec::Vec::new(),
+    });
+}
+
+/// IP_RECVERR / IPV6_RECVERR on a UDP socket: its smoltcp socket queues
+/// ICMP errors for the error queue from now on.
+fn udp_set_recverr(pid: u32, fd: usize, on: bool) {
+    let Some(e) = sock_entry(pid, fd) else { return };
+    if !is_udp_entry(&e) { return; }
+    let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return };
+    if udpany::of(e.ofd).is_some() { return; }
+    let mut stack = stack_for(sid);
+    if let Some(s) = stack.as_mut() { s.socket_set.get_mut::<udp::Socket>(socket_handle).set_recverr(on); }
+}
+
+/// MSG_ERRQUEUE: the oldest entry of the socket error queue of a UDP socket
+/// (EAGAIN when empty); `take` dequeues it (not MSG_PEEK).
+fn udp_recv_err(pid: u32, fd: usize, take: bool) -> Result<udp::ErrEntry, i32> {
+    let e = sock_entry(pid, fd).ok_or(-9i32)?;
+    if !is_udp_entry(&e) { return Err(-11); }
+    let SockState::InetConnected { socket_handle, sid, .. } = e.state else { return Err(-11) };
+    let mut stack = stack_for(sid);
+    let s = stack.as_mut().ok_or(-100i32)?;
+    s.socket_set.get_mut::<udp::Socket>(socket_handle).recv_err(take).ok_or(-11)
 }
 
 /// Read and clear the pending ICMP error of a connected UDP socket (SO_ERROR);
@@ -7997,11 +8618,26 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                     IPV6_V6ONLY => Some(o.v6only as u32),
                     IPV6_UNICAST_HOPS => Some(if o.ttl == 0 { 64 } else { o.ttl as u32 }),
                     IPV6_MULTICAST_HOPS => Some(o.mc_ttl as u32),
+                    IPV6_MULTICAST_LOOP => Some((!o.mc_noloop) as u32),
+                    IPV6_MULTICAST_IF => Some(if o.mc_if == 0 { 0 } else { o.mc_if as u32 }),
+                    IPV6_MULTICAST_ALL => Some(mcast::all(e.ofd) as u32),
                     IPV6_TCLASS => Some(o.tos as u32),
                     IPV6_RECVPKTINFO => Some((o.recv6 & RECV6_PKTINFO != 0) as u32),
                     IPV6_RECVHOPLIMIT => Some((o.recv6 & RECV6_HOPLIMIT != 0) as u32),
                     IPV6_RECVTCLASS => Some((o.recv6 & RECV6_TCLASS != 0) as u32),
                     IPV6_RECVERR => Some((o.recv6 & RECV6_ERR != 0) as u32),
+                    IPV6_MTU_DISCOVER => Some(o.pmtud_mode() as u32),
+                    IPV6_DONTFRAG => Some(o.dontfrag as u32),
+                    IPV6_MTU => match e.state {
+                        SockState::InetConnected { socket_handle, sid, .. } if is_udp_entry(&e) => {
+                            let peer = stack_for(sid).as_mut().and_then(|s| s.socket_set.get_mut::<udp::Socket>(socket_handle).peer());
+                            match peer {
+                                Some(IpEndpoint { addr: a @ IpAddress::Ipv6(_), .. }) => Some(path_mtu_ip(sid, a)),
+                                _ => None,
+                            }
+                        }
+                        _ => return err_reply(-107), // ENOTCONN
+                    },
                     _ => None,
                 }
             }
@@ -8042,6 +8678,32 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             if !wr_user(optlen_ptr, n as u32) { return err_reply(-14); }
             return ok_reply();
         }
+        // IP_MTU on a socket with no peer: ENOTCONN, as Linux.
+        if level == IPPROTO_IP && optname == IP_MTU && is_inet(e.domain)
+            && !matches!(e.state, SockState::InetConnected { .. }) {
+            return err_reply(-107);
+        }
+        if optname == MCAST_MSFILTER && ((level == IPPROTO_IP && is_inet(e.domain)) || (level == IPPROTO_IPV6 && e.domain as usize == AF_INET6)) {
+            return mcast_msfilter_get(&e, level == IPPROTO_IPV6, optval_ptr, optlen_ptr);
+        }
+        // IP_MSFILTER: in = multiaddr/interface and room for sources; out = filter.
+        if level == IPPROTO_IP && optname == IP_MSFILTER && is_inet(e.domain) {
+            let Some(cap) = sched::uaccess::read_user::<u32>(optlen_ptr) else { return err_reply(-14) };
+            if (cap as usize) < 16 { return err_reply(-22); }
+            let Some(group) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr) else { return err_reply(-14) };
+            let Some(addr) = sched::uaccess::read_user::<[u8; 4]>(optval_ptr + 4) else { return err_reply(-14) };
+            let Some(room) = sched::uaccess::read_user::<u32>(optval_ptr + 12) else { return err_reply(-14) };
+            let (inc, srcs) = match mcast::msfilter_get(e.ofd, mcast::m4(group), addr, 0) {
+                Ok(r) => r, Err(x) => return err_reply(x) };
+            let n = (srcs.len()).min(room as usize).min((cap as usize - 16) / 4);
+            let mut b = alloc::vec![0u8; 16 + 4 * n];
+            b[..4].copy_from_slice(&group); b[4..8].copy_from_slice(&addr);
+            b[8..12].copy_from_slice(&(inc as u32).to_ne_bytes());
+            b[12..16].copy_from_slice(&(srcs.len() as u32).to_ne_bytes());
+            for (i, s) in srcs.iter().take(n).enumerate() { b[16 + 4 * i..20 + 4 * i].copy_from_slice(&s[12..]); }
+            if !ucopy_out(optval_ptr, &b) || !wr_user(optlen_ptr, b.len() as u32) { return err_reply(-14); }
+            return ok_reply();
+        }
         // IP_MULTICAST_IF answers a struct in_addr.
         if level == IPPROTO_IP && optname == IP_MULTICAST_IF && is_inet(e.domain) {
             let a = sock_opts(e.ofd).mc_addr;
@@ -8076,9 +8738,17 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
             b[0] = st;
             let put = |b: &mut [u8; TCP_INFO_LEN], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_ne_bytes());
             put(&mut b, 8, 200_000);   // rto (us)
-            put(&mut b, 16, 1448);     // snd_mss
+            // The path MTU the cache knows (ICMP frag-needed / packet-too-big)
+            // clamps the sender's segment size, as tcp_sync_mss does.
+            let pmtu = match e.state {
+                SockState::InetConnected { sid, remote_endpoint: Some(r), .. } =>
+                    path_mtu_ip(sid, r.addr).min(1500),
+                _ => 1500,
+            };
+            let hdr = if matches!(e.state, SockState::InetConnected { remote_endpoint: Some(IpEndpoint { addr: IpAddress::Ipv6(_), .. }), .. }) { 72 } else { 52 };
+            put(&mut b, 16, (pmtu - hdr).min(1448)); // snd_mss
             put(&mut b, 20, 1448);     // rcv_mss
-            put(&mut b, 60, 1500);     // pmtu
+            put(&mut b, 60, pmtu);     // pmtu
             put(&mut b, 68, 1000);     // rtt (us)
             put(&mut b, 80, 10);       // snd_cwnd
             put(&mut b, 84, 1460);     // advmss
@@ -8108,13 +8778,18 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
 /// The credentials recvmsg on `fd` reports: those of the batch it took, when
 /// the receiving description has SO_PASSCRED.
 fn rcv_cred(pid: u32, fd: usize, c: Option<Ucred>) -> Option<Ucred> {
-    let c = c?;
     let e = sock_entry(pid, fd)?;
-    if sock_opts(e.ofd).passcred { Some(c) } else { None }
+    if !sock_opts(e.ofd).passcred { return None; }
+    // Data sent while nobody wanted credentials (SO_PASSCRED enabled later,
+    // or a send that did not record them) reports the peer end's own, as
+    // Linux's always-attached sender credentials did.
+    if c.is_some() { return c; }
+    let p = unix_peer_cred(pid, fd);
+    if p.pid == 0 { None } else { Some(p) }
 }
 
 fn unix_peer_cred(pid: u32, fd: usize) -> Ucred {
-    let (conn_idx, is_a) = match unix_stream_end(pid, fd) {
+    let (conn_idx, is_a) = match unix_stream_end(pid, fd).or_else(|| unix_conn_end(pid, fd)) {
         Some(e) => e,
         None => return Ucred::zero(),
     };
@@ -8302,6 +8977,11 @@ fn handle_queue_len(pid: u32, sockfd: usize, outq: bool) -> Message {
     let sock_domain = tbl.socks[slot].domain as usize;
     drop(tbls);
     let n = match state {
+        SockState::UnixListening { bound_idx }
+            if sock_domain == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8 =>
+        {
+            if outq { 0 } else { unixdg::head_len(unixdg::sid_of(bound_idx)) }
+        }
         // A wildcard UDP server: the datagram a read would return next.
         SockState::InetConnected { socket_handle, sid, .. }
             if sock_type == SOCK_DGRAM as u8 && udpany::of(ofd).is_some() =>
@@ -8731,6 +9411,18 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
             // then wakes only UNIX_RD(conn, A).
             (ev, Some(conn.seq), Some(unix_end_keys(conn_idx, true, requested)))
         }
+        SockState::UnixListening { bound_idx }
+            if ent.domain as usize == AF_UNIX && sock_type & 0xf == SOCK_DGRAM as u8 =>
+        {
+            drop(tbls);
+            unixdg::poll(unixdg::sid_of(bound_idx), ofd)
+        }
+        SockState::Unbound { domain, sock_type: ty }
+            if domain as usize == AF_UNIX && ty & 0xf == SOCK_DGRAM as u8 =>
+        {
+            drop(tbls);
+            unixdg::poll(0, ofd)
+        }
         SockState::UnixListening { bound_idx } => {
             drop(tbls);
             // Readable only when a connect is pending against *this* listener's
@@ -8828,7 +9520,7 @@ fn handle_poll(pid: u32, fd: usize, requested: u32, want_ofd: u32) -> Message {
                     let mut ev = 0;
                     if socket.can_recv() { ev |= POLLIN; }
                     // A pending ICMP error (datagram_poll: sk_err).
-                    if socket.error() != 0 { ev |= POLLERR; }
+                    if socket.error() != 0 || socket.errq_len() != 0 { ev |= POLLERR; }
                     // Writable while the send queue has room: a full one
                     // (EAGAIN) becomes writable again when the daemon drains
                     // it, which is the edge an EPOLLET writer waits for.

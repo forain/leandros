@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <sys/mount.h>
 #include <sys/sysmacros.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -2647,6 +2648,114 @@ static int e7x_ns0_gen(int m) {
     umount("/tmp/e7x/gn");
     return rc;
 }
+static int e7x_mrefs(void) {
+    char b[8192];
+    int n = slurp("/proc/mntselftest", b, sizeof b);
+    char *l = n > 0 ? strstr(b, "ns0_mrefs=") : NULL;
+    return l ? atoi(l + 10) : -1;
+}
+/* lane mntref: a detached mount's record lives exactly until its last dirfd closes */
+static int e7x_ns0_many(int m) {
+    (void)m;
+    int rc = 0, base = e7x_mrefs();
+    if (base < 0) return 12;
+    mkdir("/tmp/e7x/mn", 0755);
+    if (mount("/tmp/e7x/src", "/tmp/e7x/mn", NULL, MS_BIND, NULL) < 0) return 13;
+    if (mount(NULL, "/tmp/e7x/mn", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { umount("/tmp/e7x/mn"); return 14; }
+    int d = open("/tmp/e7x/mn", O_RDONLY | O_DIRECTORY);
+    if (d < 0) { umount("/tmp/e7x/mn"); return 15; }
+    if (umount("/tmp/e7x/mn") < 0) { close(d); return 16; }
+    /* well over the old 256-entry cap of removed flagged mounts, each with a dirfd opened and closed */
+    for (int i = 0; i < 300 && !rc; i++) {
+        if (mount("/tmp/e7x/src", "/tmp/e7x/mn", NULL, MS_BIND, NULL) < 0) { rc = 17; break; }
+        if (mount(NULL, "/tmp/e7x/mn", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) rc = 18;
+        int t = open("/tmp/e7x/mn", O_RDONLY | O_DIRECTORY);
+        if (t >= 0) close(t); else rc = 19;
+        umount("/tmp/e7x/mn");
+    }
+    if (!rc && mount("/tmp/e7x/src", "/tmp/e7x/mn", NULL, MS_BIND, NULL) < 0) rc = 20;
+    if (!rc) {
+        errno = 0; int fd = openat(d, "gy", O_CREAT | O_WRONLY, 0644);
+        if (fd >= 0 || errno != EROFS) { printf("  old dirfd after 300 detaches errno=%d\n", errno); rc = 21; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/gy"); } }
+        umount("/tmp/e7x/mn");
+    }
+    if (!rc && e7x_mrefs() != base + 1) { printf("  mrefs held=%d base=%d\n", e7x_mrefs(), base); rc = 22; }
+    close(d);
+    if (!rc && e7x_mrefs() != base) { printf("  mrefs leaked=%d base=%d\n", e7x_mrefs(), base); rc = 23; }
+    return rc;
+}
+/* lane mntrace: open() racing umount2(MNT_DETACH) must still record the mount the fd was opened through.
+ * Every failure prints one "DIAG e7race:" line carrying everything needed to diagnose it from the log. */
+static int e7x_race(int m) {
+    (void)m;
+    volatile int *stop = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    long long t0 = now_ns();
+#define E7R_DIAG(rc, fmt, ...) printf("DIAG e7race: rc=%d " fmt " ms=%lld\n", rc, ##__VA_ARGS__, (now_ns() - t0) / 1000000)
+    if (stop == MAP_FAILED) { E7R_DIAG(12, "mmap errno=%d", errno); return 12; }
+    stop[0] = 0; stop[1] = 0; stop[2] = 0; stop[3] = 0; stop[4] = 0;
+    mkdir("/tmp/e7x/rc", 0755);
+    struct stat ss, st;
+    if (stat("/tmp/e7x/src", &ss) < 0) { E7R_DIAG(13, "stat src errno=%d", errno); return 13; }
+    pid_t c = fork();
+    if (c < 0) { E7R_DIAG(14, "fork errno=%d", errno); return 14; }
+    if (c == 0) {
+        /* stop[2]=child exit site (1 mount, 2 remount), stop[3]=its errno, stop[4]=cycles done */
+        while (!stop[0]) {
+            stop[1]++; /* odd: mounting, not yet read-only */
+            if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) { stop[3] = errno; stop[2] = 1; _exit(1); }
+            if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { stop[3] = errno; stop[2] = 2; umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
+            stop[1]++; /* even: read-only for sure */
+            for (volatile int i = 0; i < 3000; i++) {}
+            umount2("/tmp/e7x/rc", MNT_DETACH);
+            stop[4]++;
+        }
+        _exit(0);
+    }
+    int through = 0, bad = 0, i = 0, opens = 0, openfail = 0, lasterr = 0;
+    for (; i < 150000 && !bad && (i < 3000 || through < 400); i++) {
+        int g1 = stop[1];
+        int d = open("/tmp/e7x/rc", O_RDONLY | O_DIRECTORY);
+        if (d < 0) { openfail++; lasterr = errno; continue; }
+        opens++;
+        int g2 = stop[1];
+        if ((g1 & 1) == 0 && g1 == g2 && fstat(d, &st) == 0 && st.st_ino == ss.st_ino && st.st_dev == ss.st_dev) {
+            through++;
+            /* the mount is gone by now or soon: the fd keeps the ro flag it was opened with */
+            for (volatile int k = 0; k < 400; k++) {}
+            errno = 0; int fd = openat(d, "rz", O_CREAT | O_WRONLY, 0644);
+            if (fd >= 0 || errno != EROFS) {
+                int e = errno, g3 = stop[1];
+                E7R_DIAG(16, "check=ro-lost iter=%d through=%d errno=%d created=%d g1=%d g2=%d g3=%d cycles=%d child_exit_site=%d child_errno=%d",
+                         i, through, e, fd >= 0, g1, g2, g3, stop[4], stop[2], stop[3]);
+                bad = 1; if (fd >= 0) { close(fd); unlink("/tmp/e7x/src/rz"); }
+            }
+        }
+        close(d);
+    }
+    stop[0] = 1;
+    int sts; waitpid(c, &sts, 0);
+    umount2("/tmp/e7x/rc", MNT_DETACH);
+    if (stop[2]) { E7R_DIAG(stop[2], "check=child-mount-failed site=%d errno=%d cycles=%d iter=%d through=%d", stop[2], stop[3], stop[4], i, through); if (!bad) return 17; }
+    if (through < 3) {
+        E7R_DIAG(15, "check=too-few-through iter=%d through=%d opens=%d openfail=%d lasterr=%d cycles=%d gen=%d", i, through, opens, openfail, lasterr, stop[4], stop[1]);
+        return 15;
+    }
+    return bad ? 16 : 0;
+}
+/* `mnttest race [N]`: loop the open-vs-detach race N times (default 20) for load reproduction */
+static int race_loop(int n) {
+    mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        long long t0 = now_ns();
+        int ok = nn_in_child(e7x_race, 0);
+        printf("race run %d/%d: %s (%lld ms)\n", i + 1, n, ok ? "PASS" : "FAIL", (now_ns() - t0) / 1000000);
+        if (!ok) bad++;
+    }
+    system("rm -rf /tmp/e7x");
+    printf("race: %d/%d failed\n", bad, n);
+    return bad ? 1 : 0;
+}
 static void e7x_suite(void) {
     e7_mk();
     mkdir("/tmp/e7x", 0755); mkdir("/tmp/e7x/src", 0755);
@@ -2657,6 +2766,8 @@ static void e7x_suite(void) {
     report("e7_ns0_mounts_show_flags", nn_in_child(e7x_ns0_view, 0));
     report("e7_ns0_dirfd_flags_live", nn_in_child(e7x_ns0_dirfd, 0));
     report("e7_ns0_dirfd_detached_keeps_flags", nn_in_child(e7x_ns0_gen, 0));
+    report("e7_ns0_mount_refcount_no_cap_no_leak", nn_in_child(e7x_ns0_many, 0));
+    report("e7_ns0_open_vs_detach_race", nn_in_child(e7x_race, 0));
     system("rm -rf /tmp/e7 /tmp/e7x");
 }
 
@@ -2967,15 +3078,80 @@ static void bindbench(void) {
     if (slurp("/proc/mntselftest", buf, sizeof buf) > 0) { char *q = strstr(buf, "bindpin_checks"); if (q) { char *e = strchr(q, '\n'); if (e) *e = 0; printf("%s\n", q); } }
 }
 
+/* ---- procbind: /dev/null bound over EVERY regular /proc file (the OCI masked-
+ * path / lxcfs pattern: crun masks /proc/interrupts, lxcfs covers meminfo,
+ * uptime, stat). Before the fix the bind failed ENOENT for generated files. */
+static int procbind_all(const char *tag, int *nfiles) {
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    static char names[128][64];
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < 128) {
+        struct stat st; char p[128];
+        snprintf(p, sizeof p, "/proc/%s", e->d_name);
+        if (lstat(p, &st) == 0 && S_ISREG(st.st_mode)) { snprintf(names[n], 64, "%s", e->d_name); n++; }
+    }
+    closedir(d);
+    /* Generated files readdir may not list but that open() serves. */
+    static const char *known[] = { "meminfo", "uptime", "stat", "loadavg", "cmdline", "cpuinfo", "version",
+                                   "interrupts", "mounts", "filesystems", NULL };
+    for (int k = 0; known[k] && n < 128; k++) {
+        int have = 0;
+        for (int i = 0; i < n; i++) if (!strcmp(names[i], known[k])) have = 1;
+        char p[128]; snprintf(p, sizeof p, "/proc/%s", known[k]);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0) { close(fd); if (!have) snprintf(names[n++], 64, "%s", known[k]); }
+    }
+    printf("procbind[%s]: %d files\n", tag, n);
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        char p[128]; snprintf(p, sizeof p, "/proc/%s", names[i]);
+        if (mount("/dev/null", p, NULL, MS_BIND, NULL) != 0) { printf("procbind[%s] bind %s: errno %d\n", tag, p, errno); bad++; continue; }
+        char b[64]; int fd = open(p, O_RDONLY); long r = fd >= 0 ? read(fd, b, sizeof b) : -1;
+        if (fd >= 0) close(fd);
+        if (r != 0) { printf("procbind[%s] %s not empty after bind (r=%ld)\n", tag, p, r); bad++; }
+        umount2(p, MNT_DETACH);
+    }
+    *nfiles = n;
+    return bad;
+}
+
+static void procbind_suite(void) {
+    /* An open descriptor on a generated /proc file names that file (crun mounts onto /proc/self/fd/N). */
+    {
+        int fd = open("/proc/meminfo", O_RDONLY);
+        char l[64], q[64]; ssize_t r = -1;
+        if (fd >= 0) { snprintf(q, sizeof q, "/proc/self/fd/%d", fd); r = readlink(q, l, sizeof l - 1); if (r > 0) l[r] = 0; close(fd); }
+        report("procbind_fd_names_proc_file", r > 0 && !strcmp(l, "/proc/meminfo"));
+    }
+    int n0 = 0;
+    int bad = procbind_all("ns0", &n0);
+    report("procbind_all_files_ns0", bad == 0 && n0 > 5);
+    int wr[2];
+    if (pipe(wr) != 0) { report("procbind_all_files_newns", 0); return; }
+    pid_t c = fork();
+    if (c == 0) {
+        int n1 = 0, ok = 0;
+        if (unshare(CLONE_NEWNS) == 0) ok = procbind_all("newns", &n1) == 0 && n1 > 5;
+        char r = ok ? 1 : 0; write(wr[1], &r, 1); _exit(0);
+    }
+    char r = 0; read(wr[0], &r, 1); waitpid(c, NULL, 0);
+    close(wr[0]); close(wr[1]);
+    report("procbind_all_files_newns", r == 1);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "race")) return race_loop(argc > 2 ? atoi(argv[2]) : 20);
     if (argc > 1 && !strcmp(argv[1], "child-ok")) return 42;
     if (argc > 1 && !strcmp(argv[1], "euid-chk")) return geteuid() == 1000 ? 42 : geteuid() == 0 ? 44 : 45;
     newapi_enosys();
     kernel_selftest();
     sb_hidden_ns0();
     ns0_invariants();
+    procbind_suite();
     newns_suite();
     hardening_suite();
     mountinfo_tests();

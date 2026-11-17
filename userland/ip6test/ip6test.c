@@ -192,10 +192,10 @@ static void test_v6only_default(void) {
 static void test_dual_accept_v4(void) {
     int l = sock6(SOCK_STREAM), ok = 0;
     int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (l >= 0 && bind_any6(l, 47301) == 0 && listen(l, 4) == 0) {
+    if (l >= 0 && bind_any6(l, 27301) == 0 && listen(l, 4) == 0) {
         int c = socket(AF_INET, SOCK_STREAM, 0); tmo(c, 3);
         struct sockaddr_in d; memset(&d, 0, sizeof d);
-        d.sin_family = AF_INET; d.sin_port = htons(47301); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        d.sin_family = AF_INET; d.sin_port = htons(27301); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(c, (struct sockaddr *)&d, sizeof d) == 0) {
             struct sockaddr_in6 p; socklen_t pl = sizeof p; memset(&p, 0, sizeof p);
             int a = accept(l, (struct sockaddr *)&p, &pl);
@@ -213,25 +213,25 @@ static void test_v6only_coexist(void) {
     int a = sock6(SOCK_STREAM), b = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(a, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
-    int r1 = bind_any6(a, 47302), r2 = bind_any4(b, 47302);
+    int r1 = bind_any6(a, 27302), r2 = bind_any4(b, 27302);
     CHECK("v6only_coexist", r1 == 0 && r2 == 0);
     close(a); close(b);
 }
 
 static void test_dual_conflict(void) {
     int a = sock6(SOCK_STREAM), b = socket(AF_INET, SOCK_STREAM, 0);
-    int r1 = bind_any6(a, 47303), r2 = bind_any4(b, 47303), e2 = errno;
+    int r1 = bind_any6(a, 27303), r2 = bind_any4(b, 27303), e2 = errno;
     CHECK("dual_conflict_v4_second", r1 == 0 && r2 < 0 && e2 == EADDRINUSE);
     close(a); close(b);
     a = socket(AF_INET, SOCK_STREAM, 0); b = sock6(SOCK_STREAM);
-    r1 = bind_any4(a, 47304); r2 = bind_any6(b, 47304); e2 = errno;
+    r1 = bind_any4(a, 27304); r2 = bind_any6(b, 27304); e2 = errno;
     CHECK("dual_conflict_v6_second", r1 == 0 && r2 < 0 && e2 == EADDRINUSE);
     close(a); close(b);
 }
 
 static void test_v6only_after_bind(void) {
     int s = sock6(SOCK_STREAM), one = 1;
-    int r = bind_any6(s, 47305);
+    int r = bind_any6(s, 27305);
     int r2 = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     CHECK("v6only_after_bind", r == 0 && r2 < 0 && errno == EINVAL);
     close(s);
@@ -241,7 +241,7 @@ static void test_mapped_connect_v6only(void) {
     int s = sock6(SOCK_STREAM), one = 1;
     setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     struct sockaddr_in6 d; memset(&d, 0, sizeof d);
-    d.sin6_family = AF_INET6; d.sin6_port = htons(47306);
+    d.sin6_family = AF_INET6; d.sin6_port = htons(27306);
     inet_pton(AF_INET6, "::ffff:127.0.0.1", &d.sin6_addr);
     int r = connect(s, (struct sockaddr *)&d, sizeof d);
     CHECK("mapped_connect_v6only", r < 0 && errno == ENETUNREACH);
@@ -250,10 +250,10 @@ static void test_mapped_connect_v6only(void) {
 
 static void test_udp_dual(void) {
     int r = sock6(SOCK_DGRAM), ok = 0;
-    if (r >= 0 && bind_any6(r, 47307) == 0) {
+    if (r >= 0 && bind_any6(r, 27307) == 0) {
         int c = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in d; memset(&d, 0, sizeof d);
-        d.sin_family = AF_INET; d.sin_port = htons(47307); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        d.sin_family = AF_INET; d.sin_port = htons(27307); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         sendto(c, "hi", 2, 0, (struct sockaddr *)&d, sizeof d);
         char buf[8]; struct sockaddr_in6 p; socklen_t pl = sizeof p; memset(&p, 0, sizeof p);
         ssize_t n = recvfrom(r, buf, sizeof buf, 0, (struct sockaddr *)&p, &pl);
@@ -480,12 +480,12 @@ static void test_gni6(void) {
 static void test_localhost_fallback(void) {
     int l = socket(AF_INET, SOCK_STREAM, 0), ok = 0;
     struct sockaddr_in a; memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET; a.sin_port = htons(47320); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_family = AF_INET; a.sin_port = htons(27320); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 4) == 0) {
         struct addrinfo h, *res = 0, *p; memset(&h, 0, sizeof h);
         h.ai_family = AF_UNSPEC; h.ai_socktype = SOCK_STREAM;
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (getaddrinfo("localhost", "47320", &h, &res) == 0) {
+        if (getaddrinfo("localhost", "27320", &h, &res) == 0) {
             for (p = res; p && !ok; p = p->ai_next) {
                 int c = socket(p->ai_family, SOCK_STREAM, 0); tmo(c, 3);
                 if (connect(c, p->ai_addr, p->ai_addrlen) == 0) ok = 1;
@@ -531,7 +531,7 @@ static int ns6_body(int mode) {
     struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
     if (u < 0 || ioctl(u, SIOCSIFFLAGS, &q) != 0) return 3;
     close(u);
-    int port = 47400 + mode;
+    int port = 27400 + mode;
     int v4s = mode == 2 || mode == 4;
     int l = socket(v4s ? AF_INET : AF_INET6, SOCK_STREAM, 0);
     if (l < 0) return 4;
@@ -614,7 +614,7 @@ static int nsudp6_body(void) {
     int a = socket(AF_INET6, SOCK_DGRAM, 0), b = socket(AF_INET6, SOCK_DGRAM, 0);
     if (a < 0 || b < 0) return 4;
     tmo(a, 3); tmo(b, 3);
-    struct sockaddr_in6 la; memset(&la, 0, sizeof la); la.sin6_family = AF_INET6; la.sin6_addr = in6addr_loopback; la.sin6_port = htons(47520);
+    struct sockaddr_in6 la; memset(&la, 0, sizeof la); la.sin6_family = AF_INET6; la.sin6_addr = in6addr_loopback; la.sin6_port = htons(27520);
     if (bind(a, (struct sockaddr *)&la, sizeof la)) return 5;
     if (sendto(b, "udp6", 4, 0, (struct sockaddr *)&la, sizeof la) != 4) return 6;
     char r[8]; struct sockaddr_in6 from; socklen_t fl = sizeof from;
@@ -785,6 +785,31 @@ static void test_ping6_global(void) {
     CHECK("ping6_global", good == 4);
 }
 
+/* ICMPv6 echo to this host's OWN global address is delivered locally (it
+ * used to go out the NIC and never come back); the v4 twin pings eth0's
+ * own IPv4 address. */
+static void test_ping6_own_global(void) {
+    char g[40] = "";
+    if (!find_global(g)) { CHECK("ping6_own_global", 0); return; }
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_own_global", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    for (int i = 0; i < 16; i++) sscanf(g + 2 * i, "%2hhx", &a.sin6_addr.s6_addr[i]);
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4323, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping own global: %d/4\n", good);
+    CHECK("ping6_own_global", good == 4);
+}
+
 static void test_ll_noscope(void) {
     struct sockaddr_in6 a = router_ll();
     a.sin6_port = htons(53);
@@ -839,6 +864,106 @@ static void test_disable_ipv6(void) {
     CHECK("disable_ipv6", gone && back);
 }
 
+// ---- DAD of the NIC addresses (lane ip6dad): tentative -> permanent, accept_dad,
+// dad_transmits, a duplicate -> DADFAILED, flags in /proc/net/if_inet6 ----
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/if_addr.h>
+
+static int conf_rw(const char *field, int set, int v) {
+    char p[96]; snprintf(p, sizeof p, "/proc/sys/net/ipv6/conf/eth0/%s", field);
+    int fd = open(p, set ? O_WRONLY : O_RDONLY);
+    if (fd < 0) return -1;
+    char b[16] = ""; int r;
+    if (set) { int n = snprintf(b, sizeof b, "%d\n", v); r = write(fd, b, n) == n ? 0 : -1; }
+    else { r = read(fd, b, sizeof b - 1) > 0 ? atoi(b) : -1; }
+    close(fd);
+    return r;
+}
+
+/* Flags (hex column 5) of the if_inet6 line of eth0 starting with `prefix`; -1 when absent. */
+static int inet6_flags(const char *prefix) {
+    char l[256];
+    if (!if_inet6_find("eth0", prefix, l, sizeof l)) return -1;
+    unsigned ix, pl, sc, fl;
+    if (sscanf(l + 33, "%x %x %x %x", &ix, &pl, &sc, &fl) != 4) return -1;
+    return (int)fl;
+}
+
+static void test_dad_sysctl(void) {
+    int a = conf_rw("accept_dad", 0, 0), t = conf_rw("dad_transmits", 0, 0);
+    int w = conf_rw("dad_transmits", 1, 3) == 0 && conf_rw("dad_transmits", 0, 0) == 3;
+    conf_rw("dad_transmits", 1, 1);
+    CHECK("dad_sysctl", a == 1 && t == 1 && w && conf_rw("dad_transmits", 0, 0) == 1);
+}
+
+static void test_dad_tentative_then_permanent(void) {
+    conf_rw("dad_transmits", 1, 2);                  /* a 2 s probing window */
+    int off = set_disable(1) == 0;
+    for (int i = 0; off && i < 50 && inet6_flags("fe80") >= 0; i++) usleep(100000);
+    int on = set_disable(0) == 0, first = -1;
+    for (int i = 0; on && i < 400 && first < 0; i++) { first = inet6_flags("fe80"); if (first < 0) usleep(5000); }
+    int last = first;
+    for (int i = 0; first >= 0 && i < 100 && (last & 0x40); i++) { usleep(100000); last = inet6_flags("fe80"); }
+    conf_rw("dad_transmits", 1, 1);
+    printf("  first flags %x then %x\n", first, last);
+    CHECK("dad_tentative_flag", first >= 0 && (first & 0x40) && !(first & 0x800));
+    CHECK("dad_becomes_permanent", last == 0x80);
+}
+
+static void test_dad_off(void) {
+    conf_rw("accept_dad", 1, 0);
+    int off = set_disable(1) == 0;
+    for (int i = 0; off && i < 50 && inet6_flags("fe80") >= 0; i++) usleep(100000);
+    int on = set_disable(0) == 0, first = -1;
+    for (int i = 0; on && i < 400 && first < 0; i++) { first = inet6_flags("fe80"); if (first < 0) usleep(5000); }
+    conf_rw("accept_dad", 1, 1);
+    CHECK("dad_accept_dad_0", first == 0x80);
+}
+
+/* RTM_NEWADDR / RTM_DELADDR of a v6 address on eth0. */
+static int nl_addr6(int add, const unsigned char *a, int plen, unsigned flags) {
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    tmo(s, 3);
+    struct { struct nlmsghdr h; struct ifaddrmsg m; struct rtattr la; unsigned char a[16]; struct rtattr fa; unsigned f; } q;
+    memset(&q, 0, sizeof q);
+    q.h.nlmsg_len = sizeof q; q.h.nlmsg_type = add ? RTM_NEWADDR : RTM_DELADDR;
+    q.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
+    q.m.ifa_family = AF_INET6; q.m.ifa_prefixlen = plen; q.m.ifa_index = if_nametoindex("eth0");
+    q.la.rta_len = RTA_LENGTH(16); q.la.rta_type = IFA_LOCAL; memcpy(q.a, a, 16);
+    q.fa.rta_len = RTA_LENGTH(4); q.fa.rta_type = IFA_FLAGS; q.f = flags;
+    int r = -1;
+    if (send(s, &q, sizeof q, 0) == (ssize_t)sizeof q) {
+        char b[256];
+        ssize_t n = recv(s, b, sizeof b, 0);
+        if (n >= (ssize_t)sizeof(struct nlmsghdr) + 4) { struct nlmsgerr *e = NLMSG_DATA((struct nlmsghdr *)b); r = e->error; }
+    }
+    close(s);
+    return r;
+}
+
+/* The flags of eth0's 2001:db8:dad::<n> style line: `hex` is the 32 hex digits. */
+static void test_dad_static_and_dup(void) {
+    unsigned char fresh[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x0d, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05 };
+    const char *fh = "20010db80dad00000000000000000005";
+    /* fresh address: tentative, then permanent */
+    conf_rw("dad_transmits", 1, 2);
+    int r = nl_addr6(1, fresh, 64, 0);
+    int first = inet6_flags(fh), last = first;
+    for (int i = 0; first >= 0 && i < 100 && (last & 0x40); i++) { usleep(100000); last = inet6_flags(fh); }
+    CHECK("dad_static_tentative", r == 0 && first >= 0 && (first & 0x40));
+    CHECK("dad_static_permanent", last == 0x80);
+    nl_addr6(0, fresh, 64, 0);
+    /* duplicate -> DADFAILED: slirp does not answer an NS for fec0::2, so it is not testable here (TODO.md) */
+    /* IFA_F_NODAD skips it */
+    r = nl_addr6(1, fresh, 64, 0x02);
+    int fl = inet6_flags(fh);
+    CHECK("dad_nodad", r == 0 && fl == 0x80);
+    nl_addr6(0, fresh, 64, 0);
+    conf_rw("dad_transmits", 1, 1);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
@@ -871,9 +996,14 @@ int main(int argc, char **argv) {
     test_ping6_ll_router();
     test_slaac_addr();
     test_ping6_global();
+    test_ping6_own_global();
     test_ll_noscope();
     test_ll_bind_scope();
     test_disable_ipv6();
+    test_dad_sysctl();
+    test_dad_tentative_then_permanent();
+    test_dad_off();
+    test_dad_static_and_dup();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }

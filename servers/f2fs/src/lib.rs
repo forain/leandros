@@ -19,6 +19,8 @@ use ipc::{Message, port};
 use spin::Mutex;
 use drivers::blkdev as virtio_blk;
 
+mod cpflags;
+mod lxchain;
 mod durable;
 
 // ── VFS protocol constants ────────────────────────────────────────────────────
@@ -145,10 +147,6 @@ const FEAT_RW_OK: u32 = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x100 | 0x200 | 0x800;
 /// Flip once linux_import preserves Linux's current-segment summaries.
 const NATIVE_IMPORT_SAFE: bool = true;
 const FEAT_BLKZONED: u32 = 0x2;
-const CP_ERROR_FLAG:     u32 = 0x0000_0008;
-const CP_FSCK_FLAG:      u32 = 0x0000_0010;
-const CP_QUOTA_NEED_FSCK: u32 = 0x0000_0400;
-const CP_DISABLED_FLAG:  u32 = 0x0000_1000;
 const LX_TAG: &[u8] = b"LeandrOS lxnode";
 
 // Checkpoint offsets (within a checkpoint block)
@@ -191,11 +189,15 @@ const CP_OWN_HEADS:      usize = 3348;
 /// checkpoint apart (`cp_is_foreign`). Past the version bitmaps (192..) and
 /// before the journal header (3072).
 const CP_OWN_VER:        usize = 2048;
+/// Writer signature (lane fsckcp): a CRC over the fields `fsck.f2fs` rewrites
+/// in place while keeping `checkpoint_ver` and our private area (flags, pack
+/// total, ver). `fsck.f2fs -f` sets NOCRC|UMOUNT and a shorter pack total on
+/// the same version, which `CP_OWN_VER` alone cannot tell from our own write.
+const CP_OWN_SIG:        usize = 2056;
 /// `sit_nat_version_bitmap`: the SIT bitmap, then the NAT bitmap (cp_payload 0).
 const CP_VER_BITMAP:     usize = 192;
 const CP_ORPHAN_PRESENT: u32   = 0x0000_0002;
 const CP_COMPACT_SUM:    u32   = 0x0000_0004;
-const CP_LARGE_NAT_BM:   u32   = 0x0000_0200;
 const CP_UMOUNT_FLAG:    u32   = 0x0000_0001;
 
 // Inode (node block) field offsets
@@ -263,6 +265,8 @@ const NODE_OFS_IND2: u32 = 4 + LX_N;
 const NODE_OFS_DIND: u32 = 5 + 2 * LX_N;
 /// `XATTR_NODE_OFFSET`.
 const NODE_OFS_XATTR: u32 = 0x1FFF_FFFF;
+const _: () = assert!(lxchain::LX_N == LX_N && lxchain::OFS_IND1 == NODE_OFS_IND1 && lxchain::OFS_IND2 == NODE_OFS_IND2
+                      && lxchain::OFS_DIND == NODE_OFS_DIND && lxchain::CP_OWN_VER == CP_OWN_VER);
 /// Offset of the direct node at `i_nid[slot]` (slot 0/1 = dnode1/2).
 fn node_ofs_dnode(slot: usize) -> u32 { 1 + slot as u32 }
 /// Offset of the indirect node at `i_nid[slot]` (slot 2/3).
@@ -3255,6 +3259,25 @@ fn nat_update_owned(ms: &mut MountState, nid: u32, owner: Option<u32>, blk_addr:
 
 // ── SIT: find a free segment ──────────────────────────────────────────────────
 
+/// lxchain (M2/L3): is `seg` the chain segment S or a filler head of the
+/// durable or the prepared checkpoint (warm/cold data, warm/cold node)? Such a
+/// segment must stay empty and unallocated while a Linux mount of that
+/// checkpoint may read its curseg. Always false with the knob off.
+pub(crate) fn lx_reserved(ms: &MountState, seg: u32) -> bool {
+    if !durable::lx_enabled() { return false; }
+    [1usize, 2, 4, 5].iter().any(|&t| ms.dur.lx_heads[t].0 == seg || ms.cp.logs[t].0 == seg)
+        || ms.dur.lx_seg == seg
+}
+
+/// `lx_reserved` as seen by filler head `t` of the next checkpoint: its own
+/// previous segment (and S for t = 4) may be kept, everything another head
+/// holds may not be taken.
+fn lx_reserved_but(ms: &MountState, seg: u32, t: usize) -> bool {
+    if !durable::lx_enabled() { return false; }
+    [1usize, 2, 4, 5].iter().any(|&u| u != t && (ms.dur.lx_heads[u].0 == seg || ms.cp.logs[u].0 == seg))
+        || (t != 4 && ms.dur.lx_seg == seg)
+}
+
 fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32> {
     // Bound the scan by the real main-area segment count, not a hardcoded
     // 1024: on a volume with fewer segments the modulo wrapped onto segments
@@ -3269,6 +3292,7 @@ fn sit_find_free_seg(ms: &mut MountState, after: u32, heads: bool) -> Option<u32
     for seg_off in 0..total {
         let seg = (start_seg + seg_off) % total;
         if pass == 0 && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if lx_reserved(ms, seg) { continue; }
         // Never hand back a segment one of the logs is *currently* writing
         // into. Before reclaim existed this could not happen — vblocks only
         // ever grew — but once a segment can drop back to zero valid blocks
@@ -3705,7 +3729,7 @@ fn lx_ovp_segs(ms: &MountState) -> u32 {
 fn lx_empty_segs(ms: &mut MountState, limit: u32) -> u32 {
     let mut n = 0;
     for seg in 0..ms.sb.seg_cnt_main {
-        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) { continue; }
+        if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno || prot_any(ms, seg) || lx_reserved(ms, seg) { continue; }
         let (blkno, off) = sit_entry_loc(ms, seg);
         if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 {
             n += 1;
@@ -3765,7 +3789,24 @@ fn log_alloc(ms: &mut MountState, node: bool) -> Option<u32> {
 /// f2fslayout) can be mounted by Linux at all; the older one-copy volumes
 /// never take this path.
 fn cp_is_foreign(sb: &SbInfo, b: &[u8; BLOCK_SIZE]) -> bool {
-    sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b) && r64(b, CP_OWN_VER) != r64(b, CP_VER)
+    sb.seg_cnt_sit >= 2 && !durable::cp_is_legacy(b)
+        && (r64(b, CP_OWN_VER) != r64(b, CP_VER) || cp_sig_foreign(b))
+}
+
+/// CRC of the fields an external fixer rewrites (see `CP_OWN_SIG`).
+fn cp_own_sig(b: &[u8; BLOCK_SIZE]) -> u32 {
+    let mut f = [0u8; 16];
+    f[0..4].copy_from_slice(&b[CP_CKPT_FLAGS..CP_CKPT_FLAGS + 4]);
+    f[4..8].copy_from_slice(&b[CP_PACK_TOTAL..CP_PACK_TOTAL + 4]);
+    f[8..16].copy_from_slice(&b[CP_VER..CP_VER + 8]);
+    durable::linux_crc(&f)
+}
+
+/// A signed block whose signature no longer matches was rewritten by someone
+/// else. A zero signature is a block from before this lane: not judged.
+fn cp_sig_foreign(b: &[u8; BLOCK_SIZE]) -> bool {
+    let s = r32(b, CP_OWN_SIG);
+    s != 0 && s != cp_own_sig(b)
 }
 
 /// Linux's roll-forward (recover_fsync_data / find_fsync_dnodes): from the
@@ -3781,12 +3822,13 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
     let off = r16(cp, CP_CUR_NODE_BLKOFF + 2) as u64;
     let bps = sb.blocks_per_seg as u64;
     if seg >= sb.seg_cnt_main as u64 || off >= bps { return None; }
-    let mut want = r64(cp, CP_VER);
-    if flags & 0x40 != 0 {
+    let ver = r64(cp, CP_VER);
+    let crc = if cpflags::cp_crc_recovery(flags) {
         let co = r32(cp, durable::CP_CHKSUM_FIELD) as usize;
         if co + 4 > BLOCK_SIZE { return None; }
-        want |= (r32(cp, co) as u64) << 32;
-    }
+        Some(r32(cp, co))
+    } else { None };
+    let want = cpflags::chain_want(ver, crc, flags)?;
     let main = sb.main_blkaddr as u64;
     let end = main + sb.seg_cnt_main as u64 * bps;
     let ft = NODE_FOOTER;
@@ -3796,10 +3838,10 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
     while addr >= main && addr < end {
         if all.len() > 100_000 { return None; }
         if !virtio_blk::read_block(dev, addr, &mut b) { return None; }
-        if r64(&b, ft + 12) != want { break; }
+        if !cpflags::chain_matches(want, r64(&b, ft + 12), flags) { break; }
         let (nid, ino, fl) = (r32(&b, ft), r32(&b, ft + 4), r32(&b, ft + 8));
         let ofs = fl >> 3;
-        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, fl & 6 != 0));
+        all.push((durable::LxChain { addr: addr as u32, nid, ino, ofs, dent: fl & 4 != 0 && nid == ino }, cpflags::node_is_fsync_mark(fl)));
         addr = r32(&b, ft + 20) as u64;
     }
     let mut out = alloc::vec::Vec::new();
@@ -3813,8 +3855,7 @@ fn linux_chain(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], flags: u32) -> Op
 }
 
 fn ofs_bad(e: &durable::LxChain) -> bool {
-    let dn = |o: u32| o != NODE_OFS_IND1 && o != NODE_OFS_IND2 && o != NODE_OFS_DIND
-        && !(o > NODE_OFS_DIND && (o - NODE_OFS_DIND - 1) % (LX_N + 1) == 0);
+    let dn = |o: u32| !lxchain::lx_ofs_indirect(o);
     e.nid == 0 || (e.ofs == 0) != (e.nid == e.ino)
         || (e.ofs != 0 && e.ofs != NODE_OFS_XATTR && !dn(e.ofs))
 }
@@ -3885,7 +3926,7 @@ fn linux_import(dev: usize, sb: &SbInfo, cp: &[u8; BLOCK_SIZE], cp_addr: u64, ro
     // cp_payload > 0: the NAT bitmap stays in the commit block, the SIT bitmap
     // moves to the payload blocks after it (Linux `__bitmap_ptr`).
     let payload = sb.cp_payload as usize;
-    if flags & CP_LARGE_NAT_BM != 0 || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
+    if cpflags::cp_large_nat_bitmap(flags) || sb.seg_cnt_nat < 2 { bail!("bitmap-layout"); }
     if payload > 0 {
         if CP_VER_BITMAP + nat_sz > durable::CP_CRC_OFF || sit_sz > payload * BLOCK_SIZE { bail!("bitmap-layout"); }
     } else if CP_VER_BITMAP + sit_sz + nat_sz > durable::CP_CRC_OFF { bail!("bitmap-layout"); }
@@ -4086,6 +4127,7 @@ fn ssr_pick(ms: &mut MountState, node: bool, heads: bool) -> Option<u32> {
     for seg in 0..ms.sb.seg_cnt_main {
         if seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno { continue; }
         if !heads && ms.cp.logs.iter().any(|l| l.0 == seg) { continue; }
+        if lx_reserved(ms, seg) { continue; }
         // A data block in a node segment (or the reverse) is something
         // fsck.f2fs cannot repair: reuse only a segment of the same class.
         let (blkno, off) = sit_entry_loc(ms, seg);
@@ -4266,6 +4308,7 @@ fn cp_pos(ms: &MountState) -> [u32; 6] {
 /// remount-ro, shutdown and contexts that may not sleep only.
 fn write_checkpoint(ms: &mut MountState, umount: bool) -> bool {
     act_code(ACT_CHECKPOINT);
+    vfs_server::F2FS_CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
     let seq = cp_seq_begin(ms.port);
     // An unlocked checkpoint or a roll-forward fsync may still be writing:
     // let it finish first (its commit decides which pack is durable, and an
@@ -4314,8 +4357,11 @@ fn build_cp_block(ms: &mut MountState, umount: bool, pack: u8, logs: &LinuxLogs)
     w32(&mut buf, CP_NEXT_FREE_NID,   ms.cp.next_free_nid);
     // Linux's log heads in the standard fields, this kernel's in CP_OWN_HEADS.
     linux_cp_fields(ms, &mut buf, logs);
-    ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 };
+    ms.cp.flags = if umount { CP_UMOUNT_FLAG } else { 0 }
+        | if durable::lx_enabled() { cpflags::CP_CRC_RECOVERY_FLAG } else { 0 };
     w32(&mut buf, CP_CKPT_FLAGS,      ms.cp.flags);
+    let sig = cp_own_sig(&buf);
+    w32(&mut buf, CP_OWN_SIG,         sig);
     (cp_blkno as u64, buf)
 }
 
@@ -4363,7 +4409,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
         let (seg, off) = ms.cp.logs[t];
         if seg < main && off == 0 && !logs.iter().any(|l| l.0 == seg)
             && seg != ms.cp.cur_data_segno && seg != ms.cp.cur_node_segno
-            && !avoid.contains(&seg) && !prot_any(ms, seg) {
+            && !avoid.contains(&seg) && !prot_any(ms, seg) && !lx_reserved_but(ms, seg, t) {
             let (blkno, o) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), o) & SIT_VBLOCKS_MASK == 0 {
                 logs[t] = (seg, 0);
@@ -4379,6 +4425,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
             // segment the durable checkpoint still points into: the
             // allocator may be moved there (below).
             if avoid.contains(&seg) || prot_any(ms, seg) { continue; }
+            if lx_reserved_but(ms, seg, t) { continue; }
             let (blkno, off) = sit_entry_loc(ms, seg);
             if r16(ms.cache.read(ms.dev, blkno), off) & SIT_VBLOCKS_MASK == 0 { pick = Some(seg); break; }
         }
@@ -4394,7 +4441,7 @@ pub(crate) fn linux_logs(ms: &mut MountState, avoid: &[u32]) -> LinuxLogs {
                 Some(h) => { ssr[t] = true; h }
                 // Nothing valid exists: at least not a segment another head has.
                 None => ((0..main).find(|&g| !logs.iter().any(|l| l.0 == g)
-                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno).unwrap_or(t as u32), 0),
+                    && g != ms.cp.cur_data_segno && g != ms.cp.cur_node_segno && !lx_reserved_but(ms, g, t)).unwrap_or(t as u32), 0),
             },
         };
         logs[t] = (seg, off);
@@ -4430,7 +4477,7 @@ fn lx_ssr_head(ms: &mut MountState, logs: &LinuxLogs, t: usize, avoid: &[u32]) -
     for pass in 0..3 {
         for seg in 0..ms.sb.seg_cnt_main {
             if logs.iter().any(|l| l.0 == seg) || seg == ms.cp.cur_data_segno || seg == ms.cp.cur_node_segno
-                || avoid.contains(&seg) { continue; }
+                || avoid.contains(&seg) || lx_reserved_but(ms, seg, t) { continue; }
             let (blkno, o) = sit_entry_loc(ms, seg);
             let v = r16(ms.cache.read(ms.dev, blkno), o);
             let ok = match pass {
@@ -4744,6 +4791,7 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
             return Ok(());
         }
     }
+    vfs_server::F2FS_CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
     // Phase 1.
     let (mut job, seq) = {
         let mut mounts = lock_mounts();
@@ -8397,11 +8445,13 @@ fn handle_statfs(ms: &mut MountState, buf_ptr: u64) -> Message {
     if buf_ptr == 0 { return err_reply(-14); } // EFAULT
 
     let bps          = ms.sb.blocks_per_seg as u64;
-    let user_blocks  = ms.sb.seg_cnt_main as u64 * bps;
+    // What the allocator can actually fill: the overprovision and the lx
+    // reserve of empty segments (`log_alloc`) never hold user data.
+    let user_blocks  = (ms.sb.seg_cnt_main as u64).saturating_sub(lx_ovp_segs(ms) as u64 + LX_RESERVE_SEGS as u64) * bps;
     let total_blocks = ms.sb.block_count.saturating_sub(ms.sb.segment0_blkaddr as u64);
     // A superblock we failed to make sense of must still not report zero —
     // `df` silently drops any filesystem with f_blocks == 0.
-    let total_blocks = if total_blocks == 0 { user_blocks.max(1) } else { total_blocks };
+    let total_blocks = if total_blocks == 0 { (ms.sb.seg_cnt_main as u64 * bps).max(1) } else { total_blocks };
 
     let valid_blocks = ms.valid_blocks;
     if statfs_check() {
@@ -9277,6 +9327,7 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
     let foreign1 = rd1 && cp_is_foreign(&sb, &cp_buf1);
     for (f, b) in [(foreign0, &mut cp_buf0), (foreign1, &mut cp_buf1)] {
         if !f { continue; }
+        dbg_str("[F2FS] foreign checkpoint (Linux or fsck.f2fs wrote it); journal dropped\n");
         w32(b, durable::CPJ_MAGIC_OFF, 0);
         let (ds, ns) = (r32(b, CP_CUR_DATA_SEGNO), r32(b, CP_CUR_NODE_SEGNO));
         let (db, nb) = (r16(b, CP_CUR_DATA_BLKOFF), r16(b, CP_CUR_NODE_BLKOFF));
@@ -9352,9 +9403,16 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
     let unknown = incompat & !durable::CPJ_INCOMPAT_KNOWN;
     let foreign = if pick1 { foreign1 } else { foreign0 };
     let mut lx_chain: alloc::vec::Vec<durable::LxChain> = alloc::vec::Vec::new();
+    // A large NAT bitmap lives outside the commit block's private area: this
+    // server cannot read or write that layout, and such a checkpoint is never
+    // "foreign" (its checksum_offset is the legacy one), so refuse rw here.
+    if cpflags::cp_large_nat_bitmap(cp.flags) && !read_only {
+        dbg_str("[F2FS] checkpoint uses a large NAT bitmap; mounting read-only\n");
+        read_only = true;
+    }
     if foreign || sb.native {
         let fl = cp.flags;
-        let why = if fl & (CP_FSCK_FLAG | CP_ERROR_FLAG | CP_DISABLED_FLAG | CP_QUOTA_NEED_FSCK) != 0 {
+        let why = if cpflags::cp_needs_fsck(fl) {
             Some("checkpoint flags ask for fsck or report an error")
         } else if foreign && fl & CP_UMOUNT_FLAG == 0 && !{
             // Unclean Linux shutdown: fine when the fsync chain (if any) can
@@ -9520,7 +9578,13 @@ fn mount_with_pinned(dev_idx: usize, mount_point: &'static str, owner_pid: u32, 
             dbg_dec(reaped);
             dbg_str("\n");
         }
-        if (recovered > 0 || reaped > 0 || foreign) && !ms.read_only { write_checkpoint(ms, false); }
+        // lxchain (H1/B): with the knob on, or after a CP that carries the
+        // chain flag, commit a non-umount CP before accepting writes, so a
+        // stale chain stamped against the old CP is dead and the first fsync
+        // of the session can chain. A failed commit leaves `lx_open` false.
+        let lx_mount_cp = durable::lx_enabled()
+            || (!foreign && ms.cp.flags & cpflags::CP_CRC_RECOVERY_FLAG != 0);
+        if (recovered > 0 || reaped > 0 || foreign || lx_mount_cp) && !ms.read_only { write_checkpoint(ms, false); }
         ms.dur.ext_free = durable::count_ext_free(ms);
     }
 
@@ -9666,6 +9730,8 @@ pub fn remount_by_port(port: u32, ro: bool) -> bool {
     for slot in mounts.iter_mut() {
         if let Some(ref mut ms) = slot {
             if ms.port == port {
+                // lxchain: a remount ro->rw commits nothing; the newest CP is
+                // this umount CP, so `settle` never opened a chain era (B).
                 if ro && !ms.read_only {
                     write_checkpoint(ms, true);
                     ms.read_only = true;

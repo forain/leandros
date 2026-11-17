@@ -43,6 +43,10 @@ pub mod env {
 
     pub fn serial_raw(s: &str) { crate::pci::serial_debug(s) }
     pub fn sleep_until(ns: u64) { crate::sys_common::sleep_until(ns) }
+    /// MSI-X for the storage drivers (same names as the built-in `kenv::irq`).
+    pub mod irq { pub use crate::irq::{IrqHandler, IrqReturn, MsixTable}; }
+    /// Interrupt-to-task wake-up: the ISR calls `notify`, the I/O path `wait`s with a timeout.
+    pub use crate::netdev::LinkMon as IrqWait;
 
     fn word(key: &str) -> Option<&'static str> {
         crate::cmdline().split_ascii_whitespace().find_map(|t| t.strip_prefix(key).and_then(|r| r.strip_prefix('=')))
@@ -89,6 +93,14 @@ pub mod env {
             out
         }
         pub fn serial_debug_dec(v: u64) { serial_debug(&alloc::format!("{}", v)); }
+    }
+
+    pub use crate::irq;
+
+    /// CPU identity and reschedule IPIs for completion handlers.
+    pub mod ipi {
+        pub fn cpu_id() -> usize { unsafe { kmod_abi::blk::sys_blk::kapi_cpu_id() } }
+        pub fn kick_cpus(mask: u64) { unsafe { kmod_abi::blk::sys_blk::kapi_kick_cpus(mask) } }
     }
 
     pub mod sched {

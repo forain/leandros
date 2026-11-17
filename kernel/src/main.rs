@@ -987,6 +987,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
                 &DTB_REQUEST,
             );
             hhdm_offset = BOOT_INFO.hhdm_offset;
+            #[cfg(target_arch = "aarch64")]
+            a64_platform_init(hhdm_offset);
 
             // aarch64 DTB fallback (no Limine DTB): `early_dtb_ram_scan`, run
             // just before the allocator is seeded so the blob's reserved
@@ -1473,7 +1475,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     }
     early_reserve_knob();
     #[cfg(target_arch = "aarch64")]
-    if is_limine { early_dtb_ram_scan(hhdm_offset as usize); }
+    if is_limine && !acpi_forced() { early_dtb_ram_scan(hhdm_offset as usize); }
     #[cfg(target_arch = "aarch64")]
     early_dtb_reserve();
     // A kexec'ing LeandrOS left its final log for us (kexec/prevlog.rs).
@@ -1523,6 +1525,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         arch_x86_64::cpufreq::set_msrtest(k("cpu.msrtest").unwrap_or(0) != 0);
     }
     if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "idmap=off")) { sched::ns::set_idmap_off(); }
+    if boot_cmdline().map_or(false, |c| c.split_ascii_whitespace().any(|t| t == "pidns.zaptest=1")) { sched::pidns::set_zaptest(); }
     // `apic.x2apic=1`: run the local APICs in x2APIC mode even when no APIC
     // ID needs it (tests the mode firmware and kexec hand-offs leave us in).
     #[cfg(target_arch = "x86_64")]
@@ -1590,6 +1593,8 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // readable RTC, CLOCK_REALTIME counts from the boot instant.
     time_init();
     kfacil_init(hhdm_offset);
+    #[cfg(all(target_arch = "aarch64", not(any(feature = "rpi5", feature = "raspi4b"))))]
+    a64_its_init();
     early_mark(13);
 
     // aarch64: SIMD and UART are now available. Run DTB fallback search if Limine
@@ -2840,6 +2845,118 @@ fn early_reserve_knob() {
 /// (phys, uart_base, pci_ecam_base) of a DTB found by the pre-mm RAM scan.
 #[cfg(target_arch = "aarch64")]
 static EARLY_RAM_DTB: spin::Mutex<Option<(usize, u64, u64)>> = spin::Mutex::new(None);
+
+/// `acpi=force` on the command line: ignore any DTB and take the platform
+/// from ACPI tables only (the EC2 Graviton situation).
+#[cfg(target_arch = "aarch64")]
+fn acpi_forced() -> bool { cmdline_knob("acpi") == Some("force") }
+
+/// GICv3 ITS bring-up (MSI / MSI-X for PCI). The ITS frame comes from the
+/// MADT (ACPI path) or the DTB's `arm,gic-v3-its` node. `gic.its=0` leaves
+/// it off; any failure leaves every driver on INTx / polling.
+#[cfg(all(target_arch = "aarch64", not(any(feature = "rpi5", feature = "raspi4b"))))]
+fn a64_its_init() {
+    if cmdline_knob("gic.its") == Some("0") {
+        serial_print_str("[ITS] disabled by gic.its=0\n");
+        return;
+    }
+    if !arch_aarch64::gic::is_v3() { return; }
+    let mut base = arch_aarch64::its::acpi_base(0);
+    if base == 0 {
+        unsafe {
+            boot::device_tree::for_each_compatible(&mut |n| {
+                if base == 0 && n.compat.split(|&c| c == 0).any(|c| c == b"arm,gic-v3-its") {
+                    if let Some((a, _)) = n.reg { base = a; }
+                }
+            });
+        }
+    }
+    if base == 0 { return; }
+    arch_aarch64::its::init(base);
+}
+
+/// aarch64 ACPI platform layer (Limine boot). When the firmware gave no DTB,
+/// or `acpi=force`, read MADT / SPCR / GTDT / MCFG / FADT and turn the GIC,
+/// console UART, timer PPIs, ECAM and PSCI conduit into runtime values instead
+/// of the QEMU-virt constants. With a DTB and no `acpi=force` nothing changes.
+#[cfg(target_arch = "aarch64")]
+fn a64_platform_init(hhdm: u64) {
+    use boot::acpi_a64::{discover, Psci, UartKind};
+    unsafe {
+        let force = acpi_forced();
+        if force {
+            // Forget everything the DTB said (limine.rs parsed it already).
+            BOOT_INFO.uart_base = 0;
+            BOOT_INFO.pci_ecam_base = 0;
+        }
+        let have_dtb = DTB_REQUEST.response().map_or(false, |r| !r.dtb_ptr.is_null());
+        if BOOT_INFO.rsdp_addr == 0 || (have_dtb && !force) { return; }
+        let p = discover(BOOT_INFO.rsdp_addr, hhdm);
+        serial_print_str("[ACPI] aarch64 platform from ACPI tables");
+        if force { serial_print_str(" (acpi=force, DTB ignored)"); }
+        serial_print_str("\n");
+
+        let mut ranges = [(0usize, 0usize); 8];
+        let mut gic = arch_aarch64::gic::PlatformGic { gicd: 0, gicc: 0, gicr: &[], ppi_virt: 0, ppi_phys: 0 };
+        if let Some(m) = p.madt {
+            for i in 0..m.gicr_n { ranges[i] = (m.gicr[i].0 as usize, m.gicr[i].1 as usize); }
+            if m.gicr_n == 0 && m.gicc_gicr_base != 0 {
+                ranges[0] = (m.gicc_gicr_base as usize, 0x2_0000 * m.cpus.max(1));
+            }
+            gic.gicd = m.gicd_base as usize;
+            gic.gicc = m.gicc_base as usize;
+            gic.gicr = &ranges;
+            serial_print_str("[ACPI] MADT gicd="); serial_print_hex(m.gicd_base as usize);
+            serial_print_str(" ver="); serial_print_hex(m.gic_version as usize);
+            serial_print_str(" gicr0="); serial_print_hex(ranges[0].0);
+            serial_print_str(" len="); serial_print_hex(ranges[0].1);
+            serial_print_str(" nr="); serial_print_hex(m.gicr_n);
+            serial_print_str(" its="); serial_print_hex(m.its_n);
+            serial_print_str(" cpus="); serial_print_hex(m.cpus);
+            serial_print_str("\n");
+        }
+        if let Some(g) = p.gtdt {
+            gic.ppi_virt = g.virt;
+            gic.ppi_phys = g.ns_el1;
+            serial_print_str("[ACPI] GTDT virt="); serial_print_hex(g.virt as usize);
+            serial_print_str(" ns_el1="); serial_print_hex(g.ns_el1 as usize);
+            serial_print_str("\n");
+        }
+        arch_aarch64::gic::set_platform(&gic);
+        if let Some(m) = p.madt { arch_aarch64::its::set_acpi_bases(&m.its[..m.its_n]); }
+        for m in &p.iort[..p.iort_n] { arch_aarch64::its::set_rid_map(m.input, m.count, m.output); }
+        if let Some(u) = p.spcr {
+            let ns = u.kind == UartKind::Ns16550;
+            let moved = arch_aarch64::uart::phys_base() != u.base as usize;
+            arch_aarch64::uart::set_platform(u.base as usize, ns, u.reg_shift, u.access_bytes);
+            arch_aarch64::gic::set_uart_intid(u.gsi);
+            BOOT_INFO.uart_base = u.base;
+            // Make the (possibly different) console reachable before init.
+            let (kp, kv) = KERNEL_ADDR_REQUEST.response()
+                .map_or((0, 0), |k| (k.physical_base as usize, k.virtual_base as usize));
+            if moved { arch_aarch64::early::arm_uart(hhdm as usize, kp, kv); }
+            serial_print_str("[ACPI] SPCR uart="); serial_print_hex(u.base as usize);
+            serial_print_str(if ns { " ns16550" } else { " pl011" });
+            serial_print_str(" shift="); serial_print_hex(u.reg_shift as usize);
+            serial_print_str(" gsi="); serial_print_hex(u.gsi as usize);
+            serial_print_str("\n");
+        }
+        if p.ecam_n > 0 {
+            BOOT_INFO.pci_ecam_base = p.ecam[0].base;
+            serial_print_str("[ACPI] MCFG segments="); serial_print_hex(p.ecam_n);
+            serial_print_str(" ecam0="); serial_print_hex(p.ecam[0].base as usize);
+            serial_print_str("\n");
+        }
+        match p.psci {
+            Psci::None => {}
+            c => {
+                arch_aarch64::smp::set_psci_conduit(c == Psci::Hvc);
+                serial_print_str(if c == Psci::Hvc { "[ACPI] FADT PSCI conduit HVC\n" } else { "[ACPI] FADT PSCI conduit SMC\n" });
+            }
+        }
+    }
+}
+
 
 /// Limine handed us no DTB (UEFI+ACPI, or a loader that leaves one in RAM):
 /// look for one in the first 32 MiB of RAM *before* `mm::init_with_map`, so

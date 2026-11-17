@@ -3,6 +3,7 @@
 # Usage: build.sh [aarch64|x86_64|both]
 # Output: m6-session-bins/out/leandros-installer-<arch>
 set -euo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-both}" in
@@ -19,6 +20,6 @@ for arch in "${ARCHES[@]}"; do
     echo "leandros-installer: build failed for $arch (log: $M6/logs/leandros-installer-$arch.log)" >&2
     exit 1
   fi
-  install -m 0755 "$HERE/target/$arch-unknown-linux-musl/release/leandros-installer" "$M6/out/leandros-installer-$arch"
+  stage_file 0755 "$HERE/target/$arch-unknown-linux-musl/release/leandros-installer" "$M6/out/leandros-installer-$arch"
   echo "leandros-installer: $arch -> $M6/out/leandros-installer-$arch"
 done

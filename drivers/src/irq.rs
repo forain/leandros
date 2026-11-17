@@ -17,8 +17,11 @@
 //!   registers a handler in this module's line table (up to 4 sharers per
 //!   line, for shared PCI INTx) and enables the SPI level-triggered; the GIC
 //!   dispatcher falls back to [`dispatch_line`] for INTIDs it does not own.
-//!   MSI needs a GICv3 ITS, which this kernel does not drive yet:
-//!   `request_msi`/MSI-X return `Unsupported` on aarch64 (TODO: ITS).
+//!   MSI / MSI-X go through the GICv3 ITS (`arch_aarch64::its`): each vector
+//!   is an LPI (INTID >= 8192, `dispatch_line` hands those to the LPI table
+//!   below) and the message is a write of the EventID to `GITS_TRANSLATER`.
+//!   Without an ITS (GICv2, rpi5, `gic.its=0`, or an ITS that failed to come
+//!   up) `request_msi`/MSI-X return `Unsupported` and drivers keep INTx.
 //!
 //! # Handler contract
 //!
@@ -80,16 +83,31 @@ pub struct IrqHandle {
 enum HandleKind {
     Vector { vector: u8 },
     Line { id: u32, slot: usize },
-    Msi { vector: u8, func: PciFunction, cap: u16 },
-    MsiX { vector: u8, table: usize, entry: u16 },
+    Msi { id: MsiId, func: PciFunction, cap: u16 },
+    MsiX { id: MsiId, table: usize, entry: u16 },
+}
+
+/// What backs an MSI vector: an x86_64 IDT vector or an aarch64 ITS LPI.
+#[derive(Clone, Copy, Debug)]
+enum MsiId {
+    Vec(u8),
+    Lpi(u32),
 }
 
 impl IrqHandle {
     /// The IDT vector (x86_64 kinds), if any.
     pub fn vector(&self) -> Option<u8> {
         match self.kind {
-            HandleKind::Vector { vector } | HandleKind::Msi { vector, .. } | HandleKind::MsiX { vector, .. } => Some(vector),
-            HandleKind::Line { .. } => None,
+            HandleKind::Vector { vector } => Some(vector),
+            HandleKind::Msi { id: MsiId::Vec(v), .. } | HandleKind::MsiX { id: MsiId::Vec(v), .. } => Some(v),
+            _ => None,
+        }
+    }
+    /// The ITS LPI INTID (aarch64 MSI / MSI-X), if any.
+    pub fn lpi(&self) -> Option<u32> {
+        match self.kind {
+            HandleKind::Msi { id: MsiId::Lpi(l), .. } | HandleKind::MsiX { id: MsiId::Lpi(l), .. } => Some(l),
+            _ => None,
         }
     }
     /// The GIC INTID (aarch64 line), if any.
@@ -219,6 +237,7 @@ static LINES: [LineSlot; NUM_LINES] = [const { LineSlot {
 /// Called by the aarch64 GIC dispatcher for INTIDs it has no built-in handler
 /// for. Returns false if nobody is registered (the caller then masks it).
 pub fn dispatch_line(id: u32) -> bool {
+    if id >= LPI_BASE { return dispatch_lpi(id); }
     if id as usize >= NUM_LINES { return false; }
     let l = &LINES[id as usize];
     let mut any = false;
@@ -258,6 +277,75 @@ pub fn dispatch_line(id: u32) -> bool {
         crate::pci::serial_debug("\n");
     }
     true
+}
+
+// ── LPI table (aarch64 ITS) ──────────────────────────────────────────────────
+
+/// First LPI INTID (GICv3).
+const LPI_BASE: u32 = 8192;
+const NUM_LPIS: usize = 256;
+
+struct LpiSlot {
+    handler: AtomicUsize,
+    ctx: AtomicUsize,
+    count: AtomicU64,
+}
+
+static LPIS: [LpiSlot; NUM_LPIS] = [const { LpiSlot {
+    handler: AtomicUsize::new(0), ctx: AtomicUsize::new(0), count: AtomicU64::new(0),
+} }; NUM_LPIS];
+
+/// Deliver an LPI to its handler. False if nobody owns it.
+pub fn dispatch_lpi(id: u32) -> bool {
+    let i = id.wrapping_sub(LPI_BASE) as usize;
+    if i >= NUM_LPIS { return false; }
+    let l = &LPIS[i];
+    let h = l.handler.load(Ordering::Acquire);
+    if h == 0 { return false; }
+    l.count.fetch_add(1, Ordering::Relaxed);
+    let f: IrqHandler = unsafe { core::mem::transmute::<usize, IrqHandler>(h) };
+    let _ = f(l.ctx.load(Ordering::Acquire));
+    true
+}
+
+/// Deliveries on LPI `id` since boot.
+pub fn lpi_count(id: u32) -> u64 {
+    let i = id.wrapping_sub(LPI_BASE) as usize;
+    if i >= NUM_LPIS { 0 } else { LPIS[i].count.load(Ordering::Relaxed) }
+}
+
+/// `/proc/interrupts` body: one line per registered source, `INTID: count kind`.
+/// Returns the bytes written to `buf` (cap bytes at most).
+#[no_mangle]
+pub extern "C" fn drivers_irq_report(buf: *mut u8, cap: usize) -> usize {
+    use core::fmt::Write;
+    struct W { p: *mut u8, cap: usize, n: usize }
+    impl Write for W {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let k = s.len().min(self.cap - self.n);
+            unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), self.p.add(self.n), k); }
+            self.n += k;
+            Ok(())
+        }
+    }
+    let mut w = W { p: buf, cap, n: 0 };
+    for (i, l) in LINES.iter().enumerate() {
+        if (0..SHARERS).any(|j| l.handler[j].load(Ordering::Relaxed) != 0) {
+            let _ = writeln!(w, "{:>5}: {:>10}  GIC-SPI", i, l.count.load(Ordering::Relaxed));
+        }
+    }
+    for (i, l) in LPIS.iter().enumerate() {
+        if l.handler.load(Ordering::Relaxed) != 0 {
+            let _ = writeln!(w, "{:>5}: {:>10}  ITS-MSI", LPI_BASE as usize + i, l.count.load(Ordering::Relaxed));
+        }
+    }
+    for (v, s) in VECTORS.iter().enumerate() {
+        if s.state.load(Ordering::Relaxed) == VEC_ALLOC && s.handler.load(Ordering::Relaxed) != 0 {
+            let _ = writeln!(w, "{:>5}: {:>10}  IDT-MSI", v, s.count.load(Ordering::Relaxed));
+        }
+    }
+    crate::virtio_blk::wait_stats(&mut w);
+    w.n
 }
 
 /// True once the storm guard has masked line `id` (until it is re-enabled):
@@ -351,14 +439,14 @@ pub fn free_irq(h: IrqHandle) {
             l.handler[slot].store(0, Ordering::Release);
             if (0..SHARERS).all(|i| l.handler[i].load(Ordering::Acquire) == 0) { line_disable(id); }
         }
-        HandleKind::Msi { vector, func, cap } => {
+        HandleKind::Msi { id, func, cap } => {
             let ctrl = func.read16(cap + 2);
             func.write16(cap + 2, ctrl & !1);
-            free_vector(vector);
+            msi_release(id);
         }
-        HandleKind::MsiX { vector, table, entry } => {
+        HandleKind::MsiX { id, table, entry } => {
             unsafe { ((table + entry as usize * 16 + 12) as *mut u32).mmio_write(1); }
-            free_vector(vector);
+            msi_release(id);
         }
     }
 }
@@ -369,6 +457,65 @@ pub fn free_irq(h: IrqHandle) {
 extern "C" {
     /// The MSI address/data pair that delivers `vector` (arch-x86_64).
     fn arch_msi_message(vector: u32, addr: *mut u64, data: *mut u32) -> bool;
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C" {
+    fn arch_its_available() -> bool;
+    fn arch_its_alloc_msi(rid: u32, addr: *mut u64, data: *mut u32, lpi: *mut u32) -> bool;
+    fn arch_its_free_msi(lpi: u32);
+}
+
+/// Can this machine deliver MSI at all (x86_64 always; aarch64 with a live ITS)?
+pub fn msi_supported() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    { true }
+    #[cfg(target_arch = "aarch64")]
+    { unsafe { arch_its_available() } }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { false }
+}
+
+/// Allocate a vector / LPI for `func`, install `handler(ctx)` and return the
+/// (address, data) message that signals it.
+fn msi_prepare(func: PciFunction, handler: IrqHandler, ctx: usize) -> Result<(u64, u32, MsiId), IrqError> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = func;
+        let vector = alloc_vector().ok_or(IrqError::NoSpace)?;
+        let (addr, data) = match msi_message(vector) { Some(m) => m, None => { free_vector(vector); return Err(IrqError::Unsupported); } };
+        if let Err(e) = set_vector_handler(vector, handler, ctx) { free_vector(vector); return Err(e); }
+        Ok((addr, data, MsiId::Vec(vector)))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !unsafe { arch_its_available() } { return Err(IrqError::Unsupported); }
+        let rid = ((func.bus as u32) << 8) | ((func.dev as u32) << 3) | func.func as u32;
+        let (mut addr, mut data, mut lpi) = (0u64, 0u32, 0u32);
+        if !unsafe { arch_its_alloc_msi(rid, &mut addr, &mut data, &mut lpi) } { return Err(IrqError::NoSpace); }
+        let i = lpi.wrapping_sub(LPI_BASE) as usize;
+        if i >= NUM_LPIS { unsafe { arch_its_free_msi(lpi) }; return Err(IrqError::NoSpace); }
+        LPIS[i].ctx.store(ctx, Ordering::Release);
+        LPIS[i].count.store(0, Ordering::Relaxed);
+        LPIS[i].handler.store(handler as usize, Ordering::Release);
+        Ok((addr, data, MsiId::Lpi(lpi)))
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { let _ = (func, handler, ctx); Err(IrqError::Unsupported) }
+}
+
+fn msi_release(id: MsiId) {
+    match id {
+        MsiId::Vec(v) => free_vector(v),
+        MsiId::Lpi(_l) => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let i = _l.wrapping_sub(LPI_BASE) as usize;
+                if i < NUM_LPIS { LPIS[i].handler.store(0, Ordering::Release); }
+                unsafe { arch_its_free_msi(_l) };
+            }
+        }
+    }
 }
 
 /// (address, data) of the message for `vector`, or None (aarch64: no ITS).
@@ -387,11 +534,9 @@ pub fn msi_message(vector: u8) -> Option<(u64, u32)> {
 /// masks per-vector if the function supports it while programming, disables
 /// INTx and MSI-X, enables MSI, sets bus mastering. Task context.
 pub fn request_msi(func: PciFunction, handler: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
-    if !cfg!(target_arch = "x86_64") { return Err(IrqError::Unsupported); }
+    if !msi_supported() { return Err(IrqError::Unsupported); }
     let cap = func.find_capability(crate::pci::cap::MSI).ok_or(IrqError::NotFound)?;
-    let vector = alloc_vector().ok_or(IrqError::NoSpace)?;
-    let (addr, data) = match msi_message(vector) { Some(m) => m, None => { free_vector(vector); return Err(IrqError::Unsupported); } };
-    if let Err(e) = set_vector_handler(vector, handler, ctx) { free_vector(vector); return Err(e); }
+    let (addr, data, id) = msi_prepare(func, handler, ctx)?;
     let ctrl = func.read16(cap + 2);
     let is64 = ctrl & (1 << 7) != 0;
     let maskable = ctrl & (1 << 8) != 0;
@@ -413,7 +558,7 @@ pub fn request_msi(func: PciFunction, handler: IrqHandler, ctx: usize) -> Result
     func.set_intx_disable(true);
     func.set_bus_master(true);
     func.write16(cap + 2, (ctrl & !(7 << 4)) | 1);
-    Ok(IrqHandle { kind: HandleKind::Msi { vector, func, cap } })
+    Ok(IrqHandle { kind: HandleKind::Msi { id, func, cap } })
 }
 
 /// Mask / unmask the MSI vector of a handle from `request_msi` (only if the
@@ -447,7 +592,7 @@ impl MsixTable {
     /// the function mask set, then clear the function mask; disable MSI and
     /// INTx; set bus mastering. Task context.
     pub fn enable(func: PciFunction) -> Result<MsixTable, IrqError> {
-        if !cfg!(target_arch = "x86_64") { return Err(IrqError::Unsupported); }
+        if !msi_supported() { return Err(IrqError::Unsupported); }
         let cap = func.find_capability(crate::pci::cap::MSIX).ok_or(IrqError::NotFound)?;
         let ctrl = func.read16(cap + 2);
         let entries = (ctrl & 0x7FF) + 1;
@@ -493,9 +638,7 @@ impl MsixTable {
     /// unmask it. Task context.
     pub fn request(&self, entry: u16, handler: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
         if entry >= self.entries { return Err(IrqError::NotFound); }
-        let vector = alloc_vector().ok_or(IrqError::NoSpace)?;
-        let (addr, data) = match msi_message(vector) { Some(m) => m, None => { free_vector(vector); return Err(IrqError::Unsupported); } };
-        if let Err(e) = set_vector_handler(vector, handler, ctx) { free_vector(vector); return Err(e); }
+        let (addr, data, id) = msi_prepare(self.func, handler, ctx)?;
         let e = self.table + entry as usize * 16;
         unsafe {
             ((e + 12) as *mut u32).mmio_write(1);
@@ -504,7 +647,7 @@ impl MsixTable {
             ((e + 8) as *mut u32).mmio_write(data);
             ((e + 12) as *mut u32).mmio_write(0);
         }
-        Ok(IrqHandle { kind: HandleKind::MsiX { vector, table: self.table, entry } })
+        Ok(IrqHandle { kind: HandleKind::MsiX { id, table: self.table, entry } })
     }
 
     /// Per-vector mask (any context).

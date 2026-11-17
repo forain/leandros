@@ -363,7 +363,7 @@ def verify_dbus_staging(arch):
     Loud, not silent: this raises SystemExit rather than warning, because a
     warning in a build that then prints a green image is the thing that failed.
     """
-    ship = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
+    ship = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), arch)
     if not os.path.isdir(ship):
         return                      # no D-Bus payload staged at all; nothing to check
     repo = os.path.normpath(os.path.join(
@@ -474,12 +474,12 @@ def main():
     
     bin_files = []
     bins = [
-        "shell", "login", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
+        "shell", "login", "utmpd", "greeter-launch", "hello", "aplay", "memtest", "vfstest", "permtest", "f2fstest", "tput",
         "pthreadtest", "timertest", "sigtest", "polltest", "fdmaxtest", "mqtest", "pipebw", "ptytest", "forktest", "shmtest", "racetest", "mmapbench",
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
-        "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "ip6test", "netlinktest", "nfttest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "inotifytest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "exitracetest", "exitwrap", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest",
+        "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "ip6test", "netlinktest", "nfttest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "ec2init", "fsbench", "pcachetest",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "chroottest", "nstest", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "inotifytest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "exitracetest", "exitwrap", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest", "w", "users", "lastlog", "utmptest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)
@@ -659,6 +659,7 @@ def main():
         b"root:x:0:0:root:/root:/bin/brush\n"
         b"cosmic-greeter:x:990:990:COSMIC Greeter:/home/cosmic-greeter:/bin/false\n"
         b"leandro:x:1000:1000:leandro:/home/leandro:/bin/brush\n"
+        b"sshd:x:22:22:sshd privsep:/var/empty:/sbin/nologin\n"
         b"nobody:x:65534:65534:nobody:/:/bin/false\n"
     )
     etc_files.append(("passwd", passwd_bytes, 0o100644))
@@ -671,8 +672,9 @@ def main():
     # Firefox's sandbox builds its library path policy from /etc/ld.so.conf;
     # list musl's default search dirs so policy and loader agree.
     etc_files.append(("ld.so.conf", b"/lib\n/usr/lib\n/usr/local/lib\n", 0o100644))
-    # Minimal v1 TZif file for UTC (no zoneinfo package in the image).
-    etc_files.append(("localtime", b"\x54\x5a\x69\x66" + b"\x00" * 35 + b"\x01\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00UTC\x00", 0o100644))
+    # /etc/localtime is a symlink into the Alpine tzdata package's zoneinfo
+    # (ports/alpine/world); timedate1 SetTimezone repoints it.
+    etc_files.append(("localtime", b"/usr/share/zoneinfo/UTC", S_IFLNK | 0o777))
     # There is deliberately no /etc/passwd.greeter here any more. The bring-up
     # scaffold reached the greeter role by adding a SECOND, uid-0
     # "cosmic-greeter" entry ahead of root and copying that file over
@@ -700,6 +702,7 @@ def main():
     etc_files.append(("group", (
         b"root:x:0:\n"
         b"tty:x:5:\n"
+        b"sshd:x:22:\n"
         b"wheel:x:10:leandro\n"
         b"audio:x:29:leandro\n"
         b"video:x:44:leandro,cosmic-greeter\n"
@@ -718,6 +721,7 @@ def main():
     shadow_lines = (
         f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
         f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
+        "sshd:!:\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
@@ -1098,6 +1102,7 @@ def main():
         m4_share_dirs.add("/sys/bus/platform")
     for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
               "/sys/class", "/sys/class/block",
+              "/sys/class/drm", "/sys/class/input",
               "/sys/class/power_supply", "/sys/class/backlight",
               "/sys/firmware", "/sys/firmware/acpi", "/sys/firmware/acpi/tables",
               "/sys/fs", "/sys/fs/cgroup"):
@@ -1114,6 +1119,13 @@ def main():
         for d in ("/sys/dev", "/sys/dev/char", _base, _dev,
                   _dev + "/drm", _dev + "/drm/" + _node):
             m4_share_dirs.add(d)
+        # Node-level identity (Linux: the drm minor's own uevent) and the
+        # /sys/class/drm/<node> entry. These are NEW paths: nothing libdrm or
+        # drm-rs stats today (device/*, device/drm, device/subsystem) moves.
+        _sysfs_attr(_base, "uevent",
+                    f"MAJOR={DRM_MAJOR}\nMINOR={_minor}\nDEVNAME=dri/{_node}\nDEVTYPE=drm_minor\n")
+        _sysfs_attr(_base, "subsystem", "../../../class/drm", 0o120777)
+        _sysfs_attr("/sys/class/drm", _node, f"../../dev/char/{DRM_MAJOR}:{_minor}", 0o120777)
         # `../../../../bus/pci`: from /sys/dev/char/<maj>:<min>/device, four
         # levels up is /sys. Only the trailing "/pci" is ever inspected.
         if os.environ.get("LEANDROS_BOARD") == "rpi5":
@@ -1136,6 +1148,11 @@ def main():
         _sysfs_attr(_dev, "revision",         f"0x{PCI_REVISION:02x}\n")
         _sysfs_attr(_dev, "class",            f"0x{PCI_CLASS:06x}\n")
         _sysfs_attr(_dev, "config",           bytes(_cfg))
+
+    # /sys/class/input and /sys/dev/char/13:* are NOT staged: the vfs
+    # synthesizes them from the live evdev registry (servers/vfs/src/sysinput.rs),
+    # so hot-plugged nodes (event2..) appear and disappear with the device.
+    # /sys/class/input itself (an empty directory) stays staged above.
 
     # ── M2 Venus ship set (Mesa's virtio Vulkan ICD + the vktest smoke test) ──
     # Sourced from the venus-lane stage dir directly rather than by copying into
@@ -1466,8 +1483,8 @@ def main():
     # and the fonts are plain data (0644) and ride the shared /usr tree walk
     # (m4_share_files/m4_share_dirs, generalized here beyond /usr/share).
     verify_dbus_staging(arch)
-    m5_arch_root = os.path.expanduser(f"~/code/leandros-artifacts/m5-session-ship/{arch}")
-    m5_fonts_src = os.path.expanduser("~/code/leandros-artifacts/m5-session-ship/share/fonts")
+    m5_arch_root = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), arch)
+    m5_fonts_src = os.path.join(os.environ.get("LEANDROS_M5_SHIP") or os.path.expanduser("~/code/leandros-artifacts/m5-session-ship"), "share/fonts")
     # cosmic-comp: LEANDROS_COSMIC_COMP=<file> wins; else the m6 rebuild that
     # carries ports/cosmic-comp's patches (ports/cosmic-comp/build.sh);
     # else the original M5 probe build.
@@ -2980,6 +2997,15 @@ def main():
         _cc = dict(_stor)
         _cc.update(path="/etc/containers/containers.conf", host=_podcc, size=os.path.getsize(_podcc))
         _ap_entries.append(_cc)
+    # at-spi2-core ships org.a11y.Bus.service running at-spi-bus-launcher, which
+    # spawns /usr/bin/dbus-daemon (absent: busd is our broker) and fails every
+    # GetAddress. ours (ports/dbus/session-pkg, leandros-sysbus a11y) wins.
+    _a11y = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "dbus", "session-pkg", "services", "org.a11y.Bus.service")
+    if os.path.isfile(_a11y):
+        for e in _ap_entries:
+            if e["path"] == "/usr/share/dbus-1/services/org.a11y.Bus.service" and e["kind"] == "file":
+                e["host"] = _a11y
+                e["size"] = os.path.getsize(_a11y)
     # Alpine gives newuidmap/newgidmap file capabilities (security.capability xattr), which the image does not
     # carry; setuid root is the equivalent until file caps exist (see podtrace-findings).
     for e in _ap_entries:
@@ -3009,6 +3035,10 @@ def main():
     # /var/tmp: containers/storage and podman stage image copies there
     _ap_dirs.add("/var/tmp")
     _ap_dirmode["/var/tmp"] = 0o1777
+    # sshd privilege separation: the network child chroots here (root-owned,
+    # not group/other writable, empty; sshd refuses to start otherwise).
+    _ap_dirs.add("/var/empty")
+    _ap_dirmode["/var/empty"] = 0o755
     for _d in set(_ap_dirs):
         while _d not in ("/", ""):
             _ap_dirs.add(_d)

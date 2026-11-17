@@ -53,27 +53,107 @@ struct Ct {
     nic: u8, nicip: [u8; 4], last: u64, replied: bool,
     /// TCP lite FSM: 0 SYN sent, 1 SYN-ACK seen, 2 established, 3 one side sent FIN, 4 closing (both FINs or RST: TIME_WAIT-lite).
     tst: u8, fins: u8,
-    /// 0 = outbound SNAT flow, 1 = inbound DNAT flow (peer -> published port), 2 = hairpin (container -> local address, DNAT + masquerade).
+    /// 0 = outbound SNAT flow, 1 = inbound DNAT flow (peer -> published port), 2 = hairpin (container -> local address, DNAT + masquerade), 3 = the same without masquerade (cross-network, source kept).
     kind: u8,
     /// Hairpin target: container ip/port, its bridge and port, its MAC and the bridge MAC.
     tip: [u8; 4], tport: u16, tbr: Sid, tps: Sid, tmac: [u8; 6], tbmac: [u8; 6],
 }
-struct Park { br: Sid, ip: [u8; 4], t: u64, port: Sid, frame: Vec<u8> }
+/// A frame held on a learn miss. `br` is the bridge whose ARP reply releases it, `sbr` the bridge it arrived on.
+struct Park { br: Sid, sbr: Sid, ip: [u8; 4], t: u64, port: Sid, frame: Vec<u8> }
+/// A NIC frame held on a learn miss (host -> container DNAT); replayed through `nic_rx`.
+pub(crate) struct NPark { pub(crate) br: Sid, pub(crate) ip: [u8; 16], pub(crate) v6: bool, pub(crate) nic: u8, pub(crate) t: u64, pub(crate) frame: Vec<u8> }
+/// At most this many frames wait per unresolved next hop (Linux's neighbour queue is about 3).
+pub(crate) const PARK_PER_IP: usize = 3;
+const PARK_TOTAL: usize = 16;
+/// Neighbour solicitation resend state for an unresolved next hop with parked frames (Linux mcast_solicit = 3).
+pub(crate) struct Probe { br: Sid, ip: [u8; 16], t: u64, sent: u8, frame: Vec<u8> }
 struct Lrn { br: Sid, ip: [u8; 4], mac: [u8; 6], port: Sid, t: u64 }
 struct Arp { nic: u8, ip: [u8; 4], mac: [u8; 6], t: u64 }
 struct Pend { nic: u8, ip: [u8; 4], t: u64, frames: Vec<Vec<u8>> }
 pub(crate) struct St {
-    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>,
+    pub(crate) ct6: Vec<crate::fwd6::Ct6>, pub(crate) nd: Vec<crate::fwd6::Nd>, pub(crate) pend6: Vec<crate::fwd6::Pend6>, pub(crate) l6: crate::fwd6::L6,
     ct: Vec<Ct>, arp: Vec<Arp>, lrn: Vec<Lrn>, pend: Vec<Pend>, park: Vec<Park>,
+    pub(crate) npark: Vec<NPark>, nreplay: Vec<(u8, Vec<u8>)>, replay: Vec<(Sid, Sid, Vec<u8>)>, expired: Vec<(Sid, Sid, Vec<u8>)>, pub(crate) expired6: Vec<(Sid, Sid, Vec<u8>)>, probe: Vec<Probe>,
     pub(crate) txq: VecDeque<(u8, Vec<u8>)>, pub(crate) inq: VecDeque<(Sid, Sid, Vec<u8>)>,
     pub(crate) next: u16, pub(crate) swept: u64,
 }
-pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(),
+pub(crate) static FWD: Mutex<St> = Mutex::new(St { ct6: Vec::new(), nd: Vec::new(), pend6: Vec::new(), l6: crate::fwd6::L6::new(), ct: Vec::new(), arp: Vec::new(), lrn: Vec::new(), pend: Vec::new(), park: Vec::new(), npark: Vec::new(), nreplay: Vec::new(), replay: Vec::new(), expired: Vec::new(), expired6: Vec::new(), probe: Vec::new(),
     txq: VecDeque::new(), inq: VecDeque::new(), next: 0, swept: 0 });
 /// Set at the first forwarded flow: the NIC rx hook costs one load until then.
 pub(crate) static USED: AtomicBool = AtomicBool::new(false);
 pub(crate) static TXQ_N: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static INQ_N: AtomicUsize = AtomicUsize::new(0);
+
+/// Diagnostic counters (/proc/net/nic "fwd_stats:"): where a forwarded UDP/ICMP flow is lost.
+/// Order: ing_udp ing_ttl ing_noroute ing_nft_drop ing_nopick emit arp_hit arp_miss pend_exp
+/// arp_learn arp_flush nicrx_udp nicrx_udp_hit nicrx_udp_miss icmperr_rx
+pub(crate) static STAT: [AtomicUsize; 35] = [const { AtomicUsize::new(0) }; 35];
+/// icmp_error_rx rejection reasons live at STAT[15 + n]; the last quoted tuple that found no conntrack entry is kept here.
+pub(crate) static LASTQ: [core::sync::atomic::AtomicU64; 2] = [core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)];
+fn rej(n: usize) -> bool { STAT[15 + n].fetch_add(1, Ordering::Relaxed); false }
+pub(crate) const S_ING_UDP: usize = 0;
+pub(crate) const S_ING_TTL: usize = 1;
+pub(crate) const S_ING_NOROUTE: usize = 2;
+pub(crate) const S_ING_NFT: usize = 3;
+pub(crate) const S_ING_NOPICK: usize = 4;
+pub(crate) const S_EMIT: usize = 5;
+pub(crate) const S_ARP_HIT: usize = 6;
+pub(crate) const S_ARP_MISS: usize = 7;
+pub(crate) const S_PEND_EXP: usize = 8;
+pub(crate) const S_ARP_LEARN: usize = 9;
+pub(crate) const S_ARP_FLUSH: usize = 10;
+pub(crate) const S_NICRX_UDP: usize = 11;
+pub(crate) const S_NICRX_HIT: usize = 12;
+pub(crate) const S_NICRX_MISS: usize = 13;
+pub(crate) const S_ICMPERR_RX: usize = 14;
+/// IPv6 (fwd6) counters, STAT[22..]: divert reached the NAT stage / no NIC route / no NIC MAC / emitted / nd hit / nd miss (NS sent) /
+/// nd learned / nic_rx entered / nic_rx echo or L4 reply seen / reply key hit / reply key miss
+pub(crate) const S6_NAT: usize = 22;
+pub(crate) const S6_NOROUTE: usize = 23;
+pub(crate) const S6_NOMAC: usize = 24;
+pub(crate) const S6_EMIT: usize = 25;
+pub(crate) const S6_ND_HIT: usize = 26;
+pub(crate) const S6_ND_MISS: usize = 27;
+pub(crate) const S6_ND_LEARN: usize = 28;
+pub(crate) const S6_RX: usize = 29;
+pub(crate) const S6_RX_L4: usize = 30;
+pub(crate) const S6_RX_HIT: usize = 31;
+pub(crate) const S6_RX_MISS: usize = 32;
+const S_NONAT: usize = 33;
+const S_PARKED: usize = 34;
+#[inline] pub(crate) fn stat6(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }
+#[inline] fn stat(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }
+
+pub(crate) fn dump_stats(w: &mut dyn core::fmt::Write) {
+    let _ = write!(w, "fwd_stats:");
+    for (n, i) in ["ing_udp", "ing_ttl", "ing_noroute", "ing_nft_drop", "ing_nopick", "emit", "arp_hit", "arp_miss", "pend_exp",
+                   "arp_learn", "arp_flush", "nicrx_udp", "nicrx_hit", "nicrx_miss", "icmperr_rx",
+                   "rej_hdr", "rej_frag", "rej_qhdr", "rej_proto", "rej_noct", "rej_odst", "icmperr_queued", "v6_nat", "v6_noroute", "v6_nomac", "v6_emit", "v6_nd_hit", "v6_nd_miss", "v6_nd_learn", "v6_rx", "v6_rx_l4", "v6_rx_hit", "v6_rx_miss", "route_nonat", "parked"].iter().zip(STAT.iter()) {
+        let _ = write!(w, " {}={}", n, i.load(Ordering::Relaxed));
+    }
+    let _ = writeln!(w);
+    let (a, b) = (LASTQ[0].load(Ordering::Relaxed), LASTQ[1].load(Ordering::Relaxed));
+    let _ = writeln!(w, "fwd_lastq: noct quoted {}.{}.{}.{}:{} -> {}.{}.{}.{}:{} proto {}",
+        (a >> 56) as u8, (a >> 48) as u8, (a >> 40) as u8, (a >> 32) as u8, (a >> 16) as u16,
+        (b >> 56) as u8, (b >> 48) as u8, (b >> 40) as u8, (b >> 32) as u8, (b >> 16) as u16, a as u8);
+    let now = sched::monotonic_ns();
+    let g = FWD.lock();
+    let _ = writeln!(w, "fwd_state: ct={} ct6={} lrn={} lrn6={} park={} park6={} npark={} replay={} expired={} nreplay={} pend={} inq={} probe={} expired6={}",
+        g.ct.len(), g.ct6.len(), g.lrn.len(), g.l6.lrn_len(), g.park.len(), g.l6.park_len(), g.npark.len(), g.replay.len(), g.expired.len(), g.nreplay.len(), g.pend.len(), g.inq.len(), g.probe.len(), g.expired6.len());
+    for a in g.arp.iter() {
+        let _ = writeln!(w, "fwd_arp: nic {} {}.{}.{}.{} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} age_ms {}", a.nic, a.ip[0], a.ip[1], a.ip[2], a.ip[3],
+            a.mac[0], a.mac[1], a.mac[2], a.mac[3], a.mac[4], a.mac[5], now.saturating_sub(a.t) / 1_000_000);
+    }
+    for q in g.pend.iter() {
+        let _ = writeln!(w, "fwd_pend: nic {} {}.{}.{}.{} frames {} age_ms {}", q.nic, q.ip[0], q.ip[1], q.ip[2], q.ip[3], q.frames.len(), now.saturating_sub(q.t) / 1_000_000);
+    }
+    for e in g.ct.iter().filter(|e| e.proto != PROTO_TCP) {
+        let _ = writeln!(w, "fwd_ct: proto {} nat {} {}.{}.{}.{}:{}->{}.{}.{}.{}:{} kind {} replied {} age_ms {} br {} port {}",
+            e.proto, e.nat, e.cip[0], e.cip[1], e.cip[2], e.cip[3], e.cport, e.rip[0], e.rip[1], e.rip[2], e.rip[3], e.rport,
+            e.kind, e.replied as u8, now.saturating_sub(e.last) / 1_000_000, e.br, e.port);
+    }
+    crate::fwd6::dump6(w, &g, now);
+}
 
 fn ct_ttl(e: &Ct) -> u64 {
     match e.proto {
@@ -139,7 +219,15 @@ pub(crate) fn forget(sid: Sid) {
     let mut g = FWD.lock();
     g.ct.retain(|e| e.br != sid && e.port != sid && e.tbr != sid && e.tps != sid);
     g.lrn.retain(|l| l.br != sid && l.port != sid);
-    g.ct6.retain(|e| e.br != sid && e.port != sid);
+    g.ct6.retain(|e| e.br != sid && e.port != sid && e.tbr != sid && e.tps != sid);
+    g.park.retain(|q| q.br != sid && q.sbr != sid && q.port != sid);
+    g.npark.retain(|q| q.br != sid);
+    g.replay.retain(|q| q.0 != sid && q.1 != sid);
+    g.expired.retain(|q| q.0 != sid && q.1 != sid);
+    g.inq.retain(|q| q.0 != sid && q.1 != sid);
+    g.l6.forget(sid);
+    g.expired6.retain(|q| q.0 != sid && q.1 != sid);
+    g.probe.retain(|q| q.br != sid);
 }
 
 // ---- checksums ---------------------------------------------------------------
@@ -265,9 +353,18 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
     let nft = crate::nfnl::has_tables(0);
     let mut work: VecDeque<(Sid, Vec<u8>)> = rx.into_iter().enumerate()
         .map(|(i, f)| (if aligned { rxsrc[i] } else { crate::vifsel::NO_PEER }, f)).collect();
+    {
+        let mut st = FWD.lock();
+        if !st.replay.is_empty() || !st.park.is_empty() {
+            expire_park(&mut st, sched::monotonic_ns());
+            let mut i = 0;
+            while i < st.replay.len() { if st.replay[i].0 == br { let (_, p, f) = st.replay.remove(i); work.push_back((p, f)); } else { i += 1; } }
+        }
+    }
     while let Some((port, mut f)) = work.pop_front() {
-        if nft && port != crate::vifsel::NO_PEER && port != br {
-            if let Some(ip) = learn(br, port, bmac, &f) { for q in unpark(br, ip).into_iter().rev() { work.push_front(q); } }
+        if (nft || on4 || on6) && port != crate::vifsel::NO_PEER && port != br {
+            if let Some(ip) = learn(br, port, bmac, &f) { requeue(br, unpark(br, ip), &mut work); }
+            if let Some(ip) = crate::fwd6::learn_c(br, port, bmac, &f) { requeue(br, crate::fwd6::unpark(br, ip), &mut work); }
         }
         if on6 && f.len() >= 54 && f[12] == 0x86 && f[13] == 0xdd && f[0..6] == bmac && port != crate::vifsel::NO_PEER && port != br {
             match crate::fwd6::divert(br, port, bmac, f) { Some(back) => keep.push_back(back), None => {} }
@@ -293,27 +390,103 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
         // Anti-spoof: the source must belong to the bridge's network, and not be the bridge itself.
         let srcok = addrs.iter().any(|&(a, p)| a != src && u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(src) & mask(p));
         if !srcok || host_local(dst) { continue; }
-        let Some(p) = parse(&mut f, false) else { continue };
         if port == crate::vifsel::NO_PEER || port == br { continue; }
+        // Another ns-0 bridge's network: route as a plain IP router, no NAT (ip_forward on both sides).
+        if let Some(t) = bridge_for(dst) {
+            if t.br != br { route_l3(br, port, &t, f); continue; }
+        }
+        let Some(p) = parse(&mut f, false) else { continue };
         ingress(br, port, bmac, f, p);
     }
     keep
 }
 
+/// Routed forward (no NAT) of an IPv4 frame from one ns-0 bridge into another's network: FORWARD hook,
+/// TTL, then the destination's learned MAC (a miss sends an ARP request and drops this packet;
+/// the sender's retransmit finds the entry). The source address is kept.
+fn route_l3(sbr: Sid, sport: Sid, t: &Tgt, mut f: Vec<u8>) {
+    let n = t.name.iter().position(|&c| c == 0).unwrap_or(16);
+    if !sched::ns::forwarding(0, &t.name[..n]) { return; }
+    if f[22] <= 1 { stat(S_ING_TTL); return; }
+    let ihl = ((f[14] & 0xf) as usize) * 4;
+    if ihl < 20 || f.len() < 14 + ihl { return; }
+    if crate::nfnl::has_tables(0) {
+        let l4 = f[23];
+        let o = 14 + ihl;
+        let (sport, dport, est) = if (l4 == PROTO_TCP || l4 == PROTO_UDP) && f.len() >= o + 14 {
+            (u16::from_be_bytes([f[o], f[o + 1]]), u16::from_be_bytes([f[o + 2], f[o + 3]]), l4 == PROTO_TCP && f[o + 13] & 0x12 != 0x02)
+        } else { (0, 0, false) };
+        let mut m = crate::nfnl::Pkt { rel: false, est, l4, src: [f[26], f[27], f[28], f[29]], dst: [f[30], f[31], f[32], f[33]], sport, dport, oif: t.name, mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
+    }
+    let dip = [f[30], f[31], f[32], f[33]];
+    let mut st = FWD.lock();
+    USED.store(true, Ordering::Relaxed);
+    let Some((tmac, tport)) = st.lrn.iter().find(|l| l.br == t.br && l.ip == dip).map(|l| (l.mac, l.port)) else {
+        // Hold the packet (a few per next hop) until the ARP reply teaches us the MAC; `divert` replays it.
+        if st.park.iter().filter(|q| q.br == t.br && q.ip == dip).count() < PARK_PER_IP && st.park.len() < PARK_TOTAL {
+            stat(S_PARKED);
+            st.park.push(Park { br: t.br, sbr, ip: dip, t: sched::monotonic_ns(), port: sport, frame: f });
+        }
+        let r = arp_request(t.mac, t.addr, dip);
+        { let mut w = [0u8; 16]; w[..4].copy_from_slice(&dip); add_probe(&mut st, t.br, w, &r); }
+        st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
+        drop(st);
+        drivers::netdev::kick();
+        return;
+    };
+    f[22] -= 1;
+    ip_csum(&mut f, ihl);
+    f[0..6].copy_from_slice(&tmac);
+    f[6..12].copy_from_slice(&t.mac);
+    if st.inq.len() < 256 { st.inq.push_back((t.br, tport, f)); INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+}
+
 fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
-    if f[22] <= 1 { return; } // TTL exhausted
-    let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { return };
+    if p.proto == PROTO_UDP { stat(S_ING_UDP); }
+    if f[22] <= 1 { stat(S_ING_TTL); return; } // TTL exhausted
+    let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { stat(S_ING_NOROUTE); return };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return };
     let now = sched::monotonic_ns();
+    // Nftables is loaded but no nat/postrouting chain exists: nothing may masquerade, so the packet is
+    // routed to the NIC subnet with its source address kept (Linux ip_forward without a NAT rule).
+    if crate::nfnl::has_tables(0) && !crate::nfnl::has_hook(0, crate::nfnl::H_POST)
+        && !FWD.lock().ct.iter().any(|e| e.kind == 0 && e.proto == p.proto && e.br == br && e.port == port && e.cip == p.src && e.cport == p.sport) {
+        let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+        let est = p.proto == PROTO_TCP && p.flags & 0x12 != 0x02;
+        let rp = if p.proto == PROTO_ICMP { 0 } else { p.dport };
+        let mut m = crate::nfnl::Pkt { rel: false, est, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rp, oif, mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
+        stat(S_NONAT);
+        f[22] -= 1;
+        ip_csum(&mut f, p.ihl);
+        f[6..12].copy_from_slice(&nicmac);
+        let mut st = FWD.lock();
+        USED.store(true, Ordering::Relaxed);
+        emit_nic(&mut st, now, nic, nh, nicip, nicmac, f);
+        drop(st);
+        drivers::netdev::kick();
+        return;
+    }
     let cmac: [u8; 6] = f[6..12].try_into().unwrap();
     let rport = if p.proto == PROTO_ICMP { 0 } else { p.dport };
     let mut st = FWD.lock();
     USED.store(true, Ordering::Relaxed);
     sweep(&mut st, now);
     let found = st.ct.iter_mut().find(|e| e.kind == 0 && e.proto == p.proto && e.br == br && e.port == port && e.cip == p.src && e.cport == p.sport
-        && e.rip == p.dst && e.rport == rport).map(|e| { e.last = now; e.cmac = cmac; e.nat });
+        && e.rip == p.dst && e.rport == rport).map(|e| { e.last = now; e.cmac = cmac; (e.nat, e.replied) });
     let nat = match found {
-        Some(n) => n,
+        Some((n, rep)) => {
+            // Established flows traverse the filter hook too, so a rule added mid-flow bites.
+            if crate::nfnl::has_tables(0) {
+                let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+                let mut m = crate::nfnl::Pkt { rel: false, est: rep, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
+                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
+            }
+            n
+        }
         None => {
             // A TCP flow starts with a bare SYN only.
             if p.proto == PROTO_TCP && p.flags & 0x12 != 0x02 { return; }
@@ -322,9 +495,9 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
             // verdict (netavark: an internal network has none, so a leaked ip_forward=1 cannot SNAT it).
             if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
-                let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
-                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return; }
-                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return; }
+                let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: None };
+                if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return; }
+                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { stat(S_ING_NFT); return; }
             }
             let mut pick = None;
             let claimed = if crate::nfnl::has_tables(0) { crate::nfnl::dnat_ports(0) } else { Vec::new() };
@@ -348,7 +521,7 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
                 let mut g = FWD.lock();
                 if let Some(i) = g.ct.iter().position(|e| e.nat == c && e.proto == p.proto && e.cip == p.src && e.cport == p.sport) { g.ct.swap_remove(i); }
             }
-            let Some(n) = pick else { return };
+            let Some(n) = pick else { stat(S_ING_NOPICK); return };
             st = FWD.lock();
             n
         }
@@ -370,9 +543,11 @@ fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
 }
 
 fn emit_nic(st: &mut St, now: u64, nic: u8, nh: [u8; 4], nicip: [u8; 4], nicmac: [u8; 6], mut f: Vec<u8>) {
+    stat(S_EMIT);
     match st.arp.iter().find(|a| a.nic == nic && a.ip == nh && now.saturating_sub(a.t) < ARP_NS).map(|a| a.mac) {
-        Some(m) => { f[0..6].copy_from_slice(&m); push_tx(st, nic, f); }
+        Some(m) => { stat(S_ARP_HIT); f[0..6].copy_from_slice(&m); push_tx(st, nic, f); }
         None => {
+            stat(S_ARP_MISS);
             let first = match st.pend.iter_mut().find(|q| q.nic == nic && q.ip == nh) {
                 Some(q) => { if q.frames.len() < PEND_FRAMES { q.frames.push(f); } false }
                 None => { st.pend.push(Pend { nic, ip: nh, t: now, frames: alloc::vec![f] }); true }
@@ -408,9 +583,12 @@ fn sweep(st: &mut St, now: u64) {
     if now.saturating_sub(st.swept) < 1_000_000_000 { return; }
     st.swept = now;
     st.ct.retain(|e| now.saturating_sub(e.last) < ct_ttl(e));
+    let pn = st.pend.iter().filter(|q| now.saturating_sub(q.t) >= PEND_NS).count();
+    if pn > 0 { STAT[S_PEND_EXP].fetch_add(pn, Ordering::Relaxed); }
     st.pend.retain(|q| now.saturating_sub(q.t) < PEND_NS);
     st.arp.retain(|a| now.saturating_sub(a.t) < ARP_NS);
     st.lrn.retain(|l| now.saturating_sub(l.t) < ARP_NS);
+    expire_park(st, now);
     crate::fwd6::sweep6(st, now);
 }
 
@@ -423,9 +601,11 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     if !USED.load(Ordering::Relaxed) || buf.len() < 34 { return false; }
     if buf[12] == 0x08 && buf[13] == 0x06 { arp_learn(nic, buf); return false; }
     if buf[12] == 0x08 && buf[13] == 0x00 && buf[23] == PROTO_ICMP && icmp_error_type(buf) {
+        stat(S_ICMPERR_RX);
         return icmp_error_rx(nic, buf);
     }
     if buf[12] != 0x08 || buf[13] != 0x00 || (buf[23] != PROTO_UDP && buf[23] != PROTO_ICMP && buf[23] != PROTO_TCP) { return false; }
+    if buf[23] == PROTO_UDP { stat(S_NICRX_UDP); }
     let mut st = FWD.lock();
     let any_nft = st.ct.is_empty() && crate::nfnl::has_tables(0);
     if st.ct.is_empty() && !any_nft { return false; }
@@ -435,12 +615,17 @@ pub(crate) fn nic_rx(nic: u8, buf: &[u8]) -> bool {
     let key = |e: &Ct| e.nic == nic && e.proto == p.proto && e.nicip == p.dst && e.nat == p.dport
         && e.rip == p.src && (p.proto == PROTO_ICMP || e.rport == p.sport) && e.kind < 2;
     if !st.ct.iter().any(|e| key(e)) {
-        match new_in(&mut st, nic, &p, now) { 0 => return false, 1 => return true, _ => {} }
+        match new_in(&mut st, nic, &p, now, buf) { 0 => return false, 1 => return true, _ => {} }
     }
-    let Some(e) = st.ct.iter_mut().find(|e| key(e)) else { return false };
+    let Some(e) = st.ct.iter_mut().find(|e| key(e)) else { if p.proto == PROTO_UDP { stat(S_NICRX_MISS); } return false };
+    if p.proto == PROTO_UDP { stat(S_NICRX_HIT); }
     e.last = now; e.replied = true;
     if p.proto == PROTO_TCP { tcp_step(e, p.flags, e.kind == 1); }
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
+    if crate::nfnl::has_tables(0) {
+        let mut m = crate::nfnl::Pkt { rel: false, est: true, l4: p.proto, src: p.src, dst: cip, sport: p.sport, dport: cport, oif: br_name(br), mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
     if f[22] <= 1 { return true; }
     f[22] -= 1;
     f[30..34].copy_from_slice(&cip);
@@ -470,14 +655,14 @@ fn icmp_error_type(b: &[u8]) -> bool {
 fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
     let ihl = (buf[14] & 15) as usize * 4;
     let tot = u16::from_be_bytes([buf[16], buf[17]]) as usize;
-    if ihl < 20 || tot < ihl + 8 + 20 || 14 + tot > buf.len() { return false; }
-    if u16::from_be_bytes([buf[20], buf[21]]) & 0x3fff != 0 { return false; }
+    if ihl < 20 || tot < ihl + 8 + 20 || 14 + tot > buf.len() { return rej(0); }
+    if u16::from_be_bytes([buf[20], buf[21]]) & 0x3fff != 0 { return rej(1); }
     let i = 14 + ihl + 8; // quoted IP header
-    if buf[i] >> 4 != 4 { return false; }
+    if buf[i] >> 4 != 4 { return rej(2); }
     let iihl = (buf[i] & 15) as usize * 4;
-    if iihl < 20 || 14 + tot < i + iihl + 8 { return false; }
+    if iihl < 20 || 14 + tot < i + iihl + 8 { return rej(2); }
     let proto = buf[i + 9];
-    if proto != PROTO_UDP && proto != PROTO_TCP && proto != PROTO_ICMP { return false; }
+    if proto != PROTO_UDP && proto != PROTO_TCP && proto != PROTO_ICMP { return rej(3); }
     let qsrc = [buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]];
     let qdst = [buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]];
     let l = i + iihl;
@@ -490,10 +675,20 @@ fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
     let mut st = FWD.lock();
     let now = sched::monotonic_ns();
     let Some(e) = st.ct.iter_mut().find(|e| e.nic == nic && e.proto == proto && e.nicip == qsrc && e.nat == qsport
-        && e.rip == qdst && (proto == PROTO_ICMP || e.rport == qdport)) else { return false };
-    if buf[30..34] != e.nicip { return false; }
+        && e.rip == qdst && (proto == PROTO_ICMP || e.rport == qdport)) else {
+        LASTQ[0].store((u32::from_be_bytes(qsrc) as u64) << 32 | (qsport as u64) << 16 | proto as u64, Ordering::Relaxed);
+        LASTQ[1].store((u32::from_be_bytes(qdst) as u64) << 32 | (qdport as u64) << 16, Ordering::Relaxed);
+        return rej(4);
+    };
+    if buf[30..34] != e.nicip { return rej(5); }
+    stat(21);
     e.last = now;
     let (cip, cport, cmac, bmac, br, port) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port);
+    // ct state related: the error quotes a tracked flow; the FORWARD hook sees it like any forwarded packet.
+    if crate::nfnl::has_tables(0) {
+        let mut m = crate::nfnl::Pkt { rel: true, est: true, l4: PROTO_ICMP, src: [buf[26], buf[27], buf[28], buf[29]], dst: cip, sport: 0, dport: 0, oif: br_name(br), mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
     let mut f = buf[..14 + tot].to_vec();
     if f[22] <= 1 { return true; }
     f[22] -= 1;
@@ -524,6 +719,7 @@ fn arp_learn(nic: u8, b: &[u8]) {
     let Some(cfg) = crate::iface::rt(nic).cfg else { return };
     if !cfg.on_link(ip) { return; }
     let now = sched::monotonic_ns();
+    stat(S_ARP_LEARN);
     let mut st = FWD.lock();
     if let Some(a) = st.arp.iter_mut().find(|a| a.nic == nic && a.ip == ip) { a.mac = mac; a.t = now; }
     else {
@@ -532,6 +728,7 @@ fn arp_learn(nic: u8, b: &[u8]) {
     }
     if let Some(i) = st.pend.iter().position(|q| q.nic == nic && q.ip == ip) {
         let q = st.pend.remove(i);
+        STAT[S_ARP_FLUSH].fetch_add(q.frames.len(), Ordering::Relaxed);
         for mut f in q.frames { f[0..6].copy_from_slice(&mac); push_tx(&mut st, nic, f); }
         drop(st);
         drivers::netdev::kick();
@@ -552,7 +749,16 @@ pub(crate) fn take_txq(nic: u8) -> Vec<Vec<u8>> {
 
 /// Un-NATed replies for the bridge switch (after the NIC pass).
 pub(crate) fn drain_in() {
-    if USED.load(Ordering::Relaxed) { let mut st = FWD.lock(); sweep(&mut st, sched::monotonic_ns()); } // expiry timer
+    if USED.load(Ordering::Relaxed) {
+        let mut st = FWD.lock(); sweep(&mut st, sched::monotonic_ns()); // expiry timer
+        let nr: Vec<(u8, Vec<u8>)> = st.nreplay.drain(..).collect();
+        let ex: Vec<(Sid, Sid, Vec<u8>)> = st.expired.drain(..).collect();
+        let ex6: Vec<(Sid, Sid, Vec<u8>)> = st.expired6.drain(..).collect();
+        drop(st);
+        for (sbr, port, f) in ex { unreach4(sbr, port, &f); }
+        for (sbr, port, f) in ex6 { crate::fwd6::unreach6(sbr, port, &f); }
+        for (nic, f) in nr { nic_rx(nic, &f); } // NIC frames released by a learned neighbour
+    }
     if INQ_N.load(Ordering::Relaxed) == 0 { return; }
     let q: Vec<(Sid, Sid, Vec<u8>)> = { let mut st = FWD.lock(); INQ_N.store(0, Ordering::Relaxed); st.inq.drain(..).collect() };
     for (br, port, f) in q {
@@ -578,17 +784,120 @@ fn learn(br: Sid, port: Sid, bmac: [u8; 6], f: &[u8]) -> Option<[u8; 4]> {
     Some(ip)
 }
 
-/// Frames parked on a learn miss for `ip` on `br`, oldest first (a retransmit-free first connect).
-fn unpark(br: Sid, ip: [u8; 4]) -> Vec<(Sid, Vec<u8>)> {
+/// Move parked frames older than the timeout to `expired` (ICMP host unreachable is sent from `divert`).
+fn expire_park(st: &mut St, now: u64) {
+    let mut i = 0;
+    while i < st.park.len() {
+        if now.saturating_sub(st.park[i].t) >= PEND_NS * 2 {
+            let q = st.park.remove(i);
+            if st.expired.len() < PARK_TOTAL { st.expired.push((q.sbr, q.port, q.frame)); }
+        } else { i += 1; }
+    }
+    st.npark.retain(|q| now.saturating_sub(q.t) < PEND_NS * 2);
+    // Resend the solicitation up to three times in all, spread over the park timeout (Linux mcast_solicit = 3).
+    let mut i = 0;
+    while i < st.probe.len() {
+        let age = now.saturating_sub(st.probe[i].t);
+        if age >= PEND_NS * 2 { st.probe.remove(i); continue; }
+        if (st.probe[i].sent as u64) < 3 && age >= st.probe[i].sent as u64 * PEND_NS * 2 / 3 {
+            let (br, f) = (st.probe[i].br, st.probe[i].frame.clone());
+            st.probe[i].sent += 1;
+            st.inq.push_back((br, crate::vifsel::NO_PEER, f)); INQ_N.fetch_add(1, Ordering::Relaxed);
+        }
+        i += 1;
+    }
+}
+
+/// Remember an ARP request / NS sent for a parked frame so it is resent until the park times out.
+pub(crate) fn add_probe(st: &mut St, br: Sid, ip: [u8; 16], frame: &[u8]) {
+    if st.probe.iter().any(|q| q.br == br && q.ip == ip) || st.probe.len() >= PARK_TOTAL { return; }
+    st.probe.push(Probe { br, ip, t: sched::monotonic_ns(), sent: 1, frame: frame.to_vec() });
+}
+
+/// Park a NIC frame whose container next hop has no learned MAC; `take_npark` releases it.
+pub(crate) fn park_nic(st: &mut St, br: Sid, ip: [u8; 16], v6: bool, nic: u8, now: u64, frame: &[u8]) {
+    if st.npark.iter().filter(|q| q.br == br && q.ip == ip && q.v6 == v6).count() < PARK_PER_IP && st.npark.len() < PARK_TOTAL {
+        stat(S_PARKED);
+        st.npark.push(NPark { br, ip, v6, nic, t: now, frame: frame.to_vec() });
+    }
+}
+
+/// Queue the NIC frames waiting for `ip` on `br` for replay through `nic_rx` (see `drain_in`).
+pub(crate) fn take_npark(st: &mut St, br: Sid, ip: [u8; 16], v6: bool, now: u64) {
+    st.npark.retain(|q| now.saturating_sub(q.t) < PEND_NS * 2);
+    st.probe.retain(|q| !(q.br == br && q.ip == ip));
+    let mut i = 0;
+    while i < st.npark.len() {
+        if st.npark[i].br == br && st.npark[i].ip == ip && st.npark[i].v6 == v6 { let q = st.npark.remove(i); st.nreplay.push((q.nic, q.frame)); } else { i += 1; }
+    }
+}
+
+/// Frames parked on a learn miss for `ip` on `br`, oldest first: (source bridge, source port, frame).
+fn unpark(br: Sid, ip: [u8; 4]) -> Vec<(Sid, Sid, Vec<u8>)> {
     let now = sched::monotonic_ns();
     let mut st = FWD.lock();
-    st.park.retain(|q| now.saturating_sub(q.t) < PEND_NS * 2);
+    expire_park(&mut st, now);
+    let mut wide = [0u8; 16]; wide[..4].copy_from_slice(&ip);
+    take_npark(&mut st, br, wide, false, now);
     let mut out = Vec::new();
     let mut i = 0;
     while i < st.park.len() {
-        if st.park[i].br == br && st.park[i].ip == ip { let q = st.park.remove(i); out.push((q.port, q.frame)); } else { i += 1; }
+        if st.park[i].br == br && st.park[i].ip == ip { let q = st.park.remove(i); out.push((q.sbr, q.port, q.frame)); } else { i += 1; }
     }
+    drop(st);
+    if !out.is_empty() { drivers::netdev::kick(); }
     out
+}
+
+/// Replay released frames: ones that arrived on this bridge go back to the front of its work queue,
+/// others are handed to their own bridge's next `divert` pass.
+pub(crate) fn requeue(br: Sid, list: Vec<(Sid, Sid, Vec<u8>)>, work: &mut VecDeque<(Sid, Vec<u8>)>) {
+    let mut other = false;
+    for (sbr, port, f) in list.into_iter().rev() {
+        if sbr == br { work.push_front((port, f)); } else { FWD.lock().replay.push((sbr, port, f)); other = true; }
+    }
+    if other { drivers::netdev::kick(); }
+}
+
+/// A parked packet whose next hop never resolved: Linux answers the sender with ICMP host unreachable.
+fn unreach4(sbr: Sid, port: Sid, f: &[u8]) {
+    let info = {
+        let v = crate::vif::VIFS.lock();
+        v[sbr as usize].as_ref().filter(|b| b.kind == VifKind::Bridge && b.netns == 0).map(|b| (b.mac, b.addrs.clone()))
+    };
+    let Some((bmac, addrs)) = info else { return };
+    let src = [f[26], f[27], f[28], f[29]];
+    let a = addrs.iter().find(|&&(a, p)| a != src && u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(src) & mask(p)).map(|x| x.0);
+    let Some(a) = a else { return };
+    if let Some(r) = host_unreach(bmac, a, f) {
+        let mut st = FWD.lock();
+        st.inq.push_back((sbr, port, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
+        drop(st);
+        drivers::netdev::kick();
+    }
+}
+
+/// ICMP destination unreachable / host unreachable for `f` (an Ethernet+IPv4 frame), from the bridge address `baddr`.
+fn host_unreach(bmac: [u8; 6], baddr: [u8; 4], f: &[u8]) -> Option<Vec<u8>> {
+    let ihl = ((f[14] & 0xf) as usize) * 4;
+    if ihl < 20 || f.len() < 14 + ihl + 8 || f[23] == PROTO_ICMP { return None; }
+    let q = &f[14..14 + ihl + 8];
+    let mut r = alloc::vec![0u8; 14 + 20 + 8 + q.len()];
+    r[0..6].copy_from_slice(&f[6..12]);
+    r[6..12].copy_from_slice(&bmac);
+    r[12..14].copy_from_slice(&[0x08, 0x00]);
+    r[14] = 0x45; r[15] = 0xc0;
+    let tl = (20 + 8 + q.len()) as u16;
+    r[16..18].copy_from_slice(&tl.to_be_bytes());
+    r[22] = 64; r[23] = PROTO_ICMP;
+    r[26..30].copy_from_slice(&baddr);
+    r[30..34].copy_from_slice(&f[26..30]);
+    ip_csum(&mut r, 20);
+    r[34] = 3; r[35] = 1;
+    r[42..].copy_from_slice(q);
+    let c = fold(sum(&r[34..], 0));
+    r[36..38].copy_from_slice(&c.to_be_bytes());
+    Some(r)
 }
 
 struct Tgt { br: Sid, mac: [u8; 6], name: [u8; 16], addr: [u8; 4] }
@@ -610,6 +919,14 @@ fn bridge_for(ip: [u8; 4]) -> Option<Tgt> {
     None
 }
 
+/// Zero-padded interface name of ns-0 bridge `br` (for `meta oifname`).
+pub(crate) fn br_name(br: Sid) -> [u8; 16] {
+    let v = crate::vif::VIFS.lock();
+    let mut o = [0u8; 16];
+    if let Some(b) = v.get(br as usize).and_then(|x| x.as_ref()) { let n = b.name.len().min(16); o[..n].copy_from_slice(&b.name[..n]); }
+    o
+}
+
 fn rewrite_dst(f: &mut Vec<u8>, p: &Pkt, ip: [u8; 4], port: u16) {
     f[30..34].copy_from_slice(&ip);
     let o = 14 + p.ihl;
@@ -620,9 +937,9 @@ fn is_new_flow(p: &Pkt) -> bool { p.proto == PROTO_UDP || (p.proto == PROTO_TCP 
 
 /// A new packet from the NIC to an address of this host: PREROUTING DNAT, then FORWARD must accept.
 /// Creates an In entry. 0 = not ours (pass to the stack), 1 = dropped, 2 = entry created.
-fn new_in(st: &mut St, nic: u8, p: &Pkt, now: u64) -> u8 {
+fn new_in(st: &mut St, nic: u8, p: &Pkt, now: u64, frame: &[u8]) -> u8 {
     if !is_new_flow(p) || !crate::iface::is_nic_addr(p.dst) { return 0; }
-    let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
+    let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
     let (acc, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
     let crate::nfnl::Nat::Dnat(cip, cport) = nat else { return if acc { 0 } else { 1 } };
     let cport = if cport == 0 { p.dport } else { cport };
@@ -631,8 +948,11 @@ fn new_in(st: &mut St, nic: u8, p: &Pkt, now: u64) -> u8 {
     if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return 1; }
     if st.ct.len() >= CT_CAP || st.ct.iter().filter(|e| e.kind == 1).count() >= CT_CAP / 2 { return 1; }
     let Some((cmac, port)) = st.lrn.iter().find(|l| l.br == t.br && l.ip == cip).map(|l| (l.mac, l.port)) else {
-        // Unknown MAC: ask for it; the peer's retransmit finds it.
+        // Unknown MAC: ask for it and hold the frame; the ARP reply replays it (else the peer's retransmit finds it).
+        let mut wide = [0u8; 16]; wide[..4].copy_from_slice(&cip);
+        park_nic(st, t.br, wide, false, nic, now, frame);
         let r = arp_request(t.mac, t.addr, cip);
+        add_probe(st, t.br, wide, &r);
         st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
         return 1;
     };
@@ -652,6 +972,11 @@ fn reply_in(br: Sid, port: Sid, f: &mut Vec<u8>, p: &Pkt) -> bool {
     e.last = now; e.replied = true;
     if p.proto == PROTO_TCP { tcp_step(e, p.flags, false); }
     let (nic, nicip, nat) = (e.nic, e.nicip, e.nat);
+    if crate::nfnl::has_tables(0) {
+        let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+        let mut m = crate::nfnl::Pkt { rel: false, est: true, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif, mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
     if f[22] <= 1 { return true; }
     let Some((_, nh, _)) = crate::iface::nic_route(p.dst) else { return true };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return true };
@@ -673,31 +998,36 @@ fn reply_in(br: Sid, port: Sid, f: &mut Vec<u8>, p: &Pkt) -> bool {
 fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
     let now = sched::monotonic_ns();
     let mut st = FWD.lock();
-    let mut hit = st.ct.iter().position(|e| e.kind == 2 && e.proto == p.proto && e.br == br && e.port == port
+    let mut hit = st.ct.iter().position(|e| (e.kind == 2 || e.kind == 3) && e.proto == p.proto && e.br == br && e.port == port
         && e.cip == p.src && e.cport == p.sport && e.rip == p.dst && e.rport == p.dport);
     let mut rev = false;
     if hit.is_none() {
-        hit = st.ct.iter().position(|e| e.kind == 2 && e.proto == p.proto && e.tbr == br && e.tip == p.src && e.tport == p.sport
-            && e.nicip == p.dst && e.nat == p.dport);
+        hit = st.ct.iter().position(|e| e.proto == p.proto && e.tbr == br && e.tip == p.src && e.tport == p.sport
+            && ((e.kind == 2 && e.nicip == p.dst && e.nat == p.dport) || (e.kind == 3 && e.cip == p.dst && e.cport == p.dport)));
         rev = hit.is_some();
     }
+    let existed = hit.is_some();
     if hit.is_none() {
         if !is_new_flow(p) || !host_local(p.dst) || st.ct.len() >= CT_CAP { return false; }
-        let mut m = crate::nfnl::Pkt { l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
+        let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: p.dport, oif: [0; 16], mark: 0, local: true, v6: None };
         let (_, nat) = crate::nfnl::eval(0, crate::nfnl::H_PRE, &mut m);
         let crate::nfnl::Nat::Dnat(cip, cport) = nat else { return false };
         let cport = if cport == 0 { p.dport } else { cport };
         let Some(t) = bridge_for(cip) else { return false };
         m.dst = cip; m.dport = cport; m.oif = t.name;
         if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return true; }
-        if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return false; }
+        // Masquerade (netavark SETMARK: same-network clients) rewrites the source; an unmarked
+        // cross-network flow is DNATed and routed with the client's own address (kind 3).
+        let masq = crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 == crate::nfnl::Nat::Masq;
         let Some((tmac, tps)) = st.lrn.iter().find(|l| l.br == t.br && l.ip == cip).map(|l| (l.mac, l.port)) else {
-            if t.br == br && st.park.len() < 16 {
-                // Hold the SYN until the ARP reply teaches us the MAC; `divert` replays it.
+            if st.park.iter().filter(|q| q.br == t.br && q.ip == cip).count() < PARK_PER_IP && st.park.len() < PARK_TOTAL {
+                // Hold the SYN until the ARP reply teaches us the MAC; `divert` replays it (also across bridges).
+                stat(S_PARKED);
                 let fr = core::mem::take(f);
-                st.park.push(Park { br, ip: cip, t: now, port, frame: fr });
+                st.park.push(Park { br: t.br, sbr: br, ip: cip, t: now, port, frame: fr });
             }
             let r = arp_request(t.mac, t.addr, cip);
+            { let mut w = [0u8; 16]; w[..4].copy_from_slice(&cip); add_probe(&mut st, t.br, w, &r); }
             st.inq.push_back((t.br, crate::vifsel::NO_PEER, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
             drop(st);
             drivers::netdev::kick(); // else the ARP request waits for the next housekeeping tick (~450 ms)
@@ -705,20 +1035,31 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
         };
         let claimed = crate::nfnl::dnat_ports(0);
         let mut cand = None;
+        if !masq { cand = Some(0); } else {
         for _ in 0..NAT_SPAN {
             let c = NAT_BASE + st.next % NAT_SPAN;
             st.next = st.next.wrapping_add(1);
             if !st.ct.iter().any(|e| e.nat == c && e.proto == p.proto) && !claimed.iter().any(|&(a, b)| c >= a && c <= b) { cand = Some(c); break; }
-        }
+        } }
         let Some(nat) = cand else { return true };
         let cmac: [u8; 6] = f[6..12].try_into().unwrap();
         st.ct.push(Ct { proto: p.proto, nat, cip: p.src, cport: p.sport, cmac, br, port, bmac, rip: p.dst, rport: p.dport,
             nic: 0, nicip: t.addr, last: now, replied: false, tst: 0, fins: 0,
-            kind: 2, tip: cip, tport: cport, tbr: t.br, tps, tmac, tbmac: t.mac });
+            kind: if masq { 2 } else { 3 }, tip: cip, tport: cport, tbr: t.br, tps, tmac, tbmac: t.mac });
         hit = Some(st.ct.len() - 1);
     }
     USED.store(true, Ordering::Relaxed);
     let i = hit.unwrap();
+    if existed && crate::nfnl::has_tables(0) {
+        // Established hairpin flows traverse FORWARD too (post-DNAT addresses, the target's bridge as oif).
+        let e = &st.ct[i];
+        let mut m = if !rev {
+            crate::nfnl::Pkt { rel: false, est: e.replied, l4: p.proto, src: p.src, dst: e.tip, sport: p.sport, dport: e.tport, oif: br_name(e.tbr), mark: 0, local: false, v6: None }
+        } else {
+            crate::nfnl::Pkt { rel: false, est: true, l4: p.proto, src: e.tip, dst: e.cip, sport: e.tport, dport: e.cport, oif: br_name(e.br), mark: 0, local: false, v6: None }
+        };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
     if f[22] <= 1 { return true; }
     f[22] -= 1;
     let o = 14 + p.ihl;
@@ -727,8 +1068,10 @@ fn hair(br: Sid, port: Sid, bmac: [u8; 6], f: &mut Vec<u8>, p: &Pkt) -> bool {
     if p.proto == PROTO_TCP { tcp_step(e, p.flags, !rev); }
     let (dbr, dport_sid);
     if !rev {
-        f[26..30].copy_from_slice(&e.nicip);
-        f[o..o + 2].copy_from_slice(&e.nat.to_be_bytes());
+        if e.kind == 2 {
+            f[26..30].copy_from_slice(&e.nicip);
+            f[o..o + 2].copy_from_slice(&e.nat.to_be_bytes());
+        }
         rewrite_dst(f, p, e.tip, e.tport);
         f[0..6].copy_from_slice(&e.tmac); f[6..12].copy_from_slice(&e.tbmac);
         dbr = e.tbr; dport_sid = e.tps;

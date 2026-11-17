@@ -55,12 +55,14 @@ pub(crate) fn scope_sid(ns: u16, scope: u32) -> Result<Sid, i32> {
 }
 
 /// The link-local address of netif `id`, while installed.
-pub(crate) fn ll_of(id: u8) -> Option<[u8; 16]> { LL.lock().get(id as usize).copied().flatten() }
+pub(crate) fn ll_of(id: u8) -> Option<[u8; 16]> { ll_cfg(id).filter(|a| dad_ok(id, a)) }
+/// The link-local address configured on netif `id`, tentative or not.
+pub(crate) fn ll_cfg(id: u8) -> Option<[u8; 16]> { LL.lock().get(id as usize).copied().flatten() }
 
 /// The NIC stack holding the v6 address `a` (link-local only until SLAAC / static addresses).
 pub(crate) fn holder_of(a: Ipv6Address) -> Option<Sid> {
     let t = LL.lock();
-    (0..MAX_NETIF).find(|&i| t[i] == Some(a.0)).map(|i| iface::sid_of(i as u8))
+    (0..MAX_NETIF).find(|&i| t[i] == Some(a.0) && dad_ok(i as u8, &a.0)).map(|i| iface::sid_of(i as u8))
 }
 
 fn prefix_match(a: &[u8; 16], p: &[u8; 16], len: u8) -> bool {
@@ -125,13 +127,16 @@ pub(crate) fn sync(nif: netdev::Netif, admin_down: bool) {
     let mut stack = crate::stack_for(iface::sid_of(nif.id));
     let Some(ref mut s) = *stack else { return };
     let have = s.interface.ip_addrs().iter().any(|c| matches!(c.address(), IpAddress::Ipv6(a) if is_link_local(&a.0)));
-    if have == want.is_some() && LL.lock()[id] == want { return; }
+    let cfg = LL.lock()[id];
+    if cfg == want && have == want.map_or(false, |l| dad_ok(nif.id, &l)) { return; }
+    if let Some(old) = cfg { if Some(old) != want { dad_forget(nif.id, &old); } }
+    let now = want.map_or(true, |l| dad_register(nif.id, nif.name().as_bytes(), l, 64, false));
     s.interface.update_ip_addrs(|addrs| {
         let keep: Vec<IpCidr> = addrs.iter().copied()
             .filter(|c| !matches!(c.address(), IpAddress::Ipv6(a) if is_link_local(&a.0))).collect();
         addrs.clear();
         for c in keep { let _ = addrs.push(c); }
-        if let Some(l) = want { let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(l)), 64)); }
+        if let (Some(l), true) = (want, now) { let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(l)), 64)); }
     });
     LL.lock()[id] = want;
     drop(stack);
@@ -142,19 +147,126 @@ pub(crate) fn sync(nif: netdev::Netif, admin_down: bool) {
 pub(crate) fn proc_if_inet6(out: &mut impl Write) {
     let _ = writeln!(out, "00000000000000000000000000000001 01 80 10 80       lo");
     for nif in netdev::iter() {
-        let Some(a) = ll_of(nif.id) else { continue };
+        let Some(a) = ll_cfg(nif.id) else { continue };
         for b in a { let _ = write!(out, "{:02x}", b); }
-        let _ = writeln!(out, " {:02x} 40 20 80 {:>8}", nif.id as u32 + 2, nif.name());
+        let _ = writeln!(out, " {:02x} 40 20 {:02x} {:>8}", nif.id as u32 + 2, 0x80 | dad_flags(nif.id, &a), nif.name());
         if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr {
             for b in g { let _ = write!(out, "{:02x}", b); }
-            let _ = writeln!(out, " {:02x} 40 00 00 {:>8}", nif.id as u32 + 2, nif.name());
+            let _ = writeln!(out, " {:02x} 40 00 {:02x} {:>8}", nif.id as u32 + 2, 0x80 | dad_flags(nif.id, &g), nif.name());
         }
     }
     for &(idx, a, p) in STATIC_A.lock().iter() {
         let name = if idx == 1 { alloc::string::String::from("lo") } else { nic_of(idx).map(|n| alloc::string::String::from(n.name())).unwrap_or_default() };
+        let fl = 0x80 | nic_of(idx).map_or(0, |n| dad_flags(n.id, &a));
         for b in a { let _ = write!(out, "{:02x}", b); }
-        let _ = writeln!(out, " {:02x} {:02x} {:02x} 80 {:>8}", idx, p, if is_link_local(&a) { 0x20 } else { 0 }, name);
+        let _ = writeln!(out, " {:02x} {:02x} {:02x} {:02x} {:>8}", idx, p, if is_link_local(&a) { 0x20 } else { 0 }, fl, name);
     }
+    crate::tunbe::proc_if_inet6(out);
+}
+
+// ── Duplicate address detection (RFC 4862) of the NIC addresses ──────────────
+// The link-local, SLAAC and static addresses of a NIC start tentative: held out of
+// the smoltcp interface while `dad_transmits` NS probes (from `::` to the
+// solicited-node group, 1 s apart) go out and a further second passes. A NA for
+// the target, or another node's NS from `::` for it, makes it DADFAILED (it stays
+// listed, never used). `accept_dad` 0, `dad_transmits` 0 and IFA_F_NODAD skip it.
+
+const DAD_MS: u64 = 1_000_000_000;
+const IFA_F_TENTATIVE: u32 = 0x40;
+const IFA_F_DADFAILED: u32 = 0x800;
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum DadSt { New, Probing(u8, u64), Failed }
+struct NDad { id: u8, addr: [u8; 16], prefix: u8, st: DadSt }
+/// Addresses not yet usable. An address with no entry is permanent.
+static NDAD: Mutex<Vec<NDad>> = Mutex::new(Vec::new());
+
+/// May `addr` of netif `id` be used (no pending or failed DAD)?
+fn dad_ok(id: u8, addr: &[u8; 16]) -> bool { !NDAD.lock().iter().any(|d| d.id == id && d.addr == *addr) }
+/// IFA_F_* of `addr` on netif `id`.
+fn dad_flags(id: u8, addr: &[u8; 16]) -> u32 {
+    match NDAD.lock().iter().find(|d| d.id == id && d.addr == *addr).map(|d| d.st) {
+        None => 0,
+        Some(DadSt::Failed) => IFA_F_TENTATIVE | IFA_F_DADFAILED,
+        Some(_) => IFA_F_TENTATIVE,
+    }
+}
+fn dad_forget(id: u8, addr: &[u8; 16]) { NDAD.lock().retain(|d| !(d.id == id && d.addr == *addr)); }
+/// A new address: true when it can be installed at once, false when it starts tentative.
+fn dad_register(id: u8, ifname: &[u8], addr: [u8; 16], prefix: u8, nodad: bool) -> bool {
+    if nodad || sched::ns::ipv6_conf(0, ifname, "accept_dad") == 0 || sched::ns::ipv6_conf(0, ifname, "dad_transmits") == 0 {
+        dad_forget(id, &addr);
+        return true;
+    }
+    let mut t = NDAD.lock();
+    if !t.iter().any(|d| d.id == id && d.addr == addr) { t.push(NDad { id, addr, prefix, st: DadSt::New }); }
+    false
+}
+
+/// The NS of a DAD probe for `addr`, a whole IPv6 packet.
+fn dad_ns_packet(addr: &[u8; 16]) -> Vec<u8> {
+    let dst = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, addr[13], addr[14], addr[15]];
+    let mut icmp = alloc::vec![135u8, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(addr);
+    let src = [0u8; 16];
+    let c = csum6(&src, &dst, &icmp);
+    icmp[2..4].copy_from_slice(&c.to_be_bytes());
+    let mut p = alloc::vec![0x60u8, 0, 0, 0];
+    p.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    p.extend_from_slice(&[58, 255]);
+    p.extend_from_slice(&src);
+    p.extend_from_slice(&dst);
+    p.extend_from_slice(&icmp);
+    p
+}
+
+/// Does `ip` (a whole IPv6 packet) claim a target for DAD purposes: a NA, or a NS from `::`?
+fn dad_claim(ip: &[u8]) -> Option<[u8; 16]> {
+    if ip.len() < 40 + 24 || ip[0] >> 4 != 6 || ip[6] != 58 { return None; }
+    let unspec = ip[8..24].iter().all(|&b| b == 0);
+    if !(ip[40] == 136 || (ip[40] == 135 && unspec)) { return None; }
+    let mut t = [0u8; 16]; t.copy_from_slice(&ip[48..64]);
+    Some(t)
+}
+
+/// What a received packet does to the pending addresses of `id`; true when one failed.
+fn dad_rx(id: u8, ip: &[u8]) -> bool {
+    let Some(t) = dad_claim(ip) else { return false };
+    let mut hit = false;
+    for d in NDAD.lock().iter_mut().filter(|d| d.id == id && d.addr == t && d.st != DadSt::Failed) { d.st = DadSt::Failed; hit = true; }
+    hit
+}
+
+/// One DAD step for NIC `id` (its stack lock held): probes due, addresses that passed.
+/// `raw` is the stack's internal ICMPv6 socket. Returns ns until the next timed event.
+fn dad_pass(nif: netdev::Netif, s: &mut crate::NetStack, raw: SocketHandle, now: u64) -> Option<u64> {
+    let id = nif.id;
+    if !iface::rt(id).carrier { return None; }
+    let probes = sched::ns::ipv6_conf(0, nif.name().as_bytes(), "dad_transmits").clamp(1, 64) as u8;
+    let mut next: Option<u64> = None;
+    let mut done: Vec<([u8; 16], u8)> = Vec::new();
+    {
+        let mut t = NDAD.lock();
+        for d in t.iter_mut().filter(|d| d.id == id) {
+            let send = match d.st {
+                DadSt::New => Some(0u8),
+                DadSt::Probing(n, due) if now >= due && n < probes => Some(n),
+                DadSt::Probing(_, due) if now >= due => { done.push((d.addr, d.prefix)); None }
+                _ => None,
+            };
+            if let Some(n) = send {
+                let sock = s.socket_set.get_mut::<raw::Socket>(raw);
+                if sock.send_slice(&dad_ns_packet(&d.addr)).is_ok() { d.st = DadSt::Probing(n + 1, now + DAD_MS); }
+                else { next = Some(1_000_000); }
+            }
+            if let DadSt::Probing(_, due) = d.st { if due > now { let w = due - now; next = Some(next.map_or(w, |x| x.min(w))); } }
+        }
+        t.retain(|d| !(d.id == id && done.iter().any(|x| x.0 == d.addr)));
+    }
+    if !done.is_empty() {
+        s.interface.update_ip_addrs(|v| for &(a, p) in &done { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(a)), p)); });
+        iface::notify(id);
+    }
+    next
 }
 
 // ── Router discovery and SLAAC (design-ipv6 L5) ──────────────────────────────
@@ -179,6 +291,9 @@ struct Slaac {
     next_rs: u64,
 }
 impl Slaac { const NONE: Slaac = Slaac { addr: None, pfx: None, router: None, rs_sent: 0, next_rs: 0 }; }
+/// Netifs that received a router advertisement (IF_RA_RCVD).
+static RA_SEEN: Mutex<[bool; MAX_NETIF]> = Mutex::new([false; MAX_NETIF]);
+pub(crate) fn ra_rcvd(id: usize) -> bool { id < MAX_NETIF && RA_SEEN.lock()[id] }
 static SLAAC: Mutex<[Slaac; MAX_NETIF]> = Mutex::new([Slaac::NONE; MAX_NETIF]);
 /// The internal raw ICMPv6 socket of each NIC stack.
 static RAW: Mutex<[Option<SocketHandle>; MAX_NETIF]> = Mutex::new([None; MAX_NETIF]);
@@ -225,6 +340,7 @@ fn withdraw(id: usize, s: &mut crate::NetStack) {
     let st = core::mem::replace(&mut SLAAC.lock()[id], Slaac::NONE);
     let sid = iface::sid_of(id as u8);
     if let Some((a, _)) = st.addr {
+        dad_forget(id as u8, &a);
         s.interface.update_ip_addrs(|v| {
             let keep: Vec<IpCidr> = v.iter().copied().filter(|c| c.address() != IpAddress::Ipv6(Ipv6Address(a))).collect();
             v.clear();
@@ -243,6 +359,7 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
     let mut src = [0u8; 16]; src.copy_from_slice(&ip[8..24]);
     let icmp = &ip[40..];
     if icmp[0] != 134 || icmp[1] != 0 || !is_link_local(&src) { return; }
+    RA_SEEN.lock()[id] = true;
     let sid = iface::sid_of(id as u8);
     let rlife = u16::from_be_bytes([icmp[6], icmp[7]]) as u32;
     let iid: [u8; 8] = match LL.lock()[id] { Some(l) => l[8..16].try_into().unwrap(), None => return };
@@ -272,7 +389,9 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
                         if t[id].addr.map_or(false, |x| x.0 == a) { drop(t); withdraw_addr(id, s); changed = true; }
                     } else if t[id].addr.map_or(true, |x| x.0 == a) {
                         if t[id].addr.is_none() {
-                            s.interface.update_ip_addrs(|v| { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(a)), 64)); });
+                            if dad_register(id as u8, nic_name(id).as_bytes(), a, 64, false) {
+                                s.interface.update_ip_addrs(|v| { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(a)), 64)); });
+                            }
                             changed = true;
                         }
                         t[id].addr = Some((a, life(valid, now)));
@@ -303,6 +422,7 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
 fn withdraw_addr(id: usize, s: &mut crate::NetStack) {
     let a = SLAAC.lock()[id].addr.take();
     if let Some((a, _)) = a {
+        dad_forget(id as u8, &a);
         s.interface.update_ip_addrs(|v| {
             let keep: Vec<IpCidr> = v.iter().copied().filter(|c| c.address() != IpAddress::Ipv6(Ipv6Address(a))).collect();
             v.clear();
@@ -317,24 +437,29 @@ fn withdraw_addr(id: usize, s: &mut crate::NetStack) {
 pub(crate) fn slaac_pass(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, now: u64) -> Option<u64> {
     let id = nif.id as usize;
     let h = RAW.lock()[id]?;
-    let on = !admin_down && LL.lock()[id].is_some() && iface::rt(nif.id).carrier
-        && sched::ns::ipv6_conf(0, nif.name().as_bytes(), "accept_ra") != 0;
-    if !on {
+    // Everything the internal socket received: DAD conflicts first, then the RAs.
+    let mut pkts: Vec<Vec<u8>> = Vec::new();
+    {
         let sock = s.socket_set.get_mut::<raw::Socket>(h);
         let mut b = [0u8; 1500];
-        while sock.can_recv() { let _ = sock.recv_slice(&mut b); }
+        while sock.can_recv() { match sock.recv_slice(&mut b) { Ok(n) => pkts.push(b[..n].to_vec()), Err(_) => break } }
+    }
+    for p in &pkts { dad_rx(nif.id, p); }
+    let dad = dad_pass(nif, s, h, now);
+    let rs = slaac_inner(nif, s, admin_down, now, h, &pkts);
+    match (dad, rs) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) }
+}
+
+fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, now: u64, h: SocketHandle, pkts: &[Vec<u8>]) -> Option<u64> {
+    let id = nif.id as usize;
+    let on = !admin_down && ll_of(nif.id).is_some() && iface::rt(nif.id).carrier
+        && sched::ns::ipv6_conf(0, nif.name().as_bytes(), "accept_ra") != 0;
+    if !on {
         withdraw(id, s);
         return None;
     }
     let autoconf = sched::ns::ipv6_conf(0, nif.name().as_bytes(), "autoconf") != 0;
-    let mut pkt = [0u8; 1500];
-    loop {
-        let sock = s.socket_set.get_mut::<raw::Socket>(h);
-        if !sock.can_recv() { break; }
-        let Ok(n) = sock.recv_slice(&mut pkt) else { break };
-        handle_ra(id, s, &pkt[..n], now, autoconf);
-    }
-    // Expiry.
+    for p in pkts { handle_ra(id, s, p, now, autoconf); }
     let st = SLAAC.lock()[id];
     if st.addr.map_or(false, |a| a.1 <= now) { withdraw_addr(id, s); iface::notify(nif.id); }
     if st.router.map_or(false, |r| r.1 <= now) {
@@ -421,10 +546,10 @@ pub(crate) fn addrs6() -> Vec<A6> {
     let mut v = alloc::vec![A6 { index: 1, addr: LOOPBACK, prefix: 128, scope: 254, flags: 0x80 }];
     for nif in netdev::iter() {
         let idx = nif.id as u32 + 2;
-        if let Some(a) = ll_of(nif.id) { v.push(A6 { index: idx, addr: a, prefix: 64, scope: 253, flags: 0x80 }); }
-        if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr { v.push(A6 { index: idx, addr: g, prefix: 64, scope: 0, flags: 0x80 }); }
+        if let Some(a) = ll_cfg(nif.id) { v.push(A6 { index: idx, addr: a, prefix: 64, scope: 253, flags: 0x80 | dad_flags(nif.id, &a) }); }
+        if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr { v.push(A6 { index: idx, addr: g, prefix: 64, scope: 0, flags: 0x80 | dad_flags(nif.id, &g) }); }
     }
-    for &(idx, a, p) in STATIC_A.lock().iter() { v.push(A6 { index: idx, addr: a, prefix: p, scope: scope_of(&a), flags: 0x80 }); }
+    for &(idx, a, p) in STATIC_A.lock().iter() { v.push(A6 { index: idx, addr: a, prefix: p, scope: scope_of(&a), flags: 0x80 | nic_of(idx).map_or(0, |n| dad_flags(n.id, &a)) }); }
     v
 }
 
@@ -451,6 +576,8 @@ pub(crate) fn lookup6(dst: [u8; 16]) -> Option<(u32, Option<[u8; 16]>)> {
     }
     best(&dst).map(|b| (b.2, b.3))
 }
+
+fn nic_name(id: usize) -> alloc::string::String { netdev::get(id).map(|n| alloc::string::String::from(n.name())).unwrap_or_default() }
 
 fn nic_of(index: u32) -> Option<netdev::Netif> { netdev::iter().find(|n| n.id as u32 + 2 == index) }
 
@@ -479,7 +606,8 @@ pub(crate) fn apply(ns: u16, op: RtOp) -> i32 {
             }
             if let Some(nif) = nic_of(index) {
                 let sid = iface::sid_of(nif.id);
-                if let Some(ref mut s) = *crate::stack_for(sid) {
+                let now = dad_register(nif.id, nif.name().as_bytes(), addr, prefix, flags & crate::rtnetlink::IFA_F_NODAD != 0);
+                if let (Some(ref mut s), true) = (&mut *crate::stack_for(sid), now) {
                     s.interface.update_ip_addrs(|v| { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(addr)), prefix)); });
                 }
                 if flags & crate::rtnetlink::IFA_F_NOPREFIXROUTE == 0 && prefix < 128 {
@@ -499,6 +627,7 @@ pub(crate) fn apply(ns: u16, op: RtOp) -> i32 {
             }
             if let Some(nif) = nic_of(index) {
                 let sid = iface::sid_of(nif.id);
+                dad_forget(nif.id, &addr);
                 if let Some(ref mut s) = *crate::stack_for(sid) {
                     s.interface.update_ip_addrs(|v| {
                         let keep: Vec<IpCidr> = v.iter().copied().filter(|c| c.address() != IpAddress::Ipv6(Ipv6Address(addr))).collect();
@@ -564,9 +693,9 @@ fn sync_static_routes(oif: u32) {
 
 /// The NIC's global v6 address (SLAAC, else a static one with scope global).
 pub(crate) fn nic_global(id: u8) -> Option<[u8; 16]> {
-    if let Some((g, _)) = SLAAC.lock()[id as usize].addr { return Some(g); }
+    if let Some((g, _)) = SLAAC.lock()[id as usize].addr { if dad_ok(id, &g) { return Some(g); } }
     let idx = id as u32 + 2;
-    STATIC_A.lock().iter().find(|&&(i, a, _)| i == idx && !is_link_local(&a) && a[0] != 0xff).map(|&(_, a, _)| a)
+    STATIC_A.lock().iter().find(|&&(i, a, _)| i == idx && !is_link_local(&a) && a[0] != 0xff && dad_ok(id, &a)).map(|&(_, a, _)| a)
 }
 
 /// Egress for a forwarded v6 packet: `(nic id, next hop, source address)`. Only NICs (never a dynamic link).

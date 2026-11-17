@@ -18,12 +18,15 @@ Options:
                              wifisim  host:wifisimtest.py alone (simulated Wi-Fi self-test boot)
                              serialxfer host:serialxfertest.py alone (serial push + kexec, scripts/pi-serial-*)
                              psklog   host:psklogtest.py alone (a cmdline wifi.psk= never reaches serial/klog/root or non-root /proc/cmdline)
+                             nitrox86 host:nitrotest.py alone (x86_64 without PIT/HPET/i8042/display, EC2 Nitro-like)
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              usbisoch host:usbisochtest.py alone (xHCI isoch OUT: 2 s 1 kHz sine to usb-audio, WAV checked)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
+                             vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -33,6 +36,8 @@ Options:
                                       + host:inloadtest.py (hostfwd connects under bulk load and an unpumped held serial)
                                       + host:udppeertest.py (udptest peer: fragments, ICMP errors, IGMP, broadcast)
                              netroam  host:netroamtest.py alone
+                             ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
+                             a64its   host:a64itstest.py alone (aarch64 GICv3 ITS: virtio-net + NVMe on MSI-X LPIs, /proc/interrupts, gic.its=0 fallback)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
@@ -45,6 +50,7 @@ Options:
                              nettag2  host:nettag2test.py alone
                              kparks   host:kparkstest.py alone
                              podpasta host:podpastatest.py alone (rootless podman on pasta: echo, host wget, -p port-forward, dns, churn, no leaks)
+                             podsmoke host:podsmoketest.py alone (root podman run --rm alpine echo hi; skips without the alpine image)
                              podbridge host:podbridgetest.py alone (root podman default bridge: echo, host/bridge wget, dns, 20x churn, no leaks)
                              podpause host:podpausetest.py alone (podman pause/unpause freezes and resumes a container)
                              drm      /bin/drmsmoke + /bin/gpuprobe gl (needs --gpu virgl|venus)
@@ -93,14 +99,60 @@ sys.path.insert(0, HERE)
 os.chdir(REPO)
 import driver  # noqa: E402
 
+SYSFS_CHECK = (
+    "__f=0; "
+    "t() { eval \"$2\" >/dev/null 2>&1 && echo \"sysfs: $1: PASS\" || { echo \"sysfs: $1: FAIL\"; __f=1; }; }; "
+    "t drm_class_card0 'test -L /sys/class/drm/card0 && grep -q DEVNAME=dri/card0 /sys/class/drm/card0/uevent'; "
+    "t drm_class_render 'test -L /sys/class/drm/renderD128 && grep -q MINOR=128 /sys/class/drm/renderD128/uevent'; "
+    "t drm_class_list 'ls /sys/class/drm | grep -q card0'; "
+    "t drm_dev_char 'grep -q MAJOR=226 /sys/dev/char/226:0/uevent && test -d /sys/dev/char/226:0/device/drm'; "
+    "t drm_device_vendor 'grep -q 0x /sys/class/drm/card0/device/vendor && grep -q 0x /sys/class/drm/card0/device/device'; "
+    "t drm_subsystem 'test -L /sys/dev/char/226:0/device/subsystem'; "
+    "t drm_conn_status 'grep -qx connected /sys/class/drm/card0-HDMI-A-1/status && grep -qx enabled /sys/class/drm/card0-HDMI-A-1/enabled && grep -qx On /sys/class/drm/card0-HDMI-A-1/dpms'; "
+    "t drm_conn_modes 'test -s /sys/class/drm/card0-HDMI-A-1/modes && grep -q x /sys/class/drm/card0-HDMI-A-1/modes && test -e /sys/class/drm/card0-HDMI-A-1/edid'; "
+    "t drm_conn_driver 'grep -q ^DRIVER=virtio-pci /sys/class/drm/card0/device/uevent || grep -q ^DRIVER=i915 /sys/class/drm/card0/device/uevent || grep -q ^DRIVER=v3d /sys/class/drm/card0/device/uevent'; "
+    "t sys_drm_list 'ls /sys/class/drm | grep -qx card0 && ls /sys/class/drm | grep -qx renderD128 && ls /sys/class/drm | grep -q ^card0-'; "
+    "t sys_char_list 'ls /sys/dev/char | grep -qx 226:0 && ls /sys/dev/char | grep -qx 226:128 && ls /sys/dev/char | grep -q ^13:'; "
+    "t sys_drm_walk 'p=$(realpath /sys/dev/char/226:0/device) && grep -q ^PCI_SLOT_NAME= $p/uevent && grep -q ^PCI_ID= $p/uevent && test -s $p/vendor && test -s $p/device && test -s $p/subsystem_vendor && test -s $p/subsystem_device && readlink /sys/dev/char/226:0/device/subsystem | grep -q /bus/'; "
+    "t sys_input_links 'test -L /sys/class/input/event0/device && test -L /sys/class/input/event0/subsystem && test -L /sys/class/input/input0/subsystem && test -L /sys/dev/char/13:64 && test \"$(readlink /sys/class/input/event0/subsystem)\" = ../../../class/input && test \"$(readlink /sys/class/input/event0/device)\" = ../input0 && test -d /sys/class/input/event0/subsystem && grep -q Keyboard /sys/dev/char/13:64/device/name && ls -F /sys/class/input/event0 | grep -q device@ && ls -F /sys/dev/char | grep -q ^13:64@'; "
+    "t input_class 'test -d /sys/class/input/event0 && test -d /sys/class/input/event1 && test -d /sys/class/input/input0'; "
+    "t input_uevent 'grep -q DEVNAME=input/event1 /sys/class/input/event1/uevent && grep -q MAJOR=13 /sys/class/input/event0/uevent'; "
+    "t input_name 'grep -q Keyboard /sys/class/input/event0/device/name && grep -q Tablet /sys/class/input/event1/device/name'; "
+    "t input_caps 'test -s /sys/class/input/event0/device/capabilities/ev && test -s /sys/class/input/event1/device/capabilities/abs'; "
+    "t input_dev_char 'test -d /sys/dev/char/13:65/device/id && grep -q 13:65 /sys/class/input/event1/dev'; "
+    "t input_caps_eviocgbit 'grep -qx 3 /sys/class/input/event1/device/capabilities/abs && grep -q 0627 /sys/class/input/event1/device/id/vendor'; "
+    "test $__f = 0"
+)
+
+# `sync FILE` is fsync(FILE), not sync(): on f2fs it must not take a checkpoint
+# (/proc/f2fsstat cp_total), bare `sync` must; an unopenable file exits 1 and the
+# others are still synced (lane syncfile).
+SYNCFILE_CHECK = (
+    "__f=0; cpt() { while read k v; do [ \"$k\" = cp_total ] && echo $v; done < /proc/f2fsstat; }; "
+    "t() { eval \"$2\" >/dev/null 2>&1 && echo \"syncfile: $1: PASS\" || { echo \"syncfile: $1: FAIL\"; __f=1; }; }; "
+    "echo data > /home/.syncf1; echo data > /home/.syncf2; "
+    "ok=0; for i in 1 2 3 4 5; do sync; sleep 1; echo x >> /home/.syncf1; a=$(cpt); sync /home/.syncf1 /home/.syncf2; b=$(cpt); "
+    "[ -n \"$a\" ] && [ \"$a\" = \"$b\" ] && { ok=1; break; }; done; "
+    "t file_no_checkpoint '[ $ok = 1 ]'; "
+    "t data_no_checkpoint 'sync -d /home/.syncf1 && [ \"$(cpt)\" = \"$b\" ]'; "
+    "t fs_ok 'sync -f /home/.syncf1'; "
+    "sync /home/.nosuch /home/.syncf1; rc=$?; "
+    "t missing_rc1 '[ $rc = 1 ]'; "
+    "echo more >> /home/.syncf1; sync; c=$(cpt); "
+    "t bare_checkpoint '[ \"$c\" -gt \"$b\" ]'; "
+    "rm -f /home/.syncf1 /home/.syncf2; "
+    "test $__f = 0"
+)
+
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
-                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest",
+                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", SYSFS_CHECK,
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
+                SYNCFILE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
@@ -120,7 +172,9 @@ SUITES = {
                 "if [ \"$(uname -m)\" = aarch64 ]; then drmsmoke --arm-v3d && MESA_LOADER_DRIVER_OVERRIDE=v3d kmscube -c 30; __k=$?; drmsmoke --disarm-v3d; test $__k = 0; fi",
                 "/bin/timertest", "/bin/jobtest", "/bin/waittest",
                 "/bin/sigchldtest", "/bin/vfstest", "/bin/nettest", "/bin/ip6test", "/bin/netlinktest", "/bin/nfttest", "/bin/udpselftest", "/bin/udptest", "/bin/pcachetest",
-                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/tuntest", "/bin/brtest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/inotifytest", "/bin/captest", "/bin/seccomptest", "/bin/bpftest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/camtest --probe",
+                "/bin/procmax", "/bin/syscalltest", "/bin/uaccesstest", "/bin/proctest", "/bin/chroottest", "/bin/mnttest", "/bin/nstest", "/bin/tuntest", "/bin/brtest", "/bin/cgtest", "/bin/ovltest", "/bin/ovlmknodtest", "/bin/idmaptest", "/bin/inotifytest", "/bin/captest", "/bin/seccomptest", "/bin/bpftest", "/bin/preadtest", "/bin/netctltest", "/bin/kmodctltest", "/bin/bttest", "/bin/pstest", "/bin/utmptest", "/bin/camtest --probe",
+                # A real GLib GFileMonitor (musl, ports/pipewire/gfilemon.c) over inotify on tmpfs + f2fs (lane filemon).
+                "/usr/bin/gfilemon /run /root",
                 # kexec tool: load + unload only (non-destructive).
                 # A blocking pipe write of >PIPE_BUF delivers every byte (lane pipefix).
                 "/bin/sh -c '[ \"$(dd if=/dev/zero bs=1M count=2 2>/dev/null | wc -c)\" = 2097152 ]'",
@@ -145,6 +199,9 @@ SUITES = {
                 # org.bluez shim (COSMIC Bluetooth applet/Settings) over btd on
                 # bttest's scripted controller: scan, pair, connect, remove.
                 "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus bluez-test",
+                # xdg-desktop-portal activation (Screenshot/FileChooser, cosmic
+                # backend), timedate1, SwitcherooControl and the a11y bus.
+                "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus svc-test",
                 # Input on one evdev device wakes no waiter on another (QMP
                 # tablet motion vs a waiter parked on the keyboard).
                 "host:evherdtest.py",
@@ -170,9 +227,30 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # Link flap/watch (own boot, ~110 s on both arches; lane suiteharness).
+                "host:netwatchtest.py",
+                # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
+                "host:blkhangtest.py",
+                # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
+                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py",
+                # Input event paths in the running VM (lane regresscov2; ~20 s total).
+                "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
+                # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
+                "host:podsmoketest.py",
                 # f2fs nid allocator never re-hands a live nid. Own boot: it
                 # stops this VM, so it must come after every suite that uses it.
                 "host:f2fsnidtest.py",
+                # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
+                "host:f2fscommittest.py",
+                # Space reuse on a small f2fs volume: churn writes N x capacity,
+                # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
+                "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
+                # Vulkan swapchain on a Wayland surface presented to cosmic-comp (--venus, x86_64 only; own boot, ~3 min).
+                "host:vkwltest.py",
+                # Wayland frame callbacks while outputs are off (lane regresscov2; own boot, ~1.5 min).
+                "host:blanktest.py",
+                # pid-ns zap timeout log + recovery via the pidns.zaptest=1 hook (own boot).
+                "host:pidnszaptest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -206,6 +284,8 @@ SUITES = {
     "nettag2": ["host:nettag2test.py"],
     # Narrow kernel parks: console poll/epoll, empty poll sets, VT_WAITACTIVE.
     "kparks": ["host:kparkstest.py"],
+    # Root `podman run --rm alpine echo hi` (skips without the LEANDROS_IMAGE_ARCHIVE image).
+    "podsmoke": ["host:podsmoketest.py"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # podman pause/unpause freeze and resume a container (needs LEANDROS_IMAGE_ARCHIVE image).
@@ -214,10 +294,13 @@ SUITES = {
     "podpasta": ["host:podpastatest.py"],
     # /proc/<pid>/comm, prctl names and /bin/ps.
     "procps": ["/bin/pstest"],
+    "utmp": ["/bin/utmptest"],
     # /dev/netctl: permission model, event stream, profiles (runs as root).
     "netctl": ["/bin/netctltest"],
     "kmodctl": ["/bin/kmodctltest"],
     "ns": ["/bin/nstest"],
+    "pidnszap": ["/bin/nstest --zaptmo"],
+    "pidnszaphost": ["host:pidnszaptest.py"],
     "mnt": ["/bin/mnttest"],
     "ovl": ["/bin/ovltest"],
     "ovlmknod": ["/bin/ovlmknodtest"],
@@ -226,6 +309,7 @@ SUITES = {
     # inotify (on by default; with --cmdline vfs.inotify=0 only the kill-switch guard runs).
     "inotify": ["/bin/inotifytest"],
     "inotifyforce": ["/bin/inotifytest force"],
+    "gfilemon": ["/usr/bin/gfilemon /run /root"],
     "cgroup": ["/bin/cgtest"],
     # The simulated Wi-Fi (kernel wifi_sim + wifi_mgr) self-test in its own boot.
     "wifisim": ["host:wifisimtest.py"],
@@ -238,8 +322,12 @@ SUITES = {
     "kexecblk": ["host:kexecblktest.py"],
     # lane kexecacpi: x86_64 ACPI tables in Reserved RAM above 2 GiB survive kexec (own boot, 6G + max-ram-below-4g=3G).
     "kexecacpi": ["host:kexecacpitest.py"],
+    # lane vkwltest: Venus Vulkan swapchain -> cosmic-comp over Wayland, frame callbacks counted (x86_64 only, own boot).
+    "vkwl": ["host:vkwltest.py"],
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
+    # lane nitrox86: x86_64 with no PIT/HPET/i8042/display (EC2 Nitro-like): login on serial, TSC stated, clock true (own boot).
+    "nitrox86": ["/bin/timertest", "host:nitrotest.py"],
     "usbisoch": ["host:usbisochtest.py"],
     "blkslow": ["host:blkslowtest.py"],
     # 12 extra virtio-blk data disks all appear in /dev and mount (own boot, openbugs #83).
@@ -248,12 +336,36 @@ SUITES = {
     "rpi5check": ["host:rpi5checktest.py"],
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
+    "f2fscommit": ["host:f2fscommittest.py"],
+    "f2fsgc": ["host:f2fsgctest.py"],
+    "a64acpi": ["host:a64acpitest.py"],
+    "blank": ["host:blanktest.py"],
+    "blkhang": ["host:blkhangtest.py"],
+    "espreset": ["host:espresettest.py"],
+    "evbtn": ["host:evbtntest.py"],
+    "evclock": ["host:evclocktest.py"],
+    "f2fscp": ["host:f2fscptest.py"],
+    "f2fscrash": ["host:f2fscrashtest.py"],
+    "f2fscrashlx": ["host:f2fscrashtest.py --linux --iters 6"],  # needs the box (F2FSINTEROP_LOCK); opt-in, not in regress
+    "f2fsfull": ["host:f2fsfulltest.py"],
+    "f2fsorphan": ["host:f2fsorphantest.py"],
+    "hidkey": ["host:hidkeytest.py"],
+    "netwatch": ["host:netwatchtest.py"],
+    "nvmemsix": ["host:nvmemsixtest.py"],
+    "pagecache-crash": ["host:pagecache-crashtest.py"],
+    "powerctl": ["host:powerctltest.py"],
+    "reboot": ["host:reboottest.py"],
+    "trialwatch": ["host:trialwatchtest.py"],
+    "uartgap": ["host:uartgaptest.py"],
+    "usbstall": ["host:usbstalltest.py"],
+    "usbunplug": ["host:usbunplugtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
     # read finishes with intact data (own boot, ~2 min; not in regress).
     "nvmefault": ["host:nvmefaulttest.py"],
+    "nvmeebs": ["host:nvmeebstest.py"],
     # Network management end to end: /dev/netctl conformance, the NM shim on
     # its mock (full, with the snapshot storm, and read-only), then the shim
     # on the REAL stack (nmrealtest.py: its own boot with wifi_sim, nmtest as
@@ -270,6 +382,8 @@ SUITES = {
                 "host:netflaptest.py",
                 # netctl metric + net.metric.<if>= boot knob (own boot).
                 "host:netmetrictest.py",
+                # EC2 first-boot service vs a fake IMDSv2 (own boot).
+                "host:ec2inittest.py",
                 # Idle net-daemon wake bound (own boot): netidletest.py.
                 "host:netidletest.py",
                 # hostfwd connects under bulk load / a held unpumped serial (own boot).
@@ -289,6 +403,9 @@ SUITES = {
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
+    "ec2init": ["host:ec2inittest.py"],
+    # GICv3 ITS MSI/MSI-X on aarch64 (own boots, ~6 min TCG; aarch64 only, x86_64 skips).
+    "a64its": ["host:a64itstest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
     # linkmontest.py alone.
@@ -310,6 +427,10 @@ SUITES = {
     # CPU fence waits really wait: the fence-wait spin bound (lane rddsys).
     "i915fence": ["/bin/i915test"],
     "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
+    # Synthetic sysfs: /sys/class/{drm,input} and the /sys/dev/char node
+    # identity libdrm/udev consumers read (lane sysfs).
+    "sysfs": [SYSFS_CHECK],
+    "syncfile": [SYNCFILE_CHECK],
     # The guest's sshd, driven from the host with the real OpenSSH client
     # (sshsmoke.py: banner, password exec, exit status, stdin EOF, pty).
     # sshfull adds key auth, root refusal, window change, sftp/scp, and git
@@ -322,7 +443,8 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "usbisochtest.py": 900}
+HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900}
 
 
 def find_fails(out):
@@ -337,6 +459,12 @@ def find_fails(out):
     return seen
 
 
+# Host scripts that only make sense on one arch (they boot their own VM of that
+# arch). A run of the other arch reports them as a skip, not a failure.
+HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
+                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64"}
+
+
 def host_run(c, timeout, arch=None, scale=1.0):
     """`host:<script> [args]`: run a script of this directory ON THE HOST
     (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape.
@@ -344,6 +472,10 @@ def host_run(c, timeout, arch=None, scale=1.0):
     (a script that boots its own VM stops it)."""
     script = c.split()[0][len("host:"):]
     argv = [sys.executable, os.path.join(HERE, script)] + c.split()[1:]
+    want = HOST_ARCH_ONLY.get(script)
+    if want and arch and arch != want:
+        return {"rc": 0, "status": "ok", "secs": 0.0,
+                "output": f"SKIP {script}: {want} only (this run is {arch})\n"}
     timeout = max(timeout, HOST_TIMEOUTS.get(script, 0) * scale)
     env = dict(os.environ)
     if arch:
@@ -358,6 +490,29 @@ def host_run(c, timeout, arch=None, scale=1.0):
         return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
 
 
+def boot_and_login(arch, mode, gpu, scale, run):
+    """Start runtests' VM and log in as root (2 attempts). True when it is up."""
+    start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
+    for attempt in range(2):
+        r = subprocess.run(start, capture_output=True, text=True, timeout=900)
+        if r.returncode == 0:
+            lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
+                                 str(int(60 * scale))],
+                                capture_output=True, text=True, timeout=900)
+            if lg.returncode == 0:
+                return True
+            print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
+        else:
+            print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
+            try:  # QEMU's own error (missing image, lock, bad drive) is what explains an instant death
+                with open(driver.QEMU_STDERR_LOG, "rb") as ef:
+                    print("[qemu-stderr] " + ef.read()[-600:].decode(errors="replace").strip(), flush=True)
+            except OSError:
+                pass
+        subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+    return False
+
+
 def self_boots(c):
     """True for a `host:` script that starts (and stops) its own VM under its own
     LEANDROS_RUN_ID. Such a script must not run while runtests' VM is up: both
@@ -366,7 +521,8 @@ def self_boots(c):
         return False
     try:
         with open(os.path.join(HERE, c.split()[0][len("host:"):])) as f:
-            return '"start"' in f.read()
+            t = f.read()
+            return '"start"' in t or "cmd_start(" in t or "ffsession.py" in t or "SELF_BOOTS" in t  # ffsession.py boots its own VM
     except OSError:
         return False
 
@@ -410,6 +566,10 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "nitrox86" in suites:
+        os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
+    if "pidnszap" in suites and cmdline is None:
+        cmdline = "pidns.zaptest=1"
     if "i915fake" in suites and cmdline is None:
         cmdline = "i915.fake=2 i915.kms=1"
     if "i915crtc2" in suites and cmdline is None:
@@ -457,37 +617,28 @@ def main(argv):
         booted = False
         if cmds and all(self_boots(c) for c in cmds):
             booted = True  # every command boots its own VM: runtests boots none
-        start = [sys.executable, DRV, "start", arch, mode] + ([f"--{gpu}"] if gpu != "none" else [])
-        for attempt in range(2):
-            if booted:
-                break
-            r = subprocess.run(start, capture_output=True, text=True, timeout=900)
-            if r.returncode == 0:
-                lg = subprocess.run([sys.executable, DRV, "login", "root", "root",
-                                     str(int(60 * scale))],
-                                    capture_output=True, text=True, timeout=900)
-                if lg.returncode == 0:
-                    booted = True
-                    break
-                print(f"run {run}: login failed (attempt {attempt}): {lg.stdout[-300:]}{lg.stderr[-300:]}", flush=True)
-            else:
-                print(f"run {run}: boot failed (attempt {attempt}): {r.stdout[-300:]}{r.stderr[-300:]}", flush=True)
-            subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+        if not booted:
+            booted = boot_and_login(arch, mode, gpu, scale, run)
         entry["boot"] = "ok" if booted else "failed"
         if not booted:
             all_ok = False
             continue
+        miss_seen = False
         with open(os.path.join(rdir, "results.txt"), "w") as res:
             for c in cmds:
                 try:
                     if self_boots(c) and driver._qemu_pid() is not None:
                         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
+                    elif not self_boots(c) and driver._qemu_pid() is None:
+                        # an earlier self-booting script stopped our VM: boot it again
+                        if not boot_and_login(arch, mode, gpu, scale, run):
+                            raise RuntimeError("reboot failed")
                     if c.startswith("host:"):
                         r = host_run(c, timeout, arch, scale)
                     else:
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
                 except Exception as e:  # noqa: BLE001
-                    r = {"rc": None, "status": f"error {e}", "output": "", "secs": 0}
+                    r = {"rc": None, "status": str(e) if str(e) == "reboot failed" else f"error {e}", "output": "", "secs": 0}
                 fails = find_fails(r["output"])
                 rc = r["rc"] if r["rc"] is not None else "?"
                 ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file")
@@ -510,6 +661,23 @@ def main(argv):
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
                                          "secs": r["secs"], "fails": fails})
+                # sig_kick guard: any writer of signal state that forgot sig_kick
+                # shows up as `miss` > 0 in /proc/rqhold (cumulative since boot).
+                # Checked after each command that ran on this VM; the first
+                # command after which it is non-zero fails the run.
+                if not miss_seen and not self_boots(c) and driver._qemu_pid() is not None:
+                    try:
+                        q = driver.serial_run("grep '^# sigfast' /proc/rqhold", timeout=60, arch=arch)
+                        m = re.search(r"\bmiss (\d+)\b(?: miss_pid (\S+))?", q["output"])
+                        if m and int(m.group(1)) > 0:
+                            miss_seen = True
+                            all_ok = False
+                            print(f"=== sig_kick guard: FAIL miss={m.group(1)} (after {c}): {q['output'].strip()[-200:]}", flush=True)
+                            res.write(f"=== sig_kick guard: FAIL after {c}\n{q['output']}\n")
+                            entry["results"].append({"cmd": "sig_kick-guard", "rc": 1, "status": "ok",
+                                                     "secs": 0, "fails": ["sig_kick_miss"]})
+                    except Exception:  # noqa: BLE001
+                        pass
         if os.path.exists(driver.SERIAL_LOG):
             subprocess.run(["cp", driver.SERIAL_LOG, os.path.join(rdir, "serial.log")])
         if os.path.exists(driver.SERIAL_FULL_LOG):

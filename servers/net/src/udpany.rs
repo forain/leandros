@@ -59,6 +59,7 @@ pub(crate) fn adopt(sid: Sid) -> usize {
                 if socket.bind(port).is_err() { return false; }
                 if fam.is_some() { socket.set_family(fam); }
                 socket.set_reuseport(sock_opts(ofd).reuseport);
+                socket.set_owner(ofd);
                 s.socket_set.add(socket)
             };
             // Commit only into a server that is still a wildcard one and
@@ -107,6 +108,7 @@ pub(crate) fn create(ns: u16, ofd: u32, psid: Sid, primary: SocketHandle, port: 
         if fam.is_some() { socket.set_family(fam); }
         // SO_REUSEPORT: the group's unicast spreading (smoltcp's demux).
         socket.set_reuseport(sock_opts(ofd).reuseport);
+        socket.set_owner(ofd);
         hs[sid as usize] = Some(s.socket_set.add(socket));
     }
     MIRRORS.lock().insert(ofd, hs);

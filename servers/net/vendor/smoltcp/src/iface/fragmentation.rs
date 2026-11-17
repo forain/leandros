@@ -268,6 +268,18 @@ pub(crate) enum FragKey {
     Ipv4(Ipv4FragKey),
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     Sixlowpan(SixlowpanFragKey),
+    /// LEANDROS: IPv6 reassembly (RFC 8200 4.5): source, destination, ident.
+    #[cfg(feature = "proto-ipv6")]
+    Ipv6(Ipv6FragKey),
+}
+
+/// LEANDROS: what identifies one fragmented IPv6 datagram.
+#[cfg(feature = "proto-ipv6")]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+pub(crate) struct Ipv6FragKey {
+    pub src: Ipv6Address,
+    pub dst: Ipv6Address,
+    pub ident: u32,
 }
 
 pub(crate) struct FragmentsBuffer {
@@ -310,6 +322,23 @@ pub(crate) struct Fragmenter {
     pub ipv4: Ipv4Fragmenter,
     #[cfg(feature = "proto-sixlowpan-fragmentation")]
     pub sixlowpan: SixlowpanFragmenter,
+    /// LEANDROS: the packet held is IPv6 (`ipv6` below), not IPv4.
+    #[cfg(feature = "proto-ipv6")]
+    pub is_v6: bool,
+    #[cfg(feature = "proto-ipv6")]
+    pub ipv6: Ipv6Fragmenter,
+}
+
+/// LEANDROS: IPv6 source fragmentation state. The buffer holds the unfragmented
+/// packet (40-byte header + payload); `sent_bytes` counts header + payload sent.
+#[cfg(feature = "proto-ipv6")]
+pub(crate) struct Ipv6Fragmenter {
+    pub repr: Ipv6Repr,
+    #[cfg(feature = "medium-ethernet")]
+    pub dst_hardware_addr: EthernetAddress,
+    pub ident: u32,
+    pub tclass: u8,
+    pub mtu: usize,
 }
 
 #[cfg(feature = "proto-ipv4-fragmentation")]
@@ -325,6 +354,8 @@ pub(crate) struct Ipv4Fragmenter {
     pub ident: u16,
     /// LEANDROS: the TOS byte every fragment carries.
     pub tos: u8,
+    /// LEANDROS: the IP MTU every fragment is cut to (the cached path MTU).
+    pub mtu: usize,
 }
 
 #[cfg(feature = "proto-sixlowpan-fragmentation")]
@@ -369,6 +400,7 @@ impl Fragmenter {
                 frag_offset: 0,
                 ident: 0,
                 tos: 0,
+                mtu: 0,
             },
 
             #[cfg(feature = "proto-sixlowpan-fragmentation")]
@@ -379,6 +411,24 @@ impl Fragmenter {
                 fragn_size: 0,
                 ll_dst_addr: Ieee802154Address::Absent,
                 ll_src_addr: Ieee802154Address::Absent,
+            },
+
+            #[cfg(feature = "proto-ipv6")]
+            is_v6: false,
+            #[cfg(feature = "proto-ipv6")]
+            ipv6: Ipv6Fragmenter {
+                repr: Ipv6Repr {
+                    src_addr: Ipv6Address::UNSPECIFIED,
+                    dst_addr: Ipv6Address::UNSPECIFIED,
+                    next_header: IpProtocol::Unknown(0),
+                    payload_len: 0,
+                    hop_limit: 0,
+                },
+                #[cfg(feature = "medium-ethernet")]
+                dst_hardware_addr: EthernetAddress::default(),
+                ident: 0,
+                tclass: 0,
+                mtu: 0,
             },
         }
     }
@@ -413,6 +463,11 @@ impl Fragmenter {
             {
                 self.ipv4.dst_hardware_addr = EthernetAddress::default();
             }
+        }
+
+        #[cfg(feature = "proto-ipv6")]
+        {
+            self.is_v6 = false;
         }
 
         #[cfg(feature = "proto-sixlowpan-fragmentation")]

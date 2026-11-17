@@ -869,6 +869,10 @@ mod nr {
     // AArch64 asm-generic: inotify_init1 = 26 (was mistakenly 360, which only
     // ever mattered once inotify stopped being ENOSYS in K2).
     pub const INOTIFY_INIT1:       usize = 26;
+    pub const FANOTIFY_INIT:       usize = 262;
+    pub const FANOTIFY_MARK:       usize = 263;
+    pub const NAME_TO_HANDLE_AT:   usize = 264;
+    pub const OPEN_BY_HANDLE_AT:   usize = 265;
     pub const INOTIFY_ADD_WATCH:   usize = 27;
     pub const INOTIFY_RM_WATCH:    usize = 28;
     pub const POSIX_FADVISE:       usize = 223;
@@ -1158,6 +1162,10 @@ mod nr {
     pub const PIDFD_GETFD:         usize = 438;
     pub const RT_SIGTIMEDWAIT:     usize = 128;
     pub const INOTIFY_INIT1:       usize = 294;
+    pub const FANOTIFY_INIT:       usize = 300;
+    pub const FANOTIFY_MARK:       usize = 301;
+    pub const NAME_TO_HANDLE_AT:   usize = 303;
+    pub const OPEN_BY_HANDLE_AT:   usize = 304;
     pub const INOTIFY_ADD_WATCH:   usize = 254;
     pub const INOTIFY_RM_WATCH:    usize = 255;
     pub const POSIX_FADVISE:       usize = 221;
@@ -2642,6 +2650,10 @@ fn dispatch_inner(
         INOTIFY_INIT1     => sys_inotify_init1(a0),
         INOTIFY_ADD_WATCH => sys_inotify_add_watch(a0, a1, a2),
         INOTIFY_RM_WATCH  => sys_inotify_rm_watch(a0, a1),
+        FANOTIFY_INIT     => sys_fanotify_init(a0, a1),
+        FANOTIFY_MARK     => sys_fanotify_mark(a0, a1, a2, a3, a4),
+        NAME_TO_HANDLE_AT => sys_name_to_handle_at(a0, a1, a2, a3, a4),
+        OPEN_BY_HANDLE_AT => sys_open_by_handle_at(a0, a1, a2),
 
         // New mount API (open_tree/move_mount/fsopen/fsconfig/fsmount/fspick/
         // mount_setattr): not implemented. Quiet, explicit ENOSYS so callers
@@ -6578,6 +6590,8 @@ fn sys_execve_kp(kpath: KPath, argv_ptr: usize, envp_ptr: usize, fd_cloexec: boo
 
     // MS_NOEXEC (Linux `path_noexec`): the file named, script or binary.
     if vfs::path_on_noexec_mount(kpath.bytes()) { return -13; } // EACCES
+    // FAN_OPEN_EXEC_PERM listeners may veto the exec (FAN_DENY / FAN_DENY_ERRNO).
+    { let fr = vfs::fan_exec_perm(kpath.bytes()); if fr != 0 { return fr as isize; } }
 
     // ── `#!` scripts ─────────────────────────────────────────────────────────
     // A file starting with `#!` names its interpreter; exec that instead, with
@@ -10266,9 +10280,12 @@ fn sys_umount2(target_ptr: usize, umount_flags: usize) -> isize {
     if let Some(m) = vfs::list_mounts().iter().find(|e| e.in_use && e.prefix == target_str && e.fstype.starts_with("fuse")) {
         let _ = m;
         // MNT_FORCE (1) | MNT_DETACH (2)
-        return fuse_server::unmount(target_str, umount_flags & 3 != 0);
+        let r = fuse_server::unmount(target_str, umount_flags & 3 != 0);
+        if r == 0 && target_str != "/" { vfs::inotify_unmounted(target_str.as_bytes()); }
+        return r;
     }
     if f2fs_server::unmount(target_str) {
+        if target_str != "/" { vfs::inotify_unmounted(target_str.as_bytes()); }
         0
     } else {
         -22 // EINVAL — nothing mounted there
@@ -11896,11 +11913,27 @@ impl KPath {
             kp.ns = Some(ns);
             return Ok(kp);
         }
-        let mut denied = false;
-        let walked = backing_walk_d(&ns, &mut false, &mut denied);
-        if denied { return Err(-13); }
         // Per-mount flags of the ns-0 mount the path lies in (ro/nodev/noexec).
-        let (mid0, fl) = vfs::alias::mount_at(&ns).unwrap_or((0, 0));
+        // Looked up BEFORE the backing walk and re-checked after it: the walk
+        // translates through the alias table, so a mount lazily detached between
+        // the walk and a later lookup would leave a path that resolved through
+        // the mount with no mount (and no flags) recorded on the fd. Mount ids
+        // are never reused, so the same id on both sides means the mount was
+        // live across the whole walk.
+        let mut denied = false;
+        let mut mnt0 = vfs::alias::mount_at(&ns);
+        let mut walked = backing_walk_d(&ns, &mut false, &mut denied);
+        if denied { return Err(-13); }
+        if mnt0.is_some() {
+            for _ in 0..8 {
+                let again = vfs::alias::mount_at(&ns);
+                if again.map(|m| m.0) == mnt0.map(|m| m.0) { break; }
+                mnt0 = again;
+                walked = backing_walk_d(&ns, &mut false, &mut denied);
+                if denied { return Err(-13); }
+            }
+        }
+        let (mid0, fl) = mnt0.unwrap_or((0, 0));
         let mut kp = match walked { Some(b) => {
             if b.len() >= HOST_PATH_MAX || ns.len() >= HOST_PATH_MAX { return Err(-36); }
             let mut kp = KPath::raw(&b);
@@ -13092,7 +13125,7 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
                     drivers::drm_device_interface::EXEC_IN_FENCE_WAITS.fetch_add(1, Ordering::Relaxed);
                     drivers::drm_device_interface::wait_fence_obj(&f, u64::MAX)
                 } {
-                    Ok(()) => 0,
+                    Ok(()) => { drivers::drm_device_interface::out_fence_flush(); 0 }
                     Err(drivers::DriverError::Busy) => -62,
                     Err(_) => -4,
                 },
@@ -13489,6 +13522,12 @@ fn unix_sockaddr_backing(addr_ptr: usize, addrlen: usize, follow: bool) -> Resul
     const AF_UNIX: u16 = 1;
     const SUN_PATH_MAX: usize = 108;
     if addrlen < 3 { return Ok(None); }
+    // Probe the family alone first: sendto/sendmsg call this for every socket
+    // domain (netlink, inet), and only an AF_UNIX name is ours to resolve. An
+    // unreadable address is left for the net server to report as EFAULT.
+    let mut fam = [0u8; 2];
+    let fam_ok = with_current_address_space(|as_| as_.read_user_buf(addr_ptr, &mut fam)).unwrap_or(false);
+    if !fam_ok || u16::from_ne_bytes(fam) != AF_UNIX { return Ok(None); }
     let mut raw = [0u8; 2 + SUN_PATH_MAX];
     let n = addrlen.min(raw.len());
     let ok = with_current_address_space(|as_| as_.read_user_buf(addr_ptr, &mut raw[..n])).unwrap_or(false);
@@ -13746,9 +13785,18 @@ fn sys_sendto(sockfd: usize, buf_ptr: usize, len: usize,
               flags: usize, addr_ptr: usize, addrlen: usize) -> isize {
     if len != 0 && !validate_user_buf(buf_ptr, len) { return -14; }
     let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_SEND,
+    let mut msg = make_vfs_msg(net_server::NET_SEND,
         &[sockfd as u64, buf_ptr as u64, len as u64,
           flags as u64, addr_ptr as u64, addrlen as u64]);
+    // A pathname AF_UNIX destination travels as its resolved host path
+    // (args 6-7), as for connect(): a chrooted sender reaches /dev/log.
+    let host = if addr_ptr != 0 && addrlen >= 3 && addrlen <= 128 {
+        match unix_sockaddr_backing(addr_ptr, addrlen, true) { Ok(h) => h, Err(e) => return e }
+    } else { None };
+    if let Some(k) = &host {
+        msg.data[48..56].copy_from_slice(&(k.ptr() as u64).to_le_bytes());
+        msg.data[56..64].copy_from_slice(&(k.bytes().len() as u64).to_le_bytes());
+    }
     net_blocking_op(pid, sockfd, flags, true, &msg)
 }
 
@@ -13765,8 +13813,22 @@ fn sys_recvfrom(sockfd: usize, buf_ptr: usize, len: usize,
 fn sys_sendmsg(sockfd: usize, msghdr_ptr: usize, flags: usize) -> isize {
     if !validate_user_buf(msghdr_ptr, 56) { return -14; } // struct msghdr (msg_flags at +48)
     let pid = current_pid();
-    let msg = make_vfs_msg(net_server::NET_SENDMSG,
+    let mut msg = make_vfs_msg(net_server::NET_SENDMSG,
         &[sockfd as u64, msghdr_ptr as u64, flags as u64]);
+    // msg_name of a pathname AF_UNIX destination, as its resolved host path.
+    let host = {
+        let mut h = [0u8; 12];
+        let ok = with_current_address_space(|as_| as_.read_user_buf(msghdr_ptr, &mut h)).unwrap_or(false);
+        let np = usize::from_ne_bytes(h[0..8].try_into().unwrap_or([0; 8]));
+        let nl = u32::from_ne_bytes(h[8..12].try_into().unwrap_or([0; 4])) as usize;
+        if ok && np != 0 && nl >= 3 && nl <= 128 {
+            match unix_sockaddr_backing(np, nl, true) { Ok(h) => h, Err(e) => return e }
+        } else { None }
+    };
+    if let Some(k) = &host {
+        msg.data[48..56].copy_from_slice(&(k.ptr() as u64).to_le_bytes());
+        msg.data[56..64].copy_from_slice(&(k.bytes().len() as u64).to_le_bytes());
+    }
     let r = net_blocking_op(pid, sockfd, flags, true, &msg);
     if r > 0 { uxtrace("SND", pid, sockfd, r); }
     r
@@ -13888,7 +13950,7 @@ fn sys_socketpair(domain: usize, sock_type: usize, protocol: usize, sv_ptr: usiz
 
 fn sys_setsockopt(sockfd: usize, level: usize, optname: usize,
                   optval_ptr: usize, optlen: usize) -> isize {
-    if optlen > 128 || (optlen != 0 && !validate_user_buf(optval_ptr, optlen)) { return -14; }
+    if optlen > 512 || (optlen != 0 && !validate_user_buf(optval_ptr, optlen)) { return -14; }
     let pid = current_pid();
     let msg = make_vfs_msg(net_server::NET_SETSOCKOPT,
         &[sockfd as u64, level as u64, optname as u64, optval_ptr as u64, optlen as u64]);
@@ -16889,6 +16951,80 @@ fn sys_inotify_add_watch(fd: usize, path_ptr: usize, mask: usize) -> isize {
     } else { path };
     let msg = make_vfs_msg(vfs::VFS_INOTIFY_ADD, &[fd as u64, path.ptr() as u64, mask as u64 & 0xFFFF_FFFF]);
     vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// fanotify_init(flags, event_f_flags) → fd (FAN_CLASS_NOTIF groups; CAP_SYS_ADMIN).
+fn sys_fanotify_init(flags: usize, event_f_flags: usize) -> isize {
+    let msg = make_vfs_msg(vfs::VFS_FANOTIFY_INIT, &[flags as u32 as u64, event_f_flags as u32 as u64]);
+    vfs_reply_val(&vfs::handle(&msg, current_pid()))
+}
+
+/// fanotify_mark(fd, flags, mask, dirfd, pathname). The path is resolved like
+/// any path syscall (symlinks followed unless FAN_MARK_DONT_FOLLOW); a NULL
+/// pathname marks the object `dirfd` names.
+fn sys_fanotify_mark(fd: usize, flags: usize, mask: usize, dirfd: usize, path_ptr: usize) -> isize {
+    const FAN_MARK_DONT_FOLLOW: usize = 4;
+    let pid = current_pid();
+    if path_ptr == 0 {
+        let msg = make_vfs_msg(vfs::VFS_FANOTIFY_MARK, &[fd as u64, 0, flags as u32 as u64, mask as u64, dirfd as u64]);
+        return vfs_reply_val(&vfs::handle(&msg, pid));
+    }
+    let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    let path = if flags & FAN_MARK_DONT_FOLLOW == 0 {
+        match follow_magic_final(path) { Ok(p) => p, Err(e) => return e }
+    } else { path };
+    let msg = make_vfs_msg(vfs::VFS_FANOTIFY_MARK, &[fd as u64, path.ptr() as u64, flags as u32 as u64, mask as u64, dirfd as u64]);
+    vfs_reply_val(&vfs::handle(&msg, pid))
+}
+
+/// name_to_handle_at(dirfd, path, handle, mount_id, flags): the same
+/// FILEID_LEANDROS handle fanotify FID records carry (type 0x4c, 12 bytes:
+/// st_ino u64 + generation 0). Filesystems that cannot be watched: EOPNOTSUPP.
+fn sys_name_to_handle_at(dirfd: usize, path_ptr: usize, fh_ptr: usize, mnt_ptr: usize, flags: usize) -> isize {
+    const AT_SYMLINK_FOLLOW: usize = 0x400;
+    const AT_HANDLE_FID: usize = 0x200;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH | AT_HANDLE_FID) != 0 { return -22; }
+    if !validate_user_buf(fh_ptr, 8) { return -14; }
+    let cap: u32 = ur(fh_ptr);
+    if cap > 128 { return -22; }
+    let raw = match copy_user_path(path_ptr) { Ok(r) => r, Err(e) => return e };
+    let host: Vec<u8> = if raw.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 { return -2; }
+        let d = dirfd as u32 as i32 as isize as usize;
+        if d == AT_FDCWD { match resolve_ns(b".").and_then(KPath::from_ns) { Ok(k) => k.buf[..k.buf.len() - 1].to_vec(), Err(e) => return e } }
+        else { match fd_host_path(d) { Some(h) => h, None => return -9 } }
+    } else {
+        let kp = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+        let kp = if flags & AT_SYMLINK_FOLLOW != 0 { match follow_magic_final(kp) { Ok(p) => p, Err(e) => return e } } else { kp };
+        kp.buf[..kp.buf.len() - 1].to_vec()
+    };
+    let id = match vfs::fh_ident(&host) { Some(i) => i, None => return -95 };
+    if cap < 12 { uw::<u32>(fh_ptr, 12); return -75; }
+    vfs::fh_remember(id, &host);
+    uw::<u32>(fh_ptr, 12);
+    uw::<i32>(fh_ptr + 4, 0x4c);
+    uw::<u64>(fh_ptr + 8, id.1);
+    uw::<u32>(fh_ptr + 16, 0);
+    if mnt_ptr != 0 { uw::<u32>(mnt_ptr, (id.0 as u32) ^ ((id.0 >> 32) as u32)); }
+    0
+}
+
+/// open_by_handle_at(mount_fd, handle, flags): CAP_DAC_READ_SEARCH; the
+/// handle must have been issued by this boot (ESTALE otherwise or when the
+/// inode is gone). `mount_fd` names the filesystem (its st_dev).
+fn sys_open_by_handle_at(mount_fd: usize, fh_ptr: usize, flags: usize) -> isize {
+    if !sched::caps::host_capable_of(current_pid(), 2 /*CAP_DAC_READ_SEARCH*/) { return -1; }
+    if !validate_user_buf(fh_ptr, 20) { return -14; }
+    let (nb, ty): (u32, i32) = (ur(fh_ptr), ur(fh_ptr + 4));
+    if nb != 12 || ty != 0x4c { return -22; }
+    let ino: u64 = ur(fh_ptr + 8);
+    let d = mount_fd as u32 as i32 as isize as usize;
+    let mp = if d == AT_FDCWD { match resolve_ns(b".").and_then(KPath::from_ns) { Ok(k) => k.buf[..k.buf.len() - 1].to_vec(), Err(e) => return e } }
+             else { match fd_host_path(d) { Some(h) => h, None => return -9 } };
+    match vfs::fh_lookup(vfs::fh_dev(&mp), ino) {
+        Some(p) => { let kp = KPath::raw(&p); vfs_open_resolved(kp.ptr(), open_flags_from_user(flags), 0) }
+        None => -116,
+    }
 }
 
 /// inotify_rm_watch(fd, wd): a no-op with the silent stub, a real removal

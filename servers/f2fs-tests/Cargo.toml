@@ -1,0 +1,14 @@
+# Host unit tests for servers/f2fs/src/cpflags.rs (checkpoint flag bits and the
+# fsync-chain stamp decision). Own workspace so it builds for the host:
+#
+#   cd servers/f2fs-tests && cargo test --target aarch64-apple-darwin
+[package]
+name = "f2fs-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"

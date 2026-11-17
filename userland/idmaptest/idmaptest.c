@@ -475,12 +475,19 @@ static int procsys_is(const char *path, const char *want)
     return slurp_file(path, b, sizeof b) >= 0 && strcmp(b, want) == 0 && !write_succeeds(path);
 }
 
+/* max_user_namespaces is a writable per-kind limit (lane nslimits): only check it reads as a positive number. */
+static int user_limit_readable(void)
+{
+    char b[32];
+    return slurp_file("/proc/sys/user/max_user_namespaces", b, sizeof b) >= 0 && atoi(b) > 0;
+}
+
 static void procsys_overflow(void)
 {
     report("procsys_overflow",
            procsys_is("/proc/sys/kernel/overflowuid", "65534\n")
         && procsys_is("/proc/sys/kernel/overflowgid", "65534\n")
-        && procsys_is("/proc/sys/user/max_user_namespaces", "32\n"));
+        && user_limit_readable());
 }
 
 /* ===== lane idcore: composed map cases ===== */
@@ -2034,11 +2041,26 @@ static int quota_run(int uid, int *made, int *err)
     while (waitpid(-1, NULL, 0) > 0) {}
     return 0;
 }
+static int set_userns_limit(const char *v, char *old, size_t osz)
+{
+    int f = open("/proc/sys/user/max_user_namespaces", O_RDWR);
+    if (f < 0) return -1;
+    if (old) { int k = read(f, old, osz - 1); old[k > 0 ? k : 0] = 0; }
+    int r = pwrite(f, v, strlen(v), 0) == (ssize_t)strlen(v) ? 0 : -1;
+    close(f);
+    return r;
+}
 static int userns_quota_enospc(void)
 {
     int made, err;
-    CHECK(quota_run(1000, &made, &err) == 0);
-    CHECK(err == ENOSPC && made >= 8 && made <= 32);
+    char old[32] = "2048";
+    /* per-uid limit is max_user_namespaces (Linux ucounts): pin it to 40 for the ENOSPC run */
+    CHECK(set_userns_limit("40", old, sizeof old) == 0);
+    int qr = quota_run(1000, &made, &err);
+    for (size_t l = strlen(old); l && old[l - 1] == '\n'; ) old[--l] = 0;
+    CHECK(set_userns_limit(old, NULL, 0) == 0);
+    CHECK(qr == 0);
+    CHECK(err == ENOSPC && made >= 8 && made <= 40);
     CHECK(quota_run(-1, &made, &err) == 0);
     CHECK(err == 0 && made == 48);
     return 0;
