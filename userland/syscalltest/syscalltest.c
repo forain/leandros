@@ -966,9 +966,20 @@ static void *pw_watcher(void *arg) {
         struct pw_tl *tl = &pw_tl[idx];
         memset(tl, 0, sizeof *tl);
         long long tpre = now_ms();
-        pid_t c = fork();
+        /* EAGAIN here is setup back-pressure, not a pidfd verdict: right after
+         * procmax (it runs just before this suite in regress) exiting tasks can
+         * still hold process-table slots for a moment. Retry for up to 2 s and
+         * label a persistent failure as setup, never as an early wake. */
+        pid_t c = -1;
+        for (int t = 0; t < 200; t++) {
+            c = fork();
+            if (c >= 0 || errno != EAGAIN) break;
+            struct timespec ts = { 0, 10 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            tpre = now_ms();
+        }
         if (c == 0) pw_conmon_child(tl);
-        if (c < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "fork: %s", strerror(errno)); pw_bad = 1; break; }
+        if (c < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "setup, not a wake verdict: fork: %s", strerror(errno)); pw_bad = 1; break; }
         long long t0 = now_ms();
         int fd = pidfd_open(c, 0);
         if (fd < 0) { snprintf(pw_msg[idx], sizeof pw_msg[idx], "pidfd_open: %s", strerror(errno)); pw_bad = 1; waitpid(c, NULL, 0); break; }
@@ -2778,10 +2789,14 @@ int main(int argc, char **argv) {
         /* Flake hunter: --pidfd-wake-loop <runs> [cpu-hogs] */
         int runs = argc > 2 ? atoi(argv[2]) : 10, hogs = argc > 3 ? atoi(argv[3]) : 0;
         setvbuf(stdout, NULL, _IOLBF, 0);
-        for (int i = 0; i < hogs; i++) if (fork() == 0) { for (;;) __asm__ volatile(""); }
+        /* Kill only our own hogs: kill(0, ...) would also hit the caller's
+         * shell, which shares our process group (sh -c 'loop' exited 143). */
+        pid_t hp[64]; if (hogs > 64) hogs = 64;
+        for (int i = 0; i < hogs; i++) if ((hp[i] = fork()) == 0) { for (;;) __asm__ volatile(""); }
         for (int i = 0; i < runs; i++) pidfd_wake_conmon();
-        signal(SIGTERM, SIG_IGN); kill(0, SIGTERM);
-        return 0;
+        for (int i = 0; i < hogs; i++) if (hp[i] > 0) { kill(hp[i], SIGKILL); waitpid(hp[i], NULL, 0); }
+        printf("pidfd-wake-loop: %d runs, %d failed\n", runs, nfail);
+        return nfail > 100 ? 100 : nfail;
     }
     const char *dirs[8];
     int ndirs = 0;
