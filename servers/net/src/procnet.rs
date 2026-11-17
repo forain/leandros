@@ -213,7 +213,6 @@ pub fn generate(name: &[u8], out: &mut Vec<u8>) -> bool {
         b"udp6" => inet6(&mut w, false),
         b"raw" => raw(&mut w),
         b"raw6" => raw6(&mut w),
-        b"v6dbg" => { /* temp: v6 rx counters */ for (i, c) in smoltcp::V6DBG.iter().enumerate() { let _ = write!(w, "{}={} ", i, c.load(core::sync::atomic::Ordering::Relaxed)); } }
         _ => return false,
     }
     true
