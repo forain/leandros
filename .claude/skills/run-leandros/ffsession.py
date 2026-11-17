@@ -158,6 +158,37 @@ def firefox_procs():
     return sum(1 for l in argv_lines() if os.path.basename(l) == "firefox")
 
 
+def brush_count():
+    return sum(1 for l in argv_lines() if os.path.basename(l) == "brush")
+
+
+def launch_firefox(n_brush0):
+    """Type `sh /tmp/ffrun.sh` into cosmic-term and check that it ran.
+    Keys typed before the terminal's window is mapped and focused are lost
+    (x86_64 KVM + virgl: the window maps seconds after the cosmic-term
+    process exists; the run then sat at "brush$  /tm" for 9 min with no
+    Firefox). So: wait for the terminal's shell, type, confirm /tmp/ff.log
+    exists; if not, record a task dump + screenshot and retype the line."""
+    if n_brush0 is not None:
+        wait_for("term_shell", lambda: brush_count() > n_brush0, 60 * SCALE)
+        SER.pump(2 * SCALE)
+    for n in range(3):
+        typ("sh /tmp/ffrun.sh"); key("ret")
+        log("firefox launched" + (f" (retype {n})" if n else ""))
+        t = time.time()
+        while time.time() - t < 30 * SCALE:
+            SER.pump(5)
+            if "FFLOG2" in sh("[ -e /tmp/ff.log ] && echo FFLOG$((1 + 1))", 30):
+                STEPS["ff_retypes"] = n
+                return
+        log(f"LAUNCH LOST: /tmp/ff.log missing {30 * SCALE:.0f}s after typing (try {n})")
+        drv("screenshot", f"{OUT}/launch-lost-{n}.ppm", t=90)
+        if n == 0:
+            ctrl_t("launch-lost-ctrlt")
+        key("ctrl-u")    # clear whatever part of the line arrived
+    STEPS["ff_retypes"] = "failed"
+
+
 def wait_for(name, pred, timeout, every=5.0):
     """Poll `pred()` until true or `timeout` s; record the time it took."""
     t = time.time()
@@ -415,11 +446,13 @@ def main():
     wait_for("desktop", have("cosmic-panel"), T_DESKTOP)
     SER.pump(3 * SCALE)
     drv("screenshot", f"{OUT}/desktop.ppm", t=90)
+    n_brush0 = None
     if NOTERM:
         log("terminal: skipped (--noterm)")
         STEPS["terminal"] = "skipped"
     else:
         t_term = time.time()
+        n_brush0 = brush_count()
         key("meta_l-t")
         n = 0
         while True:
@@ -446,8 +479,7 @@ def main():
             key("esc")
     snap("desktop")
     if not NOFF:
-        typ("sh /tmp/ffrun.sh"); key("ret")
-        log("firefox launched")
+        launch_firefox(n_brush0)
         wait_for("firefox", lambda: firefox_procs() >= 3, T_FF)
         if WHEEL:
             SER.pump(20 * SCALE)   # page load and first paint
