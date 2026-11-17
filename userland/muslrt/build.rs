@@ -1,5 +1,5 @@
 // Shared build script of the no_std programs linked against static musl
-// (<arch>-unknown-linux-musl, zig linker wrapper, see scripts/build-userland.sh).
+// (<arch>-unknown-linux-musl, clang/lld linker wrapper, see scripts/build-userland.sh).
 // rustc passes -nodefaultlibs for no_std crates, so libc is requested here, and
 // the stack size comes from PT_GNU_STACK (musl's default thread stack is only
 // 128 KiB).

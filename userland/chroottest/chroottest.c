@@ -1,8 +1,8 @@
 /*
  * chroottest — what a toolchain running in a chroot needs from the kernel,
  * with the results Linux gives. Like syscalltest, the same file builds for
- * the host (cc chroottest.c) and for LeandrOS (zig cc -target
- * <arch>-linux-musl -static). Run as root (chroot/mount need it); as another
+ * the host (cc chroottest.c) and for LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
+ * Run as root (chroot/mount need it); as another
  * user the root-only cases SKIP.
  *
  *   chroottest [-d DIR]     work directory (default /var/tmp, a disk

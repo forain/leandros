@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# musl-driver.sh <aarch64|x86_64> <c|c++> args...  -- clang as a drop-in for the old `zig cc -target <a>-linux-musl`.
-# Our flags come first, user args after (they win). Parity with zig: static ET_EXEC, non-PIE codegen,
+# musl-driver.sh <aarch64|x86_64> <c|c++> args...  -- clang for the static musl world.
+# Our flags come first, user args after (they win). Static ET_EXEC, non-PIE codegen,
 # no outline atomics, -DNDEBUG at -O2/-O3/-Os/-Oz. cc-rs --target spellings are stripped (one triple).
 set -u
 arch=$1 lang=$2; shift 2

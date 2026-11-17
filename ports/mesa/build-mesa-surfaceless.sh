@@ -1,7 +1,7 @@
 #!/bin/sh
 # Furthest-working Mesa cross-build (surfaceless+drm, EGL+GLESv2+GBM, softpipe/kms_swrast,
 # no LLVM, no glvnd) for x86_64-unknown-linux-musl on the macOS host.
-# Prereqs on host: zig 0.16, meson, ninja, `brew install bison` (>=3.x), flex,
+# Prereqs on host: clang/lld (scripts/toolchain), meson, ninja, `brew install bison` (>=3.x), flex,
 #   python venv at $ROOT/.venv with mako+packaging+pyyaml (+pyelftools for inspection).
 # Layout under $ROOT (this script's directory): src/mesa (mesa 25.3.6 checkout),
 #   sysroot/ (cross-built libdrm etc. installed with prefix /usr), build/, .venv/.

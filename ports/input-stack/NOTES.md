@@ -186,3 +186,5 @@ sh build-meson-lib.sh libinput <arch>   # aarch64: tools fail, lib ok -> manual 
 These scripts point at a merged sysroot (`sysroot-<arch>/`) built up across the
 musl-dynamic, mesa-wave2, and d3-input-stack lanes; see `ports/gl-stack/NOTES.md`
 for the full foundation recipe and the merged-sysroot layout they assume.
+
+> zig recipe retired 2026-11: the wrappers and scripts in this directory now drive clang/lld (scripts/toolchain); the zig-specific text below is historical.

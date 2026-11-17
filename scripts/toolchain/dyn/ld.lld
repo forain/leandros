@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# Raw ELF linker, rustc's `-C linker=` target with `-C linker-flavor=ld` (replaces zig-ld-lld).
+# Raw ELF linker, rustc's `-C linker=` target with `-C linker-flavor=ld`.
 . "$(dirname "${BASH_SOURCE[0]}")/../env.sh" || exit 1
 exec "$LLD" "$@"

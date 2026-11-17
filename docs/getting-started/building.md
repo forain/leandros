@@ -19,9 +19,9 @@ A full build from clean takes from several minutes on a fast machine to most of 
 
 ## What the build does
 
-Once per run it downloads and caches the Limine bootloader binaries (version 11.4.1, in `.limine-cache/`), builds the input-stack shims (`libseat`, `libudev`, needs zig) and, when `../doomgeneric` exists, stages the SoundFont. Then, for each architecture:
+Once per run it downloads and caches the Limine bootloader binaries (version 11.4.1, in `.limine-cache/`), builds the input-stack shims (`libseat`, `libudev`, needs the clang/lld toolchain) and, when `../doomgeneric` exists, stages the SoundFont. Then, for each architecture:
 
-1. **In-tree userland** (`scripts/build-userland.sh --release`): the programs and regression suites under `userland/`, plus the two C conformance tests (`privtest`, `nettest`) when zig is present.
+1. **In-tree userland** (`scripts/build-userland.sh --release`): the programs and regression suites under `userland/`, plus the two C conformance tests (`privtest`, `nettest`) (the build fails if the toolchain is missing).
 2. **Ported software**: DOOM, MAME, Firefox, the desktop portal, PipeWire, `bottom`, brush, coreutils, mkfs.fat, mkfs.xfs, `spawnwedge`, `killmt`, disks-rs's `disktester`, then the D-Bus session package (busd, `dbus-run-session`, `session.conf`), the system-bus services (`ports/sysbus`) and the iso-codes data.
 3. **initrd** — a `newc` CPIO holding `/bin/init` and, for any driver configured `=m`, `lib/modules/<build-id>/` ([loadable modules](../kernel/modules.md)); everything else comes from the root file system. It is written uncompressed (`initrd-<arch>.cpio`) and copied to `initrd-<arch>.cpio.gz`, because the kernel's initrd parser does not decompress.
 4. **Kernel**, built twice with `-Z build-std=core,alloc` against the custom target spec `targets/<arch>-unknown-kernel.json`:

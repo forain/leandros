@@ -14,7 +14,7 @@ Both architectures boot to a graphical login when the host offers a GPU path, an
 
 ## Pages
 
-- [Prerequisites](prerequisites.md) — the Rust toolchain, QEMU and firmware, the linker, zig and the musl cross toolchain, container tooling, and the sibling repositories.
+- [Prerequisites](prerequisites.md) — the Rust toolchain, QEMU and firmware, the linker, the clang/lld musl cross toolchain, container tooling, and the sibling repositories.
 - [Building](building.md) — what `build-all.sh` builds and stages, the release-only rule, the SoundFont, and the image-provenance pitfalls that make a boot run the wrong code.
 - [Running](running.md) — `run-qemu.sh`: accelerators, boot modes, GPU paths (`--venus`, `--virgl`, `--no-gpu`), disks, networking, display and audio, and its environment variables.
 - [Logging in](logging-in.md) — the graphical login, the accounts, the text-login opt-out, serial and VT logins.

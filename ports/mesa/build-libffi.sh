@@ -1,6 +1,6 @@
 #!/bin/sh
 # Cross-build libffi 3.4.x for <arch>-linux-musl into sysroot-<arch>.
-# autotools builds objects + static lib fine with zig cc, but libtool on a
+# autotools builds objects + static lib fine with the clang wrapper, but libtool on a
 # darwin BUILD host cannot emit an ELF .so (it leaves dangling symlinks), so we
 # link libffi.so directly from the PIC objects. Usage: build-libffi.sh <arch>
 set -e
@@ -14,7 +14,7 @@ cd "$SRC"
 make -j4
 make DESTDIR="$D" install || true   # install trips on the dangling .so symlink; headers/.a/.pc land
 PICOBJS=$(find . -path "*/.libs/*.o" | sort)
-zig cc -target "$ARCH-linux-musl" -shared -fPIC -Wl,-soname,libffi.so.8 -o libffi.so.8.1.4 $PICOBJS
+"$CC" -shared -fPIC -Wl,-soname,libffi.so.8 -o libffi.so.8.1.4 $PICOBJS
 mkdir -p "$D/usr/lib/pkgconfig" "$D/usr/include"
 install -m755 libffi.so.8.1.4 "$D/usr/lib/libffi.so.8.1.4"
 ln -sf libffi.so.8.1.4 "$D/usr/lib/libffi.so.8"

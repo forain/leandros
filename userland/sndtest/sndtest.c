@@ -9,7 +9,7 @@
  *   sndtest lr [sec]                left only (440 Hz), then right only (660 Hz)
  *   sndtest all                     info, tone, lr, info, summary (default)
  *
- * Plain C (static musl via zig, like nettest); the summary lines start with
+ * Plain C (static musl via the clang wrapper, like nettest); the summary lines start with
  * "sndtest:" so a boot log can be grepped.
  */
 #include <errno.h>

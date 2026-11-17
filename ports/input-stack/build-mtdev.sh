@@ -1,9 +1,10 @@
 #!/bin/sh
 # mtdev 1.1.6 is autotools-only; libtool on a darwin build host cannot emit a
-# Linux ELF .so. Bypass autotools entirely: compile the 5 core .c with zig cc
-# -fPIC and link a proper soname'd shared object with zig ld.lld. Install the
+# Linux ELF .so. Bypass autotools entirely: compile the 5 core .c with the clang wrapper
+# -fPIC and link a proper soname'd shared object with ld.lld. Install the
 # headers + a hand-written mtdev.pc into the merged sysroot. Usage: <arch>
 set -e
+. "$(dirname "$0")/../../scripts/toolchain/env.sh"
 D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
 arch="$1"; [ -n "$arch" ] || { echo "usage: build-mtdev.sh <arch>"; exit 2; }
 S=$D/sysroot-$arch
@@ -18,7 +19,7 @@ for s in caps core iobuf match match_four; do
   objs="$objs $B/$s.o"
 done
 # soname libmtdev.so.1 (libtool version-info 1:0:0)
-zig ld.lld --error-limit=0 --sysroot="$S" --eh-frame-hdr -znow -m "$em" -shared \
+"$LLD" --error-limit=0 --sysroot="$S" --eh-frame-hdr -znow -m "$em" -shared \
   -soname libmtdev.so.1 -o "$B/libmtdev.so.1.0.0" \
   "$S/usr/lib/crti.o" $objs "$S/usr/lib/crtn.o" -L"$S/usr/lib" -lc
 # install

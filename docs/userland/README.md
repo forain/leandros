@@ -13,9 +13,9 @@ LeandrOS userland comes from three places and is linked three ways.
 | Source | Examples | Linked against | Built by |
 |---|---|---|---|
 | In-tree `no_std` programs ([userland/](../../userland/)) | `init`, `login`, `greeter-launch`, `mount`, `lsblk`, `aplay`, `vfstest` | `leandros-libc`, static `ET_EXEC` on `*-unknown-none` | [scripts/build-userland.sh](../../scripts/build-userland.sh) |
-| In-tree tests that need a full libc | `pthreadtest`, `sigtest`, `polltest`, `drmsmoke`, `vttest`, `ping` | musl, static (`<arch>-unknown-linux-musl`, zig linker wrapper) | the same script (`MUSL_LINKED`) |
+| In-tree tests that need a full libc | `pthreadtest`, `sigtest`, `polltest`, `drmsmoke`, `vttest`, `ping` | musl, static (`<arch>-unknown-linux-musl`, clang/lld linker wrapper) | the same script (`MUSL_LINKED`) |
 | In-tree `std` crates and ports | `killmt`, `spawnwedge`, `ports/sysbus`, `ports/mkfs-xfs`, greetd, busd | musl, static (`-C relocation-model=static`) | each crate's own `build.sh` |
-| Sibling checkouts | brush, uutils coreutils, bottom, disks-rs | musl, static, through `zig cc` | `scripts/build-all.sh` |
+| Sibling checkouts | brush, uutils coreutils, bottom, disks-rs | musl, static, through the clang musl wrapper | `scripts/build-all.sh` |
 | Prebuilt or cross-built third-party | COSMIC (including its panel applets, files, edit and screenshot), Mesa, libinput, Firefox, PipeWire, ripgrep, the portal | musl, **dynamic** against the shipped `ld-musl` | `ports/*` recipes, the artifacts tree, Alpine containers |
 
 All of it lands in one f2fs root image, packed by

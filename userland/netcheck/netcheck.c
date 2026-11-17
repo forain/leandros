@@ -1,7 +1,7 @@
 /*
  * netcheck — end-to-end "can this machine reach the Internet" check, for the
  * boot-time network self-test (net.test=1 -> init -> /bin/net-autotest) and
- * for running by hand. Plain C, static musl (zig cc), POSIX sockets only.
+ * for running by hand. Plain C, static musl (clang musl wrapper), POSIX sockets only.
  *
  *   netcheck [--if NAME] [--link-wait S] [--dhcp-wait S] [--no-download] [--quick]
  *   netcheck --nic        just print /proc/net/nic

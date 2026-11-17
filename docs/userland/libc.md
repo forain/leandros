@@ -12,10 +12,10 @@ musl, and the `../relibc` sibling checkout is no longer needed.)
 | Library | Where | Used by | Linkage |
 |---|---|---|---|
 | leandros-libc | [userland/libc](../../userland/libc/src/lib.rs) | `init`, `login`, `shell`, `greeter-launch`, `mount`, `aplay`, `vfstest`, DOOM, … | static, target `<arch>-unknown-none` |
-| musl 1.2.5 | Rust's self-contained musl, zig's bundled musl, and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
+| musl 1.2.5 | Rust's self-contained musl, Alpine's musl (static, via the clang wrapper), and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
 
 The `MUSL_LINKED` tests (`pthreadtest`, `sigtest`, `timertest`, `polltest`, `drmsmoke`, `vttest`,
-`ping`, …) are `no_std` crates linked against static `<arch>-unknown-linux-musl` through the zig
+`ping`, …) are `no_std` crates linked against static `<arch>-unknown-linux-musl` through the clang/lld
 linker wrapper; their start-up is musl's `crt1` and `userland/muslrt` holds the shared pieces.
 
 ## leandros-libc
@@ -44,7 +44,7 @@ translation layer. Nothing in those projects is patched to know it is running on
 Rust crates (busd, greetd, `leandros-sysbus`, `mkfs.xfs`, `killmt`, `spawnwedge`) are built
 with `cargo +nightly` for the musl targets using Rust's self-contained musl CRT and
 `rust-lld`; no cross-gcc is needed. Sibling projects (brush, coreutils, bottom, disks-rs) link
-through `zig cc -target <arch>-linux-musl` wrappers
+through `scripts/toolchain/<arch>-linux-musl-cc` wrappers
 ([scripts/linker-aarch64-musl.sh](../../scripts/linker-aarch64-musl.sh)), with `cc`/`ar`
 wrappers for crates that compile C (`AR` matters: cc-rs otherwise uses the macOS `ar`, whose
 archives ld.lld cannot read, and every C symbol comes back undefined at link time).
@@ -73,10 +73,10 @@ executable loads at its bias, a `PT_INTERP` interpreter is mapped at `INTERP_BAS
 
 Building that musl world on macOS had two traps worth recording:
 
-- `zig cc` substitutes its bundled musl, forces static linking and refuses
-  `-Wl,-dynamic-linker`, so the dynamic world compiles with `zig cc` but links with
-  `zig ld.lld` directly.
-- zig injects `libcompiler_rt`, whose *weak* `memcpy`/`memset`/libm symbols collide with
+- The dynamic world compiles with clang against the merged sysroot and links with
+  `ld.lld` directly (`scripts/toolchain/dyn/musl-dyn-link.sh`); the retired zig toolchain
+  forced static linking and refused `-Wl,-dynamic-linker`.
+- The retired zig toolchain injected `libcompiler_rt`, whose *weak* `memcpy`/`memset`/libm symbols collide with
   musl's strong ones; ld.lld then demoted the *winning* strong symbol to local hidden and
   dropped it from `.dynsym`. The library looked structurally perfect and failed only at
   run-time symbol resolution. musl is therefore built with a patched compiler-rt copy whose
@@ -141,7 +141,7 @@ it), and private futexes are keyed per process, not by address alone.
 - **Exited threads are freed.** the old relibc never unmapped an exited thread's 1 MiB pthread stack or its TCB/TLS mapping, so every thread left two VMAs and about 1 MiB of address space behind (`pthreadtest churn 5000`: VMAs 208 to 10208 and VmSize 113 MB to 5.29 GB; after the fix 8 VMAs and 9544 kB, flat). The kernel was innocent. The review follow-up blocks all signals and disables cancellation before a thread exits (as musl's `pthread_exit` does), makes `pthread_detach` of an already-exited thread push it on the zombie list instead of blocking, and has a fork child forget the parent's zombie list.
 - **`fork()` holds the libc thread-map lock (historical, relibc).** `pthread::create` inserts into `OS_TID_TO_PTHREAD` (a futex mutex) after the clone; a fork from another thread at that moment gave the child a locked mutex and its first `pthread_create` hung forever. `fork` now takes the lock around the fork, and `epolltest churn 20 tfork` is in `regress`.
 - **Affinity.** `sched_getcpu`, `sched_setaffinity`/`getaffinity` and `waitid` exist in the libc, and the scheduler honours the mask (placement, wake CPU choice, EEVDF pick, load balance).
-- **`memset` in zig-static musl builds** on aarch64 was a byte loop (musl's C fallback); an assembly version is used. Every other C library in the image already used word or vector `mem*`.
+- **Static musl `memset`** on aarch64: static binaries link Alpine's `libc.a`, whose `mem*` are musl's assembly versions (the retired zig toolchain's compiler_rt `memset` was a byte loop).
 
 ## Limitations & open work
 

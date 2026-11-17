@@ -12,7 +12,7 @@ Three shapes recur, and each port's recipe says which it uses:
 
 | Shape | Used for | How |
 |---|---|---|
-| **Cross-built from source, static musl** | busd, greetd, `leandros-sysbus`, `mkfs.fat`, `mkfs.xfs`, brush, coreutils | `cargo +nightly` for `*-unknown-linux-musl`, `-C relocation-model=static`, Rust's or zig's musl ([libc.md](libc.md#static-musl)); each port's `build.sh` owns its toolchain details |
+| **Cross-built from source, static musl** | busd, greetd, `leandros-sysbus`, `mkfs.fat`, `mkfs.xfs`, brush, coreutils | `cargo +nightly` for `*-unknown-linux-musl`, `-C relocation-model=static`, Rust's or Alpine's musl ([libc.md](libc.md#static-musl)); each port's `build.sh` owns its toolchain details |
 | **Cross-built from source, dynamic musl** | COSMIC, Mesa, libinput/xkbcommon/pixman, pop-launcher, xdg-desktop-portal-cosmic | the shared toolchain in the artifacts tree (`build-rust.sh`, `gen-cargo-config.sh`, merged sysroots); meson cross files for C libraries |
 | **Repackaged from Alpine 3.21** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside Alpine 3.21 of the target architecture (a podman/docker container on the host, a chroot staged with `apk.static` inside LeandrOS — see [In-guest builds](#in-guest-builds-apk-without-containers)), collect the `DT_NEEDED` closure, keep the ELFs as Alpine built them (no soname rewrite or SSP shim for PipeWire, GStreamer, the portal and the GPU Mesa stage; Firefox and git still rewrite), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
 
@@ -117,7 +117,7 @@ Running Alpine binaries *outside* a chroot, against the guest's libc, is a separ
   in `ldso/dynlink.c`), and the guest's interpreter is that same musl.
 - (Obsolete: the guest `libc.so` exports exactly Alpine 3.21 musl's dynamic symbols, including
   `__stack_chk_guard`; no preload is needed.) The old obstacle was aarch64's `__stack_chk_guard`, which the guest `libc.so` does not
-  export. This is the zig/ld.lld visibility problem recorded in the musl-dynamic notes.
+  export. This was the (since retired) zig-built libc's ld.lld visibility problem recorded in the musl-dynamic notes.
   Until libc exports it, use `LD_PRELOAD=/usr/lib/libleandros_ssp.so.1` for such binaries.
   The repackaged ports keep their `patchelf` rewrite, which is still the right tool for
   shipping into the image.
@@ -197,7 +197,7 @@ Known gaps:
 
 - **gl-stack** records how the first dynamic binaries came to exist: a merged sysroot per
   architecture (musl `libc.so` + `ld-musl`, libdrm, Mesa, libwayland, libffi, the input
-  libraries), `zig cc` as the C compiler with ld.lld as the linker, and an acceptance check
+  libraries), clang as the C compiler with ld.lld as the linker, and an acceptance check
   that every output is `ET_DYN` with `PT_INTERP=/lib/ld-musl-<arch>.so.1` and zero host
   libraries in its `DT_NEEDED` closure. `kmscube`, smithay's `anvil` and a first cosmic-comp
   link were the rungs. cosmic-comp's smithay feature set is hard-wired in its
@@ -212,7 +212,7 @@ Known gaps:
   greeter's compositor must stay root — are recorded in
   [../desktop/limitations.md](../desktop/limitations.md#login-and-privilege).
 - **mesa**: Mesa 25.3.6, no LLVM. The early softpipe-only stage was built on the Mac with
-  `zig cc`; the current GPU stage (Zink, virgl, softpipe, the Venus ICD, optionally v3d and
+  clang; the current GPU stage (Zink, virgl, softpipe, the Venus ICD, optionally v3d and
   NVK) is built natively in an Alpine container. Patch `0001` makes EGL report a missing
   robust-access extension as `EGL_BAD_ATTRIBUTE`, so wgpu-hal retries without robustness on
   hosts like ANGLE/Metal; patch `0002` stops virgl emitting triangle fans on GLES hosts,
@@ -346,8 +346,8 @@ uses a pinned SoundFont. x86_64 audio clipping, from DOOM's own mixing, is open.
 ## MAME
 
 MAME is built from the sibling `../mame` with a LeandrOS OSD (`src/osd/leandros/`) and
-`Makefile.leandros`: GENie project generation, `zig` as the C/C++ toolchain targeting
-`<arch>-linux-musl` for the C++ runtime, compiled against zig's bundled musl headers. Points worth
+`Makefile.leandros`: GENie project generation, the clang/lld musl wrappers
+(`scripts/toolchain/<arch>-linux-musl-{cc,c++}`: libc++, libc++abi and libunwind linked statically) as the C/C++ toolchain, compiled against Alpine's musl headers. Points worth
 knowing before touching it: GENie needs `--PLATFORM` even for non-Android builds and an empty
 `ARCH=` in the sub-make; `USE_QTDEBUG` must be forced to 0 before `modules.lua` runs, with a
 stub `qtdbg_leandros` project satisfying the unconditional link; musl's `PAGE_SIZE` macro

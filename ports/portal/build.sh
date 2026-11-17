@@ -9,7 +9,7 @@
 #      but two stubs, so the foreign arch under emulation is fine.
 #   2. build-backend.sh: xdg-desktop-portal-cosmic, cross-built unmodified on
 #      the host with the m6-session-bins toolchain -> out/backend-<arch>/.
-#      Needs cargo +nightly, zig and ~/code/leandros-artifacts (the Mac, or a
+#      Needs cargo +nightly, clang/lld (scripts/toolchain) and ~/code/leandros-artifacts (the Mac, or a
 #      box with those); LEANDROS_PORTAL_BACKEND=<file> uses a prebuilt binary.
 #   3. Assemble out/<arch>/: the rootfs-shaped tree that
 #      scripts/mkfs-f2fs-populated.py overlays onto the image (same rules as

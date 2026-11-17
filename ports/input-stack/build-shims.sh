@@ -31,7 +31,7 @@ build_one() {
   # Full versioned file: libX.so.1.0.0 ; soname libX.so.1 ; devlink libX.so
   full="$soname.0.0"
   # --version-script must reach the linker as a single =-joined token: split
-  # across two argv entries ("-Wl,--version-script" "$map"), clang/zig treat
+  # across two argv entries ("-Wl,--version-script" "$map"), clang treats
   # the path as a second, unrelated positional input rather than the script's
   # argument.
   "$cc" -shared -fPIC -O2 -Wall -Wextra -std=c11 \

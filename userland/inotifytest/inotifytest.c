@@ -1,6 +1,6 @@
 /*
  * inotifytest -- inotify semantics (design-inotify.md, lane L1: tmpfs dirent
- * events). Static zig-cc build, runs as root; one "case: PASS|FAIL|SKIP" line
+ * events). Static clang-musl build, runs as root; one "case: PASS|FAIL|SKIP" line
  * per case. The real cases run by default and SKIP when the kernel is booted
  * with vfs.inotify=0; `inotifytest force` runs them regardless (fail-first evidence
  * against the silent stub). The kill-switch guard runs only with the knob off.

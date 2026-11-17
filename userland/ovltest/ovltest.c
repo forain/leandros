@@ -11,7 +11,7 @@
  *     user.* name on files and directories, every path/l/f variant, on tmpfs
  *     and f2fs. Overlay's storage layer maps ONLY ENODATA to "absent".
  *
- * Runs as root. Builds for LeandrOS with zig cc -target <arch>-linux-musl.
+ * Runs as root. Builds for LeandrOS with scripts/toolchain/<arch>-linux-musl-cc.
  */
 #define _GNU_SOURCE
 #include <errno.h>

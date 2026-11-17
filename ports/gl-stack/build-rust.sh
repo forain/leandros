@@ -2,7 +2,7 @@
 # Cross-build a Rust crate DYNAMIC for <arch>-unknown-linux-musl against the merged m3 sysroot.
 # Usage: build-rust.sh <manifest-dir> <arch> [extra cargo args...]
 # Env wiring: pkg-config points at the merged sysroot so -sys crates resolve our .so/.pc;
-# cc for any C in build scripts uses our zig cc wrapper; libclang available if any bindgen fires.
+# cc for any C in build scripts uses our clang wrapper; libclang available if any bindgen fires.
 set -e
 D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
 mani="$1"; shift; arch="$1"; shift

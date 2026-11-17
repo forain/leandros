@@ -1,7 +1,7 @@
 /*
  * proctest — process accounting, /proc links and process-lifetime ABI, with
  * the results Linux gives. Builds for the host (cc proctest.c -lpthread) and
- * for LeandrOS (zig cc -target <arch>-linux-musl -static).
+ * for LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  *
  *   proctest [-d DIR]...   directories for the rename/unlink cases (default
  *                          /tmp, plus /root when root)

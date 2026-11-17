@@ -218,3 +218,5 @@ contain DRM_FORMAT_MOD_LINEAR or the allocation hard-fails with "Unsupported mod
 requested" (v3d_resource.c:836-839), because should_tile is already false so the UIF
 branch cannot be taken. v3d advertises {BROADCOM_UIF, LINEAR} (v3d_screen.c:634-635),
 so a modifier-aware GBM path is fine as long as our IN_FORMATS includes LINEAR.
+
+> zig recipe retired 2026-11: the wrappers and scripts in this directory now drive clang/lld (scripts/toolchain); the zig-specific text below is historical.

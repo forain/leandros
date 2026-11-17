@@ -2,7 +2,7 @@
  * udptest — UDP (and the ICMP / TCP-listener edges next to it) through the
  * net server, with the results Linux gives. Like nettest, the same file
  * builds for the host (cc udptest.c -lpthread, checked on a Linux kernel)
- * and for LeandrOS (zig cc -target <arch>-linux-musl -static).
+ * and for LeandrOS (scripts/toolchain/<arch>-linux-musl-cc -static).
  *
  *   udptest [-x NAME]...      skip case NAME
  *
