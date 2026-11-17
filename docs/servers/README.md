@@ -9,7 +9,7 @@ Everything above the microkernel core that a Linux program would call "the kerne
 | `vfs` | [`servers/vfs`](../../servers/vfs) | the fd tables, mount routing, tmpfs (`/tmp`, `/dev/shm`, `/run/user`), `/dev`, `/proc`, `/sys/class/block`, pipes, eventfd/timerfd/signalfd/inotify, block devices | `VFS_*` tags (`open`/`read`/`write`/`close`/`ioctl`/…) | [vfs.md](vfs.md) |
 | `f2fs` | [`servers/f2fs`](../../servers/f2fs) | `/` and `/data` | the same `VFS_*` tags, forwarded by the VFS | [filesystems.md](filesystems.md) |
 | `xattr` | [`servers/xattr`](../../servers/xattr) | not a server: the shared xattr/ACL/permission contract crate | — | [filesystems.md](filesystems.md#extended-attributes-and-posix-acls), [security.md](security.md) |
-| `net` | [`servers/net`](../../servers/net) | AF_INET (smoltcp with Reno/CUBIC, DHCPv4, ICMP), minimal `NETLINK_ROUTE`, AF_UNIX, `/proc/net/*` | `NET_*` tags | [networking.md](networking.md) |
+| `net` | [`servers/net`](../../servers/net) | AF_INET (smoltcp with Reno/CUBIC, DHCPv4, ICMP), IPv6 (SLAAC, NDP, PMTU), `NETLINK_ROUTE` and the nf_tables control plane, AF_UNIX, `/proc/net/*` | `NET_*` tags | [networking.md](networking.md) |
 | `tty` | [`servers/tty`](../../servers/tty) | console termios, job control, PTYs, the six VTs and their keyboard, POSIX timers | `TTY_IOCTL`, `TIMER_*`, plus direct calls | [tty-and-vt.md](tty-and-vt.md) |
 | `drm` | [`servers/drm`](../../servers/drm) | `/dev/dri/card0`, `/dev/dri/renderD128` | Linux DRM ioctls carried as VFS ioctl messages | [../graphics/drm-kms.md](../graphics/drm-kms.md) |
 | `evdev` | [`servers/evdev`](../../servers/evdev) | `/dev/input/eventN` | Linux `input_event` reads | [../input.md](../input.md) |
@@ -119,7 +119,7 @@ Server-side handles are released on **every** path out of a task, not only a cle
 
 - [vfs.md](vfs.md) — fd tables, path resolution, mounts, tmpfs, shared memory, pipes, `/proc`, synthetic `/sys`, open-file pools, permission enforcement in resolution.
 - [filesystems.md](filesystems.md) — the f2fs server, the xattr/ACL contract crate, the block-device layer (loop, GPT, BLKPG), `/dev/root` and USB root.
-- [networking.md](networking.md) — smoltcp TCP/IP with DHCP, ICMP and congestion control, rtnetlink and `SIOCGIF*`, and AF_UNIX in full.
+- [networking.md](networking.md) — smoltcp TCP/IP and IPv6 with DHCP, ICMP and congestion control, path MTU, an nftables rule engine, rtnetlink and `SIOCGIF*`, and AF_UNIX in full.
 - [netctl.md](netctl.md) — the `/dev/netctl` network control protocol (interfaces, route metrics, Wi-Fi radio class, profiles), ABI 1 (additions such as `SET_METRIC` are new ioctls, not layout changes).
 - [tty-and-vt.md](tty-and-vt.md) — the tty server, line discipline, job control, PTYs, virtual terminals and VT switching.
 - [security.md](security.md) — accounts, `/etc/shadow`, login, credentials, permission enforcement, and the privilege gaps that remain.

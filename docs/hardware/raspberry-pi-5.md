@@ -417,6 +417,8 @@ the BSS cache). The firmware (`cyw43455-sdio.bin`, CLM, NVRAM) is staged into th
 `ports/brcmfmac/fetch.sh`; `prepare-rpi5-sdcard.sh --wifi-ssid NAME` writes the credentials (the SSID is
 never derived from the PSK file name: SSIDs are case-sensitive, and an early card used the wrong case).
 
+**Multicast.** The CYW firmware drops group-addressed frames unless told otherwise, so `init` sets the `allmulti` iovar after the interface is up (lane nicmcast). Without it mDNS and IPv6 neighbour discovery never reached the stack (a Mac sending 30 datagrams to 224.0.0.251 produced +5 received frames before, +37 after). There is no per-group list: the chip passes all multicast and the network stack filters by joined group. The other NIC drivers already pass multicast (macb hash all-ones, e1000e `RCTL_MPE`, r8169 `ACCEPT_MULTICAST`, iwlwifi's pass-all `MCAST_FILTER_CMD` after association; `iwl.mcast=0` disables it).
+
 How the bring-up works and why it looks the way it does:
 
 - **Download order follows brcmfmac.** ALP clock only while downloading, KSO wake, CR4 halted and D11

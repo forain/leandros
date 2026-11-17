@@ -630,6 +630,10 @@ See [graphics/drm-kms.md](../graphics/drm-kms.md#the-i915-backend) for the conne
 the eDP panel is the only lit output by default; HDMI and the two DP++ ports (DDI-B and DDI-C, both routed to USB-C/dock)
 are probed and reported as extra connectors only with `i915.extout=1`, and no external display has been lit yet.
 
+**KMS features beyond the basics (lane i915feat).** Cursor planes take 64, 128 and 256 pixel ARGB images (`CAP_CURSOR_W/H` 256, `/proc/i915` `cursor_size`). Async page flips (`PLANE_CTL` bit 9, the atomic and legacy flip flags) are accepted when the framebuffer matches the plane's pitch and size and refused with `EINVAL` together with `ALLOW_MODESET`. `WAIT_VBLANK` and `CRTC_GET_SEQUENCE` read the pipe frame counter, and `IN_FENCE_FD` is honoured as a CPU wait before the commit. Limits: the vblank wait polls the counter every 500 us rather than taking the interrupt, `DRM_VBLANK_EVENT`/`SIGNAL` return `EINVAL`, a non-blocking commit blocks on an unsignalled in-fence, and wide cursors use the capped plane-1A watermark. Verified on the laptop (23 new `kms_*` cases pass, no FIFO underruns).
+
+**CPU vector state and graphics speed (lane lapfps).** Until 2026-11-14 CPUID's OSXSAVE bit was never set, so all userland ran SSE-only. The kernel now sets `CR4.OSXSAVE` and `XCR0 = 7` (x87, SSE, AVX), saves the upper YMM halves on every context switch and in signal frames, and `sigtest` guards both. On the UHD 620 Firefox is proven on the iris driver: a canvas animation runs at 60 FPS and WebGL2 at 60 FPS at 720p; a 1080p heavy shader reaches 35 FPS with the render engine 100% busy, so GPU-bound work has no software bottleneck. Canvas-2D (CPU Skia) is slow (about 5 FPS on a gradient-heavy page) and AVX did not change it; it matches Linux arm64 running the same Alpine Firefox, so it is not an OS gap.
+
 ### USB-C and Thunderbolt
 
 The USB-C ports sit behind the Alpine Ridge xHCI (`3a:00.0`). Lane `lapusbc` prints a root-hub line per controller

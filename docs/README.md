@@ -37,7 +37,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 ### 4. [Servers](servers/README.md)
 - [VFS](servers/vfs.md) — fd tables, mounts, tmpfs, shared memory, `/proc`, `/sys`
 - [Filesystems and storage](servers/filesystems.md) — F2FS (including performance on slow media and the storage knob table), xattrs and POSIX ACLs, block devices
-- [Networking](servers/networking.md) — smoltcp TCP/IP and a complete AF_UNIX
+- [Networking](servers/networking.md) — smoltcp TCP/IP and IPv6, nftables and a complete AF_UNIX
 - [TTYs and virtual terminals](servers/tty-and-vt.md) — line discipline, job control, PTYs, VT switching
 - [Users and security](servers/security.md) — accounts, login, permission enforcement
 
