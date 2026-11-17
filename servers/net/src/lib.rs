@@ -4620,9 +4620,11 @@ fn handle_bind(pid: u32, fd: usize, addr_ptr: usize, addrlen: usize, host: Optio
                 // another interface was refused with a port unreachable and
                 // its sends left by the first stack's route (lane udp2).
                 let server = ip.is_unspecified();
-                // A non-initial netns has only a down loopback: its UDP bind
-                // stays a pure table entry, no host-stack socket (unreachable).
-                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() {
+                // A non-initial netns with neither a loopback that is up nor a
+                // tun/tap: its UDP bind stays a pure table entry, no host-stack
+                // socket (unreachable). With a tun/tap it receives from the
+                // first datagram on, as on Linux (not only from the first read).
+                if me.netns() == 0 || vif::lo_up_sid(me.netns()).is_some() || tunbe::has_vifs(me.netns()) {
                     if let Err(e) = udp_materialize(pid, slot, None, 0, server) { return err_reply(e); }
                 }
             }
