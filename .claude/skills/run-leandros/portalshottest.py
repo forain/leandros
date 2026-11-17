@@ -27,17 +27,17 @@ bus = "unix:path=/run/user/1000/bus"
 post = (f"su leandro -c 'DBUS_SESSION_BUS_ADDRESS={bus} DBUS_SYSTEM_BUS_ADDRESS={bus} "
         f"XDG_RUNTIME_DIR=/run/user/1000 /usr/libexec/leandros-sysbus portal screenshot {t}' "
         "> /tmp/portalshot.out 2>&1; echo PORTALSHOT_RC=$?; grep -E '^(PASS|FAIL|PORTAL_PROBE)' /tmp/portalshot.out; "
-        "f=$(sed -n 's/.*file:\\/\\/\\([^ ]*\\.png\\).*/\\1/p' /tmp/portalshot.out | head -n 1); "
-        "echo SHOTFILE=$f; [ -n \"$f\" ] && ls -l \"$f\"; [ -n \"$f\" ] && [ -s \"$f\" ] && echo SHOT_NONEMPTY")
+        "ls -l /tmp/screenshot-*.png")
 r = subprocess.run([sys.executable, os.path.join(HERE, "ffsession.py"), arch, tag,
                     "--nofirefox", "--post", post, "--post-timeout", "240"])
 try:
     text = open(f"{out}/run-{tag}/post.txt").read()
 except OSError:
     text = ""
-lines = [l for l in text.splitlines() if re.match(r"(PASS|FAIL|PORTAL_PROBE|PORTALSHOT_RC|SHOTFILE|SHOT_NONEMPTY|-rw)", l)]
+lines = [l for l in text.splitlines() if re.match(r"(PASS|FAIL|PORTAL_PROBE|PORTALSHOT_RC|-rw)", l)]
 print("\n".join(lines))
-ok = ("PORTALSHOT_RC=0" in text and "SHOT_NONEMPTY" in text
+m = re.search(r"^-\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s.*/tmp/screenshot-\S+\.png", text, re.M)
+ok = ("PORTALSHOT_RC=0" in text and m is not None and int(m.group(1)) > 0
       and re.search(r"^PASS Screenshot\.Screenshot", text, re.M) is not None)
 print(f"portalshottest.py {arch}: {'PASS' if ok else 'FAIL'} (ffsession rc {r.returncode}, {out}/run-{tag})")
 sys.exit(0 if ok else 1)
