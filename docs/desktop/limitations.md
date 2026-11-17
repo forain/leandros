@@ -146,4 +146,4 @@ Recorded so they are not reopened without new evidence:
 
 | Limit | Detail |
 |---|---|
-| **cosmic-player is aarch64-verified only** | Audio works through the patched gst-plugin-pipewire 1.2.7 (the pool-activation deadlock is fixed). It needs `GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY` (set by the `.desktop`). x86_64 is untested. See `artifacts/notes/lane-gstport-2026-10-30.md`. |
+| **cosmic-player is gated by `gstsession.py` (aarch64 + x86_64 on the Mac)** | Audio works through the patched gst-plugin-pipewire 1.2.7 (the pool-activation deadlock is fixed). It needs `GST_PLUGIN_FEATURE_RANK=pipewiresink:PRIMARY` (set by the `.desktop`). The gate (`.claude/skills/run-leandros/gstsession.py <arch> <outdir>`) passes when the player is still running after ~40 s with no panic and no GStreamer error line; sound on x86_64 is unverified. See `artifacts/notes/lane-gstport-2026-10-30.md`. |
