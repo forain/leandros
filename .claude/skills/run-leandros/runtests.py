@@ -159,7 +159,7 @@ SYNCFILE_CHECK = (
 
 SUITES = {
     "regress": ["/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
-                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
+                "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/execdev", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", SYSFS_CHECK,
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",

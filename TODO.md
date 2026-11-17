@@ -68,7 +68,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Dual-boot**: no whole-disk wipes; Windows/NTFS and new-machine flows per `docs/design/dualboot-methodology.md`.
 
 ### Toolchain / dev experience
-- **zig to clang** migration (est. 2-4 days, not started).
+- **zig to clang** migration (est. 2-4 days, not started). Once ../mame is rebuilt with the aarch64 fix from lane/execfault, drop `-Wl,--image-base=0x1000000` from ../mame Makefile.leandros (lld's default 0x200000 now runs).
 - **Claude Code in-guest**: `claude-run` only appends to `/etc/passwd`/`group`; only 2.1.296 is pinned; x86_64 VT/cosmic-term runs not screenshotted.
 - **Test harness**: run with `python3 -u` and no pipe; pass `-D <file>` when host tracing is on.
 - **Unpushed sibling-repo fix**: `sync FILE` → fsync lives in `../coreutils` commit 24b9372 (main, ahead of origin by 1). Push it together with the next leandros push. The box's `leandros-siblings/coreutils` has the same diff only as an uncommitted change, so a reset there silently reverts `sync FILE` to a whole-system sync (the `syncfile` regress suite catches it).
