@@ -77,7 +77,7 @@ absent its systemd calls reduce to logged warnings
   cosmic-session's relay — when cosmic-session dies, the session log goes quiet even though
   the desktop keeps running.
 - **Session stderr is kept in `/tmp`.** `start-cosmic-leandros` redirects its own stderr (inherited by cosmic-comp, the panel, applets and notifications) to `/tmp/cosmic-session-<uid>.log`, and the greeter launcher sends greetd's, the greeter's and its compositor's to `/tmp/greeter.log`. One previous generation is kept as `.1`, rotated at start. They are plain redirects because there is no `tee` or FIFO to pipe through; before this the output went to pipes nobody read.
-- **Login sessions join the session cgroup.** sshd, greetd and the greeter-launch sessions create `/sys/fs/cgroup/user.slice/user-<uid>.slice/session-<name>.scope`, owned by the user, as `/bin/login` does for console logins, so per-session accounting and logind's view of the processes match. The step is best effort: on failure the session stays in the parent's cgroup.
+- **Login sessions join the session cgroup.** sshd, greetd and the greeter-launch sessions create `/sys/fs/cgroup/user.slice/user-<uid>.slice/session-<id>.scope` (greetd through `pam-leandros`, keyed by the session pid), owned by the user, as `/bin/login` does for console logins, so per-session accounting and logind's view of the processes match. The step is best effort: on failure the session stays in the parent's cgroup.
 
 The kernel surfaces this choreography depends on are all ours and all guarded by
 `userland/scmtest`: `F_SETFD` on socket fds (launch-pad clears `FD_CLOEXEC` on inherited
