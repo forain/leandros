@@ -1063,11 +1063,7 @@ impl Mon {
         }
         if pid == 0 {
             unsafe {
-                for fd in 3..1024 {
-                    if fd != b {
-                        libc::close(fd);
-                    }
-                }
+                crate::sandbox::close_except(&[b]);
                 let fail = |msg: &str| -> ! {
                     let mut w = W::default();
                     w.str(msg.as_bytes());

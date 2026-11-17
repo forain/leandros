@@ -1110,6 +1110,67 @@ def privsep_highfd(ssh, user, pw):
     step("privsep_confine_closes_high_fds", ok, f"preauth={[(d['pid'], d['keyfds']) for d in det]}")
 
 
+PS_RSS = r"""for p in /proc/[0-9]*; do
+read k n < $p/status
+m=${n#sshd}
+if [ x$m != x$n ]; then
+pp=; rss=; uid=
+while read k v w; do
+case $k in PPid:) pp=$v;; VmRSS:) rss=$v;; esac
+done < $p/status
+echo "${p#/proc/}|$pp|$n|$rss"
+fi
+done"""
+
+
+def privsep_perf(ssh, user, pw, tmp):
+    """Measurements, not gates: RSS (kB) of the listener, a monitor and a net child with one authenticated
+    session open, and ssh pipe / scp throughput over the forwarded QEMU port. Printed as PERF lines."""
+    sudo_write(ssh, user, pw, "/tmp/sshrss.sh", PS_RSS)
+    holders = [subprocess.Popen(["ssh", *ssh.pw_opts(), "-p", str(ssh.port), f"{user}@{ssh.host}", "sleep 60"],
+                                env=ssh.env(pw), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL) for _ in range(4)]
+    time.sleep(6)
+    _, out, _ = sudo_sh(ssh, user, pw, "sh /tmp/sshrss.sh")
+    rows = [ln.split("|") for ln in out.splitlines() if ln.count("|") == 3]
+    pids = {r[0] for r in rows}
+    lis = [r for r in rows if r[2] == "sshd" and r[1] not in pids]
+    mon = [r for r in rows if r[2] == "sshd" and r[1] in {x[0] for x in lis}]
+    pre = [r for r in rows if r[2] == "sshd-preauth"]
+    def kb(rs):
+        v = [int(r[3].split()[0]) for r in rs if r[3].split()]
+        return f"{min(v)}..{max(v)}" if v else "n/a"
+    print(f"PERF rss_kB listener={kb(lis)} monitor_or_session={kb(mon)} netchild={kb(pre)} connections=4 rows={len(rows)}", flush=True)
+    for h in holders:
+        stop(h)
+    mb = 16
+    src = os.path.join(tmp, "perf.bin")
+    with open(src, "wb") as f:
+        f.write(os.urandom(1 << 20) * mb)
+    t0 = time.time()
+    r1 = subprocess.run(["ssh", *ssh.pw_opts(), "-p", str(ssh.port), f"{user}@{ssh.host}", "cat > /tmp/perf.bin"],
+                        env=ssh.env(pw), stdin=open(src, "rb"), capture_output=True, timeout=300)
+    up = time.time() - t0
+    t0 = time.time()
+    r2 = subprocess.run(["ssh", *ssh.pw_opts(), "-p", str(ssh.port), f"{user}@{ssh.host}", "cat /tmp/perf.bin"],
+                        env=ssh.env(pw), stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+    down = time.time() - t0
+    ok = r1.returncode == 0 and r2.returncode == 0 and len(r2.stdout) == mb << 20
+    print(f"PERF ssh_pipe MiB/s up={mb / up:.2f} down={mb / down:.2f} size={mb}MiB ok={ok}", flush=True)
+    t0 = time.time()
+    r3 = subprocess.run(["scp", "-O", *ssh.pw_opts(), "-P", str(ssh.port), src, f"{user}@{ssh.host}:/tmp/perf2.bin"],
+                        env=ssh.env(pw), stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+    sc = time.time() - t0
+    print(f"PERF scp(-O) MiB/s up={mb / sc:.2f} rc={r3.returncode} {r3.stderr.decode()[-80:]!r}", flush=True)
+    t0 = time.time()
+    r4 = subprocess.run(["scp", *ssh.pw_opts(), "-P", str(ssh.port), src, f"{user}@{ssh.host}:/tmp/perf3.bin"],
+                        env=ssh.env(pw), stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+    sc = time.time() - t0
+    print(f"PERF scp(sftp) MiB/s up={mb / sc:.2f} rc={r4.returncode} {r4.stderr.decode()[-80:]!r}", flush=True)
+    sudo_sh(ssh, user, pw, "rm -f /tmp/perf.bin /tmp/perf2.bin /tmp/perf3.bin")
+    step("privsep_perf_measured", ok and bool(pre), f"rows={len(rows)} netchild_found={bool(pre)}")
+
+
 def privsep_crash(ssh, user, pw):
     """Crash isolation: a SEGV in one connection's process must not take the listener or other sessions down."""
     pid, fd = pty.fork()
@@ -1211,6 +1272,7 @@ def main(argv):
     privsep_grace(ssh, user, pw, tmp)
     privsep_stalled_monitor(ssh, user, pw)
     privsep_highfd(ssh, user, pw)
+    privsep_perf(ssh, user, pw, tmp)
     privsep_crash(ssh, user, pw)
     privsep_count(ssh, user, pw)  # last: on a tree without per-connection processes it leaves the guest without sshd
     shutil.rmtree(tmp, ignore_errors=True)
