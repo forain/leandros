@@ -37,6 +37,7 @@ mod cost;
 mod abi;
 mod stat;
 mod churn;
+mod nest;
 
 type c_int = i32;
 type c_long = i64;
@@ -222,6 +223,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
             let tfork = argc >= 4 && *(*argv.add(3)) == b't';
             return churn::churn_main(secs, tfork);
         }
+        // `nest`: nested-epoll lost-wakeup stress (lane nestep, see nest.rs).
+        if !arg.is_null() && *arg == b'n' { return nest::nest_main(); }
         // `cost` / `costbench` (lane epollcost, see cost.rs).
         if !arg.is_null() && *arg == b'c' {
             return if *arg.add(4) == b'b' { cost::costbench() } else { cost::cost_main() };
