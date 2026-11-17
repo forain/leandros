@@ -101,7 +101,7 @@ mkfs checks that every dependency of every record is satisfied.
 
 Conflict policy: a package that ships a base file fails with apk's own `trying to overwrite X
 owned by leandros-base`. `--force-overwrite` bypasses it and is unsupported. See [libc.md](libc.md#alpine-musl-as-the-runtime-libc) for the libc layout
-(`LEANDROS_LIBC=zig` restores the old fake `musl=1.2.5-r99` provide and the hard links). Install scripts run under brush; `/bin/busybox.static` plus `adduser`, `addgroup`,
+. Install scripts run under brush; `/bin/busybox.static` plus `adduser`, `addgroup`,
 `deluser` and `delgroup` shims serve the packages that call them. Triggers, openrc and
 services are out of scope.
 

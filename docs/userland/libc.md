@@ -84,11 +84,12 @@ Building that musl world on macOS had two traps worth recording:
 
 #### Alpine musl as the runtime libc
 
-By default (`LEANDROS_LIBC=alpine`) the image's libc is unmodified Alpine
+The image's libc is unmodified Alpine
 `musl` package (the version and sha256 are pinned in `ports/alpine/<arch>.lock`; cached `.apk` under
 `~/.cache/leandros/apk/<arch>/`) and is owned by apk as a real package
-([ports.md](ports.md#live-root-apk)). Our own musl was the same upstream 1.2.5 source; the
-exported dynsym is identical, and `scripts/musl/alpine-parity.sh` (run by `build-all.sh`) fails
+([ports.md](ports.md#live-root-apk)). The previous zig-built musl 1.2.5 libc (and its `LEANDROS_LIBC=zig` mode,
+`relink-libc.sh`, `dynlist-cc.sh`, `rtlib-shim`) was retired in 2026-11; the
+exported dynsym matched it, and `scripts/musl/alpine-parity.sh` (run by `build-all.sh`) fails
 the build if the Alpine libc drifts from the golden list (`alpine-parity.<arch>.golden`;
 FUNC sizes are not compared, Alpine builds `-Os`). Layout:
 
@@ -96,12 +97,11 @@ FUNC sizes are not compared, Alpine builds `-Os`). Layout:
   resolves a symlink for `PT_INTERP`);
 - `/lib/libc.musl-<arch>.so.1` and `/usr/lib/libc.so`: symlinks to it (the latter is owned by
   no package, so `apk add musl-dev` may take it over);
-- `/lib/ld-musl-<arch>.so.1.zig`: our zig-linked libc, the recovery copy. If the loader is
-  damaged, from the static shell: `/usr/sbin/busybox.static cp /lib/ld-musl-<arch>.so.1.zig
-  /lib/ld-musl-<arch>.so.1`.
+- `/lib/ld-musl-<arch>.so.1.recovery`: a byte copy of Alpine's loader (own inode, unowned by
+  any package), the recovery copy. If the loader is damaged, from the static shell:
+  `/usr/sbin/busybox.static cp /lib/ld-musl-<arch>.so.1.recovery /lib/ld-musl-<arch>.so.1`.
 
-`LEANDROS_LIBC=zig` rebuilds the previous image exactly (three hard links to our libc,
-fake `musl=1.2.5-r99` provide). `apk del musl` is refused; `musl` is pinned in
+`apk del musl` is refused; `musl` is pinned in
 `/etc/apk/world`, so any bump (3.24 / musl 1.2.6) needs the full test set. The build sysroot,
 the Firefox and git ports still apply the rewrite below (a parallel lane replaces them). Alpine's loader is
 stripped; install `musl-dbg` to symbolize it.
@@ -113,11 +113,6 @@ exports `__stack_chk_guard` (aarch64 GCC reads the canary from that global), and
 build scripts fails if the Alpine `ld-musl` it builds against does not export it. The Firefox
 and git ports still rewrite to `libc.so` and add the shim until they move to vanilla apk packages.
 `libleandros_ssp.so.1` stays in the image because older in-tree binaries may `DT_NEEDED` it.
-
-With `LEANDROS_LIBC=zig` the zig libc has no SONAME, but musl's loader maps any `libc.*` name to
-the loader itself, so an unmodified `libc.musl-<arch>.so.1` `DT_NEEDED` still resolves there.
-The zig libc exports `__stack_chk_guard` via `scripts/musl/relink-libc.sh`, which refuses an
-output without it.
 
 ## Threading (pthreads)
 
