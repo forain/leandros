@@ -57,6 +57,7 @@
  *   udp_pmtud_netns     a path MTU learned in one namespace is invisible in another
  *   udp_pmtud_want_frag a WANT datagram over the cached path MTU leaves as fragments cut to it (tun wire); DO is EMSGSIZE
  *   tcp_pmtud_clamp     frag-needed shrinks TCP's segment size (TCP_INFO snd_mss/pmtu)
+ *   udp6_pmtud_expiry the cached v6 path MTU expires after net.ipv6.route.mtu_expires (default 600 s; the test sets 2 s and restores it)
  *   udp6_pmtud_want_frag a datagram over the cached v6 path MTU leaves as Fragment-header packets (tun wire) and reassembles when looped back; IPV6_DONTFRAG is EMSGSIZE
  *   udp6_pmtud          IPV6_MTU_DISCOVER / IPV6_MTU, ICMPv6 packet-too-big, EMSGSIZE
  *   udp_pmtud           IP_MTU_DISCOVER / IP_MTU, frag-needed shrinks the path, DO sends past it are EMSGSIZE
@@ -1091,6 +1092,7 @@ int main(int argc, char **argv) {
     udp_pmtud_want_frag();
     tcp_pmtud_clamp();
     udp6_pmtud();
+    udp6_pmtud_expiry();
     udp6_pmtud_want_frag();
     udp_recverr_refused();
     udp_recverr_recvvariants();

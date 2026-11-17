@@ -7,8 +7,12 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const SLOTS: usize = 64;
-/// Linux net.ipv4.route.mtu_expires.
-const EXPIRES_MS: u64 = 600_000;
+/// Linux net.ipv4.route.mtu_expires (default 600 s); the server follows the
+/// initial namespace's `/proc/sys/net/ipv{4,6}/route/mtu_expires` via `set_expires_ms`.
+static EXPIRES_MS: AtomicU64 = AtomicU64::new(600_000);
+
+/// Entries live this long after they were recorded (applies to cached entries too).
+pub fn set_expires_ms(ms: u64) { EXPIRES_MS.store(ms, Ordering::Relaxed); }
 /// Linux net.ipv4.route.min_pmtu.
 pub const MIN_PMTU: u16 = 552;
 /// IPv6 minimum link MTU (RFC 8200).
@@ -17,7 +21,7 @@ pub const MIN_PMTU6: u16 = 1280;
 /// 64-bit hash of (scope, address), never 0; scope in bits 48.. of SCOPE.
 static KEY: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static SCOPE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
-/// mtu in bits 0..16, expiry (ms) above.
+/// mtu in bits 0..16, time recorded (ms) above.
 static VAL: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 
 fn hash(scope: u16, a: &[u8; 16]) -> u64 {
@@ -41,9 +45,9 @@ pub fn update(scope: u16, dst: [u8; 16], mtu: u16, min: u16, now_ms: u64) {
     // An existing, smaller MTU only ever grows by expiring.
     if KEY[i].load(Ordering::Relaxed) == k {
         let v = VAL[i].load(Ordering::Relaxed);
-        if v >> 16 > now_ms && (v & 0xffff) as u16 <= mtu { return; }
+        if (v >> 16) + EXPIRES_MS.load(Ordering::Relaxed) > now_ms && (v & 0xffff) as u16 <= mtu { return; }
     }
-    VAL[i].store((now_ms + EXPIRES_MS) << 16 | mtu as u64, Ordering::Relaxed);
+    VAL[i].store(now_ms << 16 | mtu as u64, Ordering::Relaxed);
     SCOPE[i].store(scope as u64 + 1, Ordering::Relaxed);
     KEY[i].store(k, Ordering::Relaxed);
 }
@@ -54,7 +58,7 @@ pub fn lookup(scope: u16, dst: [u8; 16], now_ms: u64) -> Option<u16> {
     let i = (k >> 8) as usize % SLOTS;
     if KEY[i].load(Ordering::Relaxed) != k { return None; }
     let v = VAL[i].load(Ordering::Relaxed);
-    if v >> 16 <= now_ms { return None; }
+    if (v >> 16) + EXPIRES_MS.load(Ordering::Relaxed) <= now_ms { return None; }
     Some((v & 0xffff) as u16)
 }
 

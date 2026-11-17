@@ -4580,6 +4580,8 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/sys/net/ipv6/conf/default/dad_transmits", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/conf/lo/dad_transmits", data: b"1\n" },
     RamEntry { path: b"/proc/sys/net/ipv6/bindv6only", data: b"0\n" },
+    RamEntry { path: b"/proc/sys/net/ipv4/route/mtu_expires", data: b"600\n" },
+    RamEntry { path: b"/proc/sys/net/ipv6/route/mtu_expires", data: b"600\n" },
 ];
 const _: () = assert!(sched::caps::CAP_LAST == 40, "update /proc/sys/kernel/cap_last_cap");
 const _: () = assert!(sched::task::NGROUPS_MAX == 32, "update /proc/sys/kernel/ngroups_max");
@@ -4640,6 +4642,8 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc/sys/net/ipv4/conf/default",
     b"/proc/sys/net/ipv4/conf/lo",
     b"/proc/sys/net/ipv6",
+    b"/proc/sys/net/ipv4/route",
+    b"/proc/sys/net/ipv6/route",
     b"/proc/sys/net/ipv6/conf",
     b"/proc/sys/net/ipv6/conf/all",
     b"/proc/sys/net/ipv6/conf/default",

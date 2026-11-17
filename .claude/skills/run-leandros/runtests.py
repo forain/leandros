@@ -418,7 +418,8 @@ SUITES = {
     # which stays ~10 min); gate with `--suite slow` (box: regress2.sh <ref> <arch> --suite slow).
     # Per-suite timeouts live in HOST_TIMEOUTS.
     "slow": ["host:f2fsorphantest.py", "host:f2fscptest.py", "host:f2fscrashtest.py",
-             "host:pagecache-crashtest.py", "host:usbunplugtest.py"],
+             "host:pagecache-crashtest.py", "host:usbunplugtest.py", "host:powerctltest.py",
+             "host:f2fsfulltest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -508,7 +509,7 @@ SUITES = {
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
 HOST_TIMEOUTS = {"sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
-                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
 

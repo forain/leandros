@@ -1401,6 +1401,7 @@ fn path_mtu_ip(sid: Sid, d: IpAddress) -> u32 {
         }
     };
     let now = sched::monotonic_ns() / 1_000_000;
+    smoltcp::pmtu::set_expires_ms(sched::ns::mtu_expires_s() as u64 * 1000);
     let key = match d {
         IpAddress::Ipv4(a) => smoltcp::pmtu::v4(a.0),
         IpAddress::Ipv6(a) => a.0,
@@ -3803,6 +3804,7 @@ fn track_carrier(nif: drivers::netdev::Netif, t: &mut NicTrack, now: u64) {
 fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Instant,
                                   sg: &mut alloc::vec::Vec<Sig>, sid: Sid,
                                   keys: &mut sched::WakeKeys) -> (bool, u64) {
+    smoltcp::pmtu::set_expires_ms(sched::ns::mtu_expires_s() as u64 * 1000);
     let mut gate = syngate::SynGate::new(dev);
     let (mut changed, mut mask) = (false, 0u64);
     let mut repolls = 0;

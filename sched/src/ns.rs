@@ -1186,7 +1186,7 @@ pub fn setns_cgroup(id: NsId) -> isize {
 // ── /proc/sys/net (per network namespace) ────────────────────────────────────
 
 pub struct NetCtl { pub path: &'static str, pub def: u32, pub max: u32, pub pair: bool }
-pub const NETCTL_N: usize = 43;
+pub const NETCTL_N: usize = 45;
 /// Entries with `pair` own this slot and the next ("lo hi" files); the next has an empty path.
 pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "core/somaxconn", def: 4096, max: 2147483647, pair: false },
@@ -1232,6 +1232,8 @@ pub static NETCTL: [NetCtl; NETCTL_N] = [
     NetCtl { path: "ipv6/conf/default/dad_transmits", def: 1, max: 64, pair: false },
     NetCtl { path: "ipv6/conf/lo/dad_transmits", def: 1, max: 64, pair: false },
     NetCtl { path: "ipv6/bindv6only", def: 0, max: 1, pair: false },
+    NetCtl { path: "ipv4/route/mtu_expires", def: 600, max: 2147483, pair: false },
+    NetCtl { path: "ipv6/route/mtu_expires", def: 600, max: 2147483, pair: false },
 ];
 const fn netctl_init() -> [[AtomicU32; NETCTL_N]; NS_MAX] {
     let mut out = [const { [const { AtomicU32::new(0) }; NETCTL_N] }; NS_MAX];
@@ -1473,6 +1475,12 @@ pub fn ping_allowed(pid: u32) -> bool {
     let owner = owner_userns(2, ns);
     if let Some(g) = from_k(1, owner, crate::egid_of(pid)) { if lo <= g && g <= hi { return true; } }
     crate::caps::pid_capable_in(pid, owner, 13) // CAP_NET_RAW
+}
+/// Path-MTU cache lifetime in seconds (net.ipv{4,6}.route.mtu_expires of the initial netns; the larger of the two).
+pub fn mtu_expires_s() -> u32 {
+    let a = netctl_find(b"ipv4/route/mtu_expires").map_or(600, |k| netctl_get(0, k));
+    let b = netctl_find(b"ipv6/route/mtu_expires").map_or(600, |k| netctl_get(0, k));
+    a.max(b)
 }
 /// net.ipv6.bindv6only of namespace `ns`: the IPV6_V6ONLY a new AF_INET6 socket starts with.
 pub fn bindv6only(ns: NsId) -> bool {
