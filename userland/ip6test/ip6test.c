@@ -192,10 +192,10 @@ static void test_v6only_default(void) {
 static void test_dual_accept_v4(void) {
     int l = sock6(SOCK_STREAM), ok = 0;
     int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (l >= 0 && bind_any6(l, 47301) == 0 && listen(l, 4) == 0) {
+    if (l >= 0 && bind_any6(l, 27301) == 0 && listen(l, 4) == 0) {
         int c = socket(AF_INET, SOCK_STREAM, 0); tmo(c, 3);
         struct sockaddr_in d; memset(&d, 0, sizeof d);
-        d.sin_family = AF_INET; d.sin_port = htons(47301); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        d.sin_family = AF_INET; d.sin_port = htons(27301); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(c, (struct sockaddr *)&d, sizeof d) == 0) {
             struct sockaddr_in6 p; socklen_t pl = sizeof p; memset(&p, 0, sizeof p);
             int a = accept(l, (struct sockaddr *)&p, &pl);
@@ -213,25 +213,25 @@ static void test_v6only_coexist(void) {
     int a = sock6(SOCK_STREAM), b = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(a, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
-    int r1 = bind_any6(a, 47302), r2 = bind_any4(b, 47302);
+    int r1 = bind_any6(a, 27302), r2 = bind_any4(b, 27302);
     CHECK("v6only_coexist", r1 == 0 && r2 == 0);
     close(a); close(b);
 }
 
 static void test_dual_conflict(void) {
     int a = sock6(SOCK_STREAM), b = socket(AF_INET, SOCK_STREAM, 0);
-    int r1 = bind_any6(a, 47303), r2 = bind_any4(b, 47303), e2 = errno;
+    int r1 = bind_any6(a, 27303), r2 = bind_any4(b, 27303), e2 = errno;
     CHECK("dual_conflict_v4_second", r1 == 0 && r2 < 0 && e2 == EADDRINUSE);
     close(a); close(b);
     a = socket(AF_INET, SOCK_STREAM, 0); b = sock6(SOCK_STREAM);
-    r1 = bind_any4(a, 47304); r2 = bind_any6(b, 47304); e2 = errno;
+    r1 = bind_any4(a, 27304); r2 = bind_any6(b, 27304); e2 = errno;
     CHECK("dual_conflict_v6_second", r1 == 0 && r2 < 0 && e2 == EADDRINUSE);
     close(a); close(b);
 }
 
 static void test_v6only_after_bind(void) {
     int s = sock6(SOCK_STREAM), one = 1;
-    int r = bind_any6(s, 47305);
+    int r = bind_any6(s, 27305);
     int r2 = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     CHECK("v6only_after_bind", r == 0 && r2 < 0 && errno == EINVAL);
     close(s);
@@ -241,7 +241,7 @@ static void test_mapped_connect_v6only(void) {
     int s = sock6(SOCK_STREAM), one = 1;
     setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     struct sockaddr_in6 d; memset(&d, 0, sizeof d);
-    d.sin6_family = AF_INET6; d.sin6_port = htons(47306);
+    d.sin6_family = AF_INET6; d.sin6_port = htons(27306);
     inet_pton(AF_INET6, "::ffff:127.0.0.1", &d.sin6_addr);
     int r = connect(s, (struct sockaddr *)&d, sizeof d);
     CHECK("mapped_connect_v6only", r < 0 && errno == ENETUNREACH);
@@ -250,10 +250,10 @@ static void test_mapped_connect_v6only(void) {
 
 static void test_udp_dual(void) {
     int r = sock6(SOCK_DGRAM), ok = 0;
-    if (r >= 0 && bind_any6(r, 47307) == 0) {
+    if (r >= 0 && bind_any6(r, 27307) == 0) {
         int c = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in d; memset(&d, 0, sizeof d);
-        d.sin_family = AF_INET; d.sin_port = htons(47307); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        d.sin_family = AF_INET; d.sin_port = htons(27307); d.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         sendto(c, "hi", 2, 0, (struct sockaddr *)&d, sizeof d);
         char buf[8]; struct sockaddr_in6 p; socklen_t pl = sizeof p; memset(&p, 0, sizeof p);
         ssize_t n = recvfrom(r, buf, sizeof buf, 0, (struct sockaddr *)&p, &pl);
@@ -480,12 +480,12 @@ static void test_gni6(void) {
 static void test_localhost_fallback(void) {
     int l = socket(AF_INET, SOCK_STREAM, 0), ok = 0;
     struct sockaddr_in a; memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET; a.sin_port = htons(47320); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_family = AF_INET; a.sin_port = htons(27320); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 4) == 0) {
         struct addrinfo h, *res = 0, *p; memset(&h, 0, sizeof h);
         h.ai_family = AF_UNSPEC; h.ai_socktype = SOCK_STREAM;
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-        if (getaddrinfo("localhost", "47320", &h, &res) == 0) {
+        if (getaddrinfo("localhost", "27320", &h, &res) == 0) {
             for (p = res; p && !ok; p = p->ai_next) {
                 int c = socket(p->ai_family, SOCK_STREAM, 0); tmo(c, 3);
                 if (connect(c, p->ai_addr, p->ai_addrlen) == 0) ok = 1;
@@ -531,7 +531,7 @@ static int ns6_body(int mode) {
     struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "lo"); q.ifr_flags = IFF_UP | IFF_RUNNING;
     if (u < 0 || ioctl(u, SIOCSIFFLAGS, &q) != 0) return 3;
     close(u);
-    int port = 47400 + mode;
+    int port = 27400 + mode;
     int v4s = mode == 2 || mode == 4;
     int l = socket(v4s ? AF_INET : AF_INET6, SOCK_STREAM, 0);
     if (l < 0) return 4;
@@ -614,7 +614,7 @@ static int nsudp6_body(void) {
     int a = socket(AF_INET6, SOCK_DGRAM, 0), b = socket(AF_INET6, SOCK_DGRAM, 0);
     if (a < 0 || b < 0) return 4;
     tmo(a, 3); tmo(b, 3);
-    struct sockaddr_in6 la; memset(&la, 0, sizeof la); la.sin6_family = AF_INET6; la.sin6_addr = in6addr_loopback; la.sin6_port = htons(47520);
+    struct sockaddr_in6 la; memset(&la, 0, sizeof la); la.sin6_family = AF_INET6; la.sin6_addr = in6addr_loopback; la.sin6_port = htons(27520);
     if (bind(a, (struct sockaddr *)&la, sizeof la)) return 5;
     if (sendto(b, "udp6", 4, 0, (struct sockaddr *)&la, sizeof la) != 4) return 6;
     char r[8]; struct sockaddr_in6 from; socklen_t fl = sizeof from;

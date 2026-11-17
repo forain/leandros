@@ -584,7 +584,7 @@ static int v6_child_body(void) {
     int idx = link_get(cs, "eth0", NULL, NULL);
     if (!idx || addr6_add(cs, idx, "fd00:6::2", 64) || link_set_up(cs, idx)) return 2;
     link_set_up(cs, link_get(cs, "lo", NULL, NULL));
-    int r = tcp6_echo_srv("fd00:6::2", 47661, done_[1]);
+    int r = tcp6_echo_srv("fd00:6::2", 27661, done_[1]);
     if (r) return 10 + r;
     return ping6_once("fd00:6::1", 0) ? 20 : 0;
 }
@@ -608,7 +608,7 @@ static void veth6(void) {
     int t = socket(AF_INET6, SOCK_STREAM, 0);
     struct timeval tv = { 5, 0 };
     setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(47661);
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(27661);
     inet_pton(AF_INET6, "fd00:6::2", &d.sin6_addr);
     int ce = connect(t, (struct sockaddr *)&d, sizeof d);
     CHECK("veth6: TCP connect to the child over v6", ce == 0);
@@ -632,7 +632,7 @@ static int v6_conf_eth0(void) {
 }
 static int br6_server_body(void) {
     int e = v6_conf_eth0(); if (e) return e;
-    int r = tcp6_echo_srv(g_ip6, 47662, done_[1]);
+    int r = tcp6_echo_srv(g_ip6, 27662, done_[1]);
     if (r) return 10 + r;
     return ping6_once("fd00:66::1", 0) ? 20 : 0;
 }
@@ -645,7 +645,7 @@ static int br6_client_body(void) {
     int t = socket(AF_INET6, SOCK_STREAM, 0);
     struct timeval tv = { 5, 0 };
     setsockopt(t, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(47662);
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(27662);
     inet_pton(AF_INET6, "fd00:66::2", &d.sin6_addr);
     if (connect(t, (struct sockaddr *)&d, sizeof d)) return 6;
     char b[8] = "ping";

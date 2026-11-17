@@ -160,7 +160,7 @@ static void udp_mcast_loop(void) {
     char me[64];
     if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
     const char *G = "239.255.42.99";
-    uint16_t port = 47011;
+    uint16_t port = 27011;
     int a = bound_reuse(port, SO_REUSEADDR), b = bound_reuse(port, SO_REUSEADDR);
     int s = socket(AF_INET, SOCK_DGRAM, 0), one = 1;
     if (a < 0 || b < 0 || s < 0) { fail(N, "setup: %s", strerror(errno)); return; }
@@ -250,7 +250,7 @@ static void udp_mcast_ssm(void) {
     char me[64];
     if (!nic_addr(me, sizeof me)) { skip(N, "no default route"); return; }
     const char *G = "239.255.42.98", *OTHER = "192.0.2.77";
-    uint16_t port = 47021;
+    uint16_t port = 27021;
     int a = bound_reuse(port, SO_REUSEADDR), b = bound_reuse(port, SO_REUSEADDR);
     int c = bound_reuse(port, SO_REUSEADDR), d = bound_reuse(port, SO_REUSEADDR);
     int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -310,7 +310,7 @@ static void udp_broadcast(void) {
     const char *N = "udp_broadcast";
     if (skipped(N)) return;
     char me[64];
-    uint16_t port = 47013;
+    uint16_t port = 27013;
     int s = socket(AF_INET, SOCK_DGRAM, 0), one = 1;
     struct sockaddr_in all = sin4("255.255.255.255", port), lob = sin4("127.255.255.255", port);
     ssize_t s1 = send_to(s, "b", 1, &all); int e1 = errno;
@@ -339,7 +339,7 @@ static void udp_broadcast(void) {
 static void udp_reuse_unicast(void) {
     const char *N = "udp_reuse_unicast";
     if (skipped(N)) return;
-    uint16_t port = 47015;
+    uint16_t port = 27015;
     int a = bound_reuse(port, SO_REUSEADDR), b = bound_reuse(port, SO_REUSEADDR);
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in to = sin4("127.0.0.1", port);
@@ -348,7 +348,7 @@ static void udp_reuse_unicast(void) {
     int na = got(a, "u", 300), nb = got(b, "u", 1);
     close(a); close(b); close(s);
     /* SO_REUSEPORT: 24 senders (24 flows). */
-    port = 47017;
+    port = 27017;
     int p = bound_reuse(port, SO_REUSEPORT), q = bound_reuse(port, SO_REUSEPORT);
     to = sin4("127.0.0.1", port);
     /* All open at once: 24 different source ports (a port just freed may

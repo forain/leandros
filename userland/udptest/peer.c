@@ -436,7 +436,7 @@ static void peer_bcast(void) {
     const char *N = "peer_bcast";
     if (skipped(N)) return;
     peer_begin(N);
-    const uint16_t Q = 40123;
+    const uint16_t Q = 20123;
     int one = 1;
     int s = socket(AF_INET, SOCK_DGRAM, 0), r = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0 || r < 0) { fail(N, "socket: %s", strerror(errno)); return; }
