@@ -135,12 +135,13 @@ Audio is verified at the destination: QEMU's `wav` backend captures the guest's 
 - A single-buffer liveness probe passes on a dead stream: QEMU consumes exactly one buffer per `START` before the voice dies.
 - A zero-run metric over the wav file is blind to stalls, because QEMU writes nothing while a stream is stalled and the file simply time-compresses; recoveries are counted from the serial log instead.
 - `min_level = 0` on a stall line is trivial (the ring starts empty after each recovery) and is not evidence of an underrun.
+- The DOOM session test (`doomsession.py`) has an audio gate in the regress harness: the wav capture must show signal and no clipping, which is how the old x86_64 clipping report was re-checked and found already fixed by the soft-float export change.
 - QEMU's `-trace enable=a,enable=b` keeps only the last pattern; use `-trace events=<file>`.
 
 ## Limitations and open work
 
 - One playback stream and one capture stream (HDA only, read-only open of `/dev/pipewire`); no ALSA ABI. No HDMI/DP playback on x86_64, and jack switching was verified for the sense read only (nothing was plugged during the lane).
-- **The PipeWire sink is still named "Virtio Sound Output"** whatever the backend (the node description in `leandros-snd-sink.c`); on the PC the panel shows that name for the HDA output. The virtio-snd and HDA drivers are loadable modules (`kmodnetsnd`; [kernel/modules.md](kernel/modules.md)).
+- **The PipeWire sink is named from the backend** ([`ports/pipewire/snd-name.h`](../ports/pipewire/snd-name.h)): `leandros-snd-sink` reads the text of the audio ioctl `SND_GET_INFO` (0x103), whose first line is `backend: virtio-sound`, `backend: hda` or module text, and derives `node.description`/`node.nick` from it (the HDA summary names the codec, e.g. "Realtek ALC887"; the fallback is "Virtio Sound Output"). `leandros-snd-sink --describe` prints `description|nick`. Verified in a guest on aarch64 (virtio-snd); the HDA branch is covered by a host test of the header only and has not run on x86_64 hardware. The virtio-snd and HDA drivers are loadable modules (`kmodnetsnd`; [kernel/modules.md](kernel/modules.md)).
 - The first playback of a session on x86_64 can show a ~40 ms gap about a second in — most likely a client xrun, since there is no real-time scheduling class and RTKit is absent. Steady playback is clean.
 - PI futexes have no priority boosting or ownership hand-off; robust lists are not implemented.
 - DOOM's x86_64 clipping is fixed (lane `kvmaudio`): `userland/libc` is built for Rust's soft-float target, so its exported `pow/exp/log/log10/tan/sqrt` took doubles in integer registers while clang-built C callers pass `xmm0/xmm1`; asm trampolines now convert, and `scripts/check-c-float-abi.py` guards the DOOM binary in `build-all.sh`. The capture shows 0 clipped samples.

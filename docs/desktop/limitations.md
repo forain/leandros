@@ -36,7 +36,7 @@ this page is the explanation.
 - **Brightness and volume hotkeys are partly unconfirmed.** The EliteBook 840 G5 brightness
   keys are mapped (`E0 12`/`E0 17`) but a real key press reaching the compositor has not been
   confirmed; other machines' keys appear as `kbd: unmapped sc` lines until mapped.
-- **cosmic-monitor has no disk or network data.** `/proc/diskstats`, `/sys/class/net`, `/sys/class/drm` and `/sys/devices/system/cpu` (cpufreq) do not exist, so the disk/network graphs and GPU/frequency readouts stay empty; CPU, memory, load and the process list work. CPU is shown as user time (no user/system split is kept).
+- **cosmic-monitor has no disk or network data.** `/proc/diskstats`, `/sys/class/net` and `/sys/devices/system/cpu` (cpufreq) do not exist (`/sys/class/drm` connectors now do, see [drm-kms.md](../graphics/drm-kms.md#sysfs-view-of-the-connectors)), so the disk/network graphs and GPU/frequency readouts stay empty; CPU, memory, load and the process list work. CPU is shown as user time (no user/system split is kept).
 - **cosmic-initial-setup's Network pages need the system bus.** They `unwrap()` `zbus::Connection::system()`; it works only with `DBUS_SYSTEM_BUS_ADDRESS` set as in the session, not from a bare shell.
 - **Headless portal Screenshot needs a stored grant.** The portal asks the user through an
   Access dialog first; without an answer (or a "screenshot" entry in the permission store) the

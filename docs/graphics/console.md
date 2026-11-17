@@ -16,6 +16,12 @@ The console renders an embedded **8×16 bitmap font** derived from Fira Code (`g
 
 `vector_font.rs` also contains a TrueType/OpenType outline parser, a rasteriser and a 256-entry glyph cache, but `init_vector_font` currently disables it ("debug boot crash") and the image carries no real TrueType font — only a synthetic header. Earlier descriptions of the console as rendering sub-pixel-positioned Fira Code outlines describe that dormant path, not the shipped one.
 
+### Tab stops and double-width cells
+
+The grid is not fixed-width ASCII any more. **Tab stops are programmable**: a bitmap, every 8 columns by default, edited by `ESC H` (set at the cursor), `CSI g` (clear), and moved through by `HT`, `CHT` and `CBT`. **Wide characters take two cells** (CJK, fullwidth forms, emoji presentation blocks): the first cell holds the code point and the second a continuation marker above U+10FFFF, which cannot collide with text. A wide character that does not fit before the right margin wraps whole and leaves the stranded cell blank; overwriting either half of a wide character blanks the other half so no half glyph survives. Zero-width marks (combining marks, variation selectors) are dropped, since nothing here can compose them.
+
+Width and tab-stop logic live in one file, [`drivers/src/wcwidth.rs`](../../drivers/src/wcwidth.rs), compiled twice: into the framebuffer console and, through `#[path]`, into the tty server's per-VT text mirror. They must agree to the cell, or a VT switch would repaint the saved plane differently from how it was first drawn. `vttest` reads the cell grid back (code points as hex, `80000000` for a continuation cell) to check both emulators.
+
 ### A real VT emulator
 
 The console is a terminal, not a print sink:
@@ -25,6 +31,10 @@ The console is a terminal, not a print sink:
 - Multi-byte ANSI escape sequences are delivered to a reader in one `read` rather than split.
 - **The framebuffer is the authoritative console** and wins geometry ties against the serial port. Two terminals of different geometry cannot both be correct off one byte stream, so the cursor-position query is intercepted in the kernel's console-write path and answered from the framebuffer; it never reaches the UART, where an attached host terminal of a different size would otherwise answer for it. When the two sinks disagree, the framebuffer is made correct and serial is accepted as approximate.
 - Synthetic console input (such as a CPR reply) is visible to `poll`/`epoll` readiness, not just to `read`. Crossterm blocks in epoll for the reply; an invisible reply left it waiting until reedline's 2 s timeout dropped brush out of interactive mode, and the stale reply then leaked to the next reader (the shell tried to execute `bin/[13;1Recho`).
+
+### Timestamps on log lines
+
+Console and klog lines carry a monotonic uptime stamp (`printk.time=0` disables it). It exists to read timelines off a serial log, for instance to place a stall relative to a compositor event, without a separate trace.
 
 ### Atomic writes
 
@@ -56,6 +66,8 @@ The rule now (`edad115`):
 - **A VT switch** revokes the scanout claim (`fb_vt_scanout_revoke`) so a text VT can take the display back; the DRM master rules then stop the background client from re-claiming it (see [drm-kms.md](drm-kms.md#drm-master-one-per-vt)).
 - **A kernel panic** takes the scanout back unconditionally with two atomic stores and no locks — the panicking thread may already hold the framebuffer lock — and brings VT 1 forward, so a panic during a live session is visible.
 
+**A VT switch does not flash the outgoing client.** While a `VT_PROCESS` release is outstanding (the outgoing owner was asked to let go and has not answered `VT_RELDISP`), the active-VT slot still names the outgoing VT, so DRM master derived from it would still let that client present onto a display the user already left. `release_pending()` in the tty server makes the DRM layer treat that window as "no master", so a present issued from inside the release handler never reaches the scanout.
+
 ### `/dev/fb0`
 
 Writes to `/dev/fb0` are copied into the console shadow and transferred to the host, but only while the console surface is on screen (a text VT with no DRM scanout owner); under a compositor they do nothing, as on Linux (`5cf984f`). Before this fbdev pixels never reached the host and the next console blit overwrote them.
@@ -74,6 +86,7 @@ Writes to `/dev/fb0` are copied into the console shadow and transferred to the h
 - The vector-font path is dormant; only the bitmap font ships.
 - Kernel log lines go to VT 1's plane only (as with `console=tty1`).
 - On return to VT 1 from a compositor, the console text flashes until the compositor's first present, because the libseat shim never sets `KD_GRAPHICS` on that VT.
+- Combining marks are dropped rather than composed, and wide glyphs come from the same bitmap font, so coverage outside Latin is limited.
 - A scroll is still a full-surface blit and transfer.
 
 ## Code and tests
