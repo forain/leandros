@@ -1118,7 +1118,7 @@ pp=; rss=; uid=
 while read k v w; do
 case $k in PPid:) pp=$v;; VmRSS:) rss=$v;; esac
 done < $p/status
-echo "${p#/proc/}|$pp|$n|$rss"
+echo ${p#/proc/}\\|$pp\\|$n\\|$rss
 fi
 done"""
 
