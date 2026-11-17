@@ -36,7 +36,7 @@ done
 pre=(--no-default-config -Wno-unused-command-line-argument "--target=$arch-unknown-linux-musl" "--sysroot=$DYN_SYSROOT"
      "-resource-dir=$T/resource" "-idirafter" "$T/sysroot/usr/include")
 # link-only flags (a compile-only run would trip meson/cc-rs probes that pass -Werror=unused-command-line-argument)
-((link)) && pre+=("-fuse-ld=$LLD" --rtlib=compiler-rt --unwindlib=none)
+((link)) && pre+=("--ld-path=$LLD" --rtlib=compiler-rt --unwindlib=none)
 [ "$arch" = aarch64 ] && pre+=(-mno-outline-atomics)
 ((opt)) && pre+=(-DNDEBUG)
 bin=$CLANG

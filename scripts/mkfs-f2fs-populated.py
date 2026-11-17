@@ -748,53 +748,18 @@ def main():
         if not any(n == _name for n, _p, _m in etc_files):
             etc_files.append((_name, _data, 0o100644))
 
-    # ── K3 dynamic-linking corpus (musl ld.so + test ladder) ──────────────────
-    # Real dynamic musl world built host-side (see the K3 NOTES.md). ld-musl IS
-    # libc.so: the SAME host file is packed at both /lib/ld-musl-<arch>.so.1 and
-    # /usr/lib/libc.so — add_files_to_dir dedupes by host path, so these become
-    # hardlinks to one inode and the kernel needs no symlink resolution to load
-    # the interpreter. The test ladder binaries are dynamic-PIE ELFs whose
-    # PT_INTERP points at /lib/ld-musl-<arch>.so.1.
+    # ── K3 dynamic-linking corpus (dynamic test ladder) ───────────────────────
+    # The runtime libc is Alpine's unmodified musl (ports/alpine/<arch>.lock,
+    # apk-owned). /lib/ld-musl-<arch>.so.1 is its regular file (PT_INTERP target:
+    # the kernel never resolves a symlink for the interpreter); libc.musl-<arch>.so.1
+    # and /usr/lib/libc.so are symlinks to it. A byte copy of the loader is kept as
+    # /lib/ld-musl-<arch>.so.1.recovery (added after the lock is staged below) for
+    # recovery from a static shell. The test ladder binaries are dynamic-PIE ELFs
+    # whose PT_INTERP points at /lib/ld-musl-<arch>.so.1.
     dyn_root = os.path.expanduser("~/code/leandros-artifacts/musl-dynamic")
-    libc_so = f"{dyn_root}/sysroot/{arch}/usr/lib/libc.so"
-    # The same objects relinked with musl's dynamic.list (scripts/musl/
-    # relink-libc.sh), so libc-internal calls such as setenv -> getenv bind
-    # locally and only the malloc family & co. stay interposable. Without it
-    # Firefox's mozglue getenv interposer self-deadlocks inside musl setenv.
-    libc_dynlist = f"{dyn_root}/libc-dynlist/{arch}/libc.so"
-    if os.path.exists(libc_dynlist):
-        libc_so = libc_dynlist
-    elif os.path.exists(libc_so):
-        print(f"WARNING: {libc_dynlist} missing; packing the libc.so without "
-              f"dynamic.list (run scripts/musl/relink-libc.sh {arch})",
-              file=sys.stderr)
-    usr_lib_files = []
-    # LEANDROS_LIBC=alpine (default): the runtime libc is Alpine 3.21's unmodified
-    # musl-1.2.5-r12 (ports/apk/out/<arch>/musl.apk), owned by apk as a real
-    # package. /lib/ld-musl-<arch>.so.1 is its regular file (PT_INTERP target: the
-    # kernel never resolves a symlink for the interpreter); libc.musl-<arch>.so.1
-    # and /usr/lib/libc.so are symlinks to it. Our zig-linked libc is kept as
-    # /lib/ld-musl-<arch>.so.1.zig for recovery from a static shell.
-    # LEANDROS_LIBC=zig: the previous layout, three hard links to our libc.so.
+    usr_lib_files = [("libc.so", f"/lib/ld-musl-{arch}.so.1".encode(), S_IFLNK | 0o777)]
     import apkdb
-    libc_mode = os.environ.get("LEANDROS_LIBC", "alpine")
-    if libc_mode not in ("alpine", "zig"):
-        sys.exit(f"LEANDROS_LIBC must be alpine or zig, not {libc_mode!r}")
-    if libc_mode == "alpine":
-        # /lib/ld-musl-<arch>.so.1 and libc.musl-<arch>.so.1 belong to the musl
-        # package of the Alpine lock (staged below); the image only adds the
-        # /usr/lib/libc.so link and the zig libc for recovery.
-        usr_lib_files.append(("libc.so", f"/lib/ld-musl-{arch}.so.1".encode(), S_IFLNK | 0o777))
-        if os.path.exists(libc_so):
-            lib_files.append((f"ld-musl-{arch}.so.1.zig", libc_so, 0o100755))
-        print(f"libc: Alpine musl from ports/alpine/{arch}.lock (apk-owned); zig libc kept as ld-musl-{arch}.so.1.zig")
-    elif os.path.exists(libc_so):
-        lib_files.append((f"ld-musl-{arch}.so.1", libc_so, 0o100755))
-        usr_lib_files.append(("libc.so", libc_so, 0o100755))
-        # The musl soname by name (ctypes, ldd-like tools, apk's so: provide);
-        # deduped by host path, so a hard link to the loader's inode.
-        lib_files.append((f"libc.musl-{arch}.so.1", libc_so, 0o100755))
-        print("libc: zig-linked musl (hard links)")
+    print(f"libc: Alpine musl from ports/alpine/{arch}.lock (apk-owned); recovery copy ld-musl-{arch}.so.1.recovery")
     for name, rel in (
         ("hello-dyn",    f"test/hello-dyn/hello-dyn-{arch}"),
         ("hello-dyn-rs", f"test/hello-dyn-rs/hello-dyn-rs-{arch}"),
@@ -2921,10 +2886,18 @@ def main():
     # staged is dropped in favour of the package's (apk-shadow below).
     import alpinepkgs, filecmp
     _ap_entries, _ap_stanzas, _ap_pkgs = alpinepkgs.stage(arch)
-    if libc_mode == "zig":
-        _ap_entries = [e for e in _ap_entries if e["pkg"] != "musl"]
-        _ap_stanzas = [x for x in _ap_stanzas if x[0] != "musl"]
-        _ap_pkgs = [x for x in _ap_pkgs if x["name"] != "musl"]
+    # Recovery copy of Alpine's loader: a distinct host file (own inode, not a hard
+    # link to the apk-owned one) so a damaged /lib/ld-musl-<arch>.so.1 can be
+    # replaced from busybox.static: cp /lib/ld-musl-<arch>.so.1.recovery ...
+    _ld_path = f"/lib/ld-musl-{arch}.so.1"
+    _ld_ent = next((e for e in _ap_entries if e["path"] == _ld_path and e.get("kind") == "file"), None)
+    if _ld_ent is None:
+        sys.exit(f"{_ld_path} is not a regular file of the musl package in ports/alpine/{arch}.lock")
+    import shutil, tempfile
+    _rec_dir = tempfile.mkdtemp(prefix="leandros-ldrec-")
+    _rec = os.path.join(_rec_dir, os.path.basename(_ld_path) + ".recovery")
+    shutil.copyfile(_ld_ent["host"], _rec)
+    lib_files.append((f"ld-musl-{arch}.so.1.recovery", _rec, 0o100755))
     _ap_gen, _ap_gen_dirs = alpinepkgs.generated_entries(arch)
     _apk_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               "..", "ports", "apk", "out", arch))
@@ -2932,8 +2905,8 @@ def main():
         sys.exit(f"{_apk_root} missing (ports/apk/build.sh {arch})")
     _overlay_port_tree(_apk_root)
     bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
-    _ap_world = ["leandros-base", "musl=" + next(e_s for e_s in [alpinepkgs.lk.read_lock(arch)[0]["musl"]["ver"]])] \
-        if libc_mode == "alpine" else ["leandros-base"]
+    _ap_world = ["leandros-base", "musl=" + alpinepkgs.lk.read_lock(arch)[0]["musl"]["ver"]]
+
     _ap_world += [n for n in alpinepkgs.world_names(arch) if n != "musl"]
     m4_share_dirs.add("/etc/apk")
     m4_share_files.append(("/etc/apk", "world", ("\n".join(_ap_world) + "\n").encode()))
@@ -3339,8 +3312,6 @@ def main():
         _p_dirs = [os.path.normpath(os.path.join(_apk_root, "..", "..", "..", n, "out", arch))
                    for n in sorted(os.listdir(os.path.join(_apk_root, "..", "..", "..")))]
         _provs = list(apkdb.STATIC_PROVIDES)
-        if libc_mode == "zig":
-            _provs += ["musl=1.2.5-r99", f"so:libc.musl-{arch}.so.1=1"]
         _lock_names = {x[0] for x in _ap_stanzas}
         _provs += [p for p in apkdb.closure_provides(_p_dirs) if p.split("=")[0] not in _lock_names]
         _libs = [(n, h) for n, h, _m in lib_files + usr_lib_files]
@@ -3360,7 +3331,7 @@ def main():
         _dmeta = {pth: (o[1], o[2], o[0]) for ino, pth in dir_nodes.items()
                   for o in [dir_owner.get(ino, (0o040755, 0, 0))]}
         _db = apkdb.build_installed(_files, _dmeta, _provs, arch, BUILD_TIME,
-                                    depends=["musl"] if libc_mode == "alpine" else (),
+                                    depends=["musl"],
                                     owned_elsewhere=frozenset(_ap_owned))
         _vdb = alpinepkgs.db_files(_ap_pkgs, _ap_stanzas)
         _bad = apkdb.check_deps(apkdb.parse_db(_db + _vdb["installed"]), [])

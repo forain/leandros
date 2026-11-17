@@ -32,7 +32,7 @@ while ((i < n)); do
     out+=("$a"); i=$((i+1))
 done
 pre=(--no-default-config -Wno-unused-command-line-argument "--target=$arch-unknown-linux-musl" "--sysroot=$T/sysroot" "-resource-dir=$T/resource"
-     "-fuse-ld=$LLD" --rtlib=compiler-rt -fno-pie)
+     "--ld-path=$LLD" --rtlib=compiler-rt -fno-pie)
 [ "$arch" = aarch64 ] && pre+=(-mno-outline-atomics)
 ((opt)) && pre+=(-DNDEBUG)
 if [ "$lang" = c++ ]; then
