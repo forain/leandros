@@ -108,7 +108,7 @@ unsafe fn dup_case() -> bool {
     ok &= ready(d, 0) == 1;
     ok &= ready(outer, 2000) == 1;
     close(sv[0]); close(sv[1]); close(d); close(outer);
-    report(b"epoll_share_dup_close_original", ok)
+    report(b"epoll_share_dup_close_original\0", ok)
 }
 
 /// Number of checks `share_main` reports.
@@ -117,10 +117,10 @@ pub const SHARE_CHECKS: i32 = 5;
 /// Returns the number of failed checks.
 pub unsafe fn share_main() -> i32 {
     let mut f = 0;
-    if !share_case(b"epoll_share_fork_exec_cloexec", 0) { f += 1; }
-    if !share_case(b"epoll_share_fork_close_exit", 1) { f += 1; }
-    if !share_case(b"epoll_share_fork_exit", 2) { f += 1; }
-    if !share_case(b"epoll_share_thread_fork_exec", 3) { f += 1; }
+    if !share_case(b"epoll_share_fork_exec_cloexec\0", 0) { f += 1; }
+    if !share_case(b"epoll_share_fork_close_exit\0", 1) { f += 1; }
+    if !share_case(b"epoll_share_fork_exit\0", 2) { f += 1; }
+    if !share_case(b"epoll_share_thread_fork_exec\0", 3) { f += 1; }
     if !dup_case() { f += 1; }
     f
 }
