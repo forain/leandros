@@ -12,8 +12,10 @@ Without ports/cosmic-comp's 0002 patch it fails with 0 callbacks while off.
 Takes the QEMU VM (use the qemu lock); run id `<LEANDROS_RUN_ID or blanktest>`.
 """
 import os
-import subprocess
 import sys
+
+import driver
+import ffsdiag
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
@@ -22,8 +24,11 @@ out = os.environ.setdefault("FFSESSION_OUT", "/tmp/ffsession")
 os.environ.setdefault("LEANDROS_RUN_ID", "blanktest")
 post = ("XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-1 /bin/blanktest; "
         "echo BLANKTEST_RC=$?")
-r = subprocess.run([sys.executable, os.path.join(HERE, "ffsession.py"), arch, tag,
-                    "--nofirefox", "--post", post])
+# runtests gives this script max(300, HOST_TIMEOUTS.get(script, 0)) * driver.wait_scale(arch)
+# (blanktest.py is not in HOST_TIMEOUTS); finish ~30 s under it so ffsession is killed
+# here (log kept, QEMU stopped) instead of by runtests' timeout.
+budget = float(os.environ.get("BLANKTEST_BUDGET", 280 * driver.wait_scale(arch) - 30))
+rc, flines, secs = ffsdiag.run(arch, tag, ["--nofirefox", "--post", post], budget)
 try:
     text = open(f"{out}/run-{tag}/post.txt").read()
 except OSError:
@@ -31,5 +36,6 @@ except OSError:
 lines = [l for l in text.splitlines() if l.startswith("blanktest:") or "BLANKTEST_RC" in l]
 print("\n".join(lines))
 ok = "blanktest: PASS" in text
-print(f"blanktest.py {arch}: {'PASS' if ok else 'FAIL'} (ffsession rc {r.returncode}, {out}/run-{tag})")
+ffsdiag.diag(flines, f"{out}/run-{tag}", ok)
+print(f"blanktest.py {arch}: {'PASS' if ok else 'FAIL'} (ffsession rc {rc}, {out}/run-{tag})")
 sys.exit(0 if ok else 1)

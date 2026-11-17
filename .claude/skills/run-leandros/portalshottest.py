@@ -14,8 +14,10 @@ Takes the QEMU VM (use the qemu lock); run id `<LEANDROS_RUN_ID or portalshot>`.
 """
 import os
 import re
-import subprocess
 import sys
+
+import driver
+import ffsdiag
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
@@ -28,8 +30,10 @@ post = (f"su leandro -c 'DBUS_SESSION_BUS_ADDRESS={bus} DBUS_SYSTEM_BUS_ADDRESS=
         f"XDG_RUNTIME_DIR=/run/user/1000 /usr/libexec/leandros-sysbus portal screenshot {t}' "
         "> /tmp/portalshot.out 2>&1; echo PORTALSHOT_RC=$?; grep -E '^(PASS|FAIL|PORTAL_PROBE)' /tmp/portalshot.out; "
         "ls -l /tmp/screenshot-*.png")
-r = subprocess.run([sys.executable, os.path.join(HERE, "ffsession.py"), arch, tag,
-                    "--nofirefox", "--post", post, "--post-timeout", "240"])
+# runtests gives this script HOST_TIMEOUTS["portalshottest.py"] (900) * driver.wait_scale(arch);
+# finish ~30 s under it so ffsession is killed here (log kept, QEMU stopped).
+budget = float(os.environ.get("PORTALSHOT_BUDGET", 900 * driver.wait_scale(arch) - 30))
+rc, flines, secs = ffsdiag.run(arch, tag, ["--nofirefox", "--post", post, "--post-timeout", "240"], budget)
 try:
     text = open(f"{out}/run-{tag}/post.txt").read()
 except OSError:
@@ -39,5 +43,6 @@ print("\n".join(lines))
 m = re.search(r"^-\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s.*/tmp/screenshot-\S+\.png", text, re.M)
 ok = ("PORTALSHOT_RC=0" in text and m is not None and int(m.group(1)) > 0
       and re.search(r"^PASS Screenshot\.Screenshot", text, re.M) is not None)
-print(f"portalshottest.py {arch}: {'PASS' if ok else 'FAIL'} (ffsession rc {r.returncode}, {out}/run-{tag})")
+ffsdiag.diag(flines, f"{out}/run-{tag}", ok)
+print(f"portalshottest.py {arch}: {'PASS' if ok else 'FAIL'} (ffsession rc {rc}, {out}/run-{tag})")
 sys.exit(0 if ok else 1)
