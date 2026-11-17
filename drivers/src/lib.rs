@@ -92,6 +92,7 @@ pub mod kms;
 pub mod kms_v3d;
 pub mod vector_font;
 pub mod glyphs;
+pub mod wcwidth;
 pub mod drm;
 pub mod drm_driver;
 pub mod drm_console;
