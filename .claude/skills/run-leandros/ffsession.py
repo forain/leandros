@@ -40,6 +40,8 @@ virtio-tablet sends as EV_REL/REL_WHEEL): in cosmic-term after `seq 1 400`,
 and in Firefox on a long generated page (the default URL under --wheel).
 Each step saves before/after screenshots (wheel-*.ppm) and logs the fraction
 of pixels that changed; `wheel.json` holds the numbers.
+`--noterm` skips the cosmic-term step (meta_l-t, wait, term.ppm, --wheel terminal
+block); without it meta_l-t is re-pressed every 45 s until T_TERM.
 `--fresh-profile` deletes leandro's Firefox profile first (a first-run
 profile, as on a newly built image).
 `--shot-every S` sets the observation screenshot period (default 30 s).
@@ -78,6 +80,7 @@ def opt(name, default, conv=str):
 
 
 NOFF = "--nofirefox" in A
+NOTERM = "--noterm" in A
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 WAIT = opt("--wait", 150, int)
@@ -412,18 +415,35 @@ def main():
     wait_for("desktop", have("cosmic-panel"), T_DESKTOP)
     SER.pump(3 * SCALE)
     drv("screenshot", f"{OUT}/desktop.ppm", t=90)
-    key("meta_l-t")
-    wait_for("terminal", have("cosmic-term"), T_TERM)
-    SER.pump(3 * SCALE)        # the terminal's window maps after its process
-    drv("screenshot", f"{OUT}/term.ppm", t=90)
-    if WHEEL:
-        typ("seq 1 400"); key("ret")
-        SER.pump(3 * SCALE)
-        wheel_step("term-up", "up", 15)
-        wheel_step("term-down", "down", 15)
-        # cosmic-term's "View" menu: a click must still open it.
-        click_step("term-view-menu", {1280: (352, 141), 1920: (586, 176)})
-        key("esc")
+    if NOTERM:
+        log("terminal: skipped (--noterm)")
+        STEPS["terminal"] = "skipped"
+    else:
+        t_term = time.time()
+        key("meta_l-t")
+        n = 0
+        while True:
+            left = T_TERM - (time.time() - t_term)
+            if wait_for("terminal", have("cosmic-term"), min(45 * SCALE, max(left, 1))):
+                STEPS["terminal"] = round(time.time() - t_term, 1)
+                break
+            if T_TERM - (time.time() - t_term) <= 0:
+                STEPS["terminal"] = None
+                break
+            n += 1
+            log(f"terminal: meta_l-t retry {n}")
+            key("meta_l-t")
+        STEPS["term_retries"] = n
+        SER.pump(3 * SCALE)        # the terminal's window maps after its process
+        drv("screenshot", f"{OUT}/term.ppm", t=90)
+        if WHEEL:
+            typ("seq 1 400"); key("ret")
+            SER.pump(3 * SCALE)
+            wheel_step("term-up", "up", 15)
+            wheel_step("term-down", "down", 15)
+            # cosmic-term's "View" menu: a click must still open it.
+            click_step("term-view-menu", {1280: (352, 141), 1920: (586, 176)})
+            key("esc")
     snap("desktop")
     if not NOFF:
         typ("sh /tmp/ffrun.sh"); key("ret")
@@ -492,6 +512,7 @@ def main():
         json.dump(WHEELRES, open(f"{OUT}/wheel.json", "w"), indent=1)
     STEPS["total"] = round(time.time() - T0, 1)
     json.dump(STEPS, open(f"{OUT}/steps.json", "w"), indent=1)
+    log("STEPS " + json.dumps(STEPS))
     subprocess.run(["cp", driver.SERIAL_LOG, f"{OUT}/serial.log"])
     subprocess.run(["cp", driver.QEMU_STDERR_LOG, f"{OUT}/qemu-stderr.log"])
     drv("stop", t=120)
