@@ -516,7 +516,11 @@ build_mame() {
     (
         ulimit -n 65536 2>/dev/null || true
         cd "$mame_dir" || exit 1
-        make -f Makefile.leandros ARCH="$arch" \
+        # The sibling tree (and its build/ dir) is shared by concurrent runs (box farm):
+        # serialize the make with flock where available so runs cannot clobber each other.
+        local lock=()
+        command -v flock >/dev/null 2>&1 && lock=(flock "$mame_dir/../.mame-build.lock")
+        "${lock[@]}" make -f Makefile.leandros ARCH="$arch" \
             LEANDROS_ROOT="$ROOT_DIR" \
         || port_failed mame "$arch" "MAME build"
     )
