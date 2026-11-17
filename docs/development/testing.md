@@ -113,6 +113,27 @@ Suites added since 2026-10-18 (all in `SUITES` of `runtests.py`, or commands in 
 | `permtest` (not in regress) | Includes the backlight group cases; run it explicitly |
 | `bttest`, `kmodctltest`, `netlinktest`, `proctest`, `strtest`, `floattest` | Bluetooth host core, module control, netlink, `/proc`, relibc string conformance, hard-float C ABI |
 
+Added in the 2026-11-11 to 11-17 wave:
+
+| Suite or command | What it guards |
+|---|---|
+| `slow` (group) | The long host tests kept out of the ten-minute `regress`: `f2fsorphantest`, `f2fscptest`, `f2fscrashtest`, `pagecache-crashtest`, `usbunplugtest`, `powerctltest`, `f2fsfulltest`. Each has its own timeout (`HOST_TIMEOUTS` in `runtests.py`) because a single 300 s default either killed them or hid a hang. Gate with `--suite slow` |
+| `virgl` (group) and `audio-session`, `video`, `clickmove`, `udevhot`, `coreutils` | `host:virglsessiontest.py <name>`: each boots a virgl COSMIC session of its own and checks one thing (audio reaching the sink, video playback, a click moving the pointer, a hot-plugged device, a brush guest running coreutils). `virgl` runs the first four |
+| `portalshot` | A live session where the portal `Screenshot` call must return response 0 and a non-empty PNG. The probe grants the PermissionStore permission first, as the Access dialog would, otherwise the portal waits on a dialog nobody answers |
+| `vkwl` | x86-64 `--venus`: a Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted |
+| `longline` and `rawline` | The serial input path: an 85-step command of about 4 KB must run, and (`rawline`) typed as one unpaced burst it must arrive above a minimum end-to-end rate. They exist because of the COM1 receive-FIFO trigger (set to 14 bytes on x86-64 so console input is no longer starved) |
+| `execdev` (regress) | an `ET_EXEC` image whose segments sit at the QEMU virt GIC and UART addresses must run: every aarch64 user page-table root used to carry kernel-only identity pages there, which shadowed the user mapping and made MAME (linked at lld's default base) fault forever. Fixed in `arch/aarch64/src/paging.rs` |
+| `harness` | `harnesstest.py`: the harness itself (line-buffered output, automatic `-D` when host tracing is on, quoted commands surviving the ssh hop) |
+| `podsmoke`, `podbridge`, `podpasta`, `podpause` | Root and rootless `podman run`, the default bridge, pasta port forwarding, pause/unpause |
+
+**Harness behaviour worth knowing before trusting a result.**
+
+- *Long command lines are staged.* brush repaints the whole edit line for every input burst, so typing an N-byte line costs O(N^2) serial output. Lines longer than `LEANDROS_LONG_LINE` (default 600) are written to a guest file in 300-byte typed pieces and run with `.`; `raw` mode (the `rawline` suite) never stages. Before this, a 3.7 KB line was cancelled and retried until the suite timed out with the guest idle.
+- *The prompt is found under kernel log lines.* A prompt glued to a timestamped kernel line (`[   26.096999] [USB-MSC] ...`, any tag, any case) used to hide it, so the driver waited out a 3 s timeout per command; that looked like an echo stall on x86-64 and was the harness.
+- *Arch-only host suites skip* on the other architecture instead of failing, and `runtests` re-boots its VM after a host script that booted its own.
+- *Output is line-buffered* and the box farm's runs are detached, so a dead waiter loses nothing (see [workflow](workflow.md#locks-the-regress-farm-and-lane-discipline)).
+- `ffsession.py --noterm` skips the cosmic-term step, which the session tests (`blanktest`, `portalshot`, the virgl suites) do not need and which was their main flake; `ffsession` runs under an inner time budget and prints `DIAG` lines (serial tail, `steps.json`) when it is killed, so a timeout carries its own evidence.
+
 Known flakes (re-run once under the lock before investigating): the `nettag2test` wake-count cases, `sigtest timed_wait_stop_resumes_remainder`, `timertest realtime_is_not_uptime`, `scmtest tcp_connect_refused`, `sshsmoke ssh_hostkey`. A wedged `socket_vmnet` bridge (one stalled VM deafens the others) makes `runtests` fall back to SLIRP.
 
 The graphical session has its own tests
