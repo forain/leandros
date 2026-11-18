@@ -152,8 +152,9 @@ CFGWRITE_CHECK = (
     "dly() { while read k v; do [ \"$k\" = fsync_delayed ] && echo $v; done < /proc/f2fsstat; }; "
     "a=$(dly); out=$(/bin/sudo -u leandro /bin/fsbench cfgwrite /home/leandro/.cfgchk 30); rc=$?; b=$(dly); "
     "/bin/sudo -u leandro /bin/rm -rf /home/leandro/.cfgchk; "
-    "pk=${out#*per_key_us=}; pk=${pk%% *}; echo \"cfgwrite: per_key_us=$pk delayed=$a..$b rc=$rc\"; "
-    "[ $rc = 0 ] && [ -n \"$b\" ] && [ $((b - a)) -le 3 ] && [ \"$pk\" -lt 150000 ] "
+    "ew=0; while read k v; do [ \"$k\" = cp_ewma_us ] && ew=$v; done < /proc/f2fsstat; "
+    "pk=${out#*per_key_us=}; pk=${pk%% *}; echo \"cfgwrite: per_key_us=$pk delayed=$a..$b cp_ewma_us=$ew rc=$rc\"; "
+    "[ $rc = 0 ] && [ -n \"$b\" ] && [ $((b - a)) -le 3 ] && [ \"$pk\" -lt 150000 ] && [ \"$ew\" -lt 1500000 ] "
     "&& echo 'cfgwrite: PASS' || { echo 'cfgwrite: FAIL'; false; }"
 )
 

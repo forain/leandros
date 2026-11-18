@@ -7850,6 +7850,8 @@ pub static F2FS_LX_FALLBACK: core::sync::atomic::AtomicU64 = core::sync::atomic:
 pub static F2FS_LX_NODES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_FSYNC_DELAYED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_FSYNC_UNDELAYED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Checkpoint device-write time average (us) that sizes the group-commit window (lane f2fsckpt).
+pub static F2FS_CP_EWMA_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_NOIO_ROUNDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_NOIO_GAVE_UP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static F2FS_DROP_CLEAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -7878,6 +7880,7 @@ fn gen_f2fsstat(drop: bool) -> Option<VnodeKind> {
     put("lx_nodes", F2FS_LX_NODES.load(Relaxed));
     put("fsync_delayed", F2FS_FSYNC_DELAYED.load(Relaxed));
     put("fsync_undelayed", F2FS_FSYNC_UNDELAYED.load(Relaxed));
+    put("cp_ewma_us", F2FS_CP_EWMA_US.load(Relaxed));
     proc_snapshot(b"/tmp/.f2fsstat", &out, false)
 }
 
