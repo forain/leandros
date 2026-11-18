@@ -13606,14 +13606,82 @@ pub fn fh_remember(id: (u64, u64), path: &[u8]) {
 /// (dev, ino) of `path` and the path recorded for the handle; `None` when the
 /// filesystem cannot be watched (EOPNOTSUPP).
 pub fn fh_ident(path: &[u8]) -> Option<(u64, u64)> {
-    if !inotify::may_watch(path) && tmpfs_path(path).is_none() { return None; }
+    if !inotify::may_watch(path) && tmpfs_path(path).is_none() && !is_f2fs_path(path) { return None; }
     let p = tmpfs_path(path).unwrap_or(path);
     inotify_ident(p).map(|i| i.id)
 }
 
-/// Path recorded for `id` provided it still names the same inode.
-/// `Err(true)` = unknown or gone (ESTALE).
-pub fn fh_lookup(dev: Option<u64>, ino: u64) -> Option<alloc::vec::Vec<u8>> {
+/// Does `path` lie on an f2fs mount (handles decode by inode number there)?
+fn is_f2fs_path(path: &[u8]) -> bool {
+    if is_tmp_path(path) { return false; }
+    let port = match find_mount_port(path) { Some(p) => p, None => return false };
+    MOUNTS.lock().iter().any(|e| e.in_use && e.port == port && e.fstype == "f2fs")
+}
+
+/// f2fs-only VFS tag: inode number -> mount-relative path + i_generation.
+const VFS_INO_PATH_F2FS: u64 = 0x7B;
+
+/// Ask the f2fs mount holding `host` for inode `ino`: (mount prefix, relative
+/// path, i_generation), `Err(true)` = the inode is gone (ESTALE), `Err(false)`
+/// = no answer (other filesystem, or no live name is reachable).
+fn f2fs_ino_path(host: &[u8], ino: u64) -> Result<(&'static str, Vec<u8>, u32), bool> {
+    let port = find_mount_port(host).ok_or(false)?;
+    let prefix = {
+        let m = MOUNTS.lock();
+        match m.iter().find(|e| e.in_use && e.port == port && e.fstype == "f2fs") { Some(e) => e.prefix, None => return Err(false) }
+    };
+    let mut buf = alloc::vec![0u8; 4096];
+    let mut msg = Message::empty();
+    msg.tag = VFS_INO_PATH_F2FS;
+    msg.data[0..8].copy_from_slice(&ino.to_le_bytes());
+    msg.data[8..16].copy_from_slice(&(buf.as_mut_ptr() as u64).to_le_bytes());
+    msg.data[16..24].copy_from_slice(&(buf.len() as u64).to_le_bytes());
+    let r = call_port(port, msg);
+    let v = i64::from_le_bytes(r.data[0..8].try_into().unwrap_or([0xff; 8]));
+    if v == -116 { return Err(true); }
+    if v < 0 { return Err(false); }
+    let n = (v as u64 & 0xffff_ffff) as usize;
+    let g = ((v as u64) >> 32) as u32;
+    buf.truncate(n.min(4096));
+    Ok((prefix, buf, g))
+}
+
+/// i_generation to put in a handle for `host` (0 where the filesystem has none).
+pub fn fh_gen(host: &[u8], id: (u64, u64)) -> u32 {
+    if is_tmp_path(host) { return 0; }
+    f2fs_ino_path(host, id.1).map(|r| r.2).unwrap_or(0)
+}
+
+/// Path of the file a handle (`ino`, `gen`) names on the filesystem `mp` lies
+/// on: asked of the owning filesystem by inode number (f2fs: rebuilt from
+/// i_pino/i_name; tmpfs: the pool slot owning the inode), so renames follow
+/// and handles survive remounts and reboots. Anything else (and an f2fs hard
+/// link whose recorded name is gone) falls back to the issued-handle table.
+/// `None` = ESTALE.
+pub fn fh_lookup(mp: &[u8], dev: Option<u64>, ino: u64, gen: u32) -> Option<alloc::vec::Vec<u8>> {
+    if is_tmp_path(mp) {
+        let found = {
+            let tmp = TMP_FILES.lock();
+            tmp.iter().find(|e| e.in_use() && !e.path().is_empty() && e.ino == ino && !e.is_link && dev.map_or(true, |d| tmpfs_dev_of(e.path()) == Some(d))).map(|e| e.path().to_vec())
+        };
+        if let Some(p) = found {
+            if fh_ident(&p).map_or(false, |i| i.1 == ino && dev.map_or(true, |d| d == i.0)) { return Some(p); }
+        }
+    } else {
+        match f2fs_ino_path(mp, ino) {
+            Ok((prefix, rel, g)) => {
+                if gen != 0 && g != gen { return None; }
+                let mut p = prefix.as_bytes().to_vec();
+                while p.len() > 1 && p.last() == Some(&b'/') { p.pop(); }
+                if p == b"/" { p.clear(); }
+                p.extend_from_slice(&rel);
+                if p.is_empty() { p.push(b'/'); }
+                return Some(p);
+            }
+            Err(true) => return None,
+            Err(false) => {}
+        }
+    }
     let (id, p) = FH_TABLE.lock().iter().find(|e| e.0 .1 == ino && dev.map_or(true, |d| d == e.0 .0)).map(|e| (e.0, e.1.clone()))?;
     if fh_ident(&p) == Some(id) { Some(p) } else { None }
 }
@@ -13641,7 +13709,9 @@ fn fan_fid_record(out: &mut Vec<u8>, ty: u8, id: (u64, u64), name: Option<&[u8]>
     out.extend_from_slice(&12u32.to_le_bytes());
     out.extend_from_slice(&0x4ci32.to_le_bytes());
     out.extend_from_slice(&id.1.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    let hp = FH_TABLE.lock().iter().find(|e| e.0 == id).map(|e| e.1.clone());
+    let g = hp.map_or(0, |p| fh_gen(&p, id));
+    out.extend_from_slice(&g.to_le_bytes());
     if let Some(n) = name { out.extend_from_slice(n); out.push(0); }
     while (out.len()) % 4 != 0 { out.push(0); }
 }

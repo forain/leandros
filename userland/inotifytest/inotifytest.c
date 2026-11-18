@@ -19,6 +19,7 @@
 #include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1488,6 +1489,54 @@ static void t_fhandle(void)
     if (ffd >= 0) close(ffd);
 }
 
+/* Handle follows the inode: rename, hard link, delete, on directory `dir`. */
+static int fh_open_ino(int mfd, struct fh20 *h, unsigned long long ino, int *err)
+{
+    int fd = (int)syscall(FH_OPEN, mfd, h, O_RDONLY); *err = errno;
+    struct stat so; int ok = fd >= 0 && fstat(fd, &so) == 0 && so.st_ino == ino;
+    if (fd >= 0) close(fd);
+    return ok;
+}
+static int fh_follow_in(const char *dir, const char *tag)
+{
+    char a[160], b[160], c[160]; int e, mid = 0;
+    snprintf(a, sizeof a, "%s/fha", dir); snprintf(b, sizeof b, "%s/fhb", dir); snprintf(c, sizeof c, "%s/fhc", dir);
+    unlink(a); unlink(b); unlink(c);
+    int f = open(a, O_CREAT | O_WRONLY, 0644); if (f < 0) { printf("  %s: create failed\n", tag); return 0; }
+    close(f);
+    struct stat st; stat(a, &st);
+    struct fh20 h; memset(&h, 0, sizeof h); h.hb = 20;
+    if (syscall(FH_N2H, AT_FDCWD, a, &h, &mid, 0) != 0) { printf("  %s: n2h failed\n", tag); return 0; }
+    int mfd = open(dir, O_RDONLY | O_DIRECTORY);
+    int r0 = fh_open_ino(mfd, &h, st.st_ino, &e);
+    /* renamed file reopens */
+    int rn = rename(a, b) == 0; int r1 = fh_open_ino(mfd, &h, st.st_ino, &e);
+    /* hard link, then rename the first name: still reopens */
+    int lk = link(b, c) == 0; int rn2 = rename(b, a) == 0; int r2 = fh_open_ino(mfd, &h, st.st_ino, &e);
+    /* one name left after unlinking another: still reopens */
+    int u1 = unlink(c) == 0; int r3 = fh_open_ino(mfd, &h, st.st_ino, &e);
+    /* deleted: ESTALE */
+    int u2 = unlink(a) == 0; int r4 = fh_open_ino(mfd, &h, st.st_ino, &e); int stale = !r4 && e == ESTALE;
+    int ok = r0 && rn && r1 && lk && rn2 && r2 && u1 && r3 && u2 && stale;
+    if (!ok) printf("  %s: r0=%d rn=%d r1=%d lk=%d rn2=%d r2=%d u1=%d r3=%d u2=%d stale=%d(e=%d) gen=%u\n", tag, r0, rn, r1, lk, rn2, r2, u1, r3, u2, stale, e, h.gen);
+    if (mfd >= 0) close(mfd);
+    return ok;
+}
+static void t_fhandle_follow(void)
+{
+    char d[128]; snprintf(d, sizeof d, "%s", base);
+    report("t_fhandle_follow_base", fh_follow_in(d, "base"));
+    mkdir("/root/fhtest", 0755);
+    struct statfs sf; int isf2 = statfs("/root/fhtest", &sf) == 0 && (unsigned long)sf.f_type == 0xF2F52010UL;
+    if (isf2) report("t_fhandle_follow_f2fs", fh_follow_in("/root/fhtest", "f2fs"));
+    /* f2fs handles carry a real, nonzero i_generation */
+    char p[64] = "/root/fhtest/gen"; int f = open(p, O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f);
+    struct fh20 h; memset(&h, 0, sizeof h); h.hb = 20; int mid;
+    long r = syscall(FH_N2H, AT_FDCWD, p, &h, &mid, 0);
+    if (isf2) report("t_fhandle_f2fs_gen", r == 0 && h.gen != 0);
+    unlink(p); rmdir("/root/fhtest");
+}
+
 /* A listener process denies / allows the execve of /bin/true. */
 static int fan_exec_run(unsigned resp, int *evmask, int *child_rc)
 {
@@ -1703,7 +1752,7 @@ static void t_hl_cases(void)
     t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
     t_fanperm_deny(); t_fanperm_allow(); t_fanperm_access(); t_fanperm_close_allows(); t_fanperm_self(); t_fanperm_einval(); t_fan_ignore();
     t_fan_hardlink();
-    t_fanfid_einval(); t_fanfid_dfid_name(); t_fanfid_dir_fid(); t_fanfid_self(); t_fhandle(); t_fanperm_exec(); t_fanperm_deny_errno();
+    t_fanfid_einval(); t_fanfid_dfid_name(); t_fanfid_dir_fid(); t_fanfid_self(); t_fhandle(); t_fhandle_follow(); t_fanperm_exec(); t_fanperm_deny_errno();
     t_fan_rename(); t_fan_open_exec(); t_fan_mount_scope(); t_fan_fs_scope(); t_fan_exec_open(); t_fanperm_create(); t_fan_fs_fid();
 }
 
