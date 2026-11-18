@@ -55,7 +55,7 @@
 
 extern crate leandros_libc;
 
-use leandros_libc::syscall::{syscall2, syscall3, syscall4};
+use leandros_libc::syscall::{syscall2, syscall3, syscall4, syscall5};
 use leandros_libc::{
     clock_gettime, close, exit, fork, mmap, munmap, nanosleep, open, read, timespec, wait4, write,
     CLOCK_MONOTONIC, STDOUT_FILENO,
@@ -74,6 +74,7 @@ mod nr {
     pub const MKDIRAT: usize = 258;
     pub const UNLINKAT: usize = 263;
     pub const MEMFD_CREATE: usize = 319;
+    pub const RENAMEAT2: usize = 316;
 }
 #[cfg(target_arch = "aarch64")]
 mod nr {
@@ -88,6 +89,7 @@ mod nr {
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
     pub const MEMFD_CREATE: usize = 279;
+    pub const RENAMEAT2: usize = 276;
 }
 
 const O_RDONLY: i32 = 0;
@@ -221,7 +223,7 @@ unsafe fn arg<'a>(argc: i32, argv: *const *const u8, i: i32) -> Option<&'a [u8]>
 }
 
 fn usage() -> i32 {
-    let m = b"FSBENCH usage: fsbench read <path> [kib] | mmapdir <dir> <nproc> [maxfiles] | walk <dir> | tick <sec> [period_ms] | statlat <path> <sec> [period_ms] | dbwrite <file> <rate> [sec] [file_kib] | statfs <n> [path] | statwalk <dir> <sec> | stallprobe <colddir> <file> <sec> [max_ms]\n";
+    let m = b"FSBENCH usage: fsbench read <path> [kib] | mmapdir <dir> <nproc> [maxfiles] | walk <dir> | tick <sec> [period_ms] | statlat <path> <sec> [period_ms] | dbwrite <file> <rate> [sec] [file_kib] | statfs <n> [path] | statwalk <dir> <sec> | stallprobe <colddir> <file> <sec> [max_ms] | cfgwrite <dir> <nkeys>\n";
     unsafe { write(STDOUT_FILENO, m.as_ptr(), m.len()) };
     2
 }
@@ -1061,6 +1063,94 @@ unsafe fn cmd_tmpbench(argc: i32, argv: *const *const u8) -> i32 {
     0
 }
 
+/// `cfgwrite <dir> <nkeys>`: cosmic-config's per-key write, as the
+/// atomicwrites crate does it (AtomicFile::write, AllowOverwrite): mkdir a
+/// private temp dir `<dir>/.atomicwriteN`, create `tmpfile.tmp` in it, write,
+/// fsync the file, renameat it to `<dir>/keyN`, fsync the temp dir and the
+/// target dir, rmdir the temp dir. Prints the mean and max time per phase.
+unsafe fn cmd_cfgwrite(argc: i32, argv: *const *const u8) -> i32 {
+    let Some(dir) = arg(argc, argv, 2) else { return usage() };
+    let Some(n) = arg(argc, argv, 3).and_then(parse_u) else { return usage() };
+    if dir.len() > 400 { return usage(); }
+    let at = AT_FDCWD as usize;
+    const O_CREAT_WR: usize = 0o1 | 0o100 | 0o1000 | 0o2000000; // O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC
+    let o_dir = (O_RDONLY | O_DIRECTORY) as usize | 0o2000000;
+    let mut dz = [0u8; PATH_MAX];
+    dz[..dir.len()].copy_from_slice(dir);
+    syscall3(nr::MKDIRAT, at, dz.as_ptr() as usize, 0o755);
+    const NPH: usize = 9;
+    let names: [&[u8]; NPH] = [b"mkdir", b"create", b"write", b"fsync_file", b"open_dirs", b"rename",
+                               b"fsync_tmpdir", b"fsync_dir", b"rmdir"];
+    let mut sum = [0u64; NPH];
+    let mut max = [0u64; NPH];
+    let mut errs = 0u64;
+    let tmpname = b"tmpfile.tmp\0";
+    let data = b"Some(\n    (\n        value: 0.5,\n    ),\n)";
+    let mut tp = [0u8; PATH_MAX];
+    let mut kp = [0u8; 64];
+    let t_all = now_us();
+    for i in 0..n {
+        let mut o = Out::new();
+        o.s(dir);
+        o.s(b"/.atomicwrite");
+        o.u(i);
+        tp[..o.len].copy_from_slice(&o.buf[..o.len]);
+        tp[o.len] = 0;
+        let key = numpath(&mut kp, b"key", i);
+        let mut t = [0u64; NPH + 1];
+        t[0] = now_us();
+        let r0 = syscall3(nr::MKDIRAT, at, tp.as_ptr() as usize, 0o700);
+        t[1] = now_us();
+        let fd = syscall4(nr::OPENAT, at, tp.as_ptr() as usize, o_dir, 0);
+        let ffd = if fd >= 0 { syscall4(nr::OPENAT, fd as usize, tmpname.as_ptr() as usize, O_CREAT_WR, 0o644) } else { -1 };
+        t[2] = now_us();
+        let w = if ffd >= 0 { write(ffd as i32, data.as_ptr(), data.len()) } else { -1 };
+        t[3] = now_us();
+        let r1 = if ffd >= 0 { syscall2(nr::FSYNC, ffd as usize, 0) } else { -1 };
+        if ffd >= 0 { close(ffd as i32); }
+        t[4] = now_us();
+        let dfd = syscall4(nr::OPENAT, at, dz.as_ptr() as usize, o_dir, 0);
+        t[5] = now_us();
+        let r2 = if fd >= 0 && dfd >= 0 {
+            syscall5(nr::RENAMEAT2, fd as usize, tmpname.as_ptr() as usize, dfd as usize, key as usize, 0)
+        } else { -1 };
+        t[6] = now_us();
+        let r3 = if fd >= 0 { syscall2(nr::FSYNC, fd as usize, 0) } else { -1 };
+        t[7] = now_us();
+        let r4 = if dfd >= 0 { syscall2(nr::FSYNC, dfd as usize, 0) } else { -1 };
+        t[8] = now_us();
+        if fd >= 0 { close(fd as i32); }
+        if dfd >= 0 { close(dfd as i32); }
+        let r5 = syscall3(nr::UNLINKAT, at, tp.as_ptr() as usize, 0x200);
+        t[9] = now_us();
+        if r0 < 0 || ffd < 0 || w < 0 || r1 < 0 || r2 < 0 || r3 < 0 || r4 < 0 || r5 < 0 {
+            errs += 1;
+            if errs == 1 { err(b"cfgwrite step failed", &tp[..o.len]); }
+        }
+        for k in 0..NPH {
+            let d = t[k + 1] - t[k];
+            sum[k] += d;
+            if d > max[k] { max[k] = d; }
+        }
+    }
+    let total = now_us() - t_all;
+    let mut o = Out::new();
+    o.s(b"FSBENCH cfgwrite");
+    o.kv(b"n", n);
+    o.kv(b"per_key_us", total / n.max(1));
+    o.kv(b"errors", errs);
+    o.flush();
+    for k in 0..NPH {
+        let mut o = Out::new();
+        o.s(b"FSBENCH cfgwrite phase ");
+        o.s(names[k]);
+        o.kv(b"mean_us", sum[k] / n.max(1));
+        o.kv(b"max_us", max[k]);
+        o.flush();
+    }
+    if errs != 0 { 1 } else { 0 }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if argv.is_null() {
@@ -1079,6 +1169,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         Some(b"tmpbench") => cmd_tmpbench(argc, argv),
         Some(b"fsyncdirty") => cmd_fsyncdirty(argc, argv),
         Some(b"wrlat") => cmd_wrlat(argc, argv),
+        Some(b"cfgwrite") => cmd_cfgwrite(argc, argv),
         _ => usage(),
     }
 }
