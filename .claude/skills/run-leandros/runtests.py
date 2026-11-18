@@ -45,6 +45,7 @@ Options:
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              straysweep host:straysweeptest.py (greetd exit spares detached ssh jobs, own boot)
+                             pktest   leandros-sysbus pk-test alone (PackageKit facade: install/remove htop over the network)
                              net      /bin/nettest alone
                              udp      /bin/udptest alone
                              pollnarrow host:pollnarrowtest.py alone
@@ -258,6 +259,10 @@ SUITES = {
                 # xdg-desktop-portal activation (Screenshot/FileChooser, cosmic
                 # backend), timedate1, SwitcherooControl and the a11y bus.
                 "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus svc-test",
+                # PackageKit facade over apk (cosmic-store backend): activation,
+                # resolve/search/install/remove through pkcon's client code,
+                # non-wheel refusal of the setuid helper. Needs network.
+                "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus pk-test",
                 # Input on one evdev device wakes no waiter on another (QMP
                 # tablet motion vs a waiter parked on the keyboard).
                 "host:evherdtest.py",
@@ -316,6 +321,7 @@ SUITES = {
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
+    "pktest": ["/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus pk-test"],
     "net": ["/bin/nettest"],
     "netlink": ["/bin/netlinktest"],
     "nft": ["/bin/nfttest"],

@@ -35,3 +35,16 @@ check:
 Build: `./build.sh [aarch64|x86_64|both]`. `scripts/build-all.sh` calls it
 from `stage_dbus_session`, and mkfs refuses to build an image whose staged
 binary is missing or older than these sources.
+
+`org.freedesktop.PackageKit` (`leandros-sysbus packagekit`) is the backend of
+cosmic-store: a PackageKit facade over apk (`src/packagekit.rs`). Resolve,
+GetPackages, GetUpdates, SearchNames and GetDetails run `apk.static` read-only
+as the session user; RefreshCache, InstallPackages, RemovePackages and
+UpdatePackages exec the set-user-ID-root `/usr/libexec/leandros-pk-helper`
+(`src/bin/leandros-pk-helper.rs`), which authorises root or the `wheel` group,
+validates names and runs `/usr/sbin/apk` (a refusal is `ErrorCode`
+not-authorized). InstallFiles and GetDetailsLocal answer not-supported. Every
+transaction logs one line to stderr. `/usr/bin/pkcon` is a client
+(`leandros-sysbus pkcon search name|resolve|install|remove|get-packages|get-updates|refresh|get-details`),
+and `leandros-sysbus pk-test` is the self-test (`pktest` suite; needs network).
+The Alpine appstream snapshot comes from `ports/appstream-alpine/build.sh`.

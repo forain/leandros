@@ -16,6 +16,8 @@
 //!   leandros-sysbus svc-test client: portal/timedate1/switcheroo/a11y activation checks
 //!   leandros-sysbus networkmanager  org.freedesktop.NetworkManager over /dev/netctl
 //!                            (or a scripted mock: LEANDROS_NM_MOCK, see nm/mock.rs)
+//!   leandros-sysbus packagekit  org.freedesktop.PackageKit (apk backend; setuid leandros-pk-helper for writes)
+//!   leandros-sysbus pkcon <args>  PackageKit command-line client (/usr/bin/pkcon); pk-test = its self-test
 //!   leandros-sysbus probe    client: exercises all of them, prints PASS/FAIL
 //!   leandros-sysbus portal <settings|screenshot|open-file|all> [timeout_s]
 //!                            client of org.freedesktop.portal.Desktop (ports/portal)
@@ -40,6 +42,9 @@ mod bluez;
 mod locale1;
 mod login1;
 mod nm;
+mod packagekit;
+mod pk_test;
+mod pkcon;
 mod polkit;
 mod power_profiles;
 mod portal_probe;
@@ -70,10 +75,10 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 /// shared by every worktree, so a sysbus rebuilt by a lane on an older tree
 /// would otherwise silently drop e.g. `bluez` or `power`. Add every new
 /// subcommand here.
-const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,bluez,bluez-test,probe,power,portal,timedate1,switcheroo,a11y,svc-test;";
+const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,packagekit,pk-test,pkcon,bluez,bluez-test,probe,power,portal,timedate1,switcheroo,a11y,svc-test;";
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|timedate1|switcheroo|a11y|svc-test|networkmanager|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|timedate1|switcheroo|a11y|svc-test|networkmanager|packagekit|pk-test|pkcon ARGS|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
     eprintln!("{SERVICES}");
     ExitCode::from(2)
 }
@@ -135,6 +140,14 @@ fn main() -> ExitCode {
             let (_pass, fail) = bluez::test::run(builder.build().await?).await;
             return Ok(Some(fail == 0));
         }
+        if which == "pk-test" {
+            let (_pass, fail) = pk_test::run(builder.build().await?).await;
+            return Ok(Some(fail == 0));
+        }
+        if which == "pkcon" {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            return Ok(pkcon::main_run(builder.build().await?, args).await);
+        }
         if which == "svc-test" {
             let (_pass, fail) = svc_test::run(builder.build().await?, std::env::args().nth(2).as_deref() == Some("portal")).await;
             return Ok(Some(fail == 0));
@@ -153,6 +166,7 @@ fn main() -> ExitCode {
             "timedate1" => timedate1::serve(builder).await?,
             "switcheroo" => switcheroo::serve(builder).await?,
             "a11y" => a11y::serve(builder, &address).await?,
+            "packagekit" => packagekit::serve(builder).await?,
             "networkmanager" => nm::serve(builder).await?,
             "bluez" => bluez::serve(builder).await?,
             _ => return Ok::<_, zbus::Error>(None),
