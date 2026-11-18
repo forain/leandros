@@ -293,7 +293,7 @@ SUITES = {
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
-                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py",
+                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
@@ -439,7 +439,7 @@ SUITES = {
     # Per-suite timeouts live in HOST_TIMEOUTS.
     "slow": ["host:f2fsorphantest.py", "host:f2fscptest.py", "host:f2fscrashtest.py",
              "host:pagecache-crashtest.py", "host:usbunplugtest.py", "host:powerctltest.py",
-             "host:f2fsfulltest.py"],
+             "host:f2fsfulltest.py", "host:trialwatchtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
@@ -548,7 +548,8 @@ def find_fails(out):
 # Host scripts that only make sense on one arch (they boot their own VM of that
 # arch). A run of the other arch reports them as a skip, not a failure.
 HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
-                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64"}
+                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64",
+                  "a64acpitest.py": "aarch64"}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):
