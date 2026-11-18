@@ -39,6 +39,8 @@ pub struct Conn {
     pub nmodes: usize,
     /// width, height, Hz
     pub modes: [(u32, u32, u32); 17],
+    pub edid: [u8; 256],
+    pub edid_len: usize,
 }
 
 pub struct Ops {
@@ -185,8 +187,12 @@ pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
         "modes" => {
             for &(wd, ht, _) in &c.modes[..c.nmodes.min(c.modes.len())] { let _ = writeln!(w, "{}x{}", wd, ht); }
         }
-        // No EDID is exposed to the guest (Linux: a zero-length file).
-        _ => {}
+        // The connector's EDID (Linux: a zero-length file without one).
+        _ => {
+            let n = c.edid_len.min(c.edid.len()).min(w.out.len());
+            w.out[..n].copy_from_slice(&c.edid[..n]);
+            w.pos = n;
+        }
     }
     Some(w.pos)
 }

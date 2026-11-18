@@ -120,6 +120,7 @@ SYSFS_CHECK = (
     "t drm_subsystem 'test -L /sys/dev/char/226:0/device/subsystem'; "
     "t drm_conn_status 'grep -qx connected /sys/class/drm/card0-HDMI-A-1/status && grep -qx enabled /sys/class/drm/card0-HDMI-A-1/enabled && grep -qx On /sys/class/drm/card0-HDMI-A-1/dpms'; "
     "t drm_conn_modes 'test -s /sys/class/drm/card0-HDMI-A-1/modes && grep -q x /sys/class/drm/card0-HDMI-A-1/modes && test -e /sys/class/drm/card0-HDMI-A-1/edid'; "
+    "t drm_conn_edid '! grep -q ^DRIVER=virtio-pci /sys/class/drm/card0/device/uevent || { test -s /sys/class/drm/card0-HDMI-A-1/edid && test \"$(od -An -tx1 -N8 /sys/class/drm/card0-HDMI-A-1/edid | tr -d \" \\n\")\" = 00ffffffffffff00; }'; "
     "t drm_conn_driver 'grep -q ^DRIVER=virtio-pci /sys/class/drm/card0/device/uevent || grep -q ^DRIVER=i915 /sys/class/drm/card0/device/uevent || grep -q ^DRIVER=v3d /sys/class/drm/card0/device/uevent'; "
     "t sys_drm_list 'ls /sys/class/drm | grep -qx card0 && ls /sys/class/drm | grep -qx renderD128 && ls /sys/class/drm | grep -q ^card0-'; "
     "t sys_char_list 'ls /sys/dev/char | grep -qx 226:0 && ls /sys/dev/char | grep -qx 226:128 && ls /sys/dev/char | grep -q ^13:'; "

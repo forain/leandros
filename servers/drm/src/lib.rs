@@ -533,7 +533,7 @@ fn sysdrm_conn(i: usize) -> Option<vfs_server::sysdrm::Conn> {
     let c = drivers::drm_device_interface::sysfs_connector(i)?;
     Some(vfs_server::sysdrm::Conn {
         conn_type: c.conn_type, type_id: c.type_id, connected: c.connected,
-        nmodes: c.nmodes, modes: c.modes,
+        nmodes: c.nmodes, modes: c.modes, edid: c.edid, edid_len: c.edid_len,
     })
 }
 
