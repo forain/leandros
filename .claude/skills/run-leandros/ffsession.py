@@ -449,7 +449,14 @@ def main():
         # IndexedDB/cache churn) is part of what is under test.
         log(sh("rm -rf /home/leandro/.mozilla /home/leandro/.cache/mozilla; ls -d /home/leandro/.mozilla 2>&1"))
 
-    wait_for("greeter", have("cosmic-greeter"), T_GREETER)
+    if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
+        # No greeter: keep what shows why (the compositor's log, every process's
+        # scheduler state, where the CPUs are) before the run goes on and is torn down.
+        open(f"{OUT}/greeterfail.txt", "w").write(sh(
+            "tail -n 60 /var/log/greetd.log; echo ===STAT; cat /proc/[0-9]*/stat; "
+            "echo ===STATUS; for p in /proc/[0-9]*; do head -c 400 $p/cmdline 2>/dev/null | tr '\\0' ' '; "
+            "echo; cat $p/status 2>/dev/null | head -n 12; done; echo ===WAKE; cat /proc/wakestat; "
+            "echo ===SYS; cat /proc/sysstat; echo ===PC; cat /proc/pcsample; echo ===VT; cat /proc/vtstat", 300))
     SER.pump(float(os.environ.get("FFS_GREETER_PAINT", 3)) * SCALE)  # greeter first paint (virgl: ~90 s)
     typ("leandro"); key("ret")
     log("greeter login typed")
