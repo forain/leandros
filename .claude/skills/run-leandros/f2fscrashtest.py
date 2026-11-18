@@ -238,7 +238,12 @@ class Claims:
                     errs.append(f"r{k}: not a whole version (size {size}, gen {g})")
         for k, size in self.a.items():
             got = sa.get(k)
-            if got is None or got == 2 ** 64 - 1:
+            if got is None:
+                # No parseable SA line: a console line (kernel log) torn into
+                # it on the serial port, not a lost file (seen 2026-11-18:
+                # "a5: missing" while the fs was whole). The caller rescans.
+                errs.append(f"a{k}: no scan line (fsynced {size})")
+            elif got == 2 ** 64 - 1:
                 errs.append(f"a{k}: missing (fsynced {size})")
             elif got < size:
                 errs.append(f"a{k}: size {got} < fsynced {size}")
@@ -358,6 +363,13 @@ def main(argv):
                 fails.append(f"iter {it - 1}: crashscan did not finish: {scan[-300:]}")
             else:
                 errs = claims.check(scan)
+                if errs and all("no scan line" in e for e in errs):
+                    # crashscan only reads: a torn console line does not repeat.
+                    print("    rescan: " + "; ".join(errs[:4]), flush=True)
+                    r2 = run(f"/bin/f2fstest crashscan {pdir}", 300)
+                    if "SCAN_DONE" in r2["output"]:
+                        errs = [e.replace("no scan line", "no scan line twice")
+                                for e in claims.check(r2["output"])]
                 nclaims = len(claims.a) + len(claims.o_sync) + len(claims.n)
                 extra = f"; {claims.inflight} blocks of the in-flight rewrite" if claims.inflight else ""
                 if claims.uncaptured:
