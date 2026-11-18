@@ -413,6 +413,30 @@ def ctrl_t(name):
     open(f"{OUT}/{name}.txt", "wb").write(SER.buf[m:])
 
 
+# Keyboard-path trace (lane kbdfocus9). The session-env RUST_LOG never showed
+# up in the session log: cosmic-session does not relay cosmic-comp's stderr.
+# So the harness wraps the two binaries itself (root shell, before login):
+# /bin/cosmic-comp -> RUST_LOG focus/keyboard trace, stderr to its own file;
+# /bin/cosmic-term -> WAYLAND_DEBUG=1 (client side: wl_keyboard enter/keymap/key).
+# The real binaries move to /usr/libexec/lrf/ so argv[0] keeps its basename.
+WLTRACE = "--no-wltrace" not in A
+COMP_RUST_LOG = ("info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace,"
+                 "smithay::input::keyboard=trace")
+
+
+def install_wraps():
+    for name, extra in (("cosmic-comp", f"export RUST_LOG='{COMP_RUST_LOG}'"),
+                        ("cosmic-term", "export WAYLAND_DEBUG=1")):
+        src = f"{OUT}/wrap-{name}"
+        open(src, "w").write("#!/bin/sh\n"
+                             f"env > /tmp/{name}-env.$$ 2>/dev/null\n"
+                             f"{extra}\n"
+                             f"exec /usr/libexec/lrf/{name} \"$@\" 2>>/tmp/{name}-$(id -u).log\n")
+        sh(f"mkdir -p /usr/libexec/lrf; [ -e /usr/libexec/lrf/{name} ] || mv /bin/{name} /usr/libexec/lrf/{name}")
+        put_file(src, f"/bin/{name}")
+        log(sh(f"chmod 755 /bin/{name}; ls -l /usr/libexec/lrf/{name} /bin/{name} | cut -c1-120"))
+
+
 def session_diag(name):
     """Save a focus/keystroke summary of the COSMIC session log to OUT/<name>.txt."""
     c = ("L=/tmp/cosmic-session-1000.log; echo bytes=$(wc -c <$L); "
@@ -423,6 +447,21 @@ def session_diag(name):
          "echo ---warn; "
          "grep -iE 'warn|error|panic' $L | grep -v 'keycode' | tail -n 40 | cut -c1-300; "
          "echo ---tail; tail -n 25 $L | cut -c1-300")
+    if WLTRACE:
+        c += ("; echo ===COMPENV; grep -h '^RUST_LOG' /tmp/cosmic-comp-env.* /tmp/cosmic-term-env.*; "
+              "C=/tmp/cosmic-comp-1000.log; T=/tmp/cosmic-term-1000.log; "
+              "echo comp_bytes=$(wc -c <$C) term_bytes=$(wc -c <$T); "
+              "for p in 'Handling keystroke' 'Input forwarded to client' 'No client currently focused' "
+              "'intercepted by filter' 'Focus set to new surface' 'Focusing window' 'focus fixup'; do "
+              "echo \"comp $p=$(grep -c \"$p\" $C)\"; done; "
+              "echo ===COMPFOCUS; grep -E 'Focus set|Focusing window|focus fixup|Restoring focus|No client|intercepted' $C "
+              "| tail -n 30 | cut -c1-400; "
+              "echo ===TERMKBD; for p in 'wl_keyboard@[0-9]*[.]enter' 'wl_keyboard@[0-9]*[.]leave' "
+              "'wl_keyboard@[0-9]*[.]keymap' 'wl_keyboard@[0-9]*[.]key[(]' 'wl_keyboard@[0-9]*[.]modifiers'; do "
+              "echo \"term $p=$(grep -c \"$p\" $T)\"; done; "
+              "grep -E 'wl_keyboard|wl_seat' $T | grep -v '[.]key[(]' | tail -n 15 | cut -c1-200; "
+              "grep 'wl_keyboard@[0-9]*[.]key[(]' $T | tail -n 6 | cut -c1-200; "
+              "echo ===TERMTAIL; grep -v 'wl_callback\\|frame\\|wl_surface\\|wl_buffer\\|damage' $T | tail -n 20 | cut -c1-200")
     open(f"{OUT}/{name}.txt", "w").write(sh(c, 90))
 
 
@@ -480,7 +519,7 @@ def main():
         put_file(src, "/tmp/fflong.html")
     if url.startswith("file:///tmp/fftest.html"):
         sh("printf '%s' \"" + page + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
-    script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
+    script = ("unset WAYLAND_DEBUG; export RUST_LOG=info; echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
               "/bin/firefox --no-remote " + url + " >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
     sh(f"printf '%s\\n' '{script}' > /tmp/ffrun.sh; chmod 755 /tmp/ffrun.sh; cat /tmp/ffrun.sh")
     if "--fresh-profile" in A:
@@ -491,6 +530,8 @@ def main():
 
     # Compositor keyboard-focus / input trace for the session (see the profile).
     sh("printf '%s\\n' 'RUST_LOG=info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace' > /tmp/session-env")
+    if WLTRACE:
+        install_wraps()
     if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
         # No greeter: keep what shows why (the compositor's log, every process's
         # scheduler state, where the CPUs are) before the run goes on and is torn down.
