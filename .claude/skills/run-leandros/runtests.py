@@ -293,7 +293,7 @@ SUITES = {
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
-                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py",
+                "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.
@@ -439,7 +439,7 @@ SUITES = {
     # Per-suite timeouts live in HOST_TIMEOUTS.
     "slow": ["host:f2fsorphantest.py", "host:f2fscptest.py", "host:f2fscrashtest.py",
              "host:pagecache-crashtest.py", "host:usbunplugtest.py", "host:powerctltest.py",
-             "host:f2fsfulltest.py"],
+             "host:f2fsfulltest.py", "host:trialwatchtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
