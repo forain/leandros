@@ -425,13 +425,13 @@ COMP_RUST_LOG = ("info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace,
 
 
 def install_wraps():
-    for name, extra in (("cosmic-comp", f"export RUST_LOG='{COMP_RUST_LOG}'"),
+    for name, extra in (("cosmic-comp", f"export RUST_LOG='{COMP_RUST_LOG}' WAYLAND_DEBUG=server"),
                         ("cosmic-term", "export WAYLAND_DEBUG=1")):
         src = f"{OUT}/wrap-{name}"
         open(src, "w").write("#!/bin/sh\n"
                              f"env > /tmp/{name}-env.$$ 2>/dev/null\n"
                              f"{extra}\n"
-                             f"exec /usr/libexec/lrf/{name} \"$@\" 2>>/tmp/{name}-$(id -u).log\n")
+                             f"exec /usr/libexec/lrf/{name} \"$@\" >>/tmp/{name}-$(id -u).log 2>&1\n")
         sh(f"mkdir -p /usr/libexec/lrf; [ -e /usr/libexec/lrf/{name} ] || mv /bin/{name} /usr/libexec/lrf/{name}")
         put_file(src, f"/bin/{name}")
         log(sh(f"chmod 755 /bin/{name}; ls -l /usr/libexec/lrf/{name} /bin/{name} | cut -c1-120"))
@@ -448,19 +448,20 @@ def session_diag(name):
          "grep -iE 'warn|error|panic' $L | grep -v 'keycode' | tail -n 40 | cut -c1-300; "
          "echo ---tail; tail -n 25 $L | cut -c1-300")
     if WLTRACE:
-        c += ("; echo ===COMPENV; grep -h '^RUST_LOG' /tmp/cosmic-comp-env.* /tmp/cosmic-term-env.*; "
+        c += ("; echo ===COMPENV; cat /tmp/cosmic-comp-env.* /tmp/cosmic-term-env.* | grep -E '^(RUST_LOG|WAYLAND_DEBUG)='; "
               "C=/tmp/cosmic-comp-1000.log; T=/tmp/cosmic-term-1000.log; "
               "echo comp_bytes=$(wc -c <$C) term_bytes=$(wc -c <$T); "
               "for p in 'Handling keystroke' 'Input forwarded to client' 'No client currently focused' "
               "'intercepted by filter' 'Focus set to new surface' 'Focusing window' 'focus fixup'; do "
               "echo \"comp $p=$(grep -c \"$p\" $C)\"; done; "
-              "echo ===COMPFOCUS; grep -E 'Focus set|Focusing window|focus fixup|Restoring focus|No client|intercepted' $C "
-              "| tail -n 30 | cut -c1-400; "
-              "echo ===TERMKBD; for p in 'wl_keyboard@[0-9]*[.]enter' 'wl_keyboard@[0-9]*[.]leave' "
-              "'wl_keyboard@[0-9]*[.]keymap' 'wl_keyboard@[0-9]*[.]key[(]' 'wl_keyboard@[0-9]*[.]modifiers'; do "
+              "echo ===COMPFOCUS; grep -E 'Focus set|Focusing window|focus fixup|Restoring focus|No client|intercepted|"
+              "get_layer_surface|set_keyboard_interactivity|wl_keyboard#[0-9]+[.](enter|leave)|zwlr_layer_surface_v1#[0-9]+[.]destroy' $C "
+              "| grep -v ' key ' | tail -n 80 | cut -c1-300; "
+              "echo ===TERMKBD; for p in 'wl_keyboard#[0-9]*[.]enter' 'wl_keyboard#[0-9]*[.]leave' "
+              "'wl_keyboard#[0-9]*[.]keymap' 'wl_keyboard#[0-9]*[.]key[(]' 'wl_keyboard#[0-9]*[.]modifiers'; do "
               "echo \"term $p=$(grep -c \"$p\" $T)\"; done; "
               "grep -E 'wl_keyboard|wl_seat' $T | grep -v '[.]key[(]' | tail -n 15 | cut -c1-200; "
-              "grep 'wl_keyboard@[0-9]*[.]key[(]' $T | tail -n 6 | cut -c1-200; "
+              "grep 'wl_keyboard#[0-9]*[.]key[(]' $T | tail -n 6 | cut -c1-200; "
               "echo ===TERMTAIL; grep -v 'wl_callback\\|frame\\|wl_surface\\|wl_buffer\\|damage' $T | tail -n 20 | cut -c1-200")
     open(f"{OUT}/{name}.txt", "w").write(sh(c, 90))
 
