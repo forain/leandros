@@ -2291,6 +2291,38 @@ pub fn open_last_fence(open_id: u32) -> u64 {
     ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0)
 }
 
+/// Text for /proc/pollfds: virtio-gpu fence floor, out-fence queue, waiter
+/// counts and per-open DRM state. try_lock only; never blocks.
+pub fn pollfds_text(s: &mut alloc::string::String) {
+    use ::core::fmt::Write;
+    let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
+    let mut last = 0u64;
+    let ctxs: Option<[(u32, u32, u64); MAX_GPU_CTXS]> = VIRTGPU_CTXS.try_lock().map(|t| {
+        let mut a = [(0u32, 0u32, 0u64); MAX_GPU_CTXS];
+        for (i, c) in t.iter().enumerate() { a[i] = (c.open_id, c.ctx_id, c.last_fence); }
+        a
+    });
+    if let Some(a) = &ctxs { for e in a { if e.2 > last { last = e.2; } } }
+    let _ = writeln!(s, "gpu floor={} last_submitted={} out_fences={} fence_waiters={} fence_event_pending={} syncobj_waiters={} out_fence_rearms={}",
+        floor, last, OUT_FENCES_N.load(Ordering::Relaxed), FENCE_WAITERS.load(Ordering::Relaxed),
+        crate::virtio_gpu::FENCE_EVENT_PENDING.load(Ordering::Relaxed) as u64, SYNCOBJ_WAITERS.load(Ordering::Relaxed),
+        OUT_FENCE_REARMS.load(Ordering::Relaxed));
+    match OUT_FENCES.try_lock() {
+        Some(q) => for &(f, tok) in q.iter() {
+            let _ = writeln!(s, "  out fence={} slot={} retired={}", f, tok, (f <= floor) as u8);
+        },
+        None => { let _ = writeln!(s, "  out_fences busy"); }
+    }
+    match &ctxs {
+        Some(a) => for &(oid, cid, lf) in a.iter() {
+            if oid == 0 { continue; }
+            let _ = writeln!(s, "drm open={} ctx={} last_fence={} retired={} evtag_bit={}", oid, cid, lf,
+                (lf <= floor) as u8, drm_event_poll_tag(oid).trailing_zeros());
+        },
+        None => { let _ = writeln!(s, "drm ctxs busy"); }
+    }
+}
+
 // ── Out-fences: FENCE_FD_OUT made real ───────────────────────────────────────
 //
 // Until submission went asynchronous the out-fence eventfd could be minted
@@ -2336,14 +2368,37 @@ pub fn out_fence_register(fence: u64, token: u64) -> bool {
     if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire) { return false; }
     if q.len() >= MAX_OUT_FENCES { return false; }
     q.push_back((fence, token));
-    OUT_FENCES_N.store(q.len(), Ordering::Relaxed);
+    OUT_FENCES_N.store(q.len(), Ordering::SeqCst);
+    drop(q);
+    // Lost-wake guard (lane blanksess2). `out_fence_service` skips the queue
+    // without its lock when it reads OUT_FENCES_N == 0, so a retirement whose
+    // service ran between our floor check above and the N store just made
+    // saw an empty queue and consumed FENCE_EVENT_PENDING: the entry stayed
+    // queued with its fence retired and nothing left to signal it (the
+    // greeter's cosmic-comp sat in ppoll on this eventfd for 366 s, ~1 boot
+    // in 25 on aarch64 TCG). Store-buffering pair with the service: we store
+    // N then load the floor, it stores the floor then loads N, each side
+    // behind a SeqCst fence, so at least one of us sees the other. If it is
+    // us, re-arm the fence event so the next tick pays the entry.
+    ::core::sync::atomic::fence(Ordering::SeqCst);
+    if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::SeqCst) {
+        OUT_FENCE_REARMS.fetch_add(1, Ordering::Relaxed);
+        crate::virtio_gpu::FENCE_EVENT_PENDING.store(true, Ordering::Release);
+    }
     true
 }
+
+/// Registrations that found their fence retired right after queueing it and
+/// re-armed the fence event (diagnostics, /proc/pollfds).
+pub static OUT_FENCE_REARMS: AtomicUsize = AtomicUsize::new(0);
 
 /// Signal every armed out-fence whose fence has retired. Tick context: try_lock
 /// only; false means "call again next tick".
 fn out_fence_service() -> bool {
-    if OUT_FENCES_N.load(Ordering::Relaxed) == 0 { return true; }
+    // Pairs with the fence in `out_fence_register`: the floor this tick
+    // published must be ordered before our read of N.
+    ::core::sync::atomic::fence(Ordering::SeqCst);
+    if OUT_FENCES_N.load(Ordering::SeqCst) == 0 { return true; }
     let p = OUT_FENCE_SIGNAL.load(Ordering::Acquire);
     if p == 0 { return true; }
     // SAFETY: only ever written by `set_out_fence_signaller` from a `fn(u64) -> bool`.
