@@ -2692,7 +2692,7 @@ static int e7x_race(int m) {
     long long t0 = now_ns();
 #define E7R_DIAG(rc, fmt, ...) printf("DIAG e7race: rc=%d " fmt " ms=%lld\n", rc, ##__VA_ARGS__, (now_ns() - t0) / 1000000)
     if (stop == MAP_FAILED) { E7R_DIAG(12, "mmap errno=%d", errno); return 12; }
-    stop[0] = 0; stop[1] = 0; stop[2] = 0; stop[3] = 0; stop[4] = 0;
+    for (int z = 0; z < 8; z++) stop[z] = 0;
     mkdir("/tmp/e7x/rc", 0755);
     struct stat ss, st;
     if (stat("/tmp/e7x/src", &ss) < 0) { E7R_DIAG(13, "stat src errno=%d", errno); return 13; }
@@ -2704,20 +2704,28 @@ static int e7x_race(int m) {
             stop[1]++; /* odd: mounting, not yet read-only */
             if (mount("/tmp/e7x/src", "/tmp/e7x/rc", NULL, MS_BIND, NULL) < 0) { stop[3] = errno; stop[2] = 1; _exit(1); }
             if (mount(NULL, "/tmp/e7x/rc", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) { stop[3] = errno; stop[2] = 2; umount2("/tmp/e7x/rc", MNT_DETACH); _exit(2); }
-            stop[1]++; /* even: read-only for sure */
-            for (volatile int i = 0; i < 3000; i++) {}
+            int g = __atomic_add_fetch(&stop[1], 1, __ATOMIC_SEQ_CST); /* even: read-only for sure */
+            /* Handshake instead of a timed window (TCG under load rarely fit a whole open in
+             * one): wait (bounded) for the parent to start an open, detach racing it, then
+             * hold the even phase until that open returned, so the open is counted. */
+            long long w = now_ns();
+            while (__atomic_load_n(&stop[5], __ATOMIC_SEQ_CST) != g && !stop[0] && now_ns() - w < 2000000) {}
             umount2("/tmp/e7x/rc", MNT_DETACH);
+            w = now_ns();
+            while (__atomic_load_n(&stop[5], __ATOMIC_SEQ_CST) == g && __atomic_load_n(&stop[6], __ATOMIC_SEQ_CST) != g && !stop[0] && now_ns() - w < 20000000) {}
             stop[4]++;
         }
         _exit(0);
     }
     int through = 0, bad = 0, i = 0, opens = 0, openfail = 0, lasterr = 0;
     for (; i < 150000 && !bad && (i < 3000 || through < 400); i++) {
-        int g1 = stop[1];
+        int g1 = __atomic_load_n(&stop[1], __ATOMIC_SEQ_CST);
+        if ((g1 & 1) == 0) __atomic_store_n(&stop[5], g1, __ATOMIC_SEQ_CST); /* child detaches now, racing this open */
         int d = open("/tmp/e7x/rc", O_RDONLY | O_DIRECTORY);
+        if ((g1 & 1) == 0) __atomic_store_n(&stop[6], g1, __ATOMIC_SEQ_CST);
         if (d < 0) { openfail++; lasterr = errno; continue; }
         opens++;
-        int g2 = stop[1];
+        int g2 = __atomic_load_n(&stop[1], __ATOMIC_SEQ_CST);
         if ((g1 & 1) == 0 && g1 == g2 && fstat(d, &st) == 0 && st.st_ino == ss.st_ino && st.st_dev == ss.st_dev) {
             through++;
             /* the mount is gone by now or soon: the fd keeps the ro flag it was opened with */
