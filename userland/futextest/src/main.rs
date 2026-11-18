@@ -17,6 +17,8 @@
 //!                           pthread_mutex_consistent makes it usable again
 //!   pi_handoff            — FUTEX_UNLOCK_PI hands the lock to the queued
 //!                           locker: the word names it before it even runs
+//!   pi_handoff_stress     — (by name only) `[rounds] [settle_ms] [bitonly]
+//!                           [hogs]`: pi_handoff rounds under CPU hogs
 //!   realtime_restart      — a FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME waiter
 //!                           is stopped, the wall clock is stepped past its
 //!                           deadline, and after SIGCONT it times out at once
@@ -319,9 +321,29 @@ static PI_TID: AtomicU32 = AtomicU32::new(0);
 static PI_RES: AtomicI32 = AtomicI32::new(-1);
 static PI_OWNED: AtomicU32 = AtomicU32::new(0);
 
-fn pi_handoff() -> bool {
+/// The scheduler state letter of thread `tid` (from /proc/self/task/<tid>/stat),
+/// or '?' if it cannot be read.
+fn thread_state(tid: u32) -> char {
+    let s = std::fs::read_to_string(format!("/proc/self/task/{}/stat", tid))
+        .or_else(|_| std::fs::read_to_string(format!("/proc/{}/stat", tid)))
+        .unwrap_or_default();
+    s.rfind(')').and_then(|i| s[i + 1..].trim_start().chars().next()).unwrap_or('?')
+}
+
+/// One hand-off round. FUTEX_WAITERS in the word is NOT proof that the
+/// locker is queued: FUTEX_LOCK_PI sets the bit with a user-space cas and only
+/// then registers in the futex table, so a locker preempted in between is
+/// invisible to FUTEX_UNLOCK_PI, which then (correctly) releases the word to 0
+/// instead of handing it over. The round therefore waits until the locker is
+/// also asleep in the kernel (state S), which it only is once registered —
+/// unless `bit_only` asks for the old, racy signal (stress mode, to show the
+/// window). `settle_ms` is the extra sleep before the unlock.
+fn pi_handoff_round(settle_ms: u64, bit_only: bool) -> (bool, String) {
     let me = gettid();
     PI_WORD.store(me, SeqCst);
+    PI_TID.store(0, SeqCst);
+    PI_RES.store(-1, SeqCst);
+    PI_OWNED.store(0, SeqCst);
     let h = thread::spawn(|| {
         let tid = gettid();
         PI_TID.store(tid, SeqCst);
@@ -330,23 +352,76 @@ fn pi_handoff() -> bool {
         PI_OWNED.store((PI_WORD.load(SeqCst) & TID_MASK == tid) as u32, SeqCst);
         futex(&PI_WORD, FUTEX_UNLOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
     });
-    // Wait until the locker is queued (it set FUTEX_WAITERS) and parked.
+    // Wait until the locker set FUTEX_WAITERS and is parked in the kernel.
     let t0 = Instant::now();
-    while PI_WORD.load(SeqCst) & FUTEX_WAITERS == 0 && t0.elapsed() < Duration::from_secs(3) {
+    let mut state = '?';
+    let parked = loop {
+        let tid = PI_TID.load(SeqCst);
+        if PI_WORD.load(SeqCst) & FUTEX_WAITERS != 0 && tid != 0 {
+            if bit_only { break true; }
+            state = thread_state(tid);
+            if state == 'S' { break true; }
+        }
+        if t0.elapsed() > Duration::from_secs(10) { break false; }
         thread::sleep(Duration::from_millis(2));
-    }
-    thread::sleep(Duration::from_millis(50));
+    };
+    let waited_ms = t0.elapsed().as_millis();
+    if settle_ms > 0 { thread::sleep(Duration::from_millis(settle_ms)); }
     let un = futex(&PI_WORD, FUTEX_UNLOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
     // Right after the unlock, before the locker has necessarily run: the
     // word must already name it, so a user-space cas cannot take the lock.
     let after = PI_WORD.load(SeqCst);
     let stolen = PI_WORD.compare_exchange(0, me, SeqCst, SeqCst).is_ok();
+    // A steal means no hand-off happened: give the lock back, or the locker
+    // (now queued behind us) and the join below would hang forever.
+    if stolen { futex(&PI_WORD, FUTEX_UNLOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0); }
     h.join().unwrap();
     let tid = PI_TID.load(SeqCst);
-    let ok = un == 0 && after == (tid | FUTEX_WAITERS) && !stolen
+    let ok = parked && un == 0 && after == (tid | FUTEX_WAITERS) && !stolen
         && PI_RES.load(SeqCst) == 0 && PI_OWNED.load(SeqCst) == 1 && PI_WORD.load(SeqCst) == 0;
-    report("pi_handoff", ok, format!("unlock={} word_after={:#x} locker={} stolen={} lock={} owned={} final={:#x}",
-        un, after, tid, stolen, PI_RES.load(SeqCst), PI_OWNED.load(SeqCst), PI_WORD.load(SeqCst)))
+    let why = if !parked { "locker never parked (WAITERS+state S) within 10s" }
+        else if after == 0 { "UNLOCK_PI released the word to 0: no queued locker found (not registered yet?)" }
+        else if after & TID_MASK != tid { "word names neither nobody nor the locker after UNLOCK_PI" }
+        else if after & FUTEX_WAITERS == 0 { "locker already re-took the free word itself (no hand-off)" }
+        else if PI_RES.load(SeqCst) != 0 || PI_OWNED.load(SeqCst) != 1 { "locker's LOCK_PI result/ownership wrong" }
+        else if PI_WORD.load(SeqCst) != 0 { "locker's UNLOCK_PI did not release to 0" }
+        else { "-" };
+    (ok, format!("{}: unlock={} word_after={:#x} locker={} state={} waited={}ms stolen={} lock={} owned={} final={:#x}",
+        why, un, after, tid, state, waited_ms, stolen, PI_RES.load(SeqCst), PI_OWNED.load(SeqCst), PI_WORD.load(SeqCst)))
+}
+
+fn pi_handoff() -> bool {
+    let (ok, detail) = pi_handoff_round(50, false);
+    report("pi_handoff", ok, detail)
+}
+
+/// `futextest pi_handoff_stress [rounds] [settle_ms] [bitonly] [hogs]`: repeat
+/// the hand-off round with CPU hogs (default 2 per CPU) spinning alongside.
+/// bitonly=1 uses the pre-fix "FUTEX_WAITERS is set" wait to show the race.
+fn pi_handoff_stress() -> bool {
+    let a: Vec<String> = std::env::args().collect();
+    let arg = |i: usize, d: u64| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let rounds = arg(2, 200);
+    let settle = arg(3, 0);
+    let bit_only = arg(4, 0) != 0;
+    let ncpu = thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(2);
+    let hogs = arg(5, 2 * ncpu);
+    static STOP: AtomicU32 = AtomicU32::new(0);
+    STOP.store(0, SeqCst);
+    let hs: Vec<_> = (0..hogs).map(|_| thread::spawn(|| {
+        let mut x = 0u64;
+        while STOP.load(SeqCst) == 0 { for _ in 0..1000 { x = x.wrapping_mul(31).wrapping_add(7); } core::hint::black_box(x); }
+    })).collect();
+    let mut fails = 0;
+    let mut first = String::new();
+    for i in 0..rounds {
+        let (ok, d) = pi_handoff_round(settle, bit_only);
+        if !ok { fails += 1; if first.is_empty() { first = format!("round {}: {}", i, d); } println!("pi_handoff_stress round {} FAIL ({})", i, d); }
+    }
+    STOP.store(1, SeqCst);
+    for h in hs { h.join().unwrap(); }
+    report("pi_handoff_stress", fails == 0, format!("{}/{} rounds failed (settle={}ms bitonly={} hogs={}); first {}",
+        fails, rounds, settle, bit_only, hogs, first))
 }
 
 // ── CLOCK_REALTIME deadline across a stop ────────────────────────────────────
@@ -1163,6 +1238,11 @@ fn main() {
         ("realtime_restart", realtime_restart),
     ];
     let mut failures = 0;
+    if only.as_deref() == Some("pi_handoff_stress") {
+        let f = pi_handoff_stress();
+        println!("--- futextest done --- failures={}", !f as i32);
+        unsafe { _exit(!f as i32); }
+    }
     for (name, f) in tests {
         if only.as_deref().map_or(false, |o| o != *name) { continue; }
         if !f() { failures += 1; }
