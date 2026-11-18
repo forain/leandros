@@ -451,11 +451,14 @@ PANELTRACE = True or "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == 
 # surfaces?  A /bin/cosmic-panel wrapper logs its start (uptime + realtime),
 # runs the panel with WAYLAND_DEBUG=1 and samples the panel's threads in
 # /proc/sysstat ('w' lines: state, syscall, time in it) every 0.2 s for 30 s.
+PANEL_SAMP = r"""P=$1; S=$2; i=0
+while [ $i -lt 120 ]; do read u x </proc/uptime; echo "@ $u" >>$S; grep "^w [0-9]+ $P " /proc/sysstat >>$S; i=$((i+1)); sleep 0.15; done
+echo END >>$S; grep "^[st] [0-9]+ $P " /proc/sysstat >>$S
+"""
 PANEL_WRAP = r"""#!/bin/sh
 U=$(id -u); S=/tmp/plsamp-$U.log
-echo "start up=$(cat /proc/uptime) rt=$(date +%s%N) pid=$$" >>$S
-( P=$$; i=0; while [ $i -lt 150 ]; do echo "@ $(cat /proc/uptime)"; grep "^w [0-9]+ $P " /proc/sysstat | cut -c1-90; i=$((i+1)); sleep 0.2; done
-  echo END; grep "^[st] [0-9]+ $P " /proc/sysstat | cut -c1-120 ) >>$S 2>&1 &
+read u x </proc/uptime; echo "start up=$u x rt=$(date +%s%N) pid=$$" >>$S
+/bin/sh /usr/libexec/lrf/plsamp.sh $$ $S </dev/null >/dev/null 2>>$S &
 export WAYLAND_DEBUG=1
 exec /usr/libexec/lrf/cosmic-panel "$@" >>/tmp/cosmic-panel-$U.log 2>&1
 """
@@ -466,6 +469,8 @@ def install_panel_wrap():
     open(src, "w").write(PANEL_WRAP)
     sh("mkdir -p /usr/libexec/lrf; [ -e /usr/libexec/lrf/cosmic-panel ] || mv /bin/cosmic-panel /usr/libexec/lrf/cosmic-panel")
     put_file(src, "/bin/cosmic-panel")
+    open(f"{OUT}/plsamp.sh", "w").write(PANEL_SAMP)
+    put_file(f"{OUT}/plsamp.sh", "/usr/libexec/lrf/plsamp.sh")
     sh("chmod 755 /bin/cosmic-panel")
 
 
@@ -477,6 +482,7 @@ def panel_diag():
          f"grep -m4 -n 'zwlr_layer_surface_v1[#@][0-9]+[.]configure' {L} | cut -c1-160; "
          f"grep -m6 -n -e '-> wl_surface[#@][0-9]+[.]attach' {L} | cut -c1-160; "
          f"grep -m3 -n 'zwp_linux_dmabuf' {L} | cut -c1-160; echo panel_log_bytes=$(wc -c <{L}); "
+         f"echo ===PLOG; grep -m40 -v -e '->' -e ' wl_' -e '@' {L} | cut -c1-200; "
          "echo ===START; for d in /proc/[0-9]*; do read c <$d/comm; case $c in cosmic*|greetd*|Xwayland*) "
          "echo \"$c $(cut -d' ' -f22 $d/stat)\";; esac; done 2>/dev/null")
     o = sh(c, 120)
