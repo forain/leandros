@@ -2303,9 +2303,10 @@ pub fn pollfds_text(s: &mut alloc::string::String) {
         a
     });
     if let Some(a) = &ctxs { for e in a { if e.2 > last { last = e.2; } } }
-    let _ = writeln!(s, "gpu floor={} last_submitted={} out_fences={} fence_waiters={} fence_event_pending={} syncobj_waiters={}",
+    let _ = writeln!(s, "gpu floor={} last_submitted={} out_fences={} fence_waiters={} fence_event_pending={} syncobj_waiters={} out_fence_rearms={}",
         floor, last, OUT_FENCES_N.load(Ordering::Relaxed), FENCE_WAITERS.load(Ordering::Relaxed),
-        crate::virtio_gpu::FENCE_EVENT_PENDING.load(Ordering::Relaxed) as u64, SYNCOBJ_WAITERS.load(Ordering::Relaxed));
+        crate::virtio_gpu::FENCE_EVENT_PENDING.load(Ordering::Relaxed) as u64, SYNCOBJ_WAITERS.load(Ordering::Relaxed),
+        OUT_FENCE_REARMS.load(Ordering::Relaxed));
     match OUT_FENCES.try_lock() {
         Some(q) => for &(f, tok) in q.iter() {
             let _ = writeln!(s, "  out fence={} slot={} retired={}", f, tok, (f <= floor) as u8);
@@ -2367,14 +2368,37 @@ pub fn out_fence_register(fence: u64, token: u64) -> bool {
     if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire) { return false; }
     if q.len() >= MAX_OUT_FENCES { return false; }
     q.push_back((fence, token));
-    OUT_FENCES_N.store(q.len(), Ordering::Relaxed);
+    OUT_FENCES_N.store(q.len(), Ordering::SeqCst);
+    drop(q);
+    // Lost-wake guard (lane blanksess2). `out_fence_service` skips the queue
+    // without its lock when it reads OUT_FENCES_N == 0, so a retirement whose
+    // service ran between our floor check above and the N store just made
+    // saw an empty queue and consumed FENCE_EVENT_PENDING: the entry stayed
+    // queued with its fence retired and nothing left to signal it (the
+    // greeter's cosmic-comp sat in ppoll on this eventfd for 366 s, ~1 boot
+    // in 25 on aarch64 TCG). Store-buffering pair with the service: we store
+    // N then load the floor, it stores the floor then loads N, each side
+    // behind a SeqCst fence, so at least one of us sees the other. If it is
+    // us, re-arm the fence event so the next tick pays the entry.
+    ::core::sync::atomic::fence(Ordering::SeqCst);
+    if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::SeqCst) {
+        OUT_FENCE_REARMS.fetch_add(1, Ordering::Relaxed);
+        crate::virtio_gpu::FENCE_EVENT_PENDING.store(true, Ordering::Release);
+    }
     true
 }
+
+/// Registrations that found their fence retired right after queueing it and
+/// re-armed the fence event (diagnostics, /proc/pollfds).
+pub static OUT_FENCE_REARMS: AtomicUsize = AtomicUsize::new(0);
 
 /// Signal every armed out-fence whose fence has retired. Tick context: try_lock
 /// only; false means "call again next tick".
 fn out_fence_service() -> bool {
-    if OUT_FENCES_N.load(Ordering::Relaxed) == 0 { return true; }
+    // Pairs with the fence in `out_fence_register`: the floor this tick
+    // published must be ordered before our read of N.
+    ::core::sync::atomic::fence(Ordering::SeqCst);
+    if OUT_FENCES_N.load(Ordering::SeqCst) == 0 { return true; }
     let p = OUT_FENCE_SIGNAL.load(Ordering::Acquire);
     if p == 0 { return true; }
     // SAFETY: only ever written by `set_out_fence_signaller` from a `fn(u64) -> bool`.
