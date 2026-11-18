@@ -176,3 +176,14 @@ pub extern "C" fn kernel_uart_rx_stats(out: *mut u64) {
     }
     unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), out, 4); }
 }
+
+/// Appends the virtio-gpu / DRM half of `/proc/pollfds` to `buf` (cap `cap`);
+/// returns the bytes written. Called by servers/vfs `gen_pollfds`.
+#[no_mangle]
+pub extern "C" fn kernel_pollfds_gpu(buf: *mut u8, cap: usize) -> usize {
+    let mut s = alloc::string::String::new();
+    drivers::drm_device_interface::pollfds_text(&mut s);
+    let n = s.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), buf, n); }
+    n
+}

@@ -8299,6 +8299,81 @@ fn proc_snapshot(fake: &[u8], data: &[u8], is_dir: bool) -> Option<VnodeKind> {
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: false, ofd: 0 })
 }
 
+/// `/proc/pollfds`: every task parked in a poll-family syscall with its fd
+/// table (tag, hit against the park mask, cheap revents), then the virtio-gpu
+/// fence / DRM state from the kernel. try_lock only; never blocks or probes a
+/// device server.
+fn gen_pollfds() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::with_capacity(16384);
+    let mut waits = alloc::vec::Vec::with_capacity(1024);
+    sched::task_waits(&mut waits);
+    const POLL_SCS: [u32; 6] = [7, 23, 271, 270, 73, 72];
+    for w in waits.iter() {
+        if w.state != b'S' || w.sc == sched::NO_SYSCALL || !POLL_SCS.contains(&w.sc) { continue; }
+        let _ = writeln!(s, "task {} {} sc={} in_sc_ms={} mask={:#x} listen={} wakes={}",
+                         w.pid, w.tgid, w.sc, w.in_sc_ns / 1_000_000, w.poll_mask, w.listen as u8, w.poll_wakes);
+        let Some(t) = FD_TABLES.try_lock() else { let _ = writeln!(s, "  fd_tables busy"); continue };
+        let Some(tr) = t.map.get(&w.tgid) else { continue };
+        let Some(tb) = tr.try_lock() else { let _ = writeln!(s, "  fd_table busy"); continue };
+        let mut n = 0;
+        for (fd, f) in tb.fds.iter_used() {
+            if n >= 64 { let _ = writeln!(s, "  ..."); break; }
+            n += 1;
+            let kind = f.kind;
+            let name = match kind {
+                VnodeKind::Pipe { .. } => "pipe", VnodeKind::Pty { .. } => "pty",
+                VnodeKind::EventFd { .. } => "eventfd", VnodeKind::TimerFd { .. } => "timerfd",
+                VnodeKind::Mq { .. } => "mq", VnodeKind::PidFd { .. } => "pidfd",
+                VnodeKind::SignalFd { .. } => "signalfd", VnodeKind::Inotify { .. } => "inotify",
+                VnodeKind::DynamicDevice { .. } => "dev", VnodeKind::TmpFile { .. } => "tmp",
+                VnodeKind::RamFile { .. } => "ram", VnodeKind::MountedFile { .. } => "file",
+                _ => "other",
+            };
+            let tag = poll_vnode_key(&kind).map(sched::poll_key_bit);
+            let _ = write!(s, "  fd {} kind={}", fd, name);
+            match tag {
+                Some(g) => { let _ = write!(s, " tag={:#x} hit={}", g, (g & w.poll_mask != 0) as u8); }
+                None => s.push_str(" tag=? hit=?"),
+            }
+            match kind {
+                VnodeKind::EventFd { slot } => {
+                    let cnt = EVENTFD_COUNTERS.try_lock().map(|c| c[slot]);
+                    let m = EVENTFD_META.try_lock().and_then(|m| m.get(slot).copied());
+                    match cnt {
+                        Some(c) => { let _ = write!(s, " rev={:#x}", POLLOUT | if c > 0 { POLLIN } else { 0 }); }
+                        None => s.push_str(" rev=?"),
+                    }
+                    let _ = write!(s, " slot={}", slot);
+                    if let Some(c) = cnt { let _ = write!(s, " cnt={}", c); }
+                    if let Some(m) = m { let _ = write!(s, " origin={} fence={}", m.origin, m.fence); }
+                }
+                VnodeKind::Pipe { ring, is_write } => {
+                    match PIPE_RINGS.try_lock() {
+                        Some(r) => {
+                            let r = &r[ring];
+                            let ev = if is_write { if r.readers == 0 { POLLERR } else if r.free() >= PIPE_BUF { POLLOUT } else { 0 } }
+                                     else { (if r.count > 0 { POLLIN } else { 0 }) | if r.writers == 0 { POLLIN | POLLHUP } else { 0 } };
+                            let _ = write!(s, " rev={:#x}", ev);
+                        }
+                        None => s.push_str(" rev=?"),
+                    }
+                }
+                VnodeKind::DynamicDevice { port, open_id, .. } => { let _ = write!(s, " rev=? port={} open={}", port, open_id); }
+                _ => s.push_str(" rev=?"),
+            }
+            s.push('\n');
+        }
+    }
+    let (dn, dpend) = sched::deferred_wake_state();
+    let _ = writeln!(s, "sched deferred_keys={} poll_wake_pending={:#x}", dn, dpend);
+    extern "C" { fn kernel_pollfds_gpu(buf: *mut u8, cap: usize) -> usize; }
+    let mut g = alloc::vec![0u8; 8192];
+    let n = unsafe { kernel_pollfds_gpu(g.as_mut_ptr(), g.len()) };
+    s.push_str(core::str::from_utf8(&g[..n]).unwrap_or(""));
+    proc_snapshot(b"/tmp/.pollfds", s.as_bytes(), false)
+}
+
 /// Which `/proc/<pid>` memory map file [`gen_proc_maps`] renders.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MapsKind { Maps, Smaps, Rollup }
@@ -8828,7 +8903,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
-                                     b"/proc/vtstat", b"/proc/rqhold", b"/proc/pcsample",
+                                     b"/proc/vtstat", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups"];
 /// The regular files `handle_open` generates through `gen_proc_system` (and
@@ -9763,6 +9838,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/epollstat" {
             match gen_epollstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/pollfds" {
+            match gen_pollfds() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }

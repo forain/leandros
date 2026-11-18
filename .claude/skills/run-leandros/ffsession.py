@@ -456,7 +456,7 @@ def main():
             "tail -n 60 /var/log/greetd.log; echo ===STAT; cat /proc/[0-9]*/stat; "
             "echo ===STATUS; for p in /proc/[0-9]*; do head -c 400 $p/cmdline 2>/dev/null | tr '\\0' ' '; "
             "echo; cat $p/status 2>/dev/null | head -n 12; done; echo ===WAKE; cat /proc/wakestat; "
-            "echo ===SYS; cat /proc/sysstat; echo ===PC; cat /proc/pcsample; echo ===VT; cat /proc/vtstat", 300))
+            "echo ===POLLFDS; cat /proc/pollfds; echo ===SYS; cat /proc/sysstat; echo ===PC; cat /proc/pcsample; echo ===VT; cat /proc/vtstat", 300))
     SER.pump(float(os.environ.get("FFS_GREETER_PAINT", 3)) * SCALE)  # greeter first paint (virgl: ~90 s)
     typ("leandro"); key("ret")
     log("greeter login typed")

@@ -627,7 +627,7 @@ const CTX_ID_POOL: u32 = 256;
 
 /// A reap retired at least one fence and the DRM layer has not been told yet.
 /// Set under `VIRTIO_GPU` (any context), consumed by `ctrlq_tick`.
-static FENCE_EVENT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) static FENCE_EVENT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Called by `ctrlq_tick` after fences retired: the DRM layer's out-fence and
 /// VIRTGPU_WAIT service. Returns false if it could not finish (a try_lock

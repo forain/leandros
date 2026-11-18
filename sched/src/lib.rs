@@ -4607,6 +4607,12 @@ const DEFERRED_KEYS: usize = 256;
 const DEFERRED_BATCH: usize = 32;
 static DEFERRED_KEY: [AtomicU64; DEFERRED_KEYS] = [const { AtomicU64::new(0) }; DEFERRED_KEYS];
 
+/// (non-zero deferred key slots, pending bit-only poll wake mask), for /proc/pollfds.
+pub fn deferred_wake_state() -> (usize, u64) {
+    let n = DEFERRED_KEY.iter().filter(|k| k.load(Ordering::Relaxed) != 0).count();
+    (n, POLL_WAKE_PENDING.load(Ordering::Relaxed))
+}
+
 /// `request_poll_wake_tagged(poll_key_bit(key))`, kept exact when there is
 /// room (a full table falls back to the bit, which over-wakes, never loses).
 pub fn request_poll_wake_key(key: u64) {

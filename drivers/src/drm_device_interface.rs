@@ -2291,6 +2291,37 @@ pub fn open_last_fence(open_id: u32) -> u64 {
     ctx_lookup_entry(open_id).map(|c| c.last_fence).unwrap_or(0)
 }
 
+/// Text for /proc/pollfds: virtio-gpu fence floor, out-fence queue, waiter
+/// counts and per-open DRM state. try_lock only; never blocks.
+pub fn pollfds_text(s: &mut alloc::string::String) {
+    use ::core::fmt::Write;
+    let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
+    let mut last = 0u64;
+    let ctxs: Option<[(u32, u32, u64); MAX_GPU_CTXS]> = VIRTGPU_CTXS.try_lock().map(|t| {
+        let mut a = [(0u32, 0u32, 0u64); MAX_GPU_CTXS];
+        for (i, c) in t.iter().enumerate() { a[i] = (c.open_id, c.ctx_id, c.last_fence); }
+        a
+    });
+    if let Some(a) = &ctxs { for e in a { if e.2 > last { last = e.2; } } }
+    let _ = writeln!(s, "gpu floor={} last_submitted={} out_fences={} fence_waiters={} fence_event_pending={} syncobj_waiters={}",
+        floor, last, OUT_FENCES_N.load(Ordering::Relaxed), FENCE_WAITERS.load(Ordering::Relaxed),
+        crate::virtio_gpu::FENCE_EVENT_PENDING.load(Ordering::Relaxed) as u64, SYNCOBJ_WAITERS.load(Ordering::Relaxed));
+    match OUT_FENCES.try_lock() {
+        Some(q) => for &(f, tok) in q.iter() {
+            let _ = writeln!(s, "  out fence={} slot={} retired={}", f, tok, (f <= floor) as u8);
+        },
+        None => { let _ = writeln!(s, "  out_fences busy"); }
+    }
+    match &ctxs {
+        Some(a) => for &(oid, cid, lf) in a.iter() {
+            if oid == 0 { continue; }
+            let _ = writeln!(s, "drm open={} ctx={} last_fence={} retired={} evtag_bit={}", oid, cid, lf,
+                (lf <= floor) as u8, drm_event_poll_tag(oid).trailing_zeros());
+        },
+        None => { let _ = writeln!(s, "drm ctxs busy"); }
+    }
+}
+
 // ── Out-fences: FENCE_FD_OUT made real ───────────────────────────────────────
 //
 // Until submission went asynchronous the out-fence eventfd could be minted
