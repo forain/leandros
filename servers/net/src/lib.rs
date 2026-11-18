@@ -1329,6 +1329,8 @@ struct SockOpts {
     mc_addr:   [u8; 4],
     /// IP_TTL (0 = default, 64) and IP_TOS (recorded and read back).
     ttl:       u8,
+    /// IPV6_UNICAST_HOPS explicitly 0 (reads back 0; -1 restores the default).
+    hops0:     bool,
     tos:       u8,
     /// IP_MTU_DISCOVER + 1 (0 = never set: Linux's default, IP_PMTUDISC_WANT).
     pmtud1:    u8,
@@ -1400,6 +1402,8 @@ fn path_mtu_ip(sid: Sid, d: IpAddress) -> u32 {
             _ => 1500,
         }
     };
+    // An RA's MTU option (ip6::ra_mtu) caps the IPv6 MTU of that NIC.
+    let link = match d { IpAddress::Ipv6(_) if sid != iface::LO => ip6::ra_mtu(sid).map_or(link, |m| link.min(m)), _ => link };
     let now = sched::monotonic_ns() / 1_000_000;
     smoltcp::pmtu::set_expires_ms(sched::ns::mtu_expires_s() as u64 * 1000);
     let key = match d {
@@ -1419,7 +1423,7 @@ impl SockOpts {
     fn pmtud_mode(&self) -> u8 { if self.pmtud1 == 0 { 1 } else { self.pmtud1 - 1 } }
     const DEFAULT: Self = Self { nodelay: false, keepalive: false, keepidle: 7200, keepintvl: 75, keepcnt: 9,
                                  reuseport: false, broadcast: false, gso: 0, shut: 0,
-                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, tos: 0, pmtud1: 0, dontfrag: false,
+                                 mc_noloop: false, mc_ttl: 1, mc_if: 0, mc_addr: [0; 4], ttl: 0, hops0: false, tos: 0, pmtud1: 0, dontfrag: false,
                                  recv: 0, bind_lock: 0, rcvtimeo: 0, sndtimeo: 0, sndbuf: 0, passcred: false, dg_peer: 0, dg_wait: 0, v6only: false, recv6: 0, icmp6f: [0; 8] };
 }
 
@@ -7201,8 +7205,16 @@ fn udp_recv_k0(pid: u32, fd: usize, cap: usize, peek: bool, gro: bool)
             let ofd = fd_ofd(pid, fd).unwrap_or(0);
             let (d, full, from) = icmp_recv_filtered(s, socket_handle, cap, peek, sock_type == SOCK_RAW as u8,
                                                      sock_dom(pid, fd) == AF_INET6, &sock_opts(ofd).icmp6f)?;
-            return Ok((d, full, RxMeta { from: IpEndpoint::new(from, 0), dst: None, spec_dst: None,
-                                         tos: 0, ttl: 0, sid, seg: 0 }));
+            // ICMPv6 (ip6_datagram_recv_specific_ctl): smoltcp keeps no per-datagram
+            // hop limit/tclass/destination, so report the default hop limit (64),
+            // tclass 0 and the local address the peer reached us on.
+            let v6dst = if let IpAddress::Ipv6(f) = from {
+                if sid == LO || f.is_loopback() { Some(IpAddress::Ipv6(smoltcp::wire::Ipv6Address([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]))) }
+                else { stack_src_addr6(s, f) }
+            } else { None };
+            let ttl = if v6dst.is_some() { 64 } else { 0 };
+            return Ok((d, full, RxMeta { from: IpEndpoint::new(from, 0), dst: v6dst, spec_dst: v6dst,
+                                         tos: 0, ttl, sid, seg: 0 }));
         }
         _ => return Err(-11),
     };
@@ -8152,8 +8164,8 @@ fn ipv6_setsockopt(pid: u32, fd: usize, optname: usize, optval_ptr: usize, optle
             o.v6only = v != 0;
         }
         IPV6_UNICAST_HOPS => match v {
-            -1 => o.ttl = 0,
-            0..=255 => o.ttl = v as u8, // 0 reads as the default
+            -1 => { o.ttl = 0; o.hops0 = false; }
+            0..=255 => { o.ttl = v as u8; o.hops0 = v == 0; } // 0 stays 0 (Linux); -1 = default
             _ => return err_reply(-22),
         },
         IPV6_MULTICAST_HOPS => match v {
@@ -8618,7 +8630,7 @@ fn handle_getsockopt(pid: u32, fd: usize, level: usize, optname: usize,
                 let o = sock_opts(e.ofd);
                 match n {
                     IPV6_V6ONLY => Some(o.v6only as u32),
-                    IPV6_UNICAST_HOPS => Some(if o.ttl == 0 { 64 } else { o.ttl as u32 }),
+                    IPV6_UNICAST_HOPS => Some(if o.ttl == 0 && !o.hops0 { 64 } else { o.ttl as u32 }),
                     IPV6_MULTICAST_HOPS => Some(o.mc_ttl as u32),
                     IPV6_MULTICAST_LOOP => Some((!o.mc_noloop) as u32),
                     IPV6_MULTICAST_IF => Some(if o.mc_if == 0 { 0 } else { o.mc_if as u32 }),

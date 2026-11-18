@@ -292,6 +292,18 @@ struct Slaac {
 }
 impl Slaac { const NONE: Slaac = Slaac { addr: None, pfx: None, router: None, rs_sent: 0, next_rs: 0 }; }
 /// Netifs that received a router advertisement (IF_RA_RCVD).
+/// The MTU a router advertised (RA option 5) per netif, 0 = none. Linux ndisc_router_discovery:
+/// ignored below IPV6_MIN_MTU (1280) or above the device MTU (1500 here), else it becomes the
+/// interface's IPv6 MTU (cnf.mtu6).
+static RA_MTU: Mutex<[u32; MAX_NETIF]> = Mutex::new([0; MAX_NETIF]);
+const DEV_MTU: u32 = 1500;
+fn ra_mtu_ok(v: u32) -> Option<u32> { if (1280..=DEV_MTU).contains(&v) { Some(v) } else { None } }
+/// The IPv6 MTU an RA set on the NIC stack `sid`, if any.
+pub(crate) fn ra_mtu(sid: crate::Sid) -> Option<u32> {
+    let id = (sid as usize).checked_sub(1)?;
+    if id >= MAX_NETIF { return None; }
+    match RA_MTU.lock()[id] { 0 => None, m => Some(m) }
+}
 static RA_SEEN: Mutex<[bool; MAX_NETIF]> = Mutex::new([false; MAX_NETIF]);
 pub(crate) fn ra_rcvd(id: usize) -> bool { id < MAX_NETIF && RA_SEEN.lock()[id] }
 static SLAAC: Mutex<[Slaac; MAX_NETIF]> = Mutex::new([Slaac::NONE; MAX_NETIF]);
@@ -338,6 +350,7 @@ fn life(secs: u32, now: u64) -> u64 { if secs == u32::MAX { ONE_SHOT } else { no
 /// Drop everything SLAAC installed on `id` (stack lock held by the caller).
 fn withdraw(id: usize, s: &mut crate::NetStack) {
     let st = core::mem::replace(&mut SLAAC.lock()[id], Slaac::NONE);
+    RA_MTU.lock()[id] = 0;
     let sid = iface::sid_of(id as u8);
     if let Some((a, _)) = st.addr {
         dad_forget(id as u8, &a);
@@ -370,6 +383,12 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
     while o.len() >= 8 {
         let l = o[1] as usize * 8;
         if l == 0 || l > o.len() { break; }
+        if o[0] == 5 && l == 8 {
+            if let Some(m) = ra_mtu_ok(u32::from_be_bytes(o[4..8].try_into().unwrap())) {
+                let mut r = RA_MTU.lock();
+                if r[id] != m { r[id] = m; changed = true; }
+            }
+        }
         if o[0] == 3 && l == 32 && o[2] == 64 {
             let (flags, valid, pref) = (o[3], u32::from_be_bytes(o[4..8].try_into().unwrap()), u32::from_be_bytes(o[8..12].try_into().unwrap()));
             let mut pfx = [0u8; 16]; pfx.copy_from_slice(&o[16..32]);
@@ -713,4 +732,17 @@ pub(crate) fn is_host6(a: &[u8; 16]) -> bool {
     if addrs6().iter().any(|x| &x.addr == a) { return true; }
     let v = crate::vif::VIFS.lock();
     v.iter().flatten().any(|x| x.netns == 0 && x.addrs6.iter().any(|&(p, _)| &p == a))
+}
+
+#[cfg(test)]
+mod ra_mtu_tests {
+    use super::*;
+    #[test]
+    fn ra_mtu_bounds() {
+        assert_eq!(ra_mtu_ok(1279), None);
+        assert_eq!(ra_mtu_ok(1280), Some(1280));
+        assert_eq!(ra_mtu_ok(1492), Some(1492));
+        assert_eq!(ra_mtu_ok(1500), Some(1500));
+        assert_eq!(ra_mtu_ok(1501), None);
+    }
 }

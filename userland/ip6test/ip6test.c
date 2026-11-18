@@ -315,6 +315,68 @@ static int ping6_run(int type, int raw) {
     return good;
 }
 
+// Hop limit 0 stays 0 (Linux), -1 restores the default (lane v6gaps).
+static void test_hops0(void) {
+    int s = sock6(SOCK_DGRAM), v = -1, w = 0;
+    socklen_t l = sizeof v;
+    int ok = s >= 0 && setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &w, sizeof w) == 0
+          && getsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, &l) == 0 && v == 0;
+    w = -1; l = sizeof v; v = 7;
+    ok = ok && setsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &w, sizeof w) == 0
+          && getsockopt(s, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, &l) == 0 && v == 64;
+    CHECK("hops0", ok);
+    if (s >= 0) close(s);
+}
+
+// A v4-mapped destination on a v6 ping socket is EINVAL (Linux ping_v6_sendmsg).
+static void test_ping6_mapped_einval(void) {
+    int s = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_mapped_einval", 0); return; }
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    inet_pton(AF_INET6, "::ffff:127.0.0.1", &a.sin6_addr);
+    uint8_t q[64]; size_t n = echo_req(q, 0x1234, 1);
+    CHECK("ping6_mapped_einval", sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) < 0 && errno == EINVAL);
+    close(s);
+}
+
+// ICMPv6 sockets carry IPV6_HOPLIMIT / IPV6_TCLASS / IPV6_PKTINFO cmsgs (lane v6gaps).
+static void test_icmp6_cmsgs(void) {
+    int s = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("icmp6_cmsgs", 0); return; }
+    tmo(s, 3);
+    int on = 1;
+    setsockopt(s, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof on);
+    setsockopt(s, IPPROTO_IPV6, IPV6_RECVTCLASS, &on, sizeof on);
+    setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof on);
+    struct sockaddr_in6 a = lo6(0);
+    uint8_t q[64], r[256]; size_t n = echo_req(q, 0x1234, 9);
+    int hop = -1, tcl = -1, pi = 0;
+    if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) == (ssize_t)n) {
+        for (int i = 0; i < 4; i++) {
+            char cb[256];
+            struct iovec iv = { r, sizeof r };
+            struct msghdr m; memset(&m, 0, sizeof m);
+            m.msg_iov = &iv; m.msg_iovlen = 1; m.msg_control = cb; m.msg_controllen = sizeof cb;
+            ssize_t g = recvmsg(s, &m, 0);
+            if (g < 8) break;
+            if (r[0] != 129) continue;
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+                if (c->cmsg_level != IPPROTO_IPV6) continue;
+                if (c->cmsg_type == IPV6_HOPLIMIT) memcpy(&hop, CMSG_DATA(c), sizeof hop);
+                else if (c->cmsg_type == IPV6_TCLASS) memcpy(&tcl, CMSG_DATA(c), sizeof tcl);
+                else if (c->cmsg_type == IPV6_PKTINFO) {
+                    struct in6_pktinfo p; memcpy(&p, CMSG_DATA(c), sizeof p);
+                    pi = !memcmp(&p.ipi6_addr, &in6addr_loopback, 16);
+                }
+            }
+            break;
+        }
+    }
+    CHECK("icmp6_cmsgs", hop > 0 && hop <= 255 && tcl == 0 && pi);
+    close(s);
+}
+
 static void test_ping6_dgram_lo(void) {
     // As an ordinary user: SOCK_DGRAM/IPPROTO_ICMPV6 is the unprivileged ping socket.
     pid_t p = fork();
@@ -984,6 +1046,9 @@ int main(int argc, char **argv) {
     test_netns_udp6();
     test_ping6_dgram_lo();
     test_ping6_raw_lo();
+    test_hops0();
+    test_ping6_mapped_einval();
+    test_icmp6_cmsgs();
     test_raw6_eperm();
     test_icmp6_filter();
     test_pktinfo6();
