@@ -81,6 +81,8 @@ def opt(name, default, conv=str):
 
 NOFF = "--nofirefox" in A
 NOTERM = "--noterm" in A
+CLICK_DEFAULT = False   # --click-term / --no-click-term override
+CLICK_TERM = ("--click-term" in A) or (CLICK_DEFAULT and "--no-click-term" not in A)
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 WAIT = opt("--wait", 150, int)
@@ -173,11 +175,21 @@ def launch_firefox(n_brush0):
     (x86_64 KVM + virgl: the window maps seconds after the cosmic-term
     process exists; the run then sat at "brush$  /tm" for 9 min with no
     Firefox). So: wait for the terminal's shell, type, confirm /tmp/ff.log
-    exists; if not, record a task dump + screenshot and retype the line."""
+    exists; if not, record a task dump + screenshot and retype the line.
+    Both outcomes also save a Ctrl-T baseline and a session-log summary."""
     if n_brush0 is not None:
         wait_for("term_shell", lambda: brush_count() > n_brush0, 60 * SCALE)
         SER.pump(2 * SCALE)
     for n in range(3):
+        if n:
+            # The keys of the previous try went to cosmic-panel: its Panel and
+            # Dock layer surfaces (Top layer, keyboard_interactivity OnDemand)
+            # can map seconds AFTER the terminal on x86_64 virgl, and
+            # cosmic-comp's map_layer() hands keyboard focus to any such layer
+            # surface as it maps, never back (lane kbdfocus9: wl_keyboard.leave
+            # on the terminal right after get_layer_surface "Panel"/"Dock").
+            # A click on the window gives focus back.
+            click_term()
         typ("sh /tmp/ffrun.sh"); key("ret")
         log("firefox launched" + (f" (retype {n})" if n else ""))
         t = time.time()
@@ -185,11 +197,14 @@ def launch_firefox(n_brush0):
             SER.pump(5)
             if "FFLOG2" in sh("[ -e /tmp/ff.log ] && echo FFLOG$((1 + 1))", 30):
                 STEPS["ff_retypes"] = n
+                ctrl_t("launch-ok-ctrlt")
+                session_diag("launch-ok-slog")
                 return
         log(f"LAUNCH LOST: /tmp/ff.log missing {30 * SCALE:.0f}s after typing (try {n})")
         drv("screenshot", f"{OUT}/launch-lost-{n}.ppm", t=90)
         if n == 0:
             ctrl_t("launch-lost-ctrlt")
+            session_diag("launch-lost-slog")
         key("ctrl-u")    # clear whatever part of the line arrived
     STEPS["ff_retypes"] = "failed"
 
@@ -262,6 +277,27 @@ def wheel_step(name, direction, count):
 def ppm_size(f):
     parts = open(f, "rb").read(64).split(maxsplit=3)
     return int(parts[1]), int(parts[2])
+
+
+def click_term():
+    """Left-click the middle of the screen (inside the tiled cosmic-term window)
+    so the terminal holds keyboard focus before the launch line is typed."""
+    drv("screenshot", f"{OUT}/preclick.ppm", t=90)
+    w, h = ppm_size(f"{OUT}/preclick.ppm")
+    s = driver._qmp_open()
+    try:
+        driver._qmp_command(s, "input-send-event", {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": (w // 2) * 32767 // w}},
+            {"type": "abs", "data": {"axis": "y", "value": (h // 2) * 32767 // h}}]})
+        time.sleep(0.3)
+        for down in (True, False):
+            driver._qmp_command(s, "input-send-event", {"events": [
+                {"type": "btn", "data": {"down": down, "button": "left"}}]})
+            time.sleep(0.1)
+    finally:
+        s.close()
+    SER.pump(2 * SCALE)
+    log("clicked the terminal window")
 
 
 def click_step(name, where):
@@ -386,6 +422,59 @@ def ctrl_t(name):
     open(f"{OUT}/{name}.txt", "wb").write(SER.buf[m:])
 
 
+# Keyboard-path trace (lane kbdfocus9). The session-env RUST_LOG never showed
+# up in the session log: cosmic-session does not relay cosmic-comp's stderr.
+# So the harness wraps the two binaries itself (root shell, before login):
+# /bin/cosmic-comp -> RUST_LOG focus/keyboard trace, stderr to its own file;
+# /bin/cosmic-term -> WAYLAND_DEBUG=1 (client side: wl_keyboard enter/keymap/key).
+# The real binaries move to /usr/libexec/lrf/ so argv[0] keeps its basename.
+WLTRACE = "--wltrace" in A   # opt-in: the wrappers add load and edit /bin
+COMP_RUST_LOG = ("info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace,"
+                 "smithay::input::keyboard=trace")
+
+
+def install_wraps():
+    for name, extra in (("cosmic-comp", f"export RUST_LOG='{COMP_RUST_LOG}' WAYLAND_DEBUG=server"),
+                        ("cosmic-term", "export WAYLAND_DEBUG=1")):
+        src = f"{OUT}/wrap-{name}"
+        open(src, "w").write("#!/bin/sh\n"
+                             f"env > /tmp/{name}-env.$$ 2>/dev/null\n"
+                             f"{extra}\n"
+                             f"exec /usr/libexec/lrf/{name} \"$@\" >>/tmp/{name}-$(id -u).log 2>&1\n")
+        sh(f"mkdir -p /usr/libexec/lrf; [ -e /usr/libexec/lrf/{name} ] || mv /bin/{name} /usr/libexec/lrf/{name}")
+        put_file(src, f"/bin/{name}")
+        log(sh(f"chmod 755 /bin/{name}; ls -l /usr/libexec/lrf/{name} /bin/{name} | cut -c1-120"))
+
+
+def session_diag(name):
+    """Save a focus/keystroke summary of the COSMIC session log to OUT/<name>.txt."""
+    c = ("L=/tmp/cosmic-session-1000.log; echo bytes=$(wc -c <$L); "
+         "for p in 'key keycode' 'Focusing window' 'Restoring focus' "
+         "'focus fixup' 'restore focus to previous popup grab' 'grab keyboard'; do "
+         "echo \"$p=$(grep -c \"$p\" $L)\"; done; "
+         "grep -E 'Focusing window|focus fixup|Restoring focus|popup grab' $L | tail -n 20 | cut -c1-300; "
+         "echo ---warn; "
+         "grep -iE 'warn|error|panic' $L | grep -v 'keycode' | tail -n 40 | cut -c1-300; "
+         "echo ---tail; tail -n 25 $L | cut -c1-300")
+    if WLTRACE:
+        c += ("; echo ===COMPENV; cat /tmp/cosmic-comp-env.* /tmp/cosmic-term-env.* | grep -E '^(RUST_LOG|WAYLAND_DEBUG)='; "
+              "C=/tmp/cosmic-comp-1000.log; T=/tmp/cosmic-term-1000.log; "
+              "echo comp_bytes=$(wc -c <$C) term_bytes=$(wc -c <$T); "
+              "for p in 'Handling keystroke' 'Input forwarded to client' 'No client currently focused' "
+              "'intercepted by filter' 'Focus set to new surface' 'Focusing window' 'focus fixup'; do "
+              "echo \"comp $p=$(grep -c \"$p\" $C)\"; done; "
+              "echo ===COMPFOCUS; grep -E 'Focus set|Focusing window|focus fixup|Restoring focus|No client|intercepted|"
+              "get_layer_surface|set_keyboard_interactivity|wl_keyboard#[0-9]+[.](enter|leave)|zwlr_layer_surface_v1#[0-9]+[.]destroy' $C "
+              "| grep -v ' key ' | tail -n 80 | cut -c1-300; "
+              "echo ===TERMKBD; for p in 'wl_keyboard#[0-9]*[.]enter' 'wl_keyboard#[0-9]*[.]leave' "
+              "'wl_keyboard#[0-9]*[.]keymap' 'wl_keyboard#[0-9]*[.]key[(]' 'wl_keyboard#[0-9]*[.]modifiers'; do "
+              "echo \"term $p=$(grep -c \"$p\" $T)\"; done; "
+              "grep -E 'wl_keyboard|wl_seat' $T | grep -v '[.]key[(]' | tail -n 15 | cut -c1-200; "
+              "grep 'wl_keyboard#[0-9]*[.]key[(]' $T | tail -n 6 | cut -c1-200; "
+              "echo ===TERMTAIL; grep -v 'wl_callback\\|frame\\|wl_surface\\|wl_buffer\\|damage' $T | tail -n 20 | cut -c1-200")
+    open(f"{OUT}/{name}.txt", "w").write(sh(c, 90))
+
+
 def main():
     global SER
     log(f"ffsession arch={ARCH} accel={driver.accel_kind(ARCH)} gpu={GPU} scale={SCALE}")
@@ -440,7 +529,7 @@ def main():
         put_file(src, "/tmp/fflong.html")
     if url.startswith("file:///tmp/fftest.html"):
         sh("printf '%s' \"" + page + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
-    script = ("echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
+    script = ("unset WAYLAND_DEBUG; export RUST_LOG=info; echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
               "/bin/firefox --no-remote " + url + " >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
     sh(f"printf '%s\\n' '{script}' > /tmp/ffrun.sh; chmod 755 /tmp/ffrun.sh; cat /tmp/ffrun.sh")
     if "--fresh-profile" in A:
@@ -449,6 +538,10 @@ def main():
         # IndexedDB/cache churn) is part of what is under test.
         log(sh("rm -rf /home/leandro/.mozilla /home/leandro/.cache/mozilla; ls -d /home/leandro/.mozilla 2>&1"))
 
+    # Compositor keyboard-focus / input trace for the session (see the profile).
+    sh("mkdir -p /etc/leandros; printf '%s\\n' 'RUST_LOG=info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace' > /etc/leandros/session-env")
+    if WLTRACE:
+        install_wraps()
     if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
         # No greeter: keep what shows why (the compositor's log, every process's
         # scheduler state, where the CPUs are) before the run goes on and is torn down.
@@ -496,6 +589,8 @@ def main():
             key("esc")
     snap("desktop")
     if not NOFF:
+        if CLICK_TERM and not NOTERM:
+            click_term()
         launch_firefox(n_brush0)
         wait_for("firefox", lambda: firefox_procs() >= 3, T_FF)
         if WHEEL:

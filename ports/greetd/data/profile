@@ -164,6 +164,11 @@ export XCURSOR_THEME XCURSOR_SIZE
 # ---- logging ---------------------------------------------------------------
 RUST_LOG=info
 RUST_BACKTRACE=1
+# Optional override (the test harness writes /etc/leandros/session-env as root to
+# turn on compositor focus/input tracing); absent on a normal boot. Never source it
+# from a world-writable place like /tmp: any local user could inject code into
+# every other user's login.
+[ -r /etc/leandros/session-env ] && . /etc/leandros/session-env
 export RUST_LOG RUST_BACKTRACE
 
 # ---- the one line that says a session started ------------------------------
