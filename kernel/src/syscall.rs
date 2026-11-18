@@ -14511,9 +14511,39 @@ fn epoll_fd_drop(i: usize, tgid: u32) -> isize {
             ep[slot].refs = ep[slot].refs.saturating_sub(1);
             if ep[slot].refs == 0 { ep[slot] = EpollInstance::empty(); }
             else if ep[slot].owner_tgid == tgid { epoll_rehome(&mut ep[slot], slot, &t, tgid); }
+            epoll_renest(&mut ep[..], &t, EPOLL_FD_BASE + i, slot);
             0
         }
     }
+}
+
+/// Epoll number `h` (on instance `slot`) is gone. Registrations of it in other
+/// instances are keyed by the number (`ofd` 0), but on Linux they belong to
+/// the file: while the instance lives (a dup, a fork child's copy) they move
+/// to a surviving number of it; with its last reference they go
+/// (`eventpoll_release`). Before lane epref they stayed on the dead number:
+/// the outer instance never reported the inner one again (cosmic-panel's
+/// applet compositor, nested in calloop's, x86_64 virgl).
+fn epoll_renest(ep: &mut [EpollInstance], t: &EpollFdTable, h: usize, slot: usize) {
+    let alias = if ep.get(slot).map_or(false, |s| s.in_use) {
+        t.t.iter().position(|e| e.in_use && e.slot as usize == slot).map(|j| EPOLL_FD_BASE + j)
+    } else { None };
+    let mut changed = false;
+    for inst in ep.iter_mut() {
+        if !inst.in_use { continue; }
+        let n = (inst.hi as usize).min(inst.interests.len());
+        if !inst.interests[..n].iter().any(|x| x.is(h as i32, 0)) { continue; }
+        let alias_free = alias.map_or(false, |a| !inst.interests[..n].iter().any(|x| x.is(a as i32, 0)));
+        for it in inst.interests[..n].iter_mut() {
+            if !it.is(h as i32, 0) { continue; }
+            match alias {
+                Some(a) if alias_free => { it.fd = a as i32; it.mseq = epoll_next_seq(); }
+                _ => *it = EpollInterest::empty(),
+            }
+            changed = true;
+        }
+    }
+    if changed { EPOLL_CTL_GEN.fetch_add(1, Ordering::AcqRel); }
 }
 
 /// The creator `gone` of a still-referenced instance no longer holds any
