@@ -126,6 +126,12 @@ QEMU's stderr goes to `/tmp/leandros-qemu-stderr.log`.
   `--keep`, `nmsession.py click X Y OUT.png [REF.ppm]`, `key`, `type`,
   `shot`, `stop`. Inside the session, `nmtest --as leandro --user-bus
   --real` (root serial shell) drives the session's own busd-activated shim.
+- `storesession.py <arch> <outdir> [--gpu virgl|venus] [--keep]`: same
+  boot and greeter login as `gstsession.py`, then starts `cosmic-store` in
+  the session and, after ~60 s, requires it alive with no panic, the
+  `leandros-sysbus packagekit` facade running and logging a `get-packages`
+  transaction (fallback: busctl BackendName `apk`), and the Alpine appstream
+  catalog in `/var/lib/swcatalog/xml`. Prints `STORESESSION pass=N fail=M`.
 - `wifisimtest.py [arch] [--level N] [--keep]`: the simulated Wi-Fi
   (kernel `wifi_sim`, the same `wifi_mgr` state machine iwlwifi runs with
   `iwlwifi.mgr=1`) in its own boot: a throwaway copy of the boot image with

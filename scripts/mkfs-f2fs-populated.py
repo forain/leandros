@@ -3349,7 +3349,11 @@ def main():
         _provs += [p for p in apkdb.closure_provides(_p_dirs) if p.split("=")[0] not in _lock_names]
         _libs = [(n, h) for n, h, _m in lib_files + usr_lib_files]
         _libs += [(n, h) for d, n, h in m4_share_files + m5_exec_files if d in ("/lib", "/usr/lib")]
-        _sop = apkdb.so_provides(_libs)
+        # The libc soname belongs to the real musl package (lock entry): the
+        # loader's .recovery copy carries the same SONAME, and a second
+        # so:libc.musl-<arch>.so.1 provider in leandros-base makes apk 3
+        # report musl "conflicts: leandros-base", so every `apk add` failed.
+        _sop = [p for p in apkdb.so_provides(_libs) if not p.startswith("so:libc.musl-")]
         _provs += _sop
         _held_explicit = set(alpinepkgs.lk.read_list(os.path.join(alpinepkgs.lk.ADIR, "held")))
         for _h in alpinepkgs.lk._held_provides(arch):
