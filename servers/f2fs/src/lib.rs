@@ -4711,6 +4711,8 @@ static CP_RUNNING: atomic::AtomicBool = atomic::AtomicBool::new(false);
 /// Moving average of a checkpoint's device-write phase (ns): bounds the
 /// delayed-commit window on fast devices (lane fsyncbatch).
 static CP_EWMA_NS: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+/// The first (cold) checkpoint since boot has run; it is not an EWMA sample.
+static CP_WARM: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 /// Checkpoint the mount behind `port` with the device writes done outside
 /// F2FS_MOUNTS (see above). With `need` (an fsync's ticket), return at once
@@ -4840,9 +4842,21 @@ fn checkpoint_mutex_held(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpO
     let t_end = sched::monotonic_ns();
     let dur = t_end.saturating_sub(t_p2);
     CP_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
+    let cold = !CP_WARM.swap(true, atomic::Ordering::Relaxed);
     {
+        // The first checkpoint after boot is cold (2-2.7 s on virtio: first
+        // touch of the journal, empty caches) and says nothing about the
+        // steady state that sizes the group-commit window, so it is not a
+        // sample. Later outliers are clamped to 4x the average, so one slow
+        // checkpoint moves it by at most 2x while a genuinely slower device
+        // still converges within a few checkpoints.
         let e = CP_EWMA_NS.load(atomic::Ordering::Relaxed);
-        CP_EWMA_NS.store(if e == 0 { dur } else { (e * 3 + dur) / 4 }, atomic::Ordering::Relaxed);
+        if !cold {
+            let dur_s = if e == 0 { dur } else { dur.min(e.saturating_mul(4)) };
+            let ne = if e == 0 { dur_s } else { (e * 3 + dur_s) / 4 };
+            CP_EWMA_NS.store(ne, atomic::Ordering::Relaxed);
+            vfs_server::F2FS_CP_EWMA_US.store(ne / 1000, atomic::Ordering::Relaxed);
+        }
         let mut w = CP_WIN.lock();
         w.n[why as usize] += 1;
         for k in 0..REGS {
