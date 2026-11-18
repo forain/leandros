@@ -181,6 +181,15 @@ def launch_firefox(n_brush0):
         wait_for("term_shell", lambda: brush_count() > n_brush0, 60 * SCALE)
         SER.pump(2 * SCALE)
     for n in range(3):
+        if n:
+            # The keys of the previous try went to cosmic-panel: its Panel and
+            # Dock layer surfaces (Top layer, keyboard_interactivity OnDemand)
+            # can map seconds AFTER the terminal on x86_64 virgl, and
+            # cosmic-comp's map_layer() hands keyboard focus to any such layer
+            # surface as it maps, never back (lane kbdfocus9: wl_keyboard.leave
+            # on the terminal right after get_layer_surface "Panel"/"Dock").
+            # A click on the window gives focus back.
+            click_term()
         typ("sh /tmp/ffrun.sh"); key("ret")
         log("firefox launched" + (f" (retype {n})" if n else ""))
         t = time.time()
@@ -419,7 +428,7 @@ def ctrl_t(name):
 # /bin/cosmic-comp -> RUST_LOG focus/keyboard trace, stderr to its own file;
 # /bin/cosmic-term -> WAYLAND_DEBUG=1 (client side: wl_keyboard enter/keymap/key).
 # The real binaries move to /usr/libexec/lrf/ so argv[0] keeps its basename.
-WLTRACE = "--no-wltrace" not in A
+WLTRACE = "--wltrace" in A   # opt-in: the wrappers add load and edit /bin
 COMP_RUST_LOG = ("info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace,"
                  "smithay::input::keyboard=trace")
 
