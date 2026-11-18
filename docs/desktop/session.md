@@ -231,6 +231,12 @@ How the panel finds an applet shapes the staging
 `cosmic-applet-minimize` is a 1×1 hidden surface with zero toplevels when no windows are
 open; that is upstream design, not a bug.
 
+Un-hide is verified by `runtests.py <arch> <tag> --suite minimize` (`minimizetest.py`): it
+minimizes cosmic-term with `mintest min` (zcosmic_toplevel_manager; cosmic-comp has no other
+minimize path, and ignores `xdg_toplevel.set_minimized`), then clicks the dock's last entry,
+placed from the Dock layer surface and input region in the panel's wire trace, and checks
+`zcosmic_toplevel_info` (`minimized` cleared, `activated` set) and that typing reaches the window.
+
 ### The launcher backend
 
 `cosmic-launcher` talks to [pop-launcher](../../ports/pop-launcher/README.md) over piped JSON

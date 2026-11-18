@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "mintest"
+version = "0.1.0"
+edition = "2021"
+description = "COSMIC toplevel probe: list toplevels with their states, minimize/restore one"
+
+# Standalone, outside the userland workspace, like userland/blanktest: a std/musl
+# crate with the pure-Rust Wayland client. Built by build.sh.
+[[bin]]
+name = "mintest"
+path = "src/main.rs"
+
+[dependencies]
+wayland-client = "=0.31.14"
+wayland-backend = "=0.3.15"
+wayland-protocols = { version = "=0.32.12", features = ["client", "staging", "unstable"] }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "32283d7", default-features = false, features = ["client"] }
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

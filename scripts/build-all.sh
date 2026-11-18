@@ -901,6 +901,18 @@ build_blanktest() {
     "$ROOT_DIR/userland/blanktest/build.sh" "$arch"
 }
 
+# Function to build mintest -- COSMIC toplevel probe (list / minimize / restore) for
+# the minimize session suite (userland/mintest). Same shape as blanktest.
+build_mintest() {
+    local arch="$1"
+    echo "Building $arch mintest..."
+    if [[ ! -x "$ROOT_DIR/userland/mintest/build.sh" ]]; then
+        echo "userland/mintest not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/mintest/build.sh" "$arch"
+}
+
 # Function to build nmtest -- the NetworkManager client test (userland/nmtest,
 # nmrs 3.4.0 + tokio) that drives leandros-sysbus networkmanager the way the
 # COSMIC network applet does. Same shape as killmt.
@@ -1149,6 +1161,7 @@ for arch in "${ARCHS[@]}"; do
     build_nmtest "$arch"
     build_procmax "$arch"
     build_blanktest "$arch"
+    build_mintest "$arch"
     build_greetdlogin "$arch"
     build_claude_run "$arch"
     build_sudo_rs "$arch"
