@@ -86,11 +86,12 @@ def main():
            "export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; "
            "export PATH=$PATH:/usr/bin; ")
     log("env: " + sh("wc -l < /tmp/env.txt; ls /run/user/*/ | tr '\\n' ' '", 30))
-    log("start: " + sh(ENV + "(cosmic-store > /tmp/store.log 2>&1 & echo $! > /tmp/store.pid); true", 30))
+    log("start: " + sh(ENV + "export RUST_BACKTRACE=1 RUST_LOG=warn; (cosmic-store > /tmp/store.log 2>&1; echo EXIT=$? > /tmp/store.exit) > /dev/null 2>&1 & true", 30))
     ser.pump(60 * scale)
 
-    PID = ('for p in $(ls /proc | grep -E "^[0-9]+$"); do c=$(cat /proc/$p/comm 2>/dev/null); '
-           '[ "$c" = cosmic-store ] && echo $p; done | head -n 1')
+    # One grep over /proc/*/comm: a per-process loop forks per iteration and every
+    # fork prints a kernel [FORK] line that splices into the serial echo.
+    PID = "grep -a -l '^cosmic-store$' /proc/[0-9]*/comm 2>/dev/null | head -n 1 | cut -d/ -f3"
     SYSBUS = ('for p in $(ls /proc | grep -E "^[0-9]+$"); do [ "$(cat /proc/$p/comm 2>/dev/null)" = leandros-sysbus ] '
               '&& tr "\\0" " " < /proc/$p/cmdline | grep -q packagekit && echo $p; done | head -n 1')
     results = []
@@ -100,11 +101,17 @@ def main():
         steps[name] = ok
         log(f"{'PASS' if ok else 'FAIL'} {name} {detail}".rstrip())
 
-    r = sh("P=$(" + PID + "); echo ALIVE=${P:-none}-END; grep -ci panicked /tmp/store.log; grep -a -E 'panicked|ERROR cosmic_store' /tmp/store.log | tail -n 3 | cut -c1-300", 60)
-    m = re.search(r"ALIVE=(\w+)-END\s+(\d+)", r)
-    check("store_alive", bool(m) and m.group(1) != "none", r[-160:].replace("\n", "|") if not m or m.group(1) == "none" else "")
-    check("store_no_panic", bool(m) and m.group(2) == "0")
+    # Verdicts travel as exit codes (serial_run's RC), not as echoed text: kernel
+    # [FORK] console lines splice into the echo and corrupt any marker.
+    ra = driver.serial_run("[ -n \"$(" + PID + ")\" ]", timeout=60 * scale, arch=arch, ser=ser)
+    rp = driver.serial_run("! grep -a -q panicked /tmp/store.log", timeout=60 * scale, arch=arch, ser=ser)
+    check("store_alive", ra["rc"] == 0, f"rc={ra['rc']}")
+    check("store_no_panic", rp["rc"] == 0, f"rc={rp['rc']}")
 
+    if not results[0]:
+        tail = sh("cat /tmp/store.exit 2>&1; tail -n 40 /tmp/store.log | cut -c1-240", 60)
+        open(f"{out}/store-tail.txt", "w").write(tail)
+        log("store exit/tail: " + tail[-1500:].replace("\n", "|"))
     pk = sh("echo PKPID=$(" + SYSBUS + ")-END", 60)
     mp = re.search(r"PKPID=(\d*)-END", pk)
     check("packagekit_service", bool(mp) and mp.group(1) != "")

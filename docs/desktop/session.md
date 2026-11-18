@@ -149,6 +149,8 @@ the service, and busd activates each from a `.service` file in
 | `net.hadess.SwitcherooControl` | `GPUs` from `/sys/class/drm/card*` (driver name, Default on the first), `NumGPUs`, `HasDualGpu` = false | no PRIME environment: `Environment` is empty |
 | `org.a11y.Bus` | `GetAddress` answers with the session bus address, so GTK/libcosmic stop waiting for the activation timeout; `org.a11y.Status` IsEnabled / ScreenReaderEnabled (false) | no at-spi registry or screen reader exists, so toolkits find no accessibility tree |
 
+> PackageKit bus: LeandrOS has no separate system bus. cosmic-store dials `Connection::system()` (`DBUS_SYSTEM_BUS_ADDRESS`), which the greeter/session launcher aliases to the session busd, so the facade is activated there from `/usr/share/dbus-1/services/org.freedesktop.PackageKit.service` like every other system-name service (NetworkManager, login1, UPower). cosmic-store stays alive in the session (checked by `storesession.py`: alive after 60 s, appstream parsed, apps listed); its log carries only non-fatal Alpine appstream warnings (relative URLs) and portal `/proc/<pid>/root` AccessDenied for the colour scheme.
+
 Anything that needs root fails with an error and never pretends to succeed.
 `leandros-sysbus probe` exercises the services the way COSMIC components do and prints
 PASS/FAIL lines (it never calls `PowerOff`/`Reboot`), which makes it the in-guest check;
