@@ -22,6 +22,34 @@ def drv(*args, timeout=200, env=None):
                        timeout=timeout, env=env, cwd=REPO)
     return p.returncode, p.stdout + p.stderr
 
+# dd's exit status, read back between unique brackets. The serial stream also
+# carries kernel diagnostic lines that are not synchronised with the shell's
+# output, and the kernel drops UART bytes under host back-pressure (bounded
+# putc wait, main.rs UART_LINE_OPEN): a "[FORK] ... holds=1" line whose head
+# was dropped leaves a bare "1" line. The old check took ANY digits-only line
+# for dd's status, so such a fragment failed the run with "read of the hung
+# disk completed without the backend" while dd was still blocked (box aarch64
+# full regress, lane inoid 2026-11-17).
+RC_CMD = 'echo "DDRC<$(cat /tmp/dd.rc 2>/dev/null)>"'
+
+
+def dd_rc(out):
+    """dd's exit status from RC_CMD's output: digits, "" (still running) or
+    None (marker not seen)."""
+    m = re.search(r"DDRC<(\d*)>", out)
+    return m.group(1) if m else None
+
+
+def selftest():
+    # Captured shape: a kernel line whose prefix was dropped, then the probe.
+    spliced = "[    5.24] [FORK] tgid=24 clone_us=996 holds=\n1\nDDRC<>\n"
+    old = bool(re.search(r"^\d+\s*$", spliced.replace("DDRC<>", "").strip(), re.M))
+    new = dd_rc(spliced)
+    print(f"selftest: old parser says completed={old}, new parser rc={new!r}")
+    ok = new == "" and dd_rc("x\nDDRC<0>\n") == "0" and dd_rc("noise 7\n") is None
+    print("PASS selftest" if ok else "FAIL selftest")
+    return 0 if ok else 1
+
 
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
@@ -35,7 +63,7 @@ def main():
         f"-drive if=none,id=hang,driver=raw,file.driver=blkdebug,"
         f"file.image.driver=file,file.image.filename={img} "
         "-device virtio-blk-pci,drive=hang")
-    ok = True
+    ok = selftest() == 0  # the parser must see through spliced kernel fragments
     try:
         rc, out = drv("start", arch, timeout=300, env=env)
         if rc != 0:
@@ -70,10 +98,11 @@ def main():
         rc, out = drv("run", f"rm -f /tmp/dd.rc; (dd if={dev} of=/dev/null bs=4096 count=1 skip=3001 iflag=direct; echo $? > /tmp/dd.rc) >/tmp/dd.out 2>&1 </dev/null & sleep 2; echo STARTED", "30")
         if "STARTED" not in out:
             ok = False; print("FAIL: could not start background read\n" + out[-300:])
-        rc, out = drv("run", "cat /tmp/dd.rc 2>/dev/null; echo ALIVE", "30")
-        if "ALIVE" not in out:
+        rc, out = drv("run", RC_CMD, "30")
+        st = dd_rc(out)
+        if st is None:
             ok = False; print("FAIL: system unresponsive during the hang\n" + out[-300:])
-        elif re.search(r"^\d+\s*$", out.replace("ALIVE", "").strip(), re.M):
+        elif st != "":
             ok = False; print("FAIL: read of the hung disk completed without the backend\n" + out[-300:])
         else:
             print("system alive while the disk is hung")
@@ -81,7 +110,9 @@ def main():
         while time.time() - t0 < 75 and not slowlines():
             time.sleep(3)
         sl = slowlines()
-        print("\n".join(sl[-1:]) or "(no slow request line)")
+        print("\n".join(sl[-3:]) or "(no slow request line)")
+        print("t_slow=%.1fs" % (time.time() - t0))
+        _, o = drv("run", "cat /tmp/dd.out; cat /tmp/dd.rc", "30"); print("dd.out:", o.strip()[-300:])
         if not sl:
             ok = False; print("FAIL: driver never reported the slow request")
         rc, out = drv("run", "echo ALIVE2", "30")
@@ -90,9 +121,8 @@ def main():
         drv("qmp", "human-monitor-command", json.dumps({"command-line": 'qemu-io hang "resume r1"'}), timeout=30)
         got = ""
         for _ in range(10):
-            rc, out = drv("run", "cat /tmp/dd.rc 2>/dev/null; echo END", "30")
-            m2 = re.search(r"^(\d+)\s*$", out, re.M)
-            if m2: got = m2.group(1); break
+            rc, out = drv("run", RC_CMD, "30")
+            if dd_rc(out): got = dd_rc(out); break
             time.sleep(2)
         if got != "0":
             ok = False; print(f"FAIL: read did not complete after resume (rc={got!r})")
@@ -125,4 +155,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(selftest() if "--selftest" in sys.argv else main())
