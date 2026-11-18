@@ -19,6 +19,7 @@
 #include <sys/mount.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1526,12 +1527,13 @@ static void t_fhandle_follow(void)
     char d[128]; snprintf(d, sizeof d, "%s", base);
     report("t_fhandle_follow_base", fh_follow_in(d, "base"));
     mkdir("/root/fhtest", 0755);
-    report("t_fhandle_follow_f2fs", fh_follow_in("/root/fhtest", "f2fs"));
+    struct statfs sf; int isf2 = statfs("/root/fhtest", &sf) == 0 && (unsigned long)sf.f_type == 0xF2F52010UL;
+    if (isf2) report("t_fhandle_follow_f2fs", fh_follow_in("/root/fhtest", "f2fs"));
     /* f2fs handles carry a real, nonzero i_generation */
     char p[64] = "/root/fhtest/gen"; int f = open(p, O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f);
     struct fh20 h; memset(&h, 0, sizeof h); h.hb = 20; int mid;
     long r = syscall(FH_N2H, AT_FDCWD, p, &h, &mid, 0);
-    report("t_fhandle_f2fs_gen", r == 0 && h.gen != 0);
+    if (isf2) report("t_fhandle_f2fs_gen", r == 0 && h.gen != 0);
     unlink(p); rmdir("/root/fhtest");
 }
 

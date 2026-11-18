@@ -8400,6 +8400,19 @@ fn handle_rename(ms: &mut MountState, old_ptr: u64, new_ptr: u64, flags: u64) ->
     };
     if !dir_add_entry(ms, new_parent_ino, new_name, ino, ftype) { return err_reply(-28); } // ENOSPC
     dir_remove_entry(ms, old_parent_ino, old_name);
+    // Keep i_pino/i_name naming a live dentry: open_by_handle_at rebuilds the
+    // path of an inode from them.
+    {
+        let a = nat_lookup(ms, ino);
+        if a != 0 {
+            let b = ms.cache.get_mut(ms.dev, a as u64);
+            let nl = new_name.len().min(255);
+            w32(b, 84, new_parent_ino);
+            w32(b, INO_NAMELEN, nl as u32);
+            b[INO_NAME..INO_NAME + 255].fill(0);
+            b[INO_NAME..INO_NAME + nl].copy_from_slice(&new_name[..nl]);
+        }
+    }
     if is_dir && new_parent_ino != old_parent_ino {
         dir_remove_entry(ms, ino, b"..");
         dir_add_entry(ms, ino, b"..", new_parent_ino, DT_DIR);
