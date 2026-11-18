@@ -548,7 +548,8 @@ def find_fails(out):
 # Host scripts that only make sense on one arch (they boot their own VM of that
 # arch). A run of the other arch reports them as a skip, not a failure.
 HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
-                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64"}
+                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64",
+                  "a64acpitest.py": "aarch64"}
 
 
 def host_run(c, timeout, arch=None, scale=1.0):
