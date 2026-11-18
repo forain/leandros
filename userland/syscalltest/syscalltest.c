@@ -49,6 +49,9 @@
  *                        waitpid(WNOHANG) reaps it (tokio's reaping path)
  *   pidfd_wake_conmon    a pidfd is never readable while the process (or its
  *                        waitpid(-1) children) lives, under SIGURG/fork/socket churn
+ *   pidfd_zombie_contend pidfd_zombie_stat with exit-path lock contention
+ *   pidfd_zombie_stat    once a pidfd reads ready, /proc/<pid>/stat says Z
+ *                        and kill(pid, 0) succeeds until the wait (2000x)
  *   pidfd_epoll_et       EPOLLIN|EPOLLET fires once for the exit
  *   pidfd_waitid         waitid(P_PIDFD): status, WNOHANG, EAGAIN on an
  *                        O_NONBLOCK pidfd
@@ -1040,6 +1043,64 @@ static void *pw_watcher(void *arg) {
     }
     pw_tid_ok[idx] = 0;
     return NULL;
+}
+
+/* pidfd_zombie_stat (lane exitorder): an exited, unwaited child is a zombie
+ * to every observer as soon as its pidfd reads ready. The kernel recycles a
+ * zombie's run-queue slot eagerly and keeps it only as an exit record; /proc
+ * used to answer "R (running)" for such a pid and kill(pid, 0) ESRCH. */
+static volatile int zc_stop;
+static void *zc_churn(void *a) {
+    (void)a;
+    while (!zc_stop) {
+        int s = socket(AF_UNIX, SOCK_STREAM, 0); if (s >= 0) close(s);
+        int p[2]; if (pipe(p) == 0) { close(p[0]); close(p[1]); }
+        int o = open("/dev/null", O_RDONLY); if (o >= 0) close(o);
+    }
+    return NULL;
+}
+
+static void zombie_loop(const char *n, int contend);
+static void pidfd_zombie_stat(void) { zombie_loop("pidfd_zombie_stat", 0); }
+/* pidfd_zombie_contend (lane zombblock): the same check while exiting
+ * children close fds/sockets against churning threads, so exit()'s tail meets
+ * contended sleeping locks after the task is already a Zombie. */
+static void pidfd_zombie_contend(void) { zombie_loop("pidfd_zombie_contend", 1); }
+
+static void zombie_loop(const char *n, int contend) {
+    const char *e = getenv("PIDFDZOMBIE_ITERS");
+    int iters = e && atoi(e) > 0 ? atoi(e) : 2000;
+    int bad_state = 0, bad_kill = 0; char first[160] = "";
+    pthread_t ch[4]; int nch = 0;
+    if (contend) { zc_stop = 0; for (; nch < 4; nch++) pthread_create(&ch[nch], NULL, zc_churn, NULL); }
+    for (int it = 0; it < iters; it++) {
+        pid_t c = fork();
+        if (c < 0) { if (errno == EAGAIN) { usleep(10000); it--; continue; } fail(n, "fork: %s", strerror(errno)); return; }
+        if (c == 0) {
+            if (contend) for (int k = 0; k < 6; k++) { int p[2]; if (pipe(p) < 0) break; socket(AF_UNIX, SOCK_STREAM, 0); }
+            _exit(0);
+        }
+        int fd = pidfd_open(c, 0);
+        if (fd < 0) { fail(n, "pidfd_open: %s", strerror(errno)); waitpid(c, NULL, 0); goto out; }
+        struct pollfd pf = { fd, POLLIN, 0 };
+        int r;
+        do r = poll(&pf, 1, 5000); while (r < 0 && errno == EINTR);
+        if (r != 1) { fail(n, "iter %d: poll=%d revents=%#x", it, r, pf.revents); close(fd); waitpid(c, NULL, 0); goto out; }
+        char pp[48], buf[256], st = '?'; snprintf(pp, sizeof pp, "/proc/%d/stat", (int)c);
+        FILE *f = fopen(pp, "r");
+        if (f) { if (fgets(buf, sizeof buf, f)) { char *p = strrchr(buf, ')'); if (p && p[1] == ' ') st = p[2]; } fclose(f); }
+        int kr = kill(c, 0), ke = kr ? errno : 0;
+        if (st != 'Z' && !bad_state++ && !first[0])
+            snprintf(first, sizeof first, "iter %d pid %d: stat state '%c' (%s)", it, (int)c, st, f ? "read" : strerror(errno));
+        if (kr != 0 && !bad_kill++ && !first[0])
+            snprintf(first, sizeof first, "iter %d pid %d: kill(pid,0)=%s", it, (int)c, strerror(ke));
+        close(fd);
+        if (waitpid(c, NULL, 0) != c) { fail(n, "iter %d: waitpid: %s", it, strerror(errno)); goto out; }
+    }
+    if (bad_state || bad_kill) fail(n, "%d/%d not Z in /proc, %d kill ESRCH; first: %s", bad_state, iters, bad_kill, first);
+    else pass(n);
+out:
+    if (contend) { zc_stop = 1; for (int i = 0; i < nch; i++) pthread_join(ch[i], NULL); }
 }
 
 static void pidfd_wake_conmon(void) {
@@ -2785,6 +2846,8 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--rseq-exec-check")) return rseq_exec_check();
     if (argc > 1 && !strcmp(argv[1], "--exec-count-check")) return exec_count_check(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "--comm-check")) return comm_check();
+    if (argc > 1 && !strcmp(argv[1], "--pidfd-zombie-stat")) { pidfd_zombie_stat(); return nfail ? 1 : 0; }
+    if (argc > 1 && !strcmp(argv[1], "--pidfd-zombie-contend")) { pidfd_zombie_contend(); return nfail ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "--pidfd-wake-loop")) {
         /* Flake hunter: --pidfd-wake-loop <runs> [cpu-hogs] */
         int runs = argc > 2 ? atoi(argv[2]) : 10, hogs = argc > 3 ? atoi(argv[3]) : 0;
@@ -2854,6 +2917,8 @@ int main(int argc, char **argv) {
     pidfd_open_errors();
     pidfd_poll_exit();
     pidfd_wake_conmon();
+    pidfd_zombie_stat();
+    pidfd_zombie_contend();
     pidfd_epoll_et();
     pidfd_waitid();
     pidfd_send_signal_case();

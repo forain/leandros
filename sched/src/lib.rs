@@ -534,8 +534,8 @@ fn process_exit_state_locked(rq: &RunQueue, tgid: Pid) -> (bool, bool) {
         // Its threads may outlive it (`group_settled`).
         None if !group_settled(rq, tgid) => return (false, false),
         None => return (true, !exit_logged_unconsumed(tgid)),
-        Some(t) if t.state == TaskState::Zombie && t.wait_reported => return (true, true),
-        Some(t) => t.state == TaskState::Zombie,
+        Some(t) if t.eff_state() == TaskState::Zombie && t.wait_reported => return (true, true),
+        Some(t) => t.eff_state() == TaskState::Zombie,
     };
     if !leader_zombie { return (false, false); }
     // The leader may exit before its threads; only scan in that case.
@@ -623,7 +623,7 @@ fn as_drop_pending(tgid: Pid) -> bool {
 /// held.
 fn group_exit_notice(rq: &RunQueue, tgid: Pid, uid: u32) -> Option<(Pid, ExitStatus, u32, u8)> {
     if let Some(l) = rq.find_pid(tgid) {
-        if l.state != TaskState::Zombie || l.wait_reported || l.ppid == 0 { return None; }
+        if l.eff_state() != TaskState::Zombie || l.wait_reported || l.ppid == 0 { return None; }
         let parent = rq.find_pid(l.ppid).map(|p| p.tgid).unwrap_or(l.ppid);
         return Some((parent, ExitStatus { code: l.exit_code, term_signal: l.term_signal }, l.uid, l.exit_signal));
     }
@@ -674,6 +674,32 @@ pub fn pidfd_target_check(pid: Pid) -> Result<(), isize> {
 /// with RUN_QUEUE held (the lock order of `wait_scan`).
 fn exit_logged_unconsumed(tgid: Pid) -> bool {
     EXIT_LOG.lock().any_pending(|e| e.pid == tgid)
+}
+
+/// `(parent_tgid, pgid, sid)` of process `tgid` when it is a zombie whose
+/// run-queue slot the dispatch loop already recycled: its exit record is
+/// logged and no wait has consumed it. Call with RUN_QUEUE held (lock order
+/// RUN_QUEUE -> EXIT_LOG, as in `log_exit`).
+///
+/// Lane exitorder: such a process is still a zombie to every observer. Its
+/// pidfd reads ready and waitid reports it, so /proc/<pid>/stat must read Z
+/// and kill(pid, 0) must succeed, as on Linux, where a task is EXIT_ZOMBIE
+/// before do_notify_pidfd publishes the exit. Before this, the vfs fell back
+/// to "R (running)" for a pid absent from the run queue (syscalltest
+/// pidfd_wake_conmon "proc_state=R" on x86_64 KVM).
+fn exit_logged_zombie(tgid: Pid) -> Option<(Pid, Pid, Pid)> {
+    let mut hit = None;
+    EXIT_LOG.lock().any_pending(|e| {
+        if e.pid == tgid && e.is_process && !e.consumed { hit = Some((e.parent_tgid, e.pgid, e.sid)); true } else { false }
+    });
+    hit
+}
+
+/// kill(2) target check for a process absent from the run queue: true when
+/// it is an unreaped zombie (see `exit_logged_zombie`), which Linux signals
+/// successfully (the signal is discarded).
+pub(crate) fn absent_zombie(tgid: Pid) -> bool {
+    exit_logged_zombie(tgid).is_some()
 }
 
 /// True when an exited, not yet waited-for process of group `pgid` is in
@@ -1607,11 +1633,14 @@ pub fn pgrp_in_session(pgid: Pid, sid: Pid) -> bool {
 /// process whose leader happens to be mid-park still reads `T`.
 pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
     let rq = RUN_QUEUE.lock();
-    let t = rq.find_pid(pid)?;
+    let t = match rq.find_pid(pid) {
+        Some(t) => t,
+        None => return exit_logged_zombie(pid).map(|(pp, pg, sid)| (pp, pg, sid, b'Z')),
+    };
     if reaped_zombie(t) { return None; }
     let leader = rq.find_pid(t.tgid);
     let leader_stopped = leader.map(|l| l.stop_signal != 0).unwrap_or(false);
-    let letter = match t.state {
+    let letter = match t.eff_state() {
         TaskState::Zombie  => b'Z',
         TaskState::Stopped => b'T',
         _ if leader_stopped => b'T',
@@ -5073,7 +5102,7 @@ pub fn task_brief(pid: Pid) -> Option<TaskBrief> {
     for _ in 0..1000 {
         if let Some(rq) = RUN_QUEUE.try_lock() {
             let t = rq.find_pid(pid)?;
-            let state = match t.state {
+            let state = match t.eff_state() {
                 TaskState::Zombie => b'Z',
                 TaskState::Stopped => b'T',
                 TaskState::Blocked => b'S',
@@ -5468,7 +5497,7 @@ fn wait_scan_inner(sel: WaitSel, caller_tgid: Pid, consume: bool, what: WaitWhat
         derefs += 1;
         let (pid, tgid, ppid, pgid, state, status, reported, stop_sig, stop_reported, cont_pending, exit_sig) =
             match rq.get(i) {
-                Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.state,
+                Some(t) => (t.pid, t.tgid, t.ppid, t.pgid, t.eff_state(),
                             ExitStatus { code: t.exit_code, term_signal: t.term_signal },
                             t.wait_reported, t.stop_signal, t.stop_reported, t.cont_pending,
                             t.exit_signal),
@@ -5698,7 +5727,7 @@ pub fn task_waits(out: &mut alloc::vec::Vec<TaskWait>) {
     for i in rq.live_slots() {
         if out.len() == out.capacity() { break; }
         if let Some(t) = rq.get(i) {
-            let state = match t.state {
+            let state = match t.eff_state() {
                 TaskState::Zombie => b'Z', TaskState::Stopped => b'T', TaskState::Blocked => b'S',
                 TaskState::Ready => b'R', TaskState::Running => b'C',
             };
@@ -8746,6 +8775,7 @@ pub fn exit(code: i32) -> ! {
         let (uid, had_vfork) = match rq.find_pid_mut(pid) {
             Some(t) => {
                 t.set_state(TaskState::Zombie);
+                t.zombie_marked = true;
                 t.exit_code = code;
                 // L5.12: a leader leaving ahead of live threads (it was not the
                 // address space's last user) stays as the process's slot.
@@ -8817,6 +8847,11 @@ pub fn exit(code: i32) -> ! {
         // switches on `si_code` and a `waitpid` caller that decodes the packed
         // status are looking at the same death and must agree.
         send_group_exit_notice(tgid, n);
+    }
+    // A sleeping lock above may have parked this task Blocked and woken it
+    // Ready: re-assert Zombie so the dispatch loop reaps it at this switch-out.
+    if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
+        if t.state != TaskState::Zombie { t.set_state(TaskState::Zombie); }
     }
     yield_now("exit");
     loop { core::hint::spin_loop(); }

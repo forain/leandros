@@ -35,6 +35,8 @@ pub static PEXIT_MISS: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_DEFER: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_DROP: AtomicU64 = AtomicU64::new(0);
 pub static SYNC_FLUSH: AtomicU64 = AtomicU64::new(0);
+/// A Zombie parked Blocked by a late sleeping lock in `exit` (kept a zombie by `Task::eff_state`).
+pub static ZOMB_BLOCKED: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn bump(c: &AtomicU64) { c.fetch_add(1, Ordering::Relaxed); }
@@ -45,10 +47,10 @@ pub struct SchedStatsLine;
 impl core::fmt::Display for SchedStatsLine {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let l = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        write!(f, "# percpu deadline_pass {} deadline_skip {} deadline_again {} pexit_fast {} pexit_slow {} pexit_miss {} sync_defer {} sync_drop {} sync_flush {}",
+        write!(f, "# percpu deadline_pass {} deadline_skip {} deadline_again {} pexit_fast {} pexit_slow {} pexit_miss {} sync_defer {} sync_drop {} sync_flush {} zomb_blocked {}",
             l(&DEADLINE_PASS), l(&DEADLINE_SKIP), l(&DEADLINE_AGAIN),
             l(&PEXIT_FAST), l(&PEXIT_SLOW), l(&PEXIT_MISS),
-            l(&SYNC_DEFER), l(&SYNC_DROP), l(&SYNC_FLUSH))?;
+            l(&SYNC_DEFER), l(&SYNC_DROP), l(&SYNC_FLUSH), l(&ZOMB_BLOCKED))?;
         crate::slot::fmt_stats(f)
     }
 }

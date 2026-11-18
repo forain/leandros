@@ -125,7 +125,7 @@ static COOKIE: AtomicU32 = AtomicU32::new(1);
 /// Counting bloom over the hash of each watch's directory path.
 static DIR_BLOOM: [AtomicU16; BLOOM] = [const { AtomicU16::new(0) }; BLOOM];
 
-struct Watch { wd: i32, mask: u32, ignore: u32, surv: bool, ino: Id, isdir: bool, multi: bool, mount: bool, path: Vec<u8>, hash: u64 }
+struct Watch { wd: i32, mask: u32, ignore: u32, surv: bool, ino: Id, isdir: bool, multi: bool, mount: bool, fs: bool, dev: u64, path: Vec<u8>, hash: u64 }
 /// What the indexes (and the MULTI/FANM counters) need to forget a watch.
 #[derive(Clone, Copy)]
 struct Wk { hash: u64, ino: Id, multi: bool, mount: bool }
@@ -292,7 +292,7 @@ pub fn add(inst: u32, path: &[u8], mask: u32, id: Id, nlink: u64, isdir: bool) -
     while i.watches.iter().any(|w| w.wd == wd) { wd = if wd == i32::MAX { 1 } else { wd + 1 }; }
     i.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
     let h = fnv(path);
-    let w = Watch { wd, mask: ev_mask, ignore: 0, surv: false, ino: id, isdir, multi: nlink > 1 && !isdir, mount: false, path: path.to_vec(), hash: h };
+    let w = Watch { wd, mask: ev_mask, ignore: 0, surv: false, ino: id, isdir, multi: nlink > 1 && !isdir, mount: false, fs: false, dev: 0, path: path.to_vec(), hash: h };
     let k = w.k();
     i.watches.push(w);
     st.nwatches += 1;
@@ -332,11 +332,11 @@ fn wdrop(st: &mut State, inst: u32, p: usize) {
 
 /// fanotify_mark ADD/REMOVE on an inode (`mount == false`) or on the mount
 /// rooted at `path`. `mask` is the fanotify mask (events | ONDIR | ON_CHILD).
-pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: u64, isdir: bool, mount: bool, ignore: bool, surv: bool) -> Result<(), i32> {
+pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: u64, isdir: bool, mount: bool, fs: bool, dev: u64, ignore: bool, surv: bool) -> Result<(), i32> {
     let mut st = STATE.lock();
     let st = &mut *st;
     let i = match st.insts.get_mut(&inst) { Some(i) if i.fan => i, _ => return Err(-22) };
-    let found = i.watches.iter().position(|w| w.mount == mount && if mount { w.path == path } else { w.ino == id && id != (0, 0) });
+    let found = i.watches.iter().position(|w| w.mount == mount && if mount { w.fs == fs && w.dev == dev } else { w.ino == id && id != (0, 0) });
     if remove {
         let p = found.ok_or(-2)?;
         let w = &mut i.watches[p];
@@ -363,7 +363,7 @@ pub fn fan_mark(inst: u32, remove: bool, path: &[u8], mask: u32, id: Id, nlink: 
     let mut wd = i.next_wd;
     while i.watches.iter().any(|w| w.wd == wd) { wd = if wd == i32::MAX { 1 } else { wd + 1 }; }
     i.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
-    let w = Watch { wd, mask: if ignore { mask & (FAN_ONDIR | FAN_ON_CHILD) } else { mask }, ignore: if ignore { mask & (FAN_EVENTS | FAN_PERM) } else { 0 }, surv: ignore && surv, ino: if mount { (0, 0) } else { id }, isdir, multi: !mount && nlink > 1 && !isdir, mount, path: path.to_vec(), hash: fnv(path) };
+    let w = Watch { wd, mask: if ignore { mask & (FAN_ONDIR | FAN_ON_CHILD) } else { mask }, ignore: if ignore { mask & (FAN_EVENTS | FAN_PERM) } else { 0 }, surv: ignore && surv, ino: if mount { (0, 0) } else { id }, isdir, multi: !mount && nlink > 1 && !isdir, mount, fs: mount && fs, dev, path: path.to_vec(), hash: fnv(path) };
     let k = w.k();
     i.watches.push(w);
     st.nwatches += 1;
@@ -398,9 +398,15 @@ pub fn fan_read(inst: u32, max: usize) -> Result<Vec<(u32, Vec<u8>, u32, u32, Id
     Ok(v)
 }
 
+/// Does mount mark `w` cover an object whose mount is rooted at `root` on
+/// filesystem `dev`? MOUNT = that mount only; FILESYSTEM = every mount of the
+/// superblock.
+fn mnt_match(w: &Watch, _root: &[u8], dev: u64) -> bool { w.dev == dev }
+
 /// Mount marks: an event on `path` reaches every mark whose mount root is a
 /// prefix of it.
 fn fan_mount(path: &[u8], mask: u32, named: bool) {
+    let (root, dev) = crate::fan_mount_of(path);
     let mut keys: Vec<u64> = Vec::new();
     {
         let mut st = STATE.lock();
@@ -411,11 +417,10 @@ fn fan_mount(path: &[u8], mask: u32, named: bool) {
             let mut evs: Vec<Ev> = Vec::new();
             if i.watches.iter().any(|w| !w.mount && w.path == path && w.ignore & mask != 0) { continue; }
             for w in i.watches.iter() {
-                if w.mount && w.ignore & mask != 0 && w.path == path { break; }
+                if w.mount && w.ignore & mask != 0 && mnt_match(w, &root, dev) { break; }
                 if !w.mount || w.mask & mask & (FAN_EVENTS | FAN_FID_EVENTS) == 0 { continue; }
                 if mask & IN_ISDIR != 0 && w.mask & FAN_ONDIR == 0 { continue; }
-                let under = w.path == path || w.path == b"/" || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/');
-                if under { evs.push(Ev { wd: w.wd, mask: mask & (FAN_EVENTS | FAN_FID_EVENTS) | (mask & IN_ISDIR), cookie: pid as u32, name: path.to_vec(), ino: (0, 0), named }); break; }
+                if mnt_match(w, &root, dev) { evs.push(Ev { wd: w.wd, mask: mask & (FAN_EVENTS | FAN_FID_EVENTS) | (mask & IN_ISDIR), cookie: pid as u32, name: path.to_vec(), ino: (0, 0), named }); break; }
             }
             for e in evs { hit |= push(i, e); }
             if hit { keys.push(key(inst)); }
@@ -793,16 +798,17 @@ pub fn fan_perm(path: &[u8], mask: u32, isdir: bool) -> i32 {
     if !perm_watched() { return 0; }
     let pid = sched::tgid_of(sched::current_pid()) as u32;
     let parent = split(path).map(|(p, _)| p);
+    let (root, dev) = crate::fan_mount_of(path);
     let mut waits: Vec<(u32, u32)> = Vec::new();
     {
         let mut st = STATE.lock();
         for (&inst, i) in st.insts.iter_mut() {
             if !i.perm || i.owner == pid { continue; }
-            if i.watches.iter().any(|w| w.path == path && w.ignore & mask != 0) { continue; }
+            if i.watches.iter().any(|w| !w.mount && w.path == path && w.ignore & mask != 0) { continue; }
             let hit = i.watches.iter().any(|w| {
                 if w.mask & mask == 0 || w.ignore & mask != 0 { return false; }
                 if isdir && w.mask & FAN_ONDIR == 0 { return false; }
-                if w.mount { return w.path == b"/" || w.path == path || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/'); }
+                if w.mount { return mnt_match(w, &root, dev); }
                 w.path == path || (w.isdir && w.mask & FAN_ON_CHILD != 0 && parent == Some(&w.path[..]))
             });
             if !hit { continue; }
@@ -890,7 +896,8 @@ pub fn fan_verdict(inst: u32, fd: i32, response: u32) -> Result<(), i32> {
 pub fn fan_rename(old: &[u8], new: &[u8], isdir: bool) {
     if !armed() { return; }
     let (po, pn) = (split(old).map(|(p, _)| p), split(new).map(|(p, _)| p));
-    let under = |w: &Watch, p: &[u8]| w.path == b"/" || w.path == p || (p.len() > w.path.len() && p.starts_with(&w.path) && p[w.path.len()] == b'/');
+    let (ro, dno) = crate::fan_mount_of(old);
+    let (rn, dnn) = crate::fan_mount_of(new);
     let mut name = old.to_vec();
     name.push(0);
     name.extend_from_slice(new);
@@ -903,7 +910,7 @@ pub fn fan_rename(old: &[u8], new: &[u8], isdir: bool) {
             let hit = i.watches.iter().any(|w| {
                 if w.mask & FAN_RENAME == 0 || w.ignore & FAN_RENAME != 0 { return false; }
                 if isdir && w.mask & FAN_ONDIR == 0 { return false; }
-                if w.mount { return under(w, old) || under(w, new); }
+                if w.mount { return mnt_match(w, &ro, dno) || mnt_match(w, &rn, dnn); }
                 w.isdir && (Some(&w.path[..]) == po || Some(&w.path[..]) == pn)
             });
             if !hit { continue; }
@@ -918,16 +925,17 @@ pub fn fan_rename(old: &[u8], new: &[u8], isdir: bool) {
 pub fn fan_open_exec(path: &[u8]) {
     if !armed() { return; }
     let parent = split(path).map(|(p, _)| p);
+    let (root, dev) = crate::fan_mount_of(path);
     let pid = sched::tgid_of(sched::current_pid()) as u32;
     let mut keys: Vec<u64> = Vec::new();
     {
         let mut st = STATE.lock();
         for (&inst, i) in st.insts.iter_mut() {
             if !i.fan { continue; }
-            if i.watches.iter().any(|w| w.path == path && w.ignore & FAN_OPEN_EXEC != 0) { continue; }
+            if i.watches.iter().any(|w| !w.mount && w.path == path && w.ignore & FAN_OPEN_EXEC != 0) { continue; }
             let wd = i.watches.iter().find(|w| {
                 if w.mask & FAN_OPEN_EXEC == 0 || w.ignore & FAN_OPEN_EXEC != 0 { return false; }
-                if w.mount { return w.path == b"/" || w.path == path || (path.len() > w.path.len() && path.starts_with(&w.path) && path[w.path.len()] == b'/'); }
+                if w.mount { return mnt_match(w, &root, dev); }
                 w.path == path || (w.isdir && w.mask & FAN_ON_CHILD != 0 && parent == Some(&w.path[..]))
             }).map(|w| w.wd);
             let Some(wd) = wd else { continue };

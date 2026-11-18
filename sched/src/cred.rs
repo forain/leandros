@@ -84,6 +84,9 @@ fn kill_check_ns(tgid: Pid, sig: u32) -> (isize, crate::ns::NsId, crate::ns::NsI
             if r == 0 && sig != 0 && crate::pidns::init_drops(c.pidns, t, sig) { return (DROPPED, tn, c.pidns); }
             (r, tn, c.pidns)
         }
+        // A zombie whose slot is already recycled (lane exitorder): Linux
+        // kill() succeeds on an unreaped zombie and the signal is dropped.
+        None if crate::absent_zombie(tgid) => (DROPPED, 0, c.pidns),
         _ => (ESRCH, 0, c.pidns),
     }
 }
