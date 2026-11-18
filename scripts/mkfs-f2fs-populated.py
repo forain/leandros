@@ -2687,6 +2687,28 @@ def main():
                 if os.path.isfile(hp) and _base:
                     _stage_cosmic_default(f"{_base}/{fn}", hp)
 
+    # cosmic-panel's CosmicPanelConfig has two fields the epoch-1.3.0
+    # default_schema does not ship (panel_config.rs:461,464). A missing key
+    # makes CosmicPanelContainerConfig::load() fail, and main.rs then calls
+    # write_entries(), which rewrites every panel key of both entries into
+    # ~/.config/cosmic before the panel even connects to Wayland: 9-14 s on
+    # x86_64 KVM virgl (lane panellate), so the Panel/Dock layer surfaces
+    # mapped after the first terminal and stole its keyboard focus. Ship the
+    # code defaults (panel_config.rs:521-522) for any entry lacking them.
+    import tempfile as _tf
+    _gen = _tf.mkdtemp(prefix="cosmic-panel-defaults-")
+    for _entry in ("Panel", "Dock"):
+        _sd = f"{cosmic_epoch}/cosmic-panel/data/default_schema/com.system76.CosmicPanel.{_entry}/v1"
+        if not os.path.isdir(_sd):
+            continue
+        for _key, _val in (("padding_overlap", "0.5"), ("keep_style_on_maximize", "false")):
+            if os.path.exists(f"{_sd}/{_key}"):
+                continue
+            _hp = os.path.join(_gen, f"{_entry}-{_key}")
+            with open(_hp, "w") as _f:
+                _f.write(_val)
+            _stage_cosmic_default(f"com.system76.CosmicPanel.{_entry}/v1/{_key}", _hp)
+
     # The three files upstream installs one at a time, each RENAMED: the ".ron"
     # suffix is stripped, and keybindings.ron additionally becomes "defaults".
     #   cosmic-comp/Makefile:26-27,55-57
