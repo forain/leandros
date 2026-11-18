@@ -81,6 +81,7 @@ def opt(name, default, conv=str):
 
 NOFF = "--nofirefox" in A
 NOTERM = "--noterm" in A
+CLICK_TERM = "--click-term" in A
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 WAIT = opt("--wait", 150, int)
@@ -268,6 +269,27 @@ def ppm_size(f):
     return int(parts[1]), int(parts[2])
 
 
+def click_term():
+    """Left-click the middle of the screen (inside the tiled cosmic-term window)
+    so the terminal holds keyboard focus before the launch line is typed."""
+    drv("screenshot", f"{OUT}/preclick.ppm", t=90)
+    w, h = ppm_size(f"{OUT}/preclick.ppm")
+    s = driver._qmp_open()
+    try:
+        driver._qmp_command(s, "input-send-event", {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": (w // 2) * 32767 // w}},
+            {"type": "abs", "data": {"axis": "y", "value": (h // 2) * 32767 // h}}]})
+        time.sleep(0.3)
+        for down in (True, False):
+            driver._qmp_command(s, "input-send-event", {"events": [
+                {"type": "btn", "data": {"down": down, "button": "left"}}]})
+            time.sleep(0.1)
+    finally:
+        s.close()
+    SER.pump(2 * SCALE)
+    log("clicked the terminal window")
+
+
 def click_step(name, where):
     """Pointer-button control for --wheel: left-click at a screen pixel,
     screenshot before/after. `where` maps framebuffer width to (px, py): the
@@ -393,14 +415,12 @@ def ctrl_t(name):
 def session_diag(name):
     """Save a focus/keystroke summary of the COSMIC session log to OUT/<name>.txt."""
     c = ("L=/tmp/cosmic-session-1000.log; echo bytes=$(wc -c <$L); "
-         "for p in 'Handling keystroke' 'Input forwarded to client' "
-         "'No client currently focused' 'Input was intercepted by filter' "
-         "'Focus set to new surface' 'Focus unset' 'Focus unchanged' "
-         "'focus fixup' 'Restoring focus'; do "
+         "for p in 'key keycode' 'Focusing window' 'Restoring focus' "
+         "'focus fixup' 'restore focus to previous popup grab' 'grab keyboard'; do "
          "echo \"$p=$(grep -c \"$p\" $L)\"; done; "
-         "grep -E 'Focus set|Focus unset|focus fixup|Restoring focus|Focusing window' $L | tail -n 20 | cut -c1-300; "
+         "grep -E 'Focusing window|focus fixup|Restoring focus|popup grab' $L | tail -n 20 | cut -c1-300; "
          "echo ---warn; "
-         "grep -iE 'warn|error|panic' $L | grep -v 'Handling keystroke' | tail -n 40 | cut -c1-300; "
+         "grep -iE 'warn|error|panic' $L | grep -v 'keycode' | tail -n 40 | cut -c1-300; "
          "echo ---tail; tail -n 25 $L | cut -c1-300")
     open(f"{OUT}/{name}.txt", "w").write(sh(c, 90))
 
@@ -468,6 +488,8 @@ def main():
         # IndexedDB/cache churn) is part of what is under test.
         log(sh("rm -rf /home/leandro/.mozilla /home/leandro/.cache/mozilla; ls -d /home/leandro/.mozilla 2>&1"))
 
+    # Compositor keyboard-focus / input trace for the session (see the profile).
+    sh("printf '%s\\n' 'RUST_LOG=info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace' > /tmp/session-env")
     if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
         # No greeter: keep what shows why (the compositor's log, every process's
         # scheduler state, where the CPUs are) before the run goes on and is torn down.
@@ -515,6 +537,8 @@ def main():
             key("esc")
     snap("desktop")
     if not NOFF:
+        if CLICK_TERM and not NOTERM:
+            click_term()
         launch_firefox(n_brush0)
         wait_for("firefox", lambda: firefox_procs() >= 3, T_FF)
         if WHEEL:

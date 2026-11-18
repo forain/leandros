@@ -164,6 +164,9 @@ export XCURSOR_THEME XCURSOR_SIZE
 # ---- logging ---------------------------------------------------------------
 RUST_LOG=info
 RUST_BACKTRACE=1
+# Optional per-boot override (the test harness writes /tmp/session-env to turn
+# on compositor focus/input tracing); absent on a normal boot.
+[ -r /tmp/session-env ] && . /tmp/session-env
 export RUST_LOG RUST_BACKTRACE
 
 # ---- the one line that says a session started ------------------------------
