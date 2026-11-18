@@ -4625,11 +4625,18 @@ struct CpSeq {
     /// `f2fs.fsync=lazy`: the time by which a checkpoint must start for the
     /// fsyncs that returned early (0 = none owed); reset at a snapshot.
     lazy_due: atomic::AtomicU64,
+    /// Delayed group commit only when there is company (lane cfgwrite):
+    /// fsyncs now waiting for a checkpoint, and the arrival time and caller
+    /// of the last one.
+    inflight: atomic::AtomicU32,
+    last_arr: atomic::AtomicU64,
+    last_pid: atomic::AtomicU32,
 }
 static CP_SEQ: [CpSeq; MAX_MOUNTS] = [const {
     CpSeq { port: atomic::AtomicU32::new(0), started: atomic::AtomicU64::new(0), done: atomic::AtomicU64::new(0),
             pending_t0: atomic::AtomicU64::new(0), last_end: atomic::AtomicU64::new(0),
-            lazy_due: atomic::AtomicU64::new(0) }
+            lazy_due: atomic::AtomicU64::new(0), inflight: atomic::AtomicU32::new(0),
+            last_arr: atomic::AtomicU64::new(0), last_pid: atomic::AtomicU32::new(0) }
 }; MAX_MOUNTS];
 
 fn cp_seq(port: u32) -> Option<&'static CpSeq> {
@@ -5200,6 +5207,9 @@ pub fn fsync_report(window_ns: u64) -> Option<alloc::string::String> {
 
 /// fsync(2)/fdatasync(2) of descriptor `file_id` (`kind`), or sync(2) /
 /// syncfs(2) of the whole mount behind `port` (see above).
+/// fsyncs that took the delayed group-commit window / that skipped it for
+/// lack of company (`/proc/f2fsstat` fsync_delayed / fsync_undelayed).
+use vfs_server::{F2FS_FSYNC_DELAYED as FSYNC_DELAYED, F2FS_FSYNC_UNDELAYED as FSYNC_UNDELAYED};
 fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
     let t_arr = sched::monotonic_ns();
     FSYNC_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
@@ -5275,12 +5285,31 @@ fn fsync_port(port: u32, caller_pid: u32, file_id: u64, kind: u64) -> Message {
     if let (true, Some(s)) = (per_file, s) {
         let d = fsync_delay_ns();
         let can_wait = sched::irqctx::can_sleep() && sched::current_pid() != 0;
-        if d != 0 && can_wait && need > s.started.load(atomic::Ordering::SeqCst) {
+        // The delay only pays when another caller can join the checkpoint:
+        // one is waiting now, or another caller's fsync arrived within the
+        // window. A lone serial caller (cosmic-config's mkdir + create +
+        // fsync + rename + fsync(dir) per key, a database's commit loop)
+        // would wait the whole window for nobody, every time: 100 config
+        // keys took 11.5 s on x86_64 KVM (lane cfgwrite). Durability is
+        // unchanged either way.
+        let now = sched::monotonic_ns();
+        let prev_pid = s.last_pid.swap(caller_pid, atomic::Ordering::SeqCst);
+        let prev_arr = s.last_arr.swap(now, atomic::Ordering::SeqCst);
+        let company = s.inflight.load(atomic::Ordering::SeqCst) != 0
+            || (prev_pid != 0 && prev_pid != caller_pid && now.saturating_sub(prev_arr) < d);
+        if d != 0 && can_wait && company && need > s.started.load(atomic::Ordering::SeqCst) {
+            FSYNC_DELAYED.fetch_add(1, atomic::Ordering::Relaxed);
+            s.inflight.fetch_add(1, atomic::Ordering::SeqCst);
             x.delay = fsync_window(port, s, need, d);
+            s.inflight.fetch_sub(1, atomic::Ordering::SeqCst);
+        } else if d != 0 {
+            FSYNC_UNDELAYED.fetch_add(1, atomic::Ordering::Relaxed);
         }
     }
     let mut out = CpOut::default();
+    if let (true, Some(s)) = (per_file, s) { s.inflight.fetch_add(1, atomic::Ordering::SeqCst); }
     let r = checkpoint_unlocked_ex(port, Some(need), if per_file { CpWhy::Fsync } else { CpWhy::Sync }, &mut out);
+    if let (true, Some(s)) = (per_file, s) { s.inflight.fetch_sub(1, atomic::Ordering::SeqCst); }
     x.ran = out.ran;
     x.wait = out.mutex_wait_ns;
     x.lat = sched::monotonic_ns().saturating_sub(t_arr);

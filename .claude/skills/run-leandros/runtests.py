@@ -144,6 +144,19 @@ SYSFS_CHECK = (
     "test $__f = 0"
 )
 
+# cosmic-config's per-key atomic write (mkdir + create + write + fsync + rename
+# + fsync(dir) x2 + rmdir) as a non-root user on /home: a lone serial fsync
+# caller must not wait the delayed group-commit window (lane cfgwrite; it was
+# 90-200 ms per key, 11.5 s for cosmic-panel's 100 keys after boot).
+CFGWRITE_CHECK = (
+    "dly() { while read k v; do [ \"$k\" = fsync_delayed ] && echo $v; done < /proc/f2fsstat; }; "
+    "a=$(dly); out=$(/bin/sudo -u leandro /bin/fsbench cfgwrite /home/leandro/.cfgchk 30); rc=$?; b=$(dly); "
+    "/bin/sudo -u leandro /bin/rm -rf /home/leandro/.cfgchk; "
+    "pk=${out#*per_key_us=}; pk=${pk%% *}; echo \"cfgwrite: per_key_us=$pk delayed=$a..$b rc=$rc\"; "
+    "[ $rc = 0 ] && [ -n \"$b\" ] && [ $((b - a)) -le 3 ] && [ \"$pk\" -lt 150000 ] "
+    "&& echo 'cfgwrite: PASS' || { echo 'cfgwrite: FAIL'; false; }"
+)
+
 # `sync FILE` is fsync(FILE), not sync(): on f2fs it must not take a checkpoint
 # (/proc/f2fsstat cp_total), bare `sync` must; an unopenable file exits 1 and the
 # others are still synced (lane syncfile).
@@ -207,7 +220,7 @@ SUITES = {
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
-                SYNCFILE_CHECK, LONGLINE_CHECK,
+                SYNCFILE_CHECK, CFGWRITE_CHECK, LONGLINE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
                 "/bin/epolltest cost",
@@ -512,6 +525,7 @@ SUITES = {
     # identity libdrm/udev consumers read (lane sysfs).
     "sysfs": [SYSFS_CHECK],
     "syncfile": [SYNCFILE_CHECK],
+    "cfgwrite": [CFGWRITE_CHECK],
     # Harness guard: a 4 KB typed line must reach the shell intact (brush
     # repaints the whole line per burst; lane sysfshang). 120 checks of 30 chars.
     "longline": [LONGLINE_CHECK],
