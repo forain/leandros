@@ -80,9 +80,12 @@ def main():
     wait_for("panel", lambda: have("cosmic-panel"), 150)
     ser.pump(10 * scale)
     sh("P=$(for d in /proc/[0-9]*; do [ \"$(cat $d/comm 2>/dev/null)\" = cosmic-panel ] && echo ${d#/proc/}; done | head -1); "
-       "tr '\\0' '\\n' < /proc/$P/environ | grep -E '^(XDG_RUNTIME_DIR|HOME|USER|DBUS_SESSION|XDG_SESSION|LANG)' > /tmp/env.txt", 60)
+       "tr '\\0' '\\n' < /proc/$P/environ | grep -E '^(XDG_RUNTIME_DIR|HOME|USER|DBUS_[A-Z_]*|XDG_SESSION|LANG)' > /tmp/env.txt", 60)
     ENV = ("set -a; . /tmp/env.txt 2>/dev/null; set +a; export WAYLAND_DISPLAY=wayland-1; unset WAYLAND_SOCKET; "
+           "U=$(ls -d /run/user/[1-9]* | head -n 1); export XDG_RUNTIME_DIR=$U HOME=/home/leandro DBUS_SESSION_BUS_ADDRESS=unix:path=$U/bus; "
+           "export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; "
            "export PATH=$PATH:/usr/bin; ")
+    log("env: " + sh("wc -l < /tmp/env.txt; ls /run/user/*/ | tr '\\n' ' '", 30))
     log("start: " + sh(ENV + "(cosmic-store > /tmp/store.log 2>&1 & echo $! > /tmp/store.pid); true", 30))
     ser.pump(60 * scale)
 
@@ -97,7 +100,7 @@ def main():
         steps[name] = ok
         log(f"{'PASS' if ok else 'FAIL'} {name} {detail}".rstrip())
 
-    r = sh("P=$(" + PID + "); echo ALIVE=${P:-none}-END; grep -ci panicked /tmp/store.log; tail -n 3 /tmp/store.log | cut -c1-160", 60)
+    r = sh("P=$(" + PID + "); echo ALIVE=${P:-none}-END; grep -ci panicked /tmp/store.log; grep -a -E 'panicked|ERROR cosmic_store' /tmp/store.log | tail -n 3 | cut -c1-300", 60)
     m = re.search(r"ALIVE=(\w+)-END\s+(\d+)", r)
     check("store_alive", bool(m) and m.group(1) != "none", r[-160:].replace("\n", "|") if not m or m.group(1) == "none" else "")
     check("store_no_panic", bool(m) and m.group(2) == "0")
