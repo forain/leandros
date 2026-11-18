@@ -446,6 +446,66 @@ def install_wraps():
         log(sh(f"chmod 755 /bin/{name}; ls -l /usr/libexec/lrf/{name} /bin/{name} | cut -c1-120"))
 
 
+PANELTRACE = True or "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
+# --paneltrace (lane panellate): when does cosmic-panel create and map its layer
+# surfaces?  A /bin/cosmic-panel wrapper logs its start (uptime + realtime),
+# runs the panel with WAYLAND_DEBUG=1 and samples the panel's threads in
+# /proc/sysstat ('w' lines: state, syscall, time in it) every 0.2 s for 30 s.
+PANEL_WRAP = r"""#!/bin/sh
+U=$(id -u); S=/tmp/plsamp-$U.log
+echo "start up=$(cat /proc/uptime) rt=$(date +%s%N) pid=$$" >>$S
+( P=$$; i=0; while [ $i -lt 150 ]; do echo "@ $(cat /proc/uptime)"; grep "^w [0-9]+ $P " /proc/sysstat | cut -c1-90; i=$((i+1)); sleep 0.2; done
+  echo END; grep "^[st] [0-9]+ $P " /proc/sysstat | cut -c1-120 ) >>$S 2>&1 &
+export WAYLAND_DEBUG=1
+exec /usr/libexec/lrf/cosmic-panel "$@" >>/tmp/cosmic-panel-$U.log 2>&1
+"""
+
+
+def install_panel_wrap():
+    src = f"{OUT}/wrap-cosmic-panel"
+    open(src, "w").write(PANEL_WRAP)
+    sh("mkdir -p /usr/libexec/lrf; [ -e /usr/libexec/lrf/cosmic-panel ] || mv /bin/cosmic-panel /usr/libexec/lrf/cosmic-panel")
+    put_file(src, "/bin/cosmic-panel")
+    sh("chmod 755 /bin/cosmic-panel")
+
+
+def panel_diag():
+    """Save the panel's start, layer-surface and first-commit times (uptime s)."""
+    L = "/tmp/cosmic-panel-1000.log"
+    c = ("cat /tmp/plsamp-1000.log; echo ===UP; cat /proc/uptime; echo ===WL; "
+         f"grep -m2 -n 'get_registry' {L} | cut -c1-160; grep -m4 -n 'get_layer_surface' {L} | cut -c1-160; "
+         f"grep -m4 -n 'zwlr_layer_surface_v1[#@][0-9]+[.]configure' {L} | cut -c1-160; "
+         f"grep -m6 -n -e '-> wl_surface[#@][0-9]+[.]attach' {L} | cut -c1-160; "
+         f"grep -m3 -n 'zwp_linux_dmabuf' {L} | cut -c1-160; echo panel_log_bytes=$(wc -c <{L}); "
+         "echo ===START; for d in /proc/[0-9]*; do read c <$d/comm; case $c in cosmic*|greetd*|Xwayland*) "
+         "echo \"$c $(cut -d' ' -f22 $d/stat)\";; esac; done 2>/dev/null")
+    o = sh(c, 120)
+    open(f"{OUT}/paneltrace.txt", "w").write(o)
+    try:
+        st = re.search(r"start up=([\d.]+) \S+ rt=(\d+)", o)
+        up0, rt0 = float(st.group(1)), int(st.group(2))
+        def to_up(stamp):
+            # wayland-rs prints realtime s%10000 as ms.us; libwayland prints
+            # (realtime us mod 2^32)/1000: take the reading that lands after start.
+            for cand, per in ((rt0 / 1e9 % 10000, 10000), ((rt0 // 1000) % 2**32 / 1e6, 2**32 / 1e6)):
+                d = (stamp / 1000 - cand) % per
+                if d < 600:
+                    return round(up0 + d, 2)
+        def first(pat):
+            m = re.search(r"\[\s*(\d+\.\d+)\][^\n]*" + pat, o)
+            return to_up(float(m.group(1))) if m else None
+        starts = {}
+        for m in re.finditer(r"^(cosmic[\w-]*) (\d+)$", o, re.M):
+            starts.setdefault(m.group(1), round(int(m.group(2)) / 100, 2))
+        r = {"panel_start": up0, "registry": first("get_registry"), "layer": first("get_layer_surface"),
+             "configure": first(r"zwlr_layer_surface_v1[#@]\d+\.configure"), "attach": first(r"-> wl_surface[#@]\d+\.attach"),
+             "procs": starts}
+        STEPS["paneltrace"] = r
+        log("PANELTRACE " + json.dumps(r))
+    except (AttributeError, ValueError) as e:
+        log(f"PANELTRACE unparsed: {e!r}")
+
+
 def session_diag(name):
     """Save a focus/keystroke summary of the COSMIC session log to OUT/<name>.txt."""
     c = ("L=/tmp/cosmic-session-1000.log; echo bytes=$(wc -c <$L); "
@@ -542,6 +602,8 @@ def main():
     sh("mkdir -p /etc/leandros; printf '%s\\n' 'RUST_LOG=info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace' > /etc/leandros/session-env")
     if WLTRACE:
         install_wraps()
+    if PANELTRACE:
+        install_panel_wrap()
     if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
         # No greeter: keep what shows why (the compositor's log, every process's
         # scheduler state, where the CPUs are) before the run goes on and is torn down.
@@ -640,6 +702,8 @@ def main():
         open(f"{OUT}/vtstat-end.txt", "w").write(o)
         log("VTSTAT", " | ".join(l for l in o.splitlines() if "vt_handoff" in l))
     snap("end")
+    if PANELTRACE:
+        panel_diag()
     o = sh("cat /tmp/ff.log; echo ===ENV; cat /tmp/ff.env; echo ===RUNTIME; "
            "ls -la /run/user/1000 /run/user/0 2>&1", 60)
     open(f"{OUT}/ff.log", "w").write(o); log(o[-6000:])
