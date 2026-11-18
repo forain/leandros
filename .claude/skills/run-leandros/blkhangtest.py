@@ -81,7 +81,9 @@ def main():
         while time.time() - t0 < 75 and not slowlines():
             time.sleep(3)
         sl = slowlines()
-        print("\n".join(sl[-1:]) or "(no slow request line)")
+        print("\n".join(sl[-3:]) or "(no slow request line)")
+        print("t_slow=%.1fs" % (time.time() - t0))
+        _, o = drv("run", "cat /tmp/dd.out; cat /tmp/dd.rc", "30"); print("dd.out:", o.strip()[-300:])
         if not sl:
             ok = False; print("FAIL: driver never reported the slow request")
         rc, out = drv("run", "echo ALIVE2", "30")
