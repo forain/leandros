@@ -446,7 +446,7 @@ def install_wraps():
         log(sh(f"chmod 755 /bin/{name}; ls -l /usr/libexec/lrf/{name} /bin/{name} | cut -c1-120"))
 
 
-PANELTRACE = True or "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
+PANELTRACE = "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
 # --paneltrace (lane panellate): when does cosmic-panel create and map its layer
 # surfaces?  A /bin/cosmic-panel wrapper logs its start (uptime + realtime),
 # runs the panel with WAYLAND_DEBUG=1 and samples the panel's threads in
