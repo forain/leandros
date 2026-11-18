@@ -13603,9 +13603,16 @@ pub fn fh_remember(id: (u64, u64), path: &[u8]) {
 /// (dev, ino) of `path` and the path recorded for the handle; `None` when the
 /// filesystem cannot be watched (EOPNOTSUPP).
 pub fn fh_ident(path: &[u8]) -> Option<(u64, u64)> {
-    if !inotify::may_watch(path) && tmpfs_path(path).is_none() { return None; }
+    if !inotify::may_watch(path) && tmpfs_path(path).is_none() && !is_f2fs_path(path) { return None; }
     let p = tmpfs_path(path).unwrap_or(path);
     inotify_ident(p).map(|i| i.id)
+}
+
+/// Does `path` lie on an f2fs mount (handles decode by inode number there)?
+fn is_f2fs_path(path: &[u8]) -> bool {
+    if is_tmp_path(path) { return false; }
+    let port = match find_mount_port(path) { Some(p) => p, None => return false };
+    MOUNTS.lock().iter().any(|e| e.in_use && e.port == port && e.fstype == "f2fs")
 }
 
 /// f2fs-only VFS tag: inode number -> mount-relative path + i_generation.
