@@ -17034,14 +17034,14 @@ fn sys_name_to_handle_at(dirfd: usize, path_ptr: usize, fh_ptr: usize, mnt_ptr: 
     uw::<u32>(fh_ptr, 12);
     uw::<i32>(fh_ptr + 4, 0x4c);
     uw::<u64>(fh_ptr + 8, id.1);
-    uw::<u32>(fh_ptr + 16, 0);
+    uw::<u32>(fh_ptr + 16, vfs::fh_gen(&host, id));
     if mnt_ptr != 0 { uw::<u32>(mnt_ptr, (id.0 as u32) ^ ((id.0 >> 32) as u32)); }
     0
 }
 
 /// open_by_handle_at(mount_fd, handle, flags): CAP_DAC_READ_SEARCH; the
-/// handle must have been issued by this boot (ESTALE otherwise or when the
-/// inode is gone). `mount_fd` names the filesystem (its st_dev).
+/// the owning filesystem finds the inode by number (f2fs, tmpfs; else the
+/// issued-handle table); ESTALE when the inode is gone or reused. `mount_fd` names the filesystem (its st_dev).
 fn sys_open_by_handle_at(mount_fd: usize, fh_ptr: usize, flags: usize) -> isize {
     if !sched::caps::host_capable_of(current_pid(), 2 /*CAP_DAC_READ_SEARCH*/) { return -1; }
     if !validate_user_buf(fh_ptr, 20) { return -14; }
@@ -17051,7 +17051,8 @@ fn sys_open_by_handle_at(mount_fd: usize, fh_ptr: usize, flags: usize) -> isize 
     let d = mount_fd as u32 as i32 as isize as usize;
     let mp = if d == AT_FDCWD { match resolve_ns(b".").and_then(KPath::from_ns) { Ok(k) => k.buf[..k.buf.len() - 1].to_vec(), Err(e) => return e } }
              else { match fd_host_path(d) { Some(h) => h, None => return -9 } };
-    match vfs::fh_lookup(vfs::fh_dev(&mp), ino) {
+    let gen: u32 = ur(fh_ptr + 16);
+    match vfs::fh_lookup(&mp, vfs::fh_dev(&mp), ino, gen) {
         Some(p) => { let kp = KPath::raw(&p); vfs_open_resolved(kp.ptr(), open_flags_from_user(flags), 0) }
         None => -116,
     }

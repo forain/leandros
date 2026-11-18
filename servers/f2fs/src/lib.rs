@@ -42,6 +42,7 @@ const VFS_RMDIR:      u64 = 0x29;
 const VFS_STATFS:     u64 = 0x33;
 const VFS_SYMLINK:    u64 = 0x35;
 const VFS_FD_PATH:    u64 = 0x23;
+const VFS_INO_PATH:   u64 = 0x7B;
 const VFS_FSTAT:      u64 = 0x31;
 const VFS_READLINK:   u64 = 0x36;
 const VFS_LINK:       u64 = 0x37;
@@ -5565,6 +5566,9 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
     inode_set_mtime(&mut buf, now);
     inode_set_ctime(&mut buf, now);
     w32(&mut buf, 84, parent_ino); // i_pino
+    // i_generation (@68): a fresh nonzero value per inode so a reused inode
+    // number never answers a stale file handle.
+    w32(&mut buf, 68, (now.1 as u32 ^ (now.0 as u32).wrapping_mul(0x9E37_79B1)) | 1);
     let namelen = name.len().min(255) as u32;
     w32(&mut buf, INO_NAMELEN, namelen);
     buf[INO_NAME..INO_NAME + namelen as usize].copy_from_slice(&name[..namelen as usize]);
@@ -7903,6 +7907,47 @@ fn handle_fd_path(ms: &mut MountState, slot: u64, buf_ptr: u64, buf_len: u64) ->
     val_reply(n as u64)
 }
 
+/// `VFS_INO_PATH(ino, buf_ptr, buf_len)` -- open_by_handle_at's decoder: the
+/// mount-relative path of inode `ino` rebuilt from i_pino/i_name, checked
+/// by resolving it back to the same inode. Reply = len | i_generation << 32,
+/// -ESTALE when the inode is free/unlinked, -ENOENT when no live name is
+/// reachable (a hard link whose recorded name is gone).
+fn handle_ino_path(ms: &mut MountState, ino: u64, buf_ptr: u64, buf_len: u64) -> Message {
+    if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
+    let ino = ino as u32;
+    let root = ms.sb.root_ino;
+    let mut parts: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut cur = ino;
+    let mut generation = 0u32;
+    let mut first = true;
+    while cur != root {
+        if parts.len() > 64 { return err_reply(-116); }
+        let addr = nat_lookup(ms, cur);
+        if addr == 0 { return err_reply(-116); }
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        if inode_mode(iblk) == 0 || inode_links(iblk) == 0 { return err_reply(-116); }
+        if first { generation = r32(iblk, 68); first = false; }
+        let nl = (r32(iblk, INO_NAMELEN) as usize).min(255);
+        if nl == 0 { return err_reply(-2); }
+        parts.push(iblk[INO_NAME..INO_NAME + nl].to_vec());
+        cur = r32(iblk, 84);
+        if cur == 0 { return err_reply(-2); }
+    }
+    if first {
+        let addr = nat_lookup(ms, ino);
+        if addr == 0 { return err_reply(-116); }
+        generation = r32(ms.cache.read(ms.dev, addr as u64), 68);
+    }
+    let mut path: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    for c in parts.iter().rev() { path.push(b'/'); path.extend_from_slice(c); }
+    if path.is_empty() { path.push(b'/'); }
+    match resolve_path_r(ms, &path, false) { Ok(i) if i == ino => {}, _ => return err_reply(-2) }
+    let n = path.len();
+    if n > buf_len as usize { return err_reply(-36); }
+    unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr as *mut u8, n); }
+    val_reply(n as u64 | (generation as u64) << 32)
+}
+
 fn handle_readlink(ms: &mut MountState, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
     let path_bytes = unsafe {
@@ -9187,6 +9232,7 @@ fn dispatch_msg(ms: &mut MountState, msg: &Message, caller_pid: u32) -> Message 
         VFS_STATFS     => handle_statfs(ms, arg(msg,1)),
         VFS_LSTAT      => handle_lstat(ms, arg(msg,0), arg(msg,1)),
         VFS_SYMLINK    => handle_symlink(ms, arg(msg,0), arg(msg,1), &cred),
+        VFS_INO_PATH   => handle_ino_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_FD_PATH    => handle_fd_path(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_READLINK   => handle_readlink(ms, arg(msg,0), arg(msg,1), arg(msg,2)),
         VFS_LINK       => handle_link(ms, arg(msg,0), arg(msg,1)),
