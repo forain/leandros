@@ -452,8 +452,9 @@ PANELTRACE = "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
 # runs the panel with WAYLAND_DEBUG=1 and samples the panel's threads in
 # /proc/sysstat ('w' lines: state, syscall, time in it) every 0.2 s for 30 s.
 PANEL_SAMP = r"""P=$1; S=$2; i=0
-while [ $i -lt 120 ]; do read u x </proc/uptime; echo "@ $u" >>$S; grep "^w [0-9]+ $P " /proc/sysstat >>$S; i=$((i+1)); sleep 0.15; done
-echo END >>$S; grep "^[st] [0-9]+ $P " /proc/sysstat >>$S
+while [ $i -lt 120 ]; do read u x </proc/uptime; echo "@ $u" >>$S
+if [ $((i%8)) = 0 ]; then grep -E "^(w [0-9]+|t [0-9]+|s) $P " /proc/sysstat; else grep -E "^w [0-9]+ $P " /proc/sysstat; fi | cut -c1-110 >>$S; i=$((i+1)); sleep 0.15; done
+echo END >>$S; grep -E "^([st] [0-9]+|s) $P " /proc/sysstat >>$S
 """
 PANEL_WRAP = r"""#!/bin/sh
 U=$(id -u); S=/tmp/plsamp-$U.log
@@ -491,9 +492,12 @@ def panel_diag():
         st = re.search(r"start up=([\d.]+) \S+ rt=(\d+)", o)
         up0, rt0 = float(st.group(1)), int(st.group(2))
         def to_up(stamp):
-            # wayland-rs prints realtime s%10000 as ms.us; libwayland prints
-            # (realtime us mod 2^32)/1000: take the reading that lands after start.
-            for cand, per in ((rt0 / 1e9 % 10000, 10000), ((rt0 // 1000) % 2**32 / 1e6, 2**32 / 1e6)):
+            # libwayland and wayland-backend >= 0.3.11 both print
+            # (realtime us mod 2^32)/1000; very old wayland-rs printed realtime
+            # s%10000. Try the u32 form FIRST: both readings often land within
+            # 600 s of start, and taking s%10000 first reported +24..32 s for a
+            # panel that called get_registry +1.3 s after exec (panellate4).
+            for cand, per in (((rt0 // 1000) % 2**32 / 1e6, 2**32 / 1e6), (rt0 / 1e9 % 10000, 10000)):
                 d = (stamp / 1000 - cand) % per
                 if d < 600:
                     return round(up0 + d, 2)
@@ -506,6 +510,13 @@ def panel_diag():
         r = {"panel_start": up0, "registry": first("get_registry"), "layer": first("get_layer_surface"),
              "configure": first(r"zwlr_layer_surface_v1[#@]\d+\.configure"), "attach": first(r"-> wl_surface[#@]\d+\.attach"),
              "procs": starts}
+        # Guest-wide slowness indicator: mean period of the sampler loop (one
+        # uptime read + grep + sleep 0.15) over its first 20 samples. About
+        # 0.15-0.25 s on a quiet box; 0.6 s+ when the box host is contended
+        # (then block reads take 100-270 ms and panel start takes 9-10 s).
+        ups = [float(x) for x in re.findall(r"^@ ([\d.]+)$", o, re.M)][:21]
+        if len(ups) > 1:
+            r["samp_period"] = round((ups[-1] - ups[0]) / (len(ups) - 1), 2)
         STEPS["paneltrace"] = r
         log("PANELTRACE " + json.dumps(r))
     except (AttributeError, ValueError) as e:
