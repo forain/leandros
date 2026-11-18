@@ -539,7 +539,7 @@ def main():
         log(sh("rm -rf /home/leandro/.mozilla /home/leandro/.cache/mozilla; ls -d /home/leandro/.mozilla 2>&1"))
 
     # Compositor keyboard-focus / input trace for the session (see the profile).
-    sh("printf '%s\\n' 'RUST_LOG=info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace' > /tmp/session-env")
+    sh("mkdir -p /etc/leandros; printf '%s\\n' 'RUST_LOG=info,cosmic_comp::input=trace,cosmic_comp::shell::focus=trace' > /etc/leandros/session-env")
     if WLTRACE:
         install_wraps()
     if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
