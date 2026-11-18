@@ -452,8 +452,9 @@ PANELTRACE = "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
 # runs the panel with WAYLAND_DEBUG=1 and samples the panel's threads in
 # /proc/sysstat ('w' lines: state, syscall, time in it) every 0.2 s for 30 s.
 PANEL_SAMP = r"""P=$1; S=$2; i=0
-while [ $i -lt 120 ]; do read u x </proc/uptime; echo "@ $u" >>$S; grep "^w [0-9]+ $P " /proc/sysstat >>$S; i=$((i+1)); sleep 0.15; done
-echo END >>$S; grep "^[st] [0-9]+ $P " /proc/sysstat >>$S
+while [ $i -lt 120 ]; do read u x </proc/uptime; echo "@ $u" >>$S
+if [ $((i%8)) = 0 ]; then grep -E "^(w [0-9]+|t [0-9]+|s) $P " /proc/sysstat; else grep -E "^w [0-9]+ $P " /proc/sysstat; fi | cut -c1-110 >>$S; i=$((i+1)); sleep 0.15; done
+echo END >>$S; grep -E "^([st] [0-9]+|s) $P " /proc/sysstat >>$S
 """
 PANEL_WRAP = r"""#!/bin/sh
 U=$(id -u); S=/tmp/plsamp-$U.log
