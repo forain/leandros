@@ -641,6 +641,8 @@ def main(argv):
             mode = rest[i + 1]; i += 2
         elif a == "--keep":
             keep = True; i += 1
+        elif a == "--paneltrace":
+            os.environ["FFS_PANELTRACE"] = "1"; i += 1
         elif a == "--cmdline":
             cmdline = rest[i + 1]; i += 2
         else:
