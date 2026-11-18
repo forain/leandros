@@ -81,7 +81,8 @@ def opt(name, default, conv=str):
 
 NOFF = "--nofirefox" in A
 NOTERM = "--noterm" in A
-CLICK_TERM = "--click-term" in A
+CLICK_DEFAULT = False   # --click-term / --no-click-term override
+CLICK_TERM = ("--click-term" in A) or (CLICK_DEFAULT and "--no-click-term" not in A)
 GPU = opt("--gpu", "virgl")
 SCALE = opt("--scale", None, float) or driver.wait_scale(ARCH)
 WAIT = opt("--wait", 150, int)
