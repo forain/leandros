@@ -29,7 +29,7 @@ Options:
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
-                             audio-session|video|clickmove|udevhot|coreutils  host:virglsessiontest.py <name> (virgl COSMIC session suites, own boot; coreutils = brush guest; `virgl` = the first four)
+                             audio-session|video|clickmove|udevhot|minimize|coreutils  host:virglsessiontest.py <name> (virgl COSMIC session suites, own boot; coreutils = brush guest; `virgl` = the first four)
                              portalshot host:portalshottest.py alone (live COSMIC session: portal Screenshot returns response 0 and a non-empty PNG)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
@@ -425,6 +425,7 @@ SUITES = {
     "video": ["host:virglsessiontest.py video"],
     "clickmove": ["host:virglsessiontest.py clickmove"],
     "udevhot": ["host:virglsessiontest.py udevhot"],
+    "minimize": ["host:virglsessiontest.py minimize"],
     "coreutils": ["host:virglsessiontest.py coreutils"],
     "virgl": ["host:virglsessiontest.py audio", "host:virglsessiontest.py video",
               "host:virglsessiontest.py clickmove", "host:virglsessiontest.py udevhot"],

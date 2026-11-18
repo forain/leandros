@@ -2113,6 +2113,12 @@ def main():
     if os.path.exists(p):
         bin_files.append(("blanktest", p, 0o100755))
 
+    # mintest: COSMIC toplevel probe (zcosmic_toplevel_info/manager) for the
+    # minimize session suite: `mintest list`, `mintest min|unmin <app_id>`.
+    p = f"userland/mintest/target/{_musl_triple}/release/mintest"
+    if os.path.exists(p):
+        bin_files.append(("mintest", p, 0o100755))
+
     # greetd-login: from a root shell, logs a user in through the running
     # greeter's greetd (password on stdin) and starts their COSMIC session.
     p = f"userland/greetdlogin/target/{_musl_triple}/release/greetd-login"
