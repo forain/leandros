@@ -12,7 +12,7 @@ The simulated Wi-Fi gets two data paths (LEANDROS_NIC2=wifisim on SLIRP
   Flaky    WPA2-PSK  -35 dBm  path 1             deauths (reason 6) in every handshake
   TkipNet  pure TKIP (pairwise TKIP only)      not joinable
   ShaNet   PSK-SHA256 only                       not joinable
-  MfpNet   PSK with MFP required                 not joinable
+  MfpNet   PSK with MFP required                 joinable (PMF/BIP landed with lane/wpa3)
   FtNet    FT-PSK only                           not joinable
 
 sshd listens on 0.0.0.0:22 from boot; a UDP echo server
@@ -39,8 +39,8 @@ Steps (`netroam_<step>: PASS|FAIL detail`):
   backoff       three disconnects in a row: back on NetA each time, Flaky
                 tried at most once (its BSS backs off 15/60/120/300 s)
   rsn_log       each rejected BSS logs its RSN details once
-  join_col      /proc/net/wifi: NetA JOIN yes; the four variants JOIN no
-  sec_msgs      connecting to each variant fails unsupported-security with a
+  join_col      /proc/net/wifi: NetA and MfpNet JOIN yes; the three unsupported variants JOIN no
+  sec_msgs      connecting to each unsupported variant fails unsupported-security with a
                 message naming the cause
 Exit 0 iff all PASS.
 """
@@ -370,15 +370,18 @@ def main(argv):
 
         if only in (None, "sec"):
             full = log_since(0)
+            # MfpNet (MFPR 1) used to be rejected; PMF/BIP support (lane/wpa3) made it joinable, so it
+            # must NOT be logged as not joinable any more.
             rows = {s: re.findall(rf"not joinable: '{s}'[^\n]*", full) for s in ("TkipNet", "ShaNet", "MfpNet", "FtNet")}
-            want = {"TkipNet": "no CCMP pairwise", "ShaNet": "PSK-SHA256", "MfpNet": "MFPR 1", "FtNet": "FT-PSK"}
-            bad = [f"{s}: {r[:2]}" for s, r in rows.items() if len(r) != 1 or want[s] not in r[0]]
+            want = {"TkipNet": "no CCMP pairwise", "ShaNet": "PSK-SHA256", "FtNet": "FT-PSK"}
+            bad = [f"{s}: {r[:2]}" for s, r in rows.items() if s in want and (len(r) != 1 or want[s] not in r[0])]
+            bad += [f"MfpNet wrongly rejected: {rows['MfpNet'][:1]}"] if rows["MfpNet"] else []
             verdict("rsn_log", not bad, "; ".join(bad) or "one RSN line per rejected BSS")
             _, wt = sh("cat /proc/net/wifi", 30)
             joins = {m.group(2): m.group(1) for m in re.finditer(r"^\S+\s+\d+\s+-?\d+\s+\S.*?\s(yes|no)\s+\d+s (\S+)\s*$", wt, re.M)}
-            ok = joins.get("NetA") == "yes" and all(joins.get(s) == "no" for s in ("TkipNet", "ShaNet", "MfpNet", "FtNet"))
+            ok = joins.get("NetA") == "yes" and joins.get("MfpNet") == "yes" and all(joins.get(s) == "no" for s in ("TkipNet", "ShaNet", "FtNet"))
             verdict("join_col", ok, f"{joins}")
-            causes = {"TkipNet": "no CCMP pairwise", "ShaNet": "PSK-SHA256", "MfpNet": "management frame protection",
+            causes = {"TkipNet": "no CCMP pairwise", "ShaNet": "PSK-SHA256",
                       "FtNet": "FT-PSK"}
             bad = []
             for s, why in causes.items():

@@ -62,7 +62,8 @@ def main(argv):
         import shutil
         img = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(driver.REPO_ROOT, f"leandros-limine-{arch}.img")
         timg = os.path.join(driver.REPO_ROOT, f"nettx-shape-{arch}.img")
-        subprocess.run(["cp", "-c", img, timg], check=True)
+        if subprocess.run(["cp", "-c", img, timg], capture_output=True).returncode != 0:  # APFS clone; GNU cp has no -c
+            subprocess.run(["cp", "--sparse=always", img, timg], check=True)
         subprocess.run([os.path.join(driver.REPO_ROOT, "scripts/set-image-cmdline.sh"), timg, f"netshape={shape}"],
                        check=True, capture_output=True)
         os.environ["LEANDROS_DISK_IMAGE"] = timg
@@ -115,7 +116,7 @@ def main(argv):
         else:
             out = sh(f"{probe}; /bin/netcheck --get http://{host}:{port}/z --secs {secs}; {probe}", secs + 90)
         s = [(float(m.group(1)), int(m.group(2))) for m in re.finditer(r"^NI (\d+\.\d+)\n(?:.*\n)*?netd: passes (\d+) ", out, re.M)]
-        why = re.findall(r"^netd_why: kicked (\d+) rearm (\d+) timer_sleeps (\d+) .*? early (\d+) active (\d+) immediate (\d+) tx_held (\d+) timer_expired (\d+) timer_hist (\d+)/(\d+)/(\d+)/(\d+)", out, re.M)
+        why = re.findall(r"^netd_why: kicked (\d+) rearm (\d+) timer_sleeps (\d+) .*? early (\d+) active (\d+)(?: rearm_capped \d+ nostack_drop \d+)? immediate (\d+) tx_held (\d+) timer_expired (\d+) timer_hist (\d+)/(\d+)/(\d+)/(\d+)", out, re.M)
         st = [l.split() for l in re.findall(r"^ST (.*)$", out, re.M)]
         g = re.search(r"NETCHECK get: (\w+) .*?([\d.]+) MB in ([\d.]+) s = ([\d.]+) Mbit/s", out)
         print("\n".join(re.findall(r"^(?:netd_(?:why|kick): |shape: |tcp_recovery: |tcp_rx: |tcp_rxwin: |neighbor: |eth0|NETCHECK|  get\|).*$", out, re.M)[-16:]), flush=True)
