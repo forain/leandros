@@ -62,7 +62,8 @@ def main(argv):
         import shutil
         img = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(driver.REPO_ROOT, f"leandros-limine-{arch}.img")
         timg = os.path.join(driver.REPO_ROOT, f"nettx-shape-{arch}.img")
-        subprocess.run(["cp", "-c", img, timg], check=True)
+        if subprocess.run(["cp", "-c", img, timg], capture_output=True).returncode != 0:  # APFS clone; GNU cp has no -c
+            subprocess.run(["cp", "--sparse=always", img, timg], check=True)
         subprocess.run([os.path.join(driver.REPO_ROOT, "scripts/set-image-cmdline.sh"), timg, f"netshape={shape}"],
                        check=True, capture_output=True)
         os.environ["LEANDROS_DISK_IMAGE"] = timg
