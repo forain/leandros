@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""virglsessiontest.py <audio|video|clickmove|udevhot|minimize|coreutils>
+"""virglsessiontest.py <audio|video|clickmove|udevhot|minimize|notifpanel|coreutils>
 
 Runs one of the virgl-COSMIC-session suites (or, for coreutils, the brush-guest
 coreutils suite) as a `host:` script of runtests.py; arch from LEANDROS_TEST_ARCH
@@ -12,6 +12,8 @@ the Mac GPU QEMU, or the box). Exit 0 iff the underlying test passes.
   udevhot    udevhottest.py: USB keyboard hot-add/removal in a COSMIC session
   minimize   minimizetest.py: cosmic-term minimized (zcosmic_toplevel_manager), un-hidden by clicking its
              dock minimize-applet entry (geometry from the panel wltrace), activated + takes keyboard input
+  notifpanel notifpaneltest.py: cosmic-panel respawns the notifications applet after a non-zero exit code
+             (gate); signal path, notifications<->panel handshake and socket latency are info
   coreutils  coreutils-test.py against a fresh brush guest (no GPU)
 """
 import json, os, subprocess, sys, tempfile
@@ -61,6 +63,8 @@ elif name == "udevhot":
     ok = run([py, f"{HERE}/udevhottest.py"]).returncode == 0
 elif name == "minimize":
     ok = run([py, f"{HERE}/minimizetest.py"]).returncode == 0
+elif name == "notifpanel":
+    ok = run([py, f"{HERE}/notifpaneltest.py"]).returncode == 0
 elif name == "coreutils":
     env["LEANDROS_GPU"] = "none"
     env["LEANDROS_SERIAL_RAW"] = os.path.join(out, "serial-raw.txt")
