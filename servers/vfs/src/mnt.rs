@@ -205,6 +205,13 @@ fn ns_mountpoint(t: &[Mnt], mut i: usize) -> Vec<u8> {
     v
 }
 
+/// /dev/random and /dev/urandom are one device here (the VFS names an open
+/// descriptor of either `/dev/urandom`).
+fn same_dev_name(a: &[u8], b: &[u8]) -> bool {
+    let r = |x: &[u8]| x == b"/dev/random" || x == b"/dev/urandom";
+    r(a) && r(b)
+}
+
 /// The inverse of [`translate`]: the namespace path at which backing path
 /// `backing` is visible. Prefers the mount `hint` (the open file's mount id),
 /// else the longest covering mount root whose path round-trips.
@@ -218,7 +225,7 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     if hint != 0 {
         if let Some(i) = (0..t.len()).find(|&i| t[i].id == hint) {
             let mp = ns_mountpoint(t, i);
-            if mp.len() > 1 { if let Some(x) = walk(t, &mp) { if x.backing == backing { return Some(mp); } } }
+            if mp.len() > 1 { if let Some(x) = walk(t, &mp) { if x.backing == backing || (x.mnt_id == hint && same_dev_name(&x.backing, backing)) { return Some(mp); } } }
         }
     }
     let mut order: Vec<usize> = (0..t.len()).collect();
@@ -369,7 +376,10 @@ pub fn bind(ns: NsId, src: &[u8], dst: &[u8], rec: bool) -> Result<u32, i32> {
 /// cover); an unbindable source is EINVAL.
 fn clone_subtree(t: &[Mnt], src: &[u8], rec: bool) -> Result<Vec<Mnt>, i32> {
     let (si, soff) = walk_idx(t, src).ok_or(-2)?;
-    let sub: &[u8] = &src[soff..];
+    // A source spelled with a trailing slash (`/oldroot/`, bwrap's `--ro-bind / /`)
+    // names the mount root itself: the children keep their mountpoints.
+    let mut sub: &[u8] = &src[soff..];
+    while sub.last() == Some(&b'/') { sub = &sub[..sub.len() - 1]; }
     let sm = &t[si];
     if sm.unbindable { return Err(-22); }
     let sid = sm.id;
