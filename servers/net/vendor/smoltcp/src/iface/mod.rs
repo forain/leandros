@@ -18,7 +18,7 @@ mod packet;
 
 #[cfg(feature = "proto-igmp")]
 pub use self::interface::MulticastError;
-pub use self::interface::IGMP_QUERY_HOOK;
+pub use self::interface::{IGMP_QUERY_HOOK, MLD_QUERY_HOOK};
 pub use self::interface::{Config, Interface, InterfaceInner as Context};
 
 pub use self::route::{Route, RouteTableFull, Routes};

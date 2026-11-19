@@ -264,13 +264,15 @@ pub(crate) fn init() {
     smoltcp::socket::udp::MCAST_SRC_FILTER.store(f as usize, Relaxed);
     let q: fn([u8; 4], &[u8]) -> bool = igmp3::query_hook;
     smoltcp::iface::IGMP_QUERY_HOOK.store(q as usize, Relaxed);
+    let m: fn([u8; 16], [u8; 16], u8, &[u8]) -> bool = mld2::query_hook;
+    smoltcp::iface::MLD_QUERY_HOOK.store(m as usize, Relaxed);
 }
 
 /// The interface's state for `group` (RFC 3376 3.2): the union of every
 /// member socket's filter. All include: INCLUDE of the union of the lists;
 /// any exclude: EXCLUDE of the intersection of the exclude lists minus the
 /// union of the include lists. None: no socket is a member.
-fn iface_state(g: &Groups, sid: Sid, group: G) -> Option<igmp3::State> {
+fn iface_state_g(g: &Groups, sid: Sid, group: G) -> Option<igmp3::State<G>> {
     let fl = FILTERS.lock();
     let (mut any, mut inc, mut exc): (bool, alloc::vec::Vec<G>, Option<alloc::vec::Vec<G>>) = (false, alloc::vec::Vec::new(), None);
     for (ofd, mine) in g.iter() {
@@ -284,18 +286,19 @@ fn iface_state(g: &Groups, sid: Sid, group: G) -> Option<igmp3::State> {
         }
     }
     if !any { return None; }
-    let a4 = |s: &G| [s[12], s[13], s[14], s[15]];
     Some(match exc {
-        Some(x) => (false, x.iter().filter(|s| !inc.contains(s)).map(a4).collect()),
-        None => (true, inc.iter().map(a4).collect()),
+        Some(x) => (false, x.into_iter().filter(|s| !inc.contains(s)).collect()),
+        None => (true, inc),
     })
 }
 
-/// Tell the IGMPv3 reporter that `group`'s state on `sid` may have changed
-/// (`GROUPS` held by the caller).
+/// Tell the IGMPv3 / MLDv2 reporter that `group`'s state on `sid` may have
+/// changed (`GROUPS` held by the caller).
 fn note(g: &Groups, sid: Sid, group: G) {
-    if !is_v4(&group) { return; }
-    igmp3::changed(sid, [group[12], group[13], group[14], group[15]], iface_state(g, sid, group));
+    let st = iface_state_g(g, sid, group);
+    if !is_v4(&group) { mld2::changed(sid, group, st); return; }
+    let a4 = |s: &G| [s[12], s[13], s[14], s[15]];
+    igmp3::changed(sid, [group[12], group[13], group[14], group[15]], st.map(|(i, v)| (i, v.iter().map(a4).collect())));
 }
 
 /// IP_ADD_MEMBERSHIP for description `ofd`.
@@ -380,26 +383,30 @@ pub(crate) fn proc_igmp(out: &mut alloc::string::String) {
 }
 
 /// /proc/net/igmp6 (Linux igmp6_mc_seq_show): index, device, group, users,
-/// flags, timer. Every interface is a member of ff01::1 and ff02::1.
+/// flags, timer. Every interface is a member of ff01::1 and ff02::1; every
+/// interface but lo also of the solicited-node group of each of its
+/// addresses. Flags: 4 (no report) for the groups MLD never reports, 2
+/// (loaded) for the others.
 pub(crate) fn proc_igmp6(out: &mut alloc::string::String) {
     use core::fmt::Write;
     let counts: alloc::vec::Vec<(G, Sid)> = GROUPS.lock().values().flatten().copied().collect();
     let mut sids: alloc::vec::Vec<(Sid, alloc::string::String)> = alloc::vec![(LO, "lo".into())];
     for n in drivers::netdev::iter() { sids.push((iface::sid_of(n.id), n.name().into())); }
     for (sid, name) in sids {
-        let groups: alloc::vec::Vec<[u8; 16]> = {
+        let (groups, sol): (alloc::vec::Vec<[u8; 16]>, alloc::vec::Vec<[u8; 16]>) = {
             let stack = stack_for(sid);
             let Some(s) = stack.as_ref() else { continue };
-            s.interface.ipv6_multicast_groups().map(|a| a.0).collect()
+            (s.interface.ipv6_multicast_groups().map(|a| a.0).collect(), mld2::solicited(s))
         };
         let mut all: alloc::vec::Vec<[u8; 16]> = alloc::vec::Vec::new();
         for lead in [1u8, 2] { let mut g = [0u8; 16]; g[0] = 0xff; g[1] = lead; g[15] = 1; all.push(g); }
-        for g in groups { if !all.contains(&g) { all.push(g); } }
+        for g in sol.into_iter().chain(groups) { if !all.contains(&g) { all.push(g); } }
         for g in all {
             let users = counts.iter().filter(|&&m| m == (g, sid)).count().max(1);
             let _ = write!(out, "{:<4} {:<15} ", sid as u32 + 1, name);
             for b in g { let _ = write!(out, "{:02x}", b); }
-            let _ = write!(out, " {:5} {:08X} 0\n", users, 0x0c);
+            let flags = if sid != LO && mld2::reportable(&g) { 0x02 } else { 0x04 };
+            let _ = write!(out, " {:5} {:08X} 0\n", users, flags);
         }
     }
 }

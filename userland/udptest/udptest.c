@@ -1041,6 +1041,7 @@ static void udp_wildcard_connect(void) {
 #include "mcastsrc.c"
 #include "pmtud2.c"
 #include "igmp3.c"
+#include "mld2.c"
 #include "recverr.c"
 
 /* Cases against the frame-level peer of udppeertest.py (second NIC). */
@@ -1113,6 +1114,7 @@ int main(int argc, char **argv) {
     udp6_mcast_req();
     udp6_mcast_deliver();
     igmp3_cases();
+    mld2_cases();
     udp_mcast_msfilter4();
     udp_broadcast();
     udp_reuse_unicast();
