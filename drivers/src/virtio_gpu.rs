@@ -3133,7 +3133,20 @@ impl VirtioGpuDevice {
 /// connector's `EDID` property blob read this).
 static PRIMARY_EDID: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
 
-pub fn primary_edid() -> Option<Vec<u8>> { PRIMARY_EDID.lock().clone() }
+static EDID_TRIED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Lazy: on x86_64 Limine hands over a GOP framebuffer, so
+/// `setup_console_framebuffer` never runs; fetch on first use instead.
+pub fn primary_edid() -> Option<Vec<u8>> {
+    if let Some(e) = PRIMARY_EDID.lock().clone() { return Some(e); }
+    if EDID_TRIED.swap(true, core::sync::atomic::Ordering::AcqRel) { return None; }
+    let e = {
+        let mut guard = VIRTIO_GPU.lock();
+        guard.as_mut()?.get_edid(0)
+    };
+    if let Some(e) = &e { *PRIMARY_EDID.lock() = Some(e.clone()); }
+    e
+}
 
 /// The reply-needing (synchronous) control-queue commands, written once for
 /// two ways of holding the device:
