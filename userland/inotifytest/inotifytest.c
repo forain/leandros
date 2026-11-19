@@ -1517,10 +1517,63 @@ static int fh_follow_in(const char *dir, const char *tag)
     int u1 = unlink(c) == 0; int r3 = fh_open_ino(mfd, &h, st.st_ino, &e);
     /* deleted: ESTALE */
     int u2 = unlink(a) == 0; int r4 = fh_open_ino(mfd, &h, st.st_ino, &e); int stale = !r4 && e == ESTALE;
-    int ok = r0 && rn && r1 && lk && rn2 && r2 && u1 && r3 && u2 && stale;
-    if (!ok) printf("  %s: r0=%d rn=%d r1=%d lk=%d rn2=%d r2=%d u1=%d r3=%d u2=%d stale=%d(e=%d) gen=%u\n", tag, r0, rn, r1, lk, rn2, r2, u1, r3, u2, stale, e, h.gen);
+    /* the recorded name is unlinked while another hard link survives (f2fs only: tmpfs keeps no inode-to-link index) */
+    int hl = strcmp(tag, "f2fs") == 0;
+    int f2 = open(a, O_CREAT | O_WRONLY, 0644); if (f2 >= 0) close(f2);
+    struct stat st2; stat(a, &st2);
+    struct fh20 h2; memset(&h2, 0, sizeof h2); h2.hb = 20;
+    int n2 = syscall(FH_N2H, AT_FDCWD, a, &h2, &mid, 0) == 0;
+    char sub[170]; snprintf(sub, sizeof sub, "%s/fhsub", dir); mkdir(sub, 0755);
+    char l[200]; snprintf(l, sizeof l, "%s/fhl", sub);
+    int lk2 = link(a, l) == 0; int u3 = unlink(a) == 0;
+    int r5 = fh_open_ino(mfd, &h2, st2.st_ino, &e);
+    unlink(l); int stale2 = !fh_open_ino(mfd, &h2, st2.st_ino, &e) && e == ESTALE; rmdir(sub);
+    int ok = r0 && rn && r1 && lk && rn2 && r2 && u1 && r3 && u2 && stale && (!hl || (n2 && lk2 && u3 && r5 && stale2));
+    if (!ok) printf("  %s: r0=%d rn=%d r1=%d lk=%d rn2=%d r2=%d u1=%d r3=%d u2=%d stale=%d(e=%d) gen=%u n2=%d lk2=%d u3=%d r5=%d(e=%d) stale2=%d\n", tag, r0, rn, r1, lk, rn2, r2, u1, r3, u2, stale, e, h.gen, n2, lk2, u3, r5, e, stale2);
     if (mfd >= 0) close(mfd);
     return ok;
+}
+/* A handle taken before a remount still opens the same inode after it: the
+ * ino and i_generation live on disk. The second (read-only) mount of the root
+ * device reads only what was checkpointed. */
+static void t_fhandle_remount(void)
+{
+    char dev[256] = ""; char line[512];
+    FILE *mf = fopen("/proc/mounts", "r");
+    if (mf) {
+        while (fgets(line, sizeof line, mf)) {
+            char dv[256], m[256], t[64];
+            if (sscanf(line, "%255s %255s %63s", dv, m, t) == 3 && !strcmp(m, "/") && !strcmp(t, "f2fs")) snprintf(dev, sizeof dev, "%s", dv);
+        }
+        fclose(mf);
+    }
+    if (!dev[0] || access(dev, F_OK) < 0) { printf("  fhandle_remount: skip (no f2fs root block dev)\n"); return; }
+    const char *a = "/root/fhtest/rma", *b = "/root/fhtest/rmb", *mnt = "/root/fhtest/rmmnt";
+    int f = open(a, O_CREAT | O_WRONLY, 0644); if (f >= 0) { (void)!write(f, "remount", 7); close(f); }
+    int lk = link(a, b) == 0, ul = unlink(a) == 0;   /* only the non-recorded name survives */
+    struct stat st; int sr = stat(b, &st) == 0;
+    struct fh20 h; memset(&h, 0, sizeof h); h.hb = 20; int mid;
+    int n2h = syscall(FH_N2H, AT_FDCWD, b, &h, &mid, 0) == 0;
+    sync();
+    mkdir(mnt, 0755);
+    pid_t pid = fork();
+    if (pid == 0) _exit(mount(dev, mnt, "f2fs", MS_RDONLY, NULL) < 0 ? errno : 0);
+    int stt = 0; if (pid > 0) waitpid(pid, &stt, 0);
+    int mounted = WIFEXITED(stt) && WEXITSTATUS(stt) == 0;
+    int ok2 = 0, e = 0;
+    if (mounted) {
+        int mfd = open(mnt, O_RDONLY | O_DIRECTORY);
+        int fd = mfd >= 0 ? (int)syscall(FH_OPEN, mfd, &h, O_RDONLY) : -1; e = errno;
+        char buf[16] = {0}; struct stat so;
+        ok2 = fd >= 0 && fstat(fd, &so) == 0 && so.st_ino == st.st_ino && read(fd, buf, 15) == 7 && !strcmp(buf, "remount");
+        if (fd >= 0) close(fd);
+        if (mfd >= 0) close(mfd);
+        umount(mnt);
+    }
+    rmdir(mnt); unlink(b);
+    int ok = lk && ul && sr && n2h && mounted && ok2;
+    if (!ok) printf("  fhandle_remount: lk=%d ul=%d sr=%d n2h=%d mounted=%d(st=%#x) open=%d e=%d\n", lk, ul, sr, n2h, mounted, stt, ok2, e);
+    report("t_fhandle_f2fs_remount", ok);
 }
 static void t_fhandle_follow(void)
 {
@@ -1534,7 +1587,9 @@ static void t_fhandle_follow(void)
     struct fh20 h; memset(&h, 0, sizeof h); h.hb = 20; int mid;
     long r = syscall(FH_N2H, AT_FDCWD, p, &h, &mid, 0);
     if (isf2) report("t_fhandle_f2fs_gen", r == 0 && h.gen != 0);
-    unlink(p); rmdir("/root/fhtest");
+    unlink(p);
+    if (isf2) t_fhandle_remount();
+    rmdir("/root/fhtest");
 }
 
 /* A listener process denies / allows the execve of /bin/true. */

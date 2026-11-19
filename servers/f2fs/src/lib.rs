@@ -5582,7 +5582,7 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
     w32(&mut buf, 84, parent_ino); // i_pino
     // i_generation (@68): a fresh nonzero value per inode so a reused inode
     // number never answers a stale file handle.
-    w32(&mut buf, 68, (now.1 as u32 ^ (now.0 as u32).wrapping_mul(0x9E37_79B1)) | 1);
+    w32(&mut buf, 68, ((now.1 as u32 ^ (now.0 as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF) | 1); // 31 bits: the VFS_INO_PATH reply packs it above bit 32 of a signed i64
     let namelen = name.len().min(255) as u32;
     w32(&mut buf, INO_NAMELEN, namelen);
     buf[INO_NAME..INO_NAME + namelen as usize].copy_from_slice(&name[..namelen as usize]);
@@ -7921,6 +7921,83 @@ fn handle_fd_path(ms: &mut MountState, slot: u64, buf_ptr: u64, buf_len: u64) ->
     val_reply(n as u64)
 }
 
+/// Every live non-dot entry of directory `dir_ino` as (ino, DT type, name).
+fn dir_collect(ms: &mut MountState, dir_ino: u32) -> alloc::vec::Vec<(u32, u8, alloc::vec::Vec<u8>)> {
+    let mut out = alloc::vec::Vec::new();
+    let iblkaddr = nat_lookup(ms, dir_ino);
+    if iblkaddr == 0 { return out; }
+    let iblk_copy = {
+        let b = ms.cache.read(ms.dev, iblkaddr as u64);
+        let mut c = [0u8; BLOCK_SIZE]; c.copy_from_slice(b); c
+    };
+    if inode_mode(&iblk_copy) & S_IFMT != S_IFDIR { return out; }
+    if lx_inline_dir(&iblk_copy) {
+        let (st, en) = inline_area(&iblk_copy);
+        let a = &iblk_copy[st..en];
+        let (nr, _bm, eo, no) = inline_dentry_layout(a.len());
+        let mut slot = 0usize;
+        while slot < nr {
+            if a[slot / 8] & (1 << (slot % 8)) == 0 { slot += 1; continue; }
+            let nl = r16(a, eo + slot * 11 + 8) as usize;
+            let n = no + slot * 8;
+            if n + nl <= a.len() {
+                let name = &a[n..n + nl];
+                if name != b"." && name != b".." {
+                    out.push((r32(a, eo + slot * 11 + 4), ft_to_dt(a[eo + slot * 11 + 10]), name.to_vec()));
+                }
+            }
+            slot += nl.div_ceil(8).max(1);
+        }
+        return out;
+    }
+    let n_data_blks = inode_size(&iblk_copy).div_ceil(BLOCK_SIZE as u64) as usize;
+    for blk_idx in 0..n_data_blks {
+        if ms.cache.poisoned() { break; }
+        let phys = inode_logical_to_phys(ms, dir_ino, blk_idx as u64);
+        if phys == 0 { continue; }
+        let dblk = ms.cache.read(ms.dev, phys as u64);
+        let dblk = unsafe { &*(dblk as *const [u8; BLOCK_SIZE]) };
+        let mut slot = 0usize;
+        while slot < NR_DENTRY_IN_BLK {
+            let byte = slot / 8;
+            if byte >= DENTRY_BITMAP_SIZE { break; }
+            if (dblk[byte] & (1 << (slot % 8))) == 0 { slot += 1; continue; }
+            let e_off    = DENTRY_ENTRIES_OFF + slot * DENTRY_ENTRY_SIZE;
+            let name_len = r16(dblk, e_off + 8) as usize;
+            let n_off    = DENTRY_NAMES_OFF + slot * DENTRY_SLOT_LEN;
+            if n_off + name_len <= BLOCK_SIZE {
+                let name = &dblk[n_off..n_off + name_len];
+                if name != b"." && name != b".." {
+                    out.push((r32(dblk, e_off + 4), ft_to_dt(dblk[e_off + 10]), name.to_vec()));
+                }
+            }
+            slot += name_len.div_ceil(DENTRY_SLOT_LEN).max(1);
+        }
+    }
+    out
+}
+
+/// A surviving name for `ino`, found by walking the tree from the root (Linux
+/// opens by ino without a path; our VFS needs one). Used only when the
+/// recorded i_pino/i_name no longer resolves, e.g. the name was unlinked while
+/// a hard link survived. Bounded so a huge tree cannot stall the server.
+fn find_name_by_scan(ms: &mut MountState, ino: u32) -> Option<alloc::vec::Vec<u8>> {
+    let root = ms.sb.root_ino;
+    let mut queue: alloc::collections::VecDeque<(u32, alloc::vec::Vec<u8>)> = alloc::collections::VecDeque::new();
+    queue.push_back((root, alloc::vec::Vec::new()));
+    let mut visited = 0usize;
+    while let Some((dir, prefix)) = queue.pop_front() {
+        visited += 1;
+        if visited > 20000 { return None; }
+        for (cino, ft, name) in dir_collect(ms, dir) {
+            let mut p = prefix.clone(); p.push(b'/'); p.extend_from_slice(&name);
+            if cino == ino { return Some(p); }
+            if ft == DT_DIR { queue.push_back((cino, p)); }
+        }
+    }
+    None
+}
+
 /// `VFS_INO_PATH(ino, buf_ptr, buf_len)` -- open_by_handle_at's decoder: the
 /// mount-relative path of inode `ino` rebuilt from i_pino/i_name, checked
 /// by resolving it back to the same inode. Reply = len | i_generation << 32,
@@ -7934,6 +8011,7 @@ fn handle_ino_path(ms: &mut MountState, ino: u64, buf_ptr: u64, buf_len: u64) ->
     let mut cur = ino;
     let mut generation = 0u32;
     let mut first = true;
+    let mut chain_ok = true;
     while cur != root {
         if parts.len() > 64 { return err_reply(-116); }
         let addr = nat_lookup(ms, cur);
@@ -7942,12 +8020,12 @@ fn handle_ino_path(ms: &mut MountState, ino: u64, buf_ptr: u64, buf_len: u64) ->
         if inode_mode(iblk) == 0 || inode_links(iblk) == 0 { return err_reply(-116); }
         if first { generation = r32(iblk, 68); first = false; }
         let nl = (r32(iblk, INO_NAMELEN) as usize).min(255);
-        if nl == 0 { return err_reply(-2); }
+        if nl == 0 { chain_ok = false; break; }
         parts.push(iblk[INO_NAME..INO_NAME + nl].to_vec());
         cur = r32(iblk, 84);
-        if cur == 0 { return err_reply(-2); }
+        if cur == 0 { chain_ok = false; break; }
     }
-    if first {
+    if first && chain_ok {
         let addr = nat_lookup(ms, ino);
         if addr == 0 { return err_reply(-116); }
         generation = r32(ms.cache.read(ms.dev, addr as u64), 68);
@@ -7955,11 +8033,21 @@ fn handle_ino_path(ms: &mut MountState, ino: u64, buf_ptr: u64, buf_len: u64) ->
     let mut path: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     for c in parts.iter().rev() { path.push(b'/'); path.extend_from_slice(c); }
     if path.is_empty() { path.push(b'/'); }
-    match resolve_path_r(ms, &path, false) { Ok(i) if i == ino => {}, _ => return err_reply(-2) }
+    let direct = chain_ok && matches!(resolve_path_r(ms, &path, false), Ok(i) if i == ino);
+    if !direct {
+        // Recorded name gone but the inode lives (checked above: links > 0).
+        // The generation must still be read from the inode itself.
+        let addr = nat_lookup(ms, ino);
+        if addr == 0 { return err_reply(-116); }
+        let iblk = ms.cache.read(ms.dev, addr as u64);
+        if inode_mode(iblk) == 0 || inode_links(iblk) == 0 { return err_reply(-116); }
+        generation = r32(iblk, 68);
+        match find_name_by_scan(ms, ino) { Some(p) => path = p, None => return err_reply(-2) }
+    }
     let n = path.len();
     if n > buf_len as usize { return err_reply(-36); }
     unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr as *mut u8, n); }
-    val_reply(n as u64 | (generation as u64) << 32)
+    val_reply(n as u64 | ((generation & 0x7FFF_FFFF) as u64) << 32) // 31 bits: bit 63 would read as an error
 }
 
 fn handle_readlink(ms: &mut MountState, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> Message {
