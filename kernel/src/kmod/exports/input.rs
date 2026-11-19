@@ -60,6 +60,16 @@ pub extern "C" fn kapi_input_set_caps(node: i32, rel: *const u8, rl: usize, key:
     0
 }
 
+/// Publish a node's INPUT_PROP_* and EV_FF bitmaps (EVIOCGPROP / EVIOCGBIT). 0, or -22.
+#[no_mangle]
+pub extern "C" fn kapi_input_set_props(node: i32, props: *const u8, pl: usize, ff: *const u8, fl: usize) -> i32 {
+    if !node_ok(node) || (pl != 0 && props.is_null()) || (fl != 0 && ff.is_null()) || pl > 8 || fl > 16 { return -22; }
+    let p: &[u8] = if pl == 0 { &[] } else { unsafe { core::slice::from_raw_parts(props, pl) } };
+    let f: &[u8] = if fl == 0 { &[] } else { unsafe { core::slice::from_raw_parts(ff, fl) } };
+    evdev_server::set_device_props(node as u32, p, f);
+    0
+}
+
 /// Remove a per-device node made by `kapi_input_register`. 0, or -22 for a fixed or unknown node.
 #[no_mangle]
 pub extern "C" fn kapi_input_unregister(node: i32) -> i32 {

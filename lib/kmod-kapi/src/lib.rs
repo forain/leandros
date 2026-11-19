@@ -462,6 +462,9 @@ pub mod input {
     pub fn set_device_caps(node: u32, rel: &[u8], key: &[u8]) {
         unsafe { sys_input::kapi_input_set_caps(node as i32, rel.as_ptr(), rel.len(), key.as_ptr(), key.len()); }
     }
+    pub fn set_device_props(node: u32, props: &[u8], ff: &[u8]) {
+        unsafe { sys_input::kapi_input_set_props(node as i32, props.as_ptr(), props.len(), ff.as_ptr(), ff.len()); }
+    }
     pub use kmod_abi::input::{INPUT_DEV_KEYBOARD, INPUT_DEV_MOUSE, REL_SRC_USB};
     /// Unregister a per-device node.
     pub fn unregister(node: u32) { unsafe { sys_input::kapi_input_unregister(node as i32); } }

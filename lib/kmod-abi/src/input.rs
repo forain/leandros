@@ -29,6 +29,7 @@ pub mod sys_input {
         pub fn kapi_input_register(owner: KmodId, kind: u32, name: *const u8, len: usize,
                                    bus: u16, vid: u16, pid: u16) -> i32;
         pub fn kapi_input_event(node: i32, ty: u16, code: u16, value: i32);
+        pub fn kapi_input_set_props(node: i32, props: *const u8, pl: usize, ff: *const u8, fl: usize) -> i32;
         pub fn kapi_input_set_caps(node: i32, rel: *const u8, rl: usize, key: *const u8, kl: usize) -> i32;
     }
 }
