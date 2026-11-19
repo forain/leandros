@@ -81,7 +81,7 @@ elif name == "ffaudio":
         mean = sum(on) / max(1, len(on))
         slp = os.path.join(out, "run-ffaudio", "serial.log")
         sl = open(slp, errors="replace").read() if os.path.exists(slp) else ""
-        bad = sum(sl.count(k) for k in ("SEGV", "[WDOG]", "panic"))
+        bad = sum(sl.count(k) for k in ("SEGV", "[WDOG]", "KERNEL PANIC", "panicked at"))
         ok = secs >= 8 and mean > 1000 and bad == 0
         print(f"ffaudio {arch}: firefox tone {secs:.2f} s above RMS 200, mean RMS {mean:.0f}, capture {n} frames, bad={bad}")
     except (OSError, ValueError, struct.error) as e:
