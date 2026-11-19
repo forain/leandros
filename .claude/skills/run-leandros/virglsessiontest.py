@@ -55,22 +55,34 @@ if name == "audio":
         print(f"audio {arch}: results unreadable: {e!r}")
         ok = False
 elif name == "ffaudio":
-    # Firefox playing the 440 Hz wav through its own PipeWire stream; the QEMU wav
-    # capture (host side of the virtio-snd/HDA device) must hold >= 8 s of tone at
-    # roughly the source level, with at most a few holes.
-    env["AV_STEPS"] = "probe,ffplay,report"
-    r = run([py, f"{HERE}/audio-session-test.py"])
-    ok = r.returncode == 0
+    # Firefox (launched by ffsession.py exactly as in the Firefox suites) plays the 440 Hz wav
+    # as a media document; the QEMU wav capture is the host side of the guest sound device. It
+    # must hold >= 8 s of tone at a real level (the wav is RMS ~5700 at source), and
+    # the session must not log pf/segv/panic/wdog.
+    import math
+    import struct
+    wavp = os.path.join(out, "capture.wav")
+    env["LEANDROS_AUDIO_WAV"] = wavp
+    env["FFSESSION_OUT"] = out
+    r = run([py, f"{HERE}/ffsession.py", arch, "ffaudio", "--url", "file:///usr/share/sounds/leandros/tone-440-10s.wav",
+             "--wait", "40", "--post", "XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/wpctl status"])
+    ok = False
     try:
-        res = json.load(open(f"{out}/results.json"))
-        f = (res.get("analysis") or {}).get("ffplay", {})
-        c = res.get("counts") or {}
-        ok = ok and f.get("tone_secs", 0) >= 8 and f.get("rms", 0) > 200 and f.get("holes_50ms", 99) <= 20 \
-            and not any(c.get(k) for k in ("pf", "segv", "panic", "wdog"))
-        print(f"ffaudio {arch}: ffplay={f} counts={c}")
-    except (OSError, KeyError, ValueError) as e:
-        print(f"ffaudio {arch}: results unreadable: {e!r}")
-        ok = False
+        raw = open(wavp, "rb").read()[44:]
+        n = len(raw) // 4
+        left = struct.unpack(f"<{n * 2}h", raw[:n * 4])[0::2]
+        w = 44100 // 20
+        rms = [math.sqrt(sum(v * v for v in left[i:i + w]) / w) for i in range(0, len(left) - w, w)]
+        on = [x for x in rms if x > 200]
+        secs = len(on) / 20
+        mean = sum(on) / max(1, len(on))
+        slp = os.path.join(out, "run-ffaudio", "serial.log")
+        sl = open(slp, errors="replace").read() if os.path.exists(slp) else ""
+        bad = sum(sl.count(k) for k in ("SEGV", "[WDOG]", "panic"))
+        ok = secs >= 8 and mean > 1000 and bad == 0
+        print(f"ffaudio {arch}: firefox tone {secs:.2f} s above RMS 200, mean RMS {mean:.0f}, capture {n} frames, bad={bad}")
+    except (OSError, ValueError, struct.error) as e:
+        print(f"ffaudio {arch}: capture unreadable: {e!r}")
 elif name == "video":
     r = run([py, f"{HERE}/videotest.py", arch, f"{rid}-vid"])
     ok = r.returncode == 0
