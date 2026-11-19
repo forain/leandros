@@ -647,10 +647,10 @@ static void hardening_suite(void) {
      * over, the old tree at /oldroot, readlink through /oldroot/proc/self/fd/N.
      * pv=1 adds the pid namespace --unshare-all brings (the pivoting task is pid 1 of it
      * and reads the OLD procfs, which names it by its parent-namespace pid). */
-    for (int pv = 0; pv < 3; pv++) {
+    for (int pv = 0; pv < 4; pv++) {
     pid = fork();
     if (pid == 0) {
-        /* pv=2: the real bwrap shape -- an ordinary uid with supplementary groups, and the
+        /* pv=3: bwrap 0.12 fd targets (new pid ns, like pv=1). pv=2: the real bwrap shape -- an ordinary uid with supplementary groups, and the
          * maps written by the PARENT for the already-unshared child. */
         unsigned uu = pv == 2 ? 1000 : 65534;
         if (pv == 2) { gid_t g[2] = { 10, 29 }; if (setgroups(2, g)) _exit(98); }
@@ -698,7 +698,95 @@ static void hardening_suite(void) {
         if (syscall(SYS_pivot_root, "/tmp/fbw3", "/tmp/fbw3/oldroot") != 0) _exit(5);
         if (chdir("/") != 0) _exit(6);
         /* --ro-bind / /: the old tree rbind-ed into place, then --dev / --proc over it */
-        if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) _exit(8);
+        if (pv != 3 && mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) _exit(8);
+        if (pv == 3) {
+            /* bwrap 0.12 setup, exactly: relative /proc bind first, then the old root rbind-ed
+             * through descriptors, then every mount under /newroot remounted nosuid,nodev,ro. */
+            if (mkdir("/proc", 0755) != 0) { printf("  mkdir /proc errno=%d\n", errno); _exit(90); }
+            if (mount_("oldroot/proc", "proc", NULL, M_BIND | M_REC | (1UL << 15)) != 0) { printf("  proc bind errno=%d\n", errno); _exit(91); }
+            { char sp[64], dp[64];
+              int dfd = open("/newroot", O_PATH | O_CLOEXEC);
+              int sfd = open("/oldroot/", O_PATH | O_CLOEXEC);
+              if (dfd < 0 || sfd < 0) _exit(92);
+              snprintf(sp, sizeof sp, "/proc/self/fd/%d", sfd);
+              snprintf(dp, sizeof dp, "/proc/self/fd/%d", dfd);
+              if (mount_(sp, dp, NULL, M_BIND | M_REC | (1UL << 15)) != 0) { printf("  fd rbind errno=%d\n", errno); _exit(93); }
+              static char rmi[65536];
+              int rl = slurp("/proc/self/mountinfo", rmi, sizeof rmi - 1);
+              if (rl <= 0) _exit(94);
+              rmi[rl] = 0;
+              for (char *ln = rmi; ln && *ln; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+                  char *q = ln; int f = 0;
+                  while (*q && *q != '\n' && f < 4) { if (*q == ' ') f++; q++; }
+                  if (f != 4 || strncmp(q, "/newroot", 8) != 0) continue;
+                  char mp[512]; size_t k = 0;
+                  while (q[k] && q[k] != ' ' && q[k] != '\n' && k < sizeof mp - 1) { mp[k] = q[k]; k++; }
+                  mp[k] = 0;
+                  if (mount_("none", mp, NULL, (1UL << 15) | M_BIND | 32 | 2 | 4 | 1) != 0 && errno != EACCES) { printf("  remount %s errno=%d\n", mp, errno); _exit(95); }
+              }
+              close(sfd); close(dfd); }
+            /* bwrap 0.12 mounts onto O_PATH descriptors of /newroot/<x>, whose backing is also
+             * visible under /oldroot: the mount must land on the path the fd was opened by. */
+            static char mib[32768];
+            char fp[64], l[64], b[256];
+            int fd = open("/newroot/dev", O_PATH | O_CLOEXEC);
+            if (fd < 0) _exit(100);
+            snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+            if (mountd_("tmpfs", fp, "tmpfs", 6, "mode=0755") != 0) { printf("  fd tmpfs errno=%d\n", errno); _exit(101); }
+            close(fd);
+            if (symlink("/proc/self/fd/0", "/newroot/dev/stdin") != 0) { printf("  symlink errno=%d\n", errno); _exit(102); }
+            if (mkdir("/newroot/dev/pts2", 0755) != 0) { printf("  mkdir errno=%d\n", errno); _exit(103); }
+            { struct stat sb;
+              if (lstat("/oldroot/dev/stdin", &sb) == 0 && S_ISLNK(sb.st_mode)) _exit(104); }
+            { int ml = slurp("/oldroot/proc/self/mountinfo", mib, sizeof mib - 1);
+              if (ml <= 0) _exit(105);
+              mib[ml] = 0;
+              int hasnew = 0, hasold = 0;
+              for (char *ln = mib; ln && *ln; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+                  char *e = strchr(ln, '\n'); size_t n = e ? (size_t)(e - ln) : strlen(ln);
+                  char tmp[512]; if (n >= sizeof tmp) n = sizeof tmp - 1;
+                  memcpy(tmp, ln, n); tmp[n] = 0;
+                  if (!strstr(tmp, " - tmpfs ")) continue;
+                  if (strstr(tmp, " /newroot/dev ")) hasnew = 1;
+                  if (strstr(tmp, " /oldroot/dev ")) hasold = 1;
+              }
+              if (!hasnew) { printf("  no tmpfs mountinfo line at /newroot/dev\n"); _exit(106); }
+              if (hasold) { printf("  tmpfs landed on /oldroot/dev\n"); _exit(107); } }
+            fd = open("/newroot/proc", O_PATH | O_CLOEXEC);
+            if (fd < 0) _exit(110);
+            snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+            if (mount_("proc", fp, "proc", 2 | 4 | 8) != 0) { printf("  fd proc errno=%d\n", errno); _exit(111); }
+            close(fd);
+            int fd2 = open("/newroot/proc/sys", O_PATH | O_CLOEXEC);
+            if (fd2 < 0) _exit(112);
+            snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd2);
+            if (mount_(fp, fp, NULL, M_BIND | (1UL << 15)) != 0) { printf("  fd bind errno=%d\n", errno); _exit(113); }
+            int fd3 = open("/newroot/proc/sys", O_PATH);
+            if (fd3 < 0) _exit(114);
+            snprintf(l, sizeof l, "/oldroot/proc/self/fd/%d", fd3);
+            ssize_t n = readlink(l, b, sizeof b - 1);
+            if (n < 0) _exit(115);
+            b[n] = 0;
+            if (strcmp(b, "/newroot/proc/sys") != 0) { printf("  fdlink -> %s\n", b); _exit(116); }
+            { int ml = slurp("/oldroot/proc/self/mountinfo", mib, sizeof mib - 1);
+              if (ml <= 0) _exit(117);
+              mib[ml] = 0;
+              int sys = 0, procnew = 0, procold = 0;
+              for (char *ln = mib; ln && *ln; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+                  char *e = strchr(ln, '\n'); size_t m = e ? (size_t)(e - ln) : strlen(ln);
+                  char tmp[512]; if (m >= sizeof tmp) m = sizeof tmp - 1;
+                  memcpy(tmp, ln, m); tmp[m] = 0;
+                  if (strstr(tmp, " /newroot/proc/sys ")) sys = 1;
+                  if (strstr(tmp, " - proc ")) {
+                      if (strstr(tmp, " /newroot/proc ")) procnew = 1;
+                      if (strstr(tmp, " /oldroot/proc ")) procold++;
+                  }
+              }
+              if (!sys) _exit(118);
+              if (!procnew) { printf("  no proc mountinfo line at /newroot/proc\n"); _exit(119); }
+              if (procold > 1) { printf("  %d proc mounts at /oldroot/proc\n", procold); _exit(120); } }
+            _exit(0);
+        }
         if (mountd_("tmpfs", "/newroot/dev", "tmpfs", 6, "mode=0755") != 0) _exit(7);
         /* bwrap --dev: stdin/stdout/stderr/fd symlinks on the fresh tmpfs */
         if (symlink("/proc/self/fd/0", "/newroot/dev/stdin") != 0) { printf("  symlink errno=%d\n", errno); _exit(70); }
@@ -746,7 +834,7 @@ static void hardening_suite(void) {
         _exit(0);
     }
     waitpid(pid, &st, 0);
-    report(pv == 2 ? "ns_userns_parentmap_pivot_bwrap_dev_proc" : pv ? "ns_userns_pidns_pivot_bwrap_dev_proc" : "ns_userns_pivot_bwrap_dev_proc", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    report(pv == 3 ? "ns_userns_pivot_bwrap_fd_target" : pv == 2 ? "ns_userns_parentmap_pivot_bwrap_dev_proc" : pv ? "ns_userns_pidns_pivot_bwrap_dev_proc" : "ns_userns_pivot_bwrap_dev_proc", WIFEXITED(st) && WEXITSTATUS(st) == 0);
     if (WIFEXITED(st)) printf("  ns_userns_pivot_bwrap pv=%d rc=%d\n", pv, WEXITSTATUS(st));
     }
 
