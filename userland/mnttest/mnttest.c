@@ -594,6 +594,106 @@ static void hardening_suite(void) {
     if (WIFEXITED(st)) printf("  ns_bind_fd_readlink rc=%d\n", WEXITSTATUS(st));
     unlink("/tmp/fbw_ur"); unlink("/tmp/fbw_nl"); rmdir("/tmp/fbw_sys");
 
+    /* bwrap --dev/--proc shape: rbind / below a tmpfs root, device files bound from the
+     * old tree over fresh files on a tmpfs /dev, a procfs with /proc/sys bound onto itself.
+     * /proc/self/fd/N of each destination names the destination (and random != urandom). */
+    pid = fork();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
+        mkdir("/tmp/fbw2", 0755);
+        if (mount_("tmpfs", "/tmp/fbw2", "tmpfs", 0) != 0) _exit(3);
+        mkdir("/tmp/fbw2/old", 0755); mkdir("/tmp/fbw2/new", 0755);
+        if (mount_("/", "/tmp/fbw2/old", NULL, M_BIND | M_REC) != 0) _exit(4);
+        mkdir("/tmp/fbw2/new/dev", 0755); mkdir("/tmp/fbw2/new/proc", 0755);
+        if (mount_("tmpfs", "/tmp/fbw2/new/dev", "tmpfs", 0) != 0) _exit(5);
+        static const char *names[] = { "random", "urandom", "null", "zero" };
+        for (int i = 0; i < 4; i++) {
+            char s[96], d[96], l[64], b[256];
+            snprintf(s, sizeof s, "/tmp/fbw2/old/dev/%s", names[i]);
+            snprintf(d, sizeof d, "/tmp/fbw2/new/dev/%s", names[i]);
+            int f = open(d, O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f);
+            if (mount_(s, d, NULL, M_BIND) != 0) _exit(10 + i);
+            int fd = open(d, O_PATH | O_CLOEXEC);
+            if (fd < 0) _exit(20 + i);
+            /* bwrap reads the link through the old root's procfs */
+            snprintf(l, sizeof l, "/tmp/fbw2/old/proc/self/fd/%d", fd);
+            ssize_t n = readlink(l, b, sizeof b - 1);
+            if (n < 0) _exit(30 + i);
+            b[n] = 0;
+            if (strcmp(b, d) != 0) { printf("  fdlink %s -> %s\n", d, b); _exit(40 + i); }
+            close(fd);
+        }
+        if (mount_("proc", "/tmp/fbw2/new/proc", "proc", 0) != 0) _exit(50);
+        char d[96] = "/tmp/fbw2/new/proc/sys", s[96] = "/tmp/fbw2/old/proc/sys", l[64], b[256];
+        if (mount_(s, d, NULL, M_BIND) != 0) _exit(51);
+        int fd = open(d, O_PATH | O_CLOEXEC);
+        if (fd < 0) _exit(52);
+        snprintf(l, sizeof l, "/tmp/fbw2/old/proc/self/fd/%d", fd);
+        ssize_t n = readlink(l, b, sizeof b - 1);
+        if (n < 0) _exit(53);
+        b[n] = 0;
+        if (strcmp(b, d) != 0) { printf("  fdlink %s -> %s\n", d, b); _exit(54); }
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_bwrap_dev_proc_fd_readlink", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  ns_bwrap_dev_proc rc=%d\n", WEXITSTATUS(st));
+
+    /* The same as unprivileged bwrap does it: user+mount ns, a tmpfs root pivoted
+     * over, the old tree at /oldroot, readlink through /oldroot/proc/self/fd/N. */
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(99);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(2);
+        { static const char *mf[] = { "/proc/self/setgroups", "/proc/self/uid_map", "/proc/self/gid_map" };
+          static const char *mv[] = { "deny", "65534 65534 1", "65534 65534 1" };
+          for (int i = 0; i < 3; i++) { int f = open(mf[i], O_WRONLY); if (f < 0 || write(f, mv[i], strlen(mv[i])) < 0) _exit(60 + i); close(f); } }
+        mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
+        mkdir("/tmp/fbw3", 0755);
+        if (mount_("tmpfs", "/tmp/fbw3", "tmpfs", 0) != 0) { printf("  tmpfs errno=%d\n", errno); _exit(3); }
+        mkdir("/tmp/fbw3/newroot", 0755); mkdir("/tmp/fbw3/oldroot", 0755);
+        if (chdir("/tmp/fbw3") != 0) _exit(4);
+        if (syscall(SYS_pivot_root, "/tmp/fbw3", "/tmp/fbw3/oldroot") != 0) _exit(5);
+        if (chdir("/") != 0) _exit(6);
+        /* --ro-bind / /: the old tree rbind-ed into place, then --dev / --proc over it */
+        if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) _exit(8);
+        if (mount_("tmpfs", "/newroot/dev", "tmpfs", 0) != 0) _exit(7);
+        static const char *names[] = { "random", "urandom", "null" };
+        for (int i = 0; i < 3; i++) {
+            char s[96], d[96], l[64], b[256];
+            snprintf(s, sizeof s, "/oldroot/dev/%s", names[i]);
+            snprintf(d, sizeof d, "/newroot/dev/%s", names[i]);
+            int f = open(d, O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f);
+            if (mount_(s, d, NULL, M_BIND) != 0) _exit(10 + i);
+            int fd = open(d, O_PATH | O_CLOEXEC);
+            if (fd < 0) _exit(20 + i);
+            snprintf(l, sizeof l, "/oldroot/proc/self/fd/%d", fd);
+            ssize_t n = readlink(l, b, sizeof b - 1);
+            if (n < 0) _exit(30 + i);
+            b[n] = 0;
+            if (strcmp(b, d) != 0) { printf("  fdlink %s -> %s\n", d, b); _exit(40 + i); }
+            close(fd);
+        }
+        if (mount_("proc", "/newroot/proc", "proc", 0) != 0) _exit(50);
+        char d[96] = "/newroot/proc/sys", l[64], b[256];
+        if (mount_(d, d, NULL, M_BIND) != 0) _exit(51);
+        int fd = open(d, O_PATH | O_CLOEXEC);
+        if (fd < 0) _exit(52);
+        snprintf(l, sizeof l, "/oldroot/proc/self/fd/%d", fd);
+        ssize_t n = readlink(l, b, sizeof b - 1);
+        if (n < 0) _exit(53);
+        b[n] = 0;
+        if (strcmp(b, d) != 0) { printf("  fdlink %s -> %s\n", d, b); _exit(54); }
+        int nm = read_mi("/oldroot/proc/self/mountinfo");
+        for (int i = 0; i < nm; i++) if (MI[i].mp[0] != '/') { printf("  relative mountpoint '%s'\n", MI[i].mp); _exit(56); }
+        if (!find_mp(nm, d)) { printf("  no mountinfo line for %s (n=%d)\n", d, nm); _exit(55); }
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_userns_pivot_bwrap_dev_proc", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  ns_userns_pivot_bwrap rc=%d\n", WEXITSTATUS(st));
+
     /* clone(NEWNS|VM|VFORK) as Linux allows */
     static char vmstack[16384] __attribute__((aligned(16)));
     pid = (pid_t)clone(vm_child, vmstack + sizeof vmstack, CLONE_NEWNS | CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
