@@ -65,7 +65,7 @@ elif name == "ffaudio":
     env["LEANDROS_AUDIO_WAV"] = wavp
     env["FFSESSION_OUT"] = out
     r = run([py, f"{HERE}/ffsession.py", arch, "ffaudio", "--url", "file:///usr/share/sounds/leandros/tone-440-10s.wav",
-             "--wait", "40", "--post", "XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/wpctl status"])
+             "--wait", "40", "--prefs", "media.autoplay.default=0;media.autoplay.blocking_policy=0", "--post", "XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/wpctl status"])
     ok = False
     try:
         raw = open(wavp, "rb").read()[44:]
