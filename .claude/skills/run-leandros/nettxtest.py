@@ -116,7 +116,7 @@ def main(argv):
         else:
             out = sh(f"{probe}; /bin/netcheck --get http://{host}:{port}/z --secs {secs}; {probe}", secs + 90)
         s = [(float(m.group(1)), int(m.group(2))) for m in re.finditer(r"^NI (\d+\.\d+)\n(?:.*\n)*?netd: passes (\d+) ", out, re.M)]
-        why = re.findall(r"^netd_why: kicked (\d+) rearm (\d+) timer_sleeps (\d+) .*? early (\d+) active (\d+) immediate (\d+) tx_held (\d+) timer_expired (\d+) timer_hist (\d+)/(\d+)/(\d+)/(\d+)", out, re.M)
+        why = re.findall(r"^netd_why: kicked (\d+) rearm (\d+) timer_sleeps (\d+) .*? early (\d+) active (\d+)(?: rearm_capped \d+ nostack_drop \d+)? immediate (\d+) tx_held (\d+) timer_expired (\d+) timer_hist (\d+)/(\d+)/(\d+)/(\d+)", out, re.M)
         st = [l.split() for l in re.findall(r"^ST (.*)$", out, re.M)]
         g = re.search(r"NETCHECK get: (\w+) .*?([\d.]+) MB in ([\d.]+) s = ([\d.]+) Mbit/s", out)
         print("\n".join(re.findall(r"^(?:netd_(?:why|kick): |shape: |tcp_recovery: |tcp_rx: |tcp_rxwin: |neighbor: |eth0|NETCHECK|  get\|).*$", out, re.M)[-16:]), flush=True)
