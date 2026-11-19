@@ -212,6 +212,9 @@ static void bench(void) {
 static int mount_(const char *s, const char *t, const char *f, unsigned long fl) {
     return (int)syscall(SYS_mount, s, t, f, fl, NULL);
 }
+static int mountd_(const char *s, const char *t, const char *f, unsigned long fl, const char *d) {
+    return (int)syscall(SYS_mount, s, t, f, fl, d);
+}
 static int umount_(const char *t, int fl) { return (int)syscall(SYS_umount2, t, fl); }
 static int exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
 static void put(const char *p, const char *c, int mode) {
@@ -641,24 +644,67 @@ static void hardening_suite(void) {
     if (WIFEXITED(st)) printf("  ns_bwrap_dev_proc rc=%d\n", WEXITSTATUS(st));
 
     /* The same as unprivileged bwrap does it: user+mount ns, a tmpfs root pivoted
-     * over, the old tree at /oldroot, readlink through /oldroot/proc/self/fd/N. */
+     * over, the old tree at /oldroot, readlink through /oldroot/proc/self/fd/N.
+     * pv=1 adds the pid namespace --unshare-all brings (the pivoting task is pid 1 of it
+     * and reads the OLD procfs, which names it by its parent-namespace pid). */
+    for (int pv = 0; pv < 3; pv++) {
     pid = fork();
     if (pid == 0) {
-        if (setgid(65534) || setuid(65534)) _exit(99);
-        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(2);
-        { static const char *mf[] = { "/proc/self/setgroups", "/proc/self/uid_map", "/proc/self/gid_map" };
-          static const char *mv[] = { "deny", "65534 65534 1", "65534 65534 1" };
-          for (int i = 0; i < 3; i++) { int f = open(mf[i], O_WRONLY); if (f < 0 || write(f, mv[i], strlen(mv[i])) < 0) _exit(60 + i); close(f); } }
+        /* pv=2: the real bwrap shape -- an ordinary uid with supplementary groups, and the
+         * maps written by the PARENT for the already-unshared child. */
+        unsigned uu = pv == 2 ? 1000 : 65534;
+        if (pv == 2) { gid_t g[2] = { 10, 29 }; if (setgroups(2, g)) _exit(98); }
+        if (setgid(uu) || setuid(uu)) _exit(99);
+        char mvu[32]; snprintf(mvu, sizeof mvu, "%u %u 1", uu, uu);
+        if (pv == 2) {
+            int p1[2], p2[2];
+            if (pipe(p1) || pipe(p2)) _exit(94);
+            pid_t c = fork();
+            if (c < 0) _exit(95);
+            if (c > 0) {
+                char b; int s2;
+                if (read(p1[0], &b, 1) != 1) _exit(93);
+                char pth[64];
+                static const char *mf2[] = { "setgroups", "uid_map", "gid_map" };
+                const char *mv2[] = { "deny", mvu, mvu };
+                for (int i = 0; i < 3; i++) {
+                    snprintf(pth, sizeof pth, "/proc/%d/%s", (int)c, mf2[i]);
+                    int f = open(pth, O_WRONLY);
+                    if (f < 0 || write(f, mv2[i], strlen(mv2[i])) < 0) { printf("  parent map %s errno=%d\n", mf2[i], errno); _exit(80 + i); }
+                    close(f);
+                }
+                if (write(p2[1], "x", 1) != 1) _exit(92);
+                waitpid(c, &s2, 0); _exit(WIFEXITED(s2) ? WEXITSTATUS(s2) : 96);
+            }
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(2);
+            char b = 'x';
+            if (write(p1[1], &b, 1) != 1 || read(p2[0], &b, 1) != 1) _exit(91);
+        } else {
+            if (unshare(CLONE_NEWUSER | CLONE_NEWNS | (pv ? CLONE_NEWPID : 0)) != 0) _exit(2);
+            if (pv) {
+                pid_t c = fork();
+                if (c < 0) _exit(95);
+                if (c > 0) { int s2; waitpid(c, &s2, 0); _exit(WIFEXITED(s2) ? WEXITSTATUS(s2) : 96); }
+            }
+            static const char *mf[] = { "/proc/self/setgroups", "/proc/self/uid_map", "/proc/self/gid_map" };
+            const char *mv[] = { "deny", mvu, mvu };
+            for (int i = 0; i < 3; i++) { int f = open(mf[i], O_WRONLY); if (f < 0 || write(f, mv[i], strlen(mv[i])) < 0) _exit(60 + i); close(f); }
+        }
         mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
         mkdir("/tmp/fbw3", 0755);
-        if (mount_("tmpfs", "/tmp/fbw3", "tmpfs", 0) != 0) { printf("  tmpfs errno=%d\n", errno); _exit(3); }
+        if (mountd_("tmpfs", "/tmp/fbw3", "tmpfs", 6, "mode=0755") != 0) { printf("  tmpfs errno=%d\n", errno); _exit(3); }
         mkdir("/tmp/fbw3/newroot", 0755); mkdir("/tmp/fbw3/oldroot", 0755);
         if (chdir("/tmp/fbw3") != 0) _exit(4);
         if (syscall(SYS_pivot_root, "/tmp/fbw3", "/tmp/fbw3/oldroot") != 0) _exit(5);
         if (chdir("/") != 0) _exit(6);
         /* --ro-bind / /: the old tree rbind-ed into place, then --dev / --proc over it */
         if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) _exit(8);
-        if (mount_("tmpfs", "/newroot/dev", "tmpfs", 0) != 0) _exit(7);
+        if (mountd_("tmpfs", "/newroot/dev", "tmpfs", 6, "mode=0755") != 0) _exit(7);
+        /* bwrap --dev: stdin/stdout/stderr/fd symlinks on the fresh tmpfs */
+        if (symlink("/proc/self/fd/0", "/newroot/dev/stdin") != 0) { printf("  symlink errno=%d\n", errno); _exit(70); }
+        if (symlink("/proc/self/fd", "/newroot/dev/fd") != 0) _exit(71);
+        { int f = open("/newroot/dev/scratch", O_CREAT | O_WRONLY, 0644); if (f < 0) { printf("  creat errno=%d\n", errno); _exit(72); } close(f);
+          if (mkdir("/newroot/dev/sub", 0755) != 0) _exit(73); }
         static const char *names[] = { "null", "zero", "full", "random", "urandom" };
         for (int i = 0; i < 5; i++) {
             char s[96], d[96], l[64], b[256];
@@ -700,8 +746,9 @@ static void hardening_suite(void) {
         _exit(0);
     }
     waitpid(pid, &st, 0);
-    report("ns_userns_pivot_bwrap_dev_proc", WIFEXITED(st) && WEXITSTATUS(st) == 0);
-    if (WIFEXITED(st)) printf("  ns_userns_pivot_bwrap rc=%d\n", WEXITSTATUS(st));
+    report(pv == 2 ? "ns_userns_parentmap_pivot_bwrap_dev_proc" : pv ? "ns_userns_pidns_pivot_bwrap_dev_proc" : "ns_userns_pivot_bwrap_dev_proc", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  ns_userns_pivot_bwrap pv=%d rc=%d\n", pv, WEXITSTATUS(st));
+    }
 
     /* clone(NEWNS|VM|VFORK) as Linux allows */
     static char vmstack[16384] __attribute__((aligned(16)));
