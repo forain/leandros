@@ -406,6 +406,7 @@ SUITES = {
     "kexecacpi": ["host:kexecacpitest.py"],
     # lane vkwltest: Venus Vulkan swapchain -> cosmic-comp over Wayland, frame callbacks counted (x86_64 only, own boot).
     "vkwl": ["host:vkwltest.py"],
+    "vkwlload": ["host:vkwlload.py"],  # vkwl 900 frames + /proc/drm/fence_stats before/after
     # lane dtbres: devices behind PCIe root port -> PCI-PCI bridge (own boot).
     "pcibridge": ["host:pcibridgetest.py"],
     # lane nitrox86: x86_64 with no PIT/HPET/i8042/display (EC2 Nitro-like): login on serial, TSC stated, clock true (own boot).
@@ -549,7 +550,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "usbisochtest.py": 900,
+HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
@@ -569,7 +570,7 @@ def find_fails(out):
 # Host scripts that only make sense on one arch (they boot their own VM of that
 # arch). A run of the other arch reports them as a skip, not a failure.
 HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
-                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64",
+                  "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64", "vkwlload.py": "x86_64",
                   "a64acpitest.py": "aarch64"}
 
 
