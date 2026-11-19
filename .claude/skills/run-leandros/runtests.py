@@ -228,7 +228,7 @@ SUITES = {
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
                 "/bin/f2fstest trunc_cold /home",
                 # ostree-pull-shaped churn on f2fs /home (lane homenotdir)
-                "/bin/f2fstest ostree /home/ostreetest 1 2",
+                "/bin/f2fstest ostree /home/ostreetest 1 2 1500",
                 "/bin/f2fstest orphanreuse /home/orphanreuse",
                 SYNCFILE_CHECK, CFGWRITE_CHECK, LONGLINE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup

@@ -18,7 +18,7 @@ mod nrs { pub const FSYNC: usize = 82; pub const LINKAT: usize = 37; pub const F
 #[cfg(target_arch = "x86_64")]
 mod nrs { pub const FSYNC: usize = 74; pub const LINKAT: usize = 265; pub const FALLOC: usize = 285; pub const FTRUNC: usize = 77; pub const MODE_OFF: usize = 24; }
 
-const OBJECTS: u64 = 6000;
+static mut OBJECTS: u64 = 6000;
 const AT_FDCWD: isize = -100;
 const AT_REMOVEDIR: usize = 0x200;
 const O_EXCL_: i32 = 0o200;
@@ -183,7 +183,9 @@ unsafe fn worker(dir: &[u8], round: u64, seedbase: u64) -> ! {
     let stfd = open_dir(tmpfd, &sn[..k + 1], sname) as isize;
     let mut ring = [0u64; 64];
     let mut nring = 0usize;
-    for i in 0..OBJECTS {
+    let nobj = OBJECTS;
+    for i in 0..nobj {
+        if i != 0 && i % 500 == 0 { out(b"ostree: progress worker "); out_dec(pid); out(b" obj "); out_dec(i); out(b"\n"); }
         let big = i == 500 || i == 1500 || rng.below(500) == 0;
         let mut key = rng.next();
         if big { key = (key & !0xff) | 0xB1; } else if key & 0xff == 0xB1 { key ^= 1; }
@@ -354,7 +356,8 @@ unsafe fn walk(dir: &[u8], remove: bool) -> u64 {
     total
 }
 
-pub(crate) unsafe fn ostree(dir: &[u8], rounds: u64, nproc: u64) -> i32 {
+pub(crate) unsafe fn ostree(dir: &[u8], rounds: u64, nproc: u64, objects: u64) -> i32 {
+    OBJECTS = objects;
     let t0 = nowms();
     let mut pb = [0u8; 300];
     for sub in [&b""[..], b"/repo", b"/repo/objects", b"/repo/tmp"] {
