@@ -1437,6 +1437,134 @@ static void cpuinfo_arm64_fields(void) {
 #endif
 }
 
+
+/* ── flatpak/ostree/bwrap procfs + tmpfile contract (lane flatfs) ───────────── */
+
+/* `s` is a lowercase 8-4-4-4-12 UUID plus the newline Linux appends. */
+static int uuid_ok(const char *s, ssize_t n) {
+    if (n != 37 || s[36] != '\n') return 0;
+    for (int i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (s[i] != '-') return 0; }
+        else if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static ssize_t slurp(const char *path, char *buf, size_t cap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, cap);
+    close(fd);
+    return n;
+}
+
+static void random_uuid_files(void) {
+    char a[64], b[64], u1[64], u2[64];
+    ssize_t na = slurp("/proc/sys/kernel/random/boot_id", a, sizeof a);
+    if (na < 0) { fail("boot_id", "open: %s", strerror(errno)); return; }
+    ssize_t nb = slurp("/proc/sys/kernel/random/boot_id", b, sizeof b);
+    if (!uuid_ok(a, na)) { fail("boot_id_format", "bad content (%zd bytes)", na); return; }
+    if (nb != na || memcmp(a, b, na)) { fail("boot_id_stable", "two reads differ"); return; }
+    struct stat st;
+    if (stat("/proc/sys/kernel/random/boot_id", &st) || !S_ISREG(st.st_mode)) { fail("boot_id_stat", "not a regular file"); return; }
+    pass("boot_id");
+    ssize_t n1 = slurp("/proc/sys/kernel/random/uuid", u1, sizeof u1);
+    ssize_t n2 = slurp("/proc/sys/kernel/random/uuid", u2, sizeof u2);
+    if (!uuid_ok(u1, n1) || !uuid_ok(u2, n2)) { fail("random_uuid_format", "bad content (%zd, %zd)", n1, n2); return; }
+    if (n1 == n2 && !memcmp(u1, u2, n1)) { fail("random_uuid_fresh", "two reads equal"); return; }
+    pass("random_uuid");
+}
+
+/* /proc/<pid>/ns is a directory: bwrap opens it and openat()s each link. */
+static int ns_dir_check(const char *dir, const char *what) {
+    struct stat st;
+    if (stat(dir, &st)) { fail(what, "stat %s: %s", dir, strerror(errno)); return 0; }
+    if (!S_ISDIR(st.st_mode)) { fail(what, "%s is not a directory", dir); return 0; }
+    DIR *d = opendir(dir);
+    if (!d) { fail(what, "opendir %s: %s", dir, strerror(errno)); return 0; }
+    static const char *want[] = { "user", "mnt", "pid", "net", "uts", "ipc", "cgroup" };
+    int seen[7] = {0}, bad = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        int k = -1;
+        for (int i = 0; i < 7; i++) if (!strcmp(e->d_name, want[i])) k = i;
+        if (k >= 0) seen[k] = 1;
+        else if (!strcmp(e->d_name, "pid_for_children")) continue;
+        else if (!strcmp(e->d_name, "time") || !strcmp(e->d_name, "time_for_children")) continue;
+        else bad = 1;
+    }
+    closedir(d);
+    for (int i = 0; i < 7; i++) if (!seen[i]) { fail(what, "readdir lacks %s", want[i]); return 0; }
+    if (bad) { fail(what, "readdir lists an unknown entry"); return 0; }
+    int fd = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) { fail(what, "open(O_PATH|O_DIRECTORY): %s", strerror(errno)); return 0; }
+    int lfd = openat(fd, "user", O_RDONLY | O_CLOEXEC);
+    if (lfd < 0) { fail(what, "openat(fd, user): %s", strerror(errno)); close(fd); return 0; }
+    struct stat ls;
+    if (fstat(lfd, &ls)) { fail(what, "fstat(user): %s", strerror(errno)); close(lfd); close(fd); return 0; }
+    close(lfd);
+    char tgt[64];
+    ssize_t n = readlinkat(fd, "mnt", tgt, sizeof tgt - 1);
+    close(fd);
+    if (n < 5 || strncmp(tgt, "mnt:[", 5)) { fail(what, "readlinkat(mnt) = %zd", n); return 0; }
+    return 1;
+}
+
+static void proc_ns_dir(void) {
+    char p[64];
+    snprintf(p, sizeof p, "/proc/%d/ns", (int)getpid());
+    if (ns_dir_check("/proc/self/ns", "proc_self_ns_dir") && ns_dir_check(p, "proc_pid_ns_dir")) pass("proc_ns_dir");
+}
+
+/* Kernel keyrings and listmount(2): quiet ENOSYS, as Linux without them. */
+static void quiet_enosys(void) {
+#ifdef __aarch64__
+    const long keyctl = 219, listmount = 458;
+#else
+    const long keyctl = 250, listmount = 458;
+#endif
+    errno = 0;
+    long r = syscall(keyctl, 0 /* KEYCTL_GET_KEYRING_ID */, -3, 0, 0, 0);
+    if (r != -1 || errno != ENOSYS) { fail("keyctl_enosys", "r=%ld errno=%d", r, errno); return; }
+    errno = 0;
+    r = syscall(listmount, 0, 0, 0, 0);
+    if (r != -1 || errno != ENOSYS) { fail("listmount_enosys", "r=%ld errno=%d", r, errno); return; }
+    pass("keyctl_listmount_enosys");
+}
+
+/* O_TMPFILE + linkat via /proc/self/fd (ostree's glnx_link_tmpfile_at). Either
+ * the filesystem refuses O_TMPFILE the way Linux does when unsupported (callers
+ * fall back to a named temp file), or the fd must be linkable. A fd that opens
+ * but cannot be linked was the "linkat: ENOENT" of `flatpak remote-add`. */
+static void tmpfile_link(const char *dir) {
+    char name[96];
+    snprintf(name, sizeof name, "tmpfile_link %s", dir);
+    int fd = open(dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        if (errno == EOPNOTSUPP || errno == EISDIR || errno == ENOSYS) { pass(name); return; }
+        fail(name, "open(O_TMPFILE): %s", strerror(errno));
+        return;
+    }
+    static const char data[] = "tmpfile-data";
+    if (write(fd, data, sizeof data - 1) != (ssize_t)sizeof data - 1) { fail(name, "write: %s", strerror(errno)); close(fd); return; }
+    char src[48], dst[PATH_MAX];
+    snprintf(src, sizeof src, "/proc/self/fd/%d", fd);
+    snprintf(dst, sizeof dst, "%s/.tmpfile-link-%d", dir, (int)getpid());
+    unlink(dst);
+    if (linkat(AT_FDCWD, src, AT_FDCWD, dst, AT_SYMLINK_FOLLOW) != 0) {
+        fail(name, "linkat(%s): %s", src, strerror(errno));
+        close(fd);
+        return;
+    }
+    char back[32] = {0};
+    ssize_t n = slurp(dst, back, sizeof back);
+    unlink(dst);
+    close(fd);
+    if (n != (ssize_t)sizeof data - 1 || memcmp(back, data, n)) { fail(name, "linked file reads %zd bytes", n); return; }
+    pass(name);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--print-faults") == 0) {
         unsigned long mi = 0, ma = 0;
@@ -1465,6 +1593,11 @@ int main(int argc, char **argv) {
     majflt_cold();
     thread_faults();
     vfork_exec_faults("/proc/self/exe");
+
+    random_uuid_files();
+    proc_ns_dir();
+    quiet_enosys();
+    for (int i = 0; i < ndirs; i++) tmpfile_link(dirs[i]);
 
     status_groups();
     sys_devices_cpu();

@@ -261,8 +261,16 @@ def apk_stanza(apk_path, index_tar_gz=None):
     return ("\n".join(L) + "\n\n").encode()
 
 
+# Alpine packages whose files overlap ones the image already carries (busd's
+# dbus-run-session and session.conf, the hicolor index.theme). leandros-base
+# lists them as replacing those packages (r:), so `apk add flatpak` (which pulls
+# dbus and hicolor-icon-theme) keeps the image's file instead of aborting with
+# "trying to overwrite ... owned by leandros-base".
+BASE_REPLACES = ("dbus", "hicolor-icon-theme")
+
+
 def build_installed(files, dir_meta, provides, arch, build_time, depends=(), musl_owned=False,
-                    owned_elsewhere=frozenset()):
+                    owned_elsewhere=frozenset(), replaces=BASE_REPLACES):
     """files: iterable of absolute image paths (regular files and hard links).
     dir_meta: {absolute dir path: (uid, gid, mode)}.
     owned_elsewhere: absolute paths owned by another package record (vanilla
@@ -286,6 +294,8 @@ def build_installed(files, dir_meta, provides, arch, build_time, depends=(), mus
          "p:" + " ".join(provides)]
     if depends:
         L.append("D:" + " ".join(depends))
+    if replaces:
+        L.append("r:" + " ".join(replaces))
     for d in sorted(by_dir):
         L.append("F:" + d)
         uid, gid, mode = dir_meta.get("/" + d, (0, 0, 0o755))
