@@ -882,6 +882,61 @@ static void hardening_suite(void) {
     if (WIFEXITED(st)) printf("  ns_userns_pivot_bwrap pv=%d rc=%d\n", pv, WEXITSTATUS(st));
     }
 
+    /* flatpak/bwrap: an O_PATH directory fd on the f2fs root, named through the old procfs after
+     * pivot_root (bind source "/oldroot" + "/proc/self/fd/N"), and plain /proc/self/fd/N. */
+    pid = fork();
+    if (pid == 0) {
+        if (setgid(1000) || setuid(1000)) _exit(99);
+        struct stat s0;
+        int dfd = open("/usr/share", O_PATH | O_DIRECTORY);
+        if (dfd < 0 || fstat(dfd, &s0) != 0) _exit(98);
+        { char pl[64]; struct stat sp; snprintf(pl, sizeof pl, "/proc/self/fd/%d", dfd);
+          if (stat(pl, &sp) != 0 || !S_ISDIR(sp.st_mode) || sp.st_ino != s0.st_ino || sp.st_dev != s0.st_dev) { printf("  plain stat %s errno=%d\n", pl, errno); _exit(80); } }
+        char mvu[32]; snprintf(mvu, sizeof mvu, "%u %u 1", 1000u, 1000u);
+        setvbuf(stdout, NULL, _IONBF, 0);
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(2);
+        static const char *mf[] = { "/proc/self/setgroups", "/proc/self/uid_map", "/proc/self/gid_map" };
+        const char *mv[] = { "deny", mvu, mvu };
+        for (int i = 0; i < 3; i++) { int f = open(mf[i], O_WRONLY); if (f < 0 || write(f, mv[i], strlen(mv[i])) < 0) _exit(60 + i); close(f); }
+        mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
+        mkdir("/tmp/fbw4", 0755);
+        if (mountd_("tmpfs", "/tmp/fbw4", "tmpfs", 6, "mode=0755") != 0) _exit(3);
+        mkdir("/tmp/fbw4/newroot", 0755); mkdir("/tmp/fbw4/oldroot", 0755);
+        if (mount_("/tmp/fbw4/newroot", "/tmp/fbw4/newroot", NULL, M_BIND | M_REC | (1UL << 15)) != 0) _exit(89);
+        if (chdir("/tmp/fbw4") != 0) _exit(4);
+        if (syscall(SYS_pivot_root, "/tmp/fbw4", "/tmp/fbw4/oldroot") != 0) _exit(5);
+        if (chdir("/") != 0) _exit(6);
+        { char pl[96]; struct stat sp; snprintf(pl, sizeof pl, "/oldroot/proc/self/fd/%d", dfd);
+          if (stat(pl, &sp) != 0) { printf("  stat %s errno=%d\n", pl, errno); _exit(81); }
+          if (!S_ISDIR(sp.st_mode) || sp.st_ino != s0.st_ino || sp.st_dev != s0.st_dev) { printf("  stat %s identity mismatch\n", pl); _exit(82); }
+          { char lb[256], rb[4096]; ssize_t ln = readlink(pl, lb, sizeof lb - 1);
+            if (ln < 0) { printf("  readlink %s errno=%d\n", pl, errno); _exit(85); }
+            lb[ln] = 0;
+            if (strcmp(lb, "/oldroot/usr/share") != 0) { printf("  readlink %s -> %s\n", pl, lb); _exit(86); }
+            { int of = open(pl, O_PATH | O_NONBLOCK | O_CLOEXEC); if (of < 0) { printf("  open O_PATH %s errno=%d\n", pl, errno); _exit(74); } close(of); }
+            if (!realpath(pl, rb)) { int e0 = errno; printf("  realpath %s errno=%d\n", pl, e0);
+              { char cp[128]; struct stat cs; char cb[256]; ssize_t cl; pid_t me = getpid();
+                const char *fm[] = { "/oldroot", "/oldroot/proc", "/oldroot/proc/self", "/oldroot/proc/%d", "/oldroot/proc/%d/fd", "/oldroot/proc/%d/fd/%d" };
+                for (int ci = 0; ci < 6; ci++) { snprintf(cp, sizeof cp, fm[ci], (int)me, dfd);
+                  cl = readlink(cp, cb, sizeof cb - 1); int er = errno; if (cl >= 0) cb[cl] = 0;
+                  printf("  walk %s: readlink=%zd (%s) errno=%d lstat=%d\n", cp, cl, cl >= 0 ? cb : "-", cl < 0 ? er : 0, lstat(cp, &cs)); } }
+              _exit(87); }
+            if (strcmp(rb, "/oldroot/usr/share") != 0) { printf("  realpath %s -> %s\n", pl, rb); _exit(88); }
+            ln = readlink("/oldroot/proc/self", lb, sizeof lb - 1);
+            if (ln <= 0) { printf("  readlink /oldroot/proc/self errno=%d\n", errno); _exit(75); }
+            lb[ln] = 0;
+            if ((pid_t)atoi(lb) != getpid()) { printf("  /oldroot/proc/self -> %s (pid %d)\n", lb, (int)getpid()); _exit(76); } }
+          if (mount_(pl, "/newroot", NULL, M_BIND | M_REC) != 0) { printf("  bind %s errno=%d\n", pl, errno); _exit(83); }
+          int n = 0; DIR *dd = opendir("/newroot"); struct dirent *de;
+          while (dd && (de = readdir(dd))) if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) n++;
+          if (dd) closedir(dd);
+          if (n == 0) { printf("  bound dir empty\n"); _exit(84); } }
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_userns_pivot_oldroot_procfd_dir", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  ns_userns_pivot_oldroot_procfd_dir rc=%d\n", WEXITSTATUS(st));
+
     /* clone(NEWNS|VM|VFORK) as Linux allows */
     static char vmstack[16384] __attribute__((aligned(16)));
     pid = (pid_t)clone(vm_child, vmstack + sizeof vmstack, CLONE_NEWNS | CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);

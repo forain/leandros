@@ -15564,6 +15564,13 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
             None    => err_reply(-2),  // ENOENT
         };
     }
+    // (Checked before the mount lookup: the root filesystem's "/" prefix would
+    // otherwise answer ENOENT for it.)
+    // A per-process procfs entry that exists (/proc/<pid>, /proc/<pid>/fd, a
+    // file below it) is not a link: EINVAL, not ENOENT. musl's realpath()
+    // readlink()s every component and aborts on anything but EINVAL, so
+    // bwrap's realpath("/oldroot/proc/self/fd/N") died on /oldroot/proc/<pid>.
+    if let Some(Some(_)) = proc_stat_kind(raw) { return err_reply(-22); }
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_READLINK;
