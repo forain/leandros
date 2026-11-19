@@ -696,6 +696,9 @@ fn new_addr(msg: &[u8], flags: u16, env: &Env) -> i32 {
         (Some(a), Some((cur, p))) if a.len() == 4 && a == &cur[..] && msg[17] == p => {
             if flags & NLM_F_EXCL != 0 { 17 } else { 0 } // EEXIST
         }
+        // A fresh netns has a DOWN lo without its address; bwrap adds 127.0.0.1/8
+        // first and raises the link second. The address appears with IFF_UP.
+        (Some(a), None) if t.loopback && a == &[127, 0, 0, 1][..] && msg[17] == 8 => 0,
         _ => 95,
     }
 }

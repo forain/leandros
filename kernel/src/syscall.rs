@@ -10152,7 +10152,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     // act on this namespace's tree: crun and containers/storage call
     // MS_REC|MS_PRIVATE / MS_SLAVE on "/" first.
     if flags & MS_PROPAGATION != 0 && flags & MS_BIND == 0 {
-        if flags & !(MS_PROPAGATION | MS_REC) != 0 { return -22; }
+        // Linux do_change_type ignores every other flag (bwrap passes MS_SILENT).
         let target = match resolve_mount_target(target_ptr) { Ok(p) => p, Err(e) => return e };
         return vfs::mnt::set_propagation(mns, &target, flags) as isize;
     }
@@ -11796,7 +11796,8 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
             let n = (n as usize).min(HOST_PATH_MAX);
             // Paths are made caller-relative; synthetic names ("pipe:[7]")
             // are returned as they are.
-            return if n > 0 && kb[0] == b'/' { reply(&host_to_view(&kb[..n])) } else { reply(&kb[..n]) };
+            let hint = match vfs::fd_mnt(me, fd) { Some((mn, m)) if mn == sched::current_mntns() => m, _ => 0 };
+            return if n > 0 && kb[0] == b'/' { reply(&host_to_view_hint(&kb[..n], hint)) } else { reply(&kb[..n]) };
         }
     }
 
@@ -12286,13 +12287,18 @@ fn proc_own_fd(p: &[u8]) -> Option<(usize, &[u8])> {
 /// mapped back to where the task sees them, then the chroot prefix stripped
 /// (getcwd's translation). Unjailed tasks, and paths not under the jail
 /// root, come back unchanged.
-fn host_to_view(p: &[u8]) -> Vec<u8> {
+fn host_to_view(p: &[u8]) -> Vec<u8> { host_to_view_hint(p, 0) }
+
+/// [`host_to_view`] preferring the mount `hint` (the open file's mount id):
+/// a file bind-mounted over another (bwrap's /dev/urandom, /proc/sys covers)
+/// is named by the mount it was opened through, as Linux d_path does.
+fn host_to_view_hint(p: &[u8], hint: u32) -> Vec<u8> {
     let root = sched::current_root_arc();
     let mns = sched::current_mntns();
     if mns != 0 {
         // The namespace's own tree answers; its root is the task's root. A
         // hidden superblock path with no namespace name never leaks out.
-        let v = vfs::mnt::reverse(mns, p, 0);
+        let v = vfs::mnt::reverse(mns, p, hint);
         if v.is_none() && vfs::mnt::is_sb_path(p) { return b"/".to_vec(); }
         let p: &[u8] = v.as_deref().unwrap_or(p);
         if let Some(r) = root.as_deref() {

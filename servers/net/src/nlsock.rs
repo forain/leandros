@@ -56,7 +56,11 @@ static NL_EVER: AtomicU32 = AtomicU32::new(0);
 pub fn create(ofd: u32, tgid: u32, netns: u16, proto: usize) {
     let mut m = NL.lock();
     m.retain(|&k, _| vfs::ofd::live(k));
-    m.insert(ofd, NlSock { pid: tgid, ns: sched::ns::NsRef::get(netns), groups: 0, proto, peer: None, q: VecDeque::new(), gen: 0 });
+    // Linux autobind: nl_portid is the pid as the creator sees it (task_tgid_vnr).
+    // bwrap checks nlmsg_pid == getpid() inside its new pid namespace.
+    let vn = sched::pidns::pidns_of(tgid);
+    let portid = if vn != 0 { sched::pidns::to_v(vn, tgid) } else { tgid };
+    m.insert(ofd, NlSock { pid: portid, ns: sched::ns::NsRef::get(netns), groups: 0, proto, peer: None, q: VecDeque::new(), gen: 0 });
     NL_EVER.store(1, Ordering::Release);
 }
 

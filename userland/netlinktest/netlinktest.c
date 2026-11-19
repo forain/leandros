@@ -314,6 +314,48 @@ static void nl_connect_test(void) {
     close(s);
 }
 
+
+/* bwrap loopback_setup shape: new user+net+pid ns, RTM_NEWADDR 127.0.0.1/8 on
+ * the DOWN lo first, then RTM_NEWLINK IFF_UP. Its reply reader insists on
+ * nlmsg_pid == getpid() (the pid-namespace-local pid), else it returns -1
+ * with a stale errno ("No child process"). */
+static int nl_do_pid(int s, struct nlb *m, unsigned *pid_out) {
+    ((struct nlmsghdr *)m->b)->nlmsg_len = m->len;
+    if (send(s, m->b, m->len, 0) != m->len) return -1;
+    char rb[2048];
+    ssize_t n = recv(s, rb, sizeof rb, 0);
+    struct nlmsghdr *h = (struct nlmsghdr *)rb;
+    if (n < (ssize_t)NLMSG_HDRLEN || h->nlmsg_type != NLMSG_ERROR) return -1;
+    *pid_out = h->nlmsg_pid;
+    return -((struct nlmsgerr *)NLMSG_DATA(h))->error;
+}
+static int bwrap_lo_body(void) {
+    alarm(20);
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID) != 0) return 1;
+    pid_t k = fork();
+    if (k < 0) return 2;
+    if (k == 0) {
+        int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+        if (s < 0 || getpid() != 1) _exit(3);
+        struct ifaddrmsg a; memset(&a, 0, sizeof a);
+        a.ifa_family = AF_INET; a.ifa_prefixlen = 8; a.ifa_index = 1;
+        struct in_addr in; inet_pton(AF_INET, "127.0.0.1", &in);
+        struct nlb m; nl_begin(&m, RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK, &a, sizeof a);
+        nl_attr(&m, IFA_LOCAL, &in, 4);
+        nl_attr(&m, IFA_ADDRESS, &in, 4);
+        unsigned pid = 0;
+        if (nl_do_pid(s, &m, &pid) != 0) _exit(4);
+        if (pid != (unsigned)getpid()) _exit(5);
+        struct ifinfomsg i; memset(&i, 0, sizeof i);
+        i.ifi_family = AF_UNSPEC; i.ifi_index = 1; i.ifi_flags = IFF_UP; i.ifi_change = IFF_UP;
+        nl_begin(&m, RTM_NEWLINK, NLM_F_ACK, &i, sizeof i);
+        if (nl_do_pid(s, &m, &pid) != 0 || pid != (unsigned)getpid()) _exit(6);
+        _exit(0);
+    }
+    int st = 0; waitpid(k, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+}
+
 static void rtnl_write_tests(void) {
     nl_connect_test();
     fflush(stdout);
@@ -321,6 +363,12 @@ static void rtnl_write_tests(void) {
     if (c == 0) { int bad = tap_cfg_body(); fflush(stdout); _exit(bad ? 1 : 0); }
     int st = 0; waitpid(c, &st, 0);
     CHECK("tap_cfg_netlink", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    fflush(stdout);
+    c = fork();
+    if (c == 0) { int bad = bwrap_lo_body(); fflush(stdout); _exit(bad); }
+    waitpid(c, &st, 0);
+    CHECK("bwrap_lo_newaddr_newlink_pidns", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  bwrap_lo rc=%d\n", WEXITSTATUS(st));
     /* non-root in the init namespace: writes need CAP_NET_ADMIN */
     fflush(stdout);
     c = fork();
