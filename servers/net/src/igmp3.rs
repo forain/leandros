@@ -19,18 +19,19 @@ use smoltcp::phy::{Device, TxToken};
 
 pub(crate) type A4 = [u8; 4];
 /// The interface state of one group: (include?, sources).
-pub(crate) type State = (bool, Vec<A4>);
+pub(crate) type State<A = A4> = (bool, Vec<A>);
 
-const ROBUSTNESS: u8 = 2;
-const IS_IN: u8 = 1; const IS_EX: u8 = 2; const TO_IN: u8 = 3; const TO_EX: u8 = 4; const ALLOW: u8 = 5; const BLOCK: u8 = 6;
+pub(crate) const ROBUSTNESS: u8 = 2;
+pub(crate) const IS_IN: u8 = 1; pub(crate) const IS_EX: u8 = 2; pub(crate) const TO_IN: u8 = 3; pub(crate) const TO_EX: u8 = 4;
+pub(crate) const ALLOW: u8 = 5; pub(crate) const BLOCK: u8 = 6;
 /// Unsolicited report interval (RFC 3376 8.14.2): retransmissions of a
 /// state change are spread over 1 s.
-const UNSOLICITED_NS: u64 = 1_000_000_000;
+pub(crate) const UNSOLICITED_NS: u64 = 1_000_000_000;
 /// Keep a report under the Ethernet MTU: 14 + 24 + 8 + records.
 const MAX_REPORT: usize = 1400;
 
 #[derive(Clone)]
-struct Rec { group: A4, ty: u8, srcs: Vec<A4> }
+pub(crate) struct Rec<A = A4> { pub group: A, pub ty: u8, pub srcs: Vec<A> }
 
 struct Change { rec: Rec, left: u8 }
 
@@ -52,24 +53,25 @@ static V3: Mutex<BTreeMap<Sid, IfState>> = Mutex::new(BTreeMap::new());
 static POLL_SID: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn set_poll_sid(sid: Sid) { POLL_SID.store(sid, Ordering::Relaxed); }
+pub(crate) fn poll_sid() -> Sid { POLL_SID.load(Ordering::Relaxed) as Sid }
 
-fn rnd(max: u64) -> u64 {
+pub(crate) fn rnd(max: u64) -> u64 {
     if max == 0 { return 0; }
     let mut x = sched::monotonic_ns() ^ 0x9e37_79b9_7f4a_7c15;
     x ^= x << 13; x ^= x >> 7; x ^= x << 17;
     x % max
 }
 
-fn minus(a: &[A4], b: &[A4]) -> Vec<A4> { a.iter().filter(|x| !b.contains(x)).copied().collect() }
+pub(crate) fn minus<A: Copy + PartialEq>(a: &[A], b: &[A]) -> Vec<A> { a.iter().filter(|x| !b.contains(x)).copied().collect() }
 
 /// RFC 3376 table 3: the records that take the interface from `old` to
 /// `new` (a missing state is INCLUDE(empty): not a member).
-fn diff(old: Option<&State>, new: Option<&State>, group: A4) -> Vec<Rec> {
-    let empty: State = (true, Vec::new());
+pub(crate) fn diff<A: Copy + PartialEq>(old: Option<&State<A>>, new: Option<&State<A>>, group: A) -> Vec<Rec<A>> {
+    let empty: State<A> = (true, Vec::new());
     let (oi, oa) = old.unwrap_or(&empty);
     let (ni, nb) = new.unwrap_or(&empty);
     let mut v = Vec::new();
-    let mut push = |ty: u8, srcs: Vec<A4>| v.push(Rec { group, ty, srcs });
+    let mut push = |ty: u8, srcs: Vec<A>| v.push(Rec { group, ty, srcs });
     match (*oi, *ni) {
         (true, true) => {
             let (a, b) = (minus(nb, oa), minus(oa, nb));
@@ -112,7 +114,7 @@ pub(crate) fn changed(sid: Sid, group: A4, new: Option<State>) {
 }
 
 /// Internet checksum of `b` folded to 16 bits (0xffff-complement).
-fn csum(b: &[u8]) -> u16 {
+pub(crate) fn csum(b: &[u8]) -> u16 {
     let mut s: u32 = 0;
     let mut i = 0;
     while i + 1 < b.len() { s += u16::from_be_bytes([b[i], b[i + 1]]) as u32; i += 2; }
@@ -162,23 +164,28 @@ pub(crate) fn query_hook(dst: A4, p: &[u8]) -> bool {
 }
 
 /// MODE_IS records for `group` (or all groups) as the query asked.
-fn reply_recs(st: &IfState, r: &Reply, out: &mut Vec<Rec>) {
-    let mut one = |group: A4, state: &State| {
+fn reply_recs(st: &IfState, r: &Reply, out: &mut Vec<Rec>) { reply_recs_g(&st.cur, r.group, &r.srcs, out); }
+
+/// The same for any address width (MLDv2 reuses it): `cur` is the reported
+/// state per group, `group` the query's group (None = general), `qsrcs` the
+/// sources it listed.
+pub(crate) fn reply_recs_g<A: Copy + PartialEq + Ord>(cur: &BTreeMap<A, State<A>>, group: Option<A>, qsrcs: &[A], out: &mut Vec<Rec<A>>) {
+    let mut one = |group: A, state: &State<A>| {
         let (inc, a) = state;
-        if r.srcs.is_empty() {
+        if qsrcs.is_empty() {
             if *inc && a.is_empty() { return; }
             out.push(Rec { group, ty: if *inc { IS_IN } else { IS_EX }, srcs: a.clone() });
         } else {
             // Group-and-source-specific (RFC 3376 5.2): INCLUDE answers the
             // sources it forwards, EXCLUDE those it does not block.
-            let s: Vec<A4> = if *inc { r.srcs.iter().filter(|x| a.contains(x)).copied().collect() }
-                             else { minus(&r.srcs, a) };
+            let s: Vec<A> = if *inc { qsrcs.iter().filter(|x| a.contains(x)).copied().collect() }
+                            else { minus(qsrcs, a) };
             if !s.is_empty() { out.push(Rec { group, ty: IS_IN, srcs: s }); }
         }
     };
-    match r.group {
-        None => for (g, s) in st.cur.iter() { one(*g, s); },
-        Some(g) => if let Some(s) = st.cur.get(&g) { one(g, s); },
+    match group {
+        None => for (g, s) in cur.iter() { one(*g, s); },
+        Some(g) => if let Some(s) = cur.get(&g) { one(g, s); },
     }
 }
 

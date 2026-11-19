@@ -320,6 +320,18 @@ impl InterfaceInner {
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
+        // LEANDROS: an MLD query (type 130) is the net server's.
+        if self.igmp_v3 && ip_payload.first() == Some(&130) {
+            let h = MLD_QUERY_HOOK.load(core::sync::atomic::Ordering::Relaxed);
+            if h != 0 {
+                if let (IpAddress::Ipv6(s), IpAddress::Ipv6(d)) = (ip_repr.src_addr(), ip_repr.dst_addr()) {
+                    // SAFETY: only ever stored from a `fn([u8; 16], [u8; 16], u8, &[u8]) -> bool`.
+                    #[allow(unsafe_code)]
+                    let f: fn([u8; 16], [u8; 16], u8, &[u8]) -> bool = unsafe { core::mem::transmute(h) };
+                    if f(s.0, d.0, ip_repr.hop_limit(), ip_payload) { return None; }
+                }
+            }
+        }
         let icmp_packet = check!(Icmpv6Packet::new_checked(ip_payload));
         let icmp_repr = check!(Icmpv6Repr::parse(
             &ip_repr.src_addr(),

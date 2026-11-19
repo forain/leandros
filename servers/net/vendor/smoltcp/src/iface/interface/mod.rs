@@ -21,7 +21,7 @@ mod sixlowpan;
 mod igmp;
 
 #[cfg(feature = "proto-igmp")]
-pub use igmp::{MulticastError, IGMP_QUERY_HOOK};
+pub use igmp::{MulticastError, IGMP_QUERY_HOOK, MLD_QUERY_HOOK};
 
 use super::packet::*;
 

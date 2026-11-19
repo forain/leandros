@@ -3457,7 +3457,14 @@ fn loop_frame(s: &NetStack, src: IpAddress, sport: u16, dst: IpEndpoint, ttl: u8
 
 /// Queue `frame` for stack `sid`'s receive side and wake the daemon.
 fn inject_frame(sid: Sid, frame: alloc::vec::Vec<u8>) {
-    if sid == LO { return; }
+    if sid == LO {
+        // The loopback stack's own device: the frame is received on its next poll.
+        let mut st = stack_for(LO);
+        if let Some(d) = st.as_mut().and_then(|s| s.loopback_dev.as_mut()) { d.push(frame); }
+        drop(st);
+        drivers::netdev::kick();
+        return;
+    }
     {
         let mut q = INJECT.lock();
         if q.len() >= INJECT_MAX { q.pop_front(); } else { INJECT_N.fetch_add(1, Ordering::Relaxed); }
@@ -3486,7 +3493,8 @@ fn mcast_if_sid(ofd: u32, dst: IpAddress) -> Option<Sid> {
     let ifx = sock_opts(ofd).mc_if;
     if ifx == 0 { return None; }
     let sid = ifx - 1;
-    (sid != LO && (sid as usize) < MAX_STACKS && stack_for(sid).is_some()).then_some(sid)
+    // lo takes IPv6 multicast only (the local copy of `inject_frame`).
+    ((sid != LO || matches!(dst, IpAddress::Ipv6(_))) && (sid as usize) < MAX_STACKS && stack_for(sid).is_some()).then_some(sid)
 }
 
 mod listen;
@@ -3495,6 +3503,7 @@ pub mod rxpolicy;
 pub mod latestack;
 mod mcast;
 mod igmp3;
+mod mld2;
 mod udpany;
 mod syngate;
 mod sa;
@@ -3813,6 +3822,7 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
     smoltcp::pmtu::set_expires_ms(sched::ns::mtu_expires_s() as u64 * 1000);
     igmp3::set_poll_sid(sid);
     igmp3::tick(s, dev, sid, timestamp);
+    mld2::tick(s, dev, sid, timestamp);
     let mut gate = syngate::SynGate::new(dev);
     let (mut changed, mut mask) = (false, 0u64);
     let mut repolls = 0;
@@ -4083,7 +4093,7 @@ pub fn net_daemon() -> ! {
         let cadence_ns: u64 = if active { NET_CADENCE_NS.load(Ordering::Relaxed) }
             else if irq_driven { IDLE_CAP_NS }
             else { 10_000_000 };
-        if let Some(ns) = igmp3::next_due(now) {
+        if let Some(ns) = igmp3::next_due(now).into_iter().chain(mld2::next_due(now)).min() {
             let d = smoltcp::time::Duration::from_micros(ns.max(1_000_000) / 1000);
             next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
         }
@@ -6062,16 +6072,21 @@ fn handle_send_k(pid: u32, fd: usize, buf_ptr: usize, len: usize, addr_ptr: usiz
                     // is off, broadcast always (Linux ip_mc_output). Built
                     // before the send, while the socket's port and the
                     // interface's addresses are at hand.
-                    let looped = if sid != LO && ((mcast && !opts.mc_noloop) || iface::is_broadcast(endpoint.addr)) {
+                    // On lo only IPv6 multicast is copied this way: smoltcp
+                    // has no ::1 source for a group, so the frame goes
+                    // straight to the loopback device and nothing is sent.
+                    let v6lo = sid == LO && mcast && matches!(endpoint.addr, IpAddress::Ipv6(_));
+                    let looped = if (sid != LO || v6lo) && ((mcast && !opts.mc_noloop) || iface::is_broadcast(endpoint.addr)) {
                         let src = bound.addr.or_else(|| match endpoint.addr {
-                            IpAddress::Ipv6(d) => stack_src_addr6(s, d),
+                            IpAddress::Ipv6(d) => stack_src_addr6(s, d)
+                                .or(if v6lo { Some(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::LOOPBACK)) } else { None }),
                             _ => stack_src_addr(s, sid),
                         });
                         let ttl = if mcast { opts.mc_ttl } else if opts.ttl != 0 { opts.ttl } else { 64 };
                         src.and_then(|src| loop_frame(s, src, bound.port, endpoint, ttl, opts.tos, &data))
                     } else { None };
                     // TTL 0 multicast never leaves the host.
-                    let r = if mcast && opts.mc_ttl == 0 { Ok(()) } else { s.socket_set.get_mut::<udp::Socket>(socket_handle).send_slice(&data, meta) };
+                    let r = if mcast && (opts.mc_ttl == 0 || v6lo) { Ok(()) } else { s.socket_set.get_mut::<udp::Socket>(socket_handle).send_slice(&data, meta) };
                     drop(stack);
                     if let (Ok(()), Some(f)) = (&r, looped) { inject_frame(sid, f); }
                     match r {

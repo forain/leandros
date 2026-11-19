@@ -36,6 +36,8 @@ pub struct LoopDev {
 
 impl LoopDev {
     pub(crate) fn new() -> Self { Self { queue: alloc::collections::VecDeque::new() } }
+    /// Queue a received frame (the local copy of a multicast datagram).
+    pub(crate) fn push(&mut self, f: alloc::vec::Vec<u8>) { self.queue.push_back(f); }
 }
 
 pub struct LoopTx<'a> {

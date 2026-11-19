@@ -36,6 +36,12 @@ impl std::error::Error for MulticastError {}
 /// it may only take leaf locks.
 pub static IGMP_QUERY_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+/// LEANDROS: the net server's MLD query handler (0 = none):
+/// `fn(src: [u8; 16], dst: [u8; 16], hop_limit: u8, icmpv6: &[u8]) -> bool`
+/// for an ICMPv6 type 130 message, called under the stack lock, so it may
+/// only take leaf locks. True: consumed.
+pub static MLD_QUERY_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 /// Querier-present timeout of RFC 3376 8.12 with the default robustness
 /// (2), query interval (125 s) and response interval (10 s).
 const IGMP_COMPAT_MS: u64 = 260_000;
@@ -54,6 +60,10 @@ impl Interface {
         self.inner.igmp_v3 = on;
         self.inner.igmp_compat = None;
     }
+
+    /// LEANDROS: does this interface speak IGMPv3 / MLDv2 through the net
+    /// server (`set_igmp_v3`)?
+    pub fn igmp_v3_enabled(&self) -> bool { self.inner.igmp_v3 }
 
     /// LEANDROS: the IGMP version in force (3, 2 or 1; 2 when the stack
     /// does not speak v3 at all).
