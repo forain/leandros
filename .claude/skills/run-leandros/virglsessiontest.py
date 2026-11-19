@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""virglsessiontest.py <audio|video|clickmove|udevhot|minimize|notifpanel|coreutils>
+"""virglsessiontest.py <audio|ffaudio|video|clickmove|udevhot|minimize|notifpanel|coreutils>
 
 Runs one of the virgl-COSMIC-session suites (or, for coreutils, the brush-guest
 coreutils suite) as a `host:` script of runtests.py; arch from LEANDROS_TEST_ARCH
@@ -53,6 +53,23 @@ if name == "audio":
         print(f"audio {arch}: tone1 holes={t1['holes_50ms']} disc={t1['discontinuities']} tone2 ratio={ratio:.3f} counts={c}")
     except (OSError, KeyError, ValueError, ZeroDivisionError) as e:
         print(f"audio {arch}: results unreadable: {e!r}")
+        ok = False
+elif name == "ffaudio":
+    # Firefox playing the 440 Hz wav through its own PipeWire stream; the QEMU wav
+    # capture (host side of the virtio-snd/HDA device) must hold >= 8 s of tone at
+    # roughly the source level, with at most a few holes.
+    env["AV_STEPS"] = "probe,ffplay,report"
+    r = run([py, f"{HERE}/audio-session-test.py"])
+    ok = r.returncode == 0
+    try:
+        res = json.load(open(f"{out}/results.json"))
+        f = (res.get("analysis") or {}).get("ffplay", {})
+        c = res.get("counts") or {}
+        ok = ok and f.get("tone_secs", 0) >= 8 and f.get("rms", 0) > 200 and f.get("holes_50ms", 99) <= 20 \
+            and not any(c.get(k) for k in ("pf", "segv", "panic", "wdog"))
+        print(f"ffaudio {arch}: ffplay={f} counts={c}")
+    except (OSError, KeyError, ValueError) as e:
+        print(f"ffaudio {arch}: results unreadable: {e!r}")
         ok = False
 elif name == "video":
     r = run([py, f"{HERE}/videotest.py", arch, f"{rid}-vid"])

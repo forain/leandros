@@ -182,6 +182,19 @@ def main():
                 time.sleep(20)
                 cs.save("sc-after")
                 res["screencast"] = sh("cat /tmp/sc.out", 20)
+        elif st == "ffplay":
+            # Firefox (cubeb-pulse -> pipewire-pulse) playing the 440 Hz wav as a
+            # media document; frames are counted on the host from the QEMU wav.
+            a = wav_size()
+            t0 = time.time()
+            sh(f"( {ENV} WAYLAND_DISPLAY=wayland-1 HOME=/tmp/ffh MOZ_ENABLE_WAYLAND=1 /bin/firefox --no-remote "
+               "file:///usr/share/sounds/leandros/tone-440-10s.wav > /tmp/ffplay.log 2>&1 & ) ; echo started", 20)
+            time.sleep(int(os.environ.get("AV_FF_SECS", "45")))
+            b = wav_size()
+            MARKS.append(("ffplay", a, b))
+            res["ffplay"] = dict(secs=round(time.time() - t0, 2), wav_bytes=b - a)
+            res["ff_status"] = sh(f"{ENV} /usr/bin/wpctl status | tail -30; tail -5 /tmp/ffplay.log", 30)
+            sh("for p in /proc/[0-9]*; do read c < $p/comm; case $c in firefox*) kill $p;; esac; done 2>/dev/null", 20)
         elif st == "console":
             res["console_ls"] = sh("ls -l /dev/pipewire", 20)
             res["console_aplay"] = sh("aplay test; echo APLAY_RC=$?", 30)
