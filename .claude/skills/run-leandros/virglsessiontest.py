@@ -64,7 +64,10 @@ elif name == "ffaudio":
     wavp = os.path.join(out, "capture.wav")
     env["LEANDROS_AUDIO_WAV"] = wavp
     env["FFSESSION_OUT"] = out
-    r = run([py, f"{HERE}/ffsession.py", arch, "ffaudio", "--url", "file:///usr/share/sounds/leandros/tone-440-10s.wav",
+    page = os.path.join(out, "ffaudio.html")
+    open(page, "w").write('<html><title>ffaudio</title><body><audio autoplay loop controls '
+                          'src="file:///usr/share/sounds/leandros/tone-440-10s.wav"></audio></body></html>')
+    r = run([py, f"{HERE}/ffsession.py", arch, "ffaudio", "--url", "file:///tmp/ffaudio.html", "--put", f"{page}:/tmp/ffaudio.html",
              "--wait", "40", "--prefs", "media.autoplay.default=0;media.autoplay.blocking_policy=0", "--post", "XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/wpctl status"])
     ok = False
     try:
