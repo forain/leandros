@@ -211,6 +211,16 @@ fn ns_mountpoint(t: &[Mnt], mut i: usize) -> Vec<u8> {
 pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     let g = NS.lock();
     let t = &g.get(&ns)?.mnts;
+    // The mount the file was opened through names it when its own mountpoint
+    // resolves to the same object: a device file bound over another keeps the
+    // source's canonical backing path (/dev/random -> /dev/urandom), which
+    // would otherwise round-trip to the first mount of that file.
+    if hint != 0 {
+        if let Some(i) = (0..t.len()).find(|&i| t[i].id == hint) {
+            let mp = ns_mountpoint(t, i);
+            if mp.len() > 1 { if let Some(x) = walk(t, &mp) { if x.backing == backing { return Some(mp); } } }
+        }
+    }
     let mut order: Vec<usize> = (0..t.len()).collect();
     order.sort_by_key(|&i| (t[i].id != hint, core::cmp::Reverse(t[i].root.len())));
     for i in order {

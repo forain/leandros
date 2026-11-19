@@ -542,6 +542,58 @@ static void hardening_suite(void) {
     waitpid(pid, &st, 0);
     report("ns_private_slave_noop", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
+    /* bwrap shape: root (no userns), new mntns, mount(NULL, "/", NULL, MS_SILENT|MS_SLAVE|MS_REC):
+     * MS_SILENT is ignored, the propagation type shows in mountinfo's optional fields. */
+    pid = fork();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        if (mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC) != 0) _exit(3);
+        int n = read_mi("/proc/self/mountinfo"); struct mi *r = find_mp(n, "/");
+        if (!r || !opt_of(r, "master:") || opt_of(r, "shared:")) _exit(4);
+        if (mount_(NULL, "/", NULL, (1UL << 15) | MS_PRIVATE_ | M_REC) != 0) _exit(5);
+        n = read_mi("/proc/self/mountinfo"); r = find_mp(n, "/");
+        if (!r || opt_of(r, "master:") || opt_of(r, "shared:")) _exit(6);
+        if (mount_(NULL, "/", NULL, MS_SHARED_ | M_REC) != 0) _exit(7);
+        n = read_mi("/proc/self/mountinfo"); r = find_mp(n, "/");
+        if (!r || !opt_of(r, "shared:")) _exit(8);
+        if (mount_(NULL, "/", NULL, (1UL << 17)) != 0) _exit(9);
+        n = read_mi("/proc/self/mountinfo"); r = find_mp(n, "/");
+        if (!r || !opt_of(r, "unbindable")) _exit(10);
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_silent_slave_mountinfo", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  ns_silent_slave rc=%d\n", WEXITSTATUS(st));
+
+    /* bwrap bind_mount() finds the mount it just made by readlinking
+     * /proc/self/fd/N of the destination; a file bound over another must be
+     * named by the destination, not the source ("Unable to find /oldroot/dev/urandom"). */
+    pid = fork();
+    if (pid == 0) {
+        if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
+        static const char *srcs[] = { "/dev/urandom", "/dev/null", "/proc/sys" };
+        static const char *dsts[] = { "/tmp/fbw_ur", "/tmp/fbw_nl", "/tmp/fbw_sys" };
+        for (int i = 0; i < 3; i++) {
+            if (i < 2) { int f = open(dsts[i], O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f); }
+            else mkdir(dsts[i], 0755);
+            if (mount_(srcs[i], dsts[i], NULL, M_BIND) != 0) _exit(10 + i);
+            int fd = open(dsts[i], O_PATH | O_CLOEXEC);
+            if (fd < 0) _exit(20 + i);
+            char l[64], b[256]; snprintf(l, sizeof l, "/proc/self/fd/%d", fd);
+            ssize_t n = readlink(l, b, sizeof b - 1);
+            if (n < 0) _exit(30 + i);
+            b[n] = 0;
+            if (strcmp(b, dsts[i]) != 0) { printf("  fdlink %s -> %s\n", dsts[i], b); _exit(40 + i); }
+            close(fd);
+        }
+        _exit(0);
+    }
+    waitpid(pid, &st, 0);
+    report("ns_bind_fd_readlink_dest", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (WIFEXITED(st)) printf("  ns_bind_fd_readlink rc=%d\n", WEXITSTATUS(st));
+    unlink("/tmp/fbw_ur"); unlink("/tmp/fbw_nl"); rmdir("/tmp/fbw_sys");
+
     /* clone(NEWNS|VM|VFORK) as Linux allows */
     static char vmstack[16384] __attribute__((aligned(16)));
     pid = (pid_t)clone(vm_child, vmstack + sizeof vmstack, CLONE_NEWNS | CLONE_VM | CLONE_VFORK | SIGCHLD, NULL);
