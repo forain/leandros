@@ -16,6 +16,8 @@ const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 
 // virtio-input device-config selects (virtio 1.1 §5.8.4).
 const VIRTIO_INPUT_CFG_EV_BITS: u8 = 0x11;
+const VIRTIO_INPUT_CFG_PROP_BITS: u8 = 0x10;
+const EV_FF: u8 = 0x15;
 const EV_KEY: u8 = 0x01;
 const EV_REL: u8 = 0x02;
 const EV_ABS: u8 = 0x03;
@@ -276,6 +278,13 @@ impl VirtioKeyboardDevice {
                 read_ev_bits(device_cfg, EV_KEY, &mut key);
             }
             crate::kenv::input::set_device_caps(EVDEV_TABLET, &rel, &key);
+            let mut props = [0u8; 4];
+            let mut ff = [0u8; 16];
+            unsafe {
+                read_prop_bits(device_cfg, &mut props);
+                read_ev_bits(device_cfg, EV_FF, &mut ff);
+            }
+            crate::kenv::input::set_device_props(EVDEV_TABLET, &props, &ff);
             crate::kenv::pci::serial_debug("[INPUT] tablet EV_REL bits=");
             crate::kenv::pci::serial_debug_hex(u32::from_le_bytes(rel));
             crate::kenv::pci::serial_debug(" BTN 0x110 byte=");
@@ -498,6 +507,16 @@ unsafe fn device_supports_ev_abs(device_cfg: *mut u8) -> bool {
 unsafe fn read_ev_bits(device_cfg: *mut u8, ev: u8, out: &mut [u8]) {
     cfg_write8(device_cfg.add(0), VIRTIO_INPUT_CFG_EV_BITS);
     cfg_write8(device_cfg.add(1), ev);
+    let size = cfg_read8(device_cfg.add(2)) as usize;
+    for i in 0..core::cmp::min(size, out.len()) {
+        out[i] = cfg_read8(device_cfg.add(8 + i));
+    }
+}
+
+/// Read the device's INPUT_PROP_* bitmap (VIRTIO_INPUT_CFG_PROP_BITS, subsel 0).
+unsafe fn read_prop_bits(device_cfg: *mut u8, out: &mut [u8]) {
+    cfg_write8(device_cfg.add(0), VIRTIO_INPUT_CFG_PROP_BITS);
+    cfg_write8(device_cfg.add(1), 0);
     let size = cfg_read8(device_cfg.add(2)) as usize;
     for i in 0..core::cmp::min(size, out.len()) {
         out[i] = cfg_read8(device_cfg.add(8 + i));

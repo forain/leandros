@@ -55,6 +55,7 @@ pub mod input {
     pub fn claim(_node: u32) -> bool { true }
     pub fn push_event(node: u32, ty: u16, code: u16, value: i32) { ::evdev_server::push_event(node, ty, code, value) }
     pub fn set_device_caps(node: u32, rel: &[u8], key: &[u8]) { ::evdev_server::set_device_caps(node, rel, key) }
+    pub fn set_device_props(node: u32, props: &[u8], ff: &[u8]) { ::evdev_server::set_device_props(node, props, ff) }
     pub fn register_stats_hook(f: fn(&mut dyn core::fmt::Write)) { ::tty_server::vt::register_stats_hook(f) }
     pub fn vt_handoff_stats() -> (u64, u64) { crate::drm_device_interface::vt_handoff_stats() }
 }

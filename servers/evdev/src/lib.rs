@@ -1189,6 +1189,48 @@ pub fn set_device_caps(dev_id: u32, rel_bits: &[u8], key_bits: &[u8]) {
     DEV_BTN_BITS[dev].store(btn, Relaxed);
 }
 
+static DEV_PROP_BITS: [core::sync::atomic::AtomicU32; MAX_DEVICES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_DEVICES];
+/// EV_FF bitmap, 128 codes (FF_RUMBLE is 0x50) as four little-endian words.
+static DEV_FF_BITS: [[core::sync::atomic::AtomicU32; 4]; MAX_DEVICES] =
+    [const { [const { core::sync::atomic::AtomicU32::new(0) }; 4] }; MAX_DEVICES];
+
+/// Driver hook: the device's own INPUT_PROP_* bitmap (first 32 props) and
+/// EV_FF bitmap (what the hardware reports; Linux bitmap layout), so
+/// EVIOCGPROP, EVIOCGBIT(EV_FF) and sysfs `properties`/`capabilities/ff`
+/// reflect the real driver.
+pub fn set_device_props(dev_id: u32, props: &[u8], ff: &[u8]) {
+    let dev = dev_id as usize;
+    if dev >= MAX_DEVICES { return; }
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut p = 0u32;
+    for (i, b) in props.iter().take(4).enumerate() { p |= (*b as u32) << (8 * i); }
+    DEV_PROP_BITS[dev].store(p, Relaxed);
+    for w in 0..4 {
+        let mut v = 0u32;
+        for i in 0..4 { v |= (ff.get(w * 4 + i).copied().unwrap_or(0) as u32) << (8 * i); }
+        DEV_FF_BITS[dev][w].store(v, Relaxed);
+    }
+}
+
+/// EVIOCGPROP bitmap of node `dev_id` (the one source for the ioctl and sysfs).
+fn prop_bits(dev_id: usize) -> [u8; 8] {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut buf = [0u8; 8];
+    if dev_id >= MAX_DEVICES { return buf; }
+    let mut p = 0u32;
+    if dev_id >= FIXED_DEVICES && dev_kind(dev_id) == DEVKIND_TOUCHPAD {
+        p = (1 << 0) | (1 << 2); // INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD
+    } else if dev_id >= FIXED_DEVICES && uinput::is_kind(dev_kind(dev_id)) {
+        p = uinput::props(dev_id);
+    } else if dev_id == DEV_TABLET {
+        p = 1 << 0; // INPUT_PROP_POINTER: libinput must see a pointer, not a touchscreen
+    }
+    p |= DEV_PROP_BITS[dev_id].load(Relaxed);
+    buf[..4].copy_from_slice(&p.to_le_bytes());
+    buf
+}
+
 /// Driver hook for a second source on the same node (a USB mouse feeding the
 /// pointer node next to, or instead of, virtio-tablet): OR its wheel axes
 /// (`REL_*` bit mask) and its `BTN_LEFT..BTN_TASK` byte into what is
@@ -1253,6 +1295,12 @@ pub const EV_BITS_MAX: usize = 96;
 /// The capability bitmask for event type `ev` of `dev_id`, written into `buf`
 /// (zeroed by the caller). Shared by EVIOCGBIT and the synthesized sysfs
 /// `capabilities/*` files so the two cannot disagree.
+fn ff_fill(dev_id: usize, buf: &mut [u8]) {
+    for (i, b) in buf.iter_mut().take(16).enumerate() {
+        *b = (DEV_FF_BITS[dev_id][i / 4].load(core::sync::atomic::Ordering::Relaxed) >> (8 * (i % 4))) as u8;
+    }
+}
+
 fn ev_bits(dev_id: usize, ev: usize, buf: &mut [u8]) {
     let n = buf.len();
     if dev_id >= FIXED_DEVICES {
@@ -1264,6 +1312,7 @@ fn ev_bits(dev_id: usize, ev: usize, buf: &mut [u8]) {
             return;
         }
         let mut set = |bit: usize| if bit / 8 < n { buf[bit / 8] |= 1 << (bit % 8); };
+        if ev == 0x15 { ff_fill(dev_id, buf); return; }
         match (kind, ev) {
             (DEVKIND_SWITCH, 0) => { set(0); set(1); set(5); }
             (DEVKIND_SWITCH, 1) => { for k in [116usize, 142, 224, 225] { set(k); } }
@@ -1286,6 +1335,7 @@ fn ev_bits(dev_id: usize, ev: usize, buf: &mut [u8]) {
         }
         return;
     }
+    if ev == 0x15 { ff_fill(dev_id, buf); return; }
     match ev {
         0 => { // supported event types
             if n >= 1 {
@@ -1611,24 +1661,9 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                           // and delivers BTN_LEFT as a pointer button — required for
                           // click-to-focus (a compositor sets keyboard focus on a
                           // pointer button press). Keyboard advertises no props.
-                    if dev_id >= FIXED_DEVICES && dev_kind(dev_id) == DEVKIND_TOUCHPAD {
-                        let mut buf = [0u8; 8];
-                        buf[0] = (1 << 0) | (1 << 2); // INPUT_PROP_POINTER | INPUT_PROP_BUTTONPAD
-                        let n = core::cmp::min(size, buf.len());
-                        copy_out(pid, arg_ptr, &buf[..n])
-                    } else if dev_id >= FIXED_DEVICES && uinput::is_kind(dev_kind(dev_id)) {
-                        let mut buf = [0u8; 8];
-                        buf[..4].copy_from_slice(&uinput::props(dev_id).to_le_bytes());
-                        let n = core::cmp::min(size, buf.len());
-                        copy_out(pid, arg_ptr, &buf[..n])
-                    } else if dev_id == DEV_TABLET {
-                        let mut buf = [0u8; 8];
-                        buf[0] = 1 << 0; // bit 0 = INPUT_PROP_POINTER
-                        let n = core::cmp::min(size, buf.len());
-                        copy_out(pid, arg_ptr, &buf[..n])
-                    } else {
-                        zero_out(pid, arg_ptr, size)
-                    }
+                    let buf = prop_bits(dev_id);
+                    let n = core::cmp::min(size, buf.len());
+                    copy_out(pid, arg_ptr, &buf[..n])
                 }
                 0x0a => { // EVIOCGMTSLOTS(len)
                     if dev_id < FIXED_DEVICES || !is_touchpad_kind(dev_kind(dev_id)) { return err_reply(-25); }
@@ -2341,8 +2376,15 @@ fn sysfs_bits(n: usize, ev: usize, out: &mut [u8]) {
     ev_bits(n, ev, &mut out[..l]);
 }
 
+fn sysfs_props(n: usize, out: &mut [u8]) {
+    if n >= MAX_DEVICES { return; }
+    let b = prop_bits(n);
+    let l = out.len().min(b.len());
+    out[..l].copy_from_slice(&b[..l]);
+}
+
 static SYSINPUT_OPS: vfs_server::sysinput::Ops =
-    vfs_server::sysinput::Ops { info: sysfs_info, bits: sysfs_bits };
+    vfs_server::sysinput::Ops { info: sysfs_info, bits: sysfs_bits, props: sysfs_props };
 
 // ── /dev/input/hotplug: uevent-like add/remove stream ─────────────────────────
 //

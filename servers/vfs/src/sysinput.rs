@@ -57,6 +57,8 @@ pub struct Ops {
     pub info: fn(n: usize) -> Option<Info>,
     /// Capability bitmap for event type `ev` (what EVIOCGBIT answers), into zeroed `out`.
     pub bits: fn(n: usize, ev: usize, out: &mut [u8]),
+    /// INPUT_PROP_* bitmap (what EVIOCGPROP answers), into zeroed `out`.
+    pub props: fn(n: usize, out: &mut [u8]),
 }
 
 static OPS: AtomicUsize = AtomicUsize::new(0);
@@ -145,7 +147,7 @@ enum Node {
 }
 
 const EV_FILES: [&str; 2] = ["dev", "uevent"];
-const DEV_FILES: [&str; 3] = ["name", "phys", "uniq"];
+const DEV_FILES: [&str; 4] = ["name", "phys", "uniq", "properties"];
 const DEV_UEVENT: &str = "uevent";
 const CAPS: [(&str, usize); 9] = [("ev", 0), ("key", 1), ("rel", 2), ("abs", 3), ("msc", 4),
                                   ("led", 0x11), ("sw", 5), ("ff", 0x15), ("snd", 0x12)];
@@ -291,6 +293,13 @@ pub fn attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
             let _ = write!(w, "PRODUCT={:x}/{:x}/{:x}/{:x}\nNAME=\"", i.ids[0], i.ids[1], i.ids[2], i.ids[3]);
             for &c in &i.name[..i.name_len] { let _ = w.write_char(c as char); }
             let _ = w.write_str("\"\n");
+        }
+        Node::DevFile(n, "properties") => {
+            (o.info)(n)?;
+            let mut bits = [0u8; 8];
+            (o.props)(n, &mut bits);
+            put_bitmap(&mut w, &bits);
+            let _ = w.write_str("\n");
         }
         Node::DevFile(n, _) => { (o.info)(n)?; let _ = w.write_str("\n"); }
         Node::IdFile(n, f) => {

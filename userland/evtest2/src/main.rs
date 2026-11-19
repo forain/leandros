@@ -534,6 +534,39 @@ unsafe fn arg_bytes<'a>(argc: isize, argv: *mut *mut u8, i: isize) -> &'a [u8] {
     } else { b"" }
 }
 
+/// Linux sysfs bitmap format: 64-bit words, highest first, leading zeros trimmed.
+fn put_words(o: &mut Out, bits: &[u8]) {
+    let w = |i: usize| -> u64 { let mut b = [0u8; 8]; b.copy_from_slice(&bits[i * 8..i * 8 + 8]); u64::from_le_bytes(b) };
+    let nw = bits.len() / 8;
+    match (0..nw).rev().find(|&i| w(i) != 0) {
+        None => o.s(b"0"),
+        Some(t) => for i in (0..=t).rev() {
+            if i != t { o.s(b" "); for sh in (0..16).rev() { o.s(&[b"0123456789abcdef"[((w(i) >> (4 * sh)) & 15) as usize]]); } }
+            else { o.hex(w(i)); }
+        },
+    }
+}
+
+/// `evtest2 sysprop <node>`: prints `PROPS <hex words>` from EVIOCGPROP and
+/// `FF <hex words>` from EVIOCGBIT(EV_FF), in sysfs format, for comparison
+/// with /sys/class/input/eventN/device/{properties,capabilities/ff}.
+unsafe fn sysprop_main(argc: isize, argv: *mut *mut u8) -> i32 {
+    let node = arg_bytes(argc, argv, 2);
+    with_path(node, |path| {
+        let fd = open(path, O_RDONLY | O_NONBLOCK);
+        if fd < 0 { return 1; }
+        let mut props = [0u8; 8];
+        let mut ff = [0u8; 16];
+        if ioctl(fd, EVIOCGPROP_8, props.as_mut_ptr()) < 0 { return 2; }
+        if ioctl(fd, 0x80104535 as c_ulong, ff.as_mut_ptr()) < 0 { return 3; }
+        let mut o = Out::new();
+        o.s(b"PROPS "); put_words(&mut o, &props); o.flush();
+        o.s(b"FF "); put_words(&mut o, &ff); o.flush();
+        close(fd);
+        0
+    })
+}
+
 unsafe fn with_path(p: &[u8], f: impl FnOnce(*const u8) -> i32) -> i32 {
     let mut buf = [0u8; 128];
     let n = if p.len() < 127 { p.len() } else { 127 };
@@ -667,6 +700,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
             b"info" => return info_main(argc, argv),
             b"gone" => return gone_main(argc, argv),
             b"cap" => return cap_main(argc, argv),
+            b"sysprop" => return sysprop_main(argc, argv),
             b"serial" => {
                 let ms = parse_u64(arg_bytes(argc, argv, 2)).unwrap_or(8000) as c_int;
                 // `on`: opt in for the run (SERIALKBD_IOCTL on the hotplug node).

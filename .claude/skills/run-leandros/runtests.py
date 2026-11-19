@@ -142,6 +142,9 @@ SYSFS_CHECK = (
     "t input_caps 'test -s /sys/class/input/event0/device/capabilities/ev && test -s /sys/class/input/event1/device/capabilities/abs'; "
     "t input_dev_char 'test -d /sys/dev/char/13:65/device/id && grep -q 13:65 /sys/class/input/event1/dev'; "
     "t input_caps_eviocgbit 'grep -qx 3 /sys/class/input/event1/device/capabilities/abs && grep -q 0627 /sys/class/input/event1/device/id/vendor'; "
+    "t input_props_ff_match 'n=0; for d in /dev/input/event*; do e=${d##*/}; x=$(/bin/evtest2 sysprop $d) || return 1; "
+    "p=$(cat /sys/class/input/$e/device/properties); f=$(cat /sys/class/input/$e/device/capabilities/ff); "
+    "[ \"$x\" = \"$(printf \"PROPS %s\\nFF %s\" \"$p\" \"$f\")\" ] || return 1; n=$((n+1)); done; [ $n -ge 2 ]'; "
     "test $__f = 0"
 )
 
