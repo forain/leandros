@@ -8912,7 +8912,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
                                      b"/proc/vtstat", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold"];
 /// The regular files `handle_open` generates through `gen_proc_system` (and
 /// the `/proc/sys/fs` ones), none of which is a RAMFS entry: stat must answer
 /// for them or they cannot be a bind-mount target.
@@ -9907,6 +9907,22 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             match gen_thermal() {
                 Some(v) => v,
                 None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/drm/fence_stats" {
+            extern "C" { fn kernel_drm_fence_stats(buf: *mut u8, cap: usize) -> usize; }
+            let mut g = alloc::vec![0u8; 2048];
+            let n = unsafe { kernel_drm_fence_stats(g.as_mut_ptr(), g.len()) };
+            match proc_snapshot(b"/tmp/.drm_fence_stats", &g[..n], false) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
+        } else if lookup_path == b"/proc/drm/fence_hold" {
+            // Test knob: root only (CAP_SYS_ADMIN in the initial userns).
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_proc_drm_hold(write) {
+                Some(v) => v,
+                None    => return err_reply(-23),
             }
         } else if let Some(c) = nslimit_sysctl(lookup_path) {
             // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
@@ -10916,6 +10932,23 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 for &d in s { v = v.saturating_mul(10).saturating_add((d - b'0') as u32); }
                 let r = sched::ns::limit_set(c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
+            }
+            let drm_hold = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_DRMH_W
+            };
+            if drm_hold {
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                if s != b"0" && s != b"1" { return err_reply(-22); }
+                extern "C" { fn kernel_drm_fence_hold_set(on: u32); }
+                unsafe { kernel_drm_fence_hold_set((s == b"1") as u32) };
+                return val_reply(count as u64);
             }
             let inot_k = {
                 let tmp = TMP_FILES.lock();
@@ -13429,6 +13462,26 @@ fn gen_proc_nslimit(c: usize, write: bool) -> Option<VnodeKind> {
     tmp.claim(idx, b"", true);
     tmp.set_path(idx, &fake[..n]);
     if !tmp_fill_kernel(&mut tmp, idx, &data[..l]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
+const PROC_DRMH_W: &[u8] = b"/tmp/.proc_drmhold";
+
+/// `/proc/drm/fence_hold`: "1\n" while the fence-retirement hold is active.
+/// A write of 0 or 1 routes through `handle_write` (test knob, root only).
+fn gen_proc_drm_hold(write: bool) -> Option<VnodeKind> {
+    extern "C" { fn kernel_drm_fence_hold_get() -> u32; }
+    let data: &[u8] = if unsafe { kernel_drm_fence_hold_get() } != 0 { b"1\n" } else { b"0\n" };
+    if !write {
+        let mut buf = [0u8; TMP_BUF_SIZE];
+        buf[..data.len()].copy_from_slice(data);
+        return gen_proc_system_file(&buf, data.len());
+    }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_DRMH_W);
+    if !tmp_fill_kernel(&mut tmp, idx, data) { tmp.release(idx); return None; }
     Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
