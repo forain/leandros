@@ -31,7 +31,41 @@ impl core::fmt::Display for MulticastError {
 #[cfg(feature = "std")]
 impl std::error::Error for MulticastError {}
 
+/// LEANDROS: the net server's IGMPv3 query handler (0 = none):
+/// `fn(dst: [u8; 4], igmp: &[u8]) -> bool`, called under the stack lock, so
+/// it may only take leaf locks.
+pub static IGMP_QUERY_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Querier-present timeout of RFC 3376 8.12 with the default robustness
+/// (2), query interval (125 s) and response interval (10 s).
+const IGMP_COMPAT_MS: u64 = 260_000;
+
+impl InterfaceInner {
+    /// LEANDROS: does this interface speak IGMPv3 right now (no older
+    /// querier heard)?
+    pub(crate) fn igmp_v3_active(&self) -> bool {
+        self.igmp_v3 && self.igmp_compat.map_or(true, |(_, until)| self.now >= until)
+    }
+}
+
 impl Interface {
+    /// LEANDROS: speak IGMPv3 through the net server's hook (default off).
+    pub fn set_igmp_v3(&mut self, on: bool) {
+        self.inner.igmp_v3 = on;
+        self.inner.igmp_compat = None;
+    }
+
+    /// LEANDROS: the IGMP version in force (3, 2 or 1; 2 when the stack
+    /// does not speak v3 at all).
+    pub fn igmp_version(&mut self, now: Instant) -> u8 {
+        self.inner.now = now;
+        if !self.inner.igmp_v3 { return 2; }
+        match self.inner.igmp_compat {
+            Some((v, until)) if now < until => if v == IgmpVersion::Version1 { 1 } else { 2 },
+            _ => 3,
+        }
+    }
+
     /// Add an address to a list of subscribed multicast IP addresses.
     ///
     /// Returns `Ok(announce_sent)` if the address was added successfully, where `announce_sent`
@@ -56,6 +90,8 @@ impl Interface {
                     .map_err(|_| MulticastError::GroupTableFull)?
                     .is_some();
                 if is_not_new {
+                    Ok(false)
+                } else if self.inner.igmp_v3_active() {
                     Ok(false)
                 } else if let Some(pkt) = self.inner.igmp_report_packet(IgmpVersion::Version2, addr)
                 {
@@ -107,6 +143,8 @@ impl Interface {
             IpAddress::Ipv4(addr) => {
                 let was_not_present = self.inner.ipv4_multicast_groups.remove(&addr).is_none();
                 if was_not_present {
+                    Ok(false)
+                } else if self.inner.igmp_v3_active() {
                     Ok(false)
                 } else if let Some(pkt) = self.inner.igmp_leave_packet(addr) {
                     // Send group leave packet
@@ -231,6 +269,16 @@ impl InterfaceInner {
         ipv4_repr: Ipv4Repr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
+        // LEANDROS: an IGMPv3 query (12 bytes or more) is the net server's.
+        if self.igmp_v3_active() && ip_payload.len() >= 12 && ip_payload[0] == 0x11 {
+            let h = IGMP_QUERY_HOOK.load(core::sync::atomic::Ordering::Relaxed);
+            if h != 0 {
+                // SAFETY: only ever stored from a `fn([u8; 4], &[u8]) -> bool`.
+                #[allow(unsafe_code)]
+                let f: fn([u8; 4], &[u8]) -> bool = unsafe { core::mem::transmute(h) };
+                if f(ipv4_repr.dst_addr.0, ip_payload) { return None; }
+            }
+        }
         let igmp_packet = check!(IgmpPacket::new_checked(ip_payload));
         let igmp_repr = check!(IgmpRepr::parse(&igmp_packet));
 
@@ -241,6 +289,16 @@ impl InterfaceInner {
                 version,
                 max_resp_time,
             } => {
+                if self.igmp_v3 {
+                    // An older querier: report its way until it is silent
+                    // for the querier-present timeout (RFC 3376 8.12).
+                    let until = self.now + Duration::from_millis(IGMP_COMPAT_MS);
+                    let v = match self.igmp_compat {
+                        Some((IgmpVersion::Version1, u)) if self.now < u => IgmpVersion::Version1,
+                        _ => version,
+                    };
+                    self.igmp_compat = Some((v, until));
+                }
                 // General query
                 if group_addr.is_unspecified()
                     && ipv4_repr.dst_addr == Ipv4Address::MULTICAST_ALL_SYSTEMS
