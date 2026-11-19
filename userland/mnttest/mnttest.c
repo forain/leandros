@@ -2539,6 +2539,78 @@ static int mns_nosuid_bind(int m) {
     if (r != 44) { printf("  sibling lost suid r=%d\n", r); return 13; }
     return 0;
 }
+/* ── lane flatrun3: generated /etc files, mount-root create ops ───────── */
+static int synth_readlink(int m) {
+    (void)m;
+    char b[64]; struct stat st;
+    const char *p[] = { "/etc/resolv.conf", "/etc/mtab" };
+    for (int i = 0; i < 2; i++) {
+        errno = 0;
+        if (readlink(p[i], b, sizeof b) != -1 || errno != EINVAL) { printf("  readlink %s errno=%d\n", p[i], errno); return 1 + i; }
+        if (lstat(p[i], &st) != 0 || !S_ISREG(st.st_mode)) { printf("  lstat %s errno=%d\n", p[i], errno); return 3 + i; }
+    }
+    char rb[4096];
+    if (!realpath("/etc/resolv.conf", rb)) { printf("  realpath errno=%d\n", errno); return 5; }
+    return strcmp(rb, "/etc/resolv.conf") ? 6 : 0;
+}
+static int synth_read_ok(const char *p) {
+    char b[64] = {0};
+    int fd = open(p, O_RDONLY);
+    if (fd < 0) { printf("  open %s errno=%d\n", p, errno); return 0; }
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd);
+    if (n < 0) { printf("  read errno=%d\n", errno); return 0; }
+    return n == 0 || !strncmp(b, "nameserver", 10) || b[0] == '#';
+}
+static int synth_bind(int m) {
+    if (unshare(CLONE_NEWNS) != 0) return 1;
+    mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
+    mkdir("/tmp/fr3", 0755);
+    if (mountd_("tmpfs", "/tmp/fr3", "tmpfs", 6, "mode=0755") != 0) return 2;
+    mkdir("/tmp/fr3/oldroot", 0755);
+    int fd = open("/tmp/fr3/rc", O_WRONLY | O_CREAT, 0644); if (fd < 0) return 3; close(fd);
+    if (m == 0) {
+        if (mount_("/etc/resolv.conf", "/tmp/fr3/rc", NULL, M_BIND) != 0) { printf("  bind errno=%d\n", errno); return 4; }
+        return synth_read_ok("/tmp/fr3/rc") ? 0 : 5;
+    }
+    if (mount_("/tmp/fr3", "/tmp/fr3", NULL, M_BIND | M_REC) != 0) return 6;
+    if (chdir("/tmp/fr3") != 0) return 7;
+    if (syscall(SYS_pivot_root, "/tmp/fr3", "/tmp/fr3/oldroot") != 0) return 8;
+    if (chdir("/") != 0) return 9;
+    char rb[4096];
+    if (!realpath("/oldroot/etc/resolv.conf", rb)) { printf("  realpath errno=%d\n", errno); return 10; }
+    if (mount_("/oldroot/etc/resolv.conf", "/rc", NULL, M_BIND) != 0) { printf("  bind errno=%d\n", errno); return 11; }
+    return synth_read_ok("/rc") ? 0 : 12;
+}
+static int is_mountpoint(const char *p) {
+    struct stat a, b;
+    return stat(p, &a) == 0 && stat("/", &b) == 0 && a.st_dev != b.st_dev;
+}
+static int mrmk_check(void) {
+    errno = 0;
+    if (mkdir("/home", 0755) != -1 || errno != EEXIST) { printf("  mkdir /home errno=%d\n", errno); return 1; }
+    struct stat st;
+    if (stat("/home/leandro", &st) == 0 && S_ISDIR(st.st_mode)) {
+        errno = 0;
+        if (mkdir("/home/leandro", 0755) != -1 || errno != EEXIST) { printf("  mkdir /home/leandro errno=%d\n", errno); return 2; }
+    }
+    return 0;
+}
+static int mrmk(int m) {
+    if (!is_mountpoint("/home")) { printf("  SKIP /home not a mount point\n"); return 0; }
+    if (m == 0) return mrmk_check();
+    if (setgroups(0, NULL) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 90;
+    if (m == 1) return mrmk_check();
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return 91;
+    wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+    return mrmk_check();
+}
+static void flatrun3_suite(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    report("synth_resolv_readlink_einval", nn_in_child(synth_readlink, 0));
+    report("synth_resolv_bind_in_mntns", nn_in_child(synth_bind, 0) && nn_in_child(synth_bind, 1));
+    report("mountroot_mkdir_eexist", nn_in_child(mrmk, 0) && nn_in_child(mrmk, 1) && nn_in_child(mrmk, 2));
+}
+
 static void mro_suite(void) {
     report("mntnosuid_bind_ignores_setuid", nn_in_child(mns_nosuid_bind, 0));
     report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
@@ -2547,6 +2619,7 @@ static void mro_suite(void) {
     report("mntro_fd_attr_erofs", nn_in_child(mro_fd_attr, 0));
     report("mntro_noexec_eacces", nn_in_child(mro_noexec, 0));
     report("mntro_nodev_eacces", nn_in_child(mro_nodev, 0));
+    flatrun3_suite();
 }
 
 /* ── lane shmbind: crun's dev/shm bind and bind-remount flags ─────────── */

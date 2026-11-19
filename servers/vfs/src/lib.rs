@@ -5753,9 +5753,13 @@ static OLD_ROOT_PREFIX: Mutex<Option<&'static str>> = Mutex::new(None);
 /// listing — what the disk holds, nor stop an administrator editing it. Two
 /// names stay synthesized: /etc/mtab (the live mount table) and
 /// /etc/resolv.conf (the DHCP lease's servers).
+/// The two generated /etc files that live in RAMFS, never on the on-disk /etc.
+fn etc_synth(path: &[u8]) -> bool {
+    path == b"/etc/mtab" || path == b"/etc/resolv.conf"
+}
 fn etc_on_disk(path: &[u8]) -> bool {
     (path == b"/etc" || path.starts_with(b"/etc/"))
-        && path != b"/etc/mtab" && path != b"/etc/resolv.conf"
+        && !etc_synth(path)
         && find_mount_port(path).is_some()
 }
 
@@ -15575,6 +15579,8 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
     // readlink()s every component and aborts on anything but EINVAL, so
     // bwrap's realpath("/oldroot/proc/self/fd/N") died on /oldroot/proc/<pid>.
     if let Some(Some(_)) = proc_stat_kind(raw) { return err_reply(-22); }
+    // Generated /etc files are regular files, not links (the F2FS root would say ENOENT).
+    if etc_synth(raw) { return err_reply(-22); }
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_READLINK;
@@ -16951,7 +16957,7 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
         return statfs_reply();
     }
     if !is_tmp_path(path)
-        && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
+        && (etc_synth(path) || path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
         return statfs_reply();
     }
