@@ -652,8 +652,8 @@ static void hardening_suite(void) {
     if (pid == 0) {
         /* pv=3: bwrap 0.12 fd targets (new pid ns, like pv=1). pv=2: the real bwrap shape -- an ordinary uid with supplementary groups, and the
          * maps written by the PARENT for the already-unshared child. */
-        unsigned uu = pv == 2 ? 1000 : 65534;
-        if (pv == 2) { gid_t g[2] = { 10, 29 }; if (setgroups(2, g)) _exit(98); }
+        unsigned uu = pv >= 2 ? 1000 : 65534;
+        if (pv >= 2) { gid_t g[2] = { 10, 29 }; if (setgroups(2, g)) _exit(98); }
         if (setgid(uu) || setuid(uu)) _exit(99);
         char mvu[32]; snprintf(mvu, sizeof mvu, "%u %u 1", uu, uu);
         if (pv == 2) {
@@ -694,6 +694,8 @@ static void hardening_suite(void) {
         mkdir("/tmp/fbw3", 0755);
         if (mountd_("tmpfs", "/tmp/fbw3", "tmpfs", 6, "mode=0755") != 0) { printf("  tmpfs errno=%d\n", errno); _exit(3); }
         mkdir("/tmp/fbw3/newroot", 0755); mkdir("/tmp/fbw3/oldroot", 0755);
+        /* bwrap: the new root dir is first bound onto itself (--ro-bind / / then overmounts that bind). */
+        if (pv == 3 && mount_("/tmp/fbw3/newroot", "/tmp/fbw3/newroot", NULL, M_BIND | M_REC | (1UL << 15)) != 0) { printf("  newroot self-bind errno=%d\n", errno); _exit(89); }
         if (chdir("/tmp/fbw3") != 0) _exit(4);
         if (syscall(SYS_pivot_root, "/tmp/fbw3", "/tmp/fbw3/oldroot") != 0) _exit(5);
         if (chdir("/") != 0) _exit(6);
@@ -785,6 +787,48 @@ static void hardening_suite(void) {
               if (!sys) _exit(118);
               if (!procnew) { printf("  no proc mountinfo line at /newroot/proc\n"); _exit(119); }
               if (procold > 1) { printf("  %d proc mounts at /oldroot/proc\n", procold); _exit(120); } }
+            /* The reverse: a descriptor opened through the OLD twin (/oldroot/X, the older mount of
+             * the same backing X) must be mounted onto by that twin, not by the newest mount that
+             * round-trips to the same backing path (/newroot/X). X is a mount that nothing was
+             * mounted over yet in the new tree (so both twins still name the same object). */
+            { char xn[64] = "", op[96], np[96];
+              int ml = slurp("/oldroot/proc/self/mountinfo", mib, sizeof mib - 1);
+              if (ml <= 0) _exit(132);
+              mib[ml] = 0;
+              for (char *ln = mib; ln && *ln && !xn[0]; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+                  char *q = ln; int f = 0;
+                  while (*q && *q != '\n' && f < 4) { if (*q == ' ') f++; q++; }
+                  if (f != 4 || strncmp(q, "/oldroot/", 9) != 0) continue;
+                  char *x = q + 9; size_t k = 0;
+                  while (x[k] && x[k] != ' ' && x[k] != '\n' && x[k] != '/' && k < sizeof xn - 1) { xn[k] = x[k]; k++; }
+                  if (x[k] != ' ' || k == 0 || !strcmp(xn, "dev") || !strcmp(xn, "proc")) { xn[0] = 0; continue; }
+                  xn[k] = 0;
+              }
+              if (!xn[0]) { printf("  no spare /oldroot/<x> mount\n"); _exit(134); }
+              snprintf(op, sizeof op, "/oldroot/%s", xn); snprintf(np, sizeof np, "/newroot/%s", xn);
+              int cnt0[2] = { 0, 0 }, cnt1[2] = { 0, 0 };
+              for (int ph = 0; ph < 2; ph++) {
+                  if (ph == 1) {
+                      fd = open(op, O_PATH | O_CLOEXEC);
+                      if (fd < 0) _exit(130);
+                      snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+                      if (mountd_("tmpfs", fp, "tmpfs", 6, "mode=0755") != 0) { printf("  fd tmpfs on old twin %s errno=%d\n", op, errno); _exit(131); }
+                      close(fd);
+                      ml = slurp("/oldroot/proc/self/mountinfo", mib, sizeof mib - 1);
+                      if (ml <= 0) _exit(135);
+                      mib[ml] = 0;
+                  }
+                  int *c = ph ? cnt1 : cnt0;
+                  char pat_o[110], pat_n[110]; snprintf(pat_o, sizeof pat_o, " %s ", op); snprintf(pat_n, sizeof pat_n, " %s ", np);
+                  for (char *ln = mib; ln && *ln; ln = strchr(ln, '\n') ? strchr(ln, '\n') + 1 : NULL) {
+                      char *e = strchr(ln, '\n'); size_t m = e ? (size_t)(e - ln) : strlen(ln);
+                      char tmp[512]; if (m >= sizeof tmp) m = sizeof tmp - 1;
+                      memcpy(tmp, ln, m); tmp[m] = 0;
+                      if (strstr(tmp, pat_o)) c[0]++;
+                      if (strstr(tmp, pat_n)) c[1]++;
+                  }
+              }
+              if (cnt1[0] != cnt0[0] + 1 || cnt1[1] != cnt0[1]) { printf("  tmpfs via %s fd: old %d->%d new %d->%d (want old+1, new same)\n", op, cnt0[0], cnt1[0], cnt0[1], cnt1[1]); _exit(133); } }
             _exit(0);
         }
         if (mountd_("tmpfs", "/newroot/dev", "tmpfs", 6, "mode=0755") != 0) _exit(7);
