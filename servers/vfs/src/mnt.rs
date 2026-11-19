@@ -241,6 +241,26 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Like [`reverse`] but considers only the mount `hint` (the mount an open
+/// descriptor was opened through). A backing path visible under several mounts
+/// (bwrap's /newroot and /oldroot are the same tree) is named by that one.
+/// An object covered by a later mount on it keeps its mountpoint name.
+pub fn reverse_via(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let i = (0..t.len()).find(|&i| t[i].id == hint)?;
+    let m = &t[i];
+    if !under(backing, &m.root) { return None; }
+    let mp = ns_mountpoint(t, i);
+    let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+    let cand = join(&mp, rest);
+    let x = walk(t, &cand)?;
+    if x.backing == backing || (x.mnt_id == hint && same_dev_name(&x.backing, backing)) || (x.ns_prefix_len == cand.len() && cand.len() > 1) {
+        return Some(cand);
+    }
+    None
+}
+
 /// Like [`reverse`] for a descriptor whose mount is unknown: among the mounts
 /// whose path round-trips, the newest wins (a container's rootfs mounts are
 /// newer than the copies of the host's, which cover the same backing paths).

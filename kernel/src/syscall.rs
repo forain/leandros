@@ -9659,7 +9659,15 @@ fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
     // anywhere in it names the mount point /sys/fs/cgroup.
     if vfs::cgroupfs::is_path(&host) { host.truncate(vfs::cgroupfs::ROOT.len()); }
     let mns = sched::current_mntns();
-    let ns = if mns != 0 { vfs::mnt::reverse_newest(mns, &host) } else { Some(host) };
+    // The mount the descriptor was opened through names it (bwrap 0.12 mounts
+    // onto O_PATH fds of /newroot/<x>, whose backing is also visible under /oldroot).
+    let via = if mns != 0 {
+        match vfs::fd_mnt(current_pid(), fd) {
+            Some((n, m)) if n as sched::ns::NsId == mns && m != 0 => vfs::mnt::reverse_via(mns, &host, m),
+            _ => None,
+        }
+    } else { None };
+    let ns = if mns != 0 { via.or_else(|| vfs::mnt::reverse_newest(mns, &host)) } else { Some(host) };
     match ns {
         Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
         _ => Err(-22),
