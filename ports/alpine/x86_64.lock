@@ -9,6 +9,7 @@ pkg at-spi2-core 2.60.5-r0 main Q1J7di2EoKFuQu5fLEUvDDTw21hR8= c9989ba9b2ff44f87
 pkg at-spi2-core-libs 2.60.5-r0 main Q1gMhUKYmeJ7LyeX0UuK/g+oGUyy0= bcd4846311c8b19ad7e08ffc3cf726ddbe3d36bbc524386bda64758f5c5981a6 -
 pkg avahi-libs 0.9_rc4-r0 main Q1MxdZZH9w8iSaM9INDfEBnaDtjn8= 380d59c58cfce9cb5cf342cf73947749ca77a880f729970e2f508aaa6fc2f713 -
 pkg brotli-libs 1.2.1-r0 main Q19ILQ4/bsNv1JEDWEcsa0i+Y4hYQ= 62a7e37e43bbfc1f8525a00ad2125fd5897135dc93b849733884cb78ffd8e26c -
+pkg bubblewrap 0.12.0-r0 main Q1FMzri/p0D+kt6pUekO1LBSFqrvw= 7755592c3f7c6de79a5c3c13554ada6302dbd98e520fe6dd8064f87ba77092e5 -
 pkg busybox-static 1.37.0-r31 main Q1rG2Ti02YkmD/IpILCMmN4jW0ftI= b0d6cfc585d7fdd12df359cc5d38d5e45894e9e9e78c4059eb41577d022ec734 -
 pkg c-ares 1.34.9-r0 main Q17RXrqEwqOyT57+GUGh3XDItYJdI= 3539a3e11c1ef1516117d8179a546ac882086e94e0d78ad51d687b3fa2b3b5f2 -
 pkg ca-certificates-bundle 20261020-r0 main Q1fG5jX4aq+0bLOwFdhQWzpfYRVr0= bb008f6d214b6af7576324659856fb63dc8dcb4373f8345ff706388696f1254d -
@@ -17,7 +18,7 @@ pkg cairo-gobject 1.18.4-r1 main Q14cxB+Zzh6FTaYfIEEdZqUvMtHkI= ec302c75a24edaa4
 pkg catatonit 0.2.1-r0 community Q1cyrRUvE/JMv6gl85rWibeZELpAA= a41ffdd275a3f0e01f6271797e096346aa15e8d8b3bec079b30da150101ddb75 -
 pkg conmon 2.2.1-r0 community Q1X7QDFE8DVDswSkBc+BNZq+sgwzs= bb10a69ae1bf93a53d4ff8aa3713715d2a52c759d0947dfbad2b0440bf83c684 -
 pkg containers-common 0.64.2-r0 community Q1tu4MXY9dfoRPOURwB2Iiul9cSVg= b8b2ce6e9492c381413b5d01d7402a609253f8f8ea4a6523770dc81958ffe508 -
-pkg crun 1.30.1-r0 community Q19Ge4EES6Xih4Fgj3WGO2e29swws= c973e49ac35a7eb1206f58267ee83be9bfe79ebce92b4882373f019b12f11767 -
+pkg crun 1.31-r0 community Q1MGwZ3JddeuNUJIoPztfWi+Kg6B0= 092c85b42b2dee13afa3f799405c24bb786b7a7b3b5750d334633677b39e08cc -
 pkg cups-libs 2.4.19-r1 main Q1d85HfZb/hX7NmmE7YDJlvl/0NRE= 5739c568d90f23006d74ff82619e1a18447a6f698ae2af61970debe6658a7bea -
 pkg dbus-libs 1.16.2-r2 main Q1LMt2GrBN+tecFdJaZ8jseUS5xc0= 105f6ba17454c587ca9345f9deb348012d1950588a22da42120c954d396c99b6 -
 pkg dosfstools 4.2-r2 main Q11LIF15Td6gVkdNsJjtz4/DSxAsE= 54387981e6dd2e432f9bf401d04845e4bc7f7e20d279ef7bcc96b6dc6e24232e -
@@ -25,7 +26,7 @@ pkg encodings 1.1.0-r0 main Q1dnp0cwnhYUc8Z++65c8UTOtMGGU= f7c0eb762638d0249b4fb
 pkg ffmpeg-libavcodec 8.1.3-r0 community Q1vl/WNncyH4r4ptTh8T7CKDEpDc8= 8aa06514a2f88547f50f506f6be5854bd54af558922218115b4ae738978492e2 -
 pkg ffmpeg-libavutil 8.1.3-r0 community Q1B2I2HMJuP7vjtAquH4PTsGH+aOk= b42c7b789b9e61b7e6e0e1db33c7467a565dc0bc0b095486b36ca6f216762f00 -
 pkg ffmpeg-libswresample 8.1.3-r0 community Q1ny3SzsU5vX2OQr3DHGlm8uckH9E= 9fc489ff9b947dd3a33c63a08ebb8a0041f8c5dd2463c59d1cdd71e5c72b451c -
-pkg firefox 151.0.3-r0 community Q12S6v0Hj+RQEvUUmpQUvlPXq+XCo= 2631ca233bb33b2895a3bf4e4045319bac796457839b2d35762a1396198a5801 -
+pkg firefox 160.0-r0 community Q1sNy+wZMnySlzemxPUZBMzWnDhX4= 14a863aa6a52373c6609be3ea31b79c4cb0083050bd4b8c941a8c8d0d3b74d17 -
 pkg font-dejavu 2.37-r6 main Q1eVXdqCY2KSDT3Jaj4+AQakSS8B8= 6e7609e7a1aaed947afe4ddcc02bbdeec571dac5ff4ea1c04af9b8480b7b9dcf -
 pkg fontconfig 2.17.1-r1 main Q1KigEPCtTgE7pePNWEk/JYw0I71s= 7634cf2fb1066ec97c8f41ec90ec9f036540e056276b7bf9a10dc4ec9e44d238 trigger
 pkg freetype 2.14.3-r0 main Q1inTeCTllWaiIzsEB0gXPSI2KScY= 09d76fde675a9ca3cfeb83d72fb09cb2e9ccf79b2937daa05a1af9a37a6b7815 -
@@ -36,8 +37,8 @@ pkg fuse3 3.18.3-r0 main Q1F/4epN5MtyvXPMw63EIqq0fR9vU= 75c11b645c916959c38d87e8
 pkg fuse3-libs 3.18.3-r0 main Q1D7ULJCEwVNO7WddZJ3+sUtjDU8U= 5455c41da8abb45ece2c7bf74cb9a9f5758d9ba17118cb85a2bc5ebef159bcfa -
 pkg gdbm 1.26-r0 main Q1YZST2BJP5JqO4dj3oTcs9+OXczc= 3278ccba30b241168ca4ab93c919be805411b918fdc062f06d3684d12dc33ae3 -
 pkg gdk-pixbuf 2.44.7-r1 community Q1kpIV149bbf4v5kWha6s8M6g1g1I= 71c422b35822af144fbc14baf7308fa6bd59c490b19842de93aef4ed46c88422 pre-deinstall,trigger
-pkg git 2.54.0-r0 main Q1KlCtqvgihl9rC6XaaIME3EjkW8c= 5a2c6782774d2e891fc2fc3fdc50c3c2743b8eb2dc7cda69b6b723af2eedcf78 -
-pkg git-init-template 2.54.0-r0 main Q1Wr3MX1rbvj1gz82ht0ADMBTHI6s= e8094a47bfa6e66b7d550ae12a7a8bcab0bc4af502aacd5d2a6fc62d2c5e488d -
+pkg git 2.54.1-r0 main Q1kcdg5/ZoR9rRdtZ9yJIIOiAhUIo= a8d6464152f823b28d80876142649bfddd8ac7959b5c24be9f8f7f2b5e2421dc -
+pkg git-init-template 2.54.1-r0 main Q17fsJiWphzzxg4ptB0IBPvs2vLUo= d64eeddb867cdb678944535e1e56d0438a9ca5114344cbf624abae31519f2afd -
 pkg glib 2.88.1-r1 main Q1nwgRDuT0i7Sr+TesASg4HK9SGaY= 2f32203b97789bc9a92e57e2d9b89eb2e6951b69534ba082a683c6e49031cb5d trigger
 pkg glycin-image-rs 2.1.5-r0 community Q1RyYw77Cc0a6EKWqi0q0c6SSS8Jw= 9c9d639e1484e244316acfd8b9815ec90773f695b90f99451e914c66ddaf4726 -
 pkg glycin-svg 2.1.5-r0 community Q1R4rHVb8cyvigafzStFyoV0UOojE= 59cf8cb8816249019f9498ef3acf20073f5443d2e89d4d3baf7878c0a454137a -
@@ -156,7 +157,7 @@ pkg nftables 1.1.6-r1 main Q1ZqfcRSV1pIxl/7ehFlO/1ZTOn28= edca96e6160479bd734bb6
 pkg nghttp2-libs 1.70.0-r0 main Q1Y70xm5rxw9PHMMlrBKiJlkaW82c= f0c4014eb2f10308dcdfd84cd49c121673c7b78cb8182b6e7a1388d8ae112a3b -
 pkg npth 1.8-r0 main Q1sq98j8gzMUiLfp8qQtoAnCBKif0= d92e7427c7e054467162218eee78589d94407bf34faf82aaf8f60dd3bd321521 -
 pkg nspr 4.38.2-r0 main Q13wb4/JHmWkW3GbArgZb0nKITqhw= 0b918a47c9e625f2b7001424dc64d6738e192594c584cecce4ae67d72199c4b0 -
-pkg nss 3.124-r0 main Q1vJybxhWPsYTPkxSCJ95GjjnEO7c= 1df40eb4fccf83653c166bd843e8193eb82a969dedb6d1e7760263d1adc078a8 -
+pkg nss 3.133-r0 main Q1zCfhNMkgVVKvSJN7x4+LFq7w2co= afe396bc1fcbd234a856edda5644d0671700acbd7c7df6b084d5c195736eab77 -
 pkg numactl 2.0.19-r0 main Q1PcAOVrefQ5JrXxK1PMPrntCQZ4Y= 4a78670a16d9ae7377906e2084be7430197d4b4c24877d65712dd1d4597b59db -
 pkg openssh-sftp-server 10.3_p1-r2 main Q1/9EXDJ54gv8dCIZPNHlm0r73aP4= 2d97de275784c7d85c4e796a4a5992dbc4bb813ba64cb137a8dfaa7131805290 -
 pkg opus 1.6.1-r0 main Q1DHHBO1zyeGJTXduPomH5Yjx6iPI= 8aecfcbe5b02eb8642ebc8703880ac3bbcdbeac537495bd98c5e4269c904f9e0 -
@@ -168,7 +169,7 @@ pkg pciutils-libs 3.15.0-r0 main Q1QlzbDBVdJ8rw/n4h5Hxn+9rh7wc= 2905bb60e9bc41d2
 pkg pcre2 10.49-r0 main Q17JkrALr3G7od2eIXlhP5IzrzXI0= 2919897914820f42a17a8d7d37df310d2dfad1c82ebe5f539cc5c765f916752a -
 pkg pinentry 1.3.2-r0 main Q1ArwCfj9sAcEPocakEgXxTTzPPUs= a95d99634b1f2398d27105e079c1a068cee60d14839e55678b0ce41f8c6a3a0f post-install,post-upgrade
 pkg pkgconf 2.5.1-r0 main Q1B0VN8FiPJzB3eATqTdiQ3m4d/d4= 20cc47b76b82e9424a35ecc4fdd7bd904ef49ada1684214910fae31bc0cab737 -
-pkg podman 5.8.9-r0 community Q1fYrfVyZLf5dXHjsbpNqqwgYBGT0= 3d4918d2254890d7fdf465e01b3d47881aa611c87ac7505d583624055000cc67 post-install,post-upgrade
+pkg podman 5.8.10-r0 community Q1ZxOnFjcLKNrppTnjn0jgZ4l2jB8= 6f00b8d7a114677eb1084bf5d34e99194510dd591b1c65098d44959cd9ec7741 post-install,post-upgrade
 pkg rav1e-libs 0.8.1-r0 community Q14iG3pb7z45YtmbyOyO8dGzvQu58= 32424451f71961f317df5d521cf980ae6eac92aa60c47d5a7b22903c1d6009d4 -
 pkg readline 8.3.3-r1 main Q1lFsW43i8AORNidTegSS7p2R/300= 766911ecb986a6c5cf0841a6b556cd1e9dbbf22b3559726de32416486cd15c81 -
 pkg ripgrep 15.1.0-r0 community Q1R4iCCbCufx311Th0TeNT+nCc3S8= 055b1973a5f2face005d167d874eef8a534d4b1edb20ce601e46cc253016b051 -
@@ -211,7 +212,6 @@ held /bin/sh pinentry
 held /bin/sh podman
 held /bin/sh shared-mime-info
 held /bin/sh slirp4netns
-held bubblewrap libglycin
 held so:libEGL.so.1 firefox
 held so:libGL.so.1 firefox
 held so:libdrm.so.2 ffmpeg-libavutil
