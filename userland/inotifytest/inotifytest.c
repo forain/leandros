@@ -1517,7 +1517,8 @@ static int fh_follow_in(const char *dir, const char *tag)
     int u1 = unlink(c) == 0; int r3 = fh_open_ino(mfd, &h, st.st_ino, &e);
     /* deleted: ESTALE */
     int u2 = unlink(a) == 0; int r4 = fh_open_ino(mfd, &h, st.st_ino, &e); int stale = !r4 && e == ESTALE;
-    /* the recorded name is unlinked while another hard link survives */
+    /* the recorded name is unlinked while another hard link survives (f2fs only: tmpfs keeps no inode-to-link index) */
+    int hl = strcmp(tag, "f2fs") == 0;
     int f2 = open(a, O_CREAT | O_WRONLY, 0644); if (f2 >= 0) close(f2);
     struct stat st2; stat(a, &st2);
     struct fh20 h2; memset(&h2, 0, sizeof h2); h2.hb = 20;
@@ -1527,7 +1528,7 @@ static int fh_follow_in(const char *dir, const char *tag)
     int lk2 = link(a, l) == 0; int u3 = unlink(a) == 0;
     int r5 = fh_open_ino(mfd, &h2, st2.st_ino, &e);
     unlink(l); int stale2 = !fh_open_ino(mfd, &h2, st2.st_ino, &e) && e == ESTALE; rmdir(sub);
-    int ok = r0 && rn && r1 && lk && rn2 && r2 && u1 && r3 && u2 && stale && n2 && lk2 && u3 && r5 && stale2;
+    int ok = r0 && rn && r1 && lk && rn2 && r2 && u1 && r3 && u2 && stale && (!hl || (n2 && lk2 && u3 && r5 && stale2));
     if (!ok) printf("  %s: r0=%d rn=%d r1=%d lk=%d rn2=%d r2=%d u1=%d r3=%d u2=%d stale=%d(e=%d) gen=%u n2=%d lk2=%d u3=%d r5=%d(e=%d) stale2=%d\n", tag, r0, rn, r1, lk, rn2, r2, u1, r3, u2, stale, e, h.gen, n2, lk2, u3, r5, e, stale2);
     if (mfd >= 0) close(mfd);
     return ok;

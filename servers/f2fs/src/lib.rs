@@ -5582,7 +5582,7 @@ fn create_inode(ms: &mut MountState, mode: u16, uid: u32, gid: u32,
     w32(&mut buf, 84, parent_ino); // i_pino
     // i_generation (@68): a fresh nonzero value per inode so a reused inode
     // number never answers a stale file handle.
-    w32(&mut buf, 68, (now.1 as u32 ^ (now.0 as u32).wrapping_mul(0x9E37_79B1)) | 1);
+    w32(&mut buf, 68, ((now.1 as u32 ^ (now.0 as u32).wrapping_mul(0x9E37_79B1)) & 0x7FFF_FFFF) | 1); // 31 bits: the VFS_INO_PATH reply packs it above bit 32 of a signed i64
     let namelen = name.len().min(255) as u32;
     w32(&mut buf, INO_NAMELEN, namelen);
     buf[INO_NAME..INO_NAME + namelen as usize].copy_from_slice(&name[..namelen as usize]);
@@ -8047,7 +8047,7 @@ fn handle_ino_path(ms: &mut MountState, ino: u64, buf_ptr: u64, buf_len: u64) ->
     let n = path.len();
     if n > buf_len as usize { return err_reply(-36); }
     unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), buf_ptr as *mut u8, n); }
-    val_reply(n as u64 | (generation as u64) << 32)
+    val_reply(n as u64 | ((generation & 0x7FFF_FFFF) as u64) << 32) // 31 bits: bit 63 would read as an error
 }
 
 fn handle_readlink(ms: &mut MountState, path_ptr: u64, buf_ptr: u64, buf_len: u64) -> Message {
