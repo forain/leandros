@@ -187,3 +187,28 @@ pub extern "C" fn kernel_pollfds_gpu(buf: *mut u8, cap: usize) -> usize {
     unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), buf, n); }
     n
 }
+
+/// `/proc/drm/fence_stats`: virtio-gpu fence completion-path counters and
+/// latency histograms (lock losses, hook latency, head-of-line hold).
+/// Returns the bytes written. Called by servers/vfs.
+#[no_mangle]
+pub extern "C" fn kernel_drm_fence_stats(buf: *mut u8, cap: usize) -> usize {
+    let mut s = alloc::string::String::new();
+    drivers::virtio_gpu::fence_stats_text(&mut s);
+    let n = s.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), buf, n); }
+    n
+}
+
+/// `/proc/drm/fence_hold`: state of the fence-retirement hold (test knob).
+#[no_mangle]
+pub extern "C" fn kernel_drm_fence_hold_get() -> u32 {
+    drivers::virtio_gpu::fence_hold_active() as u32
+}
+
+/// `/proc/drm/fence_hold` write: nonzero holds fence retirement (auto-released
+/// after 2 s), zero releases it.
+#[no_mangle]
+pub extern "C" fn kernel_drm_fence_hold_set(on: u32) {
+    drivers::virtio_gpu::fence_hold_set(on != 0);
+}

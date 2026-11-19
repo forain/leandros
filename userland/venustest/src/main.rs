@@ -721,6 +721,36 @@ unsafe fn poll_in_ready(fd: c_int) -> bool {
     poll(&mut p as *mut PollFd, 1, 0) == 1 && (p.revents & POLLIN) != 0
 }
 
+/// Fence-hold test knob (`/proc/drm/fence_hold`, root only): while on, the
+/// kernel parks the host's fence retirements, so an out-fence or a NOWAIT wait
+/// on a just-kicked submission is deterministically pending whatever the
+/// emulator's speed (aarch64 TCG retires a trivial Venus stream before the
+/// ioctl chain returns). The kernel releases it itself after 2 s, so a crashed
+/// test cannot wedge the desktop. False if the knob cannot be written.
+unsafe fn fence_hold(on: bool) -> bool {
+    let f = open(b"/proc/drm/fence_hold\0".as_ptr(), 1 /* O_WRONLY */);
+    if f < 0 { return false; }
+    let v: &[u8] = if on { b"1\n" } else { b"0\n" };
+    let ok = write(f, v.as_ptr() as *const c_void, v.len()) == v.len() as isize;
+    close(f);
+    ok
+}
+
+/// Print `/proc/drm/fence_stats` (completion-path counters) to the console.
+unsafe fn dump_fence_stats(tag: &[u8]) {
+    let f = open(b"/proc/drm/fence_stats\0".as_ptr(), 0);
+    if f < 0 { out(b"  fence_stats: unavailable\n"); return; }
+    let mut buf = [0u8; 1024];
+    let n = read(f, buf.as_mut_ptr() as *mut c_void, buf.len());
+    close(f);
+    if n <= 0 { return; }
+    out(b"  [fence_stats "); out(tag); out(b"]\n");
+    for line in buf[..n as usize].split(|&c| c == b'\n') {
+        if line.is_empty() { continue; }
+        out(b"    "); out(line); out(b"\n");
+    }
+}
+
 /// `poll_in_ready` with a deadline: does `fd` become readable within
 /// `timeout_ms`? This is `sim_syncobj_wait`'s shape — the same `poll(POLLIN)`,
 /// given time — and the honest question for a fence that is only signalled
@@ -869,6 +899,9 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
     // — asserted as "at least one of the four", which is the strongest claim
     // that survives a host answering faster than the ioctl chain — and every
     // one must become readable once the host has answered.
+    // The fence-hold knob makes "pending at return" deterministic on every
+    // arch/accelerator: retirements are parked until released.
+    let held = fence_hold(true);
     let mut fds = [-1i32; 4];
     let mut pending_at_return = 0;
     let mut minted = 0;
@@ -881,10 +914,13 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         }
     }
     if !report(b"phase7_fence_fd_minted_x4", minted == 4) { failures += 1; }
-    if pending_at_return >= 1 {
-        if !report(b"phase7_fence_fd_unsignalled_at_return", true) { failures += 1; }
-    } else {
-        out(b"  SKIP phase7_fence_fd_unsignalled_at_return: submit retired synchronously (no out-fence pending at return in 4 tries)\n");
+    // Held: all four must be pending, and stay so for 50 ms (nothing may
+    // signal an out-fence the host has not retired).
+    let still_pending = held && fds.iter().all(|&f| f >= 3 && !poll_in_within(f, 50));
+    let hold_released = fence_hold(false);
+    if !report(b"phase7_fence_fd_unsignalled_at_return",
+               held && hold_released && pending_at_return == 4 && still_pending) {
+        failures += 1;
     }
     let mut all_signalled = minted == 4;
     for &f in fds.iter() {
@@ -1701,7 +1737,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
         // WAIT takes a BO handle, and until the per-BO fence landed it threw
         // that handle away and answered from one process-global fence. These
         // assert the upstream contract that replaced it. Note what they can and
-        // cannot prove: submission is a synchronous busy-spin, so every fence is
+        // cannot prove: with the host answering at once, every fence is
         // already retired and every *successful* wait would also have succeeded
         // under the old code. The refusals are the load-bearing half — they are
         // only possible once handles are resolved rather than ignored.
@@ -1721,23 +1757,22 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             // "At least once in three" is the hedge against a host that
             // answers faster than the ioctl chain.
             const VIRTGPU_WAIT_NOWAIT: u32 = 1;
+            // With retirement held, NOWAIT right after the kick must say busy
+            // every time (deterministic, also on aarch64 TCG where the host
+            // otherwise retires the fence before the ioctl chain returns); a
+            // blocking WAIT after the release must still answer 0.
             let mut busy_seen = 0;
             let mut settled = true;
+            let mut held_ok = true;
             for _ in 0..3 {
-                if exec_with_bos(fd, &[blob.bo_handle]) != 0 { settled = false; break; }
+                if !fence_hold(true) { held_ok = false; }
+                if exec_with_bos(fd, &[blob.bo_handle]) != 0 { settled = false; fence_hold(false); break; }
                 let mut w = DrmVirtgpu3dWait { handle: blob.bo_handle, flags: VIRTGPU_WAIT_NOWAIT };
                 if ioctl(fd, DRM_IOCTL_VIRTGPU_WAIT, &mut w as *mut _) != 0 { busy_seen += 1; }
+                if !fence_hold(false) { held_ok = false; }
                 if wait_bo(fd, blob.bo_handle) != 0 { settled = false; }
             }
-            // On aarch64 TCG the host retires the fence before the ioctl chain
-            // returns (even behind a 64-submission burst), so "busy after kick"
-            // is unobservable there. That is a SKIP, not a pass and not a
-            // failure: nothing was proven either way.
-            if busy_seen >= 1 {
-                if !report(b"virtgpu_wait_nowait_busy_after_kick", true) { failures += 1; }
-            } else {
-                out(b"  SKIP virtgpu_wait_nowait_busy_after_kick: submit retired synchronously (NOWAIT never saw a pending fence in 3 tries)\n");
-            }
+            if !report(b"virtgpu_wait_nowait_busy_after_kick", held_ok && busy_seen == 3) { failures += 1; }
             if !report(b"virtgpu_wait_blocks_until_retired", settled) { failures += 1; }
         }
 
@@ -2937,6 +2972,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
         }
     }
 
+    dump_fence_stats(b"end");
     out(b"--- venustest done, failures = ");
     out_u64(failures as u64);
     out(b" ---\n");

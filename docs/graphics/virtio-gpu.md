@@ -40,6 +40,10 @@ Each fenced chain carries a fence id; retirement publishes a lock-free floor tha
 
 When a context is destroyed with fenced commands still in flight, the host never retires them. The driver drains for up to 200 ms before `CTX_DESTROY`, then marks what remains abandoned so one parked chain cannot become a permanent hole under the fence floor. One control-queue chain per abandoned fence stays parked host-side.
 
+`/proc/drm/fence_stats` (read-only) reports the completion path: completion interrupts, how often the ISR lost `VIRTIO_GPU.try_lock` (`isr_lock_lost`, completions then wait for a task-context reap or the 100 Hz tick), task-context reaps that set the fence event (`task_reap_events`), retire-to-fence-hook latency (`hook_lat_us`) and how long a fence that retired ahead of an older one waited for the global floor (`hol_us`, head-of-line hold). Latencies are histogram upper bounds in microseconds.
+
+`/proc/drm/fence_hold` is a root-only test knob: writing `1` parks the host's fence retirements (chains are still reaped, the watchdog still sees the host answering), so an out-fence or a `VIRTGPU_WAIT` with `NOWAIT` on a just-kicked submission is deterministically pending on any emulator speed; writing `0` applies them. The kernel releases the hold itself after 2 s. venustest uses it for `phase7_fence_fd_unsignalled_at_return` and `virtgpu_wait_nowait_busy_after_kick`.
+
 ### Resource ids
 
 Dumb buffers, virgl 3D resources and blobs all draw from one `alloc_resource_id()` space, monotonic and never reused. Three framebuffer paths once derived their host resource as `handle + 10` (to dodge the console's resource 1); the 3D allocator starts at 16, so gem handle 6 and the first 3D resource were the same host resource. That was invisible while dumb buffers (the softpipe desktop) and 3D resources (Venus) were never busy together, and it surfaced under Zink — which uses both — as the host refusing `RESOURCE_ATTACH_BACKING`, which the then-synchronous busy-spin turned into a wedged guest. It looked exactly like "Zink is unsupported" (`a32f53d`). Context ids `1..256` are recycled lowest-first after `CTX_DESTROY` is answered.

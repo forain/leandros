@@ -118,6 +118,11 @@ pub struct VirtioGpuDevice {
     /// Retired fence ids above `fence_floor`; 0 marks a free slot. Sized to the
     /// control queue, which bounds how many fences can be outstanding at all.
     fences_ahead: Vec<u64>,
+    /// Retire time (us) of each `fences_ahead` slot, for the head-of-line histogram.
+    fences_ahead_t: Vec<u64>,
+    /// Retirements parked by the fence-hold test knob (`FENCE_HOLD_UNTIL_US`).
+    held: [u64; FENCE_HELD_MAX],
+    held_n: usize,
     /// Control-queue commands the host has not answered yet, indexed by the
     /// head descriptor of their chain. See `Inflight`.
     inflight: Vec<Option<Inflight>>,
@@ -629,6 +634,121 @@ const CTX_ID_POOL: u32 = 256;
 /// Set under `VIRTIO_GPU` (any context), consumed by `ctrlq_tick`.
 pub(crate) static FENCE_EVENT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// ── Fence completion-path telemetry (lane venusae, design venusasync part A) ──
+//
+// Read-only counters answering "is completion tick-paced?" and "does the
+// single global floor hold an out-of-order fence back?": rendered by
+// `fence_stats_text` for /proc/drm/fence_stats.
+
+/// A completion interrupt ran `ctrlq_tick` and lost `VIRTIO_GPU.try_lock`:
+/// its completions are left for a task-context reap or the 100 Hz tick.
+pub static CTRLQ_ISR_LOCK_LOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Task-context reaps (submit backpressure, spin waits, `fence_retired_now`)
+/// that retired fences and set `FENCE_EVENT_PENDING`: only the next IRQ or
+/// tick pays the DRM layer for them.
+static TASK_REAP_EVENTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Fences that retired ahead of an older unretired one (head-of-line cases).
+static FENCES_RETIRED_AHEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Time of the oldest retirement the fence hook has not paid yet (0 = none).
+static FIRST_RETIRE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Fence-hold test knob (`/proc/drm/fence_hold`): while `monotonic_us()` is
+/// below this, host fence retirements are parked instead of applied. 0 = off.
+static FENCE_HOLD_UNTIL_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Auto-release after this long, so a crashed test cannot wedge the desktop.
+const FENCE_HOLD_MAX_US: u64 = 2_000_000;
+/// Fence ids parked by the hold at most; beyond it retirements apply normally.
+const FENCE_HELD_MAX: usize = 64;
+static FENCE_HOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FENCE_HELD_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static FENCE_HOLD_AUTO_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Latency histogram in microseconds: bucket i counts `< LAT_BOUNDS_US[i]`,
+/// the last bucket everything above.
+const LAT_BOUNDS_US: [u64; 9] = [50, 100, 250, 500, 1000, 2000, 5000, 10000, 20000];
+struct LatHist {
+    b: [core::sync::atomic::AtomicU64; 10],
+    n: core::sync::atomic::AtomicU64,
+    max: core::sync::atomic::AtomicU64,
+}
+impl LatHist {
+    const fn new() -> Self {
+        const Z: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        LatHist { b: [Z; 10], n: Z, max: Z }
+    }
+    fn record(&self, us: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let i = LAT_BOUNDS_US.iter().position(|&l| us < l).unwrap_or(9);
+        self.b[i].fetch_add(1, Relaxed);
+        self.n.fetch_add(1, Relaxed);
+        self.max.fetch_max(us, Relaxed);
+    }
+    /// Upper bound (us) of the bucket holding quantile `permille`/1000; 0 if empty.
+    fn quantile_ub(&self, permille: u64) -> u64 {
+        use core::sync::atomic::Ordering::Relaxed;
+        let n = self.n.load(Relaxed);
+        if n == 0 { return 0; }
+        let want = (n * permille).div_ceil(1000).max(1);
+        let mut acc = 0;
+        for i in 0..10 {
+            acc += self.b[i].load(Relaxed);
+            if acc >= want { return if i < 9 { LAT_BOUNDS_US[i] } else { self.max.load(Relaxed) }; }
+        }
+        self.max.load(Relaxed)
+    }
+}
+/// Retire (`fence_complete`) to fence-hook-run latency.
+static HOOK_LAT: LatHist = LatHist::new();
+/// Out-of-order retire to floor-reached latency (head-of-line hold).
+static HOL_LAT: LatHist = LatHist::new();
+
+/// A task-context reap retired fences: remember it for the DRM layer.
+#[inline]
+fn task_reap_event() {
+    TASK_REAP_EVENTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Start (`on`) or end the fence-hold test knob. Ending applies every parked
+/// retirement and re-arms the fence event. Task context.
+pub fn fence_hold_set(on: bool) {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    if on {
+        FENCE_HOLDS.fetch_add(1, Relaxed);
+        FENCE_HOLD_UNTIL_US.store((crate::snd::monotonic_us() + FENCE_HOLD_MAX_US).max(1), Release);
+    } else {
+        FENCE_HOLD_UNTIL_US.store(0, Release);
+        if let Some(gpu) = VIRTIO_GPU.lock().as_mut() { gpu.hold_release(); }
+        FENCE_EVENT_PENDING.store(true, Release);
+    }
+}
+
+/// True while the fence-hold knob is active (not yet expired).
+pub fn fence_hold_active() -> bool {
+    let u = FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire);
+    u != 0 && crate::snd::monotonic_us() < u
+}
+
+/// Text for /proc/drm/fence_stats.
+pub fn fence_stats_text(s: &mut alloc::string::String) {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering::Relaxed;
+    let _ = writeln!(s, "irqs={} isr_lock_lost={} task_reap_events={} retired_ahead={}",
+        CTRLQ_IRQS.load(Relaxed), CTRLQ_ISR_LOCK_LOST.load(Relaxed),
+        TASK_REAP_EVENTS.load(Relaxed), FENCES_RETIRED_AHEAD.load(Relaxed));
+    let _ = writeln!(s, "hook_lat_us n={} p50<={} p99<={} max={}",
+        HOOK_LAT.n.load(Relaxed), HOOK_LAT.quantile_ub(500), HOOK_LAT.quantile_ub(990), HOOK_LAT.max.load(Relaxed));
+    let _ = writeln!(s, "hol_us n={} p50<={} p99<={} max={}",
+        HOL_LAT.n.load(Relaxed), HOL_LAT.quantile_ub(500), HOL_LAT.quantile_ub(990), HOL_LAT.max.load(Relaxed));
+    let _ = write!(s, "hook_hist_us");
+    for i in 0..10 { let _ = write!(s, " {}", HOOK_LAT.b[i].load(Relaxed)); }
+    let _ = write!(s, "\nhol_hist_us");
+    for i in 0..10 { let _ = write!(s, " {}", HOL_LAT.b[i].load(Relaxed)); }
+    let _ = writeln!(s, "\nbounds_us {:?} +inf", LAT_BOUNDS_US);
+    let _ = writeln!(s, "hold active={} holds={} held_total={} auto_releases={}",
+        fence_hold_active() as u8, FENCE_HOLDS.load(Relaxed), FENCE_HELD_TOTAL.load(Relaxed),
+        FENCE_HOLD_AUTO_RELEASES.load(Relaxed));
+}
+
 /// Called by `ctrlq_tick` after fences retired: the DRM layer's out-fence and
 /// VIRTGPU_WAIT service. Returns false if it could not finish (a try_lock
 /// lost) and wants to be called again next tick. Installed by the DRM layer.
@@ -655,7 +775,7 @@ pub static CTRLQ_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 #[no_mangle]
 pub extern "C" fn virtio_gpu_msix_isr() {
     CTRLQ_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if !ctrlq_tick() { kick_waiting_cpus(); }
+    if !ctrlq_tick() { CTRLQ_ISR_LOCK_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed); kick_waiting_cpus(); }
 }
 
 /// `crate::irq` handler shape around [`virtio_gpu_msix_isr`].
@@ -702,7 +822,7 @@ extern "C" fn virtio_gpu_intx_isr(_ctx: usize) -> crate::irq::IrqReturn {
         if CTRLQ_IRQS.fetch_add(1, Relaxed) == 0 {
             crate::pci::serial_debug("[GPU] INTx: first control-queue completion interrupt\n");
         }
-        if !ctrlq_tick() { kick_waiting_cpus(); }
+        if !ctrlq_tick() { CTRLQ_ISR_LOCK_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed); kick_waiting_cpus(); }
     }
     crate::irq::IrqReturn::Handled
 }
@@ -757,6 +877,7 @@ pub fn ctrlq_tick() -> bool {
         reaped = true;
         if let Some(gpu) = g.as_mut() {
             if gpu.ctrlq_reap(false) { FENCE_EVENT_PENDING.store(true, Release); }
+            if gpu.hold_poll(crate::snd::monotonic_us()) { FENCE_EVENT_PENDING.store(true, Release); }
             if gpu.fence_watchdog(crate::snd::monotonic_us()) > 0 {
                 FENCE_EVENT_PENDING.store(true, Release);
             }
@@ -767,7 +888,12 @@ pub fn ctrlq_tick() -> bool {
         if p != 0 {
             // SAFETY: only ever written by `set_fence_event_hook` from a `fn() -> bool`.
             let f: fn() -> bool = unsafe { core::mem::transmute::<usize, fn() -> bool>(p) };
+            let t0 = FIRST_RETIRE_US.load(core::sync::atomic::Ordering::Relaxed);
+            let t1 = crate::snd::monotonic_us();
             if !f() { FENCE_EVENT_PENDING.store(true, Release); }
+            else if t0 != 0 && FIRST_RETIRE_US.compare_exchange(t0, 0, core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed).is_ok() {
+                HOOK_LAT.record(t1.saturating_sub(t0));
+            }
         }
     }
     reaped
@@ -1089,7 +1215,7 @@ fn wait_sync_unlocked_inner(head: u16, self_reaped: &mut bool, parks: &mut u32) 
             let woke_at = wait.parked_at.get();
             if let Some(mut g) = VIRTIO_GPU.try_lock() {
                 if let Some(gpu) = g.as_mut() {
-                    if gpu.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, Release); }
+                    if gpu.ctrlq_reap(true) { task_reap_event(); }
                 }
                 drop(g);
                 if SYNC_DONE[h].load(SeqCst) {
@@ -1277,6 +1403,9 @@ impl VirtioGpuDevice {
             next_fence_id: 1,
             fence_floor: 0,
             fences_ahead: Vec::new(),
+            fences_ahead_t: Vec::new(),
+            held: [0; FENCE_HELD_MAX],
+            held_n: 0,
             inflight: Vec::new(),
             deferred_free: Vec::new(),
             next_ctx_id: CTX_ID_POOL,
@@ -1417,6 +1546,7 @@ impl VirtioGpuDevice {
                 );
             }
             self.fences_ahead = alloc::vec![0u64; qsize.max(1)];
+            self.fences_ahead_t = alloc::vec![0u64; qsize.max(1)];
             self.deferred_free = Vec::with_capacity(qsize * 3 + 8);
 
             // 6b. Control-queue completion interrupt (MSI-X vector 0), before
@@ -1686,19 +1816,27 @@ impl VirtioGpuDevice {
     /// Record that the host retired `id`. Exact, not a watermark: the floor
     /// only advances over ids that have actually completed.
     fn fence_complete(&mut self, id: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
         if id == 0 || id <= self.fence_floor { return; }
+        let now = crate::snd::monotonic_us();
         if id == self.fence_floor + 1 {
             self.fence_floor = id;
             // Fold in everything that had finished ahead of the floor.
             loop {
                 let next = self.fence_floor + 1;
                 match self.fences_ahead.iter().position(|&f| f == next) {
-                    Some(i) => { self.fences_ahead[i] = 0; self.fence_floor = next; }
+                    Some(i) => {
+                        self.fences_ahead[i] = 0;
+                        self.fence_floor = next;
+                        if let Some(&t) = self.fences_ahead_t.get(i) { HOL_LAT.record(now.saturating_sub(t)); }
+                    }
                     None => break,
                 }
             }
         } else if let Some(i) = self.fences_ahead.iter().position(|&f| f == 0) {
             self.fences_ahead[i] = id;
+            if let Some(t) = self.fences_ahead_t.get_mut(i) { *t = now; }
+            FENCES_RETIRED_AHEAD.fetch_add(1, Relaxed);
         } else {
             // No slot: more fences ahead of the floor than the ring can carry,
             // which the accounting above makes impossible. Fall back to the
@@ -1706,6 +1844,41 @@ impl VirtioGpuDevice {
             self.fence_floor = id;
         }
         GPU_FENCE_FLOOR.store(self.fence_floor, core::sync::atomic::Ordering::Release);
+        let _ = FIRST_RETIRE_US.compare_exchange(0, now.max(1), Relaxed, Relaxed);
+    }
+
+    /// A fence the host answered: `fence_complete`, unless the fence-hold test
+    /// knob is parking retirements. Fixed-size list, no allocation (IRQ context).
+    fn fence_retire_host(&mut self, id: u64) {
+        let u = FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire);
+        if u != 0 {
+            if crate::snd::monotonic_us() < u && self.held_n < FENCE_HELD_MAX {
+                self.held[self.held_n] = id;
+                self.held_n += 1;
+                FENCE_HELD_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            self.hold_release();
+        }
+        self.fence_complete(id);
+    }
+
+    /// Apply every parked retirement and clear the hold. Cheap no-op when idle.
+    fn hold_release(&mut self) {
+        FENCE_HOLD_UNTIL_US.store(0, core::sync::atomic::Ordering::Release);
+        let n = self.held_n;
+        self.held_n = 0;
+        for i in 0..n { let id = self.held[i]; self.fence_complete(id); }
+    }
+
+    /// Tick/IRQ: end an expired hold. True if it released parked fences.
+    fn hold_poll(&mut self, now: u64) -> bool {
+        let u = FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire);
+        if u == 0 || now < u { return false; }
+        FENCE_HOLD_AUTO_RELEASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let had = self.held_n != 0;
+        self.hold_release();
+        had
     }
 
     /// Drain the used ring. Every completed chain is either handed to its
@@ -1764,7 +1937,7 @@ impl VirtioGpuDevice {
                 CTRLQ_LAST_USED.store(q.last_used_idx as u32, core::sync::atomic::Ordering::Release);
             }
             if e.fence_id != 0 {
-                self.fence_complete(e.fence_id);
+                self.fence_retire_host(e.fence_id);
                 retired = true;
                 host_fence_answered();
                 // The one independent liveness signal for SUBMIT_3D: a reply
@@ -1977,7 +2150,7 @@ impl VirtioGpuDevice {
     /// means the device has stopped answering.
     fn ensure_ctrlq_room(&mut self, need: u16) -> bool {
         self.drain_deferred_frees();
-        if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+        if self.ctrlq_reap(true) { task_reap_event(); }
         if self.queues[0].as_ref().map(|q| q.num_free >= need).unwrap_or(false) { return true; }
         // The host stopped answering fences (see `fence_watchdog`): the ring
         // is full of chains it will never hand back. Fail now rather than
@@ -1995,7 +2168,7 @@ impl VirtioGpuDevice {
         let mut iter = 0u64;
         let mut ok = false;
         while iter < CTRLQ_WAIT_ITERS {
-            if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+            if self.ctrlq_reap(true) { task_reap_event(); }
             if self.queues[0].as_ref().map(|q| q.num_free >= need).unwrap_or(false) { ok = true; break; }
             if !wait.step(&window, iter) { break; }
             iter += 1;
@@ -2146,7 +2319,7 @@ impl VirtioGpuDevice {
         let mut iter = 0u64;
         let mut done = false;
         while iter < CTRLQ_WAIT_ITERS {
-            if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+            if self.ctrlq_reap(true) { task_reap_event(); }
             if self.inflight[head_idx as usize].map(|e| e.done).unwrap_or(false) { done = true; break; }
             if !wait.step(&window, iter) { break; }
             iter += 1;
@@ -2808,7 +2981,7 @@ impl VirtioGpuDevice {
     pub fn fence_retired_now(&mut self, id: u64) -> bool {
         if self.fence_retired(id) { return true; }
         self.drain_deferred_frees();
-        if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+        if self.ctrlq_reap(true) { task_reap_event(); }
         self.fence_retired(id)
     }
 
@@ -2822,7 +2995,7 @@ impl VirtioGpuDevice {
     /// the used ring. Task context.
     pub fn ctx_fences_outstanding_now(&mut self, ctx_id: u32) -> usize {
         self.drain_deferred_frees();
-        if self.ctrlq_reap(true) { FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release); }
+        if self.ctrlq_reap(true) { task_reap_event(); }
         self.inflight.iter().flatten()
             .filter(|e| e.fence_id != 0 && !e.sync && Self::inflight_ctx(e) == ctx_id)
             .count()
