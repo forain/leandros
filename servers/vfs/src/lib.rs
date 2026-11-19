@@ -448,6 +448,8 @@ static TMP_FILES: Mutex<TmpPool> = Mutex::new(TmpPool::new());
 /// was opened from, so the open descriptor names that path (readlink of
 /// `/proc/self/fd/N`, and the mount(2) targets crun passes that way) and not
 /// the synthetic one. Entries die with `gen_proc_system_file` reusing the slot.
+/// `/proc/sys/kernel/random/boot_id`, drawn on first read.
+static BOOT_ID_UUID: Mutex<Option<[u8; 16]>> = Mutex::new(None);
 static PSYS_ORIGIN: Mutex<alloc::vec::Vec<(usize, alloc::vec::Vec<u8>)>> = Mutex::new(alloc::vec::Vec::new());
 
 // ── Shared VMO store (K1 shared file-backed mmap) ────────────────────────────
@@ -4632,6 +4634,7 @@ static RAMFS_DIRS: &[&[u8]] = &[
     b"/proc/net",
     b"/proc/sys",
     b"/proc/sys/kernel",
+    b"/proc/sys/kernel/random",
     b"/proc/sys/vm",
     b"/proc/sys/user",
     b"/proc/sys/net",
@@ -8065,6 +8068,30 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         buf[..n].copy_from_slice(&o[..n]);
         return Some(n);
     }
+    // `/proc/sys/kernel/random/{boot_id,uuid}`: a RFC 4122 v4 UUID, lowercase
+    // 8-4-4-4-12 and a newline (Linux's format). boot_id is drawn once per
+    // boot (ostree, systemd tools and flatpak key caches on it); uuid is new
+    // on every read.
+    if path == b"/proc/sys/kernel/random/boot_id" || path == b"/proc/sys/kernel/random/uuid" {
+        let mut u = [0u8; 16];
+        if path.ends_with(b"/boot_id") {
+            let mut g = BOOT_ID_UUID.lock();
+            if g.is_none() { let mut r = [0u8; 16]; sched::random::fill(&mut r); *g = Some(r); }
+            u = g.unwrap();
+        } else {
+            sched::random::fill(&mut u);
+        }
+        u[6] = (u[6] & 0x0f) | 0x40;
+        u[8] = (u[8] & 0x3f) | 0x80;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut p = 0;
+        for (i, b) in u.iter().enumerate() {
+            if i == 4 || i == 6 || i == 8 || i == 10 { buf[p] = b'-'; p += 1; }
+            buf[p] = HEX[(b >> 4) as usize]; buf[p + 1] = HEX[(b & 15) as usize]; p += 2;
+        }
+        buf[p] = b'\n';
+        return Some(p + 1);
+    }
     if path == b"/proc/sys/fs/file-nr" {
         let live = ofd::census().map_or(0, |(l, _)| l);
         let mut p = write_u32(buf, 0, live as u32);
@@ -8495,6 +8522,31 @@ fn gen_proc_maps(pid: u32, kind: MapsKind) -> Option<VnodeKind> {
 /// path *is* `/proc/<pid>`, so `openat(dirfd, "stat")` (bottom, procps)
 /// resolves through the fd's path, fstat says S_IFDIR, and getdents lists
 /// `PROC_PID_FILES`.
+/// `/proc/<pid|self|thread-self>/ns` (the directory itself) -> the process
+/// it belongs to. Linux lists the namespace links here; bwrap, nsenter and
+/// runc open the directory and then openat() each link.
+fn proc_ns_dir(path: &[u8], caller: u32) -> Option<u32> {
+    let rest = strip_trailing_slash(path).strip_prefix(b"/proc/")?;
+    let who = rest.strip_suffix(b"/ns")?;
+    if who == b"thread-self" { return Some(caller); }
+    if who == b"self" { return Some(sched::tgid_of(caller)); }
+    proc_parse_num(who)
+}
+
+/// Open of the directory `/proc/<pid>/ns`: an ephemeral pool directory whose
+/// path is `/proc/<pid>/ns`, listed by `handle_getdents64` from `NS_NAMES`.
+fn gen_proc_ns_dir(pid: u32) -> Option<VnodeKind> {
+    let mut path = [0u8; 24];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut n = 6;
+    let mut d = [0u8; 10]; let mut k = 0; let mut v = pv(pid);
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    while k > 0 { k -= 1; path[n] = d[k]; n += 1; }
+    path[n..n + 3].copy_from_slice(b"/ns");
+    n += 3;
+    proc_snapshot(&path[..n], b"", true)
+}
+
 fn gen_proc_pid_dir(pid: u32) -> Option<VnodeKind> {
     let mut path = [0u8; 16];
     path[..6].copy_from_slice(b"/proc/");
@@ -8653,6 +8705,9 @@ fn proc_stat_kind(path: &[u8]) -> Option<Option<(bool, u32, &[u8])>> {
         }));
     }
     let alive = |p: u32| sched::proc_stat_of(p).is_some();
+    if let Some(p) = proc_ns_dir(path, sched::current_pid()) {
+        return Some(if alive(p) { Some((true, p, &b""[..])) } else { None });
+    }
     if path == PROC_SELF_FDINFO_DIR { return Some(Some((true, sched::current_tgid(), &b""[..]))); }
     if let Some((p, n)) = proc_fdinfo_file(path, sched::current_pid()) {
         let ok = alive(p) && vfs_get_node_kind(p, n).is_some();
@@ -8919,7 +8974,7 @@ const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc
 const PROC_SYSTEM_FILES: &[&[u8]] = &[b"/proc/meminfo", b"/proc/uptime", b"/proc/cmdline", b"/proc/nvrm_state",
                                       b"/proc/loadavg", b"/proc/stat", b"/proc/mounts", b"/proc/interrupts",
                                       b"/proc/sys/fs/nr_open", b"/proc/sys/fs/file-max", b"/proc/sys/fs/file-nr",
-                                      b"/proc/sys/fs/ovl_selftest", b"/proc/kmod_initrd", b"/proc/kmod_buildid"];
+                                      b"/proc/sys/fs/ovl_selftest", b"/proc/sys/kernel/random/boot_id", b"/proc/sys/kernel/random/uuid", b"/proc/kmod_initrd", b"/proc/kmod_buildid"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
                                    b"smaps_rollup", b"environ", b"uid_map", b"gid_map", b"setgroups", b"oom_score_adj", b"cgroup",
                                    b"mountinfo", b"mounts"];
@@ -9340,6 +9395,13 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     // them, so the open resolves and stats but neither creates nor truncates;
     // handle_read/handle_write refuse the resulting fd by inspecting O_PATH in
     // the stored flags.
+    // O_TMPFILE (__O_TMPFILE | O_DIRECTORY, x86_64 layout): no filesystem here
+    // can create an unnamed inode that linkat(2) later names. Linux answers
+    // EOPNOTSUPP for such a filesystem and every caller (ostree/glnx, glibc
+    // tmpfile, Python tempfile) then falls back to a named temp file plus
+    // rename. Before 2026-11-19 f2fs opened the directory read-write instead,
+    // so ostree's linkat(/proc/self/fd/N) failed ENOENT ("Creating repo: linkat").
+    if flags & 0o20200000 == 0o20200000 { return err_reply(-95); }
     let flags = if flags & O_PATH != 0 {
         flags & !(O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND | O_EXCL)
     } else {
@@ -9754,6 +9816,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(id) => VnodeKind::NsFd { kind: k as u8, id },
                 None     => return err_reply(-2),
             }
+        } else if let Some(tpid) = proc_ns_dir(lookup_path, pid) {
+            // /proc/<pid>/ns: the directory of namespace links.
+            if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
+            if flags & 0o3 != 0 { return err_reply(-21); } // EISDIR for write opens
+            match gen_proc_ns_dir(tpid) {
+                Some(v) => v,
+                None    => return err_reply(-23), // ENFILE: pool full
+            }
         } else if flags & 0o3 != 0 && proc_oom_target(lookup_path, pid).is_some() {
             let tpid = proc_oom_target(lookup_path, pid).unwrap();
             if sched::proc_stat_of(tpid).is_none() { return err_reply(-2); }
@@ -9992,6 +10062,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/proc/interrupts" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
                || lookup_path == b"/proc/sys/fs/file-nr"
+               || lookup_path == b"/proc/sys/kernel/random/boot_id" || lookup_path == b"/proc/sys/kernel/random/uuid"
                || lookup_path == b"/proc/sys/fs/ovl_selftest" {
             match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
                 Some(v) => {
@@ -12656,6 +12727,20 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
         if off == 0 && fds.iter().any(|&f| f >= next) { return err_reply(-22); } // EINVAL: buffer too small
         if !fds.iter().any(|&f| f >= next) { next = fds.last().map_or(from, |&l| l + 1).max(from); }
         set_dir_pos(&mut tbl.fds[fd], next + 2);
+        return val_reply(off as u64);
+    }
+
+    // `/proc/<pid>/ns` (see `gen_proc_ns_dir`): one symlink per namespace kind.
+    if dir_is_tmp && proc_ns_dir(dir_path, pid).is_some() {
+        let mut i = pos - 2;
+        while i < sched::ns::NS_NAMES.len() {
+            match write_dirent(buf, off, count, 0x6400_0000 + i as u64, sched::ns::NS_NAMES[i], 10) {
+                Some(r) => { off += r; i += 1; }
+                None => break,
+            }
+        }
+        if off == 0 && i < sched::ns::NS_NAMES.len() { return err_reply(-22); }
+        set_dir_pos(&mut tbl.fds[fd], i + 2);
         return val_reply(off as u64);
     }
 

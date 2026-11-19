@@ -862,6 +862,11 @@ mod nr {
     pub const FSCONFIG: usize = 431;
     pub const FSMOUNT: usize = 432;
     pub const FSPICK: usize = 433;
+    pub const ADD_KEY: usize = 217;
+    pub const REQUEST_KEY: usize = 218;
+    pub const KEYCTL: usize = 219;
+    pub const STATMOUNT: usize = 457;
+    pub const LISTMOUNT: usize = 458;
     pub const MOUNT_SETATTR: usize = 442;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
@@ -1157,6 +1162,11 @@ mod nr {
     pub const FSCONFIG: usize = 431;
     pub const FSMOUNT: usize = 432;
     pub const FSPICK: usize = 433;
+    pub const ADD_KEY: usize = 248;
+    pub const REQUEST_KEY: usize = 249;
+    pub const KEYCTL: usize = 250;
+    pub const STATMOUNT: usize = 457;
+    pub const LISTMOUNT: usize = 458;
     pub const MOUNT_SETATTR: usize = 442;
     pub const PIDFD_SEND_SIGNAL:   usize = 424;
     pub const PIDFD_GETFD:         usize = 438;
@@ -2662,6 +2672,11 @@ fn dispatch_inner(
         MOVE_MOUNT => sys_move_mount(a0, a1, a2, a3, a4),
         MOUNT_SETATTR => sys_mount_setattr(a0, a1, a2, a3, a4),
         FSOPEN | FSCONFIG | FSMOUNT | FSPICK => -38,
+
+        // Kernel keyrings and statmount/listmount: Linux without CONFIG_KEYS
+        // (or before 6.8) answers ENOSYS without a trace; podman/crun/systemd
+        // helpers probe them once and fall back (keyrings unused, mountinfo).
+        ADD_KEY | REQUEST_KEY | KEYCTL | STATMOUNT | LISTMOUNT => -38,
 
         _ => log_enosys(number),
     }
