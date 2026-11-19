@@ -7334,7 +7334,12 @@ fn handle_close(ms: &mut MountState, file_id: u64) -> Message {
         // e.g. every directory `rm -rf` removed through an open descriptor).
         // A mapping that outlives the last close is handled by `reap_orphans`.
         if was_open && ino != 0 && !ino_is_open(ms, ino) {
-            reclaim_orphan(ms, ino, false);
+            // Done with it: drop the id so a stale entry cannot outlive the
+            // inode (skipped when the cache is poisoned: a doomed run is
+            // undone and the inode lives on).
+            if reclaim_orphan(ms, ino, false) && !ms.cache.poisoned() {
+                ms.orphans.retain(|&i| i != ino);
+            }
         }
     }
     ok_reply()
@@ -7699,8 +7704,12 @@ fn reclaim_orphan(ms: &mut MountState, ino: u32, ignore_pins: bool) -> bool {
     if held { return false; }
     let a = nat_lookup(ms, ino);
     if a == 0 { return true; }
-    let (links, mode) = { let b = ms.cache.read(ms.dev, a as u64); (inode_links(b), inode_mode(b)) };
-    if links != 0 || mode == 0 { return true; }
+    // NAT(ino) may name a block that is no longer this inode: after the inode
+    // was reclaimed (close path) and a checkpoint, the nid is reused, e.g. for
+    // an indirect node whose word 3 is 0. Only the footer tells them apart.
+    let (links, mode, mine) = { let b = ms.cache.read(ms.dev, a as u64);
+        (inode_links(b), inode_mode(b), footer_nid(b) == ino && footer_ino(b) == ino) };
+    if !mine || links != 0 || mode == 0 { return true; }
     if !ignore_pins { mm::pagecache::drop_file(page_cache_key(ms.port, ino)); }
     free_inode_data_and_nodes(ms, ino);
     free_block(ms, a);

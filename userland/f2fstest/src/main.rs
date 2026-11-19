@@ -16,6 +16,8 @@ mod crash;
 mod full;
 mod fsyncsub;
 mod orphan;
+mod orphanreuse;
+mod ostree;
 mod trunc;
 
 /// argv[i] as a byte slice (no NUL).
@@ -60,6 +62,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 return if arg(argv, 1) == b"fullscan" { full::fullscan(dir, num(3, 100000)) }
                        else { full::fullchurn(dir, num(3, 1), num(4, 4000)) };
             }
+            b"ostree" => {
+                let num = |i: usize, d: u64| if argc as usize > i {
+                    arg(argv, i).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
+                } else { d };
+                return ostree::ostree(dir, num(3, 3).max(1), num(4, 6).max(1), num(5, 6000).max(1));
+            }
+            b"orphanreuse" => return orphanreuse::orphanreuse(dir),
             b"trunc_cold" => return trunc::trunc_cold(dir),
             b"mmaporphan" => return orphan::mmaporphan(dir),
             b"holdorphan" => return orphan::holdorphan(dir),
