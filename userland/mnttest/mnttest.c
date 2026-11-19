@@ -685,9 +685,18 @@ static void hardening_suite(void) {
         if (n < 0) _exit(53);
         b[n] = 0;
         if (strcmp(b, d) != 0) { printf("  fdlink %s -> %s\n", d, b); _exit(54); }
-        int nm = read_mi("/oldroot/proc/self/mountinfo");
-        for (int i = 0; i < nm; i++) if (MI[i].mp[0] != '/') { printf("  relative mountpoint '%s'\n", MI[i].mp); _exit(56); }
-        if (!find_mp(nm, d)) { printf("  no mountinfo line for %s (n=%d)\n", d, nm); _exit(55); }
+        { static char mib[32768];
+          int ml = slurp("/oldroot/proc/self/mountinfo", mib, sizeof mib - 1);
+          if (ml <= 0) _exit(56);
+          mib[ml] = 0;
+          /* every mountpoint absolute, and the self-bind listed where bwrap looks it up */
+          if (!strstr(mib, " /newroot/proc/sys ")) { printf("  no mountinfo line for /newroot/proc/sys (len=%d)\n", ml); _exit(55); }
+          if (!strstr(mib, " /newroot/dev/random ") || !strstr(mib, " /newroot/dev/urandom ")) _exit(57);
+          for (char *l = mib; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL) {
+              char *sp = l; int f = 0;
+              while (*sp && *sp != '\n' && f < 4) { if (*sp == ' ') f++; sp++; }
+              if (f == 4 && *sp != '/') { printf("  relative mountpoint in: %.60s\n", l); _exit(58); }
+          } }
         _exit(0);
     }
     waitpid(pid, &st, 0);
