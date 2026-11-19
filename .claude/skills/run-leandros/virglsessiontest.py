@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""virglsessiontest.py <audio|video|clickmove|udevhot|minimize|notifpanel|coreutils>
+"""virglsessiontest.py <audio|ffaudio|video|clickmove|udevhot|minimize|notifpanel|coreutils>
 
 Runs one of the virgl-COSMIC-session suites (or, for coreutils, the brush-guest
 coreutils suite) as a `host:` script of runtests.py; arch from LEANDROS_TEST_ARCH
@@ -54,6 +54,38 @@ if name == "audio":
     except (OSError, KeyError, ValueError, ZeroDivisionError) as e:
         print(f"audio {arch}: results unreadable: {e!r}")
         ok = False
+elif name == "ffaudio":
+    # Firefox (launched by ffsession.py exactly as in the Firefox suites) plays the 440 Hz wav
+    # as a media document; the QEMU wav capture is the host side of the guest sound device. It
+    # must hold >= 8 s of tone at a real level (the wav is RMS ~5700 at source), and
+    # the session must not log pf/segv/panic/wdog.
+    import math
+    import struct
+    wavp = os.path.join(out, "capture.wav")
+    env["LEANDROS_AUDIO_WAV"] = wavp
+    env["FFSESSION_OUT"] = out
+    page = os.path.join(out, "ffaudio.html")
+    open(page, "w").write('<html><title>ffaudio</title><body><audio autoplay loop controls '
+                          'src="file:///usr/share/sounds/leandros/tone-440-10s.wav"></audio></body></html>')
+    r = run([py, f"{HERE}/ffsession.py", arch, "ffaudio", "--url", "file:///tmp/ffaudio.html", "--put", f"{page}:/tmp/ffaudio.html",
+             "--wait", "40", "--prefs", "media.autoplay.default=0;media.autoplay.blocking_policy=0", "--post", "XDG_RUNTIME_DIR=/run/user/1000 /usr/bin/wpctl status"])
+    ok = False
+    try:
+        raw = open(wavp, "rb").read()[44:]
+        n = len(raw) // 4
+        left = struct.unpack(f"<{n * 2}h", raw[:n * 4])[0::2]
+        w = 44100 // 20
+        rms = [math.sqrt(sum(v * v for v in left[i:i + w]) / w) for i in range(0, len(left) - w, w)]
+        on = [x for x in rms if x > 200]
+        secs = len(on) / 20
+        mean = sum(on) / max(1, len(on))
+        slp = os.path.join(out, "run-ffaudio", "serial.log")
+        sl = open(slp, errors="replace").read() if os.path.exists(slp) else ""
+        bad = sum(sl.count(k) for k in ("SEGV", "[WDOG]", "KERNEL PANIC", "panicked at"))
+        ok = secs >= 8 and mean > 1000 and bad == 0
+        print(f"ffaudio {arch}: firefox tone {secs:.2f} s above RMS 200, mean RMS {mean:.0f}, capture {n} frames, bad={bad}")
+    except (OSError, ValueError, struct.error) as e:
+        print(f"ffaudio {arch}: capture unreadable: {e!r}")
 elif name == "video":
     r = run([py, f"{HERE}/videotest.py", arch, f"{rid}-vid"])
     ok = r.returncode == 0
