@@ -1927,6 +1927,7 @@ mod k2a {
         let o = unsafe { &mut *o };
         o.conn_type = 11; o.type_id = i as u32 + 1; o.connected = i == 0; o.nmodes = 1;
         o.modes[0] = KKmsTiming { clock_khz: 148500, h: [1920, 2008, 2052, 2200], v: [1080, 1084, 1089, 1125], flags: 5 };
+        if i == 0 { o.edid[0][1] = 0xff; o.edid[7][15] = 0x5a; o.edid_len = 128; }
         true
     }
     extern "C" fn oinfo(_c: usize, i: usize, o: *mut KKmsConnInfo) -> bool { fill(i, o) }
@@ -2022,6 +2023,7 @@ fn kmodkapi_k2a(t: &mut T) {
     let o = gpu_kms::outputs().unwrap();
     let i0 = (o.info)(0).unwrap();
     t.check((o.count)() == 2 && i0.conn_type == 11 && i0.connected && i0.nmodes == 1 && i0.modes[0].clock_khz == 148500 && i0.modes[0].h[3] == 2200 && i0.modes[0].flags == 5, "k2a: outputs info flattened");
+    t.check({ let e = i0.edid_vec(); e.len() == 128 && e[1] == 0xff && e[127] == 0x5a } && (o.info)(1).unwrap().edid_vec().is_empty(), "k2a: outputs EDID plumbed through KmsConnInfo");
     t.check((o.cached)(1).is_none() && (o.info)(2).is_none() && (o.crtc_mask)(1) == 2, "k2a: outputs cached/none/mask");
     t.check(reg(KIND_CURSOR2, &k2a::CU as *const _ as *const u8) == 0 && reg(KIND_PIPE2, &k2a::P2 as *const _ as *const u8) == 0, "k2a: pipe2 + its cursor registered");
     let p = gpu_kms::pipe2().unwrap();

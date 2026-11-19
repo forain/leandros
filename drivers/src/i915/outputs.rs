@@ -292,6 +292,7 @@ fn reprobe(i: usize) -> Option<KmsConnInfo> {
             inf.connected = true;
             if valid {
                 parse_edid(&edid, &mut inf);
+                inf.set_edid(&edid);
                 let cc = Conn { dp_khz, ..c };
                 let before = inf.nmodes;
                 let mut k = 0;

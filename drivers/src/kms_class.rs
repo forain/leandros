@@ -43,6 +43,7 @@ pub struct KKmsTiming { pub clock_khz: u32, pub h: [u16; 4], pub v: [u16; 4], pu
 pub struct KKmsConnInfo {
     pub conn_type: u32, pub type_id: u32, pub enc_type: u32, pub connected: bool,
     pub mm_w: u32, pub mm_h: u32, pub modes: [KKmsTiming; 4], pub nmodes: usize,
+    pub edid: [[u8; 16]; 8], pub edid_len: usize,
 }
 
 fn to_c_timing(t: &KmsTiming) -> KKmsTiming { KKmsTiming { clock_khz: t.clock_khz, h: t.h, v: t.v, flags: t.flags } }
@@ -51,7 +52,7 @@ fn from_c_info(i: &KKmsConnInfo) -> KmsConnInfo {
     let mut m = [KmsTiming::default(); 4];
     for k in 0..4 { m[k] = from_c_timing(&i.modes[k]); }
     KmsConnInfo { conn_type: i.conn_type, type_id: i.type_id, enc_type: i.enc_type, connected: i.connected,
-                  mm_w: i.mm_w, mm_h: i.mm_h, modes: m, nmodes: i.nmodes.min(4) }
+                  mm_w: i.mm_w, mm_h: i.mm_h, modes: m, nmodes: i.nmodes.min(4), edid: i.edid, edid_len: i.edid_len.min(128) }
 }
 
 #[repr(C)]

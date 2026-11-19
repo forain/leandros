@@ -259,7 +259,7 @@ pub mod kms {
     #[repr(C)] #[derive(Clone, Copy, Default)]
     struct KTiming { clock_khz: u32, h: [u16; 4], v: [u16; 4], flags: u32 }
     #[repr(C)] #[derive(Clone, Copy, Default)]
-    struct KConnInfo { conn_type: u32, type_id: u32, enc_type: u32, connected: bool, mm_w: u32, mm_h: u32, modes: [KTiming; 4], nmodes: usize }
+    struct KConnInfo { conn_type: u32, type_id: u32, enc_type: u32, connected: bool, mm_w: u32, mm_h: u32, modes: [KTiming; 4], nmodes: usize, edid: [[u8; 16]; 8], edid_len: usize }
 
     #[repr(C)] #[derive(Clone, Copy)]
     struct KBackendOps {
@@ -323,7 +323,7 @@ pub mod kms {
         let mut m = [KTiming::default(); 4];
         for k in 0..4 { m[k] = ctim(&i.modes[k]); }
         KConnInfo { conn_type: i.conn_type, type_id: i.type_id, enc_type: i.enc_type, connected: i.connected,
-                    mm_w: i.mm_w, mm_h: i.mm_h, modes: m, nmodes: i.nmodes.min(4) }
+                    mm_w: i.mm_w, mm_h: i.mm_h, modes: m, nmodes: i.nmodes.min(4), edid: i.edid, edid_len: i.edid_len }
     }
     #[allow(dead_code)] fn _unused(t: &KTiming) -> KmsTiming { tim(t) }
 
