@@ -218,7 +218,7 @@ def rawline_run(c, timeout, arch):
 
 
 SUITES = {
-    "ostree": ["/bin/f2fstest ostree /home/ostreetest"],
+    "ostree": ["/bin/f2fstest ostree /home/ostreetest 1 2 1500"],
     "orphanreuse": ["/bin/f2fstest orphanreuse /home/orphanreuse"],
     "regress": ["/bin/vttest", "/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/execdev", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
