@@ -909,7 +909,10 @@ static void hardening_suite(void) {
           if (stat(pl, &sp) != 0) { printf("  stat %s errno=%d\n", pl, errno); _exit(81); }
           if (!S_ISDIR(sp.st_mode) || sp.st_ino != s0.st_ino || sp.st_dev != s0.st_dev) { printf("  stat %s identity mismatch\n", pl); _exit(82); }
           if (mount_(pl, "/newroot", NULL, M_BIND | M_REC) != 0) { printf("  bind %s errno=%d\n", pl, errno); _exit(83); }
-          if (access("/newroot/bin", F_OK) != 0 && access("/newroot/lib", F_OK) != 0 && access("/newroot/man", F_OK) != 0) { printf("  bound dir empty\n"); _exit(84); } }
+          int n = 0; DIR *dd = opendir("/newroot"); struct dirent *de;
+          while (dd && (de = readdir(dd))) if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..")) n++;
+          if (dd) closedir(dd);
+          if (n == 0) { printf("  bound dir empty\n"); _exit(84); } }
         _exit(0);
     }
     waitpid(pid, &st, 0);

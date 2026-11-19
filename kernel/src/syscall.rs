@@ -9683,7 +9683,12 @@ fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
     if let Ok(raw) = copy_user_str(target_ptr, 4096) {
         if let Some((fd, b"")) = proc_own_fd(&raw) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
     }
-    ns_follow_links(resolve_user_path(target_ptr)?)
+    let rp = resolve_user_path(target_ptr)?;
+    // The same magic link spelled through a procfs mounted elsewhere
+    // (bwrap's "/oldroot" + "/proc/self/fd/N" after pivot_root): the backing
+    // path is /proc/..., so the descriptor is named the same way.
+    if let Some((fd, b"")) = proc_own_fd(rp.bytes()) { return KPath::from_ns(fd_mount_ns_path(fd)?); }
+    ns_follow_links(rp)
 }
 
 fn sys_mount(
