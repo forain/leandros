@@ -3494,6 +3494,7 @@ mod unixdg;
 pub mod rxpolicy;
 pub mod latestack;
 mod mcast;
+mod igmp3;
 mod udpany;
 mod syngate;
 mod sa;
@@ -3516,6 +3517,7 @@ fn init_nic(nif: drivers::netdev::Netif) {
     config.random_seed = sched::ticks() ^ sched::monotonic_ns();
 
     let mut interface = Interface::new(config, &mut device, stack_now());
+    interface.set_igmp_v3(true);
     // Linux's net.ipv4.ipfrag_time: an incomplete datagram's fragments are
     // dropped after 30 s (smoltcp's default is 60 s).
     interface.set_reassembly_timeout(smoltcp::time::Duration::from_secs(30));
@@ -3809,6 +3811,8 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
                                   sg: &mut alloc::vec::Vec<Sig>, sid: Sid,
                                   keys: &mut sched::WakeKeys) -> (bool, u64) {
     smoltcp::pmtu::set_expires_ms(sched::ns::mtu_expires_s() as u64 * 1000);
+    igmp3::set_poll_sid(sid);
+    igmp3::tick(s, dev, sid, timestamp);
     let mut gate = syngate::SynGate::new(dev);
     let (mut changed, mut mask) = (false, 0u64);
     let mut repolls = 0;
@@ -4079,6 +4083,10 @@ pub fn net_daemon() -> ! {
         let cadence_ns: u64 = if active { NET_CADENCE_NS.load(Ordering::Relaxed) }
             else if irq_driven { IDLE_CAP_NS }
             else { 10_000_000 };
+        if let Some(ns) = igmp3::next_due(now) {
+            let d = smoltcp::time::Duration::from_micros(ns.max(1_000_000) / 1000);
+            next_poll = Some(next_poll.map_or(d, |n| n.min(d)));
+        }
         let mut sleep_ns = match next_poll {
             Some(d) => (d.total_micros() * 1000).min(cadence_ns),
             None => cadence_ns,

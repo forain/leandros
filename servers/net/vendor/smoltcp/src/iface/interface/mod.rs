@@ -21,7 +21,7 @@ mod sixlowpan;
 mod igmp;
 
 #[cfg(feature = "proto-igmp")]
-pub use igmp::MulticastError;
+pub use igmp::{MulticastError, IGMP_QUERY_HOOK};
 
 use super::packet::*;
 
@@ -127,6 +127,13 @@ pub struct InterfaceInner {
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "proto-igmp")]
     igmp_report_state: IgmpReportState,
+    /// LEANDROS: IGMPv3 is spoken by the net server (`mcast.rs`): no v2
+    /// report or leave is sent from here and v3 queries go to its hook,
+    /// unless a v1/v2 querier was heard (`igmp_compat`).
+    #[cfg(feature = "proto-igmp")]
+    igmp_v3: bool,
+    #[cfg(feature = "proto-igmp")]
+    igmp_compat: Option<(IgmpVersion, Instant)>,
     /// LEANDROS: the TOS byte of the IPv4 packet being processed (handed to
     /// UDP sockets for IP_RECVTOS).
     pub(crate) rx_tos: u8,
@@ -246,6 +253,10 @@ impl Interface {
                 ipv6_multicast_groups: LinearMap::new(),
                 #[cfg(feature = "proto-igmp")]
                 igmp_report_state: IgmpReportState::Inactive,
+                #[cfg(feature = "proto-igmp")]
+                igmp_v3: false,
+                #[cfg(feature = "proto-igmp")]
+                igmp_compat: None,
                 #[cfg(feature = "medium-ieee802154")]
                 sequence_no,
                 #[cfg(feature = "medium-ieee802154")]

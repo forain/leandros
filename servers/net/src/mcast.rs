@@ -98,6 +98,12 @@ fn interface_set(sid: Sid, group: G, join: bool) -> Result<(), i32> {
                          else { s.interface.leave_multicast_group(dev, g, now) },
             None => return Err(-19),
         }
+    } else if sid >= iface::FIRST_DYN {
+        // A tap/tun/veth stack: the IGMPv3 reporter sends through the stack's
+        // own device; a v1/v2-compat report from here has no wire to take.
+        let mut dev = framedev::FrameDev { rx: Default::default(), tx: alloc::vec::Vec::new(), mtu: 1500 };
+        if join { s.interface.join_multicast_group(&mut dev, g, now) }
+        else { s.interface.leave_multicast_group(&mut dev, g, now) }
     } else {
         let Some(nif) = drivers::netdev::iter().find(|n| iface::sid_of(n.id) == sid) else { return Err(-19) };
         let mut dev = NicDevice::new(nif);
@@ -151,6 +157,7 @@ pub(crate) fn source(ofd: u32, op: SrcOp, group: G, addr: [u8; 4], ifindex: i32,
         if !matches!(op, SrcOp::Add) { return Err(EINVAL); }
         join_locked(&mut g, ofd, group, sid)?;
         FILTERS.lock().entry(ofd).or_default().push(Filter { group, sid, include: true, srcs: alloc::vec![src] });
+        note(&g, sid, group);
         return Ok(());
     }
     let mut fl = FILTERS.lock();
@@ -199,6 +206,7 @@ pub(crate) fn source(ofd: u32, op: SrcOp, group: G, addr: [u8; 4], ifindex: i32,
         memb_del(ofd, group);
         if !g.values().any(|v| v.contains(&(group, sid))) { let _ = interface_set(sid, group, false); }
     }
+    note(&g, sid, group);
     Ok(())
 }
 
@@ -233,6 +241,8 @@ pub(crate) fn msfilter_set(ofd: u32, group: G, addr: [u8; 4], ifindex: i32, incl
     v.retain(|x| !(x.group == group && x.sid == sid));
     if include || !list.is_empty() { v.push(Filter { group, sid, include, srcs: list }); }
     if v.is_empty() { fl.remove(&ofd); }
+    drop(fl);
+    note(&g, sid, group);
     Ok(())
 }
 
@@ -247,18 +257,54 @@ pub(crate) fn msfilter_get(ofd: u32, group: G, addr: [u8; 4], ifindex: i32) -> R
         .map_or((false, alloc::vec::Vec::new()), |f| (f.include, f.srcs.clone())))
 }
 
-/// Install the receive filter hook.
+/// Install the receive filter hook and the IGMPv3 query hook.
 pub(crate) fn init() {
     use core::sync::atomic::Ordering::Relaxed;
     let f: fn(u32, G, G) -> bool = src_accepts;
     smoltcp::socket::udp::MCAST_SRC_FILTER.store(f as usize, Relaxed);
+    let q: fn([u8; 4], &[u8]) -> bool = igmp3::query_hook;
+    smoltcp::iface::IGMP_QUERY_HOOK.store(q as usize, Relaxed);
+}
+
+/// The interface's state for `group` (RFC 3376 3.2): the union of every
+/// member socket's filter. All include: INCLUDE of the union of the lists;
+/// any exclude: EXCLUDE of the intersection of the exclude lists minus the
+/// union of the include lists. None: no socket is a member.
+fn iface_state(g: &Groups, sid: Sid, group: G) -> Option<igmp3::State> {
+    let fl = FILTERS.lock();
+    let (mut any, mut inc, mut exc): (bool, alloc::vec::Vec<G>, Option<alloc::vec::Vec<G>>) = (false, alloc::vec::Vec::new(), None);
+    for (ofd, mine) in g.iter() {
+        if !mine.contains(&(group, sid)) { continue; }
+        any = true;
+        let f = fl.get(ofd).and_then(|v| v.iter().find(|x| x.group == group && x.sid == sid));
+        let (include, srcs) = f.map_or((false, &[][..]), |f| (f.include, &f.srcs[..]));
+        if include { for s in srcs { if !inc.contains(s) { inc.push(*s); } } }
+        else {
+            exc = Some(match exc { None => srcs.to_vec(), Some(p) => p.into_iter().filter(|x| srcs.contains(x)).collect() });
+        }
+    }
+    if !any { return None; }
+    let a4 = |s: &G| [s[12], s[13], s[14], s[15]];
+    Some(match exc {
+        Some(x) => (false, x.iter().filter(|s| !inc.contains(s)).map(a4).collect()),
+        None => (true, inc.iter().map(a4).collect()),
+    })
+}
+
+/// Tell the IGMPv3 reporter that `group`'s state on `sid` may have changed
+/// (`GROUPS` held by the caller).
+fn note(g: &Groups, sid: Sid, group: G) {
+    if !is_v4(&group) { return; }
+    igmp3::changed(sid, [group[12], group[13], group[14], group[15]], iface_state(g, sid, group));
 }
 
 /// IP_ADD_MEMBERSHIP for description `ofd`.
 pub(crate) fn join(ofd: u32, group: G, addr: [u8; 4], ifindex: i32) -> Result<(), i32> {
     let sid = interface_of(group, addr, ifindex)?;
     let mut g = GROUPS.lock();
-    join_locked(&mut g, ofd, group, sid)
+    join_locked(&mut g, ofd, group, sid)?;
+    note(&g, sid, group);
+    Ok(())
 }
 
 type Groups = alloc::collections::BTreeMap<u32, alloc::vec::Vec<(G, Sid)>>;
@@ -288,6 +334,7 @@ pub(crate) fn leave(ofd: u32, group: G, addr: [u8; 4], ifindex: i32) -> Result<(
     drop_filter(ofd, group, sid);
     memb_del(ofd, group);
     if !g.values().any(|v| v.contains(&(group, sid))) { let _ = interface_set(sid, group, false); }
+    note(&g, sid, group);
     Ok(())
 }
 
@@ -300,6 +347,7 @@ pub(crate) fn release(ofd: u32) {
     let Some(mine) = g.remove(&ofd) else { return };
     for (group, sid) in mine {
         if !g.values().any(|v| v.contains(&(group, sid))) { let _ = interface_set(sid, group, false); }
+        note(&g, sid, group);
     }
 }
 
@@ -314,14 +362,16 @@ pub(crate) fn proc_igmp(out: &mut alloc::string::String) {
     let mut sids: alloc::vec::Vec<(Sid, alloc::string::String)> = alloc::vec![(LO, "lo".into())];
     for n in drivers::netdev::iter() { sids.push((iface::sid_of(n.id), n.name().into())); }
     for (sid, name) in sids {
+        let mut ver = 2u8;
         let groups: alloc::vec::Vec<[u8; 4]> = {
-            let stack = stack_for(sid);
-            let Some(s) = stack.as_ref() else { continue };
+            let mut stack = stack_for(sid);
+            let Some(s) = stack.as_mut() else { continue };
+            ver = s.interface.igmp_version(stack_now());
             s.interface.ipv4_multicast_groups().map(|a| a.0).collect()
         };
         let mut all = alloc::vec![[224u8, 0, 0, 1]];
         for g in groups { if !all.contains(&g) { all.push(g); } }
-        let _ = write!(out, "{}\t{:<10}: {:5}      V2\n", sid as u32 + 1, name, all.len());
+        let _ = write!(out, "{}\t{:<10}: {:5}      V{}\n", sid as u32 + 1, name, all.len(), ver);
         for g in all {
             let users = counts.iter().filter(|&&m| m == (m4(g), sid)).count().max(1);
             let _ = write!(out, "\t\t\t\t{:08X} {:5} 0:00000000\t\t0\n", u32::from_le_bytes(g), users);

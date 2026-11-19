@@ -170,6 +170,7 @@ fn make_stack(sid: Sid, mac: [u8; 6]) {
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
     config.random_seed = sched::ticks() ^ sched::monotonic_ns();
     let mut interface = Interface::new(config, &mut dev, stack_now());
+    interface.set_igmp_v3(true);
     interface.set_pmtu_scope(sid as u16);
     smoltcp::pmtu::clear_scope(sid as u16);
     *stack_for(sid) = Some(NetStack {
