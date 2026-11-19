@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """vkwlload.py -- vkwltest with a long run (VKWL_FRAMES, default 900) and /proc/drm/fence_stats captured before/after."""
+# SELF_BOOTS: vkwltest.py boots its own VM
 import os
 import runpy
 import sys
