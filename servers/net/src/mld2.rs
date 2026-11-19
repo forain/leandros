@@ -239,6 +239,7 @@ fn member(st: &State<A6>) -> bool { !(st.0 && st.1.is_empty()) }
 /// address list, send what is due.
 pub(crate) fn tick<D: Device>(s: &mut NetStack, dev: &mut D, sid: Sid, ts: Instant) {
     if sid == LO || !s.interface.igmp_v3_enabled() { return; }
+    #[allow(irrefutable_let_patterns)]
     let HardwareAddress::Ethernet(EthernetAddress(mac)) = s.interface.hardware_addr() else { return };
     let now = sched::monotonic_ns();
     let sol = solicited(s);
@@ -247,7 +248,7 @@ pub(crate) fn tick<D: Device>(s: &mut NetStack, dev: &mut D, sid: Sid, ts: Insta
         if let IpAddress::Ipv6(a) = c.address() { if a.is_link_local() { src = a.0; break; } }
     }
     let mut frames: Vec<Vec<u8>> = Vec::new();
-    let (mut chg, mut rep) = (false, 0usize);
+    let (chg, rep);
     {
         let mut v = V6.lock();
         if !v.contains_key(&sid) && sol.is_empty() { return; }
@@ -260,8 +261,8 @@ pub(crate) fn tick<D: Device>(s: &mut NetStack, dev: &mut D, sid: Sid, ts: Insta
         let compat = now < st.compat_until;
         let mut recs: Vec<Rec<A6>> = Vec::new();
         let mut v1: Vec<(u8, A6)> = Vec::new();
-        if !st.changes.is_empty() && now >= st.next_change {
-            chg = true;
+        chg = !st.changes.is_empty() && now >= st.next_change;
+        if chg {
             if compat {
                 for c in &st.changes {
                     let g = c.rec.group;
