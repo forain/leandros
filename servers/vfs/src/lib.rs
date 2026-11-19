@@ -8933,6 +8933,17 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
     if path.ends_with(b"/cmdline") || path.ends_with(b"/environ") {
         return gen_proc_args(pid, path.ends_with(b"/environ"));
     }
+    // A mount namespace's table is not bounded by the 2 KiB scratch buffer: a
+    // truncated mountinfo hides the newest mounts (bwrap --dev/--proc looks the
+    // mount it just made up in it, "Unable to find ... in mount table").
+    if path.ends_with(b"/mountinfo") || path.ends_with(b"/mounts") {
+        let ns = sched::ns::mntns_of(pid);
+        if ns != 0 {
+            if let Some(v) = mnt::render_tree(ns, path.ends_with(b"/mountinfo")) {
+                return proc_snapshot(b"/tmp/.proc_mnt", &v, false);
+            }
+        }
+    }
     let mut buf = [0u8; TMP_BUF_SIZE];
     let len = gen_proc_self_content(pid, path, &mut buf)?;
 

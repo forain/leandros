@@ -659,8 +659,8 @@ static void hardening_suite(void) {
         /* --ro-bind / /: the old tree rbind-ed into place, then --dev / --proc over it */
         if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) _exit(8);
         if (mount_("tmpfs", "/newroot/dev", "tmpfs", 0) != 0) _exit(7);
-        static const char *names[] = { "random", "urandom", "null" };
-        for (int i = 0; i < 3; i++) {
+        static const char *names[] = { "null", "zero", "full", "random", "urandom" };
+        for (int i = 0; i < 5; i++) {
             char s[96], d[96], l[64], b[256];
             snprintf(s, sizeof s, "/oldroot/dev/%s", names[i]);
             snprintf(d, sizeof d, "/newroot/dev/%s", names[i]);
