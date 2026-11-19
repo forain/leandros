@@ -458,6 +458,7 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         DRM_MODE_OBJECT_CONNECTOR_T if obj_id == DRM_CONNECTOR_ID => {
             if crate::virtio_gpu::primary_edid().is_some() { CONNECTOR_EDID } else { CONNECTOR }
         }
+        DRM_MODE_OBJECT_CONNECTOR_T if crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE).is_some_and(|i| ext_edid(i).is_some()) => CONNECTOR_EDID,
         DRM_MODE_OBJECT_CONNECTOR_T if crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE).is_some() => CONNECTOR,
         // obj_type 0 (DRM_MODE_OBJECT_ANY) or an unrecognised type: fall back
         // to the plane ids, which are the only unambiguous ones.
@@ -865,6 +866,9 @@ pub fn sysfs_connector(i: usize) -> Option<SysConn> {
             c.modes[k] = (t.h[0] as u32, t.v[0] as u32, hz);
             c.nmodes = k + 1;
         }
+        let e = inf.edid_vec();
+        c.edid[..e.len()].copy_from_slice(&e);
+        c.edid_len = e.len();
     }
     Some(c)
 }
@@ -3269,6 +3273,28 @@ static IN_FORMATS_BLOB: AtomicU32 = AtomicU32::new(0);
 /// Blob id of the primary connector's `EDID` property (the bytes sysfs `edid`
 /// serves); created on first use, 0 when the host gave no EDID.
 static EDID_BLOB: AtomicU32 = AtomicU32::new(0);
+
+/// Cached EDID of extra connector `i` (the same bytes sysfs `edid` serves).
+fn ext_edid(i: usize) -> Option<Vec<u8>> {
+    let inf = crate::gpu_kms::outputs().and_then(|o| (o.cached)(i))?;
+    let e = inf.edid_vec();
+    if inf.connected && !e.is_empty() { Some(e) } else { None }
+}
+
+/// Per-extra-connector `EDID` blob ids; a changed EDID (hot-plug of another
+/// sink) gets a fresh blob, a vanished one reads 0.
+static EXT_EDID_BLOB: [AtomicU32; crate::gpu_kms::EXT_MAX] = [const { AtomicU32::new(0) }; crate::gpu_kms::EXT_MAX];
+
+fn ext_edid_blob(i: usize) -> u32 {
+    let cur = EXT_EDID_BLOB[i].load(Ordering::Acquire);
+    let want = ext_edid(i);
+    let mut b = BLOBS.lock();
+    if cur != 0 && want.is_some() && b.get(&cur) == want.as_ref() { return cur; }
+    if cur != 0 { b.remove(&cur); }
+    let new = match want { Some(e) => { let id = NEXT_BLOB_ID.fetch_add(1, Ordering::Relaxed); b.insert(id, e); id } None => 0 };
+    EXT_EDID_BLOB[i].store(new, Ordering::Release);
+    new
+}
 
 fn edid_blob() -> u32 {
     let id = EDID_BLOB.load(Ordering::Acquire);
@@ -7840,7 +7866,10 @@ impl DrmDeviceInterface {
                 _ => DRM_PLANE_TYPE_PRIMARY as u64,
             },
             PROP_IN_FORMATS => in_formats_blob() as u64,
-            PROP_CONN_EDID => edid_blob() as u64,
+            PROP_CONN_EDID => match crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE) {
+                Some(i) => ext_edid_blob(i) as u64,
+                None => edid_blob() as u64,
+            },
             PROP_IN_FENCE_FD => -1i64 as u64,
             PROP_VRR_ENABLED => CRTC_VRR[(obj_id == DRM_CRTC2_ID) as usize].load(Ordering::Relaxed) as u64,
             PROP_CONN_CRTC_ID if two => {

@@ -243,6 +243,22 @@ pub struct KmsConnInfo {
     pub mm_h: u32,
     pub modes: [KmsTiming; 4],
     pub nmodes: usize,
+    /// EDID block 0 as read over DDC/AUX (`[[u8; 16]; 8]` = 128 bytes, kept
+    /// nested so `Default` derives); `edid_len` 0 = none / invalid.
+    pub edid: [[u8; 16]; 8],
+    pub edid_len: usize,
+}
+
+impl KmsConnInfo {
+    /// The raw EDID bytes, empty when the sink gave no valid one.
+    pub fn edid_vec(&self) -> alloc::vec::Vec<u8> {
+        if self.edid_len == 0 { return alloc::vec::Vec::new(); }
+        self.edid.iter().flatten().copied().take(self.edid_len.min(128)).collect()
+    }
+    pub fn set_edid(&mut self, e: &[u8; 128]) {
+        for (k, c) in self.edid.iter_mut().enumerate() { c.copy_from_slice(&e[k * 16..k * 16 + 16]); }
+        self.edid_len = 128;
+    }
 }
 
 pub struct KmsOutputs {
