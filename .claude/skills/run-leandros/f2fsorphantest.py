@@ -52,8 +52,8 @@ spec.loader.exec_module(fsckmod)
 
 
 
-def relabel(img):
-    name = LABEL.encode("utf-16-le")
+def relabel(img, label=LABEL):
+    name = label.encode("utf-16-le")
     with open(img, "r+b") as f:
         for base in (0, 4096):
             f.seek(base + 1024 + 124)
@@ -84,6 +84,7 @@ def main(argv):
     subprocess.run([sys.executable, os.path.join(REPO, "scripts", "mkfs-f2fs-home.py"), "create", img,
                     "--size", "64M"], check=True, stdout=subprocess.DEVNULL)
     relabel(img)
+    extra0 = os.environ.get("LEANDROS_QEMU_EXTRA", "")
     pci = "virtio-blk-pci,drive=orphdisk" + (",disable-legacy=on" if arch == "aarch64" else "")
     os.environ["LEANDROS_QEMU_EXTRA"] = (os.environ.get("LEANDROS_QEMU_EXTRA", "") +
                                          f" -drive if=none,id=orphdisk,format=raw,file={img} -device {pci}").strip()
@@ -168,6 +169,31 @@ def main(argv):
     driver.cmd_stop()
     rc, o = fsck_out(img, strict=True)
     check("ro phase: fsck --strict-leaks", rc == 0, o.strip()[-200:])
+
+    # Phase 3 (lane homenotdir): stale orphan ids must not reclaim reused nids.
+    # Needs more room than the 64 MiB image: its own 512 MiB disk and label.
+    label2 = "f2fsreuse-test"
+    img2 = os.path.join(out, "reuse.img")
+    if os.path.exists(img2):
+        os.unlink(img2)
+    subprocess.run([sys.executable, os.path.join(REPO, "scripts", "mkfs-f2fs-home.py"), "create", img2,
+                    "--size", "512M"], check=True, stdout=subprocess.DEVNULL)
+    relabel(img2, label2)
+    pci2 = "virtio-blk-pci,drive=reusedisk" + (",disable-legacy=on" if arch == "aarch64" else "")
+    os.environ["LEANDROS_QEMU_EXTRA"] = (extra0 + f" -drive if=none,id=reusedisk,format=raw,file={img2} -device {pci2}").strip()
+    boot()
+    r = run(f"mkdir -p /mnt/or && mount -t f2fs LABEL={label2} /mnt/or && echo MOUNT_OK || echo MOUNT_FAIL", 120)
+    check("orphanreuse: mount", "MOUNT_OK" in r)
+    r = run("/bin/f2fstest orphanreuse /mnt/or/orphanreuse; echo RC=$?", 900)
+    check("orphanreuse: guest", "orphanreuse: PASS" in r and "FAIL" not in r, r.strip()[-200:])
+    r = run("umount /mnt/or && echo UMOUNT_OK", 120)
+    check("orphanreuse: umount", "UMOUNT_OK" in r)
+    driver.cmd_stop()
+    rc, o = fsck_out(img2, strict=True)
+    rc2, o2 = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "fsck-f2fs.py"), img2, "--strict-links"],
+                             capture_output=True, text=True, timeout=600).returncode, ""
+    check("orphanreuse: fsck --strict-leaks", rc == 0, o.strip()[-300:])
+    check("orphanreuse: fsck --strict-links", rc2 == 0, "")
 
     print("f2fsorphantest:", "PASS" if not fails else f"FAIL ({', '.join(fails)})", flush=True)
     return 0 if not fails else 1

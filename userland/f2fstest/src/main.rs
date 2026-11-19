@@ -16,6 +16,7 @@ mod crash;
 mod full;
 mod fsyncsub;
 mod orphan;
+mod orphanreuse;
 mod ostree;
 mod trunc;
 
@@ -67,6 +68,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 } else { d };
                 return ostree::ostree(dir, num(3, 3).max(1), num(4, 6).max(1));
             }
+            b"orphanreuse" => return orphanreuse::orphanreuse(dir),
             b"trunc_cold" => return trunc::trunc_cold(dir),
             b"mmaporphan" => return orphan::mmaporphan(dir),
             b"holdorphan" => return orphan::holdorphan(dir),

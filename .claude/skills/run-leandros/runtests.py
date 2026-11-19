@@ -219,6 +219,7 @@ def rawline_run(c, timeout, arch):
 
 SUITES = {
     "ostree": ["/bin/f2fstest ostree /home/ostreetest"],
+    "orphanreuse": ["/bin/f2fstest orphanreuse /home/orphanreuse"],
     "regress": ["/bin/vttest", "/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/execdev", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", RAWLINE_CHECK, SYSFS_CHECK,
@@ -228,6 +229,7 @@ SUITES = {
                 "/bin/f2fstest trunc_cold /home",
                 # ostree-pull-shaped churn on f2fs /home (lane homenotdir)
                 "/bin/f2fstest ostree /home/ostreetest",
+                "/bin/f2fstest orphanreuse /home/orphanreuse",
                 SYNCFILE_CHECK, CFGWRITE_CHECK, LONGLINE_CHECK,
                 # Nested epoll sets on the ready list: LT/ET/ONESHOT/close/dup
                 # cases, and probes per call of a cosmic-comp-shaped set.
