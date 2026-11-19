@@ -31,6 +31,7 @@ REPO = driver.REPO_ROOT
 ARCH = os.environ.get("LEANDROS_TEST_ARCH") or (sys.argv[1] if len(sys.argv) > 1 else "x86_64")
 FRAMES = int(os.environ.get("VKWL_FRAMES", "60"))
 ROUTE = os.environ.get("VKWL_ROUTE", "sw")
+STATS = os.environ.get("VKWL_STATS") == "1"  # opt-in: cat /proc/drm/fence_stats before/after the run
 PUSH = [sys.executable, os.path.join(REPO, "scripts/pi-serial-push.py"), "--port", "unix:" + driver.SERIAL_SOCK]
 ENV = dict(os.environ, LEANDROS_PI_SERIAL="unix:" + driver.SERIAL_SOCK, LEANDROS_PI_LOGIN="root:root")
 DRV = [sys.executable, os.path.join(HERE, "driver.py")]
@@ -88,9 +89,13 @@ def main():
         if sock == "wayland-1" and "wayland-1" not in o.split("WAITED=")[-1]:
             print(guest("ls -l /run/user/0; tail -n 40 /run/user/0/cosmic.log; ps | tail -n 30", timeout=60)[1][-3500:])
         guest("sleep 20", timeout=60)  # outputs probed before a client's surface gets a configure
+        if STATS:
+            print("FENCE_STATS before:\n" + guest("cat /proc/drm/fence_stats", timeout=60)[1], flush=True)
         rc, o = guest(f"XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY={sock} /bin/vkwl {ROUTE} {FRAMES} quiet",
                       timeout=600)
         print("\n".join(o.strip().splitlines()[-30:]), flush=True)
+        if STATS:
+            print("FENCE_STATS after:\n" + guest("cat /proc/drm/fence_stats", timeout=60)[1], flush=True)
         m = re.search(r"vkwl done, failures = (\d+)", o)
         check("vkwl: 0 failures", bool(m) and m.group(1) == "0", m.group(0) if m else "no summary line")
         for t in ("wl_display_connect", "queue_present_all_frames", "compositor_frame_callbacks"):
