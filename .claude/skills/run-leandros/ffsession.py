@@ -452,8 +452,12 @@ PANELTRACE = "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
 # runs the panel with WAYLAND_DEBUG=1 and samples the panel's threads in
 # /proc/sysstat ('w' lines: state, syscall, time in it) every 0.2 s for 30 s.
 PANEL_SAMP = r"""P=$1; S=$2; i=0
+# Also sample the bus daemons' threads (lane panelprof): the panel's first
+# step is a blocking session-bus connect, so a stall shows up in busd too.
+B=$P; for d in /proc/[0-9]*; do read c <$d/comm; [ "$c" = busd ] && B="$B|${d#/proc/}"; done 2>/dev/null
+echo "busd tgids: $B" >>$S
 while [ $i -lt 120 ]; do read u x </proc/uptime; echo "@ $u" >>$S
-if [ $((i%8)) = 0 ]; then grep -E "^(w [0-9]+|t [0-9]+|s) $P " /proc/sysstat; else grep -E "^w [0-9]+ $P " /proc/sysstat; fi | cut -c1-110 >>$S; i=$((i+1)); sleep 0.15; done
+if [ $((i%8)) = 0 ]; then grep -E "^(w [0-9]+|t [0-9]+|s) ($B) " /proc/sysstat; else grep -E "^w [0-9]+ ($B) " /proc/sysstat; fi | cut -c1-110 >>$S; i=$((i+1)); sleep 0.15; done
 echo END >>$S; grep -E "^([st] [0-9]+|s) $P " /proc/sysstat >>$S
 """
 PANEL_WRAP = r"""#!/bin/sh
@@ -461,8 +465,16 @@ U=$(id -u); S=/tmp/plsamp-$U.log
 read u x </proc/uptime; echo "start up=$u x rt=$(date +%s%N) pid=$$" >>$S
 /bin/sh /usr/libexec/lrf/plsamp.sh $$ $S </dev/null >/dev/null 2>>$S &
 export WAYLAND_DEBUG=1
+[ -n "$PANEL_RUST_LOG" ] && export RUST_LOG="$PANEL_RUST_LOG"
+[ -r /usr/libexec/lrf/panel-rust-log ] && export RUST_LOG="$(cat /usr/libexec/lrf/panel-rust-log)"
 exec /usr/libexec/lrf/cosmic-panel "$@" >>/tmp/cosmic-panel-$U.log 2>&1
 """
+
+
+# Default on under --paneltrace: zbus=trace timestamps the session-bus connect
+# (SpaceContainer::new blocks on it); FFS_PANEL_RUST_LOG=off disables it.
+PANEL_RUST_LOG = os.environ.get("FFS_PANEL_RUST_LOG", "info,zbus=trace")
+PANEL_RUST_LOG = "" if PANEL_RUST_LOG == "off" else PANEL_RUST_LOG
 
 
 def install_panel_wrap():
@@ -473,6 +485,10 @@ def install_panel_wrap():
     open(f"{OUT}/plsamp.sh", "w").write(PANEL_SAMP)
     put_file(f"{OUT}/plsamp.sh", "/usr/libexec/lrf/plsamp.sh")
     sh("chmod 755 /bin/cosmic-panel")
+    # FFS_PANEL_RUST_LOG=<filter>: the panel's own tracing (e.g. zbus=trace)
+    # timestamps each startup step; the session env does not reach the panel.
+    rl = PANEL_RUST_LOG
+    sh(f"echo '{rl}' >/usr/libexec/lrf/panel-rust-log" if rl else "rm -f /usr/libexec/lrf/panel-rust-log")
 
 
 def panel_diag():
@@ -488,6 +504,9 @@ def panel_diag():
          "echo \"$c $(cut -d' ' -f22 $d/stat)\";; esac; done 2>/dev/null")
     o = sh(c, 120)
     open(f"{OUT}/paneltrace.txt", "w").write(o)
+    if PANEL_RUST_LOG:
+        open(f"{OUT}/panel-rustlog.txt", "w").write(
+            sh(f"grep -v -e ' wl_' -e '-> ' {L} | head -n 250 | cut -c1-200", 120))
     try:
         st = re.search(r"start up=([\d.]+) \S+ rt=(\d+)", o)
         up0, rt0 = float(st.group(1)), int(st.group(2))
