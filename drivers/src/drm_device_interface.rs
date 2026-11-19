@@ -271,6 +271,8 @@ const PROP_VRR_ENABLED: u32 = 62;
 /// descriptor / DP MSA_TIMING_PAR_IGNORED (TODO.md "VRR").
 const PROP_VRR_CAPABLE: u32 = 71;
 const PROP_CONN_CRTC_ID: u32 = 70;
+/// Connector `EDID` (immutable blob): the primary connector's host EDID.
+const PROP_CONN_EDID: u32 = 72;
 
 // drm_mode_object types (used as OBJECT-property value types).
 const DRM_MODE_OBJECT_CRTC: u64 = 0xcccc_cccc;
@@ -345,6 +347,7 @@ static PROPS: &[PropDef] = &[
     prop(PROP_CONN_CRTC_ID, b"CRTC_ID\0", PropKind::Object(DRM_MODE_OBJECT_CRTC)),
     prop(PROP_VRR_ENABLED, b"VRR_ENABLED\0", PropKind::Range(0, 1)),
     prop(PROP_VRR_CAPABLE, b"vrr_capable\0", PropKind::Range(0, 1)),
+    prop(PROP_CONN_EDID, b"EDID\0", PropKind::Blob),
 ];
 
 fn prop_def(id: u32) -> Option<&'static PropDef> {
@@ -414,6 +417,7 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
     ];
     const CRTC: &[u32] = &[PROP_ACTIVE, PROP_MODE_ID, PROP_VRR_ENABLED];
     const CONNECTOR: &[u32] = &[PROP_CONN_CRTC_ID, PROP_VRR_CAPABLE];
+    const CONNECTOR_EDID: &[u32] = &[PROP_CONN_CRTC_ID, PROP_VRR_CAPABLE, PROP_CONN_EDID];
     // With a KMS backend (gpu_kms): IN_FORMATS on the primary (so smithay
     // allocates with the modifiers the backend can scan out), and a cursor
     // plane only when the backend has a hardware cursor (`gpu_kms::cursor`).
@@ -451,7 +455,9 @@ fn object_props(obj_id: u32, obj_type: u32) -> &'static [u32] {
         },
         DRM_MODE_OBJECT_CRTC_T if obj_id == DRM_CRTC_ID => CRTC,
         DRM_MODE_OBJECT_CRTC_T if obj_id == DRM_CRTC2_ID && crate::gpu_kms::extra_crtcs() > 0 => CRTC,
-        DRM_MODE_OBJECT_CONNECTOR_T if obj_id == DRM_CONNECTOR_ID => CONNECTOR,
+        DRM_MODE_OBJECT_CONNECTOR_T if obj_id == DRM_CONNECTOR_ID => {
+            if crate::virtio_gpu::primary_edid().is_some() { CONNECTOR_EDID } else { CONNECTOR }
+        }
         DRM_MODE_OBJECT_CONNECTOR_T if crate::gpu_kms::ext_index(obj_id, crate::gpu_kms::EXT_CONN_BASE).is_some() => CONNECTOR,
         // obj_type 0 (DRM_MODE_OBJECT_ANY) or an unrecognised type: fall back
         // to the plane ids, which are the only unambiguous ones.
@@ -814,6 +820,9 @@ pub struct SysConn {
     pub nmodes: usize,
     /// width, height, refresh Hz
     pub modes: [(u32, u32, u32); 17],
+    /// Raw EDID (up to 256 bytes); `edid_len` 0 = none.
+    pub edid: [u8; 256],
+    pub edid_len: usize,
 }
 
 /// Is there a DRM device whose GETCONNECTOR works?
@@ -827,7 +836,7 @@ fn sysfs_drm_present() -> bool {
 /// Connector `i` (0 = the primary, 1.. = the backend's extras), `None` past the end.
 pub fn sysfs_connector(i: usize) -> Option<SysConn> {
     if !sysfs_drm_present() { return None; }
-    let mut c = SysConn { conn_type: 0, type_id: 0, connected: false, nmodes: 0, modes: [(0, 0, 0); 17] };
+    let mut c = SysConn { conn_type: 0, type_id: 0, connected: false, nmodes: 0, modes: [(0, 0, 0); 17], edid: [0; 256], edid_len: 0 };
     if i == 0 {
         c.conn_type = if crate::gpu_kms::internal_panel() { 14 } else { 11 };
         c.type_id = 1;
@@ -835,6 +844,11 @@ pub fn sysfs_connector(i: usize) -> Option<SysConn> {
         let (sizes, n) = primary_modes();
         for k in 0..n { c.modes[k] = (sizes[k].0, sizes[k].1, 60); }
         c.nmodes = n;
+        if let Some(e) = crate::virtio_gpu::primary_edid() {
+            let l = e.len().min(256);
+            c.edid[..l].copy_from_slice(&e[..l]);
+            c.edid_len = l;
+        }
         return Some(c);
     }
     let e = i - 1;
@@ -3251,6 +3265,22 @@ fn mode_refused(w: u32, h: u32, what: &str) -> bool {
 /// IN_FORMATS blob (struct drm_format_modifier_blob) for the primary plane,
 /// created on first use while a KMS backend is registered; 0 otherwise.
 static IN_FORMATS_BLOB: AtomicU32 = AtomicU32::new(0);
+
+/// Blob id of the primary connector's `EDID` property (the bytes sysfs `edid`
+/// serves); created on first use, 0 when the host gave no EDID.
+static EDID_BLOB: AtomicU32 = AtomicU32::new(0);
+
+fn edid_blob() -> u32 {
+    let id = EDID_BLOB.load(Ordering::Acquire);
+    if id != 0 { return id; }
+    let Some(e) = crate::virtio_gpu::primary_edid() else { return 0 };
+    let new = NEXT_BLOB_ID.fetch_add(1, Ordering::Relaxed);
+    BLOBS.lock().insert(new, e);
+    match EDID_BLOB.compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => new,
+        Err(cur) => { BLOBS.lock().remove(&new); cur }
+    }
+}
 
 fn in_formats_blob() -> u32 {
     let Some(b) = crate::gpu_kms::backend() else { return 0 };
@@ -7810,6 +7840,7 @@ impl DrmDeviceInterface {
                 _ => DRM_PLANE_TYPE_PRIMARY as u64,
             },
             PROP_IN_FORMATS => in_formats_blob() as u64,
+            PROP_CONN_EDID => edid_blob() as u64,
             PROP_IN_FENCE_FD => -1i64 as u64,
             PROP_VRR_ENABLED => CRTC_VRR[(obj_id == DRM_CRTC2_ID) as usize].load(Ordering::Relaxed) as u64,
             PROP_CONN_CRTC_ID if two => {
@@ -7932,7 +7963,7 @@ impl DrmDeviceInterface {
 
         unsafe {
             ptr::write_unaligned((arg + 20) as *mut u32, prop_flags(def.kind)
-                | if def.id == PROP_VRR_CAPABLE { DRM_MODE_PROP_IMMUTABLE } else { 0 });
+                | if def.id == PROP_VRR_CAPABLE || def.id == PROP_CONN_EDID { DRM_MODE_PROP_IMMUTABLE } else { 0 });
             // name[32] — zero the field first so a shorter name never inherits
             // the caller's stack bytes.
             ptr::write_bytes((arg + 24) as *mut u8, 0, 32);
@@ -8101,7 +8132,7 @@ impl DrmDeviceInterface {
                         else if b_on && obj == DRM_CRTC2_ID { want_vrr[1] = Some(val as u32); }
                         else { return Err(DriverError::InvalidParameter); }
                     }
-                    PROP_VRR_CAPABLE => return Err(DriverError::InvalidParameter),
+                    PROP_VRR_CAPABLE | PROP_CONN_EDID => return Err(DriverError::InvalidParameter),
                     PROP_ACTIVE if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_active_b = Some(val); }
                     PROP_MODE_ID if b_on && obj == DRM_CRTC2_ID => { touch_b = true; want_mode_b = Some(val); }
                     PROP_ACTIVE => {

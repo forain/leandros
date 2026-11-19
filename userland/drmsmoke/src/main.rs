@@ -679,6 +679,47 @@ fn sysfs_connector_matches(ty: u32, id: u32, connection: u32, count_modes: u32) 
     n >= 0 && b[..n as usize].iter().filter(|&&c| c == b'\n').count() as u32 == count_modes.min(if connection == 1 { 99 } else { 0 })
 }
 
+/// The connector's `EDID` property blob (DRM_IOCTL_MODE_GETPROPBLOB) compared
+/// with `/sys/class/drm/card0-<TYPE>-<n>/edid`. Passes when the connector
+/// has no EDID property and the sysfs file is empty (Linux behaviour), or when
+/// the sysfs bytes equal the blob and start with the 00 FF*6 00 header.
+unsafe fn sysfs_edid_matches(fd: c_int, conn: u32, ty: u32, id: u32) -> bool {
+    const OBJ_GETPROPERTIES: c_ulong = 0xC02064B9;
+    const GETPROPERTY: c_ulong = 0xC04064AA;
+    const GETPROPBLOB: c_ulong = 0xC01064AC;
+    let mut sys = [0u8; 512];
+    let sn = read_conn_attr(ty, id, b"edid", &mut sys);
+    if sn < 0 { return false; }
+    let sn = sn as usize;
+    let mut ids = [0u32; 16];
+    let mut vals = [0u64; 16];
+    // struct drm_mode_obj_get_properties { u64 props_ptr, values_ptr; u32 count, obj_id, obj_type; }
+    let mut req = [0u64; 4];
+    req[0] = ids.as_mut_ptr() as u64;
+    req[1] = vals.as_mut_ptr() as u64;
+    req[2] = 16 | (conn as u64) << 32;
+    req[3] = 0xc0c0c0c0; // DRM_MODE_OBJECT_CONNECTOR
+    if ioctl(fd, OBJ_GETPROPERTIES, &mut req as *mut _) != 0 { return false; }
+    let n = ((req[2] & 0xFFFF_FFFF) as usize).min(16);
+    for k in 0..n {
+        // struct drm_mode_get_property: prop_id at 16, name[32] at 24
+        let mut gp = [0u64; 8];
+        gp[2] = ids[k] as u64;
+        if ioctl(fd, GETPROPERTY, &mut gp as *mut _) != 0 { continue; }
+        let name = core::slice::from_raw_parts((gp.as_ptr() as *const u8).add(24), 5);
+        if name != b"EDID\0" { continue; }
+        let mut blob = [0u8; 512];
+        let mut gb = [0u64; 2];
+        gb[0] = vals[k] | 512u64 << 32;
+        gb[1] = blob.as_mut_ptr() as u64;
+        if vals[k] == 0 || ioctl(fd, GETPROPBLOB, &mut gb as *mut _) != 0 { return false; }
+        let bl = (gb[0] >> 32) as usize;
+        return bl >= 128 && bl == sn && blob[..bl] == sys[..bl]
+            && blob[..8] == [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0];
+    }
+    sn == 0
+}
+
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
         write(1, name.as_ptr() as *const c_void, name.len());
@@ -2364,6 +2405,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if !report_errno(b"GETCONNECTOR", conn_ok, conn_errno) { failures += 1; }
     // /sys/class/drm/card0-<TYPE>-<n>/{status,modes} agree with GETCONNECTOR.
     if conn_ok && !report(b"SYSFS_CONNECTOR", sysfs_connector_matches(conn2.connector_type, conn2.connector_type_id, conn2.connection, conn2.count_modes)) { failures += 1; }
+
+    if conn_ok && !report(b"SYSFS_EDID", unsafe { sysfs_edid_matches(fd, connector_id, conn2.connector_type, conn2.connector_type_id) }) { failures += 1; }
 
     let w = if modes[0].hdisplay > 0 { modes[0].hdisplay as u32 } else { 256 };
     let h = if modes[0].vdisplay > 0 { modes[0].vdisplay as u32 } else { 256 };

@@ -3111,7 +3111,29 @@ impl VirtioGpuDevice {
         }
         None
     }
+
+    /// VIRTIO_GPU_CMD_GET_EDID for `scanout`: the host's EDID block(s), or
+    /// `None` without VIRTIO_GPU_F_EDID / on a failed or empty reply.
+    /// Request: header + `scanout` u32 + padding u32. Reply: header +
+    /// `size` u32 + padding u32 + `edid[1024]`.
+    pub fn get_edid(&mut self, scanout: u32) -> Option<Vec<u8>> {
+        const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
+        if !self.has_feature(VIRTIO_GPU_F_EDID) { return None; }
+        let mut req = [0u8; 8];
+        req[..4].copy_from_slice(&scanout.to_le_bytes());
+        let resp = self.send_command(VirtioGpuCmd::GetEdid, &req).ok()?;
+        if u32::from_le_bytes(resp.get(0..4)?.try_into().ok()?) != VIRTIO_GPU_RESP_OK_EDID { return None; }
+        let size = u32::from_le_bytes(resp.get(24..28)?.try_into().ok()?) as usize;
+        let e = resp.get(32..32 + size.min(1024))?;
+        if e.len() >= 128 && e[..8] == [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0] { Some(e.to_vec()) } else { None }
+    }
 }
+
+/// EDID of scanout 0, fetched once at console setup (sysfs `edid` and the
+/// connector's `EDID` property blob read this).
+static PRIMARY_EDID: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
+
+pub fn primary_edid() -> Option<Vec<u8>> { PRIMARY_EDID.lock().clone() }
 
 /// The reply-needing (synchronous) control-queue commands, written once for
 /// two ways of holding the device:
@@ -3906,6 +3928,8 @@ pub fn setup_console_framebuffer(default_width: u32, default_height: u32) -> Opt
 
     let mut guard = VIRTIO_GPU.lock();
     let gpu = guard.as_mut()?;
+
+    if let Some(e) = gpu.get_edid(0) { *PRIMARY_EDID.lock() = Some(e); }
 
     // Prefer the display's reported mode; fall back to the caller's default.
     let (width, height) = match gpu.get_display_info() {
