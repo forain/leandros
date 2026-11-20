@@ -2898,6 +2898,163 @@ static void flatrun4_suite(void) {
     report("synth_etc_xattr_enodata", nn_in_child(fr4_synth_xattr, 0));
 }
 
+/* A file bind mount onto a regular file living on a tmpfs must stay visible (bwrap --ro-bind). */
+#define FB_FAIL(code, name) do { printf("  fb m=%d step=%s errno=%d mode=%o size=%lld\n", m, name, errno, (unsigned)fb_st.st_mode, (long long)fb_st.st_size); return code; } while (0)
+static struct stat fb_st;
+static int fb_check(int m, const char *f, const char *want, const char *tag) {
+    struct stat a, h; char buf[16] = {0}, hb[16] = {0};
+    memset(&fb_st, 0, sizeof fb_st);
+    if (stat(f, &a) != 0) { char n[48]; snprintf(n, sizeof n, "%s:stat", tag); FB_FAIL(20, n); }
+    fb_st = a;
+    if (!S_ISREG(a.st_mode)) { char n[48]; snprintf(n, sizeof n, "%s:notreg", tag); FB_FAIL(21, n); }
+    if (lstat(f, &h) != 0) { char n[48]; snprintf(n, sizeof n, "%s:lstat", tag); FB_FAIL(22, n); }
+    if (want == NULL) {
+        if (stat("/etc/hostname", &h) != 0 || a.st_size != h.st_size) { char n[48]; snprintf(n, sizeof n, "%s:size", tag); FB_FAIL(23, n); }
+        int hf = open("/etc/hostname", O_RDONLY); if (hf >= 0) { read(hf, hb, 8); close(hf); }
+    } else {
+        if (a.st_size != (off_t)strlen(want)) { char n[48]; snprintf(n, sizeof n, "%s:size", tag); FB_FAIL(23, n); }
+        strncpy(hb, want, 8);
+    }
+    int fd = open(f, O_RDONLY);
+    if (fd < 0) { char n[48]; snprintf(n, sizeof n, "%s:open", tag); FB_FAIL(24, n); }
+    ssize_t n = read(fd, buf, 8); close(fd);
+    if (n < 0) { char nm[48]; snprintf(nm, sizeof nm, "%s:read", tag); FB_FAIL(25, nm); }
+    if (strncmp(buf, hb, 6) != 0) { char nm[48]; snprintf(nm, sizeof nm, "%s:content", tag); FB_FAIL(26, nm); }
+    return 0;
+}
+static int fb_case(int m) {
+    char base[96], x[128], fp[64], src[64];
+    int r = fr3_enter(m & 2);
+    if (r) return r;
+    int disk = m & 1, pivot = m & 4, stack = m & 8, fd;
+    memset(&fb_st, 0, sizeof fb_st);
+    char b0[64] = "", nr[96] = "";
+    if (pivot) {
+        snprintf(b0, sizeof b0, "/tmp/fbp%d", m); mkdir(b0, 0755);
+        if (mountd_("tmpfs", b0, "tmpfs", 6, "mode=0755") != 0) FB_FAIL(2, "tmpfs-base0");
+        snprintf(x, sizeof x, "%s/oldroot", b0); mkdir(x, 0755);
+        snprintf(nr, sizeof nr, "%s/newroot", b0); mkdir(nr, 0755);
+        if (mount_("/", nr, NULL, M_BIND | M_REC) != 0) FB_FAIL(3, "rbind-root");
+        snprintf(base, sizeof base, "%s/tmp", nr);
+        if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FB_FAIL(4, "tmpfs-newroot-tmp");
+    } else if (disk) {
+        if (m & 2) { snprintf(base, sizeof base, "/root/fbd%d", (int)getpid()); }
+        else snprintf(base, sizeof base, "/root/fbd%d", (int)getpid());
+        if (mkdir(base, 0755) != 0) { if (m & 2) return 0; FB_FAIL(5, "mkdir-disk"); }
+    } else {
+        snprintf(base, sizeof base, "/tmp/fbt%d", m); mkdir(base, 0755);
+        if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FB_FAIL(6, "tmpfs-base");
+    }
+    snprintf(x, sizeof x, "%s/x", base);
+    fd = open(x, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) FB_FAIL(7, "creat");
+    write(fd, "orig\n", 5); close(fd);
+    if (stat(x, &fb_st) != 0 || !S_ISREG(fb_st.st_mode) || fb_st.st_size != 5) FB_FAIL(8, "orig-stat");
+    if (mount_("/etc/hostname", x, NULL, M_BIND) != 0) FB_FAIL(9, "bind");
+    if ((r = fb_check(m, x, NULL, "after-bind"))) return r;
+    fd = open(x, O_PATH | O_CLOEXEC); if (fd < 0) FB_FAIL(10, "open-opath");
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 1UL) != 0) FB_FAIL(11, "ro-remount");
+    close(fd);
+    if ((r = fb_check(m, x, NULL, "after-ro"))) return r;
+    fd = open(x, O_WRONLY);
+    if (fd >= 0 || errno != EROFS) { if (fd >= 0) close(fd); FB_FAIL(12, "wronly-erofs"); }
+    if (stack) {
+        snprintf(src, sizeof src, "/tmp/fbsrc%d", m);
+        fd = open(src, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) FB_FAIL(13, "src-creat");
+        write(fd, "second\n", 7); close(fd);
+        if (mount_(src, x, NULL, M_BIND) != 0) FB_FAIL(14, "bind2");
+        if ((r = fb_check(m, x, "second\n", "after-bind2"))) return r;
+        unlink(src);
+        if ((r = fb_check(m, x, "second\n", "after-unlink"))) return r;
+    }
+    if (pivot) {
+        if (mount_(b0, b0, NULL, M_BIND | M_REC) != 0) FB_FAIL(15, "selfbind");
+        if (chdir(b0) != 0) FB_FAIL(16, "chdir");
+        snprintf(x, sizeof x, "%s/oldroot", b0);
+        if (syscall(SYS_pivot_root, b0, x) != 0) FB_FAIL(17, "pivot_root");
+        if (chdir("/") != 0) FB_FAIL(18, "chdir-/");
+        if (umount_("/oldroot", M_DETACH) != 0) FB_FAIL(19, "umount-oldroot");
+        if (chroot("/newroot") != 0) FB_FAIL(27, "chroot");
+        if (chdir("/") != 0) FB_FAIL(18, "chdir-/2");
+        if ((r = fb_check(m, "/tmp/x", stack ? "second\n" : NULL, "after-pivot"))) return r;
+    }
+    return 0;
+}
+#define FBB(code, name) do { printf("  fbb m=%d step=%s errno=%d\n", m, name, errno); return code; } while (0)
+static int fb_bwrap(int m) {
+    char base[64], fp[64], lk[128]; struct stat st, hs; int fd; ssize_t n;
+    int r = fr3_enter(m & 2);
+    if (r) return r;
+    int data = m & 1;
+    off_t want = 5; char wb[16] = "data\n";
+    if (!data) {
+        if (stat("/etc/hostname", &hs) != 0) FBB(30, "stat-hostname");
+        want = hs.st_size;
+        fd = open("/etc/hostname", O_RDONLY); memset(wb, 0, sizeof wb);
+        if (fd >= 0) { read(fd, wb, 8); close(fd); }
+    }
+    snprintf(base, sizeof base, "/tmp/fbb%d", m); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FBB(2, "tmpfs-base");
+    if (chdir(base) != 0) FBB(3, "chdir-base");
+    if (mkdir("newroot", 0755) != 0) FBB(4, "mkdir-newroot");
+    if (mkdir("oldroot", 0755) != 0) FBB(5, "mkdir-oldroot");
+    if (syscall(SYS_pivot_root, base, "oldroot") != 0) FBB(6, "pivot1");
+    if (chdir("/") != 0) FBB(7, "chdir-/");
+    mkdir("/proc", 0755);
+    if (mount_("proc", "/proc", "proc", 0) != 0) FBB(31, "mount-proc");
+    if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) FBB(8, "rbind-newroot");
+    fd = open("/newroot", O_PATH | O_CLOEXEC); if (fd < 0) FBB(9, "open-newroot");
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    n = readlink(fp, lk, sizeof lk - 1); if (n >= 0) lk[n] = 0; else lk[0] = 0;
+    printf("  fbb m=%d readlink newroot=%s\n", m, lk);
+    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 1UL | 2UL) != 0) FBB(10, "ro-remount-newroot");
+    close(fd);
+    if (mountd_("tmpfs", "/newroot/tmp", "tmpfs", 6, "mode=0755") != 0) FBB(11, "tmpfs-newroot-tmp");
+    const char *src = "/oldroot/etc/hostname";
+    if (data) {
+        fd = open("/bindfile", O_RDWR | O_CREAT | O_EXCL, 0600); if (fd < 0) FBB(12, "bindfile-creat");
+        write(fd, "data\n", 5); close(fd); src = "/bindfile";
+    }
+    fd = open("/newroot/tmp/x", O_WRONLY | O_CREAT | O_NOCTTY, 0444); if (fd < 0) FBB(13, "ensure-file");
+    close(fd);
+    if (mount_(src, "/newroot/tmp/x", NULL, M_BIND | M_REC) != 0) FBB(14, "bind-file");
+    fd = open("/newroot/tmp/x", O_PATH | O_CLOEXEC); if (fd < 0) FBB(15, "open-opath-x");
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    n = readlink(fp, lk, sizeof lk - 1); if (n >= 0) lk[n] = 0; else lk[0] = 0;
+    printf("  fbb m=%d readlink x=%s\n", m, lk);
+    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 1UL | 2UL) != 0) FBB(16, "ro-remount-x");
+    close(fd);
+    if (data) unlink("/bindfile");
+    if (stat("/newroot/tmp/x", &st) != 0) FBB(17, "pre-final");
+    if (umount_("/oldroot", M_DETACH) != 0) FBB(18, "umount-oldroot");
+    if (chdir("/newroot") != 0) FBB(19, "chdir-newroot");
+    if (syscall(SYS_pivot_root, ".", ".") != 0) FBB(20, "pivot2");
+    if (umount_(".", M_DETACH) != 0) FBB(21, "umount-dot");
+    if (chdir("/") != 0) FBB(22, "chdir-/2");
+    if (stat("/tmp/x", &st) != 0) FBB(23, "final-stat");
+    if (!S_ISREG(st.st_mode) || st.st_size != want) { printf("  fbb m=%d final mode=%o size=%lld want=%lld\n", m, (unsigned)st.st_mode, (long long)st.st_size, (long long)want); return 24; }
+    char buf[16] = {0};
+    fd = open("/tmp/x", O_RDONLY); if (fd < 0) FBB(25, "final-open");
+    n = read(fd, buf, 8); close(fd);
+    if (n < 0) FBB(26, "final-read");
+    if (strncmp(buf, wb, 5) != 0) { printf("  fbb m=%d final content mismatch\n", m); return 27; }
+    DIR *d = opendir("/tmp"); if (!d) FBB(28, "opendir");
+    struct dirent *e; int found = 0; char names[256] = "";
+    while ((e = readdir(d))) { if (!strcmp(e->d_name, "x")) found = 1; strncat(names, e->d_name, sizeof names - strlen(names) - 2); strcat(names, " "); }
+    closedir(d);
+    if (!found) { printf("  fbb m=%d x not listed: %s\n", m, names); return 29; }
+    return 0;
+}
+static void filebind_suite(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
+    report("filebind_disk_file_bind_visible", nn_in_child(fb_case, 1));
+    report("filebind_tmpfs_file_bind_stacked", nn_in_child(fb_case, 8) & nn_in_child(fb_case, 10));
+    report("filebind_tmpfs_file_bind_pivot", nn_in_child(fb_case, 4) & nn_in_child(fb_case, 6));
+    report("filebind_bwrap_exact_hostname", nn_in_child(fb_bwrap, 0) & nn_in_child(fb_bwrap, 2));
+    report("filebind_bwrap_exact_data", nn_in_child(fb_bwrap, 1) & nn_in_child(fb_bwrap, 3));
+}
+
 static void mro_suite(void) {
     report("mntnosuid_bind_ignores_setuid", nn_in_child(mns_nosuid_bind, 0));
     report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
@@ -2908,6 +3065,7 @@ static void mro_suite(void) {
     report("mntro_nodev_eacces", nn_in_child(mro_nodev, 0));
     flatrun3_suite();
     flatrun4_suite();
+    filebind_suite();
 }
 
 /* ── lane shmbind: crun's dev/shm bind and bind-remount flags ─────────── */
@@ -3921,6 +4079,7 @@ static void procbind_suite(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "filebind")) { filebind_suite(); return fails ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "race")) return race_loop(argc > 2 ? atoi(argv[2]) : 20);
