@@ -16379,6 +16379,8 @@ fn handle_getxattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize,
                    val_ptr: usize, size: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    // The generated /etc files exist but carry no attributes.
+    if etc_synth(strip_trailing_slash(raw)) { return err_reply(-61); }
     if let Some(path) = tmpfs_path(raw) {
         let cred = cred_of(pid);
         let tmp = TMP_FILES.lock();
@@ -16395,6 +16397,7 @@ fn handle_getxattr(pid: u32, tag: u64, path_ptr: usize, name_ptr: usize,
 fn handle_listxattr(pid: u32, tag: u64, path_ptr: usize, list_ptr: usize, size: usize) -> Message {
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    if etc_synth(strip_trailing_slash(raw)) { return val_reply(0); }
     if let Some(path) = tmpfs_path(raw) {
         let euid = sched::caps::host_capable_of(pid, sched::caps::CAP_SYS_ADMIN);
         let tmp = TMP_FILES.lock();
