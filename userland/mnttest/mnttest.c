@@ -2604,8 +2604,94 @@ static int mrmk(int m) {
     wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
     return mrmk_check();
 }
+/* bubblewrap --unshare-user flow: bind the nsfs file /proc/self/ns/user onto a tmpfs file
+ * through /proc/self/fd/N after a pivot; open /proc files through a pre-pivot /proc fd. */
+static int fr3_enter(int m) {
+    if (m == 2) {
+        if (setgroups(0, NULL) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 90;
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return 91;
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+    } else if (unshare(CLONE_NEWNS) != 0) return 91;
+    mount_(NULL, "/", NULL, (1UL << 15) | MS_SLAVE_ | M_REC);
+    return 0;
+}
+static int fr3_userns_bind(int m) {
+    char base[64], p[128], q[128];
+    int r = fr3_enter(m);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fr3u%d", m);
+    mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) { printf("  tmpfs errno=%d\n", errno); return 2; }
+    snprintf(p, sizeof p, "%s/oldroot", base); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/proc", base); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/newroot", base); mkdir(p, 0755);
+    if (mountd_("tmpfs", p, "tmpfs", 6, "mode=0755") != 0) return 3;
+    snprintf(q, sizeof q, "%s/run", p); mkdir(q, 0755);
+    if (mountd_("tmpfs", q, "tmpfs", 6, "mode=0755") != 0) return 4;
+    snprintf(q, sizeof q, "%s/run/.userns", p);
+    int fd = open(q, O_WRONLY | O_CREAT, 0644); if (fd < 0) return 5; close(fd);
+    if (m != 0) {
+        if (mount_(base, base, NULL, M_BIND | M_REC) != 0) return 6;
+        if (chdir(base) != 0) return 7;
+        snprintf(p, sizeof p, "%s/oldroot", base);
+        if (syscall(SYS_pivot_root, base, p) != 0) { printf("  pivot errno=%d\n", errno); return 8; }
+        if (chdir("/") != 0) return 9;
+        if (mount_("/oldroot/proc", "/proc", NULL, M_BIND | M_REC) != 0) { printf("  procbind errno=%d\n", errno); return 10; }
+    }
+    const char *src = m ? "/oldroot/proc/self/ns/user" : "/proc/self/ns/user";
+    const char *dst = m ? "/newroot/run/.userns" : q;
+    int sfd = open(src, O_PATH | O_CLOEXEC); if (sfd < 0) { printf("  open src errno=%d\n", errno); return 11; }
+    int dfd = open(dst, O_PATH | O_NOFOLLOW | O_CLOEXEC); if (dfd < 0) { printf("  open dst errno=%d\n", errno); return 12; }
+    char sp[64], dp[64];
+    snprintf(sp, sizeof sp, "/proc/self/fd/%d", sfd); snprintf(dp, sizeof dp, "/proc/self/fd/%d", dfd);
+    if (mount_(sp, dp, NULL, M_BIND | 0x8000UL /* MS_SILENT */) != 0) { printf("  bind nsfs errno=%d\n", errno); return 13; }
+    struct stat a, b;
+    if (stat(dst, &a) != 0 || stat(m ? "/proc/self/ns/user" : "/proc/self/ns/user", &b) != 0) { printf("  stat errno=%d\n", errno); return 14; }
+    if (a.st_ino != b.st_ino) { printf("  ino %lu vs %lu\n", (unsigned long)a.st_ino, (unsigned long)b.st_ino); return 15; }
+    return 0;
+}
+/* bubblewrap --disable-userns: after the pivot and the detach of the old root, /proc files are
+ * opened for writing through the /proc fd taken before it, while the new /proc has ro covers. */
+static int fr3_procfd_ro(int m) {
+    char base[64], p[128];
+    int r = fr3_enter(m);
+    if (r) return r;
+    int pfd = open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC); if (pfd < 0) return 1;
+    snprintf(base, sizeof base, "/tmp/fr3p%d", m);
+    mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) return 2;
+    snprintf(p, sizeof p, "%s/oldroot", base); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/proc", base); mkdir(p, 0755);
+    if (mount_("/proc", p, NULL, M_BIND | M_REC) != 0) { printf("  procbind errno=%d\n", errno); return 3; }
+    const char *cov[] = { "sys", "irq", "bus" };
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof p, "%s/proc/%s", base, cov[i]);
+        if (access(p, F_OK) != 0) continue;
+        if (mount_(p, p, NULL, M_BIND | M_REC) != 0) { printf("  cover %s errno=%d\n", cov[i], errno); return 4; }
+        if (mount_(NULL, p, NULL, M_BIND | 32UL | 1UL) != 0) { printf("  remount ro %s errno=%d\n", cov[i], errno); return 5; }
+    }
+    if (mount_(base, base, NULL, M_BIND | M_REC) != 0) return 6;
+    if (chdir(base) != 0) return 7;
+    snprintf(p, sizeof p, "%s/oldroot", base);
+    if (syscall(SYS_pivot_root, base, p) != 0) { printf("  pivot errno=%d\n", errno); return 8; }
+    if (chdir("/") != 0) return 9;
+    if (umount_("/oldroot", M_DETACH) != 0) { printf("  detach errno=%d\n", errno); return 10; }
+    int self = openat(pfd, "self", O_PATH);
+    if (self < 0) { printf("  openat self errno=%d\n", errno); return 11; }
+    if (m != 0) {
+        int u = openat(self, "uid_map", O_WRONLY);
+        if (u < 0) { printf("  uid_map errno=%d\n", errno); return 12; }
+        close(u);
+    }
+    int s = openat(pfd, "sys/user/max_user_namespaces", O_WRONLY);
+    if (s < 0 && (m == 0 || errno == EROFS)) { printf("  max_user_namespaces errno=%d\n", errno); return 13; }
+    if (s >= 0) close(s);
+    return 0;
+}
 static void flatrun3_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    report("bwrap_bind_nsfs_userns_file", nn_in_child(fr3_userns_bind, 0) & nn_in_child(fr3_userns_bind, 1) & nn_in_child(fr3_userns_bind, 2));
+    report("bwrap_procfd_write_after_ro_cover", nn_in_child(fr3_procfd_ro, 0) & nn_in_child(fr3_procfd_ro, 2));
     report("synth_resolv_readlink_einval", nn_in_child(synth_readlink, 0));
     report("synth_resolv_bind_in_mntns", nn_in_child(synth_bind, 0) && nn_in_child(synth_bind, 1));
     report("mountroot_mkdir_eexist", nn_in_child(mrmk, 0) && nn_in_child(mrmk, 1) && nn_in_child(mrmk, 2));

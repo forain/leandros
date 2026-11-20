@@ -13380,6 +13380,15 @@ pub fn nsfs_bind_source(path: &[u8], caller: u32) -> Result<Option<Vec<u8>>, isi
     push_dec(&mut v, k as u32); v.push(b'/'); push_dec(&mut v, id as u32);
     Ok(Some(v))
 }
+/// The synthetic bind source of an opened nsfs file (`fd` of `pid`), taking a
+/// namespace reference; None when `fd` is not an nsfs file.
+pub fn nsfd_bind_source(pid: u32, fd: usize) -> Option<Vec<u8>> {
+    let (k, id) = nsfd_target(pid, fd).ok()?;
+    sched::ns::hold_raw(id);
+    let mut v = alias::NS_SRC.to_vec();
+    push_dec(&mut v, k as u32); v.push(b'/'); push_dec(&mut v, id as u32);
+    Some(v)
+}
 fn push_dec(v: &mut Vec<u8>, mut n: u32) {
     let mut d = [0u8; 10]; let mut i = 0;
     loop { d[i] = b'0' + (n % 10) as u8; i += 1; n /= 10; if n == 0 { break; } }
