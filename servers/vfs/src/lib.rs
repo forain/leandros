@@ -5075,6 +5075,8 @@ fn mnt_flag_check(tag: u64, msg: &Message, backing: &[u8], flags: u8) -> Result<
         let fl = arg(msg, 1) as u32;
         if fl & O_PATH != 0 { return Ok(()); }
         let mode = st(backing);
+        // Linux: O_CREAT|O_EXCL on an existing name is EEXIST before any write/ro-mount check
+        if flags & mnt::MNT_RDONLY != 0 && fl & O_CREAT != 0 && fl & O_EXCL != 0 && mode.is_some() { return Err(-17); }
         let special = matches!(mode.map(|m| m & S_IFMT), Some(0o020000) | Some(0o060000) | Some(0o010000) | Some(0o140000));
         if flags & mnt::MNT_NODEV != 0 && matches!(mode.map(|m| m & S_IFMT), Some(0o020000) | Some(0o060000)) {
             return Err(-13);
