@@ -180,6 +180,9 @@ pub fn pin_verified(ns: NsId, id: u32, gen: u64) {
 /// released by `orphan_take_unused` once no mount in any namespace has them as root.
 static ORPHANS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static ORPHAN_SEQ: AtomicU32 = AtomicU32::new(1);
+/// Self-test counters: full mount-root scans done by `orphan_take_unused`, next name number.
+static ORPHAN_SCANS: AtomicU32 = AtomicU32::new(0);
+pub fn orphan_stats() -> (u32, u32, usize) { (ORPHAN_SCANS.load(Ordering::Relaxed), ORPHAN_SEQ.load(Ordering::Relaxed), ORPHANS.lock().len()) }
 static ORPHAN_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True when some mount of any namespace has backing root `path`. Only a
@@ -214,6 +217,7 @@ pub fn orphan_mark_dirty() { if orphans_any() { ORPHAN_DIRTY.store(true, Orderin
 /// unless a mount went away since the last call.
 pub fn orphan_take_unused() -> Vec<Vec<u8>> {
     if !ORPHAN_DIRTY.swap(false, Ordering::AcqRel) { return Vec::new(); }
+    ORPHAN_SCANS.fetch_add(1, Ordering::Relaxed);
     let used: Vec<Vec<u8>> = NS.lock().values().flat_map(|n| n.mnts.iter().map(|m| m.root.to_vec())).collect();
     let mut o = ORPHANS.lock();
     let mut dead = Vec::new();
