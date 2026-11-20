@@ -258,6 +258,20 @@ static PM_OK: AtomicBool = AtomicBool::new(false);
 pub fn serial_reset_hook() -> Option<fn(u8, bool, u64)> {
     PM_OK.load(Ordering::Acquire).then_some(serial_magic as fn(u8, bool, u64))
 }
+/// The PM block exists and is mapped (the restart path may write PM_RSTS).
+pub fn pm_ok() -> bool { PM_OK.load(Ordering::Acquire) }
+
+/// Log the one-shot boot-partition request this boot came from (PM_RSTS
+/// partition field, set by `reboot N` on Linux or LeandrOS) and clear it, so
+/// a later watchdog/panic reset boots the firmware default (autoboot.txt's
+/// boot_partition on a dual-boot card), as a plain reboot does.
+fn note_boot_partition() {
+    use crate::rpi_misc_logic::pm;
+    let Some(p) = crate::rpi_pm::with(|r| pm::partition_of(r.r(pm::RSTS))) else { return };
+    if p == 0 || p == 63 { return; }
+    line(|b| { b.s("[pifw] booted via reboot partition request ").x(p as u64).s(": cleared"); });
+    let _ = crate::rpi_pm::with(|r| pm::set_partition(r, 0));
+}
 static WDT_FED: AtomicBool = AtomicBool::new(true);
 
 fn wdt_feed_hook() {
@@ -337,6 +351,7 @@ fn wdt_init(cmdline: &str) {
         _ => {}
     }
     PM_OK.store(true, Ordering::Release);
+    note_boot_partition();
     let was = crate::rpi_pm::with(|r| crate::rpi_misc_logic::pm::is_running(r)).unwrap_or(false);
     if opt(cmdline, "wdt.off") == Some("1") {
         if was { crate::rpi_pm::wdt_stop(); }

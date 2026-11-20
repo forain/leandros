@@ -76,3 +76,7 @@ pub fn wdt_running_nolock() -> bool { with_nolock(|r| pm::is_running(r)).unwrap_
 pub fn restart() -> bool { with_nolock(|r| pm::restart(r)).is_some() }
 /// Firmware halt (partition 63) + reset (fallback when PSCI SYSTEM_OFF returns).
 pub fn power_off() -> bool { with_nolock(|r| pm::power_off(r)).is_some() }
+
+/// One-shot boot partition for the next reset (PM_RSTS partition field,
+/// 0 = firmware default), lock-free: the restart path. False if unmapped.
+pub fn set_boot_partition(p: u8) -> bool { with_nolock(|r| pm::set_partition(r, p)).is_some() }

@@ -33,4 +33,12 @@ cargo check -p kernel --features "$feats" --target "$spec" \
     -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec \
     >"$kdir/check.log" 2>&1 || rc=$?
 tail -n "${CHECK_TAIL:-20}" "$kdir/check.log"
+# Host unit tests of the Pi logic (PM_RSTS boot partition, RESTART2 "[N] [tryboot]",
+# SD MBR F2FS-root pick): the module is self-contained, so plain rustc --test.
+if rustc --edition 2021 --test "$ROOT_DIR/drivers/src/rpi_misc_logic.rs" -o "$kdir/rpi_misc_logic-test" >"$kdir/hosttest.log" 2>&1 \
+   && "$kdir/rpi_misc_logic-test" -q >>"$kdir/hosttest.log" 2>&1; then
+    echo "check-rpi5: rpi_misc_logic host tests ok"
+else
+    tail -n 20 "$kdir/hosttest.log"; echo "check-rpi5: rpi_misc_logic host tests FAILED"; rc=1
+fi
 exit "$rc"

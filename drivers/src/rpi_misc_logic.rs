@@ -114,6 +114,26 @@ pub mod pm {
     /// `__bcm2835_restart`: full reset ~150 µs from now.
     pub fn restart(r: &mut dyn Regs32) { arm(r, 10); }
 
+    /// The boot-partition field of PM_RSTS: partition bits 0..5 live in RSTS
+    /// bits 0, 2, 4, 6, 8, 10 (`__bcm2835_restart`, raspberrypi/linux
+    /// drivers/watchdog/bcm2835_wdt.c). 0 = the firmware's default partition.
+    pub const RSTS_PARTITION_CLR: u32 = 0xffff_faaa;
+
+    pub fn partition_bits(p: u8) -> u32 {
+        (0..6).fold(0u32, |a, i| a | (((p as u32) >> i) & 1) << (2 * i))
+    }
+
+    pub fn partition_of(rsts: u32) -> u8 {
+        (0..6).fold(0u8, |a, i| a | ((((rsts >> (2 * i)) & 1) as u8) << i))
+    }
+
+    /// Request boot partition `p` for the next reset (read-modify-write, all
+    /// other RSTS bits kept, as Linux does).
+    pub fn set_partition(r: &mut dyn Regs32, p: u8) {
+        let v = r.r(RSTS) & RSTS_PARTITION_CLR & 0x00ff_ffff;
+        r.w(RSTS, PASSWORD | v | partition_bits(p));
+    }
+
     /// `bcm2835_power_off`: boot partition 63 (firmware halt) then reset.
     pub fn power_off(r: &mut dyn Regs32) {
         let v = r.r(RSTS);
@@ -344,5 +364,133 @@ pub mod wdt {
     pub fn pm_regs_plausible(rstc: u32, rsts: u32, wdog: u32) -> bool {
         let hi = 0xff00_0000;
         rstc & hi == 0 && rsts & hi == 0 && wdog & !super::pm::WDOG_TIME_SET == 0
+    }
+}
+
+// ── reboot(RESTART2, arg) on the Pi: "[N] [tryboot]" ─────────────────────────
+pub mod restart2 {
+    /// Parse the RESTART2 argument the way raspberrypi/linux does: a leading
+    /// decimal number is the one-shot boot partition (`bcm2835_restart` /
+    /// `psci_sys_reset`: `sscanf("%lu")`, values >= 63 ignored, 0 = firmware
+    /// default), the `tryboot` token sets the firmware's one-shot tryboot flag
+    /// (`rpi_firmware_notify_reboot`). LeandrOS's tryboot.txt lives on MBR
+    /// partition 1, so a tryboot without an explicit partition ("tryboot",
+    /// "0 tryboot") targets partition 1: on a dual-boot card whose
+    /// autoboot.txt defaults to another partition the trial still boots
+    /// LeandrOS, and on a single-boot card p1 is the default anyway.
+    /// Returns (partition, tryboot).
+    pub fn parse(arg: &str) -> (u8, bool) {
+        let t = arg.trim_start();
+        let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let mut part = 0u8;
+        if digits > 0 {
+            if let Ok(v) = t[..digits].parse::<u64>() {
+                if v < 63 { part = v as u8; }
+            }
+        }
+        let tryboot = arg.split_ascii_whitespace().any(|w| w == "tryboot");
+        if tryboot && part == 0 { part = 1; }
+        (part, tryboot)
+    }
+}
+
+// ── SD card MBR: which 0x83 partition is the F2FS root ───────────────────────
+pub mod sdmbr {
+    pub const F2FS_MAGIC: u32 = 0xF2F5_2010;
+    /// Byte offset of the first F2FS superblock inside the partition.
+    pub const F2FS_SB_OFFSET: u64 = 1024;
+
+    /// Start LBA (512-byte sectors) of the F2FS root among the MBR's type
+    /// 0x83 partitions: the first whose superblock magic (read through
+    /// `magic_at(lba)`) is F2FS. A dual-boot card also carries an ext4 0x83
+    /// partition (Raspberry Pi OS root, p4), so the type alone is not enough.
+    /// No 0x83 with the magic (unreadable / unformatted): the first 0x83, as
+    /// before. `None` without a 55AA signature or any 0x83 entry.
+    pub fn pick_f2fs(mbr: &[u8], mut magic_at: impl FnMut(u64) -> Option<u32>) -> Option<u64> {
+        if mbr.len() < 512 || mbr[510] != 0x55 || mbr[511] != 0xAA { return None; }
+        let mut first = None;
+        for i in 0..4usize {
+            let e = &mbr[446 + i * 16..446 + i * 16 + 16];
+            if e[4] != 0x83 { continue; }
+            let lba = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+            if first.is_none() { first = Some(lba); }
+            if magic_at(lba) == Some(F2FS_MAGIC) { return Some(lba); }
+        }
+        first
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fake { rsts: u32, writes: u32 }
+    impl Regs32 for Fake {
+        fn r(&mut self, off: usize) -> u32 { assert_eq!(off, pm::RSTS); self.rsts }
+        fn w(&mut self, off: usize, v: u32) { assert_eq!(off, pm::RSTS); self.writes += 1; self.rsts = v & 0x00ff_ffff; assert_eq!(v & 0xff00_0000, pm::PASSWORD); }
+    }
+
+    #[test]
+    fn partition_bits_match_linux() {
+        assert_eq!(pm::partition_bits(0), 0);
+        assert_eq!(pm::partition_bits(1), 0x001);
+        assert_eq!(pm::partition_bits(2), 0x004);
+        assert_eq!(pm::partition_bits(3), 0x005);
+        assert_eq!(pm::partition_bits(63), pm::RSTS_RASPBERRYPI_HALT);
+        for p in 0..64u8 { assert_eq!(pm::partition_of(pm::partition_bits(p)), p); }
+    }
+
+    #[test]
+    fn set_partition_keeps_other_bits() {
+        let mut f = Fake { rsts: 0x1a0a | 0x555, writes: 0 };
+        pm::set_partition(&mut f, 3);
+        assert_eq!(f.rsts, 0x1a0a | 0x005);
+        pm::set_partition(&mut f, 0);
+        assert_eq!(f.rsts, 0x1a0a);
+        assert_eq!(f.writes, 2);
+    }
+
+    #[test]
+    fn restart2_args() {
+        assert_eq!(restart2::parse(""), (0, false));
+        assert_eq!(restart2::parse("3"), (3, false));
+        assert_eq!(restart2::parse("1"), (1, false));
+        assert_eq!(restart2::parse("tryboot"), (1, true));
+        assert_eq!(restart2::parse("0 tryboot"), (1, true));
+        assert_eq!(restart2::parse("3 tryboot"), (3, true));
+        assert_eq!(restart2::parse("63"), (0, false));
+        assert_eq!(restart2::parse("99 tryboot"), (1, true));
+        assert_eq!(restart2::parse("  2  "), (2, false));
+        assert_eq!(restart2::parse("recovery"), (0, false));
+        assert_eq!(restart2::parse("0 trybootx"), (0, false));
+    }
+
+    fn mbr(entries: &[(u8, u32)]) -> [u8; 512] {
+        let mut m = [0u8; 512];
+        for (i, &(ty, lba)) in entries.iter().enumerate() {
+            let e = &mut m[446 + i * 16..446 + i * 16 + 16];
+            e[4] = ty;
+            e[8..12].copy_from_slice(&lba.to_le_bytes());
+        }
+        m[510] = 0x55; m[511] = 0xAA;
+        m
+    }
+
+    #[test]
+    fn f2fs_root_on_dual_boot_card() {
+        // p1 FAT32 LeandrOS boot, p2 F2FS root, p3 FAT32 RPi OS boot, p4 ext4.
+        let m = mbr(&[(0x0c, 8192), (0x83, 1_056_768), (0x0c, 40_000_000), (0x83, 41_000_000)]);
+        let magic = |lba| if lba == 1_056_768 { Some(sdmbr::F2FS_MAGIC) } else { Some(0xEF53) };
+        assert_eq!(sdmbr::pick_f2fs(&m, magic), Some(1_056_768));
+        // ext4 ahead of the F2FS partition in the table: still the F2FS one.
+        let m = mbr(&[(0x0c, 8192), (0x83, 41_000_000), (0x0c, 40_000_000), (0x83, 1_056_768)]);
+        assert_eq!(sdmbr::pick_f2fs(&m, magic), Some(1_056_768));
+        // Single-boot card, magic unreadable: first 0x83 as before.
+        let m = mbr(&[(0x0c, 8192), (0x83, 1_056_768)]);
+        assert_eq!(sdmbr::pick_f2fs(&m, |_| None), Some(1_056_768));
+        // No signature / no Linux partition.
+        let mut bad = m; bad[511] = 0;
+        assert_eq!(sdmbr::pick_f2fs(&bad, |_| None), None);
+        assert_eq!(sdmbr::pick_f2fs(&mbr(&[(0x0c, 8192)]), |_| None), None);
     }
 }

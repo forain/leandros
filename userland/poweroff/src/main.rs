@@ -141,6 +141,12 @@ unsafe fn via_login1(a: Action, envp: *const *const u8) {
     leandros_libc::process::execve(bin.as_ptr(), args.as_ptr(), envp);
 }
 
+/// A boot partition argument: decimal 1..=62, no leading zero.
+fn is_partition(n: &[u8]) -> bool {
+    if n.is_empty() || n.len() > 2 || n[0] == b'0' || !n.iter().all(|c| c.is_ascii_digit()) { return false; }
+    n.iter().fold(0u32, |a, &c| a * 10 + (c - b'0') as u32) < 63
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32 {
     let arg0 = cstr(*argv);
@@ -167,8 +173,15 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     let mut tryboot = false;
     let mut commit = false;
     let mut hold = 0u8;
+    // `reboot N` (Pi 5): one-shot boot partition N (1..62) for the next reset,
+    // as on Raspberry Pi OS (`reboot 3` = MBR partition 3, e.g. the Linux of a
+    // dual-boot card). Direct, no init, like tryboot.
+    let mut partition: &[u8] = b"";
     for i in first..argc as isize {
         match cstr(*argv.offset(i)) {
+            n if is_partition(n) => {
+                partition = n; action = Action::Reboot;
+            }
             b"-f" | b"--force" | b"-ff" => force = true,
             // `reboot tryboot`: firmware tryboot reset (Pi 5). Direct, no init.
             b"tryboot" | b"--tryboot" => { tryboot = true; action = Action::Reboot; }
@@ -184,7 +197,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
             b"-n" | b"--no-sync" | b"-w" | b"--wtmp-only" | b"-d" | b"--no-wtmp"
             | b"--no-wall" | b"-i" => {}
             b"-h" | b"--help" => {
-                out(STDOUT_FILENO, b"usage: poweroff|reboot|halt [-f|--force] [-p|--poweroff] [--reboot] [--halt]\n");
+                out(STDOUT_FILENO, b"usage: poweroff|reboot|halt [-f|--force] [-p|--poweroff] [--reboot] [--halt]\n       reboot [N] [tryboot]   (Pi 5: one-shot boot partition N, firmware tryboot)\n");
                 return 0;
             }
             other => {
@@ -212,13 +225,18 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
         }
         return 0;
     }
-    if tryboot {
+    if tryboot || !partition.is_empty() {
         // Straight to reboot(2): init's orderly path cannot carry the argument.
+        // "N tryboot" / "N" / "0 tryboot" (the kernel maps a tryboot without a
+        // partition to partition 1, LeandrOS's boot FAT).
         syscall0(nr::SYNC);
-        let arg = b"0 tryboot\0";
+        let mut arg = [0u8; 16];
+        let mut k = 0;
+        for &c in if partition.is_empty() { &b"0"[..] } else { partition } { arg[k] = c; k += 1; }
+        if tryboot { for &c in b" tryboot" { arg[k] = c; k += 1; } }
         let r = syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART2, arg.as_ptr() as usize);
         out(STDERR_FILENO, base);
-        out(STDERR_FILENO, b": reboot(2) tryboot: ");
+        out(STDERR_FILENO, if tryboot { &b": reboot(2) tryboot: "[..] } else { &b": reboot(2) partition: "[..] });
         out(STDERR_FILENO, errno_name(r));
         out(STDERR_FILENO, b"\n");
         return 1;
