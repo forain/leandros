@@ -3052,18 +3052,23 @@ static int bp2_gc_case(int m) {
     if (unlink(src) != 0) return 7;
     if (bpin_find_orphan("/tmp") != base + 1) { printf("  bp2gc: no hidden name after unlink\n"); return 8; }
     if (umount_(dst, 0) != 0) return 9;
+    /* Every check runs as the non-owner: any open/stat/unlink by root would
+     * itself run the gc and hide the bug. */
     pid_t c = fork();
-    if (c == 0) { if (setgid(1001) || setuid(1001)) _exit(99); stat(dst, &st); stat(dst, &st); _exit(0); }
+    if (c == 0) {
+        if (setgid(1001) || setuid(1001)) _exit(99);
+        stat(dst, &st); stat(dst, &st);
+        int left = bpin_find_orphan("/tmp") - base;
+        if (left != 0) { printf("  bp2gc: hidden name left after non-owner gc (%d)\n", left); _exit(10); }
+        long s0 = bp2_stat("orphan_scans=");
+        for (int i = 0; i < 6; i++) { stat(dst, &st); close(open(dst, O_RDONLY)); }
+        long s1 = bp2_stat("orphan_scans=");
+        if (s1 - s0 != 0) { printf("  bp2gc: %ld rescans for 12 later ops\n", s1 - s0); _exit(11); }
+        if (bp2_stat("orphans=") != 0) { printf("  bp2gc: orphans pending=%ld\n", bp2_stat("orphans=")); _exit(12); }
+        _exit(0);
+    }
     int w = 0; waitpid(c, &w, 0);
-    int left = bpin_find_orphan("/tmp") - base;
-    if (left != 0) { printf("  bp2gc: hidden name left after non-owner gc (%d)\n", left); return 10; }
-    long s0 = bp2_stat("orphan_scans=");
-    c = fork();
-    if (c == 0) { if (setgid(1001) || setuid(1001)) _exit(99); for (int i = 0; i < 6; i++) { stat(dst, &st); open(dst, O_RDONLY); } _exit(0); }
-    waitpid(c, &w, 0);
-    long s1 = bp2_stat("orphan_scans=");
-    if (s1 - s0 != 0) { printf("  bp2gc: %ld rescans for 12 later ops\n", s1 - s0); return 11; }
-    if (bp2_stat("orphans=") != 0) { printf("  bp2gc: orphans pending=%ld\n", bp2_stat("orphans=")); return 12; }
+    if (!WIFEXITED(w) || WEXITSTATUS(w) != 0) return 20 + (WIFEXITED(w) ? WEXITSTATUS(w) : 0);
     unlink(dst);
     return 0;
 }
