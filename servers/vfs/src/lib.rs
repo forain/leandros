@@ -5087,6 +5087,10 @@ fn mnt_flag_check(tag: u64, msg: &Message, backing: &[u8], flags: u8) -> Result<
         return Ok(());
     }
     if flags & mnt::MNT_RDONLY != 0 {
+        // Linux looks the name up before asking for write access to the mount,
+        // so creating something that already exists is EEXIST, not EROFS
+        // (bubblewrap's mkdir_with_parents under a ro-bound /usr depends on it).
+        if matches!(tag, VFS_MKDIR | VFS_MKNOD | VFS_SYMLINK) && st(backing).is_some() { return Err(-17); }
         match tag {
             VFS_UNLINK | VFS_RMDIR | VFS_MKDIR | VFS_MKNOD | VFS_RENAME | VFS_LINK | VFS_SYMLINK
             | VFS_CHMOD | VFS_LCHMOD | VFS_CHOWN | VFS_LCHOWN | VFS_UTIMENS | VFS_LUTIMENS

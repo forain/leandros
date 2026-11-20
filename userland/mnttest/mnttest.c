@@ -2428,6 +2428,20 @@ static int mro_erofs(int m) {
     put("/tmp/mrw/ok", "k", 0644); if (!exists("/tmp/mrw/ok")) return 32;
     return 0;
 }
+/* A create syscall naming something that already exists answers EEXIST even
+ * on a read-only mount (Linux checks the lookup before the mount's write
+ * access). bubblewrap's mkdir_with_parents relies on it for every bind
+ * destination below a ro-bound /usr (flatpak: /usr/lib/<arch>/GL). */
+static int mro_eexist_first(int m) {
+    (void)m;
+    int r = mro_setup(); if (r) return r;
+    errno = 0; if (mkdir("/tmp/mrb/d", 0755) == 0 || errno != EEXIST) { printf("  mkdir dir errno=%d\n", errno); return 10; }
+    errno = 0; if (mkdir("/tmp/mrb/f", 0755) == 0 || errno != EEXIST) { printf("  mkdir file errno=%d\n", errno); return 11; }
+    errno = 0; if (symlink("a", "/tmp/mrb/f") == 0 || errno != EEXIST) { printf("  symlink errno=%d\n", errno); return 12; }
+    errno = 0; if (mknod("/tmp/mrb/f", S_IFREG | 0644, 0) == 0 || errno != EEXIST) { printf("  mknod errno=%d\n", errno); return 13; }
+    errno = 0; if (mkdir("/tmp/mrb/nd", 0755) == 0 || errno != EROFS) { printf("  mkdir new errno=%d\n", errno); return 14; }
+    return 0;
+}
 static int mro_openfd_keeps_writing(int m) {
     (void)m;
     int r = mro_setup(); if (r) return r;
@@ -2528,6 +2542,7 @@ static int mns_nosuid_bind(int m) {
 static void mro_suite(void) {
     report("mntnosuid_bind_ignores_setuid", nn_in_child(mns_nosuid_bind, 0));
     report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
+    report("mntro_exists_is_eexist_not_erofs", nn_in_child(mro_eexist_first, 0));
     report("mntro_rw_fd_survives_remount_ro", nn_in_child(mro_openfd_keeps_writing, 0));
     report("mntro_fd_attr_erofs", nn_in_child(mro_fd_attr, 0));
     report("mntro_noexec_eacces", nn_in_child(mro_noexec, 0));
