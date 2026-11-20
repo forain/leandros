@@ -175,6 +175,54 @@ pub fn pin_set(ns: NsId, id: u32, pin: (u64, u64), gen: u64) {
 pub fn pin_verified(ns: NsId, id: u32, gen: u64) {
     if let Some(m) = NS.lock().get_mut(&ns).and_then(|n| n.mnts.iter_mut().find(|m| m.id == id)) { if m.vgen < gen { m.vgen = gen; } }
 }
+/// bindpin: hidden backing names that keep the inode of an unlinked file bind
+/// source alive (Linux keeps the dentry pinned). Registered by `unlink`,
+/// released by `orphan_take_unused` once no mount in any namespace has them as root.
+static ORPHANS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static ORPHAN_SEQ: AtomicU32 = AtomicU32::new(1);
+static ORPHAN_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// True when some mount of any namespace has backing root `path`. Only a
+/// file (or link) bind can match a path being unlinked.
+pub fn root_in_use(path: &[u8]) -> bool {
+    NS.lock().values().any(|n| n.mnts.iter().any(|m| &*m.root == path))
+}
+/// Fresh hidden sibling name of `path` (same directory, hence the same fs).
+pub fn orphan_name_for(path: &[u8]) -> Vec<u8> {
+    let i = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+    let mut v = path[..i].to_vec();
+    let n = ORPHAN_SEQ.fetch_add(1, Ordering::Relaxed);
+    v.extend_from_slice(b"/.leandros-orphan-");
+    let mut digits = Vec::new();
+    let mut x = n; while x > 0 { digits.push(b'0' + (x % 10) as u8); x /= 10; }
+    digits.reverse();
+    v.extend_from_slice(&digits);
+    v
+}
+/// Point every mount rooted at `old` at `new` (the renamed inode) and remember `new`.
+pub fn orphan_adopt(old: &[u8], new: &[u8]) {
+    for n in NS.lock().values_mut() {
+        for m in n.mnts.iter_mut() { if &*m.root == old { m.root = new.to_vec().into_boxed_slice(); } }
+    }
+    ORPHANS.lock().push(new.to_vec());
+}
+pub fn is_orphan(path: &[u8]) -> bool { ORPHANS.lock().iter().any(|o| o.as_slice() == path) }
+pub fn orphans_any() -> bool { !ORPHANS.lock().is_empty() }
+/// A mount went away: an orphan may be unreferenced now.
+pub fn orphan_mark_dirty() { if orphans_any() { ORPHAN_DIRTY.store(true, Ordering::Release); } }
+/// Orphans no mount refers to any more (removed from the registry); `[]`
+/// unless a mount went away since the last call.
+pub fn orphan_take_unused() -> Vec<Vec<u8>> {
+    if !ORPHAN_DIRTY.swap(false, Ordering::AcqRel) { return Vec::new(); }
+    let used: Vec<Vec<u8>> = NS.lock().values().flat_map(|n| n.mnts.iter().map(|m| m.root.to_vec())).collect();
+    let mut o = ORPHANS.lock();
+    let mut dead = Vec::new();
+    o.retain(|p| if used.iter().any(|u| u == p) { true } else { dead.push(p.clone()); false });
+    dead
+}
+/// Give an orphan back after a failed delete (retry at the next unmount).
+pub fn orphan_requeue(p: Vec<u8>) { ORPHANS.lock().push(p); ORPHAN_DIRTY.store(true, Ordering::Release); }
+
 /// Backing root of mount `id` (for pinning at bind time).
 pub fn root_of(ns: NsId, id: u32) -> Option<Vec<u8>> {
     NS.lock().get(&ns)?.mnts.iter().find(|m| m.id == id).map(|m| m.root.to_vec())
@@ -664,6 +712,7 @@ pub fn umount(ns: NsId, target: &[u8], detach: bool) -> Result<(), i32> {
         sbs
     };
     for sb in dead_sbs { sb_put(sb); }
+    orphan_mark_dirty();
     Ok(())
 }
 
@@ -752,6 +801,7 @@ pub fn release(ns: NsId) {
     ANON.lock().retain(|a| a.0 != ns);
     let t = NS.lock().remove(&ns);
     if let Some(t) = t { for m in t.mnts.iter() { sb_put(m.sb); } }
+    orphan_mark_dirty();
 }
 
 /// Free the trees of namespaces that died under the scheduler lock, then
