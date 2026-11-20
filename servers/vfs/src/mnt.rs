@@ -178,8 +178,12 @@ pub fn pin_verified(ns: NsId, id: u32, gen: u64) {
 /// bindpin: hidden backing names that keep the inode of an unlinked file bind
 /// source alive (Linux keeps the dentry pinned). Registered by `unlink`,
 /// released by `orphan_take_unused` once no mount in any namespace has them as root.
-static ORPHANS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// (path, failed delete attempts so far)
+static ORPHANS: Mutex<Vec<(Vec<u8>, u8)>> = Mutex::new(Vec::new());
 static ORPHAN_SEQ: AtomicU32 = AtomicU32::new(1);
+/// Self-test counters: full mount-root scans done by `orphan_take_unused`, next name number.
+static ORPHAN_SCANS: AtomicU32 = AtomicU32::new(0);
+pub fn orphan_stats() -> (u32, u32, usize) { (ORPHAN_SCANS.load(Ordering::Relaxed), ORPHAN_SEQ.load(Ordering::Relaxed), ORPHANS.lock().len()) }
 static ORPHAN_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// True when some mount of any namespace has backing root `path`. Only a
@@ -187,7 +191,9 @@ static ORPHAN_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::Atomic
 pub fn root_in_use(path: &[u8]) -> bool {
     NS.lock().values().any(|n| n.mnts.iter().any(|m| &*m.root == path))
 }
-/// Fresh hidden sibling name of `path` (same directory, hence the same fs).
+/// Hidden sibling name of `path` (same directory, hence the same fs) with a
+/// fresh number. The caller renames with RENAME_NOREPLACE and takes the next
+/// one on EEXIST: the counter restarts every boot, names may already exist.
 pub fn orphan_name_for(path: &[u8]) -> Vec<u8> {
     let i = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
     let mut v = path[..i].to_vec();
@@ -204,24 +210,27 @@ pub fn orphan_adopt(old: &[u8], new: &[u8]) {
     for n in NS.lock().values_mut() {
         for m in n.mnts.iter_mut() { if &*m.root == old { m.root = new.to_vec().into_boxed_slice(); } }
     }
-    ORPHANS.lock().push(new.to_vec());
+    ORPHANS.lock().push((new.to_vec(), 0));
 }
-pub fn is_orphan(path: &[u8]) -> bool { ORPHANS.lock().iter().any(|o| o.as_slice() == path) }
+pub fn is_orphan(path: &[u8]) -> bool { ORPHANS.lock().iter().any(|o| o.0.as_slice() == path) }
 pub fn orphans_any() -> bool { !ORPHANS.lock().is_empty() }
 /// A mount went away: an orphan may be unreferenced now.
 pub fn orphan_mark_dirty() { if orphans_any() { ORPHAN_DIRTY.store(true, Ordering::Release); } }
 /// Orphans no mount refers to any more (removed from the registry); `[]`
 /// unless a mount went away since the last call.
-pub fn orphan_take_unused() -> Vec<Vec<u8>> {
+pub fn orphan_take_unused() -> Vec<(Vec<u8>, u8)> {
     if !ORPHAN_DIRTY.swap(false, Ordering::AcqRel) { return Vec::new(); }
+    ORPHAN_SCANS.fetch_add(1, Ordering::Relaxed);
     let used: Vec<Vec<u8>> = NS.lock().values().flat_map(|n| n.mnts.iter().map(|m| m.root.to_vec())).collect();
     let mut o = ORPHANS.lock();
     let mut dead = Vec::new();
-    o.retain(|p| if used.iter().any(|u| u == p) { true } else { dead.push(p.clone()); false });
+    o.retain(|p| if used.iter().any(|u| *u == p.0) { true } else { dead.push(p.clone()); false });
     dead
 }
-/// Give an orphan back after a failed delete (retry at the next unmount).
-pub fn orphan_requeue(p: Vec<u8>) { ORPHANS.lock().push(p); ORPHAN_DIRTY.store(true, Ordering::Release); }
+/// Give an orphan back after a failed delete: retried at the next VFS op, at
+/// most `ORPHAN_TRIES` attempts in all, then it is dropped (left on disk).
+pub const ORPHAN_TRIES: u8 = 3;
+pub fn orphan_requeue(p: Vec<u8>, tries: u8) { ORPHANS.lock().push((p, tries)); ORPHAN_DIRTY.store(true, Ordering::Release); }
 
 /// Backing root of mount `id` (for pinning at bind time).
 pub fn root_of(ns: NsId, id: u32) -> Option<Vec<u8>> {

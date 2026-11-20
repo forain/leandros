@@ -3031,6 +3031,103 @@ static int bpin_case(int m) {
     if (bpin_find_orphan(dir) != 0) { printf("  bp m=%d orphan left in %s\n", m, dir); return 17; }
     return 0;
 }
+/* bindpin2: gc credentials, NOREPLACE hidden names, real nlink. */
+static long bp2_stat(const char *key) {
+    static char b[16384]; if (slurp("/proc/mntselftest", b, sizeof b) <= 0) return -1;
+    char *q = strstr(b, key); return q ? atol(q + strlen(key)) : -1;
+}
+/* m=0: a file owned by uid 1000 in sticky /tmp is bound then unlinked by root;
+ * after the umount a DIFFERENT uid triggers the gc. The hidden name must go
+ * (the vfs deletes it with its own credentials) and no rescans may follow. */
+static int bp2_gc_case(int m) {
+    struct stat st; int fd; (void)m;
+    int r = fr3_enter(0); if (r) return r;
+    int base = bpin_find_orphan("/tmp");
+    const char *src = "/tmp/bp2gc-src", *dst = "/tmp/bp2gc-dst";
+    fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return 3; close(fd);
+    fd = open(src, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return 4;
+    write(fd, "pinned\n", 7); close(fd);
+    if (chown(src, 1000, 1000) != 0) return 5;
+    if (mount_(src, dst, NULL, M_BIND) != 0) return 6;
+    if (unlink(src) != 0) return 7;
+    if (bpin_find_orphan("/tmp") != base + 1) { printf("  bp2gc: no hidden name after unlink\n"); return 8; }
+    if (umount_(dst, 0) != 0) return 9;
+    /* Every check runs as the non-owner: any open/stat/unlink by root would
+     * itself run the gc and hide the bug. */
+    pid_t c = fork();
+    if (c == 0) {
+        if (setgid(1001) || setuid(1001)) _exit(99);
+        stat(dst, &st); stat(dst, &st);
+        int left = bpin_find_orphan("/tmp") - base;
+        if (left != 0) { printf("  bp2gc: hidden name left after non-owner gc (%d)\n", left); _exit(10); }
+        long s0 = bp2_stat("orphan_scans=");
+        for (int i = 0; i < 6; i++) { stat(dst, &st); close(open(dst, O_RDONLY)); }
+        long s1 = bp2_stat("orphan_scans=");
+        if (s1 - s0 != 0) { printf("  bp2gc: %ld rescans for 12 later ops\n", s1 - s0); _exit(11); }
+        if (bp2_stat("orphans=") != 0) { printf("  bp2gc: orphans pending=%ld\n", bp2_stat("orphans=")); _exit(12); }
+        _exit(0);
+    }
+    int w = 0; waitpid(c, &w, 0);
+    if (!WIFEXITED(w) || WEXITSTATUS(w) != 0) return 20 + (WIFEXITED(w) ? WEXITSTATUS(w) : 0);
+    unlink(dst);
+    return 0;
+}
+/* m=0 tmpfs dir, m=1 f2fs dir: pre-existing .leandros-orphan-<next> names survive. */
+static int bp2_decoy_case(int m) {
+    char dir[64], p[160], src[96], dst[64], buf[32]; struct stat st; int fd;
+    int r = fr3_enter(0); if (r) return r;
+    if (m == 0) snprintf(dir, sizeof dir, "/tmp/bp2d%d", (int)getpid()); else snprintf(dir, sizeof dir, "/root/bp2d%d", (int)getpid());
+    mkdir(dir, 0755);
+    long seq = bp2_stat("orphan_seq="); if (seq < 1) return 2;
+    for (long i = seq; i < seq + 3; i++) {
+        snprintf(p, sizeof p, "%s/.leandros-orphan-%ld", dir, i);
+        fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (fd < 0) return 3;
+        snprintf(buf, sizeof buf, "decoy%ld", i); write(fd, buf, strlen(buf)); close(fd);
+    }
+    snprintf(src, sizeof src, "%s/src", dir); snprintf(dst, sizeof dst, "/tmp/bp2dd%d", m);
+    fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return 4; close(fd);
+    fd = open(src, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (fd < 0) return 5;
+    write(fd, "pinned\n", 7); close(fd);
+    if (mount_(src, dst, NULL, M_BIND) != 0) return 6;
+    if (unlink(src) != 0) return 7;
+    for (long i = seq; i < seq + 3; i++) {
+        snprintf(p, sizeof p, "%s/.leandros-orphan-%ld", dir, i); memset(buf, 0, sizeof buf);
+        fd = open(p, O_RDONLY); if (fd < 0) { printf("  bp2decoy: decoy %ld gone\n", i); return 8; }
+        read(fd, buf, sizeof buf - 1); close(fd);
+        snprintf(p, sizeof p, "decoy%ld", i);
+        if (strcmp(buf, p) != 0) { printf("  bp2decoy: decoy %ld clobbered: [%s]\n", i, buf); return 9; }
+    }
+    memset(buf, 0, sizeof buf);
+    fd = open(dst, O_RDONLY); if (fd < 0) return 10;
+    read(fd, buf, 8); close(fd);
+    if (strncmp(buf, "pinned\n", 7) != 0) { printf("  bp2decoy: bind reads [%s]\n", buf); return 11; }
+    if (umount_(dst, 0) != 0) return 12;
+    stat(dst, &st); stat(dst, &st);
+    for (long i = seq; i < seq + 3; i++) { snprintf(p, sizeof p, "%s/.leandros-orphan-%ld", dir, i); unlink(p); }
+    unlink(dst); rmdir(dir);
+    return 0;
+}
+/* m=0 tmpfs, m=1 f2fs: a source with 2 links reports nlink 1 through the bind after unlink. */
+static int bp2_nlink_case(int m) {
+    char dir[64], src[96], src2[96], dst[64]; struct stat st; int fd;
+    int r = fr3_enter(0); if (r) return r;
+    if (m == 0) snprintf(dir, sizeof dir, "/tmp/bp2n%d", (int)getpid()); else snprintf(dir, sizeof dir, "/root/bp2n%d", (int)getpid());
+    mkdir(dir, 0755);
+    snprintf(src, sizeof src, "%s/src", dir); snprintf(src2, sizeof src2, "%s/src2", dir); snprintf(dst, sizeof dst, "/tmp/bp2nd%d", m);
+    fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) return 4; close(fd);
+    fd = open(src, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (fd < 0) return 5;
+    write(fd, "pinned\n", 7); close(fd);
+    if (link(src, src2) != 0) return 6;
+    if (mount_(src, dst, NULL, M_BIND) != 0) return 7;
+    if (unlink(src) != 0) return 8;
+    if (stat(dst, &st) != 0) return 9;
+    if (st.st_nlink != 1) { printf("  bp2nlink: nlink=%d want 1\n", (int)st.st_nlink); return 10; }
+    if (umount_(dst, 0) != 0) return 11;
+    stat(dst, &st); stat(dst, &st);
+    if (stat(src2, &st) != 0 || st.st_nlink != 1) { printf("  bp2nlink: surviving link nlink=%d\n", (int)st.st_nlink); return 12; }
+    unlink(src2); unlink(dst); rmdir(dir);
+    return 0;
+}
 static void filebind_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
@@ -3039,6 +3136,11 @@ static void filebind_suite(void) {
     report("filebind_tmpfs_file_bind_pivot", nn_in_child(fb_case, 4) & nn_in_child(fb_case, 6));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
     report("bindpin_unlink_source_f2fs", nn_in_child(bpin_case, 1) & nn_in_child(bpin_case, 9));
+    report("bindpin2_gc_nonowner_sticky", nn_in_child(bp2_gc_case, 0));
+    report("bindpin2_decoy_orphan_survives_tmpfs", nn_in_child(bp2_decoy_case, 0));
+    report("bindpin2_decoy_orphan_survives_f2fs", nn_in_child(bp2_decoy_case, 1));
+    report("bindpin2_nlink_real_tmpfs", nn_in_child(bp2_nlink_case, 0));
+    report("bindpin2_nlink_real_f2fs", nn_in_child(bp2_nlink_case, 1));
     report("bindpin_unlink_source_sbtmpfs", nn_in_child(bpin_case, 2) & nn_in_child(bpin_case, 10));
 }
 
