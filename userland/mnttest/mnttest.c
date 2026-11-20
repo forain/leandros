@@ -3045,6 +3045,52 @@ static int fb_bwrap(int m) {
     if (!found) { printf("  fbb m=%d x not listed: %s\n", m, names); return 29; }
     return 0;
 }
+/* bwrap openat_in_root: after rbind of "/oldroot/" onto /newroot, a dirfd opened on
+ * /newroot must name its base through /newroot, so mounts via the child fd land there. */
+#define FBT(code, step) do { printf("  fbt m=%d step=%s errno=%d\n", m, step, errno); return code; } while (0)
+static int fb_twin(int m) {
+    char base[64], p[96], nr[96], od[96], lk[128], fp[96]; int fd, root_fd; ssize_t n;
+    int r = fr3_enter(m & 2);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fbtw-%d", (int)getpid()); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FBT(2, "tmpfs-base");
+    snprintf(nr, sizeof nr, "%s/newroot", base); snprintf(od, sizeof od, "%s/oldroot", base);
+    if (mkdir(nr, 0755) != 0) FBT(4, "mkdir-newroot");
+    if (mkdir(od, 0755) != 0) FBT(5, "mkdir-oldroot");
+    if (mount_(nr, nr, NULL, M_BIND | M_REC) != 0) FBT(3, "bind-newroot");
+    if (chdir(base) != 0) FBT(6, "chdir-base");
+    if (syscall(SYS_pivot_root, base, "oldroot") != 0) FBT(7, "pivot1");
+    if (chdir("/") != 0) FBT(8, "chdir-/");
+    if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) FBT(9, "rbind");
+    root_fd = open("/newroot", O_PATH | O_CLOEXEC); if (root_fd < 0) FBT(10, "open-root");
+    if (m & 1) {
+        struct { unsigned long long flags, mode, resolve; } how = { O_PATH | O_NOFOLLOW | O_CLOEXEC, 0, 0x10 };
+        fd = (int)syscall(SYS_openat2, root_fd, "tmp", &how, 24);
+    } else fd = openat(root_fd, "tmp", O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) FBT(11, "openat");
+    snprintf(p, sizeof p, "/oldroot/proc/self/fd/%d", fd);
+    n = readlink(p, lk, sizeof lk - 1); if (n >= 0) lk[n] = 0; else lk[0] = 0;
+    if (strcmp(lk, "/newroot/tmp") != 0) { printf("  fbt m=%d step=readlink got=%s\n", m, lk); return 12; }
+    snprintf(fp, sizeof fp, "/oldroot/proc/self/fd/%d", fd);
+    if (mount("tmpfs", fp, "tmpfs", MS_NOSUID | MS_NODEV, NULL) != 0) FBT(13, "mount-tmpfs");
+    if (access("/newroot/tmp/.fbtw-marker", F_OK) == 0) { printf("  fbt m=%d step=tmpfs-landed-oldroot\n", m); return 14; }
+    if (errno != ENOENT) FBT(15, "access-newroot");
+    if (mount("oldroot", "oldroot", NULL, MS_REC | MS_PRIVATE, NULL) != 0) FBT(16, "oldroot-private");
+    if (umount2("oldroot", MNT_DETACH) != 0) FBT(17, "umount-oldroot");
+    if (chdir("/newroot") != 0) FBT(18, "chdir-newroot");
+    if (syscall(SYS_pivot_root, ".", ".") != 0) FBT(19, "pivot2");
+    if (umount2(".", MNT_DETACH) != 0) FBT(20, "umount-dot");
+    if (chdir("/") != 0) FBT(21, "chdir-/2");
+    if (access("/tmp/.fbtw-marker", F_OK) == 0 || errno != ENOENT) FBT(22, "marker-visible");
+    return 0;
+}
+static int fb_twin_run(void) {
+    int f = open("/tmp/.fbtw-marker", O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f);
+    chmod("/tmp", 01777);
+    int ok = nn_in_child(fb_twin, 0) & nn_in_child(fb_twin, 1) & nn_in_child(fb_twin, 2) & nn_in_child(fb_twin, 3);
+    unlink("/tmp/.fbtw-marker");
+    return ok;
+}
 static void filebind_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
@@ -3053,6 +3099,7 @@ static void filebind_suite(void) {
     report("filebind_tmpfs_file_bind_pivot", nn_in_child(fb_case, 4) & nn_in_child(fb_case, 6));
     report("filebind_bwrap_exact_hostname", nn_in_child(fb_bwrap, 0) & nn_in_child(fb_bwrap, 2));
     report("filebind_bwrap_exact_data", nn_in_child(fb_bwrap, 1) & nn_in_child(fb_bwrap, 3));
+    report("filebind_openat_newroot_twin", fb_twin_run());
 }
 
 static void mro_suite(void) {
