@@ -5546,7 +5546,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
 }
 
 fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
-    if msg.tag == VFS_UNLINK || msg.tag == VFS_OPEN || msg.tag == VFS_STAT { bindpin_orphan_gc(caller_pid); }
+    if msg.tag == VFS_UNLINK || msg.tag == VFS_OPEN || msg.tag == VFS_STAT { bindpin_orphan_gc(); }
     match msg.tag {
         VFS_OPEN         => {
             // Remember the mount a mount-namespace task opened through, so a
@@ -15069,31 +15069,47 @@ fn bindpin_orphan_unlink(pid: u32, path: &[u8]) -> Option<Message> {
     let mut sb = [0u8; 256];
     let r = handle_stat(sp.as_ptr() as usize, sb.as_mut_ptr() as usize);
     if reply_val(&r) >= 0 && read_stat_mode(sb.as_ptr() as usize) & 0o170000 == 0o040000 { return None; }
-    let hidden = mnt::orphan_name_for(path);
-    let (mut o, mut n) = (path.to_vec(), hidden.clone());
-    o.push(0); n.push(0);
-    let r = handle_rename(pid, o.as_ptr() as usize, n.as_ptr() as usize, 0);
-    if reply_val(&r) >= 0 { mnt::orphan_adopt(path, &hidden); }
-    Some(r)
+    // RENAME_NOREPLACE: the counter restarts every boot, an old `.leandros-orphan-N`
+    // may exist (f2fs) and must not be replaced; take the next number on EEXIST.
+    let mut o = path.to_vec(); o.push(0);
+    for _ in 0..4096 {
+        let hidden = mnt::orphan_name_for(path);
+        let mut n = hidden.clone(); n.push(0);
+        let r = handle_rename(pid, o.as_ptr() as usize, n.as_ptr() as usize, 1);
+        match reply_val(&r) {
+            -17 => continue,
+            v if v >= 0 => { mnt::orphan_adopt(path, &hidden); return Some(r); }
+            _ => return Some(r),
+        }
+    }
+    Some(err_reply(-17))
 }
 
-/// Delete orphans (see `bindpin_orphan_unlink`) whose last bind is gone.
-fn bindpin_orphan_gc(pid: u32) {
-    for p in mnt::orphan_take_unused() {
+/// Delete orphans (see `bindpin_orphan_unlink`) whose last bind is gone. Runs
+/// with the VFS's own root identity (an unknown pid resolves to the
+/// kernel-private root cred): the caller that happens to trigger the scan may
+/// be a non-owner in a sticky dir, another user or a userns task. Gone
+/// already (ENOENT/ESTALE) or unreachable for good (EROFS) drops the entry;
+/// anything else is retried a couple of times, then dropped.
+fn bindpin_orphan_gc() {
+    const SELF_PID: u32 = u32::MAX;
+    for (p, tries) in mnt::orphan_take_unused() {
         let mut c = p.clone(); c.push(0);
-        let e = reply_val(&handle_unlink(pid, c.as_ptr() as usize));
-        if e < 0 && e != -2 { mnt::orphan_requeue(p); }
+        let e = reply_val(&handle_unlink(SELF_PID, c.as_ptr() as usize));
+        if e >= 0 || e == -2 || e == -116 || e == -30 { continue; }
+        if tries + 1 < mnt::ORPHAN_TRIES { mnt::orphan_requeue(p, tries + 1); }
     }
 }
 
-/// nlink of an orphan (its last name is gone) reads 0, as on Linux.
+/// nlink of an orphan: the hidden name is not a link of the file, so the real
+/// count minus one (0 when it was the last one, as on Linux).
 fn bindpin_orphan_nlink(path_ptr: usize, stat_ptr: usize) {
     if !mnt::orphans_any() { return; }
     let (b, l) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return };
     if !mnt::is_orphan(strip_trailing_slash(&b[..l])) { return; }
     unsafe {
-        #[cfg(target_arch = "x86_64")] { ((stat_ptr + 16) as *mut u64).write_unaligned(0); }
-        #[cfg(not(target_arch = "x86_64"))] { ((stat_ptr + 20) as *mut u32).write_unaligned(0); }
+        #[cfg(target_arch = "x86_64")] { let p = (stat_ptr + 16) as *mut u64; p.write_unaligned(p.read_unaligned().saturating_sub(1)); }
+        #[cfg(not(target_arch = "x86_64"))] { let p = (stat_ptr + 20) as *mut u32; p.write_unaligned(p.read_unaligned().saturating_sub(1)); }
     }
 }
 
