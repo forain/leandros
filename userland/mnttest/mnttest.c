@@ -3186,6 +3186,45 @@ static int fb_twin_run(void) {
     unlink("/tmp/.fbtw-marker");
     return ok;
 }
+/* bwrap ensure_node_at on a second file bind of the same dest: after the first bind is remounted
+ * read-only, openat(parent_fd, "x", O_WRONLY|O_CREAT|O_EXCL) must fail EEXIST (Linux checks the
+ * name before any read-only mount check); without O_EXCL it is EROFS. m bit 1 = uid 1000,
+ * bit 0 = parent_fd via openat2(RESOLVE_IN_ROOT) like bwrap's safe_openat. */
+#define FXE(code, step) do { printf("  fxe m=%d step=%s errno=%d\n", m, step, errno); return code; } while (0)
+static int fb_excl_ro(int m) {
+    char base[64], p[96], fp[96], lk[128], buf[64]; int fd, pfd; ssize_t n; struct stat st;
+    int r = fr3_enter(m & 2);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fxe-%d", (int)getpid()); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FXE(2, "tmpfs-base");
+    snprintf(p, sizeof p, "%s/x", base);
+    fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0444); if (fd < 0) FXE(3, "creat-x");
+    close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC); if (fd < 0) FXE(4, "open-opath-x");
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_("/etc/hostname", fp, NULL, M_BIND | M_REC) != 0) FXE(5, "bind-file");
+    n = readlink(fp, lk, sizeof lk - 1); if (n >= 0) lk[n] = 0; else lk[0] = 0;
+    if (mount_(NULL, lk, NULL, 2134055UL) != 0) FXE(6, "ro-remount-x");
+    close(fd);
+    int root_fd = open(base, O_PATH | O_NOCTTY | O_CLOEXEC); if (root_fd < 0) FXE(7, "open-base");
+    if (m & 1) {
+        struct { unsigned long long flags, mode, resolve; } how = { O_PATH | O_NOFOLLOW | O_CLOEXEC, 0, 0x10 };
+        pfd = (int)syscall(SYS_openat2, root_fd, ".", &how, 24);
+    } else pfd = openat(root_fd, ".", O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (pfd < 0) FXE(8, "parent-fd");
+    errno = 0; fd = openat(pfd, "x", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC, 0444);
+    if (fd >= 0 || errno != EEXIST) FXE(10, "openat-excl-not-EEXIST");
+    errno = 0; fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0444);
+    if (fd >= 0 || errno != EEXIST) FXE(11, "open-excl-not-EEXIST");
+    errno = 0; fd = open(p, O_WRONLY | O_CREAT, 0444);
+    if (fd >= 0 || errno != EROFS) FXE(12, "open-creat-not-EROFS");
+    fd = openat(pfd, "x", O_PATH | O_NOFOLLOW | O_CLOEXEC); if (fd < 0) FXE(13, "openat-opath");
+    close(fd);
+    fd = open(p, O_RDONLY); if (fd < 0) FXE(14, "open-rd");
+    n = read(fd, buf, sizeof buf - 1); close(fd);
+    if (stat("/etc/hostname", &st) != 0 || n != st.st_size || n <= 0) FXE(15, "content");
+    return 0;
+}
 #define BPN(code, name) do { printf("  bp m=%d step=%s errno=%d\n", m, name, errno); return code; } while (0)
 /* bindpin: unlinking the SOURCE of a file bind must not break the bind (Linux pins the
  * inode): the target keeps the old bytes, reports nlink 0, and no stale name is left once
@@ -3344,6 +3383,7 @@ static void filebind_suite(void) {
     report("filebind_bwrap_exact_data", nn_in_child(fb_bwrap, 1) & nn_in_child(fb_bwrap, 3));
     report("filebind_bwrap_exact_stack", nn_in_child(fb_bwrap_exact, 0) & nn_in_child(fb_bwrap_exact, 1) & nn_in_child(fb_bwrap_exact, 2) & nn_in_child(fb_bwrap_exact, 3));
     report("filebind_openat_newroot_twin", fb_twin_run());
+    report("filebind_excl_on_ro_bind", nn_in_child(fb_excl_ro, 0) & nn_in_child(fb_excl_ro, 1) & nn_in_child(fb_excl_ro, 2) & nn_in_child(fb_excl_ro, 3));
     report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
     report("bindpin_unlink_source_f2fs", nn_in_child(bpin_case, 1) & nn_in_child(bpin_case, 9));
