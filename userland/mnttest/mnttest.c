@@ -3392,6 +3392,92 @@ static int devtty_opath_case(int m) {
     if (stat(dst, &st) != 0 || !S_ISCHR(st.st_mode)) FBB(8, "target-not-chr");
     return 0;
 }
+/* bwrap --dev binds /proc/self/fd/N of an O_PATH /dev/tty (no ctty) onto the
+ * new /dev/tty: the fd must name /dev/tty and the bound node must stat 5:0,
+ * not the console's 5:1 (the fd used to readlink as /dev/stderr). */
+static int devtty_opath_bind_rdev_case(int m) {
+    char base[64], fp[64], dst[96], ln[64]; struct stat st; int fd; ssize_t n;
+    if (setsid() < 0) FBB(1, "setsid");
+    fd = open("/dev/tty", O_PATH | O_CLOEXEC);
+    if (fd < 0) FBB(2, "opath-dev-tty");
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    n = readlink(fp, ln, sizeof ln - 1);
+    if (n < 0) FBB(3, "readlink");
+    ln[n] = 0;
+    if (strcmp(ln, "/dev/tty") != 0) { printf("  dttr: readlink=%s\n", ln); return 4; }
+    int r = fr3_enter(m & 2);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/dtr%d", m); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FBB(5, "tmpfs-base");
+    snprintf(dst, sizeof dst, "%s/tty", base);
+    int tf = open(dst, O_WRONLY | O_CREAT, 0644); if (tf < 0) FBB(6, "create-target"); close(tf);
+    if (mount_(fp, dst, NULL, M_BIND) != 0) FBB(7, "bind-via-procfd");
+    if (stat(dst, &st) != 0 || !S_ISCHR(st.st_mode)) FBB(8, "target-not-chr");
+    if (major(st.st_rdev) != 5 || minor(st.st_rdev) != 0) {
+        printf("  dttr: bound rdev=%u:%u\n", major(st.st_rdev), minor(st.st_rdev)); return 9;
+    }
+    return 0;
+}
+/* Relative on-disk /sys links (DRM: 226:N -> ../../devices/..., device -> ../..)
+ * resolve inside a mount namespace, as libdrm in a flatpak sandbox walks them.
+ * Was ELOOP (strict-links VFS_ELINKRACE retries) for every link the namespace
+ * walk skipped because its backing path was under /sys. */
+static int sysfs_drm_links_ns_case(int m) {
+    const char *P[] = { "/sys/dev/char/226:128/uevent", "/sys/dev/char/226:128/device/uevent",
+                        "/sys/dev/char/226:0/device/drm" };
+    struct stat st; int i, r;
+    if (stat(P[1], &st) != 0) return 0; /* no DRM device staged on this board */
+    r = fr3_enter(m & 2);
+    if (r) return r;
+    if (m & 4) {
+        /* bwrap --dev-bind / /: tmpfs base, pivot into it, rbind the old root
+         * onto /newroot, then make /newroot the root (the original repro). */
+        char base[32]; snprintf(base, sizeof base, "/tmp/sdl%d", m); mkdir(base, 0755);
+        if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0 || chdir(base) != 0) return 40;
+        if (mkdir("newroot", 0755) != 0 || mkdir("oldroot", 0755) != 0) return 41;
+        if (syscall(SYS_pivot_root, base, "oldroot") != 0 || chdir("/") != 0) return 42;
+        if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) return 43;
+        if (chdir("/newroot") != 0 || syscall(SYS_pivot_root, ".", ".") != 0) return 44;
+        if (umount2(".", MNT_DETACH) != 0 || chdir("/") != 0) return 45;
+    }
+    for (i = 0; i < 3; i++)
+        if (stat(P[i], &st) != 0) { printf("  sdl: m=%d %s errno=%d\n", m, P[i], errno); return 10 + i; }
+    return 0;
+}
+/* bwrap's resolve_symlinks_in_ops() realpath()s every bind source in the fresh
+ * child (userns+mntns[+pidns], uid map written, before any mount). musl's
+ * realpath readlink()s each prefix and aborts on any errno but EINVAL, so
+ * readlink("/dev/dri") answering ENOENT made flatpak drop its -try bind of
+ * /dev/dri and Mesa in the sandbox found no GPU. bit 2: uid-1000 userns,
+ * bit 4: also a new pid namespace (checked in its pid 1). */
+static int devdri_rl_check(int m) {
+    const char *P[] = { "/dev", "/dev/dri", "/dev/dri/renderD128" };
+    char b[256]; int i;
+    for (i = 0; i < 3; i++) {
+        errno = 0;
+        ssize_t n = readlink(P[i], b, sizeof b);
+        if (n >= 0 || errno != EINVAL) { printf("  ddr: m=%d readlink %s n=%zd errno=%d\n", m, P[i], n, errno); return 20 + i; }
+        char *rp = realpath(P[i], NULL);
+        if (!rp || strcmp(rp, P[i]) != 0) { printf("  ddr: m=%d realpath %s -> %s errno=%d\n", m, P[i], rp ? rp : "(null)", errno); free(rp); return 30 + i; }
+        free(rp);
+    }
+    return 0;
+}
+static int devdri_realpath_ns_case(int m) {
+    struct stat st;
+    if (stat("/dev/dri/renderD128", &st) != 0) return 0; /* no DRM device on this board */
+    if (m & 2) {
+        if (setgroups(0, NULL) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 90;
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS | ((m & 4) ? CLONE_NEWPID : 0)) != 0) return 91;
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+    } else if (unshare(CLONE_NEWNS | ((m & 4) ? CLONE_NEWPID : 0)) != 0) return 91;
+    if (!(m & 4)) return devdri_rl_check(m);
+    pid_t c = fork();
+    if (c < 0) return 92;
+    if (c == 0) _exit(devdri_rl_check(m));
+    int ws = 0; if (waitpid(c, &ws, 0) != c) return 93;
+    return WIFEXITED(ws) ? WEXITSTATUS(ws) : 94;
+}
 static void filebind_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
@@ -3404,6 +3490,9 @@ static void filebind_suite(void) {
     report("filebind_openat_newroot_twin", fb_twin_run());
     report("filebind_excl_on_ro_bind", nn_in_child(fb_excl_ro, 0) & nn_in_child(fb_excl_ro, 1) & nn_in_child(fb_excl_ro, 2) & nn_in_child(fb_excl_ro, 3));
     report("devtty_opath_no_ctty", nn_in_child(devtty_opath_case, 0) & nn_in_child(devtty_opath_case, 2));
+    report("sysfs_drm_links_in_mntns", nn_in_child(sysfs_drm_links_ns_case, 0) & nn_in_child(sysfs_drm_links_ns_case, 2) & nn_in_child(sysfs_drm_links_ns_case, 4) & nn_in_child(sysfs_drm_links_ns_case, 6));
+    report("devdri_realpath_in_userns", nn_in_child(devdri_realpath_ns_case, 0) & nn_in_child(devdri_realpath_ns_case, 2) & nn_in_child(devdri_realpath_ns_case, 6));
+    report("devtty_opath_bind_rdev", nn_in_child(devtty_opath_bind_rdev_case, 0) & nn_in_child(devtty_opath_bind_rdev_case, 2));
     report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
     report("bindpin_unlink_source_f2fs", nn_in_child(bpin_case, 1) & nn_in_child(bpin_case, 9));

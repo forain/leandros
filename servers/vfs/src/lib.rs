@@ -2150,6 +2150,8 @@ pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
     match tbl.fds[fd].kind {
         // A console proxy is the console itself — never a link to whatever
         // its `target_fd` slot holds now (see `VnodeKind::DevStdio`).
+        // An O_PATH /dev/tty with no ctty names the 5:0 node, not the console.
+        VnodeKind::DevStdio { target_fd: TTY_NODE_FD } => false,
         VnodeKind::DevStdio { .. } => true,
         // A virtual console IS the console: writes land on the active VT
         // (the mirror `vt::console_out` feeds), reads take console input.
@@ -4964,7 +4966,12 @@ fn sys_readlink(path: &[u8]) -> Option<Vec<u8>> {
 
 /// Readlink of one backing path on any filesystem; `None` when it is not a link.
 fn backing_readlink(backing: &[u8]) -> Option<Vec<u8>> {
-    if backing.starts_with(b"/proc") || backing.starts_with(b"/sys") || backing.starts_with(b"/dev") { return None; }
+    // /sys is NOT skipped: its DRM tree is staged on disk with relative
+    // links (`device -> ../..`, `/sys/dev/char/226:N -> ../../devices/...`),
+    // and a strict-links filesystem answers VFS_ELINKRACE for a link the
+    // namespace walk left unresolved, so every such path was ELOOP in a
+    // mount namespace (flatpak's Mesa: drmGetDeviceFromDevId found no device).
+    if backing.starts_with(b"/proc") || backing.starts_with(b"/dev") { return None; }
     let mut p = backing.to_vec();
     p.push(0);
     let mut out = alloc::vec![0u8; 512];
@@ -15665,6 +15672,16 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if let Some(Some(_)) = proc_stat_kind(raw) { return err_reply(-22); }
     // Generated /etc files are regular files, not links (the F2FS root would say ENOENT).
     if etc_synth(raw) { return err_reply(-22); }
+    // Synthesised /dev directories (/dev/dri, /dev/input, ...) and dynamic
+    // device nodes (/dev/dri/renderD128) exist but are not links. They are not
+    // on the root volume, so the "/" mount below answered ENOENT, and musl's
+    // realpath("/dev/dri") failed: bwrap could not find the source of
+    // flatpak's --dev-bind-try /dev/dri, and the sandbox had no GPU.
+    if raw.starts_with(b"/dev/") {
+        if RAMFS_DIRS.iter().any(|&d| d == raw) { return err_reply(-22); }
+        let dynamic = DYNAMIC_DEVICES.lock().iter().any(|d| d.in_use && d.path.as_bytes() == raw);
+        if dynamic { return err_reply(-22); }
+    }
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_READLINK;
@@ -17817,6 +17834,10 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             }),
             VnodeKind::DevStdio { target_fd: 0 } => FdInfo::Static(b"/dev/stdin"),
             VnodeKind::DevStdio { target_fd: 1 } => FdInfo::Static(b"/dev/stdout"),
+            // An O_PATH /dev/tty with no controlling terminal names the 5:0
+            // node itself; bwrap --dev binds /proc/self/fd/N of it, so naming
+            // it /dev/stderr bound the console (5:1) as the sandbox's /dev/tty.
+            VnodeKind::DevStdio { target_fd: TTY_NODE_FD } => FdInfo::Static(b"/dev/tty"),
             VnodeKind::DevStdio { .. } => FdInfo::Static(b"/dev/stderr"),
             // A file on a mounted filesystem: only the owning mount server
             // knows the path behind its file_id, so ask it.
