@@ -285,6 +285,19 @@ pub fn reverse(ns: NsId, backing: &[u8], hint: u32) -> Option<Vec<u8>> {
             if mp.len() > 1 { if let Some(x) = walk(t, &mp) { if x.backing == backing || (x.mnt_id == hint && same_dev_name(&x.backing, backing)) { return Some(mp); } } }
         }
     }
+    // An object covered by a later mount (a file bound over another file bound
+    // onto it) keeps its mountpoint name when named through the hint mount.
+    if hint != 0 {
+        if let Some(i) = (0..t.len()).find(|&i| t[i].id == hint) {
+            let m = &t[i];
+            if under(backing, &m.root) {
+                let mp = ns_mountpoint(t, i);
+                let rest: &[u8] = if &*m.root == b"/" { backing } else { &backing[m.root.len()..] };
+                let cand = join(&mp, rest);
+                if let Some(x) = walk(t, &cand) { if x.ns_prefix_len == cand.len() && cand.len() > 1 { return Some(cand); } }
+            }
+        }
+    }
     let mut order: Vec<usize> = (0..t.len()).collect();
     order.sort_by_key(|&i| (t[i].id != hint, core::cmp::Reverse(t[i].root.len())));
     for i in order {
