@@ -166,6 +166,7 @@ struct T {
 impl T {
     fn report(&mut self, name: &str, t: Instant, r: Result<String, String>) {
         let ms = t.elapsed().as_millis();
+        step(&format!("after {name}"));
         match r {
             Ok(v) => {
                 self.pass += 1;
@@ -181,6 +182,7 @@ impl T {
 
 macro_rules! check {
     ($t:expr, $name:expr, $body:expr) => {{
+        step($name);
         let t0 = Instant::now();
         let r: Result<String, String> = async { $body }.await;
         $t.report($name, t0, r);
@@ -252,6 +254,78 @@ fn saved_wifi_count(snap: &nmrs::NetworkSnapshot, ssid: &str) -> usize {
         .count()
 }
 
+
+// ---- Stall diagnostics (lane nmflake) ---------------------------------
+// `nmtest --spawn --quick` hung once past the 900 s regress timeout with no
+// record of where. Every check and every teardown phase names itself here;
+// a plain OS thread (independent of the tokio runtime, which may be the thing
+// that is stuck) prints, when one phase has made no progress for
+// NMTEST_STALL_SECS (default 120 s; again every period while it lasts), the
+// phase, and every process with its threads' scheduler states and the
+// kernel's wait-channel field from /proc. It only reports: the test's
+// behaviour and verdicts are unchanged.
+static STEP: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+fn step(name: &str) {
+    if let Ok(mut s) = STEP.lock() {
+        *s = Some((name.to_string(), Instant::now()));
+    }
+}
+
+fn proc_states(pid: &str) -> String {
+    // stat: "pid (comm) S ppid ..." -- comm may contain spaces/parens.
+    let rd = |p: String| std::fs::read_to_string(p).unwrap_or_default();
+    let stat = rd(format!("/proc/{pid}/stat"));
+    let (comm, rest) = match (stat.find('('), stat.rfind(')')) {
+        (Some(a), Some(b)) if b > a => (&stat[a + 1..b], stat[b + 1..].trim()),
+        _ => ("?", ""),
+    };
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // After comm: [0]=state [1]=ppid ... [32]=wchan (Linux field 35).
+    let g = |i: usize| f.get(i).copied().unwrap_or("?");
+    let mut thr = Vec::new();
+    if let Ok(d) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        for e in d.flatten() {
+            let tid = e.file_name().to_string_lossy().into_owned();
+            let ts = rd(format!("/proc/{pid}/task/{tid}/stat"));
+            let st = ts.rfind(')').and_then(|b| ts[b + 1..].split_whitespace().next().map(str::to_string));
+            thr.push(format!("{tid}:{}", st.unwrap_or_else(|| "?".into())));
+        }
+    }
+    let cmd = rd(format!("/proc/{pid}/cmdline")).replace('\0', " ");
+    format!("pid {pid} ppid {} {} wchan {} comm={comm} threads=[{}] cmd={}", g(1), g(0), g(32), thr.join(","), cmd.trim())
+}
+
+fn stall_watchdog() {
+    let period = std::env::var("NMTEST_STALL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120u64);
+    let _ = std::thread::Builder::new().name("nmtest-watchdog".into()).spawn(move || {
+        let mut last_dump: Option<Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let Some((name, since)) = STEP.lock().ok().and_then(|s| s.clone()) else { continue };
+            let stalled = since.elapsed().as_secs();
+            if stalled < period || last_dump.is_some_and(|d| d.elapsed().as_secs() < period) {
+                continue;
+            }
+            last_dump = Some(Instant::now());
+            let mut out = format!("NMTEST-STALL step={name:?} no progress for {stalled} s; processes:\n");
+            if let Ok(d) = std::fs::read_dir("/proc") {
+                let mut pids: Vec<u64> = d.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+                pids.sort_unstable();
+                for p in pids {
+                    out.push_str("NMTEST-STALL   ");
+                    out.push_str(&proc_states(&p.to_string()));
+                    out.push('\n');
+                }
+            }
+            use std::io::Write;
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(out.as_bytes());
+            let _ = so.flush();
+        }
+    });
+}
+
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--as") {
@@ -286,8 +360,16 @@ fn main() -> std::process::ExitCode {
             }
         }
     }
+    stall_watchdog();
+    step("runtime start");
     match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(rt) => rt.block_on(amain(args)),
+        Ok(rt) => {
+            let r = rt.block_on(amain(args));
+            step("runtime shutdown");
+            drop(rt);
+            step("exit");
+            r
+        }
         Err(e) => {
             eprintln!("nmtest: runtime: {e}");
             std::process::ExitCode::from(2)
@@ -314,6 +396,7 @@ async fn amain(args: Vec<String>) -> std::process::ExitCode {
             }
         }
     }
+    step("bus connect");
     let bus = match zbus::Connection::system().await {
         Ok(c) => c,
         Err(e) => {
@@ -337,6 +420,7 @@ async fn amain(args: Vec<String>) -> std::process::ExitCode {
                 cmd.env("LEANDROS_NM_MOCK_RO", "1");
             }
         }
+        step("spawn shim");
         match cmd.spawn() {
             Ok(c) => child = Some(c),
             Err(e) => {
@@ -344,6 +428,7 @@ async fn amain(args: Vec<String>) -> std::process::ExitCode {
                 return std::process::ExitCode::from(2);
             }
         }
+        step("wait for shim name");
         let dbus = zbus::fdo::DBusProxy::new(&bus).await.expect("DBus proxy");
         let name = zbus::names::BusName::try_from(NM).expect("name");
         let ok = wait_until(Duration::from_secs(15), || {
@@ -374,9 +459,13 @@ async fn amain(args: Vec<String>) -> std::process::ExitCode {
     }
     println!("NMTEST pass={} fail={}", t.pass, t.fail);
     if let Some(mut c) = child {
+        step("teardown: kill shim");
         let _ = c.kill();
+        step("teardown: wait for shim");
         let _ = c.wait();
     }
+    step("teardown: drop bus");
+    drop(bus);
     if t.fail == 0 { std::process::ExitCode::SUCCESS } else { std::process::ExitCode::from(1) }
 }
 

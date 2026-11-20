@@ -756,6 +756,18 @@ def main(argv):
                         r = rawline_run(c, timeout, arch)
                     else:
                         r = driver.serial_run(c, timeout=timeout, arch=arch)
+                        if r["status"] == "timeout":
+                            # A hang leaves no other trace (nmtest flake, lane
+                            # nmflake): record every process left behind after
+                            # the ^C with its threads' states from /proc. Only
+                            # appended to the output; the verdict is unchanged.
+                            try:
+                                d = driver.serial_run(
+                                    "for p in /proc/[0-9]*; do echo STALLPS $p; cat $p/cmdline $p/task/*/stat 2>/dev/null; echo; done",
+                                    timeout=120, arch=arch)
+                                r["output"] += "\n--- processes after the timeout ---\n" + d["output"]
+                            except Exception:  # noqa: BLE001
+                                pass
                 except Exception as e:  # noqa: BLE001
                     r = {"rc": None, "status": str(e) if str(e) == "reboot failed" else f"error {e}", "output": "", "secs": 0}
                 fails = find_fails(r["output"])
