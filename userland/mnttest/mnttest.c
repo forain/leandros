@@ -3373,6 +3373,25 @@ static int bp2_nlink_case(int m) {
     unlink(src2); unlink(dst); rmdir(dir);
     return 0;
 }
+static int devtty_opath_case(int m) {
+    char base[64], fp[64], dst[96]; struct stat st; int fd, e;
+    if (setsid() < 0) FBB(1, "setsid");
+    fd = open("/dev/tty", O_PATH | O_CLOEXEC);
+    if (fd < 0) FBB(2, "opath-dev-tty");
+    if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) || major(st.st_rdev) != 5 || minor(st.st_rdev) != 0) FBB(3, "fstat-5:0");
+    e = open("/dev/tty", O_RDWR);
+    if (e >= 0 || errno != ENXIO) FBB(4, "rdwr-enxio");
+    int r = fr3_enter(m & 2);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/dtt%d", m); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) FBB(5, "tmpfs-base");
+    snprintf(dst, sizeof dst, "%s/tty", base);
+    int tf = open(dst, O_WRONLY | O_CREAT, 0644); if (tf < 0) FBB(6, "create-target"); close(tf);
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(fp, dst, NULL, M_BIND) != 0) FBB(7, "bind-via-procfd");
+    if (stat(dst, &st) != 0 || !S_ISCHR(st.st_mode)) FBB(8, "target-not-chr");
+    return 0;
+}
 static void filebind_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
@@ -3384,6 +3403,7 @@ static void filebind_suite(void) {
     report("filebind_bwrap_exact_stack", nn_in_child(fb_bwrap_exact, 0) & nn_in_child(fb_bwrap_exact, 1) & nn_in_child(fb_bwrap_exact, 2) & nn_in_child(fb_bwrap_exact, 3));
     report("filebind_openat_newroot_twin", fb_twin_run());
     report("filebind_excl_on_ro_bind", nn_in_child(fb_excl_ro, 0) & nn_in_child(fb_excl_ro, 1) & nn_in_child(fb_excl_ro, 2) & nn_in_child(fb_excl_ro, 3));
+    report("devtty_opath_no_ctty", nn_in_child(devtty_opath_case, 0) & nn_in_child(devtty_opath_case, 2));
     report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
     report("bindpin_unlink_source_f2fs", nn_in_child(bpin_case, 1) & nn_in_child(bpin_case, 9));
