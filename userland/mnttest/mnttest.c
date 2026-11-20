@@ -3091,6 +3091,57 @@ static int fb_twin_run(void) {
     unlink("/tmp/.fbtw-marker");
     return ok;
 }
+#define BPN(code, name) do { printf("  bp m=%d step=%s errno=%d\n", m, name, errno); return code; } while (0)
+/* bindpin: unlinking the SOURCE of a file bind must not break the bind (Linux pins the
+ * inode): the target keeps the old bytes, reports nlink 0, and no stale name is left once
+ * the bind is unmounted. m: 0 = /tmp tmpfs, 1 = f2fs root, 2 = a mounted tmpfs (bwrap
+ * --tmpfs base), bit 4 = the source is unlinked before the ro remount, bit 8 = data bind
+ * made like bwrap --ro-bind-data (bind, remount ro through an O_PATH fd, unlink). */
+static int bpin_find_orphan(const char *dir) {
+    DIR *d = opendir(dir); if (!d) return -1;
+    struct dirent *e; int n = 0;
+    while ((e = readdir(d))) if (strstr(e->d_name, "orphan")) n++;
+    closedir(d);
+    return n;
+}
+static int bpin_case(int m) {
+    char dir[96], src[128], dst[128], fp[64]; struct stat st; char buf[16] = {0}; int fd;
+    int r = fr3_enter(0);
+    if (r) return r;
+    int kind = m & 3;
+    if (kind == 0) snprintf(dir, sizeof dir, "/tmp/bpt%d", m);
+    else if (kind == 1) snprintf(dir, sizeof dir, "/root/bpd%d", (int)getpid());
+    else { snprintf(dir, sizeof dir, "/tmp/bps%d", m); mkdir(dir, 0755);
+           if (mountd_("tmpfs", dir, "tmpfs", 6, "mode=0755") != 0) BPN(2, "tmpfs-base"); }
+    mkdir(dir, 0755);
+    snprintf(src, sizeof src, "%s/src", dir);
+    snprintf(dst, sizeof dst, "/tmp/bpdst%d", m);
+    fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (fd < 0) BPN(3, "dst-creat");
+    close(fd);
+    fd = open(src, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (fd < 0) BPN(4, "src-creat");
+    write(fd, "pinned\n", 7); close(fd);
+    if (mount_(src, dst, NULL, M_BIND) != 0) BPN(5, "bind");
+    if (m & 8) {
+        fd = open(dst, O_PATH | O_CLOEXEC); if (fd < 0) BPN(6, "open-opath");
+        snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+        if (mount_(NULL, fp, NULL, 32UL | M_BIND | 1UL) != 0) BPN(7, "ro-remount");
+        close(fd);
+    }
+    if (unlink(src) != 0) BPN(8, "unlink-src");
+    if (stat(src, &st) == 0) BPN(9, "src-still-named");
+    if (stat(dst, &st) != 0) BPN(10, "stat-dst");
+    if (!S_ISREG(st.st_mode) || st.st_size != 7) { printf("  bp m=%d mode=%o size=%lld\n", m, (unsigned)st.st_mode, (long long)st.st_size); return 11; }
+    if (st.st_nlink != 0) { printf("  bp m=%d nlink=%d want 0\n", m, (int)st.st_nlink); return 12; }
+    fd = open(dst, O_RDONLY); if (fd < 0) BPN(13, "open-dst");
+    ssize_t n = read(fd, buf, 8); close(fd);
+    if (n != 7 || strncmp(buf, "pinned\n", 7) != 0) BPN(14, "read-dst");
+    if (m & 8) { fd = open(dst, O_WRONLY); if (fd >= 0 || errno != EROFS) BPN(15, "wronly-erofs"); }
+    if (umount_(dst, 0) != 0) BPN(16, "umount-dst");
+    /* the hidden name is deleted lazily (next vfs op after the unmount) */
+    stat(dst, &st); stat(dst, &st);
+    if (bpin_find_orphan(dir) != 0) { printf("  bp m=%d orphan left in %s\n", m, dir); return 17; }
+    return 0;
+}
 static void filebind_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
@@ -3100,6 +3151,9 @@ static void filebind_suite(void) {
     report("filebind_bwrap_exact_hostname", nn_in_child(fb_bwrap, 0) & nn_in_child(fb_bwrap, 2));
     report("filebind_bwrap_exact_data", nn_in_child(fb_bwrap, 1) & nn_in_child(fb_bwrap, 3));
     report("filebind_openat_newroot_twin", fb_twin_run());
+    report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
+    report("bindpin_unlink_source_f2fs", nn_in_child(bpin_case, 1) & nn_in_child(bpin_case, 9));
+    report("bindpin_unlink_source_sbtmpfs", nn_in_child(bpin_case, 2) & nn_in_child(bpin_case, 10));
 }
 
 static void mro_suite(void) {
