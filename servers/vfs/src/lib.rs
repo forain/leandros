@@ -15672,6 +15672,16 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if let Some(Some(_)) = proc_stat_kind(raw) { return err_reply(-22); }
     // Generated /etc files are regular files, not links (the F2FS root would say ENOENT).
     if etc_synth(raw) { return err_reply(-22); }
+    // Synthesised /dev directories (/dev/dri, /dev/input, ...) and dynamic
+    // device nodes (/dev/dri/renderD128) exist but are not links. They are not
+    // on the root volume, so the "/" mount below answered ENOENT, and musl's
+    // realpath("/dev/dri") failed: bwrap could not find the source of
+    // flatpak's --dev-bind-try /dev/dri, and the sandbox had no GPU.
+    if raw.starts_with(b"/dev/") {
+        if RAMFS_DIRS.iter().any(|&d| d == raw) { return err_reply(-22); }
+        let dynamic = DYNAMIC_DEVICES.lock().iter().any(|d| d.in_use && d.path.as_bytes() == raw);
+        if dynamic { return err_reply(-22); }
+    }
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_READLINK;
