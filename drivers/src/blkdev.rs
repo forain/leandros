@@ -820,6 +820,45 @@ fn resolve_root_label(label: &str) -> Result<usize, RootErr> {
 ///    type (MBR 0x83 / GPT Linux filesystem GUID); a remaining tie is
 ///    `Ambiguous`.
 pub fn resolve_root(cmdline: Option<&str>, boot: Option<BootDisk>) -> Result<usize, RootErr> {
+    let r = resolve_root_inner(cmdline, boot);
+    if let Ok(i) = r { ROOT_IDX.store(i, Ordering::Release); }
+    r
+}
+
+/// Registry index of the resolved root (`usize::MAX` until resolved).
+static ROOT_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Byte length of the root F2FS filesystem (superblock), 0 until read.
+static ROOT_FS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Absolute byte range of whole disk `idx` that the mounted root filesystem
+/// occupies: raw writes there (from a block node) must be refused, the
+/// filesystem owns those bytes. `[0, fs)` for a root on a whole disk,
+/// `[partition start, + fs)` on the parent disk of a root partition.
+pub fn busy_range(idx: usize) -> Option<(u64, u64)> {
+    let r = ROOT_IDX.load(Ordering::Acquire);
+    let e = get(r)?;
+    let base = match e.parent {
+        None if r == idx => 0,
+        Some(p) if p as usize == idx => e.start * e.ss as u64,
+        _ => return None,
+    };
+    let mut fs = ROOT_FS_BYTES.load(Ordering::Relaxed);
+    if fs == 0 {
+        let mut b = alloc::vec![0u8; BLOCK];
+        if read_blocks(r, 0, &mut b) && is_f2fs_block0(&b) {
+            let log_bs = u32::from_le_bytes(b[1024 + 16..1024 + 20].try_into().unwrap());
+            let blocks = u64::from_le_bytes(b[1024 + 36..1024 + 44].try_into().unwrap());
+            if (9..=16).contains(&log_bs) { fs = blocks << log_bs; }
+        }
+        // Unknown filesystem size: the whole root device is in use.
+        if fs == 0 { fs = e.nsectors.saturating_mul(e.ss as u64); }
+        if fs == 0 { fs = u64::MAX / 2; }
+        ROOT_FS_BYTES.store(fs, Ordering::Relaxed);
+    }
+    Some((base, fs))
+}
+
+fn resolve_root_inner(cmdline: Option<&str>, boot: Option<BootDisk>) -> Result<usize, RootErr> {
     if let Some(spec) = cmdline.and_then(parse_root_arg) {
         if let Some(name) = spec.strip_prefix("/dev/") {
             return lookup_name(name).ok_or(RootErr::NotFound);

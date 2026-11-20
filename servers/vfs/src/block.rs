@@ -104,6 +104,9 @@ pub struct DiskOps {
     pub set_rw: fn(usize) -> bool,
     /// Make whole disk `idx` (an NVMe disk) read-only again.
     pub set_ro: fn(usize) -> bool,
+    /// Absolute byte range of whole disk `idx` that a mounted filesystem
+    /// owns (the root): `write(2)` on any node overlapping it is EBUSY.
+    pub busy: fn(usize) -> Option<(u64, u64)>,
 }
 
 /// NVMe controller identity (model / serial strings are already trimmed).
@@ -140,6 +143,11 @@ pub struct DiskInfo {
     pub scsi: bool,
     /// NVMe namespace (`nvme0n1`, Linux major 259, "blkext").
     pub nvme: bool,
+    /// SD/MMC card (`mmcblk0`, Linux major 179). Its partition table is
+    /// read here (`rrpart`), not by the kernel registry.
+    pub mmc: bool,
+    /// Root-only node (0600 root:root), inherited by its partitions.
+    pub private: bool,
     /// The disk refuses writes: `write(2)` answers EROFS, sysfs `ro` reads 1,
     /// BLKROGET returns 1.
     pub ro: bool,
@@ -196,6 +204,8 @@ struct BDev {
     ro: bool,
     /// Hidden from /dev and /sys/class/block listings (explicit open still works).
     special: bool,
+    /// 0600 root:root instead of 0660 root:disk (the whole SD card).
+    private: bool,
     ident: Option<DiskIdent>,
 }
 
@@ -214,6 +224,7 @@ impl BDev {
             removable: false,
             ro: false,
             special: false,
+            private: false,
             ident: None,
         }
     }
@@ -234,11 +245,13 @@ struct LoopState {
     backing: VnodeKind,
     path: [u8; 128],
     plen: u8,
+    /// LO_FLAGS_PARTSCAN: BLKRRPART reads the table on the backing file.
+    partscan: bool,
 }
 
 impl LoopState {
     const fn empty() -> Self {
-        Self { bound: false, backing: VnodeKind::None, path: [0; 128], plen: 0 }
+        Self { bound: false, backing: VnodeKind::None, path: [0; 128], plen: 0, partscan: false }
     }
 }
 
@@ -273,6 +286,7 @@ pub fn init(disk_ops: &'static DiskOps) {
             removable: false,
             ro: false,
             special: false,
+            private: false,
             ident: None,
         };
     }
@@ -323,7 +337,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
         let slot = match free_slot(b) { Some(s) => s, None => break };
         // 254 is what QEMU/Linux hands virtio-blk, 8 is SCSI/USB disks; 16
         // minors per disk leaves room for its partition nodes.
-        let major = if d.nvme { 259 } else if d.scsi { 8 } else { 254 };
+        let major = if d.nvme { 259 } else if d.scsi { 8 } else if d.mmc { 179 } else { 254 };
         let base_minor = d.ordinal as u32 * 16;
         let entry = match d.parent {
             None if i <= u8::MAX as usize => Some(BDev {
@@ -339,6 +353,7 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                 removable: d.removable,
                 ro: d.ro,
                 special: d.special,
+                private: d.private,
                 ident: d.ident,
             }),
             Some(p) => b.iter()
@@ -356,11 +371,17 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
                     removable: d.removable,
                     ro: d.ro,
                     special: d.special,
+                    private: d.private,
                     ident: d.ident,
                 }),
             None => None,
         };
-        if let Some(e) = entry { b[slot] = e; }
+        if let Some(e) = entry {
+            b[slot] = e;
+            if d.mmc && d.parent.is_none() && slot < 64 {
+                PENDING_SCAN.fetch_or(1 << slot, Ordering::AcqRel);
+            }
+        }
         i += 1;
     }
     KNOWN_DISKS.store(i, Ordering::Release);
@@ -370,6 +391,24 @@ fn sync_disks(b: &mut [BDev; MAX_BDEV]) {
 /// resolves or enumerates *names* goes through here, so a disk registered at
 /// runtime appears in `/dev` and `/sys/class/block` on the next lookup.
 fn synced() -> spin::MutexGuard<'static, [BDev; MAX_BDEV]> {
+    use core::sync::atomic::Ordering;
+    let b = synced_inner();
+    if PENDING_SCAN.load(Ordering::Acquire) == 0 { return b; }
+    // First sight of an SD card: read its MBR into partition nodes, as Linux
+    // does at probe. I/O cannot run under BDEVS (leaf lock), so drop it.
+    drop(b);
+    let p = PENDING_SCAN.swap(0, Ordering::AcqRel);
+    for slot in 0..64u16 {
+        if p & (1 << slot) != 0 { let _ = rrpart(slot); }
+    }
+    synced_inner()
+}
+
+/// Whole disks (registry slot bits) whose partition table the VFS still has
+/// to read (see `DiskInfo::mmc`).
+static PENDING_SCAN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn synced_inner() -> spin::MutexGuard<'static, [BDev; MAX_BDEV]> {
     let mut b = BDEVS.lock();
     if let Some(o) = ops() {
         let gen = (o.removed_gen)();
@@ -498,6 +537,18 @@ pub fn dev_rdev(dev: u16) -> u64 {
 /// True when the node is a character device (`/dev/loop-control`); everything
 /// else in the registry is a block device and must report `S_IFBLK`.
 pub fn dev_is_char(dev: u16) -> bool { dev == LOOP_CONTROL }
+
+/// `(mode bits, gid)` of the node: 0600 root:root for a private disk (the
+/// whole SD card and its partitions: the card holds the boot firmware),
+/// else 0660 root:disk.
+pub fn dev_perm(dev: u16) -> (u16, u32) {
+    if dev == LOOP_CONTROL || dev == NO_DEV { return (0o660, 6); }
+    let b = BDEVS.lock();
+    match b.get(dev as usize) {
+        Some(e) if e.in_use && e.private => (0o600, 0),
+        _ => (0o660, 6),
+    }
+}
 
 /// A stable inode number for a block node, distinct from the pipe
 /// (0x1000_0000), tmpfs (0x2000_0000) and pty ranges.
@@ -737,6 +788,13 @@ fn write_chunk(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 };
     if off >= size { return if dev_read_only(dev) { -30 } else { -28 }; } // EROFS / ENOSPC
     let n = len.min((size - off) as usize).min(MAX_XFER);
+    // Bytes a mounted filesystem owns are never written through a raw node.
+    if let (Root::Disk(i), Some(o)) = (root, ops()) {
+        if let Some((bs, bl)) = (o.busy)(i as usize) {
+            let a = base + off;
+            if n > 0 && a < bs.saturating_add(bl) && bs < a + n as u64 { return -16; } // EBUSY
+        }
+    }
     // A live BLKWRWIN window on this disk is the only way to write it when it
     // is read-only, and confines writes to its ranges when it is not.
     match root {
@@ -1309,7 +1367,13 @@ pub fn ioctl(pid: u32, ofd_id: u32, dev: u16, cmd: usize, arg: usize) -> isize {
         // re-read has nothing to do — and succeeding is what Linux does for a
         // device with no partitions open.
         BLKWRWIN => blkwrwin(pid, ofd_id, backing, size, ro, arg),
-        BLKRRPART => 0,
+        BLKRRPART => match backing {
+            Backing::Disk(_) => rrpart(dev),
+            Backing::Loop(n) if LOOPS.lock()[n as usize].partscan => rrpart(dev),
+            // A loop without LO_FLAGS_PARTSCAN keeps its BLKPG-made table
+            // (disks-rs), and a partition has nothing to re-read.
+            _ => 0,
+        },
         BLKFLSBUF => flush_dev(dev),
         BLKPG => blkpg(dev, arg),
         LOOP_SET_FD | LOOP_CLR_FD | LOOP_SET_STATUS64 | LOOP_GET_STATUS64
@@ -1396,7 +1460,17 @@ fn loop_ioctl(pid: u32, n: u8, dev: u16, cmd: usize, arg: usize) -> isize {
         // reports the binding we do have.
         LOOP_SET_STATUS64 => {
             if arg == 0 { return -14; }
-            if !LOOPS.lock()[n as usize].bound { return -6; }
+            // struct loop_info64: lo_flags is the u32 at byte 52.
+            let flags = match sched::uaccess::read_user::<u32>(arg + 52) { Some(v) => v, None => return -14 };
+            let scan = {
+                let mut l = LOOPS.lock();
+                if !l[n as usize].bound { return -6; }
+                let was = l[n as usize].partscan;
+                l[n as usize].partscan = flags & LO_FLAGS_PARTSCAN != 0;
+                !was && flags & LO_FLAGS_PARTSCAN != 0
+            };
+            // Linux scans the table when PARTSCAN is switched on.
+            if scan { let _ = rrpart(dev); }
             0
         }
         LOOP_GET_STATUS64 => {
@@ -1491,6 +1565,67 @@ fn close_backing(kind: VnodeKind) {
     }
 }
 
+// ── BLKRRPART: re-read the partition table ──────────────────────────────────
+
+#[path = "../../../drivers/src/partscan.rs"]
+#[allow(dead_code)]
+mod partscan;
+
+const LO_FLAGS_PARTSCAN: u32 = 8;
+
+/// Read `buf.len()` bytes at absolute byte `off` of a backing root.
+fn root_read(root: Root, off: u64, buf: &mut [u8]) -> bool {
+    match root {
+        Root::Disk(i) => disk_read(i as usize, off, buf),
+        Root::Loop(l) => match loop_backing(l) {
+            Some(k) => backing_read(k, off, buf),
+            None => false,
+        },
+    }
+}
+
+/// Re-read whole device `dev`'s MBR/GPT and make its partition nodes match:
+/// an entry whose number, start and length are unchanged keeps its node (an
+/// open fd on it stays valid), a changed or vanished one is dropped, a new
+/// one is added. No table at all drops every partition, as on Linux. The
+/// mounted root is protected by the `busy` range, not by its node here.
+fn rrpart(dev: u16) -> isize {
+    let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 };
+    let (lbs, part) = {
+        let b = BDEVS.lock();
+        (b[dev as usize].lbs.max(512), matches!(b[dev as usize].backing, Backing::Part { .. }))
+    };
+    if part { return -22; }
+    let res = partscan::scan(lbs, size / lbs as u64, |lba, buf| {
+        root_read(root, base + lba * lbs as u64, buf)
+    });
+    let want: alloc::vec::Vec<(u32, u64, u64)> = res.parts.iter()
+        .map(|p| (p.pno, p.start_lba * lbs as u64, p.num_lbas * lbs as u64))
+        .filter(|&(_, s, l)| l > 0 && s.checked_add(l).map_or(false, |e| e <= size))
+        .collect();
+    let mut keep: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    {
+        let mut b = BDEVS.lock();
+        for e in b.iter_mut() {
+            if !e.in_use { continue; }
+            if let Backing::Part { parent, pno } = e.backing {
+                if parent as u16 != dev { continue; }
+                if want.iter().any(|&(p, s, l)| p == pno && s == e.start && l == e.size) {
+                    keep.push(pno);
+                } else {
+                    *e = BDev::empty();
+                }
+            }
+        }
+    }
+    let mut rc = 0;
+    for &(p, s, l) in want.iter().filter(|w| !keep.contains(&w.0)) {
+        let r = add_partition(dev, p, s as i64, l as i64);
+        if r != 0 { rc = r; }
+    }
+    rc
+}
+
 // ── BLKPG ────────────────────────────────────────────────────────────────────
 
 fn blkpg(dev: u16, arg: usize) -> isize {
@@ -1557,7 +1692,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
     }
     let mut name = [0u8; NAME_MAX];
     let nlen = match part_name(b[d].name(), pno, &mut name) { Some(n) => n, None => return -22 };
-    let (major, base_minor, lbs, removable, ro) = (b[d].major, b[d].minor, b[d].lbs, b[d].removable, b[d].ro);
+    let (major, base_minor, lbs, removable, ro, private) = (b[d].major, b[d].minor, b[d].lbs, b[d].removable, b[d].ro, b[d].private);
     let slot = match free_slot(&b) { Some(s) => s, None => return -28 };
     b[slot] = BDev {
         in_use: true,
@@ -1572,6 +1707,7 @@ fn add_partition(dev: u16, pno: u32, start: i64, length: i64) -> isize {
         removable,
         ro,
         special: false,
+        private,
         ident: None,
     };
     0

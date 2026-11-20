@@ -1328,6 +1328,67 @@ unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
     Some(lba_start / SECTORS_PER_BLOCK as u64)
 }
 
+/// Root F2FS filesystem byte length (superblock block_count << log_blocksize)
+/// at block `blk`, for the busy range of the whole card.
+unsafe fn record_root_fs_size(dev: &SdhciDevice, blk: u64) {
+    let mut sb = alloc::vec![0u8; BLOCK_SIZE];
+    if !dev.do_io(false, blk, sb.as_mut_ptr()) { return; }
+    let o = F2FS_SB_OFFSET;
+    if u32::from_le_bytes(sb[o..o + 4].try_into().unwrap()) != F2FS_MAGIC { return; }
+    let log_bs = u32::from_le_bytes(sb[o + 16..o + 20].try_into().unwrap());
+    let blocks = u64::from_le_bytes(sb[o + 36..o + 44].try_into().unwrap());
+    if (9..=16).contains(&log_bs) { ROOT_FS_BYTES.store(blocks << log_bs, Ordering::Relaxed); }
+}
+
+/// Whole card in 4096-byte blocks, from the CSD (0 = unknown).
+static CARD_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Byte length of the F2FS root filesystem (superblock block_count), 0 = unknown.
+static ROOT_FS_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Device index of the whole card (`/dev/mmcblk0`, rpi5 only).
+pub const WHOLE_IDX: usize = 3;
+
+/// CSD v2.0 (SDHC/SDXC): C_SIZE = CSD[69:48], capacity (C_SIZE+1) * 512 KiB.
+/// The response registers hold CSD[127:8] as bits [119:0] (see probe_card),
+/// so C_SIZE is word 1 bits [29:8] and CSD_STRUCTURE word 3 bits [23:22].
+/// CSD v1 (SDSC, <= 2 GB) cards are left at unknown.
+fn card_capacity_from_csd(csd: &[u32; 4]) {
+    if (csd[3] >> 22) & 0x3 != 1 { return; }
+    let c_size = ((csd[1] >> 8) & 0x3F_FFFF) as u64;
+    CARD_BLOCKS.store((c_size + 1) * 512 * 1024 / BLOCK_SIZE as u64, Ordering::Relaxed);
+}
+
+/// Absolute byte range of the mounted F2FS root on device `idx` (writes
+/// there must go through the filesystem, never a raw node): `[0, fs)` on
+/// vdb and `[p2 start, + fs)` on the whole card.
+pub fn busy_range(idx: usize) -> Option<(u64, u64)> {
+    let fs = ROOT_FS_BYTES.load(Ordering::Relaxed);
+    let devs = DEVICES.lock();
+    let root = devs.get(1)?.as_ref()?;
+    match idx {
+        1 => Some((0, if fs == 0 { u64::MAX } else { fs })),
+        WHOLE_IDX if devs.get(WHOLE_IDX)?.is_some() =>
+            Some((root.partition_offset * BLOCK_SIZE as u64, if fs == 0 { u64::MAX / 2 } else { fs })),
+        _ => None,
+    }
+}
+
+/// The whole-card device refuses (driver-level, below the VFS EBUSY check)
+/// any write overlapping the mounted root filesystem.
+fn whole_write_blocked(dev_idx: usize, blk: u64, n: u64) -> bool {
+    if dev_idx != WHOLE_IDX { return false; }
+    match busy_range(WHOLE_IDX) {
+        Some((s, l)) => {
+            let (a, e) = (blk * BLOCK_SIZE as u64, (blk + n) * BLOCK_SIZE as u64);
+            a < s.saturating_add(l) && s < e
+        }
+        None => false,
+    }
+}
+
+pub fn is_whole_card(idx: usize) -> bool {
+    idx == WHOLE_IDX && matches!(DEVICES.lock().get(idx), Some(Some(_)))
+}
+
 /// MBR partition 1 if it is FAT32 (0x0b/0x0c) and 4 KiB-aligned:
 /// `(offset, length)` in 4096-byte blocks (length rounded down).
 #[cfg(feature = "rpi5")]
@@ -1418,7 +1479,10 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     // Failure is not fatal. `negotiate_bus` reads a zero as "unknown" and falls
     // back to the 25 MHz every SDHC card is required to support.
     let tran_speed_khz = match dev.send_command(CMD_SEND_CSD, rca << 16, RESP_136, false, true, false) {
-        Some(csd) => tran_speed_to_khz(((csd[2] >> 24) & 0xFF) as u8),
+        Some(csd) => {
+            card_capacity_from_csd(&csd);
+            tran_speed_to_khz(((csd[2] >> 24) & 0xFF) as u8)
+        }
         None => { dev.reset_cmd_dat(); dbg(b'd'); 0 }
     };
 
@@ -1437,6 +1501,7 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     #[cfg(feature = "rpi5")]
     {
         dev.partition_offset = find_f2fs_partition(&dev)?;
+        record_root_fs_size(&dev, dev.partition_offset);
     }
 
     Some(dev)
@@ -1478,6 +1543,23 @@ pub fn init() {
                 crate::kenv::pci::serial_debug("[sdhci] boot FAT (MBR p1) exposed as /dev/vdc\n");
                 3
             } else { 2 };
+            // The whole card as /dev/mmcblk0 (index 3): MBR, every partition,
+            // free space. Writes overlapping the mounted root are refused.
+            #[cfg(feature = "rpi5")]
+            let n = {
+                let cb = CARD_BLOCKS.load(Ordering::Relaxed);
+                if let (true, Some(d1)) = (cb > 0, devs[1].as_ref()) {
+                    devs[WHOLE_IDX] = Some(SdhciDevice {
+                        base: d1.base, high_capacity: d1.high_capacity,
+                        partition_offset: 0, limit_blocks: cb, boot_fat: false,
+                    });
+                    crate::kenv::pci::serial_debug("[sdhci] whole card exposed as /dev/mmcblk0\n");
+                    WHOLE_IDX + 1
+                } else {
+                    crate::kenv::pci::serial_debug("[sdhci] whole card NOT exposed: capacity unknown (CSD)\n");
+                    n
+                }
+            };
             #[cfg(not(feature = "rpi5"))]
             let n = 2;
             dbg(b']');
@@ -1542,6 +1624,8 @@ fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -
             _ => return false,
         }
     }
+    // After the DEVICES hold above: busy_range takes that lock itself.
+    if is_write && whole_write_blocked(dev_idx, blk, total as u64) { return false; }
     if !MULTI_ON.load(Ordering::Relaxed) {
         // Exactly the pre-multi-block behaviour: one 4 KiB block (8 single
         // sectors) per `DEVICES` hold, no reschedule point.
@@ -1599,6 +1683,7 @@ pub fn flush(dev_idx: usize) -> bool {
 
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
+    if whole_write_blocked(dev_idx, blk, 1) { return false; }
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
         dev.allowed(true, blk, 1) && dev.do_io_span(true, blk, 1, buf.as_ptr() as *mut u8)

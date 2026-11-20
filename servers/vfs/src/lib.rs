@@ -16523,7 +16523,8 @@ fn blockdev_meta(dev: u16) -> xattr::FileMeta {
     const S_IFBLK: u16 = 0o060000;
     const S_IFCHR: u16 = 0o020000;
     let ifmt = if block::dev_is_char(dev) { S_IFCHR } else { S_IFBLK };
-    xattr::FileMeta { mode: ifmt | 0o660, uid: 0, gid: 6 }
+    let (perm, gid) = block::dev_perm(dev);
+    xattr::FileMeta { mode: ifmt | perm, uid: 0, gid }
 }
 
 /// The access an open(2) with `flags` asks for (O_ACCMODE).
@@ -17239,8 +17240,9 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
     if let VnodeKind::BlockDev { dev, .. } = kind {
         const S_IFBLK: u32 = 0o060000;
         let ifmt = if block::dev_is_char(dev) { S_IFCHR } else { S_IFBLK };
-        write_stat_full_rdev(stat_ptr, ifmt | 0o660, 1, block::dev_size(dev),
-                             block::dev_ino(dev), 0, 6, block::dev_rdev(dev));
+        let (perm, gid) = block::dev_perm(dev);
+        write_stat_full_rdev(stat_ptr, ifmt | perm as u32, 1, block::dev_size(dev),
+                             block::dev_ino(dev), 0, gid, block::dev_rdev(dev));
         return ok_reply();
     }
 
@@ -17615,8 +17617,9 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         if let Some(dev) = block::lookup_dev_node(lookup_path) {
             const S_IFBLK: u32 = 0o060000;
             let ifmt = if block::dev_is_char(dev) { 0o020000 } else { S_IFBLK };
-            write_stat_full_rdev(stat_ptr, ifmt | 0o660, 1, block::dev_size(dev),
-                                 block::dev_ino(dev), 0, 6, block::dev_rdev(dev));
+            let (perm, gid) = block::dev_perm(dev);
+            write_stat_full_rdev(stat_ptr, ifmt | perm as u32, 1, block::dev_size(dev),
+                                 block::dev_ino(dev), 0, gid, block::dev_rdev(dev));
             return ok_reply();
         }
         // The synthesized sysfs subtree: `/sys/class/block` directories, then
