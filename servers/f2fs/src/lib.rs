@@ -6926,6 +6926,8 @@ fn may_modify_dir(ms: &mut MountState, dir: u32) -> Result<(), i32> {
 /// with the old order. Existence is no secret to a caller with search
 /// permission anyway; `stat` answers it.
 fn create_gate(ms: &mut MountState, parent: u32, name: &[u8]) -> Result<(), i32> {
+    // An empty name is the filesystem root itself (mkdir of a mount point): EEXIST, as Linux.
+    if name.is_empty() { return Err(-17); }
     if name.len() > NAME_MAX { return Err(-36); } // ENAMETOOLONG
     if !may_access_ino(ms, parent, xattr::MAY_EXEC) { return Err(-13); }
     if dir_lookup(ms, parent, name) != 0 { return Err(-17); } // EEXIST

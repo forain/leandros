@@ -9691,6 +9691,22 @@ fn mount_target_kpath(target_ptr: usize) -> Result<KPath, isize> {
     ns_follow_links(rp)
 }
 
+/// A MS_BIND source spelled `/proc/self/fd/N` where N is an opened nsfs file
+/// (bwrap's `--bind /proc/self/ns/user /run/.userns` opens the source O_PATH and
+/// binds through its descriptor): the synthetic nsfs bind source, which takes
+/// its own namespace reference.
+fn nsfd_bind_source(source_ptr: usize) -> Option<Vec<u8>> {
+    let mut fd = None;
+    if let Ok(raw) = copy_user_str(source_ptr, 4096) {
+        if let Some((n, b"")) = proc_own_fd(&raw) { fd = Some(n); }
+    }
+    if fd.is_none() {
+        let rp = resolve_user_path(source_ptr).ok()?;
+        if let Some((n, b"")) = proc_own_fd(rp.bytes()) { fd = Some(n); }
+    }
+    vfs::nsfd_bind_source(current_pid(), fd?)
+}
+
 fn sys_mount(
     source_ptr: usize,
     target_ptr: usize,
@@ -9765,9 +9781,18 @@ fn sys_mount(
         match read_user_short_str(fstype_ptr) { Ok(v) => v, Err(e) => return e }
     };
     let alias_src: Option<(Vec<u8>, &'static str)> = if flags & MS_BIND != 0 {
-        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let mut src_opt = None;
+        let nsb = match nsfd_bind_source(source_ptr) {
+            Some(s) => Ok(Some(s)),
+            None => {
+                let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
+                let r = vfs::nsfs_bind_source(src.ns_bytes(), current_pid());
+                src_opt = Some(src);
+                r
+            }
+        };
         // Binding /proc/<pid>/ns/<name> keeps that namespace alive.
-        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+        match nsb {
             Err(e) => return e,
             Ok(Some(synth)) => {
                 let mp = target_path.ns_bytes();
@@ -9784,6 +9809,7 @@ fn sys_mount(
             }
             Ok(None) => {}
         }
+        let Some(src) = src_opt else { return -2 };
         Some((src.bytes().to_vec(), "none"))
     } else {
         match &fstype_raw[..] {
@@ -10182,10 +10208,19 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
     let tns = target.ns_bytes().to_vec();
     let tdir = match kpath_is_dir(&target) { Ok(d) => d, Err(e) => return e };
     if flags & MS_BIND != 0 {
-        let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
+        let mut src_opt = None;
+        let nsb = match nsfd_bind_source(source_ptr) {
+            Some(s) => Ok(Some(s)),
+            None => {
+                let src = match mount_target_kpath(source_ptr) { Ok(p) => p, Err(e) => return e };
+                let r = vfs::nsfs_bind_source(src.ns_bytes(), current_pid());
+                src_opt = Some(src);
+                r
+            }
+        };
         // Binding /proc/<pid>/ns/<name> onto a file keeps that namespace
         // alive: the mount's superblock owns the reference.
-        match vfs::nsfs_bind_source(src.ns_bytes(), current_pid()) {
+        match nsb {
             Err(e) => return e,
             Ok(Some(synth)) => {
                 let put = |s: &[u8]| if let Some((_, id)) = vfs::alias::ns_src(s) { sched::ns::put_raw(id); };
@@ -10198,6 +10233,7 @@ fn sys_mount_ns(mns: sched::ns::NsId, source_ptr: usize, target_ptr: usize, fsty
             }
             Ok(None) => {}
         }
+        let Some(src) = src_opt else { return -2 };
         let sdir = match kpath_is_dir(&src) { Ok(d) => d, Err(e) => return e };
         if sdir != tdir {
             return -20;
@@ -12229,6 +12265,18 @@ fn fd_hidden_host(mns: sched::ns::NsId, fd: usize) -> Option<Vec<u8>> {
         return None;
     }
     let host = fd_host_path(fd)?;
+    // A /proc descriptor taken from another mount tree (bwrap opens /proc before
+    // it clones, then writes /proc/self/uid_map and /proc/sys/user/* through it
+    // after the pivot) or whose mount was since detached keeps its own mount: its
+    // lookups never see the procfs mount, or the ro covers over /proc/sys etc.,
+    // of the namespace's current tree.
+    if host == b"/proc" || host.starts_with(b"/proc/") {
+        let gone = match vfs::fd_mnt(current_pid(), fd) {
+            Some((n, m)) if n == mns => m != 0 && vfs::mnt::flags_opt(n, m).is_none(),
+            _ => true,
+        };
+        if gone { return Some(host); }
+    }
     let hint = match vfs::fd_mnt(current_pid(), fd) { Some((n, m)) if n == mns => m, _ => 0 };
     match vfs::mnt::reverse(mns, &host, hint) {
         None => Some(host),

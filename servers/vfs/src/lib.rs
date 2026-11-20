@@ -5753,9 +5753,13 @@ static OLD_ROOT_PREFIX: Mutex<Option<&'static str>> = Mutex::new(None);
 /// listing — what the disk holds, nor stop an administrator editing it. Two
 /// names stay synthesized: /etc/mtab (the live mount table) and
 /// /etc/resolv.conf (the DHCP lease's servers).
+/// The two generated /etc files that live in RAMFS, never on the on-disk /etc.
+fn etc_synth(path: &[u8]) -> bool {
+    path == b"/etc/mtab" || path == b"/etc/resolv.conf"
+}
 fn etc_on_disk(path: &[u8]) -> bool {
     (path == b"/etc" || path.starts_with(b"/etc/"))
-        && path != b"/etc/mtab" && path != b"/etc/resolv.conf"
+        && !etc_synth(path)
         && find_mount_port(path).is_some()
 }
 
@@ -10012,8 +10016,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if let Some(c) = nslimit_sysctl(lookup_path) {
             // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
             let write = flags & 0o3 != 0;
-            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
-            match gen_proc_nslimit(c, write) {
+            if write && !nslimit_may_write(pid) { return err_reply(-13); }
+            match gen_proc_nslimit(pid, c, write) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -11016,7 +11020,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if s.is_empty() || !s.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
                 let mut v = 0u32;
                 for &d in s { v = v.saturating_mul(10).saturating_add((d - b'0') as u32); }
-                let r = sched::ns::limit_set(c, v);
+                let r = sched::ns::limit_set_in(sched::ns::userns_of(pid), c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let drm_hold = {
@@ -13376,6 +13380,15 @@ pub fn nsfs_bind_source(path: &[u8], caller: u32) -> Result<Option<Vec<u8>>, isi
     push_dec(&mut v, k as u32); v.push(b'/'); push_dec(&mut v, id as u32);
     Ok(Some(v))
 }
+/// The synthetic bind source of an opened nsfs file (`fd` of `pid`), taking a
+/// namespace reference; None when `fd` is not an nsfs file.
+pub fn nsfd_bind_source(pid: u32, fd: usize) -> Option<Vec<u8>> {
+    let (k, id) = nsfd_target(pid, fd).ok()?;
+    sched::ns::hold_raw(id);
+    let mut v = alias::NS_SRC.to_vec();
+    push_dec(&mut v, k as u32); v.push(b'/'); push_dec(&mut v, id as u32);
+    Some(v)
+}
 fn push_dec(v: &mut Vec<u8>, mut n: u32) {
     let mut d = [0u8; 10]; let mut i = 0;
     loop { d[i] = b'0' + (n % 10) as u8; i += 1; n /= 10; if n == 0 { break; } }
@@ -13545,9 +13558,18 @@ fn nslimit_sysctl(path: &[u8]) -> Option<usize> {
 }
 const PROC_NSLIM_W: &[u8] = b"/tmp/.proc_nslim_";
 
-fn gen_proc_nslimit(c: usize, write: bool) -> Option<VnodeKind> {
+/// Linux `set_permissions`: the limits are per user namespace; writable by
+/// CAP_SYS_ADMIN in the initial one, or by the owner of (or CAP_SYS_RESOURCE in) the caller's own.
+fn nslimit_may_write(pid: u32) -> bool {
+    let ns = sched::ns::userns_of(pid);
+    if ns == 0 { return sched::caps::pid_capable_in(pid, 0, 21); }
+    sched::caps::pid_capable_in(pid, ns, 21) || sched::caps::pid_capable_in(pid, ns, 24)
+        || sched::ns::owner(ns).0 == sched::euid_of(pid)
+}
+
+fn gen_proc_nslimit(pid: u32, c: usize, write: bool) -> Option<VnodeKind> {
     let mut data = [0u8; 12];
-    let l = oom_text(sched::ns::limit_get(c) as i32, &mut data);
+    let l = oom_text(sched::ns::limit_in(sched::ns::userns_of(pid), c) as i32, &mut data);
     let mut buf = [0u8; TMP_BUF_SIZE];
     if !write {
         buf[..l].copy_from_slice(&data[..l]);
@@ -15575,6 +15597,8 @@ fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
     // readlink()s every component and aborts on anything but EINVAL, so
     // bwrap's realpath("/oldroot/proc/self/fd/N") died on /oldroot/proc/<pid>.
     if let Some(Some(_)) = proc_stat_kind(raw) { return err_reply(-22); }
+    // Generated /etc files are regular files, not links (the F2FS root would say ENOENT).
+    if etc_synth(raw) { return err_reply(-22); }
     if let Some(port) = find_mount_port(raw) {
         let mut proxy = Message::empty();
         proxy.tag = VFS_READLINK;
@@ -16951,7 +16975,7 @@ fn handle_statfs(path_ptr: usize, buf_ptr: usize) -> Message {
         return statfs_reply();
     }
     if !is_tmp_path(path)
-        && (path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
+        && (etc_synth(path) || path.starts_with(b"/proc") || path.starts_with(b"/dev") || block::is_sysfs_path(path) || sysclass::is_path(path)) {
         write_statfs(buf_ptr, &procfs_statfs());
         return statfs_reply();
     }
