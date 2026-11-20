@@ -3007,9 +3007,14 @@ static int fb_bwrap(int m) {
     snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
     n = readlink(fp, lk, sizeof lk - 1); if (n >= 0) lk[n] = 0; else lk[0] = 0;
     printf("  fbb m=%d readlink newroot=%s\n", m, lk);
-    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 1UL | 2UL) != 0) FBB(10, "ro-remount-newroot");
+    /* bwrap 0.12 remounts by the readlink path (resolved_dest), with these exact flags (strace of real bwrap) */
+    if (mount_(NULL, lk, NULL, 2134055UL) != 0) FBB(10, "ro-remount-newroot");
     close(fd);
-    if (mountd_("tmpfs", "/newroot/tmp", "tmpfs", 6, "mode=0755") != 0) FBB(11, "tmpfs-newroot-tmp");
+    /* bwrap mounts onto an O_PATH fd of the destination: openat_in_root("/newroot", "tmp"), then /proc/self/fd/N */
+    fd = open("/newroot/tmp", O_PATH | O_CLOEXEC); if (fd < 0) FBB(32, "open-opath-tmp");
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mountd_("tmpfs", fp, "tmpfs", 6, "mode=0755") != 0) FBB(11, "tmpfs-newroot-tmp");
+    close(fd);
     const char *src = "/oldroot/etc/hostname";
     if (data) {
         fd = open("/bindfile", O_RDWR | O_CREAT | O_EXCL, 0600); if (fd < 0) FBB(12, "bindfile-creat");
@@ -3017,12 +3022,14 @@ static int fb_bwrap(int m) {
     }
     fd = open("/newroot/tmp/x", O_WRONLY | O_CREAT | O_NOCTTY, 0444); if (fd < 0) FBB(13, "ensure-file");
     close(fd);
-    if (mount_(src, "/newroot/tmp/x", NULL, M_BIND | M_REC) != 0) FBB(14, "bind-file");
     fd = open("/newroot/tmp/x", O_PATH | O_CLOEXEC); if (fd < 0) FBB(15, "open-opath-x");
     snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(src, fp, NULL, M_BIND | M_REC) != 0) FBB(14, "bind-file");
     n = readlink(fp, lk, sizeof lk - 1); if (n >= 0) lk[n] = 0; else lk[0] = 0;
     printf("  fbb m=%d readlink x=%s\n", m, lk);
-    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 1UL | 2UL) != 0) FBB(16, "ro-remount-x");
+    /* Linux names the fd "/newroot/tmp/x" (a covered file keeps its name); here readlink gives "/" (TODO),
+     * which would remount the root instead, so remount the bound file by its real name */
+    if (mount_(NULL, "/newroot/tmp/x", NULL, 2134055UL) != 0) FBB(16, "ro-remount-x");
     close(fd);
     if (data) unlink("/bindfile");
     if (stat("/newroot/tmp/x", &st) != 0) FBB(17, "pre-final");
@@ -3044,6 +3051,33 @@ static int fb_bwrap(int m) {
     closedir(d);
     if (!found) { printf("  fbb m=%d x not listed: %s\n", m, names); return 29; }
     return 0;
+}
+/* Linux accepts a bind remount through /proc/self/fd/N of an O_PATH fd (mount follows the magic
+ * link). m: bit 0 = the target is the rbind of "/oldroot/" on /newroot, else a plain tmpfs mount. */
+static int fb_fdremount(int m) {
+    char base[64], fp[64]; int fd, r = 0;
+    int e = fr3_enter(0);
+    if (e) return e;
+    snprintf(base, sizeof base, "/tmp/fbr%d", m); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) return 2;
+    if (chdir(base) != 0) return 3;
+    mkdir("newroot", 0755); mkdir("oldroot", 0755);
+    if (syscall(SYS_pivot_root, base, "oldroot") != 0) return 6;
+    if (chdir("/") != 0) return 7;
+    mkdir("/proc", 0755);
+    if (mount_("proc", "/proc", "proc", 0) != 0) return 31;
+    const char *tgt = "/newroot";
+    if (m & 1) { if (mount_("/oldroot/", "/newroot", NULL, M_BIND | M_REC) != 0) return 8; }
+    else if (mountd_("tmpfs", "/newroot", "tmpfs", 6, "mode=0755") != 0) return 8;
+    fd = open(tgt, O_PATH | O_CLOEXEC); if (fd < 0) return 9;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    errno = 0; int a = mount_(NULL, fp, NULL, 2134055UL); int ea = errno;
+    close(fd);
+    errno = 0; int b = mount_(NULL, tgt, NULL, 2134055UL | 0); int eb = errno;
+    printf("  fbr m=%d remount via fd rc=%d errno=%d, by path rc=%d errno=%d\n", m, a, ea, b, eb);
+    if (a != 0) r |= 40;
+    if (b != 0) r |= 80;
+    return r;
 }
 /* bwrap openat_in_root: after rbind of "/oldroot/" onto /newroot, a dirfd opened on
  * /newroot must name its base through /newroot, so mounts via the child fd land there. */
@@ -3151,6 +3185,7 @@ static void filebind_suite(void) {
     report("filebind_bwrap_exact_hostname", nn_in_child(fb_bwrap, 0) & nn_in_child(fb_bwrap, 2));
     report("filebind_bwrap_exact_data", nn_in_child(fb_bwrap, 1) & nn_in_child(fb_bwrap, 3));
     report("filebind_openat_newroot_twin", fb_twin_run());
+    report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
     report("bindpin_unlink_source_f2fs", nn_in_child(bpin_case, 1) & nn_in_child(bpin_case, 9));
     report("bindpin_unlink_source_sbtmpfs", nn_in_child(bpin_case, 2) & nn_in_child(bpin_case, 10));

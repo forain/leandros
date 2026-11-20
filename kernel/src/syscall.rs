@@ -9669,7 +9669,13 @@ fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
     } else { None };
     let ns = if mns != 0 { via.or_else(|| vfs::mnt::reverse_newest(mns, &host)) } else { Some(host) };
     match ns {
-        Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
+        Some(mut n) if !vfs::mnt::is_sb_path(&n) => {
+            // The root of a mount whose backing root is "/" comes back as
+            // "<mountpoint>/" (reverse_via joins the empty rest with a slash):
+            // a mount target names its mount point exactly, so drop it.
+            while n.len() > 1 && n.last() == Some(&b'/') { n.pop(); }
+            Ok(n)
+        }
         _ => Err(-22),
     }
 }
