@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <stdint.h>
+#include <sys/xattr.h>
 #include <linux/sched.h>
 
 static int fails;
@@ -2742,6 +2743,161 @@ static void flatrun3_suite(void) {
     report("mountroot_mkdir_eexist", nn_in_child(mrmk, 0) && nn_in_child(mrmk, 1) && nn_in_child(mrmk, 2));
 }
 
+/* bubblewrap --dev: a tmpfs with MS_NODEV, an empty regular file on it, /dev/null bound over the
+ * file. The file bind is its own mount without nodev, so it must open; remounting that bind with
+ * MS_NODEV must keep giving EACCES. */
+static int fr4_devnull(int m) {
+    char base[64], p[128];
+    int r = fr3_enter(m);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fr4d%d", m);
+    mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) { printf("  tmpfs errno=%d\n", errno); return 2; }
+    snprintf(p, sizeof p, "%s/null", base);
+    int fd = open(p, O_WRONLY | O_CREAT, 0666); if (fd < 0) return 3; close(fd);
+    if (mount_("/dev/null", p, NULL, M_BIND | M_REC) != 0) { printf("  bind errno=%d\n", errno); return 4; }
+    fd = open(p, O_WRONLY); if (fd < 0) { printf("  open wronly errno=%d\n", errno); return 5; }
+    close(fd);
+    fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0666); if (fd < 0) { printf("  open creat errno=%d\n", errno); return 6; }
+    if (write(fd, "hi\n", 3) != 3) return 7;
+    close(fd);
+    if (mount_(NULL, p, NULL, 32UL | M_BIND | 2UL /* nosuid */) != 0) { printf("  remount nosuid errno=%d\n", errno); return 8; }
+    fd = open(p, O_WRONLY); if (fd < 0) { printf("  open after nosuid errno=%d\n", errno); return 9; }
+    close(fd);
+    if (mount_(NULL, p, NULL, 32UL | M_BIND | 4UL /* nodev */) != 0) { printf("  remount nodev errno=%d\n", errno); return 10; }
+    errno = 0; fd = open(p, O_WRONLY);
+    if (fd >= 0 || errno != EACCES) { printf("  nodev bind open fd=%d errno=%d\n", fd, errno); return 11; }
+    return 0;
+}
+/* the same after the pivot, as bwrap does it: bind /dev/null over the file through an O_PATH fd
+ * of it, remount that bind nosuid through the fd, pivot, detach the old root, open /dev/null. */
+static int fr4_devnull_pivot(int m) {
+    char base[64], p[128], fp[64];
+    int r = fr3_enter(m);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fr4p%d", m);
+    mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) return 2;
+    snprintf(p, sizeof p, "%s/oldroot", base); mkdir(p, 0755);
+    snprintf(p, sizeof p, "%s/dev", base); mkdir(p, 0755);
+    if (mountd_("tmpfs", p, "tmpfs", 6, "mode=0755") != 0) return 3;
+    snprintf(p, sizeof p, "%s/dev/null", base);
+    int fd = open(p, O_WRONLY | O_CREAT, 0666); if (fd < 0) return 4; close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC); if (fd < 0) return 5;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_("/dev/null", fp, NULL, M_BIND | M_REC) != 0) { printf("  bind errno=%d\n", errno); return 6; }
+    close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC); if (fd < 0) return 7;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 2UL) != 0) { printf("  remount errno=%d\n", errno); return 8; }
+    close(fd);
+    if (mount_(base, base, NULL, M_BIND | M_REC) != 0) return 9;
+    if (chdir(base) != 0) return 10;
+    snprintf(p, sizeof p, "%s/oldroot", base);
+    if (syscall(SYS_pivot_root, base, p) != 0) { printf("  pivot errno=%d\n", errno); return 11; }
+    if (chdir("/") != 0) return 12;
+    if (umount_("/oldroot", M_DETACH) != 0) return 13;
+    fd = open("/dev/null", O_WRONLY); if (fd < 0) { printf("  open /dev/null errno=%d\n", errno); return 14; }
+    close(fd);
+    fd = open("/dev/null", O_WRONLY | O_CREAT | O_TRUNC, 0666); if (fd < 0) { printf("  creat /dev/null errno=%d\n", errno); return 15; }
+    close(fd);
+    return 0;
+}
+/* bubblewrap --ro-bind / / marks every mount of the old root nodev; --dev then binds
+ * /oldroot/dev/null (nodev) over a file of a nodev tmpfs and remounts that bind with only nosuid:
+ * clearing nodev on the new bind must make the node usable. */
+static int fr4_devnull_clear(int m) {
+    char base[64], p[128], q[128], fp[64];
+    int r = fr3_enter(m);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fr4c%d", m);
+    mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) return 2;
+    snprintf(p, sizeof p, "%s/old", base);
+    int fd = open(p, O_WRONLY | O_CREAT, 0666); if (fd < 0) return 3; close(fd);
+    if (mount_("/dev/null", p, NULL, M_BIND | M_REC) != 0) return 4;
+    if (mount_(NULL, p, NULL, 32UL | M_BIND | 4UL | 2UL) != 0) { printf("  remount old errno=%d\n", errno); return 5; }
+    snprintf(q, sizeof q, "%s/new", base);
+    fd = open(q, O_WRONLY | O_CREAT, 0666); if (fd < 0) return 6; close(fd);
+    fd = open(q, O_PATH | O_CLOEXEC); if (fd < 0) return 7;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(p, fp, NULL, M_BIND | M_REC) != 0) { printf("  bind errno=%d\n", errno); return 8; }
+    close(fd);
+    errno = 0; fd = open(q, O_WRONLY);
+    if (fd >= 0 || errno != EACCES) { printf("  inherited nodev open fd=%d errno=%d\n", fd, errno); return 9; }
+    fd = open(q, O_PATH | O_CLOEXEC); if (fd < 0) return 10;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 2UL) != 0) { printf("  remount new errno=%d\n", errno); return 11; }
+    close(fd);
+    fd = open(q, O_WRONLY); if (fd < 0) { printf("  open after clearing nodev errno=%d\n", errno); return 12; }
+    close(fd);
+    return 0;
+}
+/* bubblewrap --ro-bind / / --dev /dev: the rbind of / (every mount remounted ro,nosuid,nodev) has
+ * a devtmpfs child at /dev; the --dev tmpfs covers it and its null file gets /dev/null bound on. */
+static int fr4_devnull_rbind(int m) {
+    char base[64], root[96], p[128], fp[64];
+    int r = fr3_enter(m);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/fr4r%d", m);
+    mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0) return 2;
+    snprintf(root, sizeof root, "%s/newroot", base); mkdir(root, 0755);
+    snprintf(p, sizeof p, "%s/oldroot", base); mkdir(p, 0755);
+    if (mount_("/", root, NULL, M_BIND | M_REC) != 0) { printf("  rbind errno=%d\n", errno); return 3; }
+    if (mount_(NULL, root, NULL, 32UL | M_BIND | M_REC | 1UL | 2UL | 4UL) != 0) { printf("  remount rec errno=%d\n", errno); return 4; }
+    snprintf(p, sizeof p, "%s/dev", root);
+    if (mountd_("tmpfs", p, "tmpfs", 6, "mode=0755") != 0) { printf("  dev tmpfs errno=%d\n", errno); return 5; }
+    snprintf(p, sizeof p, "%s/dev/null", root);
+    int fd = open(p, O_WRONLY | O_CREAT, 0666); if (fd < 0) { printf("  creat errno=%d\n", errno); return 6; } close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC); if (fd < 0) return 7;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_("/dev/null", fp, NULL, M_BIND | M_REC) != 0) { printf("  bind errno=%d\n", errno); return 8; }
+    close(fd);
+    fd = open(p, O_PATH | O_CLOEXEC); if (fd < 0) return 9;
+    snprintf(fp, sizeof fp, "/proc/self/fd/%d", fd);
+    if (mount_(NULL, fp, NULL, 32UL | M_BIND | 2UL) != 0) { printf("  remount errno=%d\n", errno); return 10; }
+    close(fd);
+    if (mount_(base, base, NULL, M_BIND | M_REC) != 0) return 12;
+    if (chdir(base) != 0) return 13;
+    snprintf(p, sizeof p, "%s/oldroot", base);
+    if (syscall(SYS_pivot_root, base, p) != 0) { printf("  pivot errno=%d\n", errno); return 14; }
+    if (chdir("/") != 0) return 15;
+    if (umount_("/oldroot", M_DETACH) != 0) return 16;
+    if (chdir("/newroot") != 0 || chroot("/newroot") != 0 || chdir("/") != 0) { printf("  chroot errno=%d\n", errno); return 17; }
+    fd = open("/dev/null", O_WRONLY); if (fd < 0) { printf("  open errno=%d\n", errno); return 11; }
+    close(fd);
+    return 0;
+}
+/* getxattr/listxattr of the generated /etc files: they exist, so ENODATA and an empty list. */
+static int fr4_synth_xattr(int m) {
+    (void)m;
+    const char *p[] = { "/etc/resolv.conf", "/etc/mtab" };
+    struct stat st; char b[64];
+    for (int i = 0; i < 2; i++) {
+        if (stat(p[i], &st) != 0) { printf("  stat %s errno=%d\n", p[i], errno); return 1; }
+        errno = 0;
+        if (getxattr(p[i], "user.x", b, sizeof b) != -1 || errno != ENODATA) { printf("  getxattr %s errno=%d\n", p[i], errno); return 2; }
+        errno = 0;
+        if (lgetxattr(p[i], "user.x", b, sizeof b) != -1 || errno != ENODATA) { printf("  lgetxattr %s errno=%d\n", p[i], errno); return 3; }
+        errno = 0;
+        ssize_t n = listxattr(p[i], b, sizeof b);
+        if (n != 0) { printf("  listxattr %s n=%zd errno=%d\n", p[i], n, errno); return 4; }
+        errno = 0;
+        n = llistxattr(p[i], b, sizeof b);
+        if (n != 0) { printf("  llistxattr %s n=%zd errno=%d\n", p[i], n, errno); return 5; }
+    }
+    return 0;
+}
+static void flatrun4_suite(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    report("bwrap_dev_null_bind_opens_in_nodev_tmpfs", nn_in_child(fr4_devnull, 0) & nn_in_child(fr4_devnull, 2));
+    report("bwrap_dev_null_pivot_opens", nn_in_child(fr4_devnull_pivot, 0) & nn_in_child(fr4_devnull_pivot, 2));
+    report("bwrap_dev_null_clear_nodev", nn_in_child(fr4_devnull_clear, 0) & nn_in_child(fr4_devnull_clear, 2));
+    report("bwrap_dev_null_rbind_root", nn_in_child(fr4_devnull_rbind, 0) & nn_in_child(fr4_devnull_rbind, 2));
+    report("synth_etc_xattr_enodata", nn_in_child(fr4_synth_xattr, 0));
+}
+
 static void mro_suite(void) {
     report("mntnosuid_bind_ignores_setuid", nn_in_child(mns_nosuid_bind, 0));
     report("mntro_ro_bind_erofs", nn_in_child(mro_erofs, 0));
@@ -2751,6 +2907,7 @@ static void mro_suite(void) {
     report("mntro_noexec_eacces", nn_in_child(mro_noexec, 0));
     report("mntro_nodev_eacces", nn_in_child(mro_nodev, 0));
     flatrun3_suite();
+    flatrun4_suite();
 }
 
 /* ── lane shmbind: crun's dev/shm bind and bind-remount flags ─────────── */
