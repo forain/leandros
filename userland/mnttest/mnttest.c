@@ -2688,10 +2688,55 @@ static int fr3_procfd_ro(int m) {
     if (s >= 0) close(s);
     return 0;
 }
+/* bubblewrap --disable-userns: user.max_user_namespaces is per user namespace. As uid 1000 in a
+ * fresh userns write "1" to it (EACCES before), the initial value stays, one nested userns is
+ * allowed and a second one created from inside it fails with ENOSPC. */
+static int fr3_rd_max(char *b, size_t n) {
+    int f = open("/proc/sys/user/max_user_namespaces", O_RDONLY); if (f < 0) return -1;
+    ssize_t k = read(f, b, n - 1); close(f); b[k > 0 ? k : 0] = 0; return (int)k;
+}
+static int fr3_maxns(int m) {
+    char before[32], after[32];
+    (void)m;
+    if (fr3_rd_max(before, sizeof before) <= 0) return 1;
+    pid_t c = fork();
+    if (c == 0) {
+        if (setgroups(0, NULL) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(90);
+        if (unshare(CLONE_NEWUSER) != 0) _exit(91);
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+        int f = open("/proc/sys/user/max_user_namespaces", O_WRONLY);
+        if (f < 0) { printf("  open max_user_namespaces errno=%d\n", errno); _exit(92); }
+        if (write(f, "1", 1) != 1) { printf("  write errno=%d\n", errno); _exit(93); }
+        close(f);
+        if (unshare(CLONE_NEWUSER) != 0) { printf("  nested unshare errno=%d\n", errno); _exit(94); }
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+        if (unshare(CLONE_NEWUSER) == 0) { printf("  second nested unshare succeeded\n"); _exit(95); }
+        if (errno != ENOSPC) { printf("  second nested errno=%d\n", errno); _exit(96); }
+        _exit(0);
+    }
+    int st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) { printf("  child status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 2; }
+    if (fr3_rd_max(after, sizeof after) <= 0 || strcmp(before, after) != 0) { printf("  initial value changed %s -> %s\n", before, after); return 3; }
+    /* a sibling is unaffected: two nested levels are still allowed */
+    c = fork();
+    if (c == 0) {
+        if (setgroups(0, NULL) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) _exit(90);
+        if (unshare(CLONE_NEWUSER) != 0) _exit(91);
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+        if (unshare(CLONE_NEWUSER) != 0) _exit(92);
+        wr("/proc/self/setgroups", "deny"); wr("/proc/self/uid_map", "1000 1000 1"); wr("/proc/self/gid_map", "1000 1000 1");
+        if (unshare(CLONE_NEWUSER) != 0) _exit(93);
+        _exit(0);
+    }
+    st = 0; waitpid(c, &st, 0);
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)) { printf("  sibling status=%d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1); return 4; }
+    return 0;
+}
 static void flatrun3_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("bwrap_bind_nsfs_userns_file", nn_in_child(fr3_userns_bind, 0) & nn_in_child(fr3_userns_bind, 1) & nn_in_child(fr3_userns_bind, 2));
     report("bwrap_procfd_write_after_ro_cover", nn_in_child(fr3_procfd_ro, 0) & nn_in_child(fr3_procfd_ro, 2));
+    report("userns_maxns_per_ns", nn_in_child(fr3_maxns, 0));
     report("synth_resolv_readlink_einval", nn_in_child(synth_readlink, 0));
     report("synth_resolv_bind_in_mntns", nn_in_child(synth_bind, 0) && nn_in_child(synth_bind, 1));
     report("mountroot_mkdir_eexist", nn_in_child(mrmk, 0) && nn_in_child(mrmk, 1) && nn_in_child(mrmk, 2));

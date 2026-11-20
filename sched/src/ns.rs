@@ -161,6 +161,22 @@ static LIMIT: [AtomicU32; LIMIT_N] = {
     a
 };
 static USED: [AtomicU32; LIMIT_N] = [ZERO32; LIMIT_N];
+/// Per-user-namespace copies of the limits (Linux `ns->ucount_max`): a new
+/// userns inherits its parent's values at creation; the initial userns uses `LIMIT`.
+static NSMAX: [[AtomicU32; LIMIT_N]; NS_MAX] = [const { [ZERO32; LIMIT_N] }; NS_MAX];
+
+/// A kind's limit as seen by user namespace `ns` (0 = the initial one).
+pub fn limit_in(ns: NsId, class: usize) -> u32 {
+    if ns == 0 { limit_get(class) } else if class < LIMIT_N { NSMAX[ns as usize][class].load(Acquire) } else { 0 }
+}
+/// Set a kind's limit in user namespace `ns` only; the initial one keeps its
+/// shared-table sum rule (`limit_set`). Never touches the parent or siblings.
+pub fn limit_set_in(ns: NsId, class: usize, v: u32) -> isize {
+    if ns == 0 { return limit_set(class, v); }
+    if class == 0 || class >= LIMIT_N { return -22; }
+    NSMAX[ns as usize][class].store(v, Release);
+    0
+}
 
 pub fn limit_get(class: usize) -> u32 { if class < LIMIT_N { LIMIT[class].load(Acquire) } else { 0 } }
 /// Live namespaces of `class` (including mount namespaces awaiting reap).
@@ -209,26 +225,39 @@ fn chain_has(first: Option<u32>, mut o: NsId, kuid: u32) -> bool {
     false
 }
 
-/// ENOSPC when any kuid in the charge chain already owns its share.
+/// ENOSPC when any (userns, kuid) level in the charge chain already owns its
+/// share, judged by that level's own limit (Linux `inc_ucount`). The element
+/// for owner userns `o` lives in `PARENT[o]`; `first` lives in `start`.
 fn quota_chain_ok(first: Option<u32>, start: NsId, class: u8) -> bool {
-    if let Some(k) = first { if k != 0 && !quota_one(k, class) { return false; } }
+    if let Some(k) = first { if k != 0 && !quota_one(start, k, class) { return false; } }
     let mut o = start;
     while o != 0 {
         let k = OWNER_EUID[o as usize].load(Acquire);
-        if k != 0 && !quota_one(k, class) { return false; }
+        if k != 0 && !quota_one(PARENT[o as usize].load(Acquire), k, class) { return false; }
         o = PARENT[o as usize].load(Acquire);
     }
     true
 }
 
-fn quota_one(kuid: u32, class: u8) -> bool {
+/// Namespaces of `class` charged to `kuid` as seen from userns `level`. The
+/// initial userns counts every namespace whose chain holds `kuid` (unchanged);
+/// a nested level counts only those charged at exactly that level.
+fn quota_one(level: NsId, kuid: u32, class: u8) -> bool {
     let mut n = 0u32;
     for id in 1..NS_MAX {
         let r = REFS[id].load(Relaxed);
         if r == 0 || r == DYING || SLOT_KIND[id].load(Acquire) != class { continue; }
-        if chain_has(None, slot_charge_start(id) as NsId, kuid) { n += 1; }
+        if level == 0 {
+            if chain_has(None, slot_charge_start(id) as NsId, kuid) { n += 1; }
+        } else {
+            let mut o = slot_charge_start(id) as NsId;
+            while o != 0 {
+                if PARENT[o as usize].load(Acquire) == level && OWNER_EUID[o as usize].load(Acquire) == kuid { n += 1; break; }
+                o = PARENT[o as usize].load(Acquire);
+            }
+        }
     }
-    n < limit_get(class as usize)
+    n < limit_in(level, class as usize)
 }
 
 /// Quota check for a non-user namespace created under owner user namespace `owner`.
@@ -257,6 +286,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
             MAP_N[0][id].store(0, Release);
             MAP_N[1][id].store(0, Release);
             // setgroups=deny is inherited from the parent (rule 7).
+            for k in 1..LIMIT_N { NSMAX[id][k].store(limit_in(parent, k), Release); }
             SETGROUPS_DENY[id].store(if parent != 0 { SETGROUPS_DENY[parent as usize].load(Acquire) } else { 0 }, Release);
             OWNER_EUID[id].store(euid, Release);
             OWNER_EGID[id].store(egid, Release);

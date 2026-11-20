@@ -10016,8 +10016,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         } else if let Some(c) = nslimit_sysctl(lookup_path) {
             // Linux: 0644 root; a write needs CAP_SYS_ADMIN in the initial userns.
             let write = flags & 0o3 != 0;
-            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
-            match gen_proc_nslimit(c, write) {
+            if write && !nslimit_may_write(pid) { return err_reply(-13); }
+            match gen_proc_nslimit(pid, c, write) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -11020,7 +11020,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if s.is_empty() || !s.iter().all(|c| c.is_ascii_digit()) { return err_reply(-22); }
                 let mut v = 0u32;
                 for &d in s { v = v.saturating_mul(10).saturating_add((d - b'0') as u32); }
-                let r = sched::ns::limit_set(c, v);
+                let r = sched::ns::limit_set_in(sched::ns::userns_of(pid), c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
             let drm_hold = {
@@ -13558,9 +13558,18 @@ fn nslimit_sysctl(path: &[u8]) -> Option<usize> {
 }
 const PROC_NSLIM_W: &[u8] = b"/tmp/.proc_nslim_";
 
-fn gen_proc_nslimit(c: usize, write: bool) -> Option<VnodeKind> {
+/// Linux `set_permissions`: the limits are per user namespace; writable by
+/// CAP_SYS_ADMIN in the initial one, or by the owner of (or CAP_SYS_RESOURCE in) the caller's own.
+fn nslimit_may_write(pid: u32) -> bool {
+    let ns = sched::ns::userns_of(pid);
+    if ns == 0 { return sched::caps::pid_capable_in(pid, 0, 21); }
+    sched::caps::pid_capable_in(pid, ns, 21) || sched::caps::pid_capable_in(pid, ns, 24)
+        || sched::ns::owner(ns).0 == sched::euid_of(pid)
+}
+
+fn gen_proc_nslimit(pid: u32, c: usize, write: bool) -> Option<VnodeKind> {
     let mut data = [0u8; 12];
-    let l = oom_text(sched::ns::limit_get(c) as i32, &mut data);
+    let l = oom_text(sched::ns::limit_in(sched::ns::userns_of(pid), c) as i32, &mut data);
     let mut buf = [0u8; TMP_BUF_SIZE];
     if !write {
         buf[..l].copy_from_slice(&data[..l]);
