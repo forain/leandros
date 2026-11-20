@@ -5546,6 +5546,7 @@ fn dispatch(msg: &Message, caller_pid: u32) -> Message {
 }
 
 fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
+    if msg.tag == VFS_UNLINK || msg.tag == VFS_OPEN || msg.tag == VFS_STAT { bindpin_orphan_gc(caller_pid); }
     match msg.tag {
         VFS_OPEN         => {
             // Remember the mount a mount-namespace task opened through, so a
@@ -5573,7 +5574,7 @@ fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
         VFS_PWRITE       => handle_pio(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize,
                                         arg(msg,2) as usize, arg(msg,3), true),
         VFS_CLOSE        => handle_close(caller_pid, arg(msg,0) as usize),
-        VFS_STAT         => handle_stat(arg(msg,0) as usize, arg(msg,1) as usize),
+        VFS_STAT         => { let r = handle_stat(arg(msg,0) as usize, arg(msg,1) as usize); if reply_val(&r) >= 0 { bindpin_orphan_nlink(arg(msg,0) as usize, arg(msg,1) as usize); } r }
         VFS_STATFS       => handle_statfs(arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_FSTATFS      => handle_fstatfs(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
         VFS_LSEEK        => handle_lseek(caller_pid, arg(msg,0) as usize,
@@ -5638,7 +5639,7 @@ fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
         VFS_READLINK         => handle_readlink(arg(msg,0) as usize, arg(msg,1) as usize,
                                                 arg(msg,2) as usize),
         VFS_LINK             => handle_link(caller_pid, arg(msg,0) as usize, arg(msg,1) as usize),
-        VFS_LSTAT            => stat_common(arg(msg,0) as usize, arg(msg,1) as usize, false),
+        VFS_LSTAT            => { let r = stat_common(arg(msg,0) as usize, arg(msg,1) as usize, false); if reply_val(&r) >= 0 { bindpin_orphan_nlink(arg(msg,0) as usize, arg(msg,1) as usize); } r }
         VFS_SETXATTR | VFS_LSETXATTR
                              => handle_setxattr(caller_pid, msg.tag, arg(msg,0) as usize,
                                                 arg(msg,1) as usize, arg(msg,2) as usize,
@@ -15056,10 +15057,50 @@ fn tmpfs_rename(pid: u32, old: &[u8], new: &[u8], flags: usize) -> Message {
     ok_reply()
 }
 
+/// bindpin: unlinking the source of a file bind keeps the inode alive for the
+/// bind (Linux pins the dentry). The name moves to a hidden sibling and every
+/// mount rooted at it follows; `bindpin_orphan_gc` deletes it after the last
+/// such mount goes. `None` = nothing binds this path, unlink normally.
+fn bindpin_orphan_unlink(pid: u32, path: &[u8]) -> Option<Message> {
+    if !mnt::root_in_use(path) { return None; }
+    // unlink of a directory is EISDIR, never a rename.
+    let mut sp = path.to_vec(); sp.push(0);
+    let mut sb = [0u8; 256];
+    let r = handle_stat(sp.as_ptr() as usize, sb.as_mut_ptr() as usize);
+    if reply_val(&r) >= 0 && read_stat_mode(sb.as_ptr() as usize) & 0o170000 == 0o040000 { return None; }
+    let hidden = mnt::orphan_name_for(path);
+    let (mut o, mut n) = (path.to_vec(), hidden.clone());
+    o.push(0); n.push(0);
+    let r = handle_rename(pid, o.as_ptr() as usize, n.as_ptr() as usize, 0);
+    if reply_val(&r) >= 0 { mnt::orphan_adopt(path, &hidden); }
+    Some(r)
+}
+
+/// Delete orphans (see `bindpin_orphan_unlink`) whose last bind is gone.
+fn bindpin_orphan_gc(pid: u32) {
+    for p in mnt::orphan_take_unused() {
+        let mut c = p.clone(); c.push(0);
+        let e = reply_val(&handle_unlink(pid, c.as_ptr() as usize));
+        if e < 0 && e != -2 { mnt::orphan_requeue(p); }
+    }
+}
+
+/// nlink of an orphan (its last name is gone) reads 0, as on Linux.
+fn bindpin_orphan_nlink(path_ptr: usize, stat_ptr: usize) {
+    if !mnt::orphans_any() { return; }
+    let (b, l) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return };
+    if !mnt::is_orphan(strip_trailing_slash(&b[..l])) { return; }
+    unsafe {
+        #[cfg(target_arch = "x86_64")] { ((stat_ptr + 16) as *mut u64).write_unaligned(0); }
+        #[cfg(not(target_arch = "x86_64"))] { ((stat_ptr + 20) as *mut u32).write_unaligned(0); }
+    }
+}
+
 fn handle_unlink(pid: u32, path_ptr: usize) -> Message {
     mnt::name_gen_bump(); // mntiso-bindpin: bind pins re-verify after this
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let raw = &pbuf[..plen];
+    if let Some(r) = bindpin_orphan_unlink(pid, strip_trailing_slash(raw)) { return r; }
 
     if cgroupfs::is_path(strip_trailing_slash(raw)) { return err_reply(-1); } // EPERM
     if devfs_owns(strip_trailing_slash(raw)) { return devfs_unlink(pid, strip_trailing_slash(raw)); }
