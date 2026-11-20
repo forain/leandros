@@ -9517,8 +9517,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             // console proxy too, which answered termios from whatever fd 0
             // was: with stdin a pipe, sudo-rs "had a terminal" whose every
             // termios call was ENOTTY (it carried a patch for it).
+            //
+            // O_PATH never reaches the driver on Linux: it only names the
+            // /dev/tty node, so it succeeds with no controlling terminal
+            // (bwrap's --dev opens its bind sources O_PATH, flatpak runs have
+            // no ctty). Only a real open gets ENXIO.
             let sid = sched::current_sid();
             match tty_server::pty::ctty_for_sid(sid) {
+                _ if flags & O_PATH != 0 => VnodeKind::DevStdio { target_fd: TTY_NODE_FD },
                 Some(n) => {
                     if let Err(e) = tty_server::pty::slave_open(n) { return err_reply(e); }
                     VnodeKind::Pty { pair: n as u16, is_master: false }
@@ -17372,6 +17378,10 @@ fn handle_stat(path_ptr: usize, stat_ptr: usize) -> Message {
 /// /dev/null (1:3), /dev/zero (1:5), /dev/urandom (1:9), /dev/fb0 (29:0).
 /// They agree with `/proc/<pid>/stat`'s tty_nr (`tty_server::ctty_dev_of_sid`)
 /// and with a path stat of the node (`dev_node_rdev`). 0 for anything else.
+/// `DevStdio::target_fd` of an O_PATH open of /dev/tty with no controlling
+/// terminal: the fd only names the 5:0 node (no stdio slot behind it).
+const TTY_NODE_FD: usize = usize::MAX;
+
 fn char_dev_rdev(kind: &VnodeKind) -> u64 {
     match *kind {
         VnodeKind::Pty { is_master: true, .. } => makedev(5, 2),
@@ -17379,6 +17389,7 @@ fn char_dev_rdev(kind: &VnodeKind) -> u64 {
             0 => pts_rdev(tty_server::pty::ident(pair as usize).1 as u32),
             n => makedev(4, n as u32),
         },
+        VnodeKind::DevStdio { target_fd: TTY_NODE_FD } => makedev(5, 0),
         VnodeKind::DevStdio { .. } => makedev(5, 1),
         VnodeKind::DevVt { vt, .. } => makedev(4, vt as u32),
         VnodeKind::DevNull => makedev(1, 3),
