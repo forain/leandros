@@ -9669,7 +9669,13 @@ fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
     } else { None };
     let ns = if mns != 0 { via.or_else(|| vfs::mnt::reverse_newest(mns, &host)) } else { Some(host) };
     match ns {
-        Some(n) if !vfs::mnt::is_sb_path(&n) => Ok(n),
+        Some(mut n) if !vfs::mnt::is_sb_path(&n) => {
+            // The root of a mount whose backing root is "/" comes back as
+            // "<mountpoint>/" (reverse_via joins the empty rest with a slash):
+            // a mount target names its mount point exactly, so drop it.
+            while n.len() > 1 && n.last() == Some(&b'/') { n.pop(); }
+            Ok(n)
+        }
         _ => Err(-22),
     }
 }
@@ -12473,7 +12479,13 @@ fn read_user_cstr_kpath(ptr: usize) -> Result<KPath, isize> {
 /// "<root><root>/…" and spuriously ENOENT).
 fn fd_abs_path(fd: usize) -> Option<Vec<u8>> {
     let host = fd_host_path(fd)?;
-    Some(host_to_view(&host))
+    // Name the fd through the mount it was opened on: bwrap's openat_in_root
+    // on /newroot after the rbind of /oldroot/ must not resolve via /oldroot.
+    let hint = match vfs::fd_mnt(current_pid(), fd) {
+        Some((n, m)) if n == sched::current_mntns() => m,
+        _ => 0,
+    };
+    Some(host_to_view_hint(&host, hint))
 }
 
 /// The host-absolute (backing) path `fd` was opened by; see [`fd_abs_path`].
