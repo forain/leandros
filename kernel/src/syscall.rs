@@ -12473,7 +12473,13 @@ fn read_user_cstr_kpath(ptr: usize) -> Result<KPath, isize> {
 /// "<root><root>/…" and spuriously ENOENT).
 fn fd_abs_path(fd: usize) -> Option<Vec<u8>> {
     let host = fd_host_path(fd)?;
-    Some(host_to_view(&host))
+    // Name the fd through the mount it was opened on: bwrap's openat_in_root
+    // on /newroot after the rbind of /oldroot/ must not resolve via /oldroot.
+    let hint = match vfs::fd_mnt(current_pid(), fd) {
+        Some((n, m)) if n == sched::current_mntns() => m,
+        _ => 0,
+    };
+    Some(host_to_view_hint(&host, hint))
 }
 
 /// The host-absolute (backing) path `fd` was opened by; see [`fd_abs_path`].
