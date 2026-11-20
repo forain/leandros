@@ -2150,6 +2150,8 @@ pub fn fd_is_console_stdio(pid: u32, fd: usize) -> bool {
     match tbl.fds[fd].kind {
         // A console proxy is the console itself — never a link to whatever
         // its `target_fd` slot holds now (see `VnodeKind::DevStdio`).
+        // An O_PATH /dev/tty with no ctty names the 5:0 node, not the console.
+        VnodeKind::DevStdio { target_fd: TTY_NODE_FD } => false,
         VnodeKind::DevStdio { .. } => true,
         // A virtual console IS the console: writes land on the active VT
         // (the mirror `vt::console_out` feeds), reads take console input.
