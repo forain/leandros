@@ -1314,16 +1314,18 @@ unsafe fn negotiate_bus(dev: &SdhciDevice, rca: u32, tran_speed_khz: u32) {
 unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
     let mut mbr = [0u8; BLOCK_SIZE];
     if !dev.do_io(false, 0, mbr.as_mut_ptr()) { return None; }
-    if mbr[510] != 0x55 || mbr[511] != 0xAA { return None; } // no valid MBR signature
-    for i in 0..4usize {
-        let entry = &mbr[446 + i * 16..446 + i * 16 + 16];
-        if entry[4] == 0x83 {
-            let lba_start = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as u64;
-            // MBR LBA is in 512-byte sectors; our blocks are 4096 bytes.
-            return Some(lba_start / SECTORS_PER_BLOCK as u64);
-        }
-    }
-    None
+    // A dual-boot card has two 0x83 partitions (F2FS root, Raspberry Pi OS
+    // ext4 root): take the one whose superblock carries the F2FS magic.
+    use crate::rpi_misc_logic::sdmbr;
+    let mut sb = [0u8; BLOCK_SIZE];
+    let lba_start = sdmbr::pick_f2fs(&mbr[..512], |lba| {
+        let off = lba * SECTOR_SIZE as u64 + sdmbr::F2FS_SB_OFFSET;
+        let (blk, at) = (off / BLOCK_SIZE as u64, (off % BLOCK_SIZE as u64) as usize);
+        if !dev.do_io(false, blk, sb.as_mut_ptr()) { return None; }
+        Some(u32::from_le_bytes(sb[at..at + 4].try_into().unwrap()))
+    })?;
+    // MBR LBA is in 512-byte sectors; our blocks are 4096 bytes.
+    Some(lba_start / SECTORS_PER_BLOCK as u64)
 }
 
 /// MBR partition 1 if it is FAT32 (0x0b/0x0c) and 4 KiB-aligned:

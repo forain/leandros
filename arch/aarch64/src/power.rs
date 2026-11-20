@@ -26,6 +26,26 @@ pub unsafe fn system_reset() {
     { let _ = crate::smp::psci_call(PSCI_SYSTEM_RESET, 0, 0, 0); }
 }
 
+/// PSCI 1.1 SYSTEM_RESET2 (SMC64) with reset_type 0 = SYSTEM_WARM_RESET and
+/// `cookie`, if PSCI_FEATURES reports it. The Raspberry Pi 5 kernel passes
+/// the `reboot N` partition this way (raspberrypi/linux "firmware/psci: Pass
+/// given partition number through": "Pi 5 uses BL31 as its armstub file, so
+/// the reset goes via PSCI"). Returns if unsupported or refused.
+///
+/// # Safety
+/// EL1; the machine restarts.
+pub unsafe fn system_reset2_warm(cookie: u64) {
+    #[cfg(all(target_arch = "aarch64", not(feature = "raspi4b")))]
+    {
+        const PSCI_FEATURES: u64 = 0x8400_000A;
+        const PSCI_SYSTEM_RESET2_64: u64 = 0xC400_0012;
+        if crate::smp::psci_call(PSCI_FEATURES, PSCI_SYSTEM_RESET2_64, 0, 0) < 0 { return; }
+        let _ = crate::smp::psci_call(PSCI_SYSTEM_RESET2_64, 0, cookie, 0);
+    }
+    #[cfg(not(all(target_arch = "aarch64", not(feature = "raspi4b"))))]
+    let _ = cookie;
+}
+
 /// Stop this CPU for good (`machine_halt`): mask interrupts, wait forever.
 pub fn halt_forever() -> ! {
     loop {

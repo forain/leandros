@@ -191,12 +191,16 @@ pub fn sys_reboot(magic1: usize, magic2: usize, cmd: usize, _arg: usize) -> isiz
         LINUX_REBOOT_CMD_RESTART2 => {
             let mut buf = [0u8; 256];
             let n = match restart2_arg(_arg, &mut buf) { Ok(n) => n, Err(e) => return e };
-            let tryboot = core::str::from_utf8(&buf[..n]).map_or(false, |a|
-                a.split_ascii_whitespace().any(|t| t == "tryboot"));
+            // "[N] [tryboot]", raspberrypi/linux syntax: N = one-shot boot
+            // partition (Pi 5), tryboot = firmware tryboot flag. A tryboot
+            // without N targets partition 1, where LeandrOS's tryboot.txt is.
+            let (part, tryboot) = core::str::from_utf8(&buf[..n])
+                .map_or((0, false), drivers::rpi_misc_logic::restart2::parse);
             if tryboot {
                 if let Err(e) = arm_tryboot() { return e; }
                 crate::tryboot::note_armed();
             }
+            REBOOT_PARTITION.store(part, Ordering::Release);
             kernel_restart()
         }
         LINUX_REBOOT_CMD_RESTART => kernel_restart(),
@@ -425,6 +429,10 @@ fn kernel_power_off() -> ! {
 /// Restart from kernel context (netwatch): the reboot(2) path, no caller checks.
 pub fn restart_now() -> ! { kernel_restart() }
 
+/// One-shot boot partition for this restart (RESTART2 "N"); 0 = firmware
+/// default. Only the Pi 5 acts on it.
+static REBOOT_PARTITION: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// `kernel_restart`.
 fn kernel_restart() -> ! {
     // A plain reset in a trial boot must never leave the one-shot tryboot flag set.
@@ -458,6 +466,18 @@ fn kernel_restart() -> ! {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
+        // Pi 5: the boot partition goes into PM_RSTS (`__bcm2835_restart`;
+        // a plain restart writes 0 = firmware default, so autoboot.txt
+        // decides) and, for an explicit partition, also through PSCI
+        // SYSTEM_RESET2's cookie as the Raspberry Pi kernel does on Pi 5.
+        #[cfg(feature = "rpi5")]
+        if drivers::rpi_misc::pm_ok() {
+            let part = REBOOT_PARTITION.load(Ordering::Acquire);
+            if drivers::rpi_pm::set_boot_partition(part) && part != 0 {
+                serial_print_str(&alloc::format!("reboot: boot partition {}\n", part));
+                arch_aarch64::power::system_reset2_warm(part as u64);
+            }
+        }
         arch_aarch64::power::system_reset();
         #[cfg(feature = "rpi5")]
         if drivers::rpi_pm::restart() {

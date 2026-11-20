@@ -46,6 +46,33 @@ expected in gen2: the reserved ranges are absent from /memory instead).
 `[KEXEC] cpuN mpidr=... still not OFF` means BL31 refused PSCI CPU_OFF: the
 new kernel will fail CPU_ON for that core (ALREADY_ON) but still boot.
 
+## Dual-boot card (Raspberry Pi OS default, LeandrOS on request)
+Layout: p1 FAT32 = LeandrOS boot (kernel.img, config.txt, tryboot.txt, A/B
+slots) + `autoboot.txt`; p2 F2FS = LeandrOS root; p3 FAT32 = Raspberry Pi OS
+boot; p4 ext4 = Linux root. p1's `autoboot.txt`:
+```
+[all]
+boot_partition=3
+```
+Never add `tryboot_a_b=1` (it makes the firmware ignore tryboot.txt).
+
+- Power cycle / plain `reboot` (either OS) / tryboot deadline / panic-watchdog
+  reset -> firmware default = p3 = Linux.
+- Linux -> LeandrOS: `sudo reboot 1` (one-shot boot partition request).
+  Trial slot from Linux: `sudo reboot "1 tryboot"` (Linux needs the space form).
+- LeandrOS -> Linux: `reboot 3`; LeandrOS -> itself: `reboot 1`.
+- `reboot tryboot` / picard `try` (RESTART2 "0 tryboot") on LeandrOS now
+  request partition 1 + the tryboot flag, so the trial reads p1's tryboot.txt
+  even though autoboot.txt defaults to p3. If the trial is not committed, the
+  deadline's plain reboot lands in Linux (not the good LeandrOS slot); enter
+  the good slot again with `sudo reboot 1` from Linux.
+- Mechanism (Pi 5): the partition goes into PM_RSTS bits 0,2,4,6,8,10
+  (`__bcm2835_restart`) and, when given, the PSCI SYSTEM_RESET2 cookie
+  (warm reset, as the Raspberry Pi kernel does: Pi 5 resets through BL31);
+  tryboot = mailbox SET_REBOOT_FLAGS 1. LeandrOS logs
+  `[pifw] booted via reboot partition request N: cleared` at boot.
+- kexec deploys (`pi-deploy`) are unaffected: they never reset the board.
+
 Rules: hold `$SP/lock.sh pi` (if the orchestrator defines it) across
 deploy -> verify -> promote; check `pi-status` shows YOUR trial before promoting.
 
