@@ -41,22 +41,30 @@ pub fn lookup_name(name: &str) -> Option<usize> {
     let b = name.as_bytes();
     if b.len() == 3 && &b[..2] == b"vd" && b[2].is_ascii_lowercase() {
         let i = (b[2] - b'a') as usize;
-        if i < device_count() { return Some(i); }
+        if i < device_count() && !crate::sdhci::is_whole_card(i) { return Some(i); }
     }
     None
 }
 
 pub fn dev_path(idx: usize) -> &'static str {
+    if crate::sdhci::is_whole_card(idx) { return "/dev/mmcblk0"; }
     PATHS.get(idx).copied().unwrap_or("/dev/?")
 }
 
 pub fn describe(idx: usize) -> Option<DiskDesc> {
     if idx >= device_count() || idx >= PATHS.len() { return None; }
     let mut name = [0u8; NAME_MAX];
-    name[..3].copy_from_slice(&PATHS[idx].as_bytes()[5..8]);
+    let whole = crate::sdhci::is_whole_card(idx);
+    let nlen = if whole {
+        name[..7].copy_from_slice(b"mmcblk0");
+        7
+    } else {
+        name[..3].copy_from_slice(&PATHS[idx].as_bytes()[5..8]);
+        3
+    };
     Some(DiskDesc {
         name,
-        nlen: 3,
+        nlen,
         parent: None,
         pno: 0,
         start_bytes: 0,
@@ -66,8 +74,9 @@ pub fn describe(idx: usize) -> Option<DiskDesc> {
         read_only: read_only(idx),
         gone: false,
         special: crate::sdhci::is_boot_fat(idx),
-        class: "vd",
-        ordinal: idx as u16,
+        // The whole card: the VFS scans its MBR into mmcblk0p1..p4 itself.
+        class: if whole { "mmcblk" } else { "vd" },
+        ordinal: if whole { 0 } else { idx as u16 },
     })
 }
 
@@ -174,7 +183,7 @@ pub fn pm_thaw() -> Result<alloc::string::String, alloc::string::String> {
 /// (the boot-FAT window, vdc, is its own device index, never a child of vdb),
 /// so a family is just the device itself.
 pub fn family_paths(idx: usize) -> alloc::vec::Vec<&'static str> {
-    if idx < device_count() && idx < PATHS.len() { alloc::vec![PATHS[idx]] } else { alloc::vec::Vec::new() }
+    if idx < device_count() && idx < PATHS.len() { alloc::vec![dev_path(idx)] } else { alloc::vec::Vec::new() }
 }
 
 /// No per-disk write policy on the SD facade (see `set_rw_list`).
@@ -182,3 +191,6 @@ pub fn rw_list_active() -> bool { false }
 
 /// No partition registry, hence no f2fs label lookup.
 pub fn f2fs_label_is(_idx: usize, _label: &str) -> bool { false }
+
+/// Absolute byte range of device `idx` the mounted root filesystem occupies.
+pub fn busy_range(idx: usize) -> Option<(u64, u64)> { crate::sdhci::busy_range(idx) }

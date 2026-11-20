@@ -24,6 +24,7 @@ mod conf;
 mod dev;
 mod disks;
 mod klog;
+mod mbr;
 mod picard;
 mod picard_cli;
 
@@ -1250,6 +1251,13 @@ const USAGE: &str = "usage: espctl [--dev /dev/<esp>] <command>
   ls [dir] | cat <f> | get <f> <local> | put <local> <f> | rm <f>";
 
 fn main() {
+    // Installed a second time as /usr/sbin/mbrtool.
+    let argv0 = std::env::args().next().unwrap_or_default();
+    if argv0.rsplit('/').next() == Some("mbrtool") {
+        let a: Vec<String> = std::env::args().skip(1).collect();
+        if let Err(e) = mbr::run(a) { eprintln!("mbrtool: {}", e); std::process::exit(1); }
+        return;
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let dev = take_opt(&mut args, "--dev");
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
@@ -1266,6 +1274,7 @@ fn main() {
     let mut o = Opts { dev, args };
     let r = match cmd.as_str() {
         "pi" => picard_cli::run(o.args.clone(), o.dev.clone()),
+        "mbr" => mbr::run(o.args.clone()),
         "status" => cmd_status(&o),
         "install" => cmd_install(&mut o),
         "arm" => cmd_arm(&o),

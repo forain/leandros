@@ -2174,6 +2174,7 @@ def main():
     if os.path.exists(p):
         m4_share_dirs.add("/usr/sbin")
         m5_exec_files.append(("/usr/sbin", "espctl", p))
+        m5_exec_files.append(("/usr/sbin", "mbrtool", p))
 
     # leandros-install: the installer backend (userland/leandros-install),
     # run as root (the GUI goes through sudo): list disks, install to one.

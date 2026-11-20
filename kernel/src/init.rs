@@ -234,6 +234,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             removable: d.removable,
             scsi: d.class == "sd",
             nvme: d.class == "nvme",
+            mmc: d.class == "mmcblk",
+            private: d.class == "mmcblk",
             ro: d.read_only,
             ordinal: d.ordinal,
             gone: d.gone,
@@ -241,6 +243,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
             ident: nvme_ident(&d),
         }),
         removed_gen: || drivers::blkdev::removed_generation(),
+        busy: |i| drivers::blkdev::busy_range(i),
         read_blocks: |i, blk, buf| drivers::blkdev::read_blocks(i, blk, buf),
         write_block: |i, blk, buf| match <&[u8; 4096]>::try_from(buf) {
             Ok(b) => drivers::blkdev::write_block(i, blk, b),
