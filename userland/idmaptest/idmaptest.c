@@ -695,6 +695,24 @@ static int map_kuid0_needs_setfcap(void)
     return 0;
 }
 
+static int map0_drm_fd = -1;          /* opened by host root, inherited by the probes */
+static struct sockaddr_un map0_sa;    /* mounted (non-tmpfs) socket owned by unmapped uid 4242, mode 0700 */
+static int map0_sock_up;
+static int map0_connect(void)
+{
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    int r = connect(s, (struct sockaddr *)&map0_sa, sizeof map0_sa);
+    int e = errno; close(s); errno = e;
+    return r;
+}
+static int map0_ovl_read(void)
+{
+    char b[64]; int fd = open("/proc/sys/fs/ovl_selftest", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, b, sizeof b); close(fd);
+    return (int)n;
+}
 /* f_cred vs writer: the CAP_SETFCAP check follows the OPENER of the map file, not the writer. */
 static int set_setfcap(int on)
 {
@@ -792,24 +810,6 @@ static int mounted_sock_group_dac(void)
 
 /* Root of a namespace that maps kuid 0 (euid 0) still is not host root. */
 static pid_t map0_target;
-static int map0_drm_fd = -1;          /* opened by host root, inherited by the probes */
-static struct sockaddr_un map0_sa;    /* mounted (non-tmpfs) socket owned by unmapped uid 4242, mode 0700 */
-static int map0_sock_up;
-static int map0_connect(void)
-{
-    int s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s < 0) return -1;
-    int r = connect(s, (struct sockaddr *)&map0_sa, sizeof map0_sa);
-    int e = errno; close(s); errno = e;
-    return r;
-}
-static int map0_ovl_read(void)
-{
-    char b[64]; int fd = open("/proc/sys/fs/ovl_selftest", O_RDONLY);
-    if (fd < 0) return -1;
-    ssize_t n = read(fd, b, sizeof b); close(fd);
-    return (int)n;
-}
 static int map0_nsroot_body(void)
 {
     if (unshare(CLONE_NEWUSER) != 0) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
