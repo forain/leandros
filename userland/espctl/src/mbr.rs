@@ -368,6 +368,27 @@ fn selftest() -> R<()> {
                 let e = f.write_at(&sb, 1024);
                 check(matches!(&e, Err(x) if x.raw_os_error() == Some(libc::EBUSY)),
                       &format!("raw write into the mounted root ({}) superblock is EBUSY (got {:?})", s, e.as_ref().map_err(|x| x.raw_os_error())));
+                // 3b. The guard covers the fs, not the device: the first 4 KiB
+                // past the fs end is writable (its own bytes are written back),
+                // the last 4 KiB inside stays EBUSY. Skipped on the real SD
+                // card (never write it from a test) and without slack.
+                let mut hdr = vec![0u8; 44];
+                f.read_exact_at(&mut hdr, 1024)?;
+                let fs = (u32::from_le_bytes(hdr[0..4].try_into().unwrap()) == 0xF2F5_2010)
+                    .then(|| u64::from_le_bytes(hdr[36..44].try_into().unwrap()) << u32::from_le_bytes(hdr[16..20].try_into().unwrap()));
+                let dev = size_of(&f).unwrap_or(0);
+                match fs {
+                    Some(fs) if !s.starts_with("/dev/mmcblk") && fs >= 4096 && dev >= fs + 4096 => {
+                        let mut b = vec![0u8; 4096];
+                        f.read_exact_at(&mut b, fs)?;
+                        let e = f.write_at(&b, fs);
+                        check(matches!(e, Ok(4096)), &format!("raw write just past the root fs end ({} @{}) succeeds (got {:?})", s, fs, e.as_ref().map_err(|x| x.raw_os_error())));
+                        f.read_exact_at(&mut b, fs - 4096)?;
+                        let e = f.write_at(&b, fs - 4096);
+                        check(matches!(&e, Err(x) if x.raw_os_error() == Some(libc::EBUSY)), &format!("raw write of the last root fs block is EBUSY (got {:?})", e.as_ref().map_err(|x| x.raw_os_error())));
+                    }
+                    _ => println!("[SKIP] past-fs-end write on {} (fs {:?}, device {} bytes)", s, fs, dev),
+                }
             }
             Err(x) => check(false, &format!("open root device {}: {}", s, x)),
         },
