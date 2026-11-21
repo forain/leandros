@@ -67,6 +67,11 @@ Options:
                            (default 300)
   --mode M                 driver.py start mode (uefi, uefi-tcg, ...)
   --keep                   leave QEMU running after the last boot
+  --shards K               split the command list over K concurrent runs (longest first, by the
+                           durations recorded in $RUNTESTS_DURATIONS, default
+                           ~/.cache/leandros/runtests-durations-<arch>.json), each with its own VM, run id
+                           (<id>-s<N>) and reflink copy of the images, then merge: the same `=== ` lines and
+                           the same summary (every command still runs, overall PASS only if every shard passes)
 
 Waits scale with the accelerator (driver.wait_scale: x3 on TCG, x1 on HVF/KVM;
 LEANDROS_WAIT_SCALE overrides).
@@ -654,6 +659,162 @@ def self_boots(c):
         return False
 
 
+DUR_DEFAULT = 20.0   # seconds assumed for a command with no recorded duration
+SHARD_VM_COST = 45.0  # booting a shard's VM
+
+
+def durations_path(arch):
+    return os.environ.get("RUNTESTS_DURATIONS") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "leandros",
+        f"runtests-durations-{arch}.json")
+
+
+def load_durations(arch):
+    try:
+        with open(durations_path(arch)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_durations(arch, rows):
+    """Remember how long each command that passed took (the next sharded run partitions by it)."""
+    try:
+        d = load_durations(arch)
+        for x in rows:
+            if x.get("rc") == 0 and x.get("status") in ("ok", "rc-file") and x.get("secs"):
+                d[x["cmd"]] = round(float(x["secs"]), 1)
+        p = durations_path(arch)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = f"{p}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=0, sort_keys=True)
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def partition(cmds, k, dur):
+    """Longest-processing-time-first over k bins. A bin that runs any non-self-booting command also
+    pays one VM boot. Inside a bin: the commands that share the bin's VM first (original order), then the
+    self-booting scripts (each stops that VM), so the VM is not rebooted between them."""
+    order = sorted(range(len(cmds)), key=lambda i: (-dur.get(cmds[i], DUR_DEFAULT), i))
+    load, hasvm, bins = [0.0] * k, [False] * k, [[] for _ in range(k)]
+    for i in order:
+        sb = self_boots(cmds[i])
+        j = min(range(k), key=lambda j: load[j] + (0 if sb or hasvm[j] else SHARD_VM_COST))
+        if not sb and not hasvm[j]:
+            hasvm[j] = True
+            load[j] += SHARD_VM_COST
+        load[j] += dur.get(cmds[i], DUR_DEFAULT)
+        bins[j].append(i)
+    return [[cmds[i] for i in sorted(b, key=lambda i: (self_boots(cmds[i]), i))] for b in bins], load
+
+
+def make_shard_tree(dest):
+    """A view of the checkout for one shard: everything symlinked except the mutable disk images and
+    EFI vars (reflink copies) and this harness directory (a real copy, so driver.REPO_ROOT, which is
+    derived from the script path, is the shard tree and its sockets/images are private)."""
+    import shutil
+    root = driver.REPO_ROOT
+    os.makedirs(dest, exist_ok=True)
+    for name in os.listdir(root):
+        src, dst = os.path.join(root, name), os.path.join(dest, name)
+        if name == ".claude":
+            os.makedirs(os.path.join(dst, "skills"), exist_ok=True)
+            for n2 in os.listdir(src):
+                if n2 != "skills":
+                    os.symlink(os.path.join(src, n2), os.path.join(dst, n2))
+            for n3 in os.listdir(os.path.join(src, "skills")):
+                s3, d3 = os.path.join(src, "skills", n3), os.path.join(dst, "skills", n3)
+                if n3 == "run-leandros":
+                    shutil.copytree(s3, d3, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+                else:
+                    os.symlink(s3, d3)
+        elif os.path.isfile(src) and (name.endswith((".img", ".fd", ".img.gpu")) and not os.path.islink(src)):
+            if subprocess.run(["cp", "--reflink=auto", "--sparse=always", src, dst]).returncode != 0:
+                shutil.copyfile(src, dst)
+        else:
+            os.symlink(src, dst)
+
+
+def run_sharded(arch, tag, cmds, k, gpu, mode, base_timeout, cmdline, keep, repeat, out):
+    import shutil
+    import threading
+    dur = load_durations(arch)
+    k = max(1, min(k, len(cmds)))
+    bins, load = partition(cmds, k, dur)
+    rid = os.environ.get("LEANDROS_RUN_ID", "runtests")
+    print(f"runtests: sharding {len(cmds)} commands over {k} runs, est. wall "
+          f"{max(load):.0f}s (sequential est. {sum(dur.get(c, DUR_DEFAULT) for c in cmds):.0f}s)", flush=True)
+    lock = threading.Lock()
+    procs = []
+    for j, b in enumerate(bins):
+        sd = os.path.join(out, f"s{j}")
+        tree = os.path.join(sd, "tree")
+        shutil.rmtree(sd, ignore_errors=True)
+        os.makedirs(sd, exist_ok=True)
+        make_shard_tree(tree)
+        os.makedirs(os.path.join(sd, "tmp"), exist_ok=True)
+        # a private TMPDIR on the data disk: host scripts' mkdtemp images no longer land on the (often full) tmpfs /tmp
+        env = dict(os.environ, LEANDROS_RUN_ID=f"{rid}-s{j}", FFSESSION_OUT=sd, TMPDIR=os.path.join(sd, "tmp"))
+        argv = [sys.executable, os.path.join(tree, ".claude", "skills", "run-leandros", "runtests.py"), arch, tag,
+                "--timeout", str(base_timeout), "--mode", mode, "--gpu", gpu, "--repeat", str(repeat)]
+        if cmdline is not None:
+            argv += ["--cmdline", cmdline]
+        if keep:
+            argv.append("--keep")
+        argv += b
+        procs.append((j, b, sd, subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                 text=True, bufsize=1, env=env, cwd=tree)))
+
+    def pump(j, p):
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            with lock:
+                print(line if line.startswith("=== ") else f"[s{j}] {line}", flush=True)
+
+    ths = [threading.Thread(target=pump, args=(j, p), daemon=True) for j, _, _, p in procs]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    all_ok, bad_boots, rows_by_cmd, allrows = True, 0, {}, []
+    for j, b, sd, p in procs:
+        rc = p.wait()
+        all_ok &= rc == 0
+        sj = os.path.join(sd, f"tests-{tag}", "summary.json")
+        try:
+            with open(sj) as f:
+                runs = json.load(f)["runs"]
+        except (OSError, ValueError):
+            runs = []
+        bad_boots += sum(1 for e in runs if e["boot"] != "ok") + max(0, repeat - len(runs))
+        for e in runs:
+            for x in e["results"]:
+                rows_by_cmd.setdefault(x["cmd"], []).append(x)
+                allrows.append(x)
+        for c in b:
+            if c not in rows_by_cmd and not any(e["boot"] != "ok" for e in runs):
+                print(f"=== {c}: RC=? [not-run, 0.0s] fails=? rc-only", flush=True)  # a shard that died mid-list
+                all_ok = False
+    record_durations(arch, allrows)
+    summary = {"arch": arch, "gpu": gpu, "shards": k, "runs": [{"cmd": c, "rows": r} for c, r in rows_by_cmd.items()]}
+    with open(os.path.join(out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+    print("--- summary")
+    for c in cmds:
+        rows = rows_by_cmd.get(c, [])
+        good = sum(1 for x in rows if x["rc"] == 0 and x["status"] in ("ok", "rc-file"))
+        unknown = sum(1 for x in rows if x["rc"] is None)
+        print(f"{c}: {good}/{len(rows)} RC=0, {unknown} unknown")
+    if not keep:
+        for j, _, sd, _ in procs:
+            shutil.rmtree(os.path.join(sd, "tree"), ignore_errors=True)
+    print(f"boots failed: {bad_boots}/{k * repeat}; overall: {'PASS' if all_ok else 'FAIL'}")
+    return 0 if all_ok else 1
+
+
 def main(argv):
     if len(argv) < 2 or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -663,6 +824,7 @@ def main(argv):
     driver.claim_run_id("runtests.py " + tag)
     gpu = "virgl" if os.environ.get("RUNTESTS_VIRGL") else "none"
     repeat, base_timeout, mode, keep = 1, 300.0, "uefi", False
+    shards = int(os.environ.get("RUNTESTS_SHARDS", "1"))
     cmds, suites = [], []
     cmdline = None
     i = 0
@@ -682,6 +844,8 @@ def main(argv):
             mode = rest[i + 1]; i += 2
         elif a == "--keep":
             keep = True; i += 1
+        elif a == "--shards":
+            shards = int(rest[i + 1]); i += 2
         elif a == "--paneltrace":
             os.environ["FFS_PANELTRACE"] = "1"; i += 1
         elif a == "--cmdline":
@@ -718,6 +882,10 @@ def main(argv):
     timeout = base_timeout * scale
     out = os.path.join(os.environ.get("FFSESSION_OUT", "/tmp/ffsession"), f"tests-{tag}")
     os.makedirs(out, exist_ok=True)
+    if shards > 1 and len(cmds) > 1:
+        print(f"runtests: arch={arch} accel={accel} gpu={gpu} scale={scale} "
+              f"timeout={timeout:.0f}s repeat={repeat} shards={shards} out={out}", flush=True)
+        return run_sharded(arch, tag, cmds, shards, gpu, mode, base_timeout, cmdline, keep, repeat, out)
     if cmdline is not None:
         # A private copy (clonefile on APFS) with the requested cmdline; the
         # driver boots LEANDROS_DISK_IMAGE instead of the build's image.
@@ -845,6 +1013,7 @@ def main(argv):
 
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
+    record_durations(arch, [x for e in summary["runs"] for x in e["results"]])
     # Per-command tally over all runs.
     print("--- summary")
     for c in cmds:
