@@ -53,7 +53,16 @@ impl Rng {
     pub(crate) fn below(&mut self, n: u64) -> u64 { if n == 0 { 0 } else { self.next() % n } }
 }
 
-pub(crate) unsafe fn out(s: &[u8]) { write(STDOUT_FILENO, s.as_ptr(), s.len()); }
+pub(crate) unsafe fn out(s: &[u8]) {
+    // Finish a short write: crash claim lines are the evidence of what was durable, a dropped one is
+    // a false "fsynced but missing" (lane f2fsmiss).
+    let mut off = 0usize;
+    let mut tries = 0u32;
+    while off < s.len() && tries < 100_000 {
+        let r = write(STDOUT_FILENO, s.as_ptr().add(off), s.len() - off);
+        if r > 0 { off += r as usize; } else { tries += 1; }
+    }
+}
 pub(crate) unsafe fn out_dec(mut v: u64) {
     let mut d = [0u8; 20];
     let mut i = d.len();
