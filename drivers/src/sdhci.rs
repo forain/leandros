@@ -331,17 +331,24 @@ const CMD_TYPE_ABORT:    u16 = 0b11 << 6;
 const MULTI_MAX_SECTORS: usize = 128;
 /// Blocks (4 KiB) per multi-block command.
 const MULTI_MAX_BLOCKS: usize = MULTI_MAX_SECTORS / SECTORS_PER_BLOCK;
-/// Multi-block CMD18/CMD25 in use. OFF by default: on the real Pi 5 it
-/// broke inbound SSH with no transfer ever reporting an error (suspected
-/// silent data corruption; QEMU's SD model never showed it). `sdhci.multi=1`
-/// opts in (see `configure`). Also cleared (for good) after
+/// Multi-block CMD18/CMD25 in use. ON by default since the `sdhci.sdtest`
+/// proof (GiB of mixed-size multi writes read back bit-exact on the real
+/// card; ~16-21 MB/s vs ~0.5-1.6 single-sector). `sdhci.multi=0` turns it
+/// off (see `configure`). Also cleared (for good) after
 /// `MULTI_FALLBACK_LIMIT` transfers failed multi-block but then succeeded
 /// sector by sector.
-static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// `sdhci.multitest=1`: at probe, compare a single-sector read and a
 /// multi-block read of the first `MULTITEST_BLOCKS` blocks. Read-only.
 static MULTITEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 const MULTITEST_BLOCKS: usize = 1024; // 4 MiB
+/// `sdhci.sdtest=<MiB>`: speed table + write/readback proof inside the scratch window.
+static SDTEST_MIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SDTEST_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The raw scratch region (see pi-remote skill): the last 8 GiB of the card,
+/// 512-byte sectors, [FIRST, END). The only place `sdtest` may write.
+const SCRATCH_FIRST: u64 = 233_222_144;
+const SCRATCH_END: u64 = 249_999_360;
 
 /// Kernel command-line knobs, read before `init` probes the card:
 /// `sdhci.multi=1` (multi-block I/O) and `sdhci.multitest=1` (boot self-test).
@@ -355,7 +362,13 @@ pub fn configure(cmdline: &str) {
             "sdhci.multi=1" => MULTI_ON.store(true, Ordering::Relaxed),
             "sdhci.multi=0" => MULTI_ON.store(false, Ordering::Relaxed),
             "sdhci.multitest=1" => MULTITEST.store(true, Ordering::Relaxed),
-            _ => {}
+            _ => {
+                if let Some(v) = w.strip_prefix("sdhci.sdtest=") {
+                    let m: u32 = v.parse().unwrap_or(0);
+                    SDTEST_MIB.store(m, Ordering::Relaxed);
+                    SDTEST_PENDING.store(m > 0, Ordering::Relaxed);
+                }
+            }
         }
     }
 }
@@ -701,6 +714,113 @@ impl SdhciDevice {
         let _ = self.wait_normal_int(NI_CMD_COMPLETE);
         self.wait_cmd_inhibit_clear(true);
         self.reset_cmd_dat();
+    }
+
+    /// Raw sector I/O confined to the scratch window. Every access (reads
+    /// too) is range-checked here, the single chokepoint of `sdtest`.
+    unsafe fn scratch_io(&self, is_write: bool, multi: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
+        if count == 0 || sector < SCRATCH_FIRST || sector.checked_add(count as u64).map_or(true, |e| e > SCRATCH_END) {
+            crate::kenv::pci::serial_debug("[sdhci] sdtest: RANGE VIOLATION refused\n");
+            return false;
+        }
+        let ok = if multi {
+            self.do_io_multi(is_write, sector, count, buf)
+        } else {
+            (0..count).all(|i| self.do_io_sector(is_write, sector + i as u64, buf.add(i * SECTOR_SIZE)))
+        };
+        if !ok { self.abort_multi(); }
+        ok
+    }
+
+    /// `sdhci.sdtest=<MiB>`: speed table and write/readback proof inside the
+    /// scratch window only (the last 8 GiB of the card, free of partitions).
+    /// Bypasses `MULTI_ON`; always exercises the raw multi/single paths.
+    unsafe fn sdtest(&self, mib: u32) {
+        let p = |s: &str| crate::kenv::pci::serial_debug(s);
+        let ph = |v: u64| {
+            let mut o = [0u8; 16];
+            for i in 0..16 { let nib = ((v >> (4 * (15 - i))) & 0xf) as u8; o[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 }; }
+            let s = o.iter().position(|&c| c != b'0').unwrap_or(15);
+            crate::kenv::pci::serial_debug(core::str::from_utf8(&o[s..]).unwrap_or("?"));
+        };
+        let pd = |mut v: u64| {
+            let mut o = [0u8; 20]; let mut i = 20;
+            if v == 0 { i -= 1; o[i] = b'0'; }
+            while v > 0 { i -= 1; o[i] = b'0' + (v % 10) as u8; v /= 10; }
+            crate::kenv::pci::serial_debug(core::str::from_utf8(&o[i..]).unwrap_or("?"));
+        };
+        let fill = |buf: &mut [u8], seed: u64| {
+            let mut x = seed | 1;
+            for w in buf.chunks_exact_mut(8) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                w.copy_from_slice(&x.to_le_bytes());
+            }
+        };
+        let mut wb = alloc::vec![0u8; 128 * SECTOR_SIZE];
+        let mut rb = alloc::vec![0u8; 128 * SECTOR_SIZE];
+        p("[sdhci] sdtest start mib="); pd(mib as u64); p("\n");
+        // Phase A: speed. 16 MiB sequential from the window start, 64 KiB spans.
+        let t_mib = 4u64;
+        let spans = (t_mib * 1048576 / 65536) as usize;
+        for (name, multi, is_write) in [("single write", false, true), ("single read", false, false),
+                                        ("multi write", true, true), ("multi read", true, false)] {
+            let t0 = sched::monotonic_ns();
+            let mut ok = true;
+            for s in 0..spans {
+                if is_write { fill(&mut wb[..], 0x1234_5678 + s as u64); }
+                let b = if is_write { wb.as_mut_ptr() } else { rb.as_mut_ptr() };
+                if !self.scratch_io(is_write, multi, SCRATCH_FIRST + (s * 128) as u64, 128, b) { ok = false; break; }
+                if s % 16 == 0 { p("[sdhci] sdtest A "); p(name); p(" span "); pd(s as u64); p(" t_ms="); pd((sched::monotonic_ns() - t0) / 1_000_000); p("\n"); }
+            }
+            let dt = (sched::monotonic_ns() - t0).max(1);
+            p("[sdhci] sdtest speed "); p(name); p(": "); pd(t_mib * 1048576 * 1_000_000_000 / dt / 1024); p(" KiB/s ok="); pd(ok as u64); p("\n");
+        }
+        // Phase B: mixed-size multi writes, verified by single-sector readback
+        // (writes) and multi readback (reads), plus guard sectors either side.
+        const SIZES: [usize; 13] = [1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64, 100, 128];
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15 ^ (sched::monotonic_ns() | 1);
+        let (mut done, mut wbad, mut rbad, mut gbad, mut ioerr, mut iters) = (0u64, 0u32, 0u32, 0u32, 0u32, 0u64);
+        let target = mib as u64 * 1048576;
+        let mut g = [0u8; 2 * SECTOR_SIZE];
+        while done < target {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let n = SIZES[(rng >> 40) as usize % SIZES.len()];
+            let start = SCRATCH_FIRST + 1 + ((rng >> 8) % ((1 << 21) - 130));
+            let len = n * SECTOR_SIZE;
+            fill(&mut wb[..len], rng);
+            let guard = iters % 4 == 0;
+            if guard {
+                fill(&mut g, rng ^ 0xdead_beef);
+                if !self.scratch_io(true, false, start - 1, 1, g.as_mut_ptr())
+                    || !self.scratch_io(true, false, start + n as u64, 1, g.as_mut_ptr().add(SECTOR_SIZE)) { ioerr += 1; }
+            }
+            if iters < 40 { p("[sdhci] sdtest B mw "); ph(start); p(" n="); pd(n as u64); p(if guard { " g\n" } else { "\n" }); }
+            if !self.scratch_io(true, true, start, n, wb.as_mut_ptr()) { ioerr += 1; iters += 1; p("[sdhci] sdtest B mw FAILED\n"); continue; }
+            if iters < 40 { p("[sdhci] sdtest B mw ok\n"); }
+            let mut bad = false;
+            if !self.scratch_io(false, false, start, n, rb.as_mut_ptr()) { ioerr += 1; }
+            else if rb[..len] != wb[..len] {
+                wbad += 1; bad = true;
+                let d = (0..len).find(|&i| rb[i] != wb[i]).unwrap_or(0);
+                if wbad <= 8 { p("[sdhci] sdtest WRITE MISMATCH sector "); ph(start); p(" n="); pd(n as u64); p(" first diff byte "); pd(d as u64); p("\n"); }
+            }
+            if !self.scratch_io(false, true, start, n, rb.as_mut_ptr()) { ioerr += 1; }
+            else if rb[..len] != wb[..len] {
+                rbad += 1;
+                if rbad <= 8 { p("[sdhci] sdtest MULTI-READ MISMATCH sector "); ph(start); p(" n="); pd(n as u64); p(if bad { " (write bad too)\n" } else { " (single read agrees with write)\n" }); }
+            }
+            if guard {
+                let mut r2 = [0u8; 2 * SECTOR_SIZE];
+                if !self.scratch_io(false, false, start - 1, 1, r2.as_mut_ptr())
+                    || !self.scratch_io(false, false, start + n as u64, 1, r2.as_mut_ptr().add(SECTOR_SIZE)) { ioerr += 1; }
+                else if r2 != g { gbad += 1; if gbad <= 8 { p("[sdhci] sdtest GUARD CLOBBERED at span sector "); ph(start); p(" n="); pd(n as u64); p("\n"); } }
+            }
+            done += len as u64; iters += 1;
+            if iters % 256 == 0 { p("[sdhci] sdtest progress MiB="); pd(done >> 20); p(" wbad="); pd(wbad as u64); p(" rbad="); pd(rbad as u64); p(" gbad="); pd(gbad as u64); p(" ioerr="); pd(ioerr as u64); p("\n"); }
+        }
+        p("[sdhci] sdtest DONE MiB="); pd(done >> 20); p(" iters="); pd(iters);
+        p(" wbad="); pd(wbad as u64); p(" rbad="); pd(rbad as u64); p(" gbad="); pd(gbad as u64); p(" ioerr="); pd(ioerr as u64);
+        p(if wbad == 0 && rbad == 0 && gbad == 0 && ioerr == 0 { " PASS\n" } else { " FAIL\n" });
     }
 
     /// `nblocks` (1..=MULTI_MAX_BLOCKS) contiguous 4 KiB blocks. Multi-block
@@ -1557,9 +1677,9 @@ pub fn init() {
                 if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
             }
             crate::kenv::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
-                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback) (sdhci.multi=1)\n"
+                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback; default, sdhci.multi=0 disables)\n"
             } else {
-                "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"
+                "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off: sdhci.multi=0)\n"
             });
             n
         }
@@ -1573,6 +1693,7 @@ pub fn device_count() -> usize {
 
 /// Read one 4096-byte block from device `dev_idx` at logical block `blk`.
 pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
+    maybe_sdtest();
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
         dev.allowed(false, blk, 1) && dev.do_io_span(false, blk, 1, buf.as_mut_ptr())
@@ -1599,12 +1720,27 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
     span_io(dev_idx, true, blk, buf.as_ptr() as *mut u8, buf.len())
 }
 
+/// Runs the `sdhci.sdtest` once, from the first block request (task context,
+/// so the tick window and watchdog keep working), before that request.
+fn maybe_sdtest() {
+    if SDTEST_PENDING.load(Ordering::Relaxed) && sched::current_pid() != 0 && !sched::irqctx::in_irq()
+        && SDTEST_PENDING.swap(false, Ordering::Relaxed) {
+        let devs = DEVICES.lock();
+        if let Some(Some(d1)) = devs.get(1) {
+            let raw = SdhciDevice { base: d1.base, high_capacity: d1.high_capacity,
+                partition_offset: 0, limit_blocks: 0, boot_fat: false };
+            unsafe { raw.sdtest(SDTEST_MIB.load(Ordering::Relaxed)); }
+        }
+    }
+}
+
 /// Contiguous span I/O, at most `MULTI_MAX_BLOCKS` per command and per
 /// `DEVICES` hold. Between chunks (lock dropped) the caller's CPU may be
 /// given to another task: the whole span is polled PIO on this CPU, and a
 /// multi-megabyte f2fs writeback otherwise keeps every task queued behind
 /// it (sshd's keepalive reply, for one) off this CPU until it ends.
 fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -> bool {
+    maybe_sdtest();
     if len == 0 || len % BLOCK_SIZE != 0 { return false; }
     let total = len / BLOCK_SIZE;
     {
