@@ -331,13 +331,13 @@ const CMD_TYPE_ABORT:    u16 = 0b11 << 6;
 const MULTI_MAX_SECTORS: usize = 128;
 /// Blocks (4 KiB) per multi-block command.
 const MULTI_MAX_BLOCKS: usize = MULTI_MAX_SECTORS / SECTORS_PER_BLOCK;
-/// Multi-block CMD18/CMD25 in use. ON by default since the `sdhci.sdtest`
-/// proof (GiB of mixed-size multi writes read back bit-exact on the real
-/// card; ~16-21 MB/s vs ~0.5-1.6 single-sector). `sdhci.multi=0` turns it
-/// off (see `configure`). Also cleared (for good) after
+/// Multi-block CMD18/CMD25 in use. OFF by default until a >=1 GiB x several
+/// `sdhci.sdtest` proof completes (256 MiB passed bit-exact on the real card:
+/// 16-21 MB/s multi vs 0.5-1.6 MB/s single-sector; 3 GiB run pending).
+/// `sdhci.multi=1` opts in (see `configure`). Also cleared (for good) after
 /// `MULTI_FALLBACK_LIMIT` transfers failed multi-block but then succeeded
 /// sector by sector.
-static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// `sdhci.multitest=1`: at probe, compare a single-sector read and a
 /// multi-block read of the first `MULTITEST_BLOCKS` blocks. Read-only.
 static MULTITEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -1677,9 +1677,9 @@ pub fn init() {
                 if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
             }
             crate::kenv::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
-                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback; default, sdhci.multi=0 disables)\n"
+                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback) (sdhci.multi=1)\n"
             } else {
-                "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off: sdhci.multi=0)\n"
+                "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"
             });
             n
         }
