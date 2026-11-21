@@ -208,7 +208,7 @@ pub fn run_ctl<F: Fwil + 'static>(fw: F, ctl: Option<Box<dyn Ctl<F>>>) -> Option
         // until netctl publishes the stored ones (which then include it).
         let legacy = legacy_creds();
         let mac = mac_address().unwrap_or([0; 6]);
-        let shared = alloc::sync::Arc::new(Mutex::new(Some(r)));
+        let shared = alloc::sync::Arc::new(sched::ksync::KMutex::new(Some(r)));
         let res = crate::wifi_radio::register(Box::new(SharedRadio(shared.clone())), MGR_NAME, "brcmf", mac, brcmf_kick,
                                           legacy.as_ref().map(|(s, p)| (s.as_slice(), p.as_slice())));
         match res {
@@ -780,7 +780,7 @@ fn brcmf_kick() {}
 
 /// The radio behind the class table while the kernel's manager thread drives it; the driver thread
 /// takes it back (`Option::take`) once the manager loop ended, to hand the bus on.
-struct SharedRadio<F: Fwil>(alloc::sync::Arc<Mutex<Option<BrcmfRadio<F>>>>);
+struct SharedRadio<F: Fwil>(alloc::sync::Arc<sched::ksync::KMutex<Option<BrcmfRadio<F>>>>);
 
 impl<F: Fwil + 'static> Radio for SharedRadio<F> {
     fn caps(&self) -> u32 { self.0.lock().as_ref().map_or(0, |r| r.caps()) }

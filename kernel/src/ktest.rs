@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 4] = ["memperf", "kmodwin", "kmodload", "kmodkapi"];
+const EXTRA: [&str; 5] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -83,6 +83,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
             "gpulock" => t_gpulock(),
+            "spinfw" => t_spinfw(fw.as_deref()),
             _ => continue,
         };
         if t.skipped && t.fails == 0 { say!("{} SKIP", t.name); skip += 1; }
@@ -1829,6 +1830,36 @@ fn t_firmware(path: Option<&str>) -> T {
     }
     let (free0, _) = (mm::buddy::free_pages(), 0);
     say!("firmware: buddy free pages after release {}", free0);
+    t
+}
+
+static SPINFW_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// `ktest=spinfw[,..] ktest.fw=/etc/<file>` (lane f2fsatomic): start a thread that, once a
+/// second, takes a spin lock and reads `ktest.fw` (default /etc/brcmf.ctl, normally absent)
+/// through `request_firmware` under it - the wifi-brcmf pattern (a driver polling its ctl
+/// file inside a spin-locked radio op). Every such open reaches the f2fs server from a context
+/// that may not sleep; before the fix each one counted as a writer and, with the cache
+/// full, ran a locked checkpoint. Never returns a result; the thread runs until reboot.
+fn t_spinfw(path: Option<&str>) -> T {
+    let mut t = T::new("spinfw");
+    let p = String::from(path.unwrap_or("/etc/brcmf.ctl"));
+    let a = now();
+    while !drivers::firmware::root_ready() && now() - a < 120_000_000_000 { kthread::msleep(100); }
+    if !drivers::firmware::root_ready() { t.check(false, "real root mounted within 120 s"); return t; }
+    let ok = kthread::spawn("ktest-spinfw", move || {
+        let mut n = 0u32;
+        loop {
+            {
+                let _g = SPINFW_LOCK.lock();
+                let _ = drivers::firmware::request_firmware(&p, 64 * 1024);
+            }
+            n += 1;
+            if n % 30 == 0 { say!("spinfw: {} polls", n); }
+            kthread::msleep(1000);
+        }
+    }).is_some();
+    t.check(ok, "spinfw thread started");
     t
 }
 
