@@ -314,10 +314,13 @@ pub fn lq_cmd_table_mimo(sta_id: u8, table: &[u32; 16], ss_ant: u8, mimo_delim: 
 
 /// LQ_CMD (v1) with the A-MPDU frame limit (LINK_QUAL_AGG_FRAME_LIMIT_DEF
 /// 63 on this family; min(63, the AP's window) with a TX session).
+/// LQ_CMD flags byte (iwlwifi.lqrts=1: LQ_FLAG_USE_RTS_MSK).
+pub static LQ_FLAGS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 pub fn lq_cmd_full(sta_id: u8, table: &[u32; 16], ss_ant: u8, mimo_delim: u8, agg_frame_limit: u8) -> Vec<u8> {
     let mut b = Buf::new();
     b.u8(sta_id).u8(0).u16(0);
-    b.u8(0).u8(mimo_delim).u8(ss_ant).u8(3); // flags, mimo_delim, single-stream ant, dual-stream AB
+    b.u8(LQ_FLAGS.load(core::sync::atomic::Ordering::Relaxed)).u8(mimo_delim).u8(ss_ant).u8(3); // flags, mimo_delim, single-stream ant, dual-stream AB
     b.u8(0).u8(0).u8(0).u8(0); // initial_rate_index[4]
     b.u16(4000).u8(3).u8(agg_frame_limit); // agg_time_limit, agg_disable_start_th, agg_frame_cnt_limit
     b.u32(0);
