@@ -418,6 +418,66 @@ pub mod sdmbr {
         }
         first
     }
+
+    /// The bytes of the card the mounted root F2FS owns: raw writes that
+    /// overlap them are EBUSY on every SD node (whole card, partitions).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RootGuard {
+        /// Start of the root partition, absolute 512-byte sector.
+        pub start_lba: u64,
+        /// Protected length in bytes from `start_lba`.
+        pub bytes: u64,
+        /// True when `bytes` is the superblock size (block_count <<
+        /// log_blocksize); false when it is the MBR entry length (or, with a
+        /// zero entry length, "rest of the card": `u64::MAX / 2`).
+        pub from_sb: bool,
+    }
+
+    impl RootGuard {
+        /// Absolute sector just past the protected bytes.
+        pub fn end_lba(&self) -> u64 { self.start_lba.saturating_add(self.bytes.div_ceil(512)) }
+        /// Whether a write of `len` bytes at absolute card byte `at` overlaps.
+        pub fn overlaps(&self, at: u64, len: u64) -> bool {
+            let s = self.start_lba * 512;
+            len > 0 && at < s.saturating_add(self.bytes) && s < at.saturating_add(len)
+        }
+    }
+
+    /// F2FS size in bytes from a superblock slice (the 1024..1024+x bytes of
+    /// the partition): `None` without the magic or with a bogus block size.
+    pub fn f2fs_bytes(sb: &[u8]) -> Option<u64> {
+        if sb.len() < 44 || u32::from_le_bytes(sb[0..4].try_into().ok()?) != F2FS_MAGIC { return None; }
+        let log_bs = u32::from_le_bytes(sb[16..20].try_into().ok()?);
+        let blocks = u64::from_le_bytes(sb[36..44].try_into().ok()?);
+        if (9..=16).contains(&log_bs) { Some(blocks << log_bs) } else { None }
+    }
+
+    /// Root partition and its guard extent. `read_blk(abs_blk, buf)` reads
+    /// the 4096-byte block `abs_blk` of the WHOLE card (absolute: block 0 is
+    /// the MBR); it must never be a reader that already adds the root
+    /// partition offset (the 2026-11-20 bug: the superblock was looked up at
+    /// twice the partition offset, the size stayed unknown and the guard
+    /// covered everything from p2 to the end of the card).
+    pub fn root_guard(mbr: &[u8], mut read_blk: impl FnMut(u64, &mut [u8; 4096]) -> bool) -> Option<RootGuard> {
+        let mut buf = [0u8; 4096];
+        let sb_at = |lba: u64| (lba * 512 + F2FS_SB_OFFSET) / 4096;
+        let sb_off = |lba: u64| ((lba * 512 + F2FS_SB_OFFSET) % 4096) as usize;
+        let start = pick_f2fs(mbr, |lba| {
+            let o = sb_off(lba);
+            if o + 4 > 4096 || !read_blk(sb_at(lba), &mut buf) { return None; }
+            Some(u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]))
+        })?;
+        let o = sb_off(start);
+        let fs = if o + 44 <= 4096 && read_blk(sb_at(start), &mut buf) { f2fs_bytes(&buf[o..]) } else { None };
+        if let Some(bytes) = fs {
+            return Some(RootGuard { start_lba: start, bytes, from_sb: true });
+        }
+        // Unknown size: the partition's MBR entry, else the rest of the card.
+        let len = (0..4usize).map(|i| &mbr[446 + i * 16..462 + i * 16])
+            .find(|e| e[4] == 0x83 && u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64 == start)
+            .map_or(0, |e| u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64 * 512);
+        Some(RootGuard { start_lba: start, bytes: if len == 0 { u64::MAX / 2 } else { len }, from_sb: false })
+    }
 }
 
 #[cfg(test)]
@@ -492,5 +552,65 @@ mod tests {
         let mut bad = m; bad[511] = 0;
         assert_eq!(sdmbr::pick_f2fs(&bad, |_| None), None);
         assert_eq!(sdmbr::pick_f2fs(&mbr(&[(0x0c, 8192)]), |_| None), None);
+    }
+
+    /// The real Pi card after the dual-boot repartition (2026-11-20): p2 is
+    /// exactly the F2FS (936960 x 4 KiB), p3 FAT32 at 8503296, p4 after it.
+    fn real_card() -> ([u8; 512], impl FnMut(u64, &mut [u8; 4096]) -> bool) {
+        let mut m = [0u8; 512];
+        for (i, &(ty, lba, n)) in [(0x0bu8, 2048u32, 1_000_000u32), (0x83, 1_003_520, 7_495_680),
+                                     (0x0c, 8_503_296, 1_048_576), (0x83, 9_551_872, 240_447_488)].iter().enumerate() {
+            let e = &mut m[446 + i * 16..462 + i * 16];
+            e[4] = ty; e[8..12].copy_from_slice(&lba.to_le_bytes()); e[12..16].copy_from_slice(&n.to_le_bytes());
+        }
+        m[510] = 0x55; m[511] = 0xAA;
+        let mut sb = [0u8; 4096];
+        sb[1024..1028].copy_from_slice(&sdmbr::F2FS_MAGIC.to_le_bytes());
+        sb[1024 + 16..1024 + 20].copy_from_slice(&12u32.to_le_bytes());
+        sb[1024 + 36..1024 + 44].copy_from_slice(&936_960u64.to_le_bytes());
+        let p4 = { let mut b = [0u8; 4096]; b[1024 + 0x38..1024 + 0x3a].copy_from_slice(&0xEF53u16.to_le_bytes()); b };
+        let mbr4k = { let mut b = [0u8; 4096]; b[..512].copy_from_slice(&m); b };
+        (m, move |blk: u64, buf: &mut [u8; 4096]| {
+            *buf = match blk { 0 => mbr4k, 125_440 => sb, 1_193_984 => p4, _ => [0u8; 4096] };
+            true
+        })
+    }
+
+    #[test]
+    fn root_guard_real_card_extent() {
+        let (m, rd) = real_card();
+        let g = sdmbr::root_guard(&m, rd).unwrap();
+        assert_eq!(g, sdmbr::RootGuard { start_lba: 1_003_520, bytes: 3_837_788_160, from_sb: true });
+        assert_eq!(g.end_lba(), 8_499_200);
+        // The writes that failed on the Pi with EBUSY must pass the guard:
+        // p3 / p4 via their nodes (partition start + offset), and the whole
+        // card at `bs=4M seek=1038`.
+        assert!(!g.overlaps(8_503_296 * 512, 4 << 20));
+        assert!(!g.overlaps(9_551_872 * 512, 4 << 20));
+        assert!(!g.overlaps(1038 * (4 << 20), 4 << 20));
+        assert!(!g.overlaps(8_499_200 * 512, 4096)); // first byte past the fs
+        // sdraw's earlier safe test write (fs end + 64 MiB).
+        assert!(!g.overlaps(4_418_699_264, 1 << 20));
+        // Anything touching the fs stays refused.
+        assert!(g.overlaps(8_499_200 * 512 - 1, 4096));
+        assert!(g.overlaps(1_003_520 * 512, 1));
+        assert!(g.overlaps(0, u64::MAX / 4));
+        assert!(!g.overlaps(1_003_520 * 512 - 4096, 4096)); // p1 end / gap
+    }
+
+    #[test]
+    fn root_guard_never_unbounded_with_an_mbr_size() {
+        // The 2026-11-20 bug: the superblock read through a reader that
+        // already adds the partition offset (block 2 x 125440) finds no
+        // magic. The guard must then fall back to p2's MBR length, not
+        // "everything from p2 to the end of the card".
+        let (m, mut rd) = real_card();
+        let g = sdmbr::root_guard(&m, |b, buf| rd(if b == 0 { 0 } else { b + 125_440 }, buf)).unwrap();
+        assert_eq!(g, sdmbr::RootGuard { start_lba: 1_003_520, bytes: 7_495_680 * 512, from_sb: false });
+        assert!(!g.overlaps(8_503_296 * 512, 4 << 20));
+        // Zero-length MBR entry and no superblock: rest of the card.
+        let mut z = m; z[446 + 16 + 12..446 + 16 + 16].fill(0);
+        let g = sdmbr::root_guard(&z, |_, buf| { *buf = [0u8; 4096]; true }).unwrap();
+        assert_eq!((g.start_lba, g.bytes, g.from_sb), (1_003_520, u64::MAX / 2, false));
     }
 }

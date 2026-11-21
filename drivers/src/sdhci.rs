@@ -1312,32 +1312,23 @@ unsafe fn negotiate_bus(dev: &SdhciDevice, rca: u32, tran_speed_khz: u32) {
 /// partitioning-tool version changes the exact start sector.
 #[cfg(feature = "rpi5")]
 unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
+    use crate::rpi_misc_logic::sdmbr;
+    // Every read here is ABSOLUTE on the card: a raw copy with offset 0, so
+    // this stays right even if `dev` already carries the root offset (it did
+    // once, and the superblock was then read at twice the offset: the size
+    // was unknown and the guard covered p2..end of card, EBUSY for p3/p4).
+    let raw = SdhciDevice { base: dev.base, high_capacity: dev.high_capacity, partition_offset: 0, limit_blocks: 0, boot_fat: false };
     let mut mbr = [0u8; BLOCK_SIZE];
-    if !dev.do_io(false, 0, mbr.as_mut_ptr()) { return None; }
+    if !raw.do_io(false, 0, mbr.as_mut_ptr()) { return None; }
     // A dual-boot card has two 0x83 partitions (F2FS root, Raspberry Pi OS
     // ext4 root): take the one whose superblock carries the F2FS magic.
-    use crate::rpi_misc_logic::sdmbr;
-    let mut sb = [0u8; BLOCK_SIZE];
-    let lba_start = sdmbr::pick_f2fs(&mbr[..512], |lba| {
-        let off = lba * SECTOR_SIZE as u64 + sdmbr::F2FS_SB_OFFSET;
-        let (blk, at) = (off / BLOCK_SIZE as u64, (off % BLOCK_SIZE as u64) as usize);
-        if !dev.do_io(false, blk, sb.as_mut_ptr()) { return None; }
-        Some(u32::from_le_bytes(sb[at..at + 4].try_into().unwrap()))
-    })?;
+    let g = sdmbr::root_guard(&mbr[..512], |blk, buf| raw.do_io(false, blk, buf.as_mut_ptr()))?;
+    ROOT_FS_BYTES.store(g.bytes, Ordering::Relaxed);
+    crate::kenv::pci::serial_debug(&alloc::format!(
+        "[sdhci] root guard: raw writes EBUSY in sectors {}..{} (root fs {} bytes, from {})\n",
+        g.start_lba, g.end_lba(), g.bytes, if g.from_sb { "superblock" } else { "MBR entry: fs size unknown" }));
     // MBR LBA is in 512-byte sectors; our blocks are 4096 bytes.
-    Some(lba_start / SECTORS_PER_BLOCK as u64)
-}
-
-/// Root F2FS filesystem byte length (superblock block_count << log_blocksize)
-/// at block `blk`, for the busy range of the whole card.
-unsafe fn record_root_fs_size(dev: &SdhciDevice, blk: u64) {
-    let mut sb = alloc::vec![0u8; BLOCK_SIZE];
-    if !dev.do_io(false, blk, sb.as_mut_ptr()) { return; }
-    let o = F2FS_SB_OFFSET;
-    if u32::from_le_bytes(sb[o..o + 4].try_into().unwrap()) != F2FS_MAGIC { return; }
-    let log_bs = u32::from_le_bytes(sb[o + 16..o + 20].try_into().unwrap());
-    let blocks = u64::from_le_bytes(sb[o + 36..o + 44].try_into().unwrap());
-    if (9..=16).contains(&log_bs) { ROOT_FS_BYTES.store(blocks << log_bs, Ordering::Relaxed); }
+    Some(g.start_lba / SECTORS_PER_BLOCK as u64)
 }
 
 /// Whole card in 4096-byte blocks, from the CSD (0 = unknown).
@@ -1501,7 +1492,6 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     #[cfg(feature = "rpi5")]
     {
         dev.partition_offset = find_f2fs_partition(&dev)?;
-        record_root_fs_size(&dev, dev.partition_offset);
     }
 
     Some(dev)
