@@ -405,7 +405,7 @@ pub unsafe extern "C" fn os_get_euid(tok: *mut u32) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn os_is_administrator() -> u8 {
     cb!("os_is_administrator");
-    (sched::irqctx::in_irq() || sched::current_euid() == 0) as u8
+    (sched::irqctx::in_irq() || sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN)) as u8
 }
 
 /// RS_ACCESS_NICE (1) / RS_ACCESS_PERFMON (3) need admin; others refused.

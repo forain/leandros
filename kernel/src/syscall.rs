@@ -18310,7 +18310,7 @@ fn do_clone(req: CloneReq, frame_ptr: usize) -> isize {
     // child takes its own, and ours drops when the clone returns.
     let new_user = if flags & CLONE_NEWUSER != 0 {
         let (p, eu, eg) = (sched::ns::current_userns(), sched::current_euid(), sched::current_egid());
-        match sched::ns::new_userns(p, eu, eg) { Ok(n) => Some(n), Err(e) => return e }
+        match sched::ns::new_userns(p, eu, eg, sched::caps::ns_capable_in(p, 31)) { Ok(n) => Some(n), Err(e) => return e }
     } else { None };
     let mut req = req;
     req.userns = new_user.as_ref().map_or(0, |n| n.id());
