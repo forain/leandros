@@ -945,32 +945,120 @@ static void hardening_suite(void) {
     if (pid > 0 && waitpid(pid, &st, 0) > 0) okvm = WIFEXITED(st) && WEXITSTATUS(st) == 42;
     report("clone_newns_vm", okvm);
 
-    /* /proc/<pid>/{root,cwd} of a task in another mount namespace is refused */
+    /* /proc/<pid>/root of a task in another mount namespace lands on THAT
+     * namespace's root (Linux; xdg-desktop-portal reads <root>/.flatpak-info of
+     * sandboxed callers); /proc/<pid>/cwd and the link text stay refused. */
     int c2p[2], p2c[2];
     if (pipe(c2p) || pipe(p2c)) { report("proc_root_pipe", 0); return; }
+    mkdir("/tmp/xnsr", 0755);
+    { int pf = open("/tmp/xnsr/parent_only", O_WRONLY | O_CREAT, 0644); if (pf >= 0) close(pf); }
     pid = fork();
     if (pid == 0) {
         char c = 'x';
         if (unshare(CLONE_NEWNS) != 0) _exit(2);
+        mount_(NULL, "/", NULL, (1UL << 15) | M_REC);
+        if (mountd_("tmpfs", "/tmp/xnsr", "tmpfs", 6, "mode=0755") != 0) _exit(3);
+        { int cf = open("/tmp/xnsr/child_only", O_WRONLY | O_CREAT, 0644); if (cf < 0) _exit(4); close(cf); }
         write(c2p[1], &c, 1);
         read(p2c[0], &c, 1);
         _exit(0);
     }
     char c;
     int up = read(c2p[0], &c, 1) == 1;
-    char pp[64];
-    int e1 = 0, e2 = 0, e3 = 0, f1;
-    snprintf(pp, sizeof pp, "/proc/%d/root/etc", (int)pid);
-    errno = 0; f1 = open(pp, O_RDONLY); e1 = errno;
-    int bad1 = f1 >= 0; if (f1 >= 0) close(f1);
+    char pp[96];
+    struct stat xs;
+    int f1, e2 = 0, e3 = 0, e4 = 0;
+    /* the open itself succeeds and is a directory */
+    snprintf(pp, sizeof pp, "/proc/%d/root", (int)pid);
+    f1 = open(pp, O_RDONLY | O_DIRECTORY); e3 = errno;
+    int root_open = f1 >= 0;
+    /* ... and resolves to the CHILD's tree: its file is there, the parent's is not */
+    int sees_child = 0, hides_parent = 0;
+    if (f1 >= 0) {
+        sees_child = fstatat(f1, "tmp/xnsr/child_only", &xs, 0) == 0;
+        hides_parent = fstatat(f1, "tmp/xnsr/parent_only", &xs, 0) != 0 && errno == ENOENT;
+        close(f1);
+    }
+    /* the parent's own tree is the opposite */
+    int parent_view = stat("/tmp/xnsr/parent_only", &xs) == 0 && stat("/tmp/xnsr/child_only", &xs) != 0;
+    report("proc_root_cross_ns_lands_on_ns_root",
+           up && root_open && sees_child && hides_parent && parent_view);
+    /* /proc/<pid>/root/<rest> across namespaces resolves inside the target's tree */
+    snprintf(pp, sizeof pp, "/proc/%d/root/tmp/xnsr/child_only", (int)pid);
+    int rest_child = stat(pp, &xs) == 0;
+    snprintf(pp, sizeof pp, "/proc/%d/root/tmp/xnsr/parent_only", (int)pid);
+    errno = 0; int rest_hidden = stat(pp, &xs) != 0 && errno == ENOENT;
+    snprintf(pp, sizeof pp, "/proc/%d/root/tmp/xnsr/child_only", (int)pid);
+    f1 = open(pp, O_RDONLY); int rest_open = f1 >= 0; if (f1 >= 0) close(f1);
+    report("proc_root_cross_ns_rest_resolves_in_target", up && rest_child && rest_hidden && rest_open);
+    /* the link text cannot be written in our view: still refused */
+    { char lb[256]; snprintf(pp, sizeof pp, "/proc/%d/root", (int)pid);
+      errno = 0; ssize_t ln = readlink(pp, lb, sizeof lb); e4 = errno;
+      report("proc_root_cross_ns_readlink_refused", up && ln < 0 && (e4 == EACCES || e4 == ENOENT)); }
+    /* cwd of another namespace's task is still refused */
     snprintf(pp, sizeof pp, "/proc/%d/cwd", (int)pid);
     errno = 0; int bad2 = chdir(pp) == 0; e2 = errno;
     if (bad2) chdir("/");
-    snprintf(pp, sizeof pp, "/proc/%d/root", (int)pid);
-    errno = 0; f1 = open(pp, O_RDONLY); e3 = errno;
-    int bad3 = f1 >= 0; if (f1 >= 0) close(f1);
-    report("proc_root_cross_ns_refused", up && !bad1 && !bad2 && !bad3
-           && (e1 == EACCES || e1 == ENOENT) && (e2 == EACCES || e2 == ENOENT) && (e3 == EACCES || e3 == ENOENT));
+    report("proc_cwd_cross_ns_refused", up && !bad2 && (e2 == EACCES || e2 == ENOENT));
+    /* a caller of another euid without CAP_SYS_PTRACE still gets EACCES */
+    { pid_t xp = fork();
+      if (xp == 0) {
+          if (setgid(65534) != 0 || setuid(65534) != 0) _exit(2);
+          char q[96]; snprintf(q, sizeof q, "/proc/%d/root", (int)pid);
+          errno = 0; int g = open(q, O_RDONLY);
+          if (g >= 0) _exit(3);
+          _exit(errno == EACCES ? 0 : 4);
+      }
+      int xst = 0; waitpid(xp, &xst, 0);
+      report("proc_root_cross_ns_other_euid_eacces", WIFEXITED(xst) && WEXITSTATUS(xst) == 0);
+      if (WIFEXITED(xst) && WEXITSTATUS(xst)) printf("  other_euid rc=%d\n", WEXITSTATUS(xst)); }
+    /* a task in a new namespace opening the (ns 0) parent's root: tm == 0 stays EACCES */
+    { pid_t zp = fork();
+      if (zp == 0) {
+          if (unshare(CLONE_NEWNS) != 0) _exit(2);
+          char q[96]; snprintf(q, sizeof q, "/proc/%d/root", (int)getppid());
+          errno = 0; int g = open(q, O_RDONLY);
+          if (g >= 0) _exit(3);
+          _exit(errno == EACCES ? 0 : 4);
+      }
+      int zst = 0; waitpid(zp, &zst, 0);
+      report("proc_root_cross_ns_tm0_eacces", WIFEXITED(zst) && WEXITSTATUS(zst) == 0);
+      if (WIFEXITED(zst) && WEXITSTATUS(zst)) printf("  tm0 rc=%d\n", WEXITSTATUS(zst)); }
+    /* a target chrooted inside its namespace: the root is the task's fs root */
+    { int cp2[2], pc2[2];
+      if (pipe(cp2) || pipe(pc2)) { report("proc_root_chroot_pipe", 0); }
+      else {
+          pid_t kp = fork();
+          if (kp == 0) {
+              char k = 'x';
+              if (unshare(CLONE_NEWNS) != 0) _exit(2);
+              mount_(NULL, "/", NULL, (1UL << 15) | M_REC);
+              mkdir("/tmp/xnsc", 0755);
+              if (mountd_("tmpfs", "/tmp/xnsc", "tmpfs", 6, "mode=0755") != 0) _exit(3);
+              { int cf = open("/tmp/xnsc/jail_only", O_WRONLY | O_CREAT, 0644); if (cf < 0) _exit(4); close(cf); }
+              if (chroot("/tmp/xnsc") != 0) _exit(5);
+              if (chdir("/") != 0) _exit(6);
+              write(cp2[1], &k, 1);
+              read(pc2[0], &k, 1);
+              _exit(0);
+          }
+          char k2;
+          int kup = read(cp2[0], &k2, 1) == 1;
+          char q[96]; struct stat ks;
+          snprintf(q, sizeof q, "/proc/%d/root", (int)kp);
+          int g = open(q, O_RDONLY | O_DIRECTORY);
+          int jail_root = g >= 0 && fstatat(g, "jail_only", &ks, 0) == 0
+                          && fstatat(g, "tmp", &ks, 0) != 0;
+          if (g >= 0) close(g);
+          snprintf(q, sizeof q, "/proc/%d/root/jail_only", (int)kp);
+          int jail_rest = stat(q, &ks) == 0;
+          snprintf(q, sizeof q, "/proc/%d/root/tmp", (int)kp);
+          int jail_no_tmp = stat(q, &ks) != 0;
+          report("proc_root_cross_ns_chroot_lands_on_task_root", kup && jail_root && jail_rest && jail_no_tmp);
+          write(pc2[1], &k2, 1);
+          waitpid(kp, &st, 0);
+          close(cp2[0]); close(cp2[1]); close(pc2[0]); close(pc2[1]);
+      } }
     report("proc_root_same_ns_ok", exists("/proc/self/root/etc"));
     write(p2c[1], &c, 1);
     waitpid(pid, &st, 0);

@@ -9192,7 +9192,9 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
             let tm = sched::ns::mntns_of(pid);
             if tm != sched::current_mntns() {
                 if tm == 0 { return Err(-13); }
-                return KPath::from_ns_mnt(b"/".to_vec(), tm);
+                // A chrooted target lands on its fs root inside its namespace.
+                let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
+                return KPath::from_ns_mnt(r, tm);
             }
             let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
             return KPath::from_ns(r);
@@ -12098,6 +12100,14 @@ fn proc_root_allowed(pid: u32) -> bool {
     proc_link_allowed(pid) && sched::ns::mntns_of(pid) == sched::current_mntns()
 }
 
+/// The `/proc/<pid>/root/<rest>` hop (not cwd): allowed into the caller's own
+/// mount namespace or into another non-zero one, whose tree translates the rest.
+fn proc_root_hop_allowed(pid: u32) -> bool {
+    if !proc_link_allowed(pid) { return false; }
+    let tm = sched::ns::mntns_of(pid);
+    tm == sched::current_mntns() || tm != 0
+}
+
 fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
     let rest = p.strip_prefix(b"/proc/")?;
     let slash = rest.iter().position(|&b| b == b'/')?;
@@ -12159,7 +12169,10 @@ fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
-        if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { *denied = true; break; }
+        let allowed = if is_root { proc_root_hop_allowed(pid) } else { proc_root_allowed(pid) };
+        if sched::exists_probe(pid) == 0 && !allowed { *denied = true; break; }
+        let tm = if is_root && sched::exists_probe(pid) == 0 { sched::ns::mntns_of(pid) } else { sched::current_mntns() };
+        let cross = tm != sched::current_mntns();
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,
@@ -12175,7 +12188,8 @@ fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::
         // Fail closed: a path that does not translate (hidden pool, missing
         // tree) must never fall back to the raw host path.
         if vfs::mnt::is_sb_path(&v) { return None; }
-        match mnt_xlate(mns, &v, crossed, mid, plen, false) {
+        let xm = if cross { tm } else { mns };
+        match mnt_xlate(xm, &v, crossed, mid, plen, false) {
             Some(t) => cur = Some(t),
             None => return None,
         }
@@ -12193,7 +12207,10 @@ fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
-        if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { *denied = true; break; }
+        let allowed = if is_root { proc_root_hop_allowed(pid) } else { proc_root_allowed(pid) };
+        if sched::exists_probe(pid) == 0 && !allowed { *denied = true; break; }
+        let tm = if is_root && sched::exists_probe(pid) == 0 { sched::ns::mntns_of(pid) } else { sched::current_mntns() };
+        let cross = tm != sched::current_mntns();
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,
@@ -12206,8 +12223,16 @@ fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<
         let mut v = Vec::with_capacity(base.len() + rest.len());
         if &*base != b"/" { v.extend_from_slice(&base); }
         v.extend_from_slice(rest);
-        *crossed |= vfs::alias::crosses(&v);
-        let t = vfs::alias::translate(&v).unwrap_or(v);
+        let t = if cross {
+            // Another namespace's tree: translate through it (fail closed).
+            match vfs::mnt::translate(tm, &v) {
+                Some(x) => { *crossed |= x.flags & vfs::mnt::MNT_NOSUID != 0; x.backing }
+                None => return Some(b"/.leandros-hidden".to_vec()),
+            }
+        } else {
+            *crossed |= vfs::alias::crosses(&v);
+            vfs::alias::translate(&v).unwrap_or(v)
+        };
         // ns 0 has no "missing tree" None (None means identity), so hand the VFS a
         // name that cannot exist: ENOENT.
         if vfs::mnt::is_sb_path(&t) { return Some(b"/.leandros-hidden".to_vec()); }
