@@ -6,12 +6,12 @@
 set -euo pipefail
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [ -z "${LEANDROS_TOOLCHAIN:-}" ]; then
-    . "$D/env.sh" 2>/dev/null || { mkdir -p "$HOME/.cache/leandros"; export LEANDROS_TOOLCHAIN=$HOME/.cache/leandros/llvm-musl; }
+    . "$D/env.sh" 2>/dev/null || { mkdir -p "${XDG_CACHE_HOME:-$HOME/.cache}/leandros"; export LEANDROS_TOOLCHAIN=${XDG_CACHE_HOME:-$HOME/.cache}/leandros/llvm-musl; }
 fi
 for a in "$@"; do
     "$D/check.sh" "$a" 2>/dev/null && continue
-    mkdir -p "${LEANDROS_TOOLCHAIN:-$HOME/.cache/leandros/llvm-musl}"
-    lk=${LEANDROS_TOOLCHAIN:-$HOME/.cache/leandros/llvm-musl}/.mk-sysroot.lock
+    mkdir -p "${LEANDROS_TOOLCHAIN:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/llvm-musl}"
+    lk=${LEANDROS_TOOLCHAIN:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/llvm-musl}/.mk-sysroot.lock
     if command -v flock >/dev/null 2>&1; then
         flock "$lk" "$D/mk-sysroot.sh" "$a"
     else

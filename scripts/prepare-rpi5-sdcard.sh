@@ -258,7 +258,7 @@ populate_f2fs_root() {
         sudo -u "$cache_owner" env BRCMFMAC_CACHE="$brc_cache" "$REPO_ROOT/ports/brcmfmac/fetch.sh" >/dev/null \
             || info "WARNING: ports/brcmfmac/fetch.sh failed; the card will lack /lib/firmware/brcm"
     else
-        brc_cache="${BRCMFMAC_CACHE:-$HOME/.cache/leandros/brcmfmac}"
+        brc_cache="${BRCMFMAC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/brcmfmac}"
         BRCMFMAC_CACHE="$brc_cache" "$REPO_ROOT/ports/brcmfmac/fetch.sh" >/dev/null \
             || info "WARNING: ports/brcmfmac/fetch.sh failed; the card will lack /lib/firmware/brcm"
     fi
@@ -270,7 +270,7 @@ populate_f2fs_root() {
         sudo -u "$cache_owner" env BTFW_CACHE="$bt_cache" "$REPO_ROOT/ports/bluez-firmware/fetch.sh" >/dev/null \
             || info "WARNING: ports/bluez-firmware/fetch.sh failed; the card will lack BCM4345C0.hcd"
     else
-        bt_cache="${BTFW_CACHE:-$HOME/.cache/leandros/bluez-firmware}"
+        bt_cache="${BTFW_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/bluez-firmware}"
         BTFW_CACHE="$bt_cache" "$REPO_ROOT/ports/bluez-firmware/fetch.sh" >/dev/null \
             || info "WARNING: ports/bluez-firmware/fetch.sh failed; the card will lack BCM4345C0.hcd"
     fi

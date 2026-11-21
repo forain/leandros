@@ -18,7 +18,7 @@ set -euo pipefail
 
 TAG="20240909"
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/rtl_nic"
-CACHE="${RTL_NIC_CACHE:-$HOME/.cache/leandros/rtl_nic}"
+CACHE="${RTL_NIC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/rtl_nic}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 

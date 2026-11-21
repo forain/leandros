@@ -43,7 +43,7 @@ MIRROR = os.environ.get("ALPINE_MIRROR", "https://dl-cdn.alpinelinux.org/alpine"
 REL = os.environ.get("LEANDROS_ALPINE_RELEASE", "")   # set by resolve_latest() / read_lock()
 PIN = os.environ.get("LEANDROS_ALPINE_PIN") == "1"      # 1: never move the lock to a newer release
 REPOS = ("main", "community")
-CACHE = os.environ.get("LEANDROS_APK_CACHE", os.path.expanduser("~/.cache/leandros/apk"))
+CACHE = os.environ.get("LEANDROS_APK_CACHE", os.path.expanduser(os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/apk")))
 SCRIPT_NAMES = (".pre-install", ".post-install", ".pre-upgrade", ".post-upgrade",
                 ".pre-deinstall", ".post-deinstall", ".trigger")
 ARCHS = ("aarch64", "x86_64")

@@ -18,7 +18,7 @@ set -euo pipefail
 
 COMMIT="cdf61dc691a49ff01a124752bd04194907f0f9cd"
 BASE="https://raw.githubusercontent.com/RPi-Distro/bluez-firmware/$COMMIT/debian/firmware/broadcom"
-CACHE="${BTFW_CACHE:-$HOME/.cache/leandros/bluez-firmware}"
+CACHE="${BTFW_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/bluez-firmware}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 

@@ -45,7 +45,7 @@ ln -sf "$HERE/out/$arch.alpine/usr/lib/libpipewire-0.3.so.0" "$HERE/out/stub-$ar
 # embedding $HERE/out/... made every worktree rebuild (and keep) a full copy of
 # every crate in the shared target dir. Reach the per-worktree SDK/stub dirs
 # through symlinks at a fixed place in the cache instead.
-CACHE=${LEANDROS_PORTS_CACHE:-$HOME/Library/Caches/leandros-ports}
+CACHE=${LEANDROS_PORTS_CACHE:-$( [ "$(uname -s)" = Darwin ] && echo "$HOME/Library/Caches" || echo "${XDG_CACHE_HOME:-$HOME/.cache}")/leandros-ports}
 STABLE=$CACHE/portal-stable/$arch
 mkdir -p "$STABLE"
 ln -sfn "$SDK" "$STABLE/sdk"
