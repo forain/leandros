@@ -3460,6 +3460,11 @@ static int devdri_rl_check(int m) {
         char *rp = realpath(P[i], NULL);
         if (!rp || strcmp(rp, P[i]) != 0) { printf("  ddr: m=%d realpath %s -> %s errno=%d\n", m, P[i], rp ? rp : "(null)", errno); free(rp); return 30 + i; }
         free(rp);
+        /* glib g_file_test(EXISTS) is access(F_OK): flatpak emits its /dev/dri
+         * bind only when it answers 0 (was ENOENT from the root volume). */
+        if (i < 2 && (access(P[i], F_OK) != 0 || access(P[i], R_OK) != 0 || access(P[i], X_OK) != 0)) {
+            printf("  ddr: m=%d access %s errno=%d\n", m, P[i], errno); return 40 + i;
+        }
     }
     return 0;
 }
@@ -3478,6 +3483,62 @@ static int devdri_realpath_ns_case(int m) {
     int ws = 0; if (waitpid(c, &ws, 0) != c) return 93;
     return WIFEXITED(ws) ? WEXITSTATUS(ws) : 94;
 }
+/* libdrm drmGetDevice2() on /dev/dri/renderD128 inside a flatpak-like sandbox:
+ * bwrap tmpfs root, ro-binds of /sys/dev/char and /sys/devices (what flatpak
+ * adds for DRI), dev-bind of /dev/dri, pivot. Then the sysfs reads libdrm does:
+ * device/drm exists, readlink device/subsystem (basename "pci"), the PCI id
+ * files, uevent PCI_SLOT_NAME, readdir of device/drm, and fstat of the node. */
+static int drm_getdev_rd(const char *p, char *b, size_t n) {
+    int f = open(p, O_RDONLY); if (f < 0) return -1;
+    ssize_t k = read(f, b, n - 1); close(f); if (k < 0) return -2; b[k] = 0; return (int)k;
+}
+static int drm_getdevice_ns_case(int m) {
+    const char *R = "/sys/dev/char/226:128";
+    char p[160], b[512], base[32]; struct stat st; int i, r;
+    if (stat("/sys/dev/char/226:128/device/uevent", &st) != 0) return 0; /* no DRM device on this board */
+    r = fr3_enter(m & 2);
+    if (r) return r;
+    snprintf(base, sizeof base, "/tmp/dgd%d", m); mkdir(base, 0755);
+    if (mountd_("tmpfs", base, "tmpfs", 6, "mode=0755") != 0 || chdir(base) != 0) return 40;
+    if (mkdir("newroot", 0755) != 0 || mkdir("oldroot", 0755) != 0) return 41;
+    if (mountd_("tmpfs", "newroot", "tmpfs", 6, "mode=0755") != 0) return 46;
+    if (syscall(SYS_pivot_root, base, "oldroot") != 0 || chdir("/") != 0) return 42;
+    const char *D[] = { "/newroot/sys", "/newroot/sys/dev", "/newroot/sys/dev/char", "/newroot/sys/devices", "/newroot/dev", "/newroot/dev/dri" };
+    for (i = 0; i < 6; i++) if (mkdir(D[i], 0755) != 0 && errno != EEXIST) { printf("  dgd: mkdir %s errno=%d\n", D[i], errno); return 47; }
+    if (mount_("/oldroot/sys/dev/char", "/newroot/sys/dev/char", NULL, M_BIND | M_REC) != 0) { printf("  dgd: bind char errno=%d\n", errno); return 43; }
+    if (mount_("/oldroot/sys/devices", "/newroot/sys/devices", NULL, M_BIND | M_REC) != 0) { printf("  dgd: bind devices errno=%d\n", errno); return 48; }
+    if (mount_("/oldroot/dev/dri", "/newroot/dev/dri", NULL, M_BIND | M_REC) != 0) { printf("  dgd: bind dri errno=%d\n", errno); return 49; }
+    if (chdir("/newroot") != 0 || syscall(SYS_pivot_root, ".", ".") != 0) return 44;
+    if (umount2(".", MNT_DETACH) != 0 || chdir("/") != 0) return 45;
+#define DGD(code, what) do { printf("  dgd: m=%d %s errno=%d\n", m, what, errno); return code; } while (0)
+    snprintf(p, sizeof p, "%s/device/drm", R);
+    if (access(p, F_OK) != 0) DGD(10, "access device/drm");
+    snprintf(p, sizeof p, "%s/device/subsystem", R);
+    ssize_t n = readlink(p, b, sizeof b - 1);
+    if (n < 0) DGD(11, "readlink device/subsystem");
+    b[n] = 0; { const char *bn = strrchr(b, '/'); if (strcmp(bn ? bn + 1 : b, "pci") != 0) { printf("  dgd: subsystem=%s\n", b); return 12; } }
+    static const char *F[] = { "vendor", "device", "subsystem_vendor", "subsystem_device", "revision", "uevent", "config" };
+    for (i = 0; i < 7; i++) {
+        snprintf(p, sizeof p, "%s/device/%s", R, F[i]);
+        errno = 0; int k = drm_getdev_rd(p, b, sizeof b);
+        if (k <= 0) { printf("  dgd: m=%d read %s k=%d errno=%d\n", m, p, k, errno); return 20 + i; }
+    }
+    snprintf(p, sizeof p, "%s/device/uevent", R); drm_getdev_rd(p, b, sizeof b);
+    if (!strstr(b, "PCI_SLOT_NAME=")) { printf("  dgd: uevent=%s\n", b); return 30; }
+    snprintf(p, sizeof p, "%s/device/drm", R);
+    DIR *d = opendir(p); if (!d) DGD(31, "opendir device/drm");
+    int seen = 0; struct dirent *e;
+    while ((e = readdir(d))) if (!strncmp(e->d_name, "renderD", 7)) seen = 1;
+    closedir(d);
+    if (!seen) { printf("  dgd: renderD missing in device/drm\n"); return 32; }
+    int f = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (f < 0) DGD(33, "open renderD128");
+    if (fstat(f, &st) != 0 || major(st.st_rdev) != 226 || minor(st.st_rdev) != 128) { printf("  dgd: rdev=%u:%u\n", major(st.st_rdev), minor(st.st_rdev)); return 34; }
+    snprintf(p, sizeof p, "/sys/dev/char/%u:%u", major(st.st_rdev), minor(st.st_rdev));
+    if (strcmp(p, R) != 0) return 35;
+    close(f);
+    return 0;
+}
 static void filebind_suite(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     report("filebind_tmpfs_file_bind_visible", nn_in_child(fb_case, 0) & nn_in_child(fb_case, 2));
@@ -3492,6 +3553,7 @@ static void filebind_suite(void) {
     report("devtty_opath_no_ctty", nn_in_child(devtty_opath_case, 0) & nn_in_child(devtty_opath_case, 2));
     report("sysfs_drm_links_in_mntns", nn_in_child(sysfs_drm_links_ns_case, 0) & nn_in_child(sysfs_drm_links_ns_case, 2) & nn_in_child(sysfs_drm_links_ns_case, 4) & nn_in_child(sysfs_drm_links_ns_case, 6));
     report("devdri_realpath_in_userns", nn_in_child(devdri_realpath_ns_case, 0) & nn_in_child(devdri_realpath_ns_case, 2) & nn_in_child(devdri_realpath_ns_case, 6));
+    report("drm_getdevice_in_flatpak_ns", nn_in_child(drm_getdevice_ns_case, 0) & nn_in_child(drm_getdevice_ns_case, 2));
     report("devtty_opath_bind_rdev", nn_in_child(devtty_opath_bind_rdev_case, 0) & nn_in_child(devtty_opath_bind_rdev_case, 2));
     report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));
