@@ -1,6 +1,6 @@
 # D3 Input-Stack — progress log & final report
 
-Workdir: `/Users/forain/.claude-forain/jobs/afde2e74/tmp/d3-input-stack`
+Workdir: `${LEANDROS_WORK:-~/.cache/leandros-work}/d3-input-stack`
 Lane: D3 (seat/udev/input userland), host-only. Pull forward libseat + libudev
 ABI shims and cross-build libxkbcommon, pixman, libdisplay-info + XKB data for
 `x86_64-linux-musl` and `aarch64-linux-musl`. Reuses the S3-proven zig-cc + meson

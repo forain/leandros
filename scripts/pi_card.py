@@ -21,8 +21,15 @@ SLOT_KERNEL = 32 << 20
 SLOT_INITRD = 16 << 20
 GOOD_DIR = "/boot/pi/good"
 STAGE_DIR = "/boot/pi/card-stage"
-WIRED_HOST = "192.168.2.6"
-WIFI_HOST = "172.16.162.184"
+
+
+def pi_hosts():
+    """Addresses to try after a reboot: LEANDROS_PI_HOST, a comma-separated list
+    (e.g. wired,wifi) when the Pi can come back on another interface."""
+    hosts = [h.strip() for h in os.environ.get("LEANDROS_PI_HOST", "").split(",") if h.strip()]
+    if not hosts:
+        sys.exit("pi_card: set LEANDROS_PI_HOST=<ip>[,<alt-ip>] (the Pi's address after a reboot)")
+    return hosts
 MARKER = "leandros.tryboot=1"
 
 
@@ -152,7 +159,7 @@ def _wait_back(R, t, timeout, expect_tag):
     t0 = time.time()
     time.sleep(5)
     while time.time() - t0 < timeout:
-        for h in (WIRED_HOST, WIFI_HOST):
+        for h in pi_hosts():
             tt = R.Target(f"pi:{h}")
             if R.probe(tt, "true") == 0:
                 return tt, tt.out("uname -v").strip()

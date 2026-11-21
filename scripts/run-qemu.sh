@@ -295,7 +295,9 @@ elif [ "$ARCH" = "aarch64" ]; then
     # -smp 4: SMP bringup via PSCI CPU_ON.
     # gic-version=3: the only GIC HVF will launch (QEMU >= 11.1); the kernel
     # drives GICv2 or GICv3 by detection, so TCG/KVM hosts use the same line.
-    MACHINE_ARGS="-machine virt,gic-version=3 -m ${LEANDROS_QEMU_MEM:-4G} -smp 4"
+    # KVM (aarch64 Linux host, e.g. Pi 5 = GICv2) cannot give GICv3: mirror the host GIC.
+    GIC_VER=3; [ "$ACCEL" = "kvm" ] && GIC_VER=host
+    MACHINE_ARGS="-machine virt,gic-version=$GIC_VER -m ${LEANDROS_QEMU_MEM:-4G} -smp 4"
     # -cpu host: real host ID registers, required by HVF/KVM passthrough
     # (vs. -cpu max's synthesized model, which is TCG-only).
     #

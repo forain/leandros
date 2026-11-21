@@ -13,7 +13,7 @@ fsyncs, checks the whole-file sha256 and renames. See userland/serrx/serrx.c.
                                                      kernel's shell, check ARGS
                                                      are in /proc/cmdline
 
---port: a device (default /dev/cu.usbserial-1410) or unix:<socket> (QEMU).
+--port: a device (default /dev/ttyUSB0 on Linux, /dev/cu.usbserial-1410 on Darwin) or unix:<socket> (QEMU).
 If /bin/serrx is missing on the target it is bootstrapped by typing its
 base64 into `head -c N | base64 -d` (~70 KB, ~7 s at 115200).
 
@@ -35,7 +35,7 @@ import time
 import zlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_PORT = "/dev/cu.usbserial-1410"
+DEFAULT_PORT = "/dev/ttyUSB0" if sys.platform.startswith("linux") else "/dev/cu.usbserial-1410"
 LOCAL_SERRX = os.path.join(REPO, "userland/target/aarch64-unknown-none/release/serrx")
 CHUNK = 768           # raw bytes per frame -> 1024 base64 chars
 WINDOW = 3            # frames in flight: ~3.1 KB < the Pi's 4 KiB backlog + 1 KiB ring

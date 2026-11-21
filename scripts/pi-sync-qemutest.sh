@@ -8,12 +8,13 @@
 # The image is cloned (cp -c) and never modified. Checks: sync applies, a second
 # dry run plans 0 changes, protected files keep their sha256, passwd/group gain
 # the bluetooth group without losing entries, the guest reboots fine afterwards.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -u
 OLD=${1:-f2fs-data0-aarch64.img}
 export LEANDROS_RUN_ID=${LEANDROS_RUN_ID:-piuserland-a64}
 export LEANDROS_NET=user LEANDROS_REMOTE=qemu
 W=$(mktemp -d /tmp/pisync-test.XXXX)
-cp -c "$OLD" "$W/root.img"
+clone_cp "$OLD" "$W/root.img"
 export LEANDROS_ROOT_IMAGE=$W/root.img
 R="python3 scripts/remote.py"
 D=".claude/skills/run-leandros/driver.py"

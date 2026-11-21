@@ -13,6 +13,7 @@
 #   8. Linux still boots by default; LeandrOS boots from the menu (scratch loader.conf
 #      default) with blk.rw= on the command line.
 # Disk: one 48 GiB APFS clone, deleted at the end. Env: FX_DIR, LEANDROS_INSTALL_BIN, GUI_BIN.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
@@ -70,7 +71,7 @@ echo "== images (one fixture copy)"
 [ -x "$GUI_BIN" ] || fail "missing GUI binary $GUI_BIN"
 mkdir -p "$WORK"; rm -f "$WORK"/disk.img* "$WORK"/stick.img*
 dfguard
-for f in "$SRC"*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
+for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
 GPT0=$(gpt_sig "$IMG")
 # Original p2 entry (GUID + attribute flags) straight from the primary GPT.
 P2ENT=$(python3 - "$IMG" <<'PY'
@@ -135,7 +136,7 @@ echo "== Linux still boots by default"
 
 echo "== choose LeandrOS (scratch copy)"
 dfguard
-SC="$WORK/scratch.img"; cp -c "$IMG" "$SC"; for x in meta manifest esp.sha256; do cp -c "$IMG.$x" "$SC.$x"; done
+SC="$WORK/scratch.img"; clone_cp "$IMG" "$SC"; for x in meta manifest esp.sha256; do clone_cp "$IMG.$x" "$SC.$x"; done
 ESP="$SC@@2M"
 printf 'default leandros.conf\ntimeout 1\nconsole-mode keep\n' > "$WORK/loader.conf.test"
 mcopy -o -i "$ESP" "$WORK/loader.conf.test" ::/loader/loader.conf

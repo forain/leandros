@@ -2,7 +2,7 @@
 # Transitive DT_NEEDED closure of an ELF against the merged sysroot, plus known
 # runtime dlopen additions. Prints the runtime-install manifest.
 # Usage: closure.sh <arch> <elf> [extra dlopen soname ...]
-D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
+D="${LEANDROS_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-work}/m3-gl-stack"
 RE=/opt/homebrew/opt/llvm/bin/llvm-readelf
 arch="$1"; shift; elf="$1"; shift; S=$D/sysroot-$arch
 seen=""

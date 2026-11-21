@@ -13,6 +13,7 @@
 # Disk: every 48 GiB image is an APFS clone (cp -c) of $FX_DIR; one scratch disk is
 # reused and the images are deleted at the end (logs stay).
 # Env: FX_DIR, LEANDROS_INSTALL_BIN, CRASH_PCTS="10 40 75".
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
@@ -44,9 +45,9 @@ P2=/dev/nvme0n1p2
 dfguard() { local g; g=$(df -g "$HOME" | awk 'NR==2{print $4}'); [ "$g" -ge 30 ] || fail "only ${g} GiB free on the host; stop"; }
 fresh_disk() { # cp -c clones only (APFS), never a plain copy
     dfguard; rm -f "${DISK:?}" "${DISK:?}".*
-    local f; for f in "$SRC"*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
+    local f; for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
 }
-fresh_stick() { dfguard; rm -f "${STICK:?}"; cp -c "$WORK/stick.base" "$STICK"; }
+fresh_stick() { dfguard; rm -f "${STICK:?}"; clone_cp "$WORK/stick.base" "$STICK"; }
 
 boot_vm() { # <log> <run-qemu args...>
     local log="$WORK/$1.log"; shift
@@ -204,7 +205,7 @@ grep -q "block count 2621440" "$WORK/check-shrunk.log" && ok "ext4 is 10 GiB" ||
 echo "-- Linux boots the shrunk fixture"
 "$ROOT/scripts/check-dualboot-fixture.sh" "$DISK" --boot "$ARCH" | tail -3 | grep -q "PASS boot" && ok "LINUX-DUALBOOT-OK" || fail "Linux boot after the shrink"
 # status flow: the stick that did the shrink still holds the session
-cp -c "$STICK" "$WORK/stick.done" 2>/dev/null || true
+clone_cp "$STICK" "$WORK/stick.done" 2>/dev/null || true
 boot_stick status
 r "$LI shrink-status --mark-verified --json" | grep -q '"state":"ready_b"' && ok "mark-verified -> ready_b" || fail "mark-verified"
 stop_vm
@@ -305,7 +306,7 @@ PY
     grep -q '"recovered":true' "$WORK/recout$PCT.log" || { tail -4 "$WORK/recout$PCT.log"; fail "recover at ${PCT}%"; }
     ok "recovered"
     stop_vm
-    [ "${KEEP_IMAGES:-0}" = 1 ] && { cp -c "$DISK" "$WORK/after$PCT.img"; cp -c "$STICK" "$WORK/stickafter$PCT.img"; }
+    [ "${KEEP_IMAGES:-0}" = 1 ] && { clone_cp "$DISK" "$WORK/after$PCT.img"; clone_cp "$STICK" "$WORK/stickafter$PCT.img"; }
     "$ROOT/scripts/check-dualboot-fixture.sh" "$DISK" | tee "$WORK/check-crash$PCT.log" | grep -E "^(FAIL|RESULT)"
     grep -q "^RESULT pristine fail=0" "$WORK/check-crash$PCT.log" || fail "post-recovery fixture check (crash $PCT)"
     [ "$(gpt_sig "$DISK")" = "$GPT0" ] && ok "GPT identical" || fail "GPT changed"

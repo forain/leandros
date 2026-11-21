@@ -13,6 +13,7 @@
 #     live nid, fixture checker passes; the target is read-only again;
 #  6. boot LeandrOS (same PARTUUIDs, /home/keep.txt still there) and Linux (LINUX-DUALBOOT-OK).
 # Env: FX_DIR, LEANDROS_INSTALL_BIN.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
@@ -61,7 +62,7 @@ while n:
     b = f.read(min(n, 1 << 24)); assert b; h.update(b); n -= len(b)
 print(h.hexdigest())' "$1" "$2" "$3"; }
 hpart() { local a b; a=$(pent "$1" "$2" "First sector"); b=$(pent "$1" "$2" "Last sector"); hrange "$1" "$a" $((b - a + 1)); }
-hgpt() { echo "$(dd if="$1" bs=1m count=1 2>/dev/null | shasum -a 256 | cut -d' ' -f1) $(dd if="$1" bs=1m skip=$(( $(stat -f %z "$1") / 1048576 - 1 )) 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; }
+hgpt() { echo "$(dd if="$1" bs=1m count=1 2>/dev/null | shasum -a 256 | cut -d' ' -f1) $(dd if="$1" bs=1m skip=$(( $(file_size "$1") / 1048576 - 1 )) 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"; }
 esp_snap() { # foreign ESP files only: names + hashes
     local d="$WORK/espsnap"; rm -rf "$d"; mkdir -p "$d"; mcopy -s -n -i "$1@@2M" :: "$d" 2>/dev/null
     (cd "$d" && find . -type f ! -path './EFI/leandros/*' ! -name leandros.conf ! -name NvVars | LC_ALL=C sort | xargs shasum -a 256) | shasum -a 256 | cut -d' ' -f1
@@ -105,7 +106,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 SRC="$FXDIR/fxgap-$ARCH.img"
 [ -f "$SRC" ] || fail "missing $SRC"
 df -g "$HOME" | awk 'NR==2 && $4 < 60 { exit 1 }' || fail "less than 60 GiB free"
-for f in "$SRC"*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
+for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
 STICK="$WORK/stick.img"
 export LEANDROS_USB_ALLOW_GENERIC_GPU=1  # QEMU fixture: non-INTEL image is fine
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$STICK" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }
@@ -139,7 +140,7 @@ for mib in (3, 5, 9, 14, 20, 40):
     f.seek(a * 512 + mib * 1048576); f.write(os.urandom(262144))
 PY
 G0=$(hgpt "$IMG"); P2_0=$(hpart "$IMG" 2); H0=$(hpart "$IMG" 6); E0=$(esp_snap "$IMG"); R_DAMAGED=$(hpart "$IMG" 5)
-cp -c "$IMG" "$WORK/pre.img"
+clone_cp "$IMG" "$WORK/pre.img"
 ok "snapshots taken (gpt $G0)"
 
 # Everything the installer could touch: the GPT areas, partitions 2-7 byte for byte, and the ESP by
@@ -161,9 +162,9 @@ neg() { # <name> <img> <gate>
     ok "negative $n refused ($gate), nothing written"
 }
 echo "== phase 4: negative cases"
-cp -c "$IMG" "$WORK/negA.img"; mdel -i "$WORK/negA.img@@2M" ::/EFI/leandros/.leandros-owned; fullsnap "$WORK/negA.img" > "$WORK/neg-A.snap"
+clone_cp "$IMG" "$WORK/negA.img"; mdel -i "$WORK/negA.img@@2M" ::/EFI/leandros/.leandros-owned; fullsnap "$WORK/negA.img" > "$WORK/neg-A.snap"
 neg A "$WORK/negA.img" R4
-cp -c "$IMG" "$WORK/negB.img"; sgdisk -t 4:3F2D991B-D385-4FFF-9CF1-A0DB03062DE5 "$WORK/negB.img" >/dev/null; fullsnap "$WORK/negB.img" > "$WORK/neg-B.snap"
+clone_cp "$IMG" "$WORK/negB.img"; sgdisk -t 4:3F2D991B-D385-4FFF-9CF1-A0DB03062DE5 "$WORK/negB.img" >/dev/null; fullsnap "$WORK/negB.img" > "$WORK/neg-B.snap"
 neg B "$WORK/negB.img" R3
 rm -f "$WORK/negA.img" "$WORK/negB.img" "$WORK"/neg-?.snap
 

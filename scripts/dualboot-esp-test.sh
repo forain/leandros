@@ -12,6 +12,7 @@
 # LeandrOS entry for the test and restored byte for byte afterwards), runs the
 # espctl trial -> reboot -> promote cycle, tests repair-esp, and finally checks
 # that Linux's ext4 and every original ESP file are untouched.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
@@ -61,7 +62,7 @@ esp_manifest() { local d; d=$(mktemp -d); mcopy -i "$IMG@@2M" -s -n '::/*' "$d/"
 
 echo "== prepare shared-layout disk"
 rm -rf "$WORK"; mkdir -p "$WORK"
-for f in "$FXDIR"/fx-$ARCH.img*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
+for f in "$FXDIR"/fx-$ARCH.img*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
 ROOT_IMG="$ROOT/f2fs-data0-$ARCH.img"; HOME_IMG="$ROOT/f2fs-data1-$ARCH.img"
 KERNEL="$ROOT/target/final-$ARCH/kernel"; INITRD="$ROOT/initrd-$ARCH.cpio"
 LIMINE="$ROOT/.limine-cache/limine-$(sed -n 's/^LIMINE_VERSION=//p' scripts/write-usb.sh | head -1 | tr -d '"')-binary/$EFI"
@@ -70,7 +71,7 @@ for f in "$ROOT_IMG" "$HOME_IMG" "$KERNEL" "$INITRD" "$LIMINE"; do [ -f "$f" ] |
 esp_manifest > "$WORK/esp.before"
 mdir -i "$IMG@@2M" -b ::/ >/dev/null
 mtype -i "$IMG@@2M" ::/loader/loader.conf > "$WORK/loader.conf.orig"
-RS=$(( ($(stat -f %z "$ROOT_IMG") + 1048575) / 1048576 )); HS=$(( ($(stat -f %z "$HOME_IMG") + 1048575) / 1048576 ))
+RS=$(( ($(file_size "$ROOT_IMG") + 1048575) / 1048576 )); HS=$(( ($(file_size "$HOME_IMG") + 1048575) / 1048576 ))
 truncate -s +$((RS + HS + 604))M "$IMG"
 sgdisk -e "$IMG" >/dev/null
 P3E=$(sgdisk -i 3 "$IMG" | sed -n 's/^Last sector: *\([0-9]*\).*/\1/p')

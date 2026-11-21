@@ -8,7 +8,7 @@
 # per-run sxk=<nonce> marker) in /proc/cmdline. Recovery from a bad kernel is a
 # power cycle (the firmware boots the card's kernel.img; this never writes it).
 #
-# Env: LEANDROS_PI_SERIAL (port; default /dev/cu.usbserial-1410, or unix:<sock>
+# Env: LEANDROS_PI_SERIAL (port; default /dev/ttyUSB0 on Linux, /dev/cu.usbserial-1410 on Darwin; or unix:<sock>
 #      for QEMU), LEANDROS_PI_LOGIN (user:pass if the console shows login:),
 #      PI_DIR (default /boot/pi). Stop any serial logger (cat) first: the port
 #      is used exclusively and the push refuses while another process holds it.
