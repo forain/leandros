@@ -331,7 +331,10 @@ pub(crate) fn crash_dead(dev: usize) -> bool {
 
 fn dw(dev: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     if !crash_pass(dev, 1) { return false; }
-    virtio_blk::write_block(dev, blk, buf)
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::write_block(dev, blk, buf);
+    crate::io_charge(crate::IO_WRITE, t0);
+    r
 }
 
 /// Write `data` (whole blocks) at `blk` in requests of `WB_IO_BLOCKS`.
@@ -375,6 +378,7 @@ fn dws(dev: usize, blk: u64, data: &[u8], cmds: &mut u32) -> bool {
     for (p, piece) in data.chunks(WB_IO_BLOCKS * BLOCK_SIZE).enumerate() {
         let at = blk + (p * WB_IO_BLOCKS) as u64;
         *cmds += 1;
+        let t0c = sched::monotonic_ns();
         if !crash_pass(dev, (piece.len() / BLOCK_SIZE) as u64) { ok = false; continue; }
         if piece.len() == BLOCK_SIZE {
             ok &= virtio_blk::write_block(dev, at, piece.try_into().unwrap());
@@ -383,13 +387,17 @@ fn dws(dev: usize, blk: u64, data: &[u8], cmds: &mut u32) -> bool {
                 ok &= virtio_blk::write_block(dev, at + j as u64, b.try_into().unwrap());
             }
         }
+        crate::io_charge(crate::IO_WRITE, t0c);
     }
     ok
 }
 
 fn dflush(dev: usize) -> bool {
     if crash_dead(dev) { return false; }
-    virtio_blk::flush(dev)
+    let t0 = sched::monotonic_ns();
+    let r = virtio_blk::flush(dev);
+    crate::io_charge(crate::IO_FLUSH, t0);
+    r
 }
 
 // ── Per-mount state ──────────────────────────────────────────────────────────

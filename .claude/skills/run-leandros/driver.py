@@ -1183,6 +1183,12 @@ def _root_bus_args(virtio_args):
     """LEANDROS_ROOT_BUS=virtio|nvme|usb (default virtio): attach the ROOT disk (drive0) as an
     NVMe namespace or a usb-storage device on qemu-xhci instead of virtio-blk; the data disks
     stay virtio. Exercises the boot-path drivers (NVME, USB_STORAGE) in QEMU."""
+    # LEANDROS_ROOTFS_BPS_WRITE=<bytes/s>: throttle the root FILESYSTEM disk's writes
+    # (QEMU throttling.bps-write on data0), a slow-flash stand-in (lane f2fsatomic).
+    bps = os.environ.get("LEANDROS_ROOTFS_BPS_WRITE", "")
+    if bps:
+        virtio_args = [a + f",throttling.bps-write={bps}" if a.startswith("if=none,id=data0,") else a
+                       for a in virtio_args]
     bus = os.environ.get("LEANDROS_ROOT_BUS", "virtio") or "virtio"
     # LEANDROS_ROOTFS_BUS=nvme|usb moves the root FILESYSTEM disk (data0, LABEL=leandros-root) instead
     # of the boot disk: the kernel must then mount root through the nvme / usb_storage driver

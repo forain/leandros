@@ -328,6 +328,9 @@ SUITES = {
                 "host:f2fscommittest.py",
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
+                # A spin-locked caller reading a file (the wifi-brcmf ctl poll) must not stall f2fs
+                # under bulk writes on a throttled disk (lane f2fsatomic; own boot, ~4 min).
+                "host:f2fsatomictest.py",
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
                 # Vulkan swapchain on a Wayland surface presented to cosmic-comp (--venus, x86_64 only; own boot, ~3 min).
                 "host:vkwltest.py",

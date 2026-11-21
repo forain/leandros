@@ -2900,10 +2900,10 @@ fn run_mutating<R>(port: u32, mut f: impl FnMut(&mut MountState) -> R) -> Option
         let rw = !ms.read_only;
         (r, rw && cp_throttle(ms), rw && c.ndirty >= c.soft_dirty())
     })?;
-    if throttle {
+    if throttle && sched::irqctx::can_sleep() && sched::current_pid() != 0 {
         THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
         let _ = checkpoint_unlocked(port, None, CpWhy::Throttle);
-    } else if kick {
+    } else if throttle || kick {
         kick_writeback(port);
     }
     Some(r)
@@ -4694,9 +4694,9 @@ fn wait_wb_idle() {
 
 /// Why a checkpoint runs (the `[ckpt]` summary).
 #[derive(Clone, Copy, PartialEq)]
-enum CpWhy { Fsync = 0, Sync = 1, Age = 2, Pressure = 3, Throttle = 4, Lazy = 5, Space = 6 }
-const CP_WHYS: usize = 7;
-const CP_WHY_NAMES: [&str; CP_WHYS] = ["fsync", "sync", "age", "pressure", "throttle", "lazy", "space"];
+enum CpWhy { Fsync = 0, Sync = 1, Age = 2, Pressure = 3, Throttle = 4, Lazy = 5, Space = 6, Atomic = 7 }
+const CP_WHYS: usize = 8;
+const CP_WHY_NAMES: [&str; CP_WHYS] = ["fsync", "sync", "age", "pressure", "throttle", "lazy", "space", "atomic"];
 
 /// What a `checkpoint_unlocked` call did, for its caller's statistics.
 #[derive(Default, Clone, Copy)]
@@ -4727,6 +4727,19 @@ fn checkpoint_unlocked(port: u32, need: Option<u64>, why: CpWhy) -> Result<(), (
 fn checkpoint_unlocked_ex(port: u32, need: Option<u64>, why: CpWhy, out: &mut CpOut) -> Result<(), ()> {
     if !sched::irqctx::can_sleep() || sched::current_pid() == 0 {
         note_atomic_request();
+        // A caller that may not sleep (a driver reading a file under a spin
+        // lock) must not run a checkpoint with F2FS_MOUNTS held: only an
+        // fsync/sync asked for durability. Everything else is a hint: wake
+        // the write-back task and go on.
+        if !matches!(why, CpWhy::Fsync | CpWhy::Sync) && WB_THREAD.load(atomic::Ordering::Acquire) {
+            CP_WIN.lock().n[CpWhy::Atomic as usize] += 1;
+            if !WB_KICKED.swap(true, atomic::Ordering::AcqRel) { WB_KICK.up(); }
+            return Ok(());
+        }
+        static KSYNC_ONCE: atomic::AtomicBool = atomic::AtomicBool::new(false);
+        if !KSYNC_ONCE.swap(true, atomic::Ordering::Relaxed) {
+            dbg_str("[KSYNC] f2fs: synchronous locked checkpoint for a caller that may not sleep\n");
+        }
         let mut mounts = lock_mounts();
         if let Some(ms) = mounts.iter_mut().flatten().find(|m| m.port == port) {
             if !flush_checkpoint(ms) { return Err(()); }
@@ -5396,7 +5409,7 @@ fn wb_thread() -> ! {
 
 fn start_wb_thread() {
     if WB_THREAD.swap(true, atomic::Ordering::AcqRel) { return; }
-    if sched::spawn(wb_thread, 0).is_none() {
+    if sched::spawn(wb_thread, 0).map(|p| sched::set_comm(p, b"f2fs-wb")).is_none() {
         WB_THREAD.store(false, atomic::Ordering::Release);
         dbg_str("[F2FS] could not start the write-back task; the I/O task does it\n");
     }
@@ -9295,16 +9308,19 @@ fn dispatch_locked(msg: &Message, caller_pid: u32, port: u32) -> Option<Message>
         let c = &ms.cache;
         // Only requests that can dirty the cache are throttled: a
         // reader must never wait out somebody else's write-back.
-        let rw = !ms.read_only && (is_mutating(msg.tag) || msg.tag == VFS_OPEN);
+        // VFS_OPEN counts only when it can write (flags = arg 1).
+        let open_w = msg.tag == VFS_OPEN
+            && (arg(msg, 1) & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) != 0;
+        let rw = !ms.read_only && (is_mutating(msg.tag) || open_w);
         (r, rw && cp_throttle(ms), rw && c.ndirty >= c.soft_dirty())
     }) {
         Some((r, t, k)) => (Some(r), t, k),
         None => (None, false, false),
     };
-    if throttle {
+    if throttle && sched::irqctx::can_sleep() && sched::current_pid() != 0 {
         THROTTLE_COUNT.fetch_add(1, atomic::Ordering::Relaxed);
         let _ = checkpoint_unlocked(port, None, CpWhy::Throttle);
-    } else if kick {
+    } else if throttle || kick {
         kick_writeback(port);
     }
     reply
