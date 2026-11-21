@@ -778,6 +778,8 @@ static int bind_mounted_sock(const char *name, uid_t uid, gid_t gid, mode_t mode
     static const char *const dirs[] = { "/root", "/var", "/home", "/mnt", NULL };
     for (int i = 0; dirs[i]; i++) {
         struct statfs sf;
+        struct stat dst;   /* the unprivileged probe callers must be able to traverse it */
+        if (stat(dirs[i], &dst) != 0 || (dst.st_mode & 0001) == 0) continue;
         if (statfs(dirs[i], &sf) != 0 || sf.f_type == 0x01021994 /* tmpfs */ || sf.f_type == 0x858458f6 /* ramfs */) continue;
         map0_sa.sun_family = AF_UNIX;
         snprintf(map0_sa.sun_path, sizeof map0_sa.sun_path, "%s/%s", dirs[i], name);
