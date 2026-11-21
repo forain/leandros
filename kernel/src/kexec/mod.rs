@@ -49,7 +49,8 @@ const INITRD_PHYS: u64 = 0x4800_0000;
 #[cfg(target_arch = "x86_64")]
 const MB2_BOOTLOADER_MAGIC: u64 = 0x36d7_6289;
 
-const CMDLINE_MAX: usize = 2048;
+/// Includes the NUL, as `kexec_file_load` passes it (Linux COMMAND_LINE_SIZE).
+const CMDLINE_MAX: usize = boot::COMMAND_LINE_SIZE;
 
 /// A staged image.
 struct Image {

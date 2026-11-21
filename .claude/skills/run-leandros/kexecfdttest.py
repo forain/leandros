@@ -28,6 +28,9 @@ PUSH = [sys.executable, os.path.join(REPO, "scripts/pi-serial-push.py"), "--port
 ENV = dict(os.environ, LEANDROS_PI_SERIAL="unix:" + driver.SERIAL_SOCK, LEANDROS_PI_LOGIN="root:root")
 KEEP = " kexec.keep_fdt_hole=1" if os.environ.get("KEXECFDT_NOFIX") == "1" else ""
 KX = "/bin/kexec -l /boot/kexec --initrd=/boot/kexec-initrd"
+# A >1500-byte append whose last knob must reach the next kernel's /proc/cmdline
+# (lane cmdline: the kernel used to keep only 512 bytes).
+LONG = " ".join(f"kexec.pad{i:03d}=0123456789abcdef" for i in range(70)) + " kexec.tail=KXTAILOK"
 
 
 def guest(cmd, timeout=120):
@@ -71,10 +74,14 @@ def main():
         rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=1'")
         print("  x86 load", rc, flush=True)
         r1 = kexec_exec("kexec.gen=1")
-        rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=2'")
+        rc, out = guest(f"{KX} --reuse-cmdline --append='kexec.gen=2 {LONG}'")
         r2 = kexec_exec("kexec.gen=2")
-        print("RESULT:", "PASS" if (r1 == 0 and r2 == 0 and rc == 0) else "FAIL x86 chain")
-        return 0 if (r1 == 0 and r2 == 0 and rc == 0) else 1
+        _, cl = guest("cat /proc/cmdline")
+        tail = "kexec.tail=KXTAILOK" in cl and len(cl) > 1500
+        print("  long cmdline carried through kexec:", tail, len(cl), flush=True)
+        ok = r1 == 0 and r2 == 0 and rc == 0 and tail
+        print("RESULT:", "PASS" if ok else "FAIL x86 chain")
+        return 0 if ok else 1
 
     def check(name, ok, detail=""):
         print(f"  {'ok  ' if ok else 'FAIL'} {name} {detail}", flush=True)
@@ -102,9 +109,11 @@ def main():
     check("X1 above image", x1 >= seg_end)
     check("gen1 -> gen2", kexec_exec("kexec.gen=2") == 0)
     # gen2: plain load for gen3 (its own FDT is wherever the allocator puts it).
-    rc, out = guest(f"{KX} --append='kexec.gen=3'")
+    rc, out = guest(f"{KX} --append='kexec.gen=3 {LONG}'")
     check("gen2 load", rc == 0, out.strip()[-80:])
     check("gen2 -> gen3", kexec_exec("kexec.gen=3") == 0)
+    _, cl = guest("cat /proc/cmdline")
+    check("long cmdline carried through kexec (>1500 B, tail intact)", "kexec.tail=KXTAILOK" in cl and len(cl) > 1500, f"len={len(cl)}")
     # gen3: the image reaching past X1.
     pt = last_pt_load(os.path.join(REPO, "target/final-aarch64/kernel-direct"))
     off, paddr, memsz = pt

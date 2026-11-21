@@ -246,7 +246,8 @@ pub(crate) struct Opts {
     pub selftest: selftest::Mode,
 }
 
-static mut CMDLINE: [u8; 1024] = [0; 1024];
+/// Same size as `boot::COMMAND_LINE_SIZE` (this crate does not depend on `boot`).
+static mut CMDLINE: [u8; 2048] = [0; 2048];
 static mut CMDLINE_LEN: usize = 0;
 
 pub(crate) fn cmdline() -> &'static str {
@@ -318,7 +319,7 @@ fn parse_opts() -> Opts {
 /// - Otherwise a kernel thread `[nvrm]` runs `rm_init_rm` and, with
 ///   `nvrm.start=1`, the whole probe/start sequence (see `device`).
 pub fn init(env: &BootEnv) {
-    let n = env.cmdline.len().min(1023);
+    let n = env.cmdline.len().min(2047);
     unsafe {
         let buf = &mut *core::ptr::addr_of_mut!(CMDLINE);
         buf[..n].copy_from_slice(&env.cmdline.as_bytes()[..n]);

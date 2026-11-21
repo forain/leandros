@@ -86,9 +86,24 @@ pub fn kexec_prevlog() -> Option<(u64, u64)> {
     if p == 0 || s == 0 { None } else { Some((p, s)) }
 }
 
-/// Longest command line kept from a direct boot.
-pub const CMDLINE_MAX: usize = 4096;
-static mut CMDLINE_BUF: [u8; CMDLINE_MAX] = [0; CMDLINE_MAX];
+/// Kernel command line capacity, NUL included (Linux `COMMAND_LINE_SIZE` on
+/// x86_64 and arm64). The one constant every command-line copy is sized by:
+/// the direct-boot buffer, the kernel's scrubbed copy, the per-driver knob
+/// copies and the kexec hand-over. A longer line is cut at this size and the
+/// cut is logged (`cmdline truncated at N of M bytes`), never silent.
+pub const COMMAND_LINE_SIZE: usize = 2048;
+/// Longest command line kept from a direct boot (without the NUL).
+pub const CMDLINE_MAX: usize = COMMAND_LINE_SIZE - 1;
+/// How far a boot parser scans a C-string command line for its NUL, so the
+/// full length is known when the line is cut at `CMDLINE_MAX`.
+pub(crate) const CMDLINE_SCAN_MAX: usize = 16 * 1024;
+static mut CMDLINE_BUF: [u8; COMMAND_LINE_SIZE] = [0; COMMAND_LINE_SIZE];
+/// Length of the direct-boot command line as the bootloader gave it, before
+/// the cut to `CMDLINE_MAX` (0 if none).
+static CMDLINE_SRC_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Full length of the direct-boot command line before any truncation.
+pub fn cmdline_src_len() -> usize { CMDLINE_SRC_LEN.load(core::sync::atomic::Ordering::Relaxed) }
 
 /// Copy `src` into the static command-line buffer and point `info` at it.
 /// Trailing NULs are dropped; an empty line leaves `info` untouched.
@@ -96,10 +111,11 @@ static mut CMDLINE_BUF: [u8; CMDLINE_MAX] = [0; CMDLINE_MAX];
 /// # Safety
 /// Boot parsers only: single CPU, before anything else reads the buffer.
 pub(crate) unsafe fn stash_cmdline(info: &mut BootInfo, src: &[u8]) {
-    let mut n = src.len().min(CMDLINE_MAX);
     // Stop at the first NUL: the source is a C string.
-    if let Some(z) = src[..n].iter().position(|&b| b == 0) { n = z; }
+    let full = src.iter().position(|&b| b == 0).unwrap_or(src.len());
+    let n = full.min(CMDLINE_MAX);
     if n == 0 { return; }
+    CMDLINE_SRC_LEN.store(full, core::sync::atomic::Ordering::Relaxed);
     let dst = core::ptr::addr_of_mut!(CMDLINE_BUF) as *mut u8;
     core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
     info.cmdline_ptr = dst as u64;

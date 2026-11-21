@@ -291,7 +291,7 @@ pub unsafe fn parse_pvh(si_phys: usize) -> BootInfo {
     if cmdline != 0 {
         let p = cmdline as *const u8;
         let mut n = 0;
-        while n < super::CMDLINE_MAX && *p.add(n) != 0 { n += 1; }
+        while n < super::CMDLINE_SCAN_MAX && *p.add(n) != 0 { n += 1; }
         stash_cmdline(&mut info, core::slice::from_raw_parts(p, n));
     }
     // version >= 1: memmap_paddr u64 @40, memmap_entries u32 @48;
@@ -356,7 +356,7 @@ pub unsafe fn parse_multiboot1(mbi_phys: usize) -> BootInfo {
         if c != 0 {
             let p = c as *const u8;
             let mut n = 0;
-            while n < super::CMDLINE_MAX && *p.add(n) != 0 { n += 1; }
+            while n < super::CMDLINE_SCAN_MAX && *p.add(n) != 0 { n += 1; }
             stash_cmdline(&mut info, core::slice::from_raw_parts(p, n));
         }
     }
