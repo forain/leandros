@@ -2,20 +2,40 @@
 """Generate drivers/data/wide-glyphs.bin: the 16x16 glyphs for every double-width
 code point (drivers/src/glyphs.rs `wide`) the console can draw.
 
-  gen-wide-glyphs.py UNIFONT_HEX OUT.bin [EMOJI_TTF]
+Regenerate (inputs live outside the repo; sha256 is verified before use):
 
-UNIFONT_HEX is GNU Unifont's unifont.hex (BMP, GPLv2+ with the font embedding
-exception; the OFL Noto Emoji monochrome font supplies the supplementary-plane
-emoji, rasterised to 16x16 and thresholded). Only code points `wide()` accepts
-and the font has a 16x16 glyph for are kept.
+  D=/data/vtwide-src   # any dir holding the two pinned files below
+  curl -LO https://ftpmirror.gnu.org/gnu/unifont/unifont-18.0.01/unifont_all-18.0.01.hex.gz
+  gunzip -k unifont_all-18.0.01.hex.gz
+  curl -L -o NotoEmoji-Regular-v2.034.ttf \\
+    https://github.com/googlefonts/noto-emoji/raw/v2.034/fonts/NotoEmoji-Regular.ttf
+  python3 scripts/gen-wide-glyphs.py $D/unifont_all-18.0.01.hex \\
+    $D/NotoEmoji-Regular-v2.034.ttf drivers/data/wide-glyphs.bin
+
+Inputs: GNU Unifont 18.0.01 unifont_all hex (GPLv2+ with the font embedding
+exception) for everything it covers, and the monochrome Noto Emoji (SIL OFL 1.1,
+googlefonts/noto-emoji tag v2.034) rasterised to 16x16 and thresholded for the
+supplementary-plane emoji Unifont lacks. Only code points `wide()` accepts and
+the fonts have a glyph for are kept. See drivers/data/README-glyphs.md.
 
 Layout (little endian): u32 nruns; nruns * (u32 first_cp, u32 len, u32 first_glyph);
 then 32 bytes per glyph, 16 rows of u16 big-endian-bit-order (bit 15 = leftmost).
 """
-import re, struct, sys
+import hashlib, re, struct, sys
 
-hexf, out = sys.argv[1], sys.argv[2]
-emoji_ttf = sys.argv[3] if len(sys.argv) > 3 else None
+PINNED = {
+    'unifont': ('unifont_all-18.0.01.hex', '3a107e6b6d0f68d685dafb54fd4a03d232f4df8e0eb9afdd6db7a855ec848901'),
+    'emoji': ('NotoEmoji-Regular.ttf (googlefonts/noto-emoji v2.034)', '415dc6290378574135b64c808dc640c1df7531973290c4970c51fdeb849cb0c5'),
+}
+if len(sys.argv) != 4:
+    sys.exit(__doc__)
+hexf, emoji_ttf, out = sys.argv[1], sys.argv[2], sys.argv[3]
+for key, path in (('unifont', hexf), ('emoji', emoji_ttf)):
+    name, want = PINNED[key]
+    got = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+    print('source %s: %s sha256 %s' % (name, path, got))
+    if got != want:
+        sys.exit('sha256 mismatch for %s: expected %s' % (name, want))
 src = open(__file__.rsplit('/scripts/', 1)[0] + '/drivers/src/glyphs.rs').read()
 body = re.search(r'pub fn wide\(u: u32\) -> bool \{\n    matches!\(u,(.*?)\)\n\}', src, re.S).group(1)
 ranges = []
@@ -34,7 +54,7 @@ for lo, hi in ranges:
     for c in range(lo, min(hi, 0x2FFFF) + 1):
         if c in uni: glyphs[c] = uni[c]
 
-if emoji_ttf:
+if True:
     from PIL import Image, ImageDraw, ImageFont
     f = ImageFont.truetype(emoji_ttf, 15)
     for lo, hi in ranges:
