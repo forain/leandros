@@ -7004,7 +7004,7 @@ impl DrmDeviceInterface {
     /// restores what it read. Root only: a long spin costs every GPU user.
     fn handle_gpu_park_spin(arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        if sched::current_euid() != 0 { return Err(DriverError::Access); }
+        if !sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) { return Err(DriverError::Access); }
         let p = arg as *mut u64;
         let old = crate::virtio_gpu::set_park_spin_us(unsafe { p.read_volatile() });
         unsafe { p.write_volatile(old); }
@@ -7015,7 +7015,7 @@ impl DrmDeviceInterface {
     /// old out; u64::MAX = default). Root only; a test knob.
     fn handle_ctx_drain_us(arg: usize) -> Result<usize, DriverError> {
         if arg == 0 { return Err(DriverError::InvalidParameter); }
-        if sched::current_euid() != 0 { return Err(DriverError::Access); }
+        if !sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) { return Err(DriverError::Access); }
         let p = arg as *mut u64;
         let old = CTX_DRAIN_US_OVERRIDE.swap(unsafe { p.read_volatile() },
                                              ::core::sync::atomic::Ordering::Relaxed);
@@ -7026,7 +7026,7 @@ impl DrmDeviceInterface {
     /// LeandrOS 0x100B: queue a DRM `change` uevent on /dev/input/hotplug, the
     /// same record the i915 HPD thread sends (DRM_DEBUG_FAKE_HPD). Root only; test hook.
     fn handle_fake_hpd() -> Result<usize, DriverError> {
-        if sched::current_euid() != 0 { return Err(DriverError::Access); }
+        if !sched::caps::host_capable(sched::caps::CAP_SYS_ADMIN) { return Err(DriverError::Access); }
         evdev_server::hp_drm_change(0);
         Ok(0)
     }

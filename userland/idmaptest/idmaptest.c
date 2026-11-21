@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -399,7 +400,7 @@ static int run_child(int (*fn)(void))
 {
     pid_t p = fork();
     if (p < 0) return 0;
-    if (p == 0) _exit(fn() ? 0 : 1);
+    if (p == 0) { int r = fn(); fflush(stdout); _exit(r ? 0 : 1); }
     int st = 0;
     waitpid(p, &st, 0);
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
@@ -617,17 +618,284 @@ static int lower_minus1_einval(void)
     return 0;
 }
 
-static int map_kuid0_eperm(void)
+static int run_ok(int (*fn)(void))
 {
-    /* refused for the privileged writer too, with or without the knob */
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) { int r = fn(); fflush(stdout); _exit(r ? 1 : 0); }
+    int st = 0;
+    waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* ---- idroot0: maps covering kuid 0 need CAP_SETFCAP (Linux verify_root_map) ---- */
+
+/* Drop CAP_SETFCAP (31) from the effective set only. */
+static int drop_setfcap(void)
+{
+    struct { unsigned v; int pid; } h = { 0x20080522, 0 };
+    struct { unsigned eff, prm, inh; } d[2];
+    if (syscall(SYS_capget, &h, d)) return -1;
+    d[0].eff &= ~(1u << 31);
+    return (int)syscall(SYS_capset, &h, d);
+}
+
+static int kuid0_nocap_child(void)
+{
+    CHECK(drop_setfcap() == 0);
     int go; pid_t c = spawn(1000, NULL, NULL, &go);
     CHECK(c > 0);
     int a = wrp(c, "uid_map", "0 0 1\n");
     int b = wrp(c, "uid_map", "1000 0 1\n");
     int d = wrp(c, "uid_map", "5 0 10\n");
+    int e = wrp(c, "gid_map", "0 0 1\n");        /* gid_map has no such rule */
+    int f = wrp(c, "uid_map", "1000 1000 1\n");  /* a refused write leaves the map writable */
+    fin(c, go);
+    CHECK(a == -EPERM && b == -EPERM && d == -EPERM && e == 0 && f == 0);
+    return 0;
+}
+
+/* Creator without CAP_SETFCAP in the parent: its own "0 0 1" is refused. */
+static int kuid0_self_nocap_child(void)
+{
+    CHECK(drop_setfcap() == 0);
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    CHECK(wr("/proc/self/uid_map", "0 0 1\n") == -EPERM);
+    return 0;
+}
+
+/* Creator with CAP_SETFCAP (host root): its own "0 0 1" works. */
+static int kuid0_self_cap_child(void)
+{
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    CHECK(wr("/proc/self/uid_map", "0 0 1\n") == 0);
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/gid_map", "0 0 1\n") == 0);
+    CHECK(getuid() == 0 && getgid() == 0);
+    return 0;
+}
+
+static int map_kuid0_needs_setfcap(void)
+{
+    CHECK(run_ok(kuid0_nocap_child));
+    CHECK(run_ok(kuid0_self_nocap_child));
+    CHECK(run_ok(kuid0_self_cap_child));
+    /* With CAP_SETFCAP (this runner is host root): ok, also as a wider range. */
+    int go; pid_t c = spawn(1000, NULL, NULL, &go);
+    CHECK(c > 0);
+    int a = wrp(c, "uid_map", "0 0 1\n");
     int e = wrp(c, "gid_map", "0 0 1\n");
     fin(c, go);
-    CHECK(a == -EPERM && b == -EPERM && d == -EPERM && e == -EPERM);
+    CHECK(a == 0 && e == 0);
+    c = spawn(1000, NULL, NULL, &go);
+    CHECK(c > 0);
+    int d = wrp(c, "uid_map", "5 0 10\n");
+    fin(c, go);
+    CHECK(d == 0);
+    return 0;
+}
+
+static int map0_drm_fd = -1;          /* opened by host root, inherited by the probes */
+static struct sockaddr_un map0_sa;    /* mounted (non-tmpfs) socket owned by unmapped uid 4242, mode 0700 */
+static int map0_sock_up;
+static int map0_connect(void)
+{
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    int r = connect(s, (struct sockaddr *)&map0_sa, sizeof map0_sa);
+    int e = errno; close(s); errno = e;
+    return r;
+}
+static int map0_ovl_read(void)
+{
+    char b[64]; int fd = open("/proc/sys/fs/ovl_selftest", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, b, sizeof b); close(fd);
+    return (int)n;
+}
+/* f_cred vs writer: the CAP_SETFCAP check follows the OPENER of the map file, not the writer. */
+static int set_setfcap(int on)
+{
+    struct { unsigned v; int pid; } h = { 0x20080522, 0 };
+    struct { unsigned eff, prm, inh; } d[2];
+    if (syscall(SYS_capget, &h, d)) return -1;
+    if (on) d[0].eff |= 1u << 31; else d[0].eff &= ~(1u << 31);
+    return (int)syscall(SYS_capset, &h, d);
+}
+static int fcred_open_nocap_write_cap(void)    /* opener WITHOUT, writer WITH: EPERM */
+{
+    int go; pid_t c = spawn(1000, NULL, NULL, &go);
+    CHECK(c > 0);
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c);
+    CHECK(set_setfcap(0) == 0);
+    int fd = open(p, O_WRONLY);
+    CHECK(fd >= 0);
+    CHECK(set_setfcap(1) == 0);
+    ssize_t n = write(fd, "0 0 1\n", 6); int e = errno; close(fd);
+    fin(c, go);
+    CHECK(n == -1 && e == EPERM);
+    return 0;
+}
+static int fcred_open_cap_write_nocap(void)    /* opener WITH, writer WITHOUT: ok */
+{
+    int go; pid_t c = spawn(1000, NULL, NULL, &go);
+    CHECK(c > 0);
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/uid_map", (int)c);
+    int fd = open(p, O_WRONLY);
+    CHECK(fd >= 0);
+    CHECK(set_setfcap(0) == 0);
+    ssize_t n = write(fd, "0 0 1\n", 6); int e = errno; close(fd);
+    fin(c, go);
+    CHECK(n == 6);
+    (void)e;
+    return 0;
+}
+/* Nested: N1 root is kuid 1000. A map in N2 whose lower id is N1's 0 (kuid 1000, not 0) still needs SETFCAP. */
+static int nested_body(void *a)
+{
+    int keep = *(int *)a;
+    if (!keep) CHECK(drop_setfcap() == 0);
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    int r = wr("/proc/self/uid_map", "0 0 1\n");
+    if (keep) CHECK(r == 0); else CHECK(r == -EPERM);
+    return 0;
+}
+static int nested_parent_root_setfcap(void)
+{
+    for (int keep = 0; keep <= 1; keep++) {
+        int go; pid_t c = spawn(1000, nested_body, &keep, &go);
+        CHECK(c > 0);
+        CHECK(wrp(c, "uid_map", "0 1000 1\n") == 0);
+        CHECK(wrp(c, "gid_map", "0 1000 1\n") == 0);
+        CHECK(fin(c, go) == 0);
+    }
+    return 0;
+}
+/* Mounted-fs unix socket connect: group write bit via supplementary groups, no group bit refused. */
+static int mnt_sock_group_child(void *a)
+{
+    (void)a;
+    gid_t g[1] = { 5000 };
+    if (setgroups(1, g) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 90;
+    return map0_connect() == 0 ? 0 : 91;
+}
+static int mounted_sock_group_dac(void)
+{
+    int lsn = -1, up = 0;
+    static const char *const dirs[] = { "/root", "/var", "/home", "/mnt", NULL };
+    for (int i = 0; dirs[i] && !up; i++) {
+        map0_sa.sun_family = AF_UNIX;
+        snprintf(map0_sa.sun_path, sizeof map0_sa.sun_path, "%s/idroot0b-grp.sock", dirs[i]);
+        unlink(map0_sa.sun_path);
+        lsn = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (lsn >= 0 && bind(lsn, (struct sockaddr *)&map0_sa, sizeof map0_sa) == 0 && listen(lsn, 8) == 0 &&
+            chown(map0_sa.sun_path, 4242, 5000) == 0 && chmod(map0_sa.sun_path, 0020) == 0) up = 1;
+        else { if (lsn >= 0) close(lsn); lsn = -1; }
+    }
+    if (!up) return SKIP;
+    pid_t p = fork();
+    if (p == 0) _exit(mnt_sock_group_child(NULL));
+    int st = 0; waitpid(p, &st, 0);
+    int ok1 = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    chmod(map0_sa.sun_path, 0000);   /* no group bit: the same caller is refused */
+    p = fork();
+    if (p == 0) _exit(mnt_sock_group_child(NULL));
+    waitpid(p, &st, 0);
+    int ok2 = WIFEXITED(st) && WEXITSTATUS(st) == 91;
+    close(lsn); unlink(map0_sa.sun_path);
+    CHECK(ok1);
+    CHECK(ok2);
+    return 0;
+}
+
+/* Root of a namespace that maps kuid 0 (euid 0) still is not host root. */
+static pid_t map0_target;
+static int map0_nsroot_body(void)
+{
+    if (unshare(CLONE_NEWUSER) != 0) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (wr("/proc/self/uid_map", "0 0 1\n") || wr("/proc/self/setgroups", "deny") ||
+        wr("/proc/self/gid_map", "0 0 1\n")) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (getuid() != 0 || geteuid() != 0) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (!(raw_socket_refused() && alarm_timer_refused() && reboot_refused() && set_mm_refused())) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (syscall(SYS_finit_module, -1, "", 0) != -1 || errno != EPERM) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }          /* module load */
+    if (kill(map0_target, 0) != -1 || errno != EPERM) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }                        /* host proc of kuid 1000 */
+    /* host-global /proc knob (CAP_SYS_ADMIN in the initial ns): kuid 0 DAC alone must not open it up */
+    int fd = open("/proc/drm/fence_hold", O_WRONLY);
+    if (fd >= 0) { ssize_t w = write(fd, "0\n", 2); close(fd); if (w == 2) { printf("  map0 step line %d (host knob write succeeded)\n", __LINE__); return 0; } }
+    if (map0_drm_fd >= 0) {              /* DRM test ioctls: host-wide knobs behind host CAP_SYS_ADMIN */
+        unsigned long long v = ~0ULL;
+        if (ioctl(map0_drm_fd, 0x100B, 0) == 0) { printf("  map0 step line %d (fake HPD ioctl allowed)\n", __LINE__); return 0; }
+        if (ioctl(map0_drm_fd, 0x100A, &v) == 0) { printf("  map0 step line %d (ctx drain ioctl allowed)\n", __LINE__); return 0; }
+        v = 0;
+        if (ioctl(map0_drm_fd, 0x1009, &v) == 0) { printf("  map0 step line %d (park spin ioctl allowed)\n", __LINE__); return 0; }
+    }
+    if (map0_sock_up && (map0_connect() == 0 || errno != EACCES)) { printf("  map0 step line %d (mounted sock connect errno %d)\n", __LINE__, errno); return 0; }
+    if (map0_ovl_read() > 0) { printf("  map0 step line %d (ovl_selftest ran)\n", __LINE__); return 0; }
+    return 1;
+}
+static int map0_control_body(void) /* same probes as host root: module load passes the priv check, kill ok */
+{
+    if (syscall(SYS_finit_module, -1, "", 0) != -1 || errno == EPERM) return 0;
+    if (kill(map0_target, 0) != 0) return 0;
+    int fd = open("/proc/drm/fence_hold", O_WRONLY);
+    if (fd < 0) return 0;
+    ssize_t w = write(fd, "0\n", 2); close(fd);
+    if (w != 2) return 0;
+    if (map0_drm_fd >= 0) {
+        unsigned long long v = ~0ULL;   /* u64::MAX = default: harmless */
+        if (ioctl(map0_drm_fd, 0x100B, 0) != 0) { printf("  ctl line %d errno %d\n", __LINE__, errno); return 0; }
+        if (ioctl(map0_drm_fd, 0x100A, &v) != 0) { printf("  ctl line %d errno %d\n", __LINE__, errno); return 0; }
+    }
+    if (map0_sock_up && map0_connect() != 0) { printf("  ctl line %d errno %d\n", __LINE__, errno); return 0; }
+    if (map0_ovl_read() <= 0) { printf("  ctl line %d ovl read\n", __LINE__); return 0; }
+    return 1;
+}
+static int ns_euid0_not_host_map0(void)
+{
+    int sp[2];
+    CHECK(pipe(sp) == 0);
+    map0_target = fork();
+    CHECK(map0_target >= 0);
+    if (map0_target == 0) { if (setresuid(1000, 1000, 1000)) _exit(1); (void)!write(sp[1], "r", 1); pause(); _exit(0); }
+    char ch; CHECK(read(sp[0], &ch, 1) == 1);
+    map0_drm_fd = open("/dev/dri/card0", O_RDWR);
+    if (map0_drm_fd < 0) printf("  note: no /dev/dri/card0, DRM probes skipped\n");
+    int lsn = -1;
+    static const char *const dirs[] = { "/root", "/var", "/home", "/mnt", NULL };
+    for (int i = 0; dirs[i] && !map0_sock_up; i++) {
+        map0_sa.sun_family = AF_UNIX;
+        snprintf(map0_sa.sun_path, sizeof map0_sa.sun_path, "%s/idroot0b-map0.sock", dirs[i]);
+        unlink(map0_sa.sun_path);
+        lsn = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (lsn >= 0 && bind(lsn, (struct sockaddr *)&map0_sa, sizeof map0_sa) == 0 && listen(lsn, 8) == 0 &&
+            chown(map0_sa.sun_path, 4242, 4242) == 0 && chmod(map0_sa.sun_path, 0700) == 0) map0_sock_up = 1;
+        else { if (lsn >= 0) close(lsn); lsn = -1; }
+    }
+    if (!map0_sock_up) printf("  note: no mounted-fs socket bind possible, connect probe skipped\n");
+    int ctl = run_child(map0_control_body);
+    int ok = run_child(map0_nsroot_body);
+    kill(map0_target, SIGKILL); waitpid(map0_target, NULL, 0);
+    if (map0_sock_up) { close(lsn); unlink(map0_sa.sun_path); }
+    if (map0_drm_fd >= 0) close(map0_drm_fd);
+    CHECK(ctl);
+    CHECK(ok);
+    return 0;
+}
+
+/* bwrap --unshare-all --uid 0 as root (writes "0 0 1"); raw unshare path if bwrap is absent. */
+static int bwrap_root_unshare_all(void)
+{
+    const char *bw = access("/usr/bin/bwrap", X_OK) == 0 ? "/usr/bin/bwrap"
+                   : access("/bin/bwrap", X_OK) == 0 ? "/bin/bwrap" : NULL;
+    if (!bw) return run_ok(kuid0_self_cap_child) ? 0 : 1;
+    pid_t p = fork();
+    CHECK(p >= 0);
+    if (p == 0) {
+        execl(bw, "bwrap", "--unshare-all", "--uid", "0", "--gid", "0", "--ro-bind", "/", "/", "/bin/true", (char *)NULL);
+        _exit(127);
+    }
+    int st = 0; waitpid(p, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     return 0;
 }
 
@@ -2220,7 +2488,13 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "gid_before_deny_eperm", gid_before_deny_eperm },
     { "setgroups_deny_inherited", setgroups_deny_inherited },
     { "nested_create_unmapped_eperm", nested_create_unmapped_eperm },
-    { "map_kuid0_eperm", map_kuid0_eperm },
+    { "map_kuid0_needs_setfcap", map_kuid0_needs_setfcap },
+    { "fcred_open_nocap_write_cap", fcred_open_nocap_write_cap },
+    { "fcred_open_cap_write_nocap", fcred_open_cap_write_nocap },
+    { "nested_parent_root_setfcap", nested_parent_root_setfcap },
+    { "mounted_sock_group_dac", mounted_sock_group_dac },
+    { "ns_euid0_not_host_map0", ns_euid0_not_host_map0 },
+    { "bwrap_root_unshare_all", bwrap_root_unshare_all },
     { "priv_multi_extent", priv_multi_extent },
     { "nested_view", nested_view },
     { "nested_map_composed", nested_map_composed },
