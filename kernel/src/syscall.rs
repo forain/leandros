@@ -9183,7 +9183,19 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     if let Some((pid, rest)) = proc_magic(b, b"root") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return Err(-2); }
-            if !proc_root_allowed(pid) { return Err(-13); }
+            if !proc_link_allowed(pid) { return Err(-13); }
+            // Another process in a different mount namespace (a Flatpak
+            // sandbox, its xdg-dbus-proxy): the open lands on the root of
+            // THAT namespace's tree, as on Linux, so xdg-desktop-portal can
+            // read `<root>/.flatpak-info` for every caller. The link text
+            // (readlink) stays refused: it cannot be written in our view.
+            let tm = sched::ns::mntns_of(pid);
+            if tm != sched::current_mntns() {
+                if tm == 0 { return Err(-13); }
+                // A chrooted target lands on its fs root inside its namespace.
+                let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
+                return KPath::from_ns_mnt(r, tm);
+            }
             let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
             return KPath::from_ns(r);
         }
@@ -12016,7 +12028,7 @@ impl KPath {
         } };
         if mid0 != 0 {
             let pid = current_pid();
-            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: mid0, hidden_flags: Some(fl) });
+            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: mid0, hidden_flags: Some(fl), ns: None });
             kp.ctx_pid = pid;
         }
         Ok(kp)
@@ -12047,7 +12059,8 @@ impl KPath {
         kp.mnt_id = mid;
         kp.ns_prefix_len = plen;
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid, hidden_flags: None });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid, hidden_flags: None,
+            ns: if mns != sched::current_mntns() { Some(mns) } else { None } });
         kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
@@ -12086,6 +12099,14 @@ fn proc_link_allowed(pid: u32) -> bool {
 /// refused (EACCES) instead of being resolved in the caller's view.
 fn proc_root_allowed(pid: u32) -> bool {
     proc_link_allowed(pid) && sched::ns::mntns_of(pid) == sched::current_mntns()
+}
+
+/// The `/proc/<pid>/root/<rest>` hop (not cwd): allowed into the caller's own
+/// mount namespace or into another non-zero one, whose tree translates the rest.
+fn proc_root_hop_allowed(pid: u32) -> bool {
+    if !proc_link_allowed(pid) { return false; }
+    let tm = sched::ns::mntns_of(pid);
+    tm == sched::current_mntns() || tm != 0
 }
 
 fn proc_magic<'a>(p: &'a [u8], what: &[u8]) -> Option<(u32, &'a [u8])> {
@@ -12149,7 +12170,10 @@ fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
-        if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { *denied = true; break; }
+        let allowed = if is_root { proc_root_hop_allowed(pid) } else { proc_root_allowed(pid) };
+        if sched::exists_probe(pid) == 0 && !allowed { *denied = true; break; }
+        let tm = if is_root && sched::exists_probe(pid) == 0 { sched::ns::mntns_of(pid) } else { sched::current_mntns() };
+        let cross = tm != sched::current_mntns();
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,
@@ -12165,7 +12189,8 @@ fn backing_walk_m(ns: &[u8], crossed: &mut bool, denied: &mut bool, mns: sched::
         // Fail closed: a path that does not translate (hidden pool, missing
         // tree) must never fall back to the raw host path.
         if vfs::mnt::is_sb_path(&v) { return None; }
-        match mnt_xlate(mns, &v, crossed, mid, plen, false) {
+        let xm = if cross { tm } else { mns };
+        match mnt_xlate(xm, &v, crossed, mid, plen, false) {
             Some(t) => cur = Some(t),
             None => return None,
         }
@@ -12183,7 +12208,10 @@ fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<
         let hit = proc_magic(p, b"root").map(|(pid, rest)| (pid, rest, true))
             .or_else(|| proc_magic(p, b"cwd").map(|(pid, rest)| (pid, rest, false)));
         let (pid, rest, is_root) = match hit { Some(h) if !h.1.is_empty() => h, _ => break };
-        if sched::exists_probe(pid) == 0 && !proc_root_allowed(pid) { *denied = true; break; }
+        let allowed = if is_root { proc_root_hop_allowed(pid) } else { proc_root_allowed(pid) };
+        if sched::exists_probe(pid) == 0 && !allowed { *denied = true; break; }
+        let tm = if is_root && sched::exists_probe(pid) == 0 { sched::ns::mntns_of(pid) } else { sched::current_mntns() };
+        let cross = tm != sched::current_mntns();
         let base: alloc::sync::Arc<[u8]> = if is_root {
             match sched::root_arc_of(pid) {
                 Some(r) => r,
@@ -12196,8 +12224,16 @@ fn backing_walk_ns0(ns: &[u8], crossed: &mut bool, denied: &mut bool) -> Option<
         let mut v = Vec::with_capacity(base.len() + rest.len());
         if &*base != b"/" { v.extend_from_slice(&base); }
         v.extend_from_slice(rest);
-        *crossed |= vfs::alias::crosses(&v);
-        let t = vfs::alias::translate(&v).unwrap_or(v);
+        let t = if cross {
+            // Another namespace's tree: translate through it (fail closed).
+            match vfs::mnt::translate(tm, &v) {
+                Some(x) => { *crossed |= x.flags & vfs::mnt::MNT_NOSUID != 0; x.backing }
+                None => return Some(b"/.leandros-hidden".to_vec()),
+            }
+        } else {
+            *crossed |= vfs::alias::crosses(&v);
+            vfs::alias::translate(&v).unwrap_or(v)
+        };
         // ns 0 has no "missing tree" None (None means identity), so hand the VFS a
         // name that cannot exist: ENOENT.
         if vfs::mnt::is_sb_path(&t) { return Some(b"/.leandros-hidden".to_vec()); }
@@ -12327,7 +12363,7 @@ fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize
     };
     if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV | vfs::mnt::MNT_NOEXEC) != 0 {
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: vfs::fd_mnt(pid, fd).map_or(0, |x| x.1), hidden_flags: Some(fl) });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: vfs::fd_mnt(pid, fd).map_or(0, |x| x.1), hidden_flags: Some(fl), ns: None });
         kp.ctx_pid = pid;
     }
     Ok(kp)
@@ -12524,6 +12560,22 @@ fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
     if raw.is_empty() { return Err(-2); }
     let d = dirfd as u32 as i32 as isize as usize;
     if d != AT_FDCWD && raw.first() != Some(&b'/') {
+        // A directory fd opened through ANOTHER mount namespace's tree
+        // (open of /proc/<pid>/root of a sandboxed task: the portal then
+        // openat()s `.flatpak-info` below it): walk below it in that tree.
+        if let Some((n, _)) = vfs::fd_mnt(current_pid(), d) {
+            if n != u16::MAX && n != 0 && n != sched::current_mntns() {
+                let p = fd_ns_path(n, d, b"").ok_or(-2isize)?;
+                let mut out: Vec<u8> = Vec::new();
+                for c in p.split(|&b| b == b'/').chain(raw.split(|&b| b == b'/')) {
+                    if c.is_empty() || c == b"." { continue; }
+                    if c == b".." { while let Some(x) = out.pop() { if x == b'/' { break; } } continue; }
+                    out.push(b'/'); out.extend_from_slice(c);
+                }
+                if out.is_empty() { out.push(b'/'); }
+                return KPath::from_ns_mnt(out, n);
+            }
+        }
         if let Some(h) = fd_hidden_host(sched::current_mntns(), d) { return hidden_below(h, &raw, d); }
     }
     KPath::from_ns(resolve_at_ns(dirfd, &raw)?)
