@@ -683,11 +683,11 @@ pub fn sticky_denies_c(dir: &FileMeta, victim: &FileMeta, cred: &Cred) -> bool {
 /// the owner included — loses the bits: the program being run is no longer
 /// the one that was granted them. 0 when nothing must change.
 #[inline]
-pub fn setid_kill_bits(mode: u16, fsuid: u32) -> u16 {
+pub fn setid_kill_bits(mode: u16) -> u16 {
     const S_ISUID: u16 = 0o4000;
     const S_ISGID: u16 = 0o2000;
     const S_IXGRP: u16 = 0o0010;
-    if fsuid == 0 || mode & S_IFMT != S_IFREG { return 0; }
+    if mode & S_IFMT != S_IFREG { return 0; }
     let mut kill = mode & S_ISUID;
     if mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP) { kill |= S_ISGID; }
     kill
@@ -698,7 +698,7 @@ pub fn setid_kill_bits(mode: u16, fsuid: u32) -> u16 {
 #[inline]
 pub fn setid_kill_bits_c(meta: &FileMeta, cred: &Cred) -> u16 {
     if cred.cap_inode(CAP_FSETID, meta.uid, meta.gid) { return 0; }
-    setid_kill_bits(meta.mode, u32::MAX)
+    setid_kill_bits(meta.mode)
 }
 
 /// fs.protected_hardlinks (Linux `may_linkat`, on by default on every major
@@ -706,11 +706,10 @@ pub fn setid_kill_bits_c(meta: &FileMeta, cred: &Cred) -> u16 {
 /// if it is a regular file, not set-uid, not set-gid-and-group-executable,
 /// and the caller could open it for reading AND writing (`may_rw`). Root and
 /// the owner are exempt. Returns true when link(2) must fail with EPERM.
-pub fn hardlink_denied(src: &FileMeta, euid: u32, may_rw: bool) -> bool {
+pub fn hardlink_denied(src: &FileMeta, may_rw: bool) -> bool {
     const S_ISUID: u16 = 0o4000;
     const S_ISGID: u16 = 0o2000;
     const S_IXGRP: u16 = 0o0010;
-    if euid == 0 || euid == src.uid { return false; }
     if src.mode & S_IFMT != S_IFREG { return true; }
     if src.mode & S_ISUID != 0 { return true; }
     if src.mode & (S_ISGID | S_IXGRP) == (S_ISGID | S_IXGRP) { return true; }
@@ -721,7 +720,7 @@ pub fn hardlink_denied(src: &FileMeta, euid: u32, may_rw: bool) -> bool {
 /// exempts the owner and `capable_wrt_inode_uidgid(CAP_FOWNER)`).
 pub fn hardlink_denied_c(src: &FileMeta, cred: &Cred, may_rw: bool) -> bool {
     if cred.euid == src.uid || cred.cap_inode(CAP_FOWNER, src.uid, src.gid) { return false; }
-    hardlink_denied(src, u32::MAX, may_rw)
+    hardlink_denied(src, may_rw)
 }
 
 /// Unified permission check for open/faccessat: POSIX 1003.1e ACL walk when

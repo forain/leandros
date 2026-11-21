@@ -16154,7 +16154,7 @@ fn tmp_meta(e: &TmpFileEntry) -> xattr::FileMeta {
 /// Does tmpfs file `idx` carry a set-ID bit a write would strip? The cheap
 /// pre-check that spares the common write the caller's fsuid lookup.
 fn tmp_has_setid(tmp: &[TmpFileEntry], idx: usize) -> bool {
-    xattr::setid_kill_bits(tmp_meta(&tmp[tmp_owner(tmp, idx)]).mode, u32::MAX) != 0
+    xattr::setid_kill_bits(tmp_meta(&tmp[tmp_owner(tmp, idx)]).mode) != 0
 }
 
 /// Strip the set-ID bits of tmpfs file `idx` as a write, truncate or O_TRUNC
