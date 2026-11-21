@@ -639,6 +639,13 @@ build_gstreamer() {
     if [[ "${LEANDROS_GSTREAMER_REBUILD:-0}" != 1 && -f "$stamp" ]] \
        && leandros_port_fresh "$port" "$arch"; then
         echo "  up to date ($port/out/$arch)"
+        # ports/gstreamer/build.sh merges its -dev tree into the m3 cross sysroot only on a
+        # rebuild; an out/ seeded from another checkout, or a fresh artifacts dir, would leave
+        # cosmic-player without glib-2.0.pc. Same no-clobber merge, here on the fresh path.
+        local sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch"
+        if [[ -d "$port/out/$arch.sysroot" && -d "$sys" && ! -f "$sys/usr/lib/pkgconfig/gstreamer-1.0.pc" ]]; then
+            cp -a -n "$port/out/$arch.sysroot/." "$sys/" && echo "  sysroot merged into $sys"
+        fi
         return 0
     fi
     stage_container_port "$port" "$arch" gstreamer GStreamer GSTREAMER
