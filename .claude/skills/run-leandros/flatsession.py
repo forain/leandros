@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""flatsession.py <arch> <outdir> [gui|probe:<script>] [--venus]
+"""flatsession.py <arch> <outdir> [gui|gpu|probe:<script>] [--venus]
 
 GPU boot (virgl default, --venus optional), greeter login as leandro, then in ONE session: apk add flatpak,
 flatpak install --user Flatseal (skipped if present), GUI `flatpak run` with WAYLAND_DEBUG=1 (90 s), checks.
@@ -66,7 +66,7 @@ if MODE.startswith("probe:"):
 
 # d) plain `flatpak run` as leandro (no session): command mode
 sh("su leandro -c 'flatpak run --command=sh com.github.tchx84.Flatseal -c \"echo inside; id\" 2>&1 | tail -n 3; echo run rc=$?'", 300)
-if MODE != "gui":
+if MODE not in ("gui", "gpu"):
     R.close(); drv("stop", t=60); print("FLATSESSION done", flush=True); sys.exit(0)
 
 wait_for("greeter", lambda: have("cosmic-greeter"), 150)
@@ -88,6 +88,96 @@ put("/tmp/cap.sh", [
     "done",
     "[ -s /tmp/env.txt ] && echo CAPTURED || echo CAPTURE-FAILED", "chmod 644 /tmp/env.txt; cat /tmp/env.txt; ls /run/user/1000"])
 sh("/tmp/cap.sh 2>&1", 90)
+if MODE == "gpu":
+    FA = "com.github.tchx84.Flatseal"
+    put("/tmp/probe.py", [
+        "import gi, ctypes, sys, os",
+        "gi.require_version('Gtk','4.0')",
+        "from gi.repository import Gtk, GLib",
+        "print('PROBE-START', flush=True)",
+        "def gl(name, lib):",
+        "    try:",
+        "        l = ctypes.CDLL(lib); l.glGetString.restype = ctypes.c_char_p; l.glGetString.argtypes = [ctypes.c_uint]",
+        "        print('GLSTR', lib, name, l.glGetString({'VENDOR':0x1F00,'RENDERER':0x1F01,'VERSION':0x1F02}[name]), flush=True)",
+        "    except Exception as e: print('GLSTR-FAIL', lib, e, flush=True)",
+        "Gtk.init()",
+        "loop = GLib.MainLoop()",
+        "w = Gtk.Window(); a = Gtk.GLArea(); a.set_size_request(300, 200); w.set_child(a)",
+        "def real(area):",
+        "    area.make_current(); e = area.get_error()",
+        "    print('GLAREA-ERR' if e else 'GLAREA-OK', e.message if e else '', flush=True)",
+        "    if not e:",
+        "        for n in ('VENDOR','RENDERER','VERSION'):",
+        "            gl(n, 'libGLESv2.so.2'); gl(n, 'libGL.so.1')",
+        "    r = w.get_native().get_renderer()",
+        "    print('GSK-RENDERER-TYPE', r.__gtype__.name if r else None, flush=True)",
+        "a.connect('realize', real); w.present(); GLib.timeout_add_seconds(10, loop.quit); loop.run(); print('PROBE-END', flush=True)"])
+    put("/tmp/png.py", [
+        "import zlib, struct, sys, hashlib",
+        "def load(p):",
+        "    d = open(p,'rb').read(); i = 8; idat = b''",
+        "    while i < len(d):",
+        "        n, t = struct.unpack('>I4s', d[i:i+8]); c = d[i+8:i+8+n]; i += 12 + n",
+        "        if t == b'IHDR': w, h, bd, ct = struct.unpack('>IIBB', c[:10]); assert bd == 8 and ct in (2, 6)",
+        "        elif t == b'IDAT': idat += c",
+        "    bpp = 3 if ct == 2 else 4; st = w * bpp; raw = zlib.decompress(idat); rows = []; prev = bytearray(st)",
+        "    for y in range(h):",
+        "        f = raw[y*(st+1)]; cur = bytearray(raw[y*(st+1)+1:(y+1)*(st+1)])",
+        "        if f == 1:",
+        "            for x in range(bpp, st): cur[x] = (cur[x] + cur[x-bpp]) & 255",
+        "        elif f == 2:",
+        "            for x in range(st): cur[x] = (cur[x] + prev[x]) & 255",
+        "        elif f == 3:",
+        "            for x in range(st): cur[x] = (cur[x] + (((cur[x-bpp] if x >= bpp else 0) + prev[x]) >> 1)) & 255",
+        "        elif f == 4:",
+        "            for x in range(st):",
+        "                a = cur[x-bpp] if x >= bpp else 0; b = prev[x]; c = prev[x-bpp] if x >= bpp else 0",
+        "                pa = abs(b-c); pb = abs(a-c); pc = abs(a+b-2*c)",
+        "                cur[x] = (cur[x] + (a if pa <= pb and pa <= pc else (b if pb <= pc else c))) & 255",
+        "        rows.append(bytes(cur)); prev = cur",
+        "    return w, h, bpp, rows",
+        "w, h, bpp, A = load('/tmp/shots-base.png'); _, _, _, B = load('/tmp/shots-' + sys.argv[1] + '.png')",
+        "x0 = y0 = 10**9; x1 = y1 = -1; n = 0",
+        "for y in range(h):",
+        "    if A[y] == B[y]: continue",
+        "    for x in range(w):",
+        "        if A[y][x*bpp:x*bpp+3] != B[y][x*bpp:x*bpp+3]:",
+        "            n += 1; x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)",
+        "print('size', w, h, 'diff_px', n, 'bbox', (x0, y0, x1, y1) if n else None)",
+        "if n:",
+        "    cols = set(); hh = hashlib.sha1()",
+        "    for y in range(y0, y1+1):",
+        "        r = B[y][x0*bpp:(x1+1)*bpp]; hh.update(r)",
+        "        for x in range(0, len(r), bpp): cols.add(r[x:x+3])",
+        "    print('crop_distinct_colors', len(cols), 'crop_sha1', hh.hexdigest())"])
+    put("/tmp/gp.sh", [
+        "#!/bin/sh", "set -a; . /tmp/env.txt; set +a", "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}",
+        "C=$HOME/.var/app/" + FA + "/cache; mkdir -p $C; cp /tmp/probe.py $C/probe.py",
+        "tag=$1; shift",
+        "echo PROBE-$tag; timeout 60 flatpak run \"$@\" --env=GSK_DEBUG=renderer --env=GDK_DEBUG=opengl,vulkan --command=python3 " + FA + " $C/probe.py > /tmp/gp-$tag.log 2>&1; echo rc=$?",
+        "grep -a -v -E '^\\[ *[0-9]+\\.' /tmp/gp-$tag.log | cut -c1-200 | tail -n 40",
+        "echo PROBE-END-$tag"])
+    put("/tmp/gs.sh", [
+        "#!/bin/sh", "set -a; . /tmp/env.txt; set +a", "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}",
+        "mkdir -p /tmp/shots; rm -f /tmp/shots/*",
+        "timeout 60 cosmic-screenshot --interactive=false --save-dir /tmp/shots 2>&1 | tail -n 3; for f in /tmp/shots/*.png; do mv $f /tmp/shots-$1.png; done; ls -l /tmp/shots-$1.png; sha1sum /tmp/shots-$1.png"])
+    put("/tmp/gg.sh", [  # Flatseal GUI for 120 s, args = flatpak run options
+        "#!/bin/sh", "set -a; . /tmp/env.txt; set +a", "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}", "tag=$1; shift",
+        "timeout 130 flatpak run \"$@\" --env=GSK_DEBUG=renderer --env=GDK_DEBUG=opengl,vulkan " + FA + " > /tmp/gg-$tag.log 2>&1"])
+    sh("chmod 755 /tmp/gp.sh /tmp/gs.sh /tmp/gg.sh; chmod 1777 /tmp; apk update 2>&1 | tail -n 1; apk add python3 2>&1 | tail -n 2; python3 -V", 400)
+    sh("su leandro -c '. /tmp/env.txt; export DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR; /usr/libexec/leandros-sysbus portal screenshot 60' 2>&1 | tail -n 3; rm -f /tmp/screenshot-*.png", 150)
+    sh("su leandro -c '/tmp/gs.sh base' 2>&1", 120)
+    sh("su leandro -c \"flatpak run --command=sh " + FA + " -c 'which python3 python3.12 gjs; python3 -c \\\"import gi; print(gi.__file__)\\\"; ls /dev/dri; echo ICD; ls /usr/share/vulkan/icd.d'\" 2>&1 | tail -n 14", 200)
+    sh("su leandro -c '/tmp/gp.sh default' 2>&1", 200)
+    sh("su leandro -c '/tmp/gp.sh ngl --env=GSK_RENDERER=ngl' 2>&1", 200)
+    for tag, extra in (("dflt", ""), ("ngl", "--env=GSK_RENDERER=ngl")):
+        sh("su leandro -c '/tmp/gg.sh " + tag + " " + extra + " &' ; sleep 1; echo started", 30)
+        ser.pump(80 * scale)
+        sh("su leandro -c '/tmp/gs.sh " + tag + "' 2>&1; python3 /tmp/png.py " + tag + " 2>&1 | tail -n 8", 400)
+        sh("grep -a -E 'Not using|Using renderer|trying|renderer|Failed|vulkan|Vulkan' /tmp/gg-" + tag + ".log | cut -c1-200 | head -n 20; grep -a -c . /tmp/gg-" + tag + ".log", 60)
+        ser.pump(55 * scale)
+    R.close(); drv("stop", t=60); print("FLATSESSION done", flush=True); sys.exit(0)
+
 put("/tmp/fgui.sh", [
     "#!/bin/sh", "set -a; [ -s /tmp/env.txt ] && . /tmp/env.txt; set +a",
     ": ${XDG_RUNTIME_DIR:=/run/user/1000}; : ${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}; export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS",
