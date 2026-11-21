@@ -17,7 +17,7 @@ set -euo pipefail
 
 TAG="20240909"
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain"
-CACHE="${INTEL_BT_CACHE:-$HOME/.cache/leandros/intel-bt}"
+CACHE="${INTEL_BT_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/intel-bt}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 

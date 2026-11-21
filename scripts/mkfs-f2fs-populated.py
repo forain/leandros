@@ -1276,7 +1276,7 @@ def main():
             for _l in open(_orm_ver):
                 if _l.startswith("OPENRM_TAG="):
                     _orm_tag = _l.split("=", 1)[1].strip().strip('"')
-        _orm_cache = os.path.expanduser(os.environ.get("OPENRM_CACHE", "~/.cache/leandros/openrm"))
+        _orm_cache = os.path.expanduser(os.environ.get("OPENRM_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/openrm")))
         if _orm_tag:
             _fw_src = os.path.join(_orm_cache, "firmware", _orm_tag)
             _fw_dir = f"/lib/firmware/nvidia/{_orm_tag}"
@@ -1318,7 +1318,7 @@ def main():
     # Redistributable but never committed; absent cache -> skipped (the
     # driver works without them).
     if arch == "x86_64":
-        _rtl_cache = os.path.expanduser(os.environ.get("RTL_NIC_CACHE", "~/.cache/leandros/rtl_nic"))
+        _rtl_cache = os.path.expanduser(os.environ.get("RTL_NIC_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/rtl_nic")))
         if os.path.isdir(_rtl_cache):
             _rtl = sorted(f for f in os.listdir(_rtl_cache) if f.endswith(".fw"))
             for _f in _rtl:
@@ -1335,7 +1335,7 @@ def main():
     # Wi-Fi credentials are NEVER in the repo: $LEANDROS_WIFI_CONF may name a
     # host file (`ssid=...` / `psk=...` lines) to stage as /etc/leandros/wifi.conf.
     if arch == "x86_64":
-        _iwl_cache = os.path.expanduser(os.environ.get("IWLWIFI_CACHE", "~/.cache/leandros/iwlwifi"))
+        _iwl_cache = os.path.expanduser(os.environ.get("IWLWIFI_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/iwlwifi")))
         if os.path.isdir(_iwl_cache):
             _iwl = sorted(f for f in os.listdir(_iwl_cache) if f.startswith("iwlwifi-") and f.endswith(".ucode"))
             for _f in _iwl:
@@ -1347,7 +1347,7 @@ def main():
     # ibt-*.{sfi,ddc} from the cache ports/intel-bt/fetch.sh fills
     # ($INTEL_BT_CACHE, default ~/.cache/leandros/intel-bt). Absent -> skipped.
     if arch == "x86_64":
-        _ibt_cache = os.path.expanduser(os.environ.get("INTEL_BT_CACHE", "~/.cache/leandros/intel-bt"))
+        _ibt_cache = os.path.expanduser(os.environ.get("INTEL_BT_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/intel-bt")))
         if os.path.isdir(_ibt_cache):
             _ibt = sorted(f for f in os.listdir(_ibt_cache) if f.startswith("ibt-") and (f.endswith(".sfi") or f.endswith(".ddc")))
             for _f in _ibt:
@@ -1361,7 +1361,7 @@ def main():
     # 5-model-b.txt} from the cache ports/brcmfmac/fetch.sh fills
     # ($BRCMFMAC_CACHE, default ~/.cache/leandros/brcmfmac). Absent -> skipped.
     if arch == "aarch64":
-        _brc_cache = os.path.expanduser(os.environ.get("BRCMFMAC_CACHE", "~/.cache/leandros/brcmfmac"))
+        _brc_cache = os.path.expanduser(os.environ.get("BRCMFMAC_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/brcmfmac")))
         if os.path.isdir(_brc_cache):
             _brc = sorted(f for f in os.listdir(_brc_cache)
                           if (f.startswith("cyw43455-sdio.") or f.startswith("brcmfmac43455-sdio.")) and not f.endswith(".part"))
@@ -1372,7 +1372,7 @@ def main():
                 print(f"  brcmfmac firmware: {len(_brc)} files in /lib/firmware/brcm")
         # Pi 5 Bluetooth patch (BCM4345C0.hcd) from ports/bluez-firmware/fetch.sh's
         # cache ($BTFW_CACHE, default ~/.cache/leandros/bluez-firmware). Absent -> skipped.
-        _bt_cache = os.path.expanduser(os.environ.get("BTFW_CACHE", "~/.cache/leandros/bluez-firmware"))
+        _bt_cache = os.path.expanduser(os.environ.get("BTFW_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/bluez-firmware")))
         _bt_hcd = os.path.join(_bt_cache, "BCM4345C0.hcd")
         if os.path.isfile(_bt_hcd):
             m4_share_dirs.update(("/lib/firmware", "/lib/firmware/brcm"))

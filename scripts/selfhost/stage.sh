@@ -18,12 +18,12 @@ set -euo pipefail
 ARCH="${1:-aarch64}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]" >&2; exit 2 ;; esac
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-OUT="${LEANDROS_SELFHOST_DIR:-$HOME/.cache/leandros/selfhost}/$ARCH"
+OUT="${LEANDROS_SELFHOST_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/selfhost}/$ARCH"
 CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")
 DATE=${CHANNEL#nightly-}
 [[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "unexpected channel '$CHANNEL'" >&2; exit 1; }
 DIST="https://static.rust-lang.org/dist/$DATE"
-CACHE="$HOME/.cache/leandros/rust-nightly/$DATE"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/leandros/rust-nightly/$DATE"
 HOST_TRIPLE="$ARCH-unknown-linux-musl"
 mkdir -p "$OUT" "$CACHE"
 

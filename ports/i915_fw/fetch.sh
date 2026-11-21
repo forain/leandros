@@ -22,7 +22,7 @@ set -euo pipefail
 
 TAG="20240909"
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/i915"
-CACHE="${I915_FW_CACHE:-$HOME/.cache/leandros/i915}"
+CACHE="${I915_FW_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/i915}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 

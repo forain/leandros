@@ -123,7 +123,7 @@ rustflags = ["-C", "relocation-model=static", "-C", "link-self-contained=yes"]
 CFG
 
 # Cargo target dir shared by all worktrees (cargo locks it), not per checkout.
-BUSD_TARGET="${LEANDROS_PORTS_CACHE:-$HOME/Library/Caches/leandros-ports}/busd-target"
+BUSD_TARGET="${LEANDROS_PORTS_CACHE:-$( [ "$(uname -s)" = Darwin ] && echo "$HOME/Library/Caches" || echo "${XDG_CACHE_HOME:-$HOME/.cache}")/leandros-ports}/busd-target"
 mkdir -p "$BUSD_TARGET"
 
 for arch in "${ARCHES[@]}"; do

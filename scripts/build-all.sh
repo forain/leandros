@@ -99,6 +99,10 @@ for _w in "$ROOT_DIR"/scripts/linker-*-musl.sh "$ROOT_DIR"/scripts/cc-*-musl.sh 
     [[ -f "$_w" ]] || continue
     cmp -s "$_w" "$TOOLS_DIR/$(basename "$_w")" || { cp "$_w" "$TOOLS_DIR/.$$.tmp" && chmod +x "$TOOLS_DIR/.$$.tmp" && mv "$TOOLS_DIR/.$$.tmp" "$TOOLS_DIR/$(basename "$_w")"; }
 done
+# The installed wrappers exec scripts/toolchain/*, which is not beside them in
+# $TOOLS_DIR. Point them at this worktree's toolchain through the environment:
+# cargo fingerprints RUSTFLAGS (the wrapper path), not the environment.
+export LEANDROS_TC_SRC="$ROOT_DIR/scripts/toolchain"
 
 # The sibling repos (brush, coreutils, bottom) are built from their own
 # directories, which rust-toolchain.toml does not reach — it only applies inside

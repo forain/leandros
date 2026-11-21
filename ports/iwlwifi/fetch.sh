@@ -22,7 +22,7 @@ set -euo pipefail
 
 TAG="20240909"
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain"
-CACHE="${IWLWIFI_CACHE:-$HOME/.cache/leandros/iwlwifi}"
+CACHE="${IWLWIFI_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/iwlwifi}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 

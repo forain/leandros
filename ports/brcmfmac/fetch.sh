@@ -26,7 +26,7 @@ set -euo pipefail
 
 COMMIT="c91cd2804cf7463aab913e7247c176049f16bbd6"
 BASE="https://raw.githubusercontent.com/RPi-Distro/firmware-nonfree/$COMMIT/debian/config/brcm80211"
-CACHE="${BRCMFMAC_CACHE:-$HOME/.cache/leandros/brcmfmac}"
+CACHE="${BRCMFMAC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/brcmfmac}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
