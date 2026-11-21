@@ -327,6 +327,9 @@ SUITES = {
                 "host:f2fsnidtest.py",
                 # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
                 "host:f2fscommittest.py",
+                # Atomic small writes: checkpoints per write (plain 1, cosmic-config 2) and power cuts
+                # between fsync / rename / dir fsync (lane f2fsckpt3; own boots, stops this VM).
+                "host:f2fsckpttest.py",
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 # A spin-locked caller reading a file (the wifi-brcmf ctl poll) must not stall f2fs
@@ -430,6 +433,7 @@ SUITES = {
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
+    "f2fsckpt": ["host:f2fsckpttest.py"],
     "f2fsgc": ["host:f2fsgctest.py"],
     "a64acpi": ["host:a64acpitest.py"],
     "blank": ["host:blanktest.py"],
@@ -562,7 +566,7 @@ SUITES = {
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
 HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900,
-                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
+                 "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "f2fsckpttest.py": 1500, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
 

@@ -743,7 +743,8 @@ pub(crate) fn settle(ms: &mut MountState) {
         ms.dur.rf_seq = 0;
         ms.dur.rf_last.clear();
         ms.dur.commit_unknown = false;
-        CP_TOTAL.fetch_add(1, atomic::Ordering::Relaxed);
+        // (cp_total is counted once, where the checkpoint starts: here it
+        // counted every unlocked checkpoint twice, lane f2fsckpt3.)
         lx_open_era(ms, v);
         let done = cp_seq(ms.port).map_or(0, |s| s.done.load(atomic::Ordering::SeqCst));
         ms.dur.ns.retain(|_, e| e.0 > done);

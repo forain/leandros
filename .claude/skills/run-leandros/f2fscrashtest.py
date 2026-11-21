@@ -363,12 +363,12 @@ def main(argv):
                 fails.append(f"iter {it - 1}: crashscan did not finish: {scan[-300:]}")
             else:
                 errs = claims.check(scan)
-                if errs and all("no scan line" in e for e in errs):
+                if errs and all(("no scan line" in e or "fsynced but missing" in e) for e in errs):
                     # crashscan only reads: a torn console line does not repeat.
                     print("    rescan: " + "; ".join(errs[:4]), flush=True)
                     r2 = run(f"/bin/f2fstest crashscan {pdir}", 300)
                     if "SCAN_DONE" in r2["output"]:
-                        errs = [e.replace("no scan line", "no scan line twice")
+                        errs = [e.replace("no scan line", "no scan line twice").replace("fsynced but missing", "fsynced but missing in both scans")
                                 for e in claims.check(r2["output"])]
                 nclaims = len(claims.a) + len(claims.o_sync) + len(claims.n)
                 extra = f"; {claims.inflight} blocks of the in-flight rewrite" if claims.inflight else ""
