@@ -763,7 +763,7 @@ static int nested_body(void *a)
 static int nested_parent_root_setfcap(void)
 {
     for (int keep = 0; keep <= 1; keep++) {
-        int go; pid_t c = spawn(-1, nested_body, &keep, &go);
+        int go; pid_t c = spawn(1000, nested_body, &keep, &go);
         CHECK(c > 0);
         CHECK(wrp(c, "uid_map", "0 1000 1\n") == 0);
         CHECK(wrp(c, "gid_map", "0 1000 1\n") == 0);
