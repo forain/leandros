@@ -950,15 +950,18 @@ static void hardening_suite(void) {
      * sandboxed callers); /proc/<pid>/cwd and the link text stay refused. */
     int c2p[2], p2c[2];
     if (pipe(c2p) || pipe(p2c)) { report("proc_root_pipe", 0); return; }
-    mkdir("/tmp/xnsr", 0755);
-    { int pf = open("/tmp/xnsr/parent_only", O_WRONLY | O_CREAT, 0644); if (pf >= 0) close(pf); }
+    /* /tmp/xnsr (parent_only) is covered in the child by a bind of /tmp/xnsr_b
+     * (child_only). A bind keeps a real backing path, unlike a tmpfs instance
+     * (whose hidden pool is deliberately unreachable from another namespace). */
+    mkdir("/tmp/xnsr", 0755); mkdir("/tmp/xnsr_b", 0755);
+    { int pf = open("/tmp/xnsr/parent_only", O_WRONLY | O_CREAT, 0644); if (pf >= 0) close(pf);
+      pf = open("/tmp/xnsr_b/child_only", O_WRONLY | O_CREAT, 0644); if (pf >= 0) close(pf); }
     pid = fork();
     if (pid == 0) {
         char c = 'x';
         if (unshare(CLONE_NEWNS) != 0) _exit(2);
         mount_(NULL, "/", NULL, (1UL << 15) | M_REC);
-        if (mountd_("tmpfs", "/tmp/xnsr", "tmpfs", 6, "mode=0755") != 0) _exit(3);
-        { int cf = open("/tmp/xnsr/child_only", O_WRONLY | O_CREAT, 0644); if (cf < 0) _exit(4); close(cf); }
+        if (mount_("/tmp/xnsr_b", "/tmp/xnsr", NULL, M_BIND) != 0) _exit(3);
         write(c2p[1], &c, 1);
         read(p2c[0], &c, 1);
         _exit(0);
@@ -981,6 +984,7 @@ static void hardening_suite(void) {
     }
     /* the parent's own tree is the opposite */
     int parent_view = stat("/tmp/xnsr/parent_only", &xs) == 0 && stat("/tmp/xnsr/child_only", &xs) != 0;
+    printf("  root_open=%d(e=%d) sees_child=%d hides_parent=%d parent_view=%d\n", root_open, e3, sees_child, hides_parent, parent_view);
     report("proc_root_cross_ns_lands_on_ns_root",
            up && root_open && sees_child && hides_parent && parent_view);
     /* /proc/<pid>/root/<rest> across namespaces resolves inside the target's tree */
@@ -990,6 +994,7 @@ static void hardening_suite(void) {
     errno = 0; int rest_hidden = stat(pp, &xs) != 0 && errno == ENOENT;
     snprintf(pp, sizeof pp, "/proc/%d/root/tmp/xnsr/child_only", (int)pid);
     f1 = open(pp, O_RDONLY); int rest_open = f1 >= 0; if (f1 >= 0) close(f1);
+    printf("  rest_child=%d rest_hidden=%d rest_open=%d\n", rest_child, rest_hidden, rest_open);
     report("proc_root_cross_ns_rest_resolves_in_target", up && rest_child && rest_hidden && rest_open);
     /* the link text cannot be written in our view: still refused */
     { char lb[256]; snprintf(pp, sizeof pp, "/proc/%d/root", (int)pid);
@@ -1026,6 +1031,8 @@ static void hardening_suite(void) {
       if (WIFEXITED(zst) && WEXITSTATUS(zst)) printf("  tm0 rc=%d\n", WEXITSTATUS(zst)); }
     /* a target chrooted inside its namespace: the root is the task's fs root */
     { int cp2[2], pc2[2];
+      mkdir("/tmp/xnsc", 0755); mkdir("/tmp/xnsc_b", 0755);
+      { int jf = open("/tmp/xnsc_b/jail_only", O_WRONLY | O_CREAT, 0644); if (jf >= 0) close(jf); }
       if (pipe(cp2) || pipe(pc2)) { report("proc_root_chroot_pipe", 0); }
       else {
           pid_t kp = fork();
@@ -1033,9 +1040,7 @@ static void hardening_suite(void) {
               char k = 'x';
               if (unshare(CLONE_NEWNS) != 0) _exit(2);
               mount_(NULL, "/", NULL, (1UL << 15) | M_REC);
-              mkdir("/tmp/xnsc", 0755);
-              if (mountd_("tmpfs", "/tmp/xnsc", "tmpfs", 6, "mode=0755") != 0) _exit(3);
-              { int cf = open("/tmp/xnsc/jail_only", O_WRONLY | O_CREAT, 0644); if (cf < 0) _exit(4); close(cf); }
+              if (mount_("/tmp/xnsc_b", "/tmp/xnsc", NULL, M_BIND) != 0) _exit(3);
               if (chroot("/tmp/xnsc") != 0) _exit(5);
               if (chdir("/") != 0) _exit(6);
               write(cp2[1], &k, 1);
@@ -1054,6 +1059,7 @@ static void hardening_suite(void) {
           int jail_rest = stat(q, &ks) == 0;
           snprintf(q, sizeof q, "/proc/%d/root/tmp", (int)kp);
           int jail_no_tmp = stat(q, &ks) != 0;
+          printf("  chroot: up=%d jail_root=%d jail_rest=%d jail_no_tmp=%d\n", kup, jail_root, jail_rest, jail_no_tmp);
           report("proc_root_cross_ns_chroot_lands_on_task_root", kup && jail_root && jail_rest && jail_no_tmp);
           write(pc2[1], &k2, 1);
           waitpid(kp, &st, 0);

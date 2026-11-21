@@ -12028,7 +12028,7 @@ impl KPath {
         } };
         if mid0 != 0 {
             let pid = current_pid();
-            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: mid0, hidden_flags: Some(fl) });
+            vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: mid0, hidden_flags: Some(fl), ns: None });
             kp.ctx_pid = pid;
         }
         Ok(kp)
@@ -12059,7 +12059,8 @@ impl KPath {
         kp.mnt_id = mid;
         kp.ns_prefix_len = plen;
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid, hidden_flags: None });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: ns.clone(), mnt_id: mid, hidden_flags: None,
+            ns: if mns != sched::current_mntns() { Some(mns) } else { None } });
         kp.ctx_pid = pid;
         kp.ns = Some(ns);
         Ok(kp)
@@ -12362,7 +12363,7 @@ fn hidden_below(mut host: Vec<u8>, rel: &[u8], fd: usize) -> Result<KPath, isize
     };
     if fl & (vfs::mnt::MNT_RDONLY | vfs::mnt::MNT_NODEV | vfs::mnt::MNT_NOEXEC) != 0 {
         let pid = current_pid();
-        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: vfs::fd_mnt(pid, fd).map_or(0, |x| x.1), hidden_flags: Some(fl) });
+        vfs::mnt::callctx_set(pid, vfs::mnt::CallCtx { ptr: kp.ptr(), ns_path: Vec::new(), mnt_id: vfs::fd_mnt(pid, fd).map_or(0, |x| x.1), hidden_flags: Some(fl), ns: None });
         kp.ctx_pid = pid;
     }
     Ok(kp)
@@ -12559,6 +12560,22 @@ fn resolve_at_path(dirfd: usize, path_ptr: usize) -> Result<KPath, isize> {
     if raw.is_empty() { return Err(-2); }
     let d = dirfd as u32 as i32 as isize as usize;
     if d != AT_FDCWD && raw.first() != Some(&b'/') {
+        // A directory fd opened through ANOTHER mount namespace's tree
+        // (open of /proc/<pid>/root of a sandboxed task: the portal then
+        // openat()s `.flatpak-info` below it): walk below it in that tree.
+        if let Some((n, _)) = vfs::fd_mnt(current_pid(), d) {
+            if n != u16::MAX && n != 0 && n != sched::current_mntns() {
+                let p = fd_ns_path(n, d, b"").ok_or(-2isize)?;
+                let mut out: Vec<u8> = Vec::new();
+                for c in p.split(|&b| b == b'/').chain(raw.split(|&b| b == b'/')) {
+                    if c.is_empty() || c == b"." { continue; }
+                    if c == b".." { while let Some(x) = out.pop() { if x == b'/' { break; } } continue; }
+                    out.push(b'/'); out.extend_from_slice(c);
+                }
+                if out.is_empty() { out.push(b'/'); }
+                return KPath::from_ns_mnt(out, n);
+            }
+        }
         if let Some(h) = fd_hidden_host(sched::current_mntns(), d) { return hidden_below(h, &raw, d); }
     }
     KPath::from_ns(resolve_at_ns(dirfd, &raw)?)

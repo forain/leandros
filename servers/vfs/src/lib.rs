@@ -5156,7 +5156,7 @@ fn rewrite_one(msg: &mut Message, spec: Option<(usize, bool)>, buf: &mut Vec<u8>
                 *buf = backing;
                 buf.push(0);
                 let nptr = buf.as_ptr() as usize;
-                mnt::callctx_set(pid, mnt::CallCtx { ptr: nptr, ns_path: nsp, mnt_id: mid, hidden_flags: None });
+                mnt::callctx_set(pid, mnt::CallCtx { ptr: nptr, ns_path: nsp, mnt_id: mid, hidden_flags: None, ns: None });
                 msg.data[idx * 8..idx * 8 + 8].copy_from_slice(&(nptr as u64).to_le_bytes());
                 return Ok(());
             }
@@ -5568,7 +5568,8 @@ fn dispatch_inner(msg: &Message, caller_pid: u32) -> Message {
                     match cx.hidden_flags {
                         // Inherit the originating mount's flags (ns MAX: no live table).
                         Some(hf) => fd_note_mnt(caller_pid, fd as usize, u16::MAX, cx.mnt_id.max(1), hf),
-                        None => fd_note_mnt(caller_pid, fd as usize, sched::current_mntns(), cx.mnt_id, mnt::flags_of(sched::current_mntns(), cx.mnt_id)),
+                        None => { let n = cx.ns.unwrap_or_else(sched::current_mntns);
+                                  fd_note_mnt(caller_pid, fd as usize, n, cx.mnt_id, mnt::flags_of(n, cx.mnt_id)) }
                     }
                 }
             }

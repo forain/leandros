@@ -1081,7 +1081,10 @@ pub fn linkscan(backing: &[u8], floor: &[u8], follow: bool) -> Option<(usize, Ve
 #[derive(Clone)]
 pub struct CallCtx { pub ptr: usize, pub ns_path: Vec<u8>, pub mnt_id: u32,
     /// Hidden-dirfd path: the originating mount's flags apply verbatim (no ns translation).
-    pub hidden_flags: Option<u8> }
+    pub hidden_flags: Option<u8>,
+    /// The mount namespace `mnt_id` belongs to when it is not the caller's own
+    /// (open of /proc/<pid>/root of a task in another namespace).
+    pub ns: Option<u16> }
 
 static CALLCTX: Mutex<BTreeMap<u32, Vec<CallCtx>>> = Mutex::new(BTreeMap::new());
 
@@ -1168,7 +1171,7 @@ pub fn selftest() -> Vec<(&'static str, bool)> {
         && linkscan(b"/.mnttest-ls/x", b"/", true).map(|r| r.0 == 1).unwrap_or(false)));
     LINKSCANNERS.lock().retain(|e| !e.0.starts_with(b"/.mnttest-ls"));
     // callctx keyed by pid
-    callctx_set(7777, CallCtx { ptr: 5, ns_path: b"/x".to_vec(), mnt_id: 9, hidden_flags: None });
+    callctx_set(7777, CallCtx { ptr: 5, ns_path: b"/x".to_vec(), mnt_id: 9, hidden_flags: None, ns: None });
     let g = callctx_get(7777, 5).map(|c| c.mnt_id == 9).unwrap_or(false) && callctx_get(7778, 5).is_none();
     callctx_clear(7777, 5);
     out.push(("callctx", g && callctx_get(7777, 5).is_none()));
