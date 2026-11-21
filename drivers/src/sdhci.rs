@@ -331,13 +331,13 @@ const CMD_TYPE_ABORT:    u16 = 0b11 << 6;
 const MULTI_MAX_SECTORS: usize = 128;
 /// Blocks (4 KiB) per multi-block command.
 const MULTI_MAX_BLOCKS: usize = MULTI_MAX_SECTORS / SECTORS_PER_BLOCK;
-/// Multi-block CMD18/CMD25 in use. OFF by default until a >=1 GiB x several
-/// `sdhci.sdtest` proof completes (256 MiB passed bit-exact on the real card:
-/// 16-21 MB/s multi vs 0.5-1.6 MB/s single-sector; 3 GiB run pending).
-/// `sdhci.multi=1` opts in (see `configure`). Also cleared (for good) after
-/// `MULTI_FALLBACK_LIMIT` transfers failed multi-block but then succeeded
-/// sector by sector.
-static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Multi-block CMD18/CMD25 in use. ON by default: proven bit-exact on the real
+/// card (`sdhci.sdtest=3072`: 3 GiB, 199570 mixed-size spans, wbad=rbad=gbad=ioerr=0)
+/// and soaked under F2FS writes with concurrent inbound SSH. 16-21 MB/s vs
+/// 0.5-1.6 MB/s single-sector. `sdhci.multi=0` disables (see `configure`). Also
+/// cleared (for good) after `MULTI_FALLBACK_LIMIT` transfers failed multi-block
+/// but then succeeded sector by sector.
+static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// `sdhci.multitest=1`: at probe, compare a single-sector read and a
 /// multi-block read of the first `MULTITEST_BLOCKS` blocks. Read-only.
 static MULTITEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
