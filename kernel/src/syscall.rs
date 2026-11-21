@@ -9183,7 +9183,17 @@ fn follow_magic_final(kp: KPath) -> Result<KPath, isize> {
     if let Some((pid, rest)) = proc_magic(b, b"root") {
         if rest.is_empty() {
             if sched::exists_probe(pid) != 0 { return Err(-2); }
-            if !proc_root_allowed(pid) { return Err(-13); }
+            if !proc_link_allowed(pid) { return Err(-13); }
+            // Another process in a different mount namespace (a Flatpak
+            // sandbox, its xdg-dbus-proxy): the open lands on the root of
+            // THAT namespace's tree, as on Linux, so xdg-desktop-portal can
+            // read `<root>/.flatpak-info` for every caller. The link text
+            // (readlink) stays refused: it cannot be written in our view.
+            let tm = sched::ns::mntns_of(pid);
+            if tm != sched::current_mntns() {
+                if tm == 0 { return Err(-13); }
+                return KPath::from_ns_mnt(b"/".to_vec(), tm);
+            }
             let r = sched::root_arc_of(pid).map(|r| r.to_vec()).unwrap_or_else(|| b"/".to_vec());
             return KPath::from_ns(r);
         }
