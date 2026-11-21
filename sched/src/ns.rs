@@ -265,10 +265,15 @@ fn quota_owner_ok(owner: NsId, class: u8) -> bool {
     owner == 0 || quota_chain_ok(None, owner, class)
 }
 
+/// Linux `ns->parent_could_setfcap`: the creator held CAP_SETFCAP in the parent
+/// namespace when it created this one. Lets the namespace's own process write
+/// a uid_map that covers kuid 0 (verify_root_map, self-write branch).
+static PARENT_SETFCAP: [core::sync::atomic::AtomicBool; NS_MAX] = [const { core::sync::atomic::AtomicBool::new(false) }; NS_MAX];
+
 /// Create a user namespace owned by (`euid`, `egid`) as a child of `parent`.
 /// The returned reference is the caller's; clone it for each holder.
 /// Errors are negative errnos: EUSERS (87) too deep, ENOSPC (28) table full.
-pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
+pub fn new_userns(parent: NsId, euid: u32, egid: u32, parent_could_setfcap: bool) -> Result<NsRef, isize> {
     // Linux create_user_ns: the creator's euid and egid must be mapped in its
     // own (current) namespace, else EPERM (rule 8).
     if from_k(0, parent, euid).is_none() || from_k(1, parent, egid).is_none() { return Err(-1); }
@@ -290,6 +295,7 @@ pub fn new_userns(parent: NsId, euid: u32, egid: u32) -> Result<NsRef, isize> {
             SETGROUPS_DENY[id].store(if parent != 0 { SETGROUPS_DENY[parent as usize].load(Acquire) } else { 0 }, Release);
             OWNER_EUID[id].store(euid, Release);
             OWNER_EGID[id].store(egid, Release);
+            PARENT_SETFCAP[id].store(parent_could_setfcap, Release);
             SLOT_USER[id].store(1, Release);
             return Ok(NsRef(id as NsId));
         }
@@ -534,11 +540,14 @@ pub fn userns_of(pid: u32) -> NsId {
 /// only (the caller checks). 0 or a negative errno.
 pub fn unshare_user() -> isize {
     let pid = crate::current_pid();
-    let (parent, euid, egid) = {
+    let (parent, euid, egid, setfcap) = {
         let rq = crate::RUN_QUEUE.lock();
-        match rq.find_pid(pid) { Some(t) => (t.userns.id(), t.euid, t.egid), None => return -3 }
+        match rq.find_pid(pid) {
+            Some(t) => (t.userns.id(), t.euid, t.egid, crate::caps::capable_snap(t.userns.id(), t.euid, t.caps[0], t.userns.id(), 31)),
+            None => return -3,
+        }
     };
-    let new = match new_userns(parent, euid, egid) { Ok(n) => n, Err(e) => return e };
+    let new = match new_userns(parent, euid, egid, setfcap) { Ok(n) => n, Err(e) => return e };
     // Swap under RUN_QUEUE; the old reference is put after the unlock.
     let old = {
         let mut rq = crate::RUN_QUEUE.lock();
@@ -857,10 +866,18 @@ pub fn write_map(opener: &Opener, writer: u32, kind: usize, data: &[u8]) -> isiz
     for i in 0..n {
         let Some(lk) = lower_to_k(par, exts[i].1, exts[i].2, kind) else { return -1 };
         comp[i] = (exts[i].0, lk, exts[i].2);
-        // Rule 6: no extent covers kuid 0 until lane idroot0.
-        if lk == 0 { return -1; }
         // Rule 9: identity maps only when the idmap=off opt-out is set.
         if !idmap_real() && exts[i].0 != lk { return -1; }
+    }
+    // Rule 6 (Linux verify_root_map): a uid_map extent whose translated lower
+    // id is kuid 0 (an extent covers 0 only by starting there) needs
+    // CAP_SETFCAP. Self-write (opener lives in the target ns): the creator
+    // had it in the parent at creation (parent_could_setfcap). Otherwise the
+    // OPENER (f_cred) needs it over the parent namespace. gid_map: no rule.
+    if kind == 0 && comp[..n].iter().any(|e| e.1 == 0) {
+        let ok = if opener.cr.0 == tns { PARENT_SETFCAP[t].load(Acquire) }
+                 else { crate::caps::capable_snap(opener.cr.0, opener.cr.1, opener.cr.3, par, 31) };
+        if !ok { return -1; }
     }
     if !privileged {
         // Rule 4: one single-id extent, the translated lower id is the

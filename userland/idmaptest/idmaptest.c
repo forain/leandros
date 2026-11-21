@@ -399,7 +399,7 @@ static int run_child(int (*fn)(void))
 {
     pid_t p = fork();
     if (p < 0) return 0;
-    if (p == 0) _exit(fn() ? 0 : 1);
+    if (p == 0) { int r = fn(); fflush(stdout); _exit(r ? 0 : 1); }
     int st = 0;
     waitpid(p, &st, 0);
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
@@ -617,17 +617,138 @@ static int lower_minus1_einval(void)
     return 0;
 }
 
-static int map_kuid0_eperm(void)
+static int run_ok(int (*fn)(void))
 {
-    /* refused for the privileged writer too, with or without the knob */
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) { int r = fn(); fflush(stdout); _exit(r ? 1 : 0); }
+    int st = 0;
+    waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/* ---- idroot0: maps covering kuid 0 need CAP_SETFCAP (Linux verify_root_map) ---- */
+
+/* Drop CAP_SETFCAP (31) from the effective set only. */
+static int drop_setfcap(void)
+{
+    struct { unsigned v; int pid; } h = { 0x20080522, 0 };
+    struct { unsigned eff, prm, inh; } d[2];
+    if (syscall(SYS_capget, &h, d)) return -1;
+    d[0].eff &= ~(1u << 31);
+    return (int)syscall(SYS_capset, &h, d);
+}
+
+static int kuid0_nocap_child(void)
+{
+    CHECK(drop_setfcap() == 0);
     int go; pid_t c = spawn(1000, NULL, NULL, &go);
     CHECK(c > 0);
     int a = wrp(c, "uid_map", "0 0 1\n");
     int b = wrp(c, "uid_map", "1000 0 1\n");
     int d = wrp(c, "uid_map", "5 0 10\n");
+    int e = wrp(c, "gid_map", "0 0 1\n");        /* gid_map has no such rule */
+    int f = wrp(c, "uid_map", "1000 1000 1\n");  /* a refused write leaves the map writable */
+    fin(c, go);
+    CHECK(a == -EPERM && b == -EPERM && d == -EPERM && e == 0 && f == 0);
+    return 0;
+}
+
+/* Creator without CAP_SETFCAP in the parent: its own "0 0 1" is refused. */
+static int kuid0_self_nocap_child(void)
+{
+    CHECK(drop_setfcap() == 0);
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    CHECK(wr("/proc/self/uid_map", "0 0 1\n") == -EPERM);
+    return 0;
+}
+
+/* Creator with CAP_SETFCAP (host root): its own "0 0 1" works. */
+static int kuid0_self_cap_child(void)
+{
+    CHECK(unshare(CLONE_NEWUSER) == 0);
+    CHECK(wr("/proc/self/uid_map", "0 0 1\n") == 0);
+    CHECK(wr("/proc/self/setgroups", "deny") == 0);
+    CHECK(wr("/proc/self/gid_map", "0 0 1\n") == 0);
+    CHECK(getuid() == 0 && getgid() == 0);
+    return 0;
+}
+
+static int map_kuid0_needs_setfcap(void)
+{
+    CHECK(run_ok(kuid0_nocap_child));
+    CHECK(run_ok(kuid0_self_nocap_child));
+    CHECK(run_ok(kuid0_self_cap_child));
+    /* With CAP_SETFCAP (this runner is host root): ok, also as a wider range. */
+    int go; pid_t c = spawn(1000, NULL, NULL, &go);
+    CHECK(c > 0);
+    int a = wrp(c, "uid_map", "0 0 1\n");
     int e = wrp(c, "gid_map", "0 0 1\n");
     fin(c, go);
-    CHECK(a == -EPERM && b == -EPERM && d == -EPERM && e == -EPERM);
+    CHECK(a == 0 && e == 0);
+    c = spawn(1000, NULL, NULL, &go);
+    CHECK(c > 0);
+    int d = wrp(c, "uid_map", "5 0 10\n");
+    fin(c, go);
+    CHECK(d == 0);
+    return 0;
+}
+
+/* Root of a namespace that maps kuid 0 (euid 0) still is not host root. */
+static pid_t map0_target;
+static int map0_nsroot_body(void)
+{
+    if (unshare(CLONE_NEWUSER) != 0) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (wr("/proc/self/uid_map", "0 0 1\n") || wr("/proc/self/setgroups", "deny") ||
+        wr("/proc/self/gid_map", "0 0 1\n")) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (getuid() != 0 || geteuid() != 0) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (!(raw_socket_refused() && alarm_timer_refused() && reboot_refused() && set_mm_refused())) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }
+    if (syscall(SYS_finit_module, -1, "", 0) != -1 || errno != EPERM) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }          /* module load */
+    if (kill(map0_target, 0) != -1 || errno != EPERM) { printf("  map0 step line %d errno %d\n", __LINE__, errno); return 0; }                        /* host proc of kuid 1000 */
+    /* host-global /proc knob (CAP_SYS_ADMIN in the initial ns): kuid 0 DAC alone must not open it up */
+    int fd = open("/proc/drm/fence_hold", O_WRONLY);
+    if (fd >= 0) { ssize_t w = write(fd, "0\n", 2); close(fd); if (w == 2) { printf("  map0 step line %d (host knob write succeeded)\n", __LINE__); return 0; } }
+    return 1;
+}
+static int map0_control_body(void) /* same probes as host root: module load passes the priv check, kill ok */
+{
+    if (syscall(SYS_finit_module, -1, "", 0) != -1 || errno == EPERM) return 0;
+    if (kill(map0_target, 0) != 0) return 0;
+    int fd = open("/proc/drm/fence_hold", O_WRONLY);
+    if (fd < 0) return 0;
+    ssize_t w = write(fd, "0\n", 2); close(fd);
+    return w == 2;
+}
+static int ns_euid0_not_host_map0(void)
+{
+    int sp[2];
+    CHECK(pipe(sp) == 0);
+    map0_target = fork();
+    CHECK(map0_target >= 0);
+    if (map0_target == 0) { if (setresuid(1000, 1000, 1000)) _exit(1); (void)!write(sp[1], "r", 1); pause(); _exit(0); }
+    char ch; CHECK(read(sp[0], &ch, 1) == 1);
+    int ctl = run_child(map0_control_body);
+    int ok = run_child(map0_nsroot_body);
+    kill(map0_target, SIGKILL); waitpid(map0_target, NULL, 0);
+    CHECK(ctl);
+    CHECK(ok);
+    return 0;
+}
+
+/* bwrap --unshare-all --uid 0 as root (writes "0 0 1"); raw unshare path if bwrap is absent. */
+static int bwrap_root_unshare_all(void)
+{
+    const char *bw = access("/usr/bin/bwrap", X_OK) == 0 ? "/usr/bin/bwrap"
+                   : access("/bin/bwrap", X_OK) == 0 ? "/bin/bwrap" : NULL;
+    if (!bw) return run_ok(kuid0_self_cap_child) ? 0 : 1;
+    pid_t p = fork();
+    CHECK(p >= 0);
+    if (p == 0) {
+        execl(bw, "bwrap", "--unshare-all", "--uid", "0", "--gid", "0", "--ro-bind", "/", "/", "/bin/true", (char *)NULL);
+        _exit(127);
+    }
+    int st = 0; waitpid(p, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
     return 0;
 }
 
@@ -2220,7 +2341,9 @@ static const struct { const char *name; int (*fn)(void); } cases[] = {
     { "gid_before_deny_eperm", gid_before_deny_eperm },
     { "setgroups_deny_inherited", setgroups_deny_inherited },
     { "nested_create_unmapped_eperm", nested_create_unmapped_eperm },
-    { "map_kuid0_eperm", map_kuid0_eperm },
+    { "map_kuid0_needs_setfcap", map_kuid0_needs_setfcap },
+    { "ns_euid0_not_host_map0", ns_euid0_not_host_map0 },
+    { "bwrap_root_unshare_all", bwrap_root_unshare_all },
     { "priv_multi_extent", priv_multi_extent },
     { "nested_view", nested_view },
     { "nested_map_composed", nested_map_composed },
