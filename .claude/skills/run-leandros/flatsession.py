@@ -38,7 +38,7 @@ R = open(f"{out}/flat.out", "w")
 def sh(c, t=60):
     o = driver.serial_run(c, timeout=t * scale, arch=arch, ser=ser)["output"]
     import re  # drop kernel console lines (FORK/MMAP spam would crowd out the tail)
-    o = "\n".join(l for l in o.splitlines() if not re.match(r"^\[ *\d+\.\d+\]", l) and not re.search(r"\[(FORK|MMAP-BIG)\]", l))
+    o = "\n".join(l for l in o.splitlines() if (not re.match(r"^\[ *\d+\.\d+\]", l) or re.search(r"(wl_|xdg_|zwp_|wp_|zxdg_|ext_|zwlr_)\w*[@#.]", l)) and not re.search(r"\[(FORK|MMAP-BIG|fslock|pcache)\]", l))
     R.write(f"### {time.strftime('%T')} {c[:200]}\n{o[-30000:]}\n"); R.flush()
     return o
 def put(path, lines):  # write a guest file via base64 (the guest shell is brush: quoting-fragile)
@@ -93,11 +93,15 @@ put("/tmp/fgui.sh", [
     ": ${XDG_RUNTIME_DIR:=/run/user/1000}; : ${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}; export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS",
     "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}",
     "echo BUS=$DBUS_SESSION_BUS_ADDRESS",
-    "flatpak run --log-session-bus --env=WAYLAND_DEBUG=1 --env=GDK_DEBUG=opengl --env=GSK_DEBUG=renderer com.github.tchx84.Flatseal > /tmp/fgui.log 2>&1; echo EXIT=$? > /tmp/fgui.exit"])
+    "flatpak run --log-session-bus --env=WAYLAND_DEBUG=1 --env=G_MESSAGES_DEBUG=all --env=GDK_DEBUG=opengl,dmabuf,vulkan-disable --env=GSK_RENDERER=ngl --env=GSK_DEBUG=renderer --env=EGL_LOG_LEVEL=debug --env=MESA_DEBUG=1 --env=LIBGL_DEBUG=verbose com.github.tchx84.Flatseal > /tmp/fgui.log 2>&1; echo EXIT=$? > /tmp/fgui.exit"])
 put("/tmp/portal.sh", [
     "#!/bin/sh", "set -a; . /tmp/env.txt; set +a",
     "export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/1000/bus}",
     "G_MESSAGES_DEBUG=all /usr/libexec/xdg-desktop-portal -r -v > /tmp/portal.log 2>&1"])
+sh("apk add python3 py3-pillow 2>&1 | tail -n 1; which cosmic-screenshot; cosmic-screenshot --help 2>&1 | head -n 20", 400)
+put("/tmp/shot.sh", ["#!/bin/sh", "set -a; . /tmp/env.txt; set +a", "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}", "mkdir -p /tmp/shots; rm -f /tmp/shots/*",
+    "timeout 60 cosmic-screenshot --interactive=false --save-dir /tmp/shots 2>&1 | tail -n 5; for f in /tmp/shots/*.png; do mv $f /tmp/shots-$1.png; done; ls -l /tmp/shots-*"])
+sh("chmod 755 /tmp/shot.sh; chmod 1777 /tmp; su leandro -c '/tmp/shot.sh base' 2>&1", 120)
 sh("su leandro -c '/tmp/portal.sh > /dev/null 2>&1 &'; sleep 3; wc -l /tmp/portal.log; head -n 5 /tmp/portal.log", 30)
 sh("rm -f /tmp/fgui.exit; su leandro -c '/tmp/fgui.sh > /tmp/fgui.pre 2>&1 &' ; sleep 1; cat /tmp/fgui.pre; echo started", 30)
 ser.pump(100 * scale)
@@ -107,7 +111,24 @@ put("/tmp/diag.sh", [
     "echo APPLINES; wc -l < /tmp/fg.clean; tail -n 14 /tmp/fg.clean | cut -c1-200",
     "echo WLCOUNT; for k in get_xdg_surface get_toplevel set_title ack_configure attach commit; do echo $k=$(grep -a -c \"$k\" /tmp/fg.clean)n; done",
     "echo GLINFO; grep -a -i -E 'opengl|renderer|MESA|ZINK|EGL|GL_|llvmpipe|virgl|swrast|dri2' /tmp/fg.clean | head -n 10 | cut -c1-200",
+    "echo BUFTYPE; for k in wl_shm.create_pool wl_shm_pool.create_buffer zwp_linux_dmabuf_v1 create_immed zwp_linux_buffer_params_v1 wl_drm wp_viewport; do echo $k=$(grep -a -c \"$k\" /tmp/fg.clean); done",
+    "echo GLSTR; grep -a -i -E 'GL_RENDERER|renderer|virgl|llvmpipe|softpipe|swrast|zink|using|Mesa|EGL|dri|gl ' /tmp/fg.clean | head -n 25 | cut -c1-220",
+    "echo SANDBOX; ls -l /dev/dri; flatpak --user info --show-permissions com.github.tchx84.Flatseal | head -n 20; flatpak --user list --runtime | head -n 12",
+    "echo WLTAIL; grep -a -E 'wl_|xdg_' /tmp/fgui.log | tail -n 25 | cut -c1-200",
     "echo PROC; for c in /proc/[0-9]*/comm; do n=$(cat $c); case $n in gjs*) d=${c%/comm}; grep -E 'State' $d/status;; esac; done"])
+sh("su leandro -c '/tmp/shot.sh after' 2>&1; grep -a -i screenshot /tmp/portal.log | tail -n 12 | cut -c1-200", 120)
+put("/tmp/pix.py", ["from PIL import Image, ImageChops",
+    "import hashlib, sys",
+    "a=Image.open('/tmp/shots-base.png').convert('RGB'); b=Image.open('/tmp/shots-after.png').convert('RGB')",
+    "print('sizes', a.size, b.size)",
+    "d=ImageChops.difference(a,b).convert('L').point(lambda v:255 if v>8 else 0)",
+    "print('diff_bbox', d.getbbox(), 'diff_px', sum(1 for v in d.getdata() if v))",
+    "bb=d.getbbox()",
+    "if bb:",
+    "  c=b.crop(bb); print('crop_colors', len(c.getcolors(1<<24) or []), 'crop_sha', hashlib.sha1(c.tobytes()).hexdigest())",
+    "print('after_colors', len(b.getcolors(1<<24) or []), 'base_sha', hashlib.sha1(a.tobytes()).hexdigest()[:12], 'after_sha', hashlib.sha1(b.tobytes()).hexdigest()[:12])"])
+sh("ls -l /tmp/shots-*.png; python3 /tmp/pix.py 2>&1 | tail -n 12", 300)
+sh("for c in /proc/[0-9]*/comm; do case $(cat $c) in gjs*) ;; *) continue;; esac; d=${c%/comm}; echo GJSMAPS ${d#/proc/} $(cat $c); ls -l $d/fd | grep -a -E 'dri|dma|drm'; grep -a -o -E '[^ ]*(gallium|_dri|vulkan|lvp|virtio|swrast|libEGL|libGL|libgbm)[^ ]*' $d/maps | sort -u | head -n 20; done", 60)
 sh("/tmp/diag.sh 2>&1", 90)
 # logs: portal, proxy/bus traffic, who owns stderr of busd/portal/proxy, gjs thread state, vfs lines
 put("/tmp/logs.sh", [
