@@ -56,6 +56,18 @@ boot_partition=3
 ```
 Never add `tryboot_a_b=1` (it makes the firmware ignore tryboot.txt).
 
+**Scratch region (raw test data only, may be overwritten any time).** The last
+8 GiB of the card is outside every partition: sectors 233222144..249999359
+(512-byte sectors; bytes 119409737728..127999672319, exactly 16777216 sectors
+= 8589934592 bytes). p4 was shrunk (2026-11-21) to start 9551872, size
+223670272 (ends at 233222144); its ext4 is 27958784 4K blocks. Write it from
+LeandrOS through `/dev/mmcblk0` (e.g. `mbrtool copy IN /dev/mmcblk0 --seek
+$((233222144*512))`, `mbrtool sha256 /dev/mmcblk0 --skip ... --count ...`);
+the SD driver only guards its own F2FS root (p2), so no EBUSY there. Never
+create a partition or filesystem over it that anything depends on; Linux does
+not touch it. The pre-shrink MBR is in `/root/mbr-before-sdscratch.bin` on the
+LeandrOS root.
+
 - Power cycle / plain `reboot` (either OS) / tryboot deadline / panic-watchdog
   reset -> firmware default = p3 = Linux.
 - Linux -> LeandrOS: `sudo reboot 1` (one-shot boot partition request).
