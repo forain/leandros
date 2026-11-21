@@ -84,9 +84,10 @@
 //!                           column when the AP receives it (as Linux rs.c
 //!                           does; the start column stays long GI; VHT 80:
 //!                           long GI only); 1 starts on SGI; 0 never uses SGI
-//!   iwlwifi.txmimo=0|1      (ht=1) two-stream MCS above MCS 7; default: on at
-//!                           5 GHz (laptop 8265, 2x2 VHT80: TCP TX 45 -> 115
-//!                           Mbit/s), off at 2.4 GHz; 1 forces both bands, 0 off
+//!   iwlwifi.txmimo=0        (ht=1) no two-stream MCS; default: two-stream MCS
+//!                           above MCS 7 on both bands (laptop 8265, 2x2: 5 GHz
+//!                           VHT80 TCP TX 45 -> 115 Mbit/s, 2.4 GHz HT20 28 ->
+//!                           53 Mbit/s)
 //!   iwlwifi.txstbc=0        (ht=1) no STBC on single-stream MCS; default:
 //!                           STBC on both antennas when the AP receives it
 //!                           (Linux rs.c on the 8000 family), the legacy
@@ -265,9 +266,8 @@ static HTRATE: AtomicBool = AtomicBool::new(true);
 static TXSGI: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.txsgi=0: no short guard interval at all (not even as a rate-control column).
 static TXSGI_OFF: AtomicBool = AtomicBool::new(false);
-static TXMIMO: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.rscol (default on): rate control searches the other columns
-/// (short GI, two streams on 5 GHz) and keeps a clearly better one.
+/// (short GI, two streams) and keeps a clearly better one.
 static RSCOL: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.txstbc / iwlwifi.txldpc (default on): STBC / LDPC on our HT
 /// transmissions when the AP receives them (Linux rs.c for the 8000 family).
@@ -290,7 +290,7 @@ static HT40_24: AtomicBool = AtomicBool::new(true);
 static VHT: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vhttx (default off): VHT TX rates on a VHT link.
 static VHTTX: AtomicBool = AtomicBool::new(true);
-/// iwlwifi.txmimo=0: two-stream TX off on every band (unset: on at 5 GHz only, 1: both bands).
+/// iwlwifi.txmimo=0: two-stream TX off on every band (default: on at both bands).
 static TXMIMO_OFF: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.txpwr=<dBm>|max: send Linux's REDUCE_TX_POWER_CMD (SET_MAC) after the MAC context (-1 = not sent).
 static TXPWR: AtomicI32 = AtomicI32::new(-1);
@@ -1417,7 +1417,6 @@ pub fn init(cmdline: &str) {
     HTRATE.store(cmdline_val(cmdline, "iwlwifi.htrate") != Some("0"), Ordering::Relaxed);
     TXSGI.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("1"), Ordering::Relaxed);
     TXSGI_OFF.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("0"), Ordering::Relaxed);
-    TXMIMO.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("1"), Ordering::Relaxed);
     RSCOL.store(cmdline_val(cmdline, "iwlwifi.rscol") != Some("0"), Ordering::Relaxed);
     TXSTBC.store(cmdline_val(cmdline, "iwlwifi.txstbc") != Some("0"), Ordering::Relaxed);
     TXLDPC.store(cmdline_val(cmdline, "iwlwifi.txldpc") != Some("0"), Ordering::Relaxed);
@@ -1438,7 +1437,7 @@ pub fn init(cmdline: &str) {
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
           if HTRATE.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.htrate=0)" },
-          if TXSGI.load(Ordering::Relaxed) { "on" } else { "off" }, if TXMIMO.load(Ordering::Relaxed) { "on" } else { "off" },
+          if TXSGI.load(Ordering::Relaxed) { "on" } else { "off" }, if TXMIMO_OFF.load(Ordering::Relaxed) { "off" } else { "on" },
           if TXSTBC.load(Ordering::Relaxed) { "on" } else { "off" }, if TXLDPC.load(Ordering::Relaxed) { "on" } else { "off" },
           match SMPS.load(Ordering::Relaxed) { ht::SM_PS_STATIC => "static", ht::SM_PS_DYNAMIC => "dynamic", _ => "off" },
           if LDPC.load(Ordering::Relaxed) { "on" } else { "off" });
@@ -2756,7 +2755,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             (Some(h), Some(cap)) if h.ht && HTRATE.load(Ordering::Relaxed) => Some(rs::HtRates {
                 sgi: TXSGI.load(Ordering::Relaxed) && if h.ht40.is_some() { cap.sgi40() } else { cap.sgi20() },
                 ht40: h.ht40.is_some() && TX40.load(Ordering::Relaxed),
-                mimo: (TXMIMO.load(Ordering::Relaxed) || (!TXMIMO_OFF.load(Ordering::Relaxed) && !band_24)) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC
+                mimo: !TXMIMO_OFF.load(Ordering::Relaxed) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC
                       && hw.tx_ant & asc::ANT_AB == asc::ANT_AB,
                 stbc: TXSTBC.load(Ordering::Relaxed) && cap.rx_stbc() && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
                       && (txant == 0 || txant == asc::ANT_AB),
@@ -2785,8 +2784,9 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
         let mut c = RateCtl::new(&cfg);
         if let (true, Some(h), Some(cap)) = (RSCOL.load(Ordering::Relaxed), htl.as_ref(), ap_ht) {
             // Two streams: the AP receives them, both chains, no forced
-            // single antenna, and 5 GHz (on 2.4 GHz BT coex shares a chain).
-            let mimo = h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
+            // single antenna. Not on 2.4 GHz, where the base ladder already
+            // runs two streams (measured: a MIMO column there loses).
+            let mimo = !TXMIMO_OFF.load(Ordering::Relaxed) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
                 && (txant == 0 || txant == asc::ANT_AB) && !band_24;
             let sgi_col = !TXSGI_OFF.load(Ordering::Relaxed) && match ht_rates.and_then(|r| r.vht) {
                 Some(v) => v.sgi80,
