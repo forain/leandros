@@ -79,8 +79,11 @@
 //!                           A-MPDU, no reorder buffer); default 1
 //!   iwlwifi.htrate=0        (ht=1) transmit at legacy rates only; default 1:
 //!                           rate control over MCS 0-7 too
-//!   iwlwifi.txsgi=1         (ht=1) transmit with the short guard interval
-//!                           when the AP takes it; default 0
+//!   iwlwifi.txsgi=0|1       (ht=1) short guard interval. Unset (default): the
+//!                           rate-control column search may move to an SGI
+//!                           column when the AP receives it (as Linux rs.c
+//!                           does; the start column stays long GI; VHT 80:
+//!                           long GI only); 1 starts on SGI; 0 never uses SGI
 //!   iwlwifi.txmimo=0|1      (ht=1) two-stream MCS above MCS 7; default: on at
 //!                           5 GHz (laptop 8265, 2x2 VHT80: TCP TX 45 -> 115
 //!                           Mbit/s), off at 2.4 GHz; 1 forces both bands, 0 off
@@ -222,6 +225,8 @@ static BA_ON: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.htrate (default on): MCS in rate control.
 static HTRATE: AtomicBool = AtomicBool::new(true);
 static TXSGI: AtomicBool = AtomicBool::new(false);
+/// iwlwifi.txsgi=0: no short guard interval at all (not even as a rate-control column).
+static TXSGI_OFF: AtomicBool = AtomicBool::new(false);
 static TXMIMO: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.rscol (default on): rate control searches the other columns
 /// (short GI, two streams on 5 GHz) and keeps a clearly better one.
@@ -1359,6 +1364,7 @@ pub fn init(cmdline: &str) {
     BA_ON.store(cmdline_val(cmdline, "iwlwifi.ba") != Some("0"), Ordering::Relaxed);
     HTRATE.store(cmdline_val(cmdline, "iwlwifi.htrate") != Some("0"), Ordering::Relaxed);
     TXSGI.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("1"), Ordering::Relaxed);
+    TXSGI_OFF.store(cmdline_val(cmdline, "iwlwifi.txsgi") == Some("0"), Ordering::Relaxed);
     TXMIMO.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("1"), Ordering::Relaxed);
     RSCOL.store(cmdline_val(cmdline, "iwlwifi.rscol") != Some("0"), Ordering::Relaxed);
     TXSTBC.store(cmdline_val(cmdline, "iwlwifi.txstbc") != Some("0"), Ordering::Relaxed);
@@ -2703,7 +2709,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             // single antenna, and 5 GHz (on 2.4 GHz BT coex shares a chain).
             let mimo = h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
                 && (txant == 0 || txant == asc::ANT_AB) && !band_24;
-            let sgi_col = match ht_rates.and_then(|r| r.vht) {
+            let sgi_col = !TXSGI_OFF.load(Ordering::Relaxed) && match ht_rates.and_then(|r| r.vht) {
                 Some(v) => v.sgi80,
                 None => if h.ht40.is_some() && TX40.load(Ordering::Relaxed) { cap.sgi40() } else { cap.sgi20() },
             };
