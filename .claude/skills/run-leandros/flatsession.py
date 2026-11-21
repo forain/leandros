@@ -7,8 +7,8 @@ Session env (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, ...) is captured from a 
 first of cosmic-session/cosmic-comp/cosmic-panel/... whose /proc/<pid>/environ has a DBUS_SESSION_BUS_ADDRESS.
 Results land in <outdir>/flat.out. Host Mesa 26.x may SEGV QEMU at stop with --virgl: results before it are valid."""
 import os, subprocess, sys, time
-os.environ.setdefault("LEANDROS_RUN_ID", "flatgui")
-os.environ.setdefault("LEANDROS_VNC_BASE", "5961")
+os.environ.setdefault("LEANDROS_RUN_ID", "flatwin")
+os.environ.setdefault("LEANDROS_VNC_BASE", "5977")
 SK = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SK)
 import gstsession as g  # noqa: E402
@@ -37,7 +37,9 @@ ser = driver._Serial()
 R = open(f"{out}/flat.out", "w")
 def sh(c, t=60):
     o = driver.serial_run(c, timeout=t * scale, arch=arch, ser=ser)["output"]
-    R.write(f"### {time.strftime('%T')} {c[:200]}\n{o[-12000:]}\n"); R.flush()
+    import re  # drop kernel console lines (FORK/MMAP spam would crowd out the tail)
+    o = "\n".join(l for l in o.splitlines() if not re.match(r"^\[ *\d+\.\d+\]", l) and not re.search(r"\[(FORK|MMAP-BIG)\]", l))
+    R.write(f"### {time.strftime('%T')} {c[:200]}\n{o[-30000:]}\n"); R.flush()
     return o
 def put(path, lines):  # write a guest file via base64 (the guest shell is brush: quoting-fragile)
     import base64
@@ -92,6 +94,11 @@ put("/tmp/fgui.sh", [
     "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}",
     "echo BUS=$DBUS_SESSION_BUS_ADDRESS",
     "flatpak run --log-session-bus --env=WAYLAND_DEBUG=1 --env=GDK_DEBUG=opengl --env=GSK_DEBUG=renderer com.github.tchx84.Flatseal > /tmp/fgui.log 2>&1; echo EXIT=$? > /tmp/fgui.exit"])
+put("/tmp/portal.sh", [
+    "#!/bin/sh", "set -a; . /tmp/env.txt; set +a",
+    "export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/1000/bus}",
+    "G_MESSAGES_DEBUG=all /usr/libexec/xdg-desktop-portal -r -v > /tmp/portal.log 2>&1"])
+sh("su leandro -c '/tmp/portal.sh > /dev/null 2>&1 &'; sleep 3; wc -l /tmp/portal.log; head -n 5 /tmp/portal.log", 30)
 sh("rm -f /tmp/fgui.exit; su leandro -c '/tmp/fgui.sh > /tmp/fgui.pre 2>&1 &' ; sleep 1; cat /tmp/fgui.pre; echo started", 30)
 ser.pump(100 * scale)
 put("/tmp/diag.sh", [
@@ -102,6 +109,27 @@ put("/tmp/diag.sh", [
     "echo GLINFO; grep -a -i -E 'opengl|renderer|MESA|ZINK|EGL|GL_|llvmpipe|virgl|swrast|dri2' /tmp/fg.clean | head -n 10 | cut -c1-200",
     "echo PROC; for c in /proc/[0-9]*/comm; do n=$(cat $c); case $n in gjs*) d=${c%/comm}; grep -E 'State' $d/status;; esac; done"])
 sh("/tmp/diag.sh 2>&1", 90)
+# logs: portal, proxy/bus traffic, who owns stderr of busd/portal/proxy, gjs thread state, vfs lines
+put("/tmp/logs.sh", [
+    "#!/bin/sh",
+    "echo PORTAL; wc -l < /tmp/portal.log; grep -a -v -E '^[[:space:]]*$' /tmp/portal.log | tail -n 45 | cut -c1-220",
+    "echo PORTAL-ERR; grep -a -i -E 'warn|error|critical|denied|fail|flatpak-info|proc/' /tmp/portal.log | head -n 25 | cut -c1-220",
+    "echo BUSTRAFFIC; grep -a -E '^(B|C|F)[-0-9]*: ' /tmp/fgui.log | wc -l; grep -a -i -E 'vfs|Error|Timeout|Settings|Registry|Inhibit' /tmp/fgui.log | grep -a -E '^(B|C|F)[-0-9]*: ' | head -n 30 | cut -c1-220",
+    "echo BUSTAIL; grep -a -E '^(B|C|F)[-0-9]*: ' /tmp/fgui.log | tail -n 15 | cut -c1-200",
+    "echo APPERR; grep -a -i -E 'warn|error|critical|timeout|fail|Gjs|Gtk-|Gdk-|dconf|vfs' /tmp/fg.clean | head -n 30 | cut -c1-220",
+    "echo FDS; for n in busd xdg-desktop-portal xdg-dbus-proxy xdg-desktop-portal-cosmic gjs; do for c in /proc/[0-9]*/comm; do [ \"$(cat $c 2>/dev/null)\" = $n ] || continue; d=${c%/comm}; echo $n ${d#/proc/} fd1=$(readlink $d/fd/1) fd2=$(readlink $d/fd/2) ppid=$(grep PPid $d/status | cut -f2); done; done",
+    "echo THREADS; for c in /proc/[0-9]*/comm; do n=$(cat $c 2>/dev/null); case $n in gjs*|xdg-dbus-prox*|xdg-desktop-p*|busd) d=${c%/comm}; for t in $d/task/*; do echo $n ${d#/proc/} ${t#$d/task/} $(cat $t/comm 2>/dev/null) st=$(grep State $t/status | cut -f2) wchan=$(cat $t/wchan 2>/dev/null) sc=$(cat $t/syscall 2>/dev/null | cut -c1-40); done;; esac; done | head -n 60",
+    "echo SVC; ls /usr/share/dbus-1/services | grep -i -E 'gtk|vfs|gvfs|portal|document'; ls /run/user/1000 | head -n 30"])
+sh("/tmp/logs.sh 2>&1", 120)
+put("/tmp/pxy.sh", [
+    "#!/bin/sh", "set -a; . /tmp/env.txt; set +a",
+    "rm -f /tmp/px.sock; xdg-dbus-proxy $DBUS_SESSION_BUS_ADDRESS /tmp/px.sock --filter --talk=org.freedesktop.DBus --log > /tmp/px.log 2>&1 &",
+    "sleep 2; ls -l /tmp/px.sock",
+    "for a in $DBUS_SESSION_BUS_ADDRESS unix:path=/tmp/px.sock; do echo ADDR $a; export DBUS_SESSION_BUS_ADDRESS=$a",
+    "  timeout 40 gdbus call --session -d org.freedesktop.DBus -o /org/freedesktop/DBus -m org.freedesktop.DBus.StartServiceByName org.gtk.vfs.Daemon 0 2>&1 | head -n 3; echo rc=$?",
+    "done", "echo PXLOG; cut -c1-200 /tmp/px.log | tail -n 20"])
+sh("apk add glib 2>&1 | tail -n 1; which gdbus; su leandro -c /tmp/pxy.sh 2>&1", 150)
+sh("sleep 1; /tmp/logs.sh 2>&1 | head -n 0; for f in /run/user/1000/*.log /tmp/*busd*.log /var/log/*busd*; do [ -f $f ] && { echo == $f; tail -n 20 $f | cut -c1-200; }; done", 60)
 R.close()
 drv("stop", t=60)
 print("FLATSESSION done", flush=True)

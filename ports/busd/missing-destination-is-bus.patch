@@ -1,0 +1,88 @@
+A method call with no destination is addressed to the bus, not dropped.
+
+busd 0.5.0's `peer::Stream` rejects every non-signal without a DESTINATION
+field ("missing destination field") and the message disappears with no reply.
+The D-Bus specification and dbus-daemon treat a destination-less message as
+addressed to the bus itself, and xdg-dbus-proxy depends on that: when it
+filters a call (any name outside the sandbox's policy, e.g. a Flatpak app's
+StartServiceByName for org.gtk.vfs.Daemon) it sends
+`org.freedesktop.DBus.Peer.Ping` with no destination and rewrites the bus's
+reply into the error for its client. With busd the ping was never answered, so
+the proxy never replied and the client waited out its 25 s timeout (gjs:
+"GVFS-WARNING ... StartServiceByName for org.gtk.vfs.Daemon: Timeout was
+reached"), the same class as service-unknown-reply.patch.
+
+Now the stream fills in `org.freedesktop.DBus` as the destination (together
+with the sender, in one rebuild) and the bus's own Peer/Introspectable/
+Properties handling answers the ping.
+
+--- a/src/peer/stream.rs	2026-11-21 13:51:04.030696674 -0300
++++ b/src/peer/stream.rs	2026-11-21 13:51:04.030718786 -0300
+@@ -29,35 +29,43 @@
+                 async move {
+                     let header = msg.header();
+ 
+-                    // Ensure destination field is present and readable for non-signals.
+-                    if msg.message_type() != message::Type::Signal && header.destination().is_none()
+-                    {
+-                        bail!("missing destination field");
+-                    }
++                    // A non-signal without a destination is addressed to the bus
++                    // itself (the D-Bus specification, and dbus-daemon, say so).
++                    // xdg-dbus-proxy relies on it: to answer a filtered call it
++                    // sends `org.freedesktop.DBus.Peer.Ping` with NO destination
++                    // and turns the bus's reply into the error for its client.
++                    let needs_dest = msg.message_type() != message::Type::Signal
++                        && header.destination().is_none();
+ 
+                     // Ensure sender field is present. If it is not we add it using the unique name
+                     // of the peer.
+-                    match header.sender() {
+-                        Some(sender) if *sender == unique_name => Ok(msg),
++                    let needs_sender = match header.sender() {
++                        Some(sender) if *sender == unique_name => false,
+                         Some(_) => bail!("failed to parse message: Invalid sender field"),
+-                        None => {
+-                            let signature = header.signature();
+-                            let body = msg.body();
+-                            let body_bytes = body.data();
+-                            let fds = body_bytes
+-                                .fds()
+-                                .iter()
+-                                .map(|fd| fd.try_clone().map(Into::into))
+-                                .collect::<zbus::zvariant::Result<Vec<_>>>()?;
+-                            let builder =
+-                                message::Builder::from(header.clone()).sender(&unique_name)?;
+-                            let new_msg =
+-                                unsafe { builder.build_raw_body(body_bytes, signature, fds)? };
+-                            trace!("Added sender field to message: {:?}", new_msg);
+-
+-                            Ok(new_msg)
+-                        }
++                        None => true,
++                    };
++                    if !needs_dest && !needs_sender {
++                        return Ok(msg);
++                    }
++                    let signature = header.signature();
++                    let body = msg.body();
++                    let body_bytes = body.data();
++                    let fds = body_bytes
++                        .fds()
++                        .iter()
++                        .map(|fd| fd.try_clone().map(Into::into))
++                        .collect::<zbus::zvariant::Result<Vec<_>>>()?;
++                    let mut builder = message::Builder::from(header.clone());
++                    if needs_dest {
++                        builder = builder.destination(crate::fdo::BUS_NAME)?;
+                     }
++                    if needs_sender {
++                        builder = builder.sender(&unique_name)?;
++                    }
++                    let new_msg = unsafe { builder.build_raw_body(body_bytes, signature, fds)? };
++                    trace!("Completed message header: {:?}", new_msg);
++
++                    Ok(new_msg)
+                 }
+             });
+ 
