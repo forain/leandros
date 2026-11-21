@@ -16645,6 +16645,11 @@ fn handle_access(pid: u32, path_ptr: usize, amode: u32, eaccess: bool) -> Messag
         || raw == b"/etc/resolv.conf" {
         return err_reply(-38);
     }
+    // Synthesised /dev directories (/dev/dri, /dev/input, ...) are not on the
+    // root volume: proxying answered its ENOENT, so access("/dev/dri", F_OK)
+    // failed (glib g_file_test EXISTS) and flatpak never emitted its /dev/dri
+    // bind for a --device=dri app. The kernel's stat-based fallback answers.
+    if raw.starts_with(b"/dev/") && RAMFS_DIRS.iter().any(|&d| d == raw) { return err_reply(-38); }
     if let Some(port) = find_mount_port(raw) {
         return xattr_proxy(port, VFS_ACCESS, path_ptr as u64, amode as u64, eaccess as u64, 0, 0);
     }

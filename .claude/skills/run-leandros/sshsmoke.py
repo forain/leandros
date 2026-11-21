@@ -1193,10 +1193,18 @@ def privsep_crash(ssh, user, pw):
         lpid = listener_pid(before)
         a, victim, isolated = new_preauth(ssh, user, pw, before)
         if victim:
-            sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
+            # A Rust process survives the first user-sent SIGSEGV exactly as on Linux: std's
+            # stack-overflow handler (installed in every Rust main) is not fatal for a signal that
+            # is not a guard-page fault, resets the disposition to SIG_DFL and returns. The second
+            # one is then the real crash.
+            sig = os.environ.get("CRASH_SIG", "SEGV")
+            sudo_sh(ssh, user, pw, f"kill -{sig} {victim}; sleep 1; kill -{sig} {victim} 2>/dev/null; true")
         t0 = time.time()
         a_eof = probe_eof(a, 8)
         eof_s = time.time() - t0
+        if not a_eof and victim:
+            _, dg, _ = sudo_sh(ssh, user, pw, f"grep -E '^(Name|State|PPid|SigPnd|ShdPnd|SigBlk|SigCgt)' /proc/{victim}/status; cat /proc/{victim}/wchan; ls -l /proc/{lpid}/fd | wc -l; ls -l /proc/{lpid}/fd | grep -c pidfd; ls /proc/{victim}/fd 2>&1 | wc -l")
+            print(f"DIAG victim={victim} listener={lpid}: {dg.strip()!r}", flush=True)
         a.close()
         after = sshd_procs(ssh, user, pw)
         gone = victim not in {p for p, _, _ in after}
@@ -1204,8 +1212,8 @@ def privsep_crash(ssh, user, pw):
         b_still = say("hello-b2", "hello-b2")
         rc, out, _ = ssh.run(user, "id -un", pw, timeout=30)
         login = rc == 0 and user in out
-        step("privsep_crash_isolated", b_ok and isolated and same and b_still and login,
-             f"procs={after} victim={victim} gone={gone} eof_s={eof_s:.1f} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof}{'' if a_eof else ' (KNOWN-OPEN: see TODO.md sshd item)'} listener_unchanged={same} b_survives={b_still} new_login={login}")
+        step("privsep_crash_isolated", b_ok and isolated and same and b_still and login and a_eof,
+             f"procs={after} victim={victim} gone={gone} eof_s={eof_s:.1f} session_b={b_ok} preauth_child={isolated} probe_eof={a_eof} listener_unchanged={same} b_survives={b_still} new_login={login}")
     finally:
         try:
             os.write(fd, b"\x04")
@@ -1226,7 +1234,12 @@ def privsep_count(ssh, user, pw):
     for _ in range(6):
         s, victim, _iso = new_preauth(ssh, user, pw, sshd_procs(ssh, user, pw))
         if victim:
-            sudo_sh(ssh, user, pw, f"kill -SEGV {victim}")
+            # A Rust process survives the first user-sent SIGSEGV exactly as on Linux: std's
+            # stack-overflow handler (installed in every Rust main) is not fatal for a signal that
+            # is not a guard-page fault, resets the disposition to SIG_DFL and returns. The second
+            # one is then the real crash.
+            sig = os.environ.get("CRASH_SIG", "SEGV")
+            sudo_sh(ssh, user, pw, f"kill -{sig} {victim}; sleep 1; kill -{sig} {victim} 2>/dev/null; true")
         probe_eof(s, 5)
         s.close()
         time.sleep(0.5)
@@ -1263,6 +1276,12 @@ def main(argv):
     forwarding(ssh, user, pw, tmp)
     accounts_extra(ssh, user, pw, tmp)
     sshdcfg(ssh, user, pw, tmp)
+    if "--only-crash" in argv:
+        for _ in range(int(os.environ.get("CRASH_REPEAT", "1"))):
+            privsep_crash(ssh, user, pw)
+        bad = [n for n, ok in RESULTS if not ok]
+        print(f"SSHSMOKE summary: {len(RESULTS) - len(bad)}/{len(RESULTS)} passed" + (f"; failed: {' '.join(bad)}" if bad else ""), flush=True)
+        return 0 if not bad else 1
     if full_mode:
         full(ssh, user, pw, tmp)
     privsep_isolation(ssh, user, pw)
