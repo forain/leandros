@@ -3,7 +3,7 @@
 # Produces dynamic .so via the clang wrapper (shared-lib path is fine; only *executables* need the
 # musl-dyn-link.sh workaround). Usage: build-meson-lib.sh <component> <arch>
 set -e
-D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
+D="${LEANDROS_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-work}/m3-gl-stack"
 comp="$1"; arch="$2"
 [ -n "$comp" ] && [ -n "$arch" ] || { echo "usage: build-meson-lib.sh <comp> <arch>"; exit 2; }
 export PATH="/opt/homebrew/opt/bison/bin:$PATH"

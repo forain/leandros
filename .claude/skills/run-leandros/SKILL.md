@@ -29,7 +29,7 @@ If you need to rebuild after a code change run `./scripts/build-all.sh` first.
 All commands run from the **repo root**:
 
 ```sh
-cd /Users/forain/code/leandros
+cd <repo root>
 
 # 1. Boot (defaults to aarch64; takes ~5s on this machine). On an Apple
 # Silicon host, aarch64's default "uefi" mode now boots with HVF acceleration

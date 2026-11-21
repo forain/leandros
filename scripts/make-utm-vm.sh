@@ -58,6 +58,7 @@
 # Usage: scripts/make-utm-vm.sh [--name NAME] [--dest DIR] [--gl] [--mem MiB] [--cpus N]
 #                               [--serial-tcp PORT] [--debug-log] [--reset-home]
 
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -129,7 +130,7 @@ mkdir -p "$DATA"
 # cp -c is an APFS clone: instant, and shares blocks until the guest writes.
 copy_image() {
     rm -f "$DATA/$1"
-    cp -c "$1" "$DATA/$1" 2>/dev/null || cp "$1" "$DATA/$1"
+    clone_cp "$1" "$DATA/$1" 2>/dev/null || cp "$1" "$DATA/$1"
 }
 echo "📦 Copying images into $DATA"
 copy_image "$DISK_IMAGE"

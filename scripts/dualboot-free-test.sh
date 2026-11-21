@@ -17,6 +17,7 @@
 #
 # Env: FX_DIR (default ~/code/leandros-artifacts/dualboot), LEANDROS_INSTALL_BIN
 # (a freshly built leandros-install pushed into the stick before use).
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
@@ -62,8 +63,8 @@ echo "== images"
 rm -rf "$WORK"; mkdir -p "$WORK"
 SRC="$FXDIR/fxgap-$ARCH.img"
 [ -f "$SRC" ] || fail "missing $SRC (FX_GAP_GIB=24 scripts/make-dualboot-fixture.sh $ARCH $SRC)"
-for f in "$SRC"*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
-cp -c "$IMG" "$WORK/pristine.img"
+for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
+clone_cp "$IMG" "$WORK/pristine.img"
 STICK="$WORK/stick.img"
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$STICK" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }
 
@@ -138,7 +139,7 @@ echo "== Linux still boots by default"
 ok "systemd-boot default boots Linux (LINUX-DUALBOOT-OK)"
 
 echo "== choose LeandrOS (scratch copy)"
-SC="$WORK/scratch.img"; cp -c "$IMG" "$SC"; for x in meta manifest esp.sha256; do cp -c "$IMG.$x" "$SC.$x"; done
+SC="$WORK/scratch.img"; clone_cp "$IMG" "$SC"; for x in meta manifest esp.sha256; do clone_cp "$IMG.$x" "$SC.$x"; done
 ESP="$SC@@2M"
 mtype -i "$ESP" ::/loader/loader.conf > "$WORK/loader.conf.orig"
 printf 'default leandros.conf\ntimeout 1\nconsole-mode keep\n' > "$WORK/loader.conf.test"

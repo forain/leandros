@@ -13,6 +13,7 @@
 # allocation area (nothing in the reserved area, no existing file's clusters);
 # config.txt, kernel.img, cmdline.txt, initrd.cpio and the dtb are byte-identical;
 # slots/ exists. cmdline.txt is only compared by hash, never printed.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -u
 cd "$(dirname "$0")/.."
 ORD=${PI_E2E_ORD:-3}            # virtio ordinal of the extra disk (vda boot, vdb data0, vdc data1, vdd = 3)
@@ -26,7 +27,7 @@ trap cleanup EXIT
 
 (cd userland/espctl/pitest && PICARD_E2E_IMG=$W/card.img cargo test --release --target "$(rustc -vV | sed -n 's/host: //p')" emit_e2e >/dev/null 2>&1) || { echo "image build failed"; exit 1; }
 cp "$W/card.img" "$W/before.img"
-cp -c leandros-limine-aarch64.img "$W/boot.img"; cp -c f2fs-data0-aarch64.img "$W/root.img"
+clone_cp leandros-limine-aarch64.img "$W/boot.img"; clone_cp f2fs-data0-aarch64.img "$W/root.img"
 scripts/set-image-cmdline.sh "$W/boot.img" "sdhci.test_bootfat=$ORD" >/dev/null
 export LEANDROS_DISK_IMAGE=$W/boot.img LEANDROS_ROOT_IMAGE=$W/root.img
 export LEANDROS_QEMU_EXTRA="-drive if=none,id=bf,format=raw,file=$W/card.img -device virtio-blk-pci,drive=bf"

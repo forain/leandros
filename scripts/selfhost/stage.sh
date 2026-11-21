@@ -14,6 +14,7 @@
 #   leandros-src.tar.gz `git archive HEAD` (committed state only, minus artifacts/)
 #   guest-build-kernel.sh  the in-guest driver, run inside an Alpine chroot
 #   SHA256SUMS
+. "$(cd "$(dirname "$0")" && pwd)/../lib/clonecp.sh"
 set -euo pipefail
 ARCH="${1:-aarch64}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]" >&2; exit 2 ;; esac
@@ -45,7 +46,7 @@ EOF
     f="$CACHE/$(basename "$url")"
     [[ -s "$f" ]] || { curl -fsSL --retry 3 -o "$f.part" "$url"; mv "$f.part" "$f"; }
     [[ "$(sha256 "$f")" == "$hash" ]] || { echo "❌ sha256 mismatch: $f" >&2; rm -f "$f"; exit 1; }
-    cp -c "$f" "$OUT/" 2>/dev/null || cp "$f" "$OUT/"
+    clone_cp "$f" "$OUT/" 2>/dev/null || cp "$f" "$OUT/"
 done
 
 # ── 2. the source: committed state only ─────────────────────────────────────

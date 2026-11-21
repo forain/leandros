@@ -9,7 +9,7 @@ build scripts from this same lane were staged into `ports/input-stack/`
 instead (see its NOTES.md addendum), since they complete that port's input
 stack rather than the GL/DRM one.
 
-Workdir (original, host-only lane): `/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack`
+Workdir (original, host-only lane): `${LEANDROS_WORK:-~/.cache/leandros-work}/m3-gl-stack`
 HOST-ONLY cross-build lane. No QEMU, no leandros-repo writes, no OS build. Preps the
 next-three-milestone test binaries so they're ready when kernel K3 (dynamic linking) + K4 (DRM) land.
 

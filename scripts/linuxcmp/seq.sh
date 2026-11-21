@@ -1,7 +1,7 @@
 #!/bin/bash
 # deploy -> boot Linux once -> collect -> verify good -> cleanup. Runs under lock.sh laptop.
-D=/private/tmp/claude-501/-Users-forain-code-leandros/3a5d881b-73e3-4b64-8356-b3e09ebd0877/scratchpad/linuxcmp
-cd /Users/forain/code/leandros; export LEANDROS_REMOTE=172.16.149.179
+D="${LINUXCMP_DIR:-${TMPDIR:-/tmp}/linuxcmp}"; mkdir -p "$D"
+cd "$(dirname "$0")/../.."; export LEANDROS_REMOTE="${LEANDROS_REMOTE:-172.16.149.179}"
 L=$D/seq.log; log(){ echo "$(date +%T) $*" >> $L; }
 R(){ timeout ${T:-90} python3 scripts/remote.py "$@" 2>&1 | sed -E 's/((wifi|iwlwifi)\.psk=)[^ ]*/\1<r>/g'; }
 [ -e /private/tmp/claude-501/-Users-forain-code-leandros/3a5d881b-73e3-4b64-8356-b3e09ebd0877/scratchpad/tkiprekey.active ] && { log "tkiprekey active, releasing lock"; exit 9; }

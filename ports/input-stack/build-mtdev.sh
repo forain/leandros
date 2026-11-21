@@ -5,7 +5,7 @@
 # headers + a hand-written mtdev.pc into the merged sysroot. Usage: <arch>
 set -e
 . "$(dirname "$0")/../../scripts/toolchain/env.sh"
-D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
+D="${LEANDROS_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-work}/m3-gl-stack"
 arch="$1"; [ -n "$arch" ] || { echo "usage: build-mtdev.sh <arch>"; exit 2; }
 S=$D/sysroot-$arch
 CC=$D/toolchain/$arch-linux-musl-cc

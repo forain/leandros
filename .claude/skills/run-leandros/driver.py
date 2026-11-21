@@ -506,6 +506,12 @@ def _kvm_usable(guest_arch: str) -> bool:
     )
 
 
+def _gic_version(accel_flags) -> str:
+    """virt GIC: 3 everywhere (HVF refuses v2), except KVM, where the host's own
+    GIC must be mirrored (Pi 5 is GICv2; KVM cannot emulate v3 there)."""
+    return "host" if "kvm" in accel_flags else "3"
+
+
 def _accel_flags(guest_arch: str, mode: str):
     """Best available accelerator for this host/guest pair.
 
@@ -1056,7 +1062,8 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             _qemu_bin("qemu-system-aarch64"),
             # gic-version=3: QEMU >= 11.1 HVF refuses a GICv2 machine outright;
             # the kernel detects v2/v3 at boot, so TCG uses the same line.
-            "-machine", "virt,gic-version=3", "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
+            # KVM on an aarch64 Linux host (Pi 5 = GICv2) needs gic-version=host.
+            "-machine", "virt,gic-version=" + _gic_version(cpu_flags), "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",

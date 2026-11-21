@@ -2,7 +2,7 @@
 # deskplay phase 1: login, 3 Firefox launches on the pinned stream, 11-min heartbeat across them
 set -u
 SP=/private/tmp/claude-501/-Users-forain-code-leandros/3a5d881b-73e3-4b64-8356-b3e09ebd0877/scratchpad; D=$SP/deskplay
-cd /Users/forain/code/leandros; export LEANDROS_REMOTE=172.16.149.179
+cd "$(dirname "$0")/../.."; export LEANDROS_REMOTE="${LEANDROS_REMOTE:-172.16.149.179}"
 R="python3 scripts/remote.py"
 scripts/desktop-login.sh $SP/laptop-login.env 2>&1 | tail -n 3
 $R push $D/dp.sh /tmp/dp.sh 2>&1 | tail -n 1

@@ -8,6 +8,7 @@
 #  3. real backend: --self-test-dualboot /dev/nvme0n1 reaches page Done;
 #  4. on the host: check-dualboot-fixture.sh --installed passes.
 # Env: GUI_BIN (default m6-session-bins/out/leandros-installer-<arch>), LEANDROS_INSTALL_BIN, FX_DIR.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
 ARCH="${1:-aarch64}"
@@ -56,7 +57,7 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 SRC="$FXDIR/fxgap-$ARCH.img"
 [ -f "$SRC" ] || fail "missing $SRC"
 df -g "$HOME" | awk 'NR==2 && $4 < 30 { exit 1 }' || fail "less than 30 GiB free"
-for f in "$SRC"*; do cp -c "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
+for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
 STICK="$WORK/stick.img"
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$STICK" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }
 

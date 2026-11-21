@@ -8,6 +8,7 @@
 #
 # The boot test needs build/ec2-<arch>.img (scripts/ec2-image.sh <arch>). On a
 # Mac hold the QEMU lock (lock.sh qemu) around it. TIMEOUT=seconds (default 420).
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
@@ -52,7 +53,7 @@ test_boot() {
     local arch="$1" img="build/ec2-$1.img" tmo="${TIMEOUT:-420}"
     [[ -f "$img" ]] || { bad "$arch: missing $img (run scripts/ec2-image.sh $arch)"; return; }
     local w; w="$(mktemp -d)"; local log="$w/serial.log"
-    cp -c "$img" "$w/disk.img" 2>/dev/null || cp "$img" "$w/disk.img"
+    clone_cp "$img" "$w/disk.img" 2>/dev/null || cp "$img" "$w/disk.img"
     local share=/opt/homebrew/share/qemu code vars
     local -a q
     if [[ $arch == x86_64 ]]; then

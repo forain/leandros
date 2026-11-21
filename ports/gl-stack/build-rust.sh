@@ -4,7 +4,7 @@
 # Env wiring: pkg-config points at the merged sysroot so -sys crates resolve our .so/.pc;
 # cc for any C in build scripts uses our clang wrapper; libclang available if any bindgen fires.
 set -e
-D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
+D="${LEANDROS_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-work}/m3-gl-stack"
 mani="$1"; shift; arch="$1"; shift
 [ -n "$mani" ] && [ -n "$arch" ] || { echo "usage: build-rust.sh <manifest-dir> <arch> [args]"; exit 2; }
 S=$D/sysroot-$arch

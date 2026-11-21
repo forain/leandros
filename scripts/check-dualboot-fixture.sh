@@ -10,6 +10,7 @@
 # unchanged, end > fs end, 1 MiB aligned) and p4-p7 inside the freed tail of p2's old range.
 # --boot <arch>: boots a cp -c clone in QEMU through systemd-boot into the
 # Linux kernel and asserts LINUX-DUALBOOT-OK (serial only), no screenshots.
+. "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -eu
 IMG=${1:?usage: $0 <img> [--installed] [--boot <arch>]}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -38,7 +39,7 @@ if [ -n "$BOOT" ]; then
   esac
   [ "$BOOT" = aarch64 ] && [ "$(uname -m)" != arm64 ] && MACH="-machine virt -cpu max -accel tcg"
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-  if [ "${FX_BOOT_INPLACE:-0}" = 1 ]; then ln -s "$IMG" "$T/disk.img"; else cp -c "$IMG" "$T/disk.img"; fi
+  if [ "${FX_BOOT_INPLACE:-0}" = 1 ]; then ln -s "$IMG" "$T/disk.img"; else clone_cp "$IMG" "$T/disk.img"; fi
   VARS=$T/vars.fd
   if [ "$BOOT" = x86_64 ]; then cp /opt/homebrew/share/qemu/edk2-i386-vars.fd "$VARS"; else dd if=/dev/zero of="$VARS" bs=1m count=64 2>/dev/null; fi
   DISKDEV="${FX_DISKDEV:-virtio-blk-pci}"

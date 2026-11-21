@@ -5,7 +5,7 @@
 #   arch:      x86_64 | aarch64
 # Proven env from S3: bison>=3 ahead of PATH; homebrew python for meson.
 set -e
-D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/d3-input-stack
+D="${LEANDROS_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-work}/d3-input-stack"
 comp="$1"; arch="$2"
 [ -n "$comp" ] && [ -n "$arch" ] || { echo "usage: build.sh <comp> <arch>"; exit 2; }
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Verify a target ELF: ET_DYN, PT_INTERP, DT_NEEDED closure against merged sysroot.
 # Usage: verify-elf.sh <arch> <elf>
-D=/Users/forain/.claude-forain/jobs/afde2e74/tmp/m3-gl-stack
+D="${LEANDROS_WORK:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-work}/m3-gl-stack"
 RE=/opt/homebrew/opt/llvm/bin/llvm-readelf
 arch="$1"; elf="$2"; S=$D/sysroot-$arch
 echo "===== $elf ($arch) ====="
