@@ -1042,7 +1042,9 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         # ever binds — which used to make `start` report a launched guest
         # against a 0-byte serial log instead of failing (see cmd_start's
         # poll() check).
-        vars_fd = os.path.join(REPO_ROOT, "aarch64_vars.fd")
+        # LEANDROS_VARS_FD: a private NVRAM copy (runtests' host: suites; QEMU write-locks
+        # the file, so two VMs of one tree cannot share aarch64_vars.fd).
+        vars_fd = os.environ.get("LEANDROS_VARS_FD") or os.path.join(REPO_ROOT, "aarch64_vars.fd")
         if not os.path.exists(vars_fd):
             vars_tpl = _find_fw(AARCH64_VARS_PATHS)
             if not vars_tpl:
@@ -1108,7 +1110,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         if "CODE" in os.path.basename(fw):
             vars_tpl = _find_fw(X86_64_VARS_PATHS)
             if vars_tpl:
-                vars_fd = os.path.join(REPO_ROOT, "x86_64_vars.fd")
+                vars_fd = os.environ.get("LEANDROS_VARS_FD") or os.path.join(REPO_ROOT, "x86_64_vars.fd")
                 if not os.path.exists(vars_fd):
                     shutil.copyfile(vars_tpl, vars_fd)
                 vars_args = ["-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}"]
