@@ -38,6 +38,10 @@ pre=(--no-default-config -Wno-unused-command-line-argument "--target=$arch-unkno
 # link-only flags (a compile-only run would trip meson/cc-rs probes that pass -Werror=unused-command-line-argument)
 ((link)) && pre+=("--ld-path=$LLD" --rtlib=compiler-rt --unwindlib=none)
 [ "$arch" = aarch64 ] && pre+=(-mno-outline-atomics)
+# Distro clangs (Arch) default to -fstack-protector-strong; upstream/Homebrew clang does not. The dynamic
+# sysroot libc.so exports no __stack_chk_guard (cf. ports/mesa/ssp_guard.c), so aarch64 links of C deps
+# (zstd-sys) fail. Pin upstream's default; an explicit -fstack-protector* from the caller still wins.
+pre+=(-fno-stack-protector)
 ((opt)) && pre+=(-DNDEBUG)
 bin=$CLANG
 if [ "$lang" = c++ ]; then
