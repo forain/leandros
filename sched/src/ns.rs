@@ -874,7 +874,7 @@ pub fn write_map(opener: &Opener, writer: u32, kind: usize, data: &[u8]) -> isiz
     // CAP_SETFCAP. Self-write (opener lives in the target ns): the creator
     // had it in the parent at creation (parent_could_setfcap). Otherwise the
     // OPENER (f_cred) needs it over the parent namespace. gid_map: no rule.
-    if kind == 0 && comp[..n].iter().any(|e| e.1 == 0) {
+    if kind == 0 && (0..n).any(|i| exts[i].1 == 0 || comp[i].1 == 0) {
         let ok = if opener.cr.0 == tns { PARENT_SETFCAP[t].load(Acquire) }
                  else { crate::caps::capable_snap(opener.cr.0, opener.cr.1, opener.cr.3, par, 31) };
         if !ok { return -1; }

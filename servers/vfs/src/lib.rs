@@ -10100,7 +10100,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                || lookup_path == b"/proc/sys/fs/file-nr"
                || lookup_path == b"/proc/sys/kernel/random/boot_id" || lookup_path == b"/proc/sys/kernel/random/uuid"
                || lookup_path == b"/proc/sys/fs/ovl_selftest" {
-            match gen_proc_system(lookup_path, sched::fsuid_of(pid) == 0) {
+            match gen_proc_system(lookup_path, host_root_of(pid)) {
                 Some(v) => {
                     if let VnodeKind::TmpFile { idx, .. } = v {
                         // Same lock order as everywhere: TMP_FILES, then PSYS_ORIGIN. Drop the
@@ -15500,11 +15500,11 @@ fn mounted_sock_resolve(pid: u32, rpath: &[u8]) -> i64 {
     let (mode, uid, gid, ino) = match mounted_lstat(port, rpath) { Ok(v) => v, Err(e) => return e as i64 };
     if mode & 0o170000 != 0o140000 { return -111; } // exists, not a socket
     let cred = cred_of(pid);
-    if cred.euid != 0 {
-        let bits = if cred.euid == uid { (mode >> 6) & 7 }
-                   else if cred.egid == gid { (mode >> 3) & 7 } else { mode & 7 };
-        if bits & 2 == 0 { return -13; } // connect needs write on the socket inode
-    }
+    // connect needs write on the socket inode: the shared evaluator (owner/group/other
+    // incl. supplementary groups, ACL-less, CAP_DAC_OVERRIDE over an inode whose uid and
+    // gid are mapped in the caller's user namespace; never "euid 0 in any namespace").
+    let meta = xattr::FileMeta { mode: mode as u16, uid, gid };
+    if !xattr::may_access(&meta, &cred, None, xattr::MAY_WRITE) { return -13; }
     let mut t = MOUNTED_SOCKS.lock();
     match t.iter().position(|e| e.0 == rpath) {
         Some(i) if t[i].1 == ino => t[i].2 as i64,
