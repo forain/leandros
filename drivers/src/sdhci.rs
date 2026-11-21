@@ -77,11 +77,18 @@ use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 use crate::kenv::{mm, sched};
 
+/// Set once `init` returns: after that `dbg*` is a no-op. The rpi5 arm pokes the
+/// UART by physical address, valid only on the boot identity map; a runtime call
+/// (retune, error recovery, re-probe) from a user mm faults, and a fault while
+/// DEVICES is held wedges all block I/O. Runtime messages use `serial_debug`.
+static PROBE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Bring-up marker straight to the Pi's debug PL011, independent of the console
 /// stack. This driver runs before userspace and had never touched real silicon;
 /// when it stalls, the only question worth answering is *which* wait stalled.
 #[cfg(feature = "rpi5")]
 fn dbg(c: u8) {
+    if PROBE_DONE.load(core::sync::atomic::Ordering::Relaxed) { return; }
     const BASE: usize = 0x107D_0010_00;
     unsafe {
         let mut spins = 0u32;
@@ -105,6 +112,7 @@ fn dbg(c: u8) {
 /// this path.
 #[cfg(feature = "raspi4b")]
 fn dbg(c: u8) {
+    if PROBE_DONE.load(core::sync::atomic::Ordering::Relaxed) { return; }
     let base = mm::phys_to_virt(0xFE20_1000);
     unsafe {
         let mut spins = 0u32;
@@ -1453,7 +1461,7 @@ const CMD_VOLTAGE_SWITCH: u8 = 11;
 const CMD_SEND_TUNING:    u8 = 19;
 const CFG_OFF: usize = 0x400;
 
-static UHS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static UHS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 static UHS_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static UHS_LAST_TUNE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static UHS_RETUNES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1732,6 +1740,12 @@ unsafe fn negotiate_uhs(dev: &SdhciDevice, rca: u32) -> bool {
             dev.apply_uhs(0, good.clk_sel);
             continue;
         }
+        {
+            // SD_PIN_SEL = card (Linux reads 2 here; we left whatever firmware set).
+            let pm = (dev.base + CFG_OFF + 0x44) as *mut u32;
+            let pv = pm.mmio_read();
+            if pv & 3 != 2 { pm.mmio_write((pv & !3) | 2); }
+        }
         dev.apply_uhs(func, clk_sel);
         if func == 3 {
             // Linux reaches SDR104 on this controller; make sure the strap
@@ -1740,8 +1754,11 @@ unsafe fn negotiate_uhs(dev: &SdhciDevice, rca: u32) -> bool {
             let v = m.mmio_read();
             dbg_str("[sdhci] uhs: max50 cfg before=");
             dbg_hex(v as u64);
-            if v & 1 == 0 || v & (1 << 31) != 0 {
-                m.mmio_write((v | 1) & !(1u32 << 31));
+            // Linux (sdhci-brcmstb) leaves 0x80000000: STRAP_OVERRIDE (bit 31) set,
+            // MAX_50MHZ_MODE_ENABLE (bit 0) clear. The previous revision wrote the
+            // inverse, which caps the clock path at 50 MHz and starves tuning.
+            if v & 1 != 0 || v & (1 << 31) == 0 {
+                m.mmio_write((v | (1u32 << 31)) & !1u32);
                 dbg_str(" -> ");
                 dbg_hex(m.mmio_read() as u64);
             }
@@ -2077,6 +2094,7 @@ pub fn init() {
         }
         None => { dbg(b'-'); 0 }
     };
+    PROBE_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn device_count() -> usize {
