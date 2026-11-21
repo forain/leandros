@@ -100,6 +100,7 @@ busd is not COSMIC, so it is patched freely; `build.sh` applies the patches in n
 | Patch | What it does |
 |---|---|
 | `current-thread-runtime.patch` | a single-threaded tokio runtime; kept from an investigation, neither necessary nor sufficient for anything now |
+| `missing-destination-is-bus.patch` | a non-signal with no destination is addressed to the bus (D-Bus spec), not dropped: xdg-dbus-proxy answers a filtered call by sending `Peer.Ping` with no destination, so before this a Flatpak app's call to a name outside its policy (gjs: `StartServiceByName org.gtk.vfs.Daemon`) never got its error and timed out after 25 s |
 | `service-unknown-reply.patch` | replies `org.freedesktop.DBus.Error.ServiceUnknown` to a method call addressed to a well-known name nobody owns, instead of dropping it |
 | `start-service-activation.patch` | real `.service`-file activation: `StartServiceByName`, `ListActivatableNames`, `UpdateActivationEnvironment`, and implicit activation of an unowned but activatable name |
 | `unique-activation.patch` | a service is spawned once however many callers ask at the same moment; the activation timeout is dbus-daemon's 25 s instead of 5 s |
