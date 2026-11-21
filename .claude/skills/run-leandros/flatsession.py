@@ -154,7 +154,7 @@ if MODE == "gpu":
         "#!/bin/sh", "set -a; . /tmp/env.txt; set +a", "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}",
         "C=$HOME/.var/app/" + FA + "/cache; mkdir -p $C; cp /tmp/probe.py $C/probe.py",
         "tag=$1; shift",
-        "echo PROBE-$tag; timeout 60 flatpak run \"$@\" --env=GSK_DEBUG=renderer --env=GDK_DEBUG=opengl,vulkan --command=python3 " + FA + " $C/probe.py > /tmp/gp-$tag.log 2>&1; echo rc=$?",
+        "echo PROBE-$tag; timeout 240 flatpak run \"$@\" --env=GSK_DEBUG=renderer --env=GDK_DEBUG=opengl,vulkan --command=python3 " + FA + " $C/probe.py > /tmp/gp-$tag.log 2>&1; echo rc=$?",
         "grep -a -v -E '^\\[ *[0-9]+\\.' /tmp/gp-$tag.log | cut -c1-200 | tail -n 40",
         "echo PROBE-END-$tag"])
     put("/tmp/gs.sh", [
@@ -163,16 +163,17 @@ if MODE == "gpu":
         "timeout 60 cosmic-screenshot --interactive=false --save-dir /tmp/shots 2>&1 | tail -n 3; for f in /tmp/shots/*.png; do mv $f /tmp/shots-$1.png; done; ls -l /tmp/shots-$1.png; sha1sum /tmp/shots-$1.png"])
     put("/tmp/gg.sh", [  # Flatseal GUI for 120 s, args = flatpak run options
         "#!/bin/sh", "set -a; . /tmp/env.txt; set +a", "export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}", "tag=$1; shift",
-        "timeout 130 flatpak run \"$@\" --env=GSK_DEBUG=renderer --env=GDK_DEBUG=opengl,vulkan " + FA + " > /tmp/gg-$tag.log 2>&1"])
+        "timeout 200 flatpak run \"$@\" --env=GSK_DEBUG=renderer --env=GDK_DEBUG=opengl,vulkan " + FA + " > /tmp/gg-$tag.log 2>&1"])
     sh("chmod 755 /tmp/gp.sh /tmp/gs.sh /tmp/gg.sh; chmod 1777 /tmp; apk update 2>&1 | tail -n 1; apk add python3 2>&1 | tail -n 2; python3 -V", 400)
     sh("su leandro -c '. /tmp/env.txt; export DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR; /usr/libexec/leandros-sysbus portal screenshot 60' 2>&1 | tail -n 3; rm -f /tmp/screenshot-*.png", 150)
     sh("su leandro -c '/tmp/gs.sh base' 2>&1", 120)
     sh("su leandro -c \"flatpak run --command=sh " + FA + " -c 'which python3 python3.12 gjs; python3 -c \\\"import gi; print(gi.__file__)\\\"; ls /dev/dri; echo ICD; ls /usr/share/vulkan/icd.d'\" 2>&1 | tail -n 14", 200)
-    sh("su leandro -c '/tmp/gp.sh default' 2>&1", 200)
-    sh("su leandro -c '/tmp/gp.sh ngl --env=GSK_RENDERER=ngl' 2>&1", 200)
+    sh("su leandro -c '/tmp/gp.sh default' 2>&1", 300)
+    sh("su leandro -c '/tmp/gp.sh ngl --env=GSK_RENDERER=ngl' 2>&1", 300)
     for tag, extra in (("dflt", ""), ("ngl", "--env=GSK_RENDERER=ngl")):
+        sh("su leandro -c \"flatpak kill " + FA + "\" 2>&1 | tail -n 1; sleep 2; echo killed", 40)
         sh("su leandro -c '/tmp/gg.sh " + tag + " " + extra + " &' ; sleep 1; echo started", 30)
-        ser.pump(80 * scale)
+        ser.pump(110 * scale)
         sh("su leandro -c '/tmp/gs.sh " + tag + "' 2>&1; python3 /tmp/png.py " + tag + " 2>&1 | tail -n 8", 400)
         sh("grep -a -E 'Not using|Using renderer|trying|renderer|Failed|vulkan|Vulkan' /tmp/gg-" + tag + ".log | cut -c1-200 | head -n 20; grep -a -c . /tmp/gg-" + tag + ".log", 60)
         ser.pump(55 * scale)
