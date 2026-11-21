@@ -364,12 +364,17 @@ def main(argv):
             else:
                 errs = claims.check(scan)
                 if errs and all(("no scan line" in e or "fsynced but missing" in e) for e in errs):
+                    first_missing = [e for e in errs if "fsynced but missing" in e]
                     # crashscan only reads: a torn console line does not repeat.
                     print("    rescan: " + "; ".join(errs[:4]), flush=True)
                     r2 = run(f"/bin/f2fstest crashscan {pdir}", 300)
                     if "SCAN_DONE" in r2["output"]:
                         errs = [e.replace("no scan line", "no scan line twice").replace("fsynced but missing", "fsynced but missing in both scans")
                                 for e in claims.check(r2["output"])]
+                        # A fsynced file missing from the first post-recovery scan is a durability bug even if a
+                        # rescan finds it (a reader saw it gone); only torn console lines may be retried away.
+                        if first_missing and not any("fsynced but missing" in e for e in errs):
+                            errs += [e.replace("fsynced but missing", "fsynced but missing in the first scan only (transient)") for e in first_missing]
                 nclaims = len(claims.a) + len(claims.o_sync) + len(claims.n)
                 extra = f"; {claims.inflight} blocks of the in-flight rewrite" if claims.inflight else ""
                 if claims.uncaptured:
