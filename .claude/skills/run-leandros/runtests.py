@@ -312,6 +312,8 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # libflatpak appstream refresh from a local ostree remote: pull of appstream2/<arch> + extraction (lane appstream; needs network for apk).
+                "host:appstreamtest.py",
                 # Link flap/watch (own boot, ~110 s on both arches; lane suiteharness).
                 "host:netwatchtest.py",
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
@@ -434,6 +436,7 @@ SUITES = {
     "a64acpi": ["host:a64acpitest.py"],
     "blank": ["host:blanktest.py"],
     "portalshot": ["host:portalshottest.py"],
+    "appstream": ["host:appstreamtest.py"],
     # lane virglsuites: virgl COSMIC-session suites, each in its own boot (need a host GPU QEMU:
     # Mac GPU QEMU or the box); coreutils = uutils behaviour in a fresh brush guest (no GPU).
     "audio-session": ["host:virglsessiontest.py audio"],
@@ -561,7 +564,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900,
+HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "appstreamtest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
