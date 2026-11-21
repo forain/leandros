@@ -81,7 +81,9 @@
 //!                           rate control over MCS 0-7 too
 //!   iwlwifi.txsgi=1         (ht=1) transmit with the short guard interval
 //!                           when the AP takes it; default 0
-//!   iwlwifi.txmimo=1        (ht=1) two-stream MCS above MCS 7; default 0
+//!   iwlwifi.txmimo=0|1      (ht=1) two-stream MCS above MCS 7; default: on at
+//!                           5 GHz (laptop 8265, 2x2 VHT80: TCP TX 45 -> 115
+//!                           Mbit/s), off at 2.4 GHz; 1 forces both bands, 0 off
 //!   iwlwifi.txstbc=0        (ht=1) no STBC on single-stream MCS; default:
 //!                           STBC on both antennas when the AP receives it
 //!                           (Linux rs.c on the 8000 family), the legacy
@@ -93,8 +95,9 @@
 //!   iwlwifi.tx40=0          (40 MHz link) transmit HT at 20 MHz
 //!   iwlwifi.vht=0           no VHT / 80 MHz on 5 GHz (default: VHT 80 MHz
 //!                           where the AP, the NVM and the SKU allow it)
-//!   iwlwifi.vhttx=1         (80 MHz VHT link) transmit VHT MCS 0-9 x 1-2 streams
-//!                           (default off: HT40 rates; untested on a real VHT link)
+//!   iwlwifi.vhttx=0         (80 MHz VHT link) transmit HT40 rates instead of VHT
+//!                           MCS 0-9 x 1-2 streams (default 1; verified on a real
+//!                           VHT80 2x2 link, lane iwl5g 2026-11-21)
 //!   iwlwifi.mcast=0         no MCAST_FILTER_CMD (the firmware then drops
 //!                           group-addressed frames); default: pass all
 //!   iwlwifi.smps=static|dynamic
@@ -243,7 +246,9 @@ static HT40_24: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vht (default on): VHT at 80 MHz on 5 GHz where allowed.
 static VHT: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.vhttx (default off): VHT TX rates on a VHT link.
-static VHTTX: AtomicBool = AtomicBool::new(false);
+static VHTTX: AtomicBool = AtomicBool::new(true);
+/// iwlwifi.txmimo=0: two-stream TX off on every band (unset: on at 5 GHz only, 1: both bands).
+static TXMIMO_OFF: AtomicBool = AtomicBool::new(false);
 /// iwlwifi.txagg (default on): TX A-MPDU on TID 0.
 static TXAGG: AtomicBool = AtomicBool::new(true);
 
@@ -1367,7 +1372,8 @@ pub fn init(cmdline: &str) {
     HT40.store(cmdline_val(cmdline, "iwlwifi.ht40") != Some("0"), Ordering::Relaxed);
     HT40_24.store(cmdline_val(cmdline, "iwlwifi.ht40_24") != Some("0"), Ordering::Relaxed);
     VHT.store(cmdline_val(cmdline, "iwlwifi.vht") != Some("0"), Ordering::Relaxed);
-    VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") == Some("1"), Ordering::Relaxed);
+    VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") != Some("0"), Ordering::Relaxed);
+    TXMIMO_OFF.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("0"), Ordering::Relaxed);
     ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
@@ -2665,7 +2671,7 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
             (Some(h), Some(cap)) if h.ht && HTRATE.load(Ordering::Relaxed) => Some(rs::HtRates {
                 sgi: TXSGI.load(Ordering::Relaxed) && if h.ht40.is_some() { cap.sgi40() } else { cap.sgi20() },
                 ht40: h.ht40.is_some() && TX40.load(Ordering::Relaxed),
-                mimo: TXMIMO.load(Ordering::Relaxed) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC
+                mimo: (TXMIMO.load(Ordering::Relaxed) || (!TXMIMO_OFF.load(Ordering::Relaxed) && !band_24)) && h.ap_streams >= 2 && h.ap_sm_ps != ht::SM_PS_STATIC
                       && hw.tx_ant & asc::ANT_AB == asc::ANT_AB,
                 stbc: TXSTBC.load(Ordering::Relaxed) && cap.rx_stbc() && hw.tx_ant & asc::ANT_AB == asc::ANT_AB
                       && (txant == 0 || txant == asc::ANT_AB),
