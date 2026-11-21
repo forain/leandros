@@ -227,6 +227,7 @@ extern "C" {
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t;
     pub fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t;
     pub fn close(fd: c_int) -> c_int;
+    pub fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
     pub fn kill(pid: c_int, sig: c_int) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, out: *mut c_void) -> c_int;
     pub fn pipe(fds: *mut c_int) -> c_int;
@@ -1759,6 +1760,69 @@ unsafe fn t_emu_wide_wrap() -> bool {
     report(b"emu_wide_wrap", ok)
 }
 
+/// Double-width characters must reach the framebuffer as their own glyphs, not
+/// the two-cell placeholder box or a blank. Paints one sample per text row on a
+/// free VT, reads the live surface back through /dev/fb0 and fingerprints each
+/// 2-cell region (16x16 px at the 8x16 console cell, origin 0,0).
+unsafe fn t_wide_glyphs(tty0: c_int) -> bool {
+    let fb = open(b"/dev/fb0\0".as_ptr(), 0);
+    if fb < 0 { out(b"  fb0 open failed\n"); return report(b"wide_glyphs", false); }
+    let mut info = [0u32; 8];
+    if ioctl(fb, 0x4600, info.as_mut_ptr() as *mut c_void) != 0 || info[6] != 32 {
+        out(b"  FBIOGET_VSCREENINFO failed\n"); close(fb); return report(b"wide_glyphs", false);
+    }
+    let pitch = info[7] as i64;
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { close(fb); return report(b"wide_glyphs", false); }
+    let sid = login_pause(fd);
+    let mut ok = switch_to(tty0, free as usize);
+    sleep_ms(300);
+    // CJK ideograph x2, kana, Hangul, BMP emoji (watch), SMP emoji (grinning face).
+    let msg = "\x1b[2J\x1b[1;1H\u{4e2d}\x1b[2;1H\u{6f22}\x1b[3;1H\u{3042}\x1b[4;1H\u{d55c}\x1b[5;1H\u{231a}\x1b[6;1H\u{1f600}";
+    write(fd, msg.as_ptr() as *const c_void, msg.len());
+    sleep_ms(500);
+    let mut hashes = [0u64; 6];
+    let mut k = 0usize;
+    while k < 6 {
+        let (mut h, mut ink, mut same_as_box) = (0xcbf29ce484222325u64, 0usize, true);
+        let mut y = 0usize;
+        while y < 16 {
+            let mut row = [0u32; 16];
+            lseek(fb, (k * 16 + y) as i64 * pitch, 0);
+            read(fb, row.as_mut_ptr() as *mut c_void, 64);
+            let mut x = 0usize;
+            while x < 16 {
+                let px = row[x] & 0xFFFFFF;
+                h = (h ^ px as u64).wrapping_mul(0x100000001b3);
+                let lit = px != 0;
+                if lit { ink += 1; }
+                let box_px = ((y == 1 || y == 14) && (1..=14).contains(&x))
+                    || ((x == 1 || x == 14) && (1..=14).contains(&y));
+                if lit != box_px { same_as_box = false; }
+                x += 1;
+            }
+            y += 1;
+        }
+        hashes[k] = h;
+        out(b"  wide sample "); out_num(k); out(b" ink="); out_num(ink);
+        out(b" box="); out_num(same_as_box as usize); out(b" hash="); out_num((h & 0xFFFFFF) as usize); out(b"\n");
+        if ink == 0 || same_as_box { ok = false; }
+        k += 1;
+    }
+    let mut a = 0usize;
+    while a < 6 { let mut b = a + 1; while b < 6 { if hashes[a] == hashes[b] { ok = false; } b += 1; } a += 1; }
+    switch_to(tty0, 1);
+    sleep_ms(100);
+    login_resume(sid);
+    close(fd);
+    close(fb);
+    report(b"wide_glyphs", ok)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let argc = argc_c as isize;
@@ -1805,7 +1869,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 40usize;
+    let total = 41usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1847,6 +1911,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_emu_wide_advance() { passed += 1; }
     if t_emu_wide_overwrite() { passed += 1; }
     if t_emu_wide_wrap() { passed += 1; }
+    if t_wide_glyphs(tty0) { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, the
     // default keyboard mode. A suite that fails halfway through a KD_GRAPHICS
