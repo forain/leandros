@@ -5475,7 +5475,7 @@ fn kill_setid(ms: &mut MountState, ino: u32) {
     };
     // CAP_FSETID over the inode in the caller's userns (Linux should_remove_suid).
     if ms.cred.cap_inode(xattr::CAP_FSETID, ouid, ogid) { return; }
-    let kill = xattr::setid_kill_bits(mode, u32::MAX);
+    let kill = xattr::setid_kill_bits(mode);
     if kill == 0 { return; }
     let iblk = ms.cache.get_mut(ms.dev, addr as u64);
     w16(iblk, INO_MODE, mode & !kill);

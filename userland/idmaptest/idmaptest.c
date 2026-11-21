@@ -771,28 +771,37 @@ static int nested_parent_root_setfcap(void)
     }
     return 0;
 }
+/* Bind a socket under a directory served by a real fs server (not tmpfs/ramfs: those never reach
+ * servers/vfs mounted_sock_resolve). Returns the listener fd or -1; the regress image must have one. */
+static int bind_mounted_sock(const char *name, uid_t uid, gid_t gid, mode_t mode)
+{
+    static const char *const dirs[] = { "/root", "/var", "/home", "/mnt", NULL };
+    for (int i = 0; dirs[i]; i++) {
+        struct statfs sf;
+        if (statfs(dirs[i], &sf) != 0 || sf.f_type == 0x01021994 /* tmpfs */ || sf.f_type == 0x858458f6 /* ramfs */) continue;
+        map0_sa.sun_family = AF_UNIX;
+        snprintf(map0_sa.sun_path, sizeof map0_sa.sun_path, "%s/%s", dirs[i], name);
+        unlink(map0_sa.sun_path);
+        int l = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (l >= 0 && bind(l, (struct sockaddr *)&map0_sa, sizeof map0_sa) == 0 && listen(l, 8) == 0 &&
+            chown(map0_sa.sun_path, uid, gid) == 0 && chmod(map0_sa.sun_path, mode) == 0) return l;
+        if (l >= 0) close(l);
+    }
+    return -1;
+}
 /* Mounted-fs unix socket connect: group write bit via supplementary groups, no group bit refused. */
 static int mnt_sock_group_child(void *a)
 {
     (void)a;
     gid_t g[1] = { 5000 };
     if (setgroups(1, g) || setresgid(1000, 1000, 1000) || setresuid(1000, 1000, 1000)) return 90;
-    return map0_connect() == 0 ? 0 : 91;
+    if (map0_connect() == 0) return 0;
+    return errno == EACCES ? 91 : 92;
 }
 static int mounted_sock_group_dac(void)
 {
-    int lsn = -1, up = 0;
-    static const char *const dirs[] = { "/root", "/var", "/home", "/mnt", NULL };
-    for (int i = 0; dirs[i] && !up; i++) {
-        map0_sa.sun_family = AF_UNIX;
-        snprintf(map0_sa.sun_path, sizeof map0_sa.sun_path, "%s/idroot0b-grp.sock", dirs[i]);
-        unlink(map0_sa.sun_path);
-        lsn = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (lsn >= 0 && bind(lsn, (struct sockaddr *)&map0_sa, sizeof map0_sa) == 0 && listen(lsn, 8) == 0 &&
-            chown(map0_sa.sun_path, 4242, 5000) == 0 && chmod(map0_sa.sun_path, 0020) == 0) up = 1;
-        else { if (lsn >= 0) close(lsn); lsn = -1; }
-    }
-    if (!up) return SKIP;
+    int lsn = bind_mounted_sock("idroot0b-grp.sock", 4242, 5000, 0020);
+    if (lsn < 0) { printf("  no socket bindable on a mounted-fs-server directory\n"); return 1; }
     pid_t p = fork();
     if (p == 0) _exit(mnt_sock_group_child(NULL));
     int st = 0; waitpid(p, &st, 0);
@@ -801,7 +810,7 @@ static int mounted_sock_group_dac(void)
     p = fork();
     if (p == 0) _exit(mnt_sock_group_child(NULL));
     waitpid(p, &st, 0);
-    int ok2 = WIFEXITED(st) && WEXITSTATUS(st) == 91;
+    int ok2 = WIFEXITED(st) && WEXITSTATUS(st) == 91;   /* 91 only for errno == EACCES */
     close(lsn); unlink(map0_sa.sun_path);
     CHECK(ok1);
     CHECK(ok2);
@@ -860,23 +869,15 @@ static int ns_euid0_not_host_map0(void)
     char ch; CHECK(read(sp[0], &ch, 1) == 1);
     map0_drm_fd = open("/dev/dri/card0", O_RDWR);
     if (map0_drm_fd < 0) printf("  note: no /dev/dri/card0, DRM probes skipped\n");
-    int lsn = -1;
-    static const char *const dirs[] = { "/root", "/var", "/home", "/mnt", NULL };
-    for (int i = 0; dirs[i] && !map0_sock_up; i++) {
-        map0_sa.sun_family = AF_UNIX;
-        snprintf(map0_sa.sun_path, sizeof map0_sa.sun_path, "%s/idroot0b-map0.sock", dirs[i]);
-        unlink(map0_sa.sun_path);
-        lsn = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (lsn >= 0 && bind(lsn, (struct sockaddr *)&map0_sa, sizeof map0_sa) == 0 && listen(lsn, 8) == 0 &&
-            chown(map0_sa.sun_path, 4242, 4242) == 0 && chmod(map0_sa.sun_path, 0700) == 0) map0_sock_up = 1;
-        else { if (lsn >= 0) close(lsn); lsn = -1; }
-    }
-    if (!map0_sock_up) printf("  note: no mounted-fs socket bind possible, connect probe skipped\n");
+    int lsn = bind_mounted_sock("idroot0b-map0.sock", 4242, 4242, 0700);
+    if (lsn >= 0) map0_sock_up = 1;
+    else printf("  no socket bindable on a mounted-fs-server directory\n");
     int ctl = run_child(map0_control_body);
     int ok = run_child(map0_nsroot_body);
     kill(map0_target, SIGKILL); waitpid(map0_target, NULL, 0);
     if (map0_sock_up) { close(lsn); unlink(map0_sa.sun_path); }
     if (map0_drm_fd >= 0) close(map0_drm_fd);
+    CHECK(map0_sock_up);
     CHECK(ctl);
     CHECK(ok);
     return 0;
