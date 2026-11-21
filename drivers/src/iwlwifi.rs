@@ -202,6 +202,44 @@ const TXQ_LOW: usize = 32;
 /// Data-queue failures logged one by one per association.
 const FAIL_LOG_MAX: u32 = 20;
 
+/// iwlwifi.txq_high / iwlwifi.txq_low: the hold / release marks above, as
+/// run-time knobs (defaults TXQ_HIGH / TXQ_LOW). The pure-ACK cap follows
+/// the high mark so a deeper queue does not starve the ACK path.
+static TXQ_HIGH_V: AtomicU32 = AtomicU32::new(TXQ_HIGH);
+static TXQ_LOW_V: AtomicU32 = AtomicU32::new(TXQ_LOW as u32);
+fn txq_cap() -> usize { core::cmp::max(TXQ_CAP, TXQ_HIGH_V.load(Ordering::Relaxed) as usize + 32) }
+
+/// Ring-feed instrumentation (`txq_feed:` in /proc/net/nic): ring depth seen
+/// at each enqueue and at each TX response, and the time from the drain kick
+/// to the net server's next enqueue.
+const QB: usize = 6;
+static QS_ENQ_N: AtomicU32 = AtomicU32::new(0);
+static QS_ENQ_SUM: AtomicU32 = AtomicU32::new(0);
+static QS_ENQ_H: [AtomicU32; QB] = [const { AtomicU32::new(0) }; QB];
+static QS_DONE_N: AtomicU32 = AtomicU32::new(0);
+static QS_DONE_SUM: AtomicU32 = AtomicU32::new(0);
+static QS_DONE_EMPTY: AtomicU32 = AtomicU32::new(0);
+static QS_DONE_H: [AtomicU32; QB] = [const { AtomicU32::new(0) }; QB];
+static QS_KICKS: AtomicU32 = AtomicU32::new(0);
+static QS_KICK_NS: AtomicU64 = AtomicU64::new(0);
+static QS_REFILL_N: AtomicU32 = AtomicU32::new(0);
+static QS_REFILL_SUM_US: AtomicU64 = AtomicU64::new(0);
+static QS_REFILL_MAX_US: AtomicU32 = AtomicU32::new(0);
+fn qs_bucket(u: usize) -> usize { match u { 0 => 0, 1..=7 => 1, 8..=15 => 2, 16..=31 => 3, 32..=63 => 4, _ => 5 } }
+fn qs_hist(h: &[AtomicU32; QB]) -> String {
+    let n: [u32; QB] = core::array::from_fn(|i| h[i].load(Ordering::Relaxed));
+    alloc::format!("0:{} 1-7:{} 8-15:{} 16-31:{} 32-63:{} 64+:{}", n[0], n[1], n[2], n[3], n[4], n[5])
+}
+fn qs_feed_line() -> String {
+    let (en, dn) = (QS_ENQ_N.load(Ordering::Relaxed), QS_DONE_N.load(Ordering::Relaxed));
+    let rn = QS_REFILL_N.load(Ordering::Relaxed);
+    alloc::format!("txq_feed: high {} low {} enq {} avg depth {}.{} [{}]; resp {} avg depth {}.{} empty {} [{}]; kicks {} refill avg {} us max {} us ({} samples)",
+        TXQ_HIGH_V.load(Ordering::Relaxed), TXQ_LOW_V.load(Ordering::Relaxed),
+        en, QS_ENQ_SUM.load(Ordering::Relaxed) / en.max(1), (QS_ENQ_SUM.load(Ordering::Relaxed) * 10 / en.max(1)) % 10, qs_hist(&QS_ENQ_H),
+        dn, QS_DONE_SUM.load(Ordering::Relaxed) / dn.max(1), (QS_DONE_SUM.load(Ordering::Relaxed) * 10 / dn.max(1)) % 10, QS_DONE_EMPTY.load(Ordering::Relaxed), qs_hist(&QS_DONE_H),
+        QS_KICKS.load(Ordering::Relaxed), QS_REFILL_SUM_US.load(Ordering::Relaxed) / rn.max(1) as u64, QS_REFILL_MAX_US.load(Ordering::Relaxed), rn)
+}
+
 /// Frames in the BSS data ring (updated on every enqueue and TX response).
 static TXQ_DEPTH: AtomicU32 = AtomicU32::new(0);
 /// `tx_ready` said no since the last drain, and how often that started.
@@ -901,7 +939,15 @@ impl Dev {
     fn txq_drained(&mut self) {
         let used = self.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
         TXQ_DEPTH.store(used as u32, Ordering::Relaxed);
-        if used < TXQ_LOW && TX_HELD.swap(false, Ordering::AcqRel) { crate::netdev::kick(); }
+        QS_DONE_N.fetch_add(1, Ordering::Relaxed);
+        QS_DONE_SUM.fetch_add(used as u32, Ordering::Relaxed);
+        QS_DONE_H[qs_bucket(used)].fetch_add(1, Ordering::Relaxed);
+        if used == 0 { QS_DONE_EMPTY.fetch_add(1, Ordering::Relaxed); }
+        if used < TXQ_LOW_V.load(Ordering::Relaxed) as usize && TX_HELD.swap(false, Ordering::AcqRel) {
+            QS_KICKS.fetch_add(1, Ordering::Relaxed);
+            QS_KICK_NS.store(crate::kdiag::now_ns(), Ordering::Relaxed);
+            crate::netdev::kick();
+        }
     }
 
     /// A Block Ack Request for TID 0 starting at `ssn`, on the management
@@ -1360,6 +1406,8 @@ pub fn init(cmdline: &str) {
         scanconn: cmdline_val(cmdline, "iwlwifi.scanconn") != Some("0"),
     };
     RC_ON.store(cmdline_val(cmdline, "iwlwifi.rc") != Some("0"), Ordering::Relaxed);
+    if let Some(v) = cmdline_val(cmdline, "iwlwifi.txq_high").and_then(|v| v.parse::<u32>().ok()) { TXQ_HIGH_V.store(v.clamp(8, 200), Ordering::Relaxed); }
+    if let Some(v) = cmdline_val(cmdline, "iwlwifi.txq_low").and_then(|v| v.parse::<u32>().ok()) { TXQ_LOW_V.store(v.clamp(1, 200), Ordering::Relaxed); }
     TXANT.store(match cmdline_val(cmdline, "iwlwifi.txant") {
         Some("a") | Some("A") => asc::ANT_A, Some("b") | Some("B") => asc::ANT_B, _ => 0 }, Ordering::Relaxed);
     MAXRATE.store(cmdline_val(cmdline, "iwlwifi.maxrate").and_then(parse_mbps).unwrap_or(0), Ordering::Relaxed);
@@ -2288,7 +2336,17 @@ fn tx_data(d: &mut Dev, eth: &[u8], port_control: bool) -> bool {
     };
     let hl = if l.qos { 26 } else { 24 };
     let used = d.t.txq[BSS_QUEUE].as_ref().map_or(0, |t| t.used());
-    if used >= TXQ_CAP && !port_control && wf::is_pure_tcp_ack(eth) {
+    QS_ENQ_N.fetch_add(1, Ordering::Relaxed);
+    QS_ENQ_SUM.fetch_add(used as u32, Ordering::Relaxed);
+    QS_ENQ_H[qs_bucket(used)].fetch_add(1, Ordering::Relaxed);
+    let kt = QS_KICK_NS.swap(0, Ordering::Relaxed);
+    if kt != 0 {
+        let us = (crate::kdiag::now_ns().saturating_sub(kt) / 1000) as u64;
+        QS_REFILL_N.fetch_add(1, Ordering::Relaxed);
+        QS_REFILL_SUM_US.fetch_add(us, Ordering::Relaxed);
+        QS_REFILL_MAX_US.fetch_max(us as u32, Ordering::Relaxed);
+    }
+    if used >= txq_cap() && !port_control && wf::is_pure_tcp_ack(eth) {
         d.txs.on_enqueue(Err(EnqFail::Capped));
         return false;
     }
@@ -3429,7 +3487,7 @@ pub fn mac_address() -> Option<[u8; 6]> { if present() { Some(*MAC.lock()) } els
 /// net server). Lock-free; a false answer is remembered so the drain kicks
 /// the daemon.
 pub fn tx_ready() -> bool {
-    if !link_up() || TXQ_DEPTH.load(Ordering::Relaxed) < TXQ_HIGH { return true; }
+    if !link_up() || TXQ_DEPTH.load(Ordering::Relaxed) < TXQ_HIGH_V.load(Ordering::Relaxed) { return true; }
     if !TX_HELD.swap(true, Ordering::AcqRel) { TX_HOLDS.fetch_add(1, Ordering::Relaxed); }
     false
 }
@@ -3645,6 +3703,8 @@ pub fn info_lines(out: &mut String) {
             let _ = writeln!(out, "ht: {}", h);
             let _ = writeln!(out, "rx_ba: {}", b);
             let _ = writeln!(out, "tx_ba: {}", d.tagg.line());
+            let _ = writeln!(out, "tx_hold: now {} episodes {} (high {} cap {})", TX_HELD.load(Ordering::Relaxed), TX_HOLDS.load(Ordering::Relaxed), TXQ_HIGH_V.load(Ordering::Relaxed), txq_cap());
+            let _ = writeln!(out, "{}", qs_feed_line());
             let _ = writeln!(out, "fw_stats: {}", fw_stats_line(d));
         }
     }
@@ -3677,7 +3737,8 @@ fn tx_lines(out: &mut String) {
     let _ = writeln!(out, "# TX ({}; since boot)", if link_up() { "associated" } else { "not associated" });
     d.txs.detail(out);
     let _ = writeln!(out, "tx_hold: now {} episodes {} (stack held at {} queued frames, cap {})", TX_HELD.load(Ordering::Relaxed),
-                     TX_HOLDS.load(Ordering::Relaxed), TXQ_HIGH, TXQ_CAP);
+                     TX_HOLDS.load(Ordering::Relaxed), TXQ_HIGH_V.load(Ordering::Relaxed), txq_cap());
+    let _ = writeln!(out, "{}", qs_feed_line());
     let _ = writeln!(out, "tx_queues: {}", queue_line(d, now));
     match d.rc.as_ref() {
         Some(c) => { let _ = writeln!(out, "tx_rate: {}", c.summary(now)); }
