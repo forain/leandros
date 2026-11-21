@@ -129,7 +129,7 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 
 use crate::kenv::{mm, sched};
@@ -254,6 +254,10 @@ static VHT: AtomicBool = AtomicBool::new(true);
 static VHTTX: AtomicBool = AtomicBool::new(true);
 /// iwlwifi.txmimo=0: two-stream TX off on every band (unset: on at 5 GHz only, 1: both bands).
 static TXMIMO_OFF: AtomicBool = AtomicBool::new(false);
+/// iwlwifi.txpwr=<dBm>|max: send Linux's REDUCE_TX_POWER_CMD (SET_MAC) after the MAC context (-1 = not sent).
+static TXPWR: AtomicI32 = AtomicI32::new(-1);
+/// Length of the REDUCE_TX_POWER_CMD for this firmware (iwl_mvm_set_tx_power), 0 = unsupported.
+static TXPWR_LEN: AtomicUsize = AtomicUsize::new(0);
 /// iwlwifi.txagg (default on): TX A-MPDU on TID 0.
 static TXAGG: AtomicBool = AtomicBool::new(true);
 
@@ -1380,6 +1384,8 @@ pub fn init(cmdline: &str) {
     VHT.store(cmdline_val(cmdline, "iwlwifi.vht") != Some("0"), Ordering::Relaxed);
     VHTTX.store(cmdline_val(cmdline, "iwlwifi.vhttx") != Some("0"), Ordering::Relaxed);
     TXMIMO_OFF.store(cmdline_val(cmdline, "iwlwifi.txmimo") == Some("0"), Ordering::Relaxed);
+    TXPWR.store(match cmdline_val(cmdline, "iwlwifi.txpwr") { Some("max") => 0, Some(v) => v.parse::<i32>().ok().filter(|&d| d > 0).unwrap_or(-1), None => -1 }, Ordering::Relaxed);
+    asc::LQ_FLAGS.store(if cmdline_val(cmdline, "iwlwifi.lqrts") == Some("1") { 1 } else { 0 }, Ordering::Relaxed);
     ilog!("QoS/HT: {}; RX Block Ack {}; TX MCS {}, short GI {}, MIMO {}, STBC {}, LDPC {}; SM PS {}, LDPC {}",
           match HT_MODE.load(Ordering::Relaxed) { HT_LEGACY => "legacy only (iwlwifi.ht=0)", HT_WMM => "WMM only (iwlwifi.ht=wmm)", _ => "WMM + HT 20 MHz" },
           if BA_ON.load(Ordering::Relaxed) { "on" } else { "off (iwlwifi.ba=0)" },
@@ -1889,6 +1895,11 @@ fn run_rt(fw: &Fw, func: &PciFunction, hw: &mut Hw) -> Res<()> {
     start_image(fw, iwl_fw::IMG_REGULAR, func)?;
     setup_paging(fw, hw)?;
     send(cmd::REPLY_SF_CFG_CMD, None, &cmd::sf_cfg_cmd(cmd::SF_INIT_OFF, None))?;
+    TXPWR_LEN.store(match fw.info.cmd_ver(0, cmd::REDUCE_TX_POWER_CMD) {
+        Some(v) if v >= 6 => 0,
+        _ if fw.info.has_api(iwl_fw::api::REDUCE_TX_POWER) => 44,
+        _ if fw.info.has_capa(iwl_fw::capa::TX_POWER_ACK) => 40,
+        _ => 36 }, Ordering::Relaxed);
     send(cmd::TX_ANT_CONFIGURATION_CMD, None, &cmd::tx_ant_cfg(hw.tx_ant))?;
     if !hw.phy_db.has_cfg() { log("WARNING: no PHY DB CFG section from the INIT image"); }
     for (ty, data) in hw.phy_db.ordered() {
@@ -2510,6 +2521,16 @@ fn connect_steps(hw: &mut Hw, b: &wf::Bss, scan_rssi: i8, pmk: Option<&[u8; 32]>
     prog.bound = true;
     send(cmd::TIME_QUOTA_CMD, None, &asc::time_quota_cmd(None))?;
     mac_ctxt(cmd::FW_CTXT_ACTION_MODIFY, &ms)?;
+    let (txp, txl) = (TXPWR.load(Ordering::Relaxed), TXPWR_LEN.load(Ordering::Relaxed));
+    if txp >= 0 && txl >= 36 {
+        // iwl_dev_tx_power_cmd: set_mode MAC (0), mac id, pwr_restriction (1/8 dBm), per-chain tables zero.
+        let mut c = alloc::vec![0u8; txl];
+        c[4..8].copy_from_slice(&(MAC_ID as u32).to_le_bytes());
+        let pr: u16 = if txp == 0 { 0x7fff } else { (8 * txp) as u16 };
+        c[8..10].copy_from_slice(&pr.to_le_bytes());
+        ilog!("REDUCE_TX_POWER: {} bytes, restriction {:#x}", txl, pr);
+        let _ = send(cmd::REDUCE_TX_POWER_CMD, None, &c);
+    }
     with_dev(|d| { d.track = Some(bssid); d.bcn = None; d.bcn_rssi = None; });
 
     // The AP station and its two queues (data TID 0, management TID 8).
