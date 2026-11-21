@@ -152,7 +152,9 @@ static EXEC_FILE_REQUEST: limine::request::ExecutableFileRequest =
 /// Copies of the two responses above, taken in `kernel_main` before the
 /// bootloader-reclaimable memory they live in can be reused. Written once,
 /// before any other CPU or thread runs; read-only afterwards.
-static mut BOOT_CMDLINE: [u8; 512] = [0; 512];
+static mut BOOT_CMDLINE: [u8; boot::COMMAND_LINE_SIZE] = [0; boot::COMMAND_LINE_SIZE];
+/// `(kept, total)` bytes when the command line was cut at `COMMAND_LINE_SIZE`.
+static CMDLINE_TRUNC: [core::sync::atomic::AtomicUsize; 2] = [core::sync::atomic::AtomicUsize::new(0), core::sync::atomic::AtomicUsize::new(0)];
 static BOOT_CMDLINE_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static mut BOOT_DISK: Option<drivers::blkdev::BootDisk> = None;
 
@@ -165,10 +167,13 @@ static BOOT_CMDLINE_SCRUBBED: core::sync::atomic::AtomicBool = core::sync::atomi
 /// `--reuse-cmdline`, driver copies) ever holds them. Whitespace runs
 /// collapse to one space. Called once, before any other CPU or thread runs.
 fn store_scrubbed_cmdline(src: &[u8]) {
-    let src = &src[..src.len().min(512)];
+    // Direct boot: the boot parser may already have cut the line; its full length is recorded.
+    let total = src.len().max(boot::cmdline_src_len());
+    let src = &src[..src.len().min(boot::CMDLINE_MAX)];
     let s = match core::str::from_utf8(src) { Ok(s) => s, Err(e) => unsafe { core::str::from_utf8_unchecked(&src[..e.valid_up_to()]) } };
     let dst = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CMDLINE) };
     let mut n = 0;
+    let mut cut = false;
     for tok in s.split_ascii_whitespace() {
         if let Some((k, v)) = tok.split_once('=') {
             if !v.is_empty() && vfs_server::cmdline_redact::is_secret_key(k) {
@@ -176,12 +181,27 @@ fn store_scrubbed_cmdline(src: &[u8]) {
                 continue;
             }
         }
+        let need = if n != 0 { tok.len() + 1 } else { tok.len() };
+        if n + need > boot::CMDLINE_MAX { cut = true; break; }
         if n != 0 { dst[n] = b' '; n += 1; }
         dst[n..n + tok.len()].copy_from_slice(tok.as_bytes());
         n += tok.len();
     }
+    if cut || total > boot::CMDLINE_MAX {
+        CMDLINE_TRUNC[0].store(n, core::sync::atomic::Ordering::Relaxed);
+        CMDLINE_TRUNC[1].store(total, core::sync::atomic::Ordering::Relaxed);
+    }
     BOOT_CMDLINE_LEN.store(n, core::sync::atomic::Ordering::Release);
     BOOT_CMDLINE_SCRUBBED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Log `cmdline truncated at N of M bytes` if the bootloader's command line
+/// did not fit `boot::COMMAND_LINE_SIZE`. Call once the console is up.
+pub fn warn_cmdline_truncated() {
+    let total = CMDLINE_TRUNC[1].load(core::sync::atomic::Ordering::Relaxed);
+    if total == 0 { return; }
+    let kept = CMDLINE_TRUNC[0].load(core::sync::atomic::Ordering::Relaxed);
+    serial_print_str(&alloc::format!("[KERN] WARNING: cmdline truncated at {} of {} bytes (limit {}): later knobs are lost\n", kept, total, boot::COMMAND_LINE_SIZE - 1));
 }
 
 /// The bootloader's kernel command line (secret knobs removed).

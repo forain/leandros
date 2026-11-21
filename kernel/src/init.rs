@@ -294,6 +294,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // exists). Runs before klog::init so its lines sit in the RAM ring and are
     // written out by the registration flush. Options: `nvprobe.*` on the
     // Limine cmdline.
+    crate::warn_cmdline_truncated();
     drivers::nvidia_probe::set_cmdline(crate::boot_cmdline().unwrap_or(""));
     // PS/2 mouse / touchpad on the i8042 AUX port (needs the command line
     // for its psmouse.* knobs, and the xHCI handoff done).

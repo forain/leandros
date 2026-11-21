@@ -46,12 +46,12 @@ const BAR0_MIN: u64 = 16 << 20;
 
 // ── command line ─────────────────────────────────────────────────────────────
 
-static mut CMDLINE: [u8; 512] = [0; 512];
+static mut CMDLINE: [u8; boot::COMMAND_LINE_SIZE] = [0; boot::COMMAND_LINE_SIZE];
 static mut CMDLINE_LEN: usize = 0;
 
 /// Record the kernel command line (called once, before anything else runs).
 pub fn set_cmdline(s: &str) {
-    let n = s.len().min(511);
+    let n = s.len().min(boot::COMMAND_LINE_SIZE - 1);
     unsafe {
         let buf = &mut *core::ptr::addr_of_mut!(CMDLINE);
         buf[..n].copy_from_slice(&s.as_bytes()[..n]);
