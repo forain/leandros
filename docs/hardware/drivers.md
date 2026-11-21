@@ -270,7 +270,7 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 | `iwlwifi.ht=0` / `wmm` / `1` | `1` | legacy association exactly as before / WMM only / WMM + HT20 + RX Block Ack |
 | `iwlwifi.ba=0` | on | decline ADDBA: HT rates without A-MPDU |
 | `iwlwifi.htrate=0` | on | HT association, legacy TX rates |
-| `iwlwifi.txsgi=1` | off | TX short guard interval when the AP accepts it |
+| `iwlwifi.txsgi=0\|1` | unset | short guard interval: unset lets the rate-control column search try SGI when the AP receives it (HT only; VHT 80 stays long GI), `1` starts on SGI, `0` never uses it |
 | `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
 | `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
 | `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
