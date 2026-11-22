@@ -112,11 +112,11 @@ def elf_has_gnu_build_id(path):
 
 
 def _greetd_src_hash():
-    """sha256 over the pam-leandros sources (sorted by name, concatenated).
+    """sha256 over the session-leandros sources (sorted by name, concatenated).
     ports/greetd/build.sh writes the same value to greetd.srchash."""
     import hashlib
     src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "ports", "greetd", "pam-leandros", "src")
+                           "..", "ports", "greetd", "session-leandros", "src")
     h = hashlib.sha256()
     for n in sorted(os.listdir(src_dir)):
         with open(os.path.join(src_dir, n), "rb") as f:
@@ -156,7 +156,7 @@ def _check_greetd_fresh(path):
     `$sha256$` and every greeter login fails with pam_authenticate AUTH_ERR
     (L11.15). The shim's `rounds=` parser string is the marker. If the
     greetd.srchash sidecar (written by build.sh) exists it must match the
-    current pam-leandros sources. File mtimes are NOT compared: a fresh git
+    current session-leandros sources. File mtimes are NOT compared: a fresh git
     worktree gives every source a new mtime."""
     with open(path, "rb") as f:
         data = f.read()
@@ -168,7 +168,7 @@ def _check_greetd_fresh(path):
         with open(sidecar) as f:
             want = f.read().strip()
         if want != _greetd_src_hash():
-            problems.append("was built from different pam-leandros sources")
+            problems.append("was built from different session-leandros sources")
     else:
         print(f"warning: {sidecar} missing; checked the rounds= marker only",
               file=sys.stderr)
@@ -872,17 +872,7 @@ def main():
                # is the first client to use client-side Wayland-EGL; without it
                # the panel panics ("Library libwayland-egl.so could not be
                # loaded.") right after "Waiting for configure event".
-               "libwayland-egl.so.1", "libffi.so.8",
-               # libpam.so.0 is the LeandrOS shadow-auth shim (source:
-               # m6-session-bins/src/libpam-shim); verifies $sha256$ /etc/shadow
-               # like /bin/login. It is DT_NEEDED by the cosmic-greeter ELF
-               # itself — pam-sys is an unconditional dependency of that build —
-               # so the dynamic loader resolves it on EVERY launch regardless of
-               # which role the binary takes. The login role makes no PAM call at
-               # all (greeter.rs has none; authentication crosses greetd IPC),
-               # but the library still has to be present or the greeter fails to
-               # load. Do not unstage it on the grounds that nothing calls it.
-               "libpam.so.0"):
+               "libwayland-egl.so.1", "libffi.so.8"):
         p = gl_lib(so)
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
@@ -1950,7 +1940,14 @@ def main():
     # /etc/vconsole.conf KEYMAP=<name> selects one at boot (loadkmap aliases
     # kbd's names such as de-latin1 onto them).
     for _dirpath, _name, _srcname in (("/etc/greetd", "greetd.conf", "greetd.conf"),
+                                      # Real Linux-PAM (Alpine's linux-pam) reads these; the
+                                      # defaults it ships live in /usr/lib/pam.d (base-auth,
+                                      # login, other ...), these override/extend them.
                                       ("/etc/pam.d",  "greetd",      "pam.d-greetd"),
+                                      ("/etc/pam.d",  "sudo",        "../../pam-rundir/data/sudo"),
+                                      ("/etc/pam.d",  "sudo-i",      "../../pam-rundir/data/sudo-i"),
+                                      ("/etc/pam.d",  "su",          "../../pam-rundir/data/su"),
+                                      ("/etc/pam.d",  "su-l",        "../../pam-rundir/data/su-l"),
                                       ("/etc",        "profile",     "profile"),
                                       ("/usr/share/wayland-sessions",
                                        "cosmic.desktop", "cosmic.desktop")):
@@ -2949,6 +2946,12 @@ def main():
     if not os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk")):
         sys.exit(f"{_apk_root} missing (ports/apk/build.sh {arch})")
     _overlay_port_tree(_apk_root)
+    # pam_rundir.so: the XDG_RUNTIME_DIR provider Alpine's base-session names
+    # (ports/pam-rundir). Overlaid after the apk root so linux-pam's own files win.
+    _prd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "pam-rundir", "out", arch)
+    if not os.path.isdir(_prd):
+        sys.exit(f"{_prd} missing (ports/pam-rundir/build.sh)")
+    _overlay_port_tree(os.path.normpath(_prd))
     bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
     _ap_world = ["leandros-base", "musl=" + alpinepkgs.lk.read_lock(arch)[0]["musl"]["ver"]]
 

@@ -986,6 +986,8 @@ build_sudo_rs() {
         return 0
     fi
     "$ROOT_DIR/ports/sudo-rs/build.sh" "$arch"
+    # pam_rundir.so: the XDG_RUNTIME_DIR session module su/sudo's pam.d names.
+    ARCHES="$arch" "$ROOT_DIR/ports/pam-rundir/build.sh"
 }
 
 # Function to build sudotest -- the su/sudo regression test (userland/sudotest).

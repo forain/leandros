@@ -90,3 +90,7 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 
 - venusisr follow-up: per-context fence timelines like Linux (one stalled context's fence currently holds back the global fence floor and everyone's retired-ahead depth; table grows to AHEAD_MAX=65536 then EAGAIN). Also a venustest 7c variant on the syncobj path.
+
+## realpam (lane/realpam, IN PROGRESS, unverified)
+- Real Linux-PAM replaces the pam-leandros shim: greetd, sudo-rs, sudotest are dynamic musl PIEs linked to Alpine's libpam.so.0 (scripts/lib/realpam.sh); shim no longer staged; /etc/pam.d/{greetd,sudo,sudo-i,su,su-l} + Alpine's /usr/lib/pam.d defaults; ports/pam-rundir provides pam_rundir.so (XDG_RUNTIME_DIR); ports/greetd/session-leandros keeps utmpx+cgroup (patch 0005).
+- NOT yet run: sudotest x86_64/aarch64, greeter login, regress3, check-rpi5.sh, laptop trial. Risks: setuid dynamic su/sudo (AT_SECURE), pam_unix -> unix_chkpwd setgid helper for non-root callers, pam_limits setrlimit in session, f2fs dir merge for /usr/lib/security.

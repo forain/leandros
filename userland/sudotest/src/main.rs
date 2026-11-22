@@ -18,7 +18,6 @@
 //! (gid 10) = {leandro}, and /etc/sudoers with `root ALL` and `%wheel ALL`.
 
 use std::ffi::CString;
-use pam_leandros as _;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -613,7 +612,7 @@ fn su_background_pty(t: &mut T) {
     }
 }
 
-// ── libpam ABI (pam-leandros), driven directly ──────────────────────────────
+// ── libpam ABI (Alpine's real Linux-PAM, /etc/pam.d), driven directly ──────────────────────────────
 //
 // The same functions greetd (login screen), su and sudo-rs call. A wrong
 // password must be rejected on every service name, accepted when right, and a
@@ -637,6 +636,7 @@ struct PamConvT {
     data: *mut c_void,
 }
 
+#[link(name = "pam")]
 extern "C" {
     fn pam_start(svc: *const c_char, user: *const c_char, conv: *const PamConvT, h: *mut *mut c_void) -> c_int;
     fn pam_authenticate(h: *mut c_void, flags: c_int) -> c_int;
@@ -692,6 +692,12 @@ fn pam_checks(t: &mut T) {
         t.check(&format!("pam {svc}: unknown user rejected"), rc != 0, &none);
         let (rc, _) = pam_try(svc, "leandro", "leandro ");
         t.check(&format!("pam {svc}: password with trailing byte rejected"), rc != 0, &none);
+    }
+    // pam_rootok (Alpine's su stack): root switches user with no password at all,
+    // for su and su-l, while a non-root caller is covered by sudotest's su cases.
+    for svc in ["su", "su-l"] {
+        let (rc, _) = pam_try(svc, "leandro", "");
+        t.check(&format!("pam {svc}: root needs no password (pam_rootok)"), rc == 0, &none);
     }
     // Locked accounts (`!`/`*` hash) never authenticate.
     let sh = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
