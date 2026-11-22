@@ -370,6 +370,8 @@ pub fn configure(cmdline: &str) {
             "sdhci.multi=1" => MULTI_ON.store(true, Ordering::Relaxed),
             "sdhci.multi=0" => MULTI_ON.store(false, Ordering::Relaxed),
             "sdhci.multitest=1" => MULTITEST.store(true, Ordering::Relaxed),
+            "sdhci.dma=1" => DMA_ON.store(true, Ordering::Relaxed),
+            "sdhci.dma=0" => DMA_ON.store(false, Ordering::Relaxed),
             "sdhci.uhs=1" => UHS_ON.store(true, Ordering::Relaxed),
             "sdhci.uhs=0" => UHS_ON.store(false, Ordering::Relaxed),
             _ => {
@@ -384,6 +386,155 @@ pub fn configure(cmdline: &str) {
 }
 static MULTI_FALLBACKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 const MULTI_FALLBACK_LIMIT: u32 = 3;
+
+// ── ADMA2 (32-bit descriptors, bounce buffer below 4 GiB) ────────────────────
+//
+// BCM2712 `mmc@fff000` sits under a `dma-ranges` that is the identity map
+// (bus address == physical), so descriptors carry physical addresses as is.
+// Data is staged through one 64 KiB bounce buffer allocated below 4 GiB at
+// init (`sdhci.dma=0` opts out, falling back to the PIO multi-block path):
+// callers hand us arbitrary kernel buffers that need not be physically
+// contiguous or DMA-reachable. The copy costs far less than the PIO it
+// replaces. The engine is treated as non-coherent: `mm::dma_cache` clean /
+// invalidate calls are plain on a coherent platform. Completion is polled
+// (Transfer Complete), like every other wait here. Any error resets the CMD+DAT
+// circuits (which also halts ADMA) and the span is redone through PIO.
+const REG_ADMA_ERROR:    usize = 0x54; // u8
+const REG_ADMA_ADDR:     usize = 0x58; // u32 low, u32 high at +4
+const TM_DMA_EN:         u16 = 1 << 0;
+const HC1_DMA_MASK:      u8 = 0b11 << 3;
+const HC1_ADMA2_32:      u8 = 0b10 << 3;
+const CAP_ADMA2:         u32 = 1 << 19;
+const ADMA_VALID:        u8 = 1 << 0;
+const ADMA_END:          u8 = 1 << 1;
+const ADMA_TRAN:         u8 = 0b10 << 4;
+/// ADMA transfers go up to 512 KiB per command: at SDR104 the per-command
+/// overhead (CMD18/25 + auto-CMD12 + card busy) is what caps 64 KiB spans.
+const DMA_MAX_SECTORS:   usize = 1024;
+const DMA_MAX_BLOCKS:    usize = DMA_MAX_SECTORS / SECTORS_PER_BLOCK;
+const BOUNCE_BYTES:      usize = DMA_MAX_SECTORS * SECTOR_SIZE;
+const ADMA_DESC_BYTES:   usize = 4096; // each descriptor maps one 4 KiB page of the bounce
+const DMA_FAIL_LIMIT:    u32 = 3;
+static DMA_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static DMA_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DMA_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DMA_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static BOUNCE_PHYS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static TABLE_PHYS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Allocate the bounce buffer and descriptor page below 4 GiB. False = no DMA.
+/// Largest span (4 KiB blocks) one `DEVICES` hold may issue.
+fn span_max_blocks() -> usize {
+    if DMA_ON.load(Ordering::Relaxed) && DMA_READY.load(Ordering::Relaxed) { DMA_MAX_BLOCKS } else { MULTI_MAX_BLOCKS }
+}
+
+fn dma_alloc() -> bool {
+    const LIMIT: usize = 0x1_0000_0000;
+    if DMA_READY.load(Ordering::Relaxed) { return true; }
+    let order = (BOUNCE_BYTES / 4096).trailing_zeros() as usize;
+    let b = match mm::buddy::alloc_below(order, LIMIT) { Some(p) => p, None => return false };
+    let t = match mm::buddy::alloc_below(0, LIMIT) {
+        Some(p) => p,
+        None => { mm::buddy::free(b, order); return false; }
+    };
+    unsafe {
+        core::ptr::write_bytes(mm::phys_to_virt(b) as *mut u8, 0, BOUNCE_BYTES);
+        core::ptr::write_bytes(mm::phys_to_virt(t) as *mut u8, 0, 4096);
+    }
+    BOUNCE_PHYS.store(b, Ordering::Relaxed);
+    TABLE_PHYS.store(t, Ordering::Relaxed);
+    DMA_READY.store(true, Ordering::Release);
+    true
+}
+
+impl SdhciDevice {
+    /// One ADMA2 CMD18/CMD25 of `count` sectors through the bounce buffer.
+    /// Caller holds `DMA_BUSY`. On false the controller may be mid-transfer:
+    /// the caller must `abort_multi()` before anything else.
+    unsafe fn do_io_multi_dma(&self, is_write: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
+        let len = count * SECTOR_SIZE;
+        let bphys = BOUNCE_PHYS.load(Ordering::Relaxed);
+        let tphys = TABLE_PHYS.load(Ordering::Relaxed);
+        let bvirt = mm::phys_to_virt(bphys);
+        let tvirt = mm::phys_to_virt(tphys);
+        let arg = if self.high_capacity { sector as u32 } else { (sector * SECTOR_SIZE as u64) as u32 };
+        let cmd = if is_write { CMD_WRITE_MULTIPLE_BLOCK } else { CMD_READ_MULTIPLE_BLOCK };
+
+        if is_write {
+            core::ptr::copy_nonoverlapping(buf as *const u8, bvirt as *mut u8, len);
+            mm::dma_cache::clean_range(bvirt, len);
+        } else {
+            mm::dma_cache::invalidate_range(bvirt, len);
+        }
+        // Descriptor table: one 8-byte entry (attr u16, length u16, address u32)
+        // per 4 KiB page, END on the last.
+        let nd = (len + ADMA_DESC_BYTES - 1) / ADMA_DESC_BYTES;
+        for i in 0..nd {
+            let off = i * ADMA_DESC_BYTES;
+            let l = (len - off).min(ADMA_DESC_BYTES);
+            let attr = ADMA_VALID | ADMA_TRAN | if i + 1 == nd { ADMA_END } else { 0 };
+            let e = (tvirt + i * 8) as *mut u32;
+            core::ptr::write_volatile(e, (attr as u32) | ((l as u32) << 16));
+            core::ptr::write_volatile(e.add(1), (bphys + off) as u32);
+        }
+        mm::dma_cache::clean_range(tvirt, nd * 8);
+
+        self.w16(REG_BLOCK_SIZE, (7 << 12) | SECTOR_SIZE as u16);
+        self.w16(REG_BLOCK_COUNT, count as u16);
+        let hc = self.r8(REG_HOST_CONTROL1);
+        self.w8(REG_HOST_CONTROL1, (hc & !HC1_DMA_MASK) | HC1_ADMA2_32);
+        self.w32(REG_ADMA_ADDR, tphys as u32);
+        self.w32(REG_ADMA_ADDR + 4, 0);
+        let tm = TM_DMA_EN | TM_BLOCK_COUNT_EN | TM_MULTI_BLOCK | TM_AUTO_CMD12
+            | if is_write { 0 } else { TM_DIR_READ };
+        self.w16(REG_TRANSFER_MODE, tm);
+
+        let mut ok = self.send_command(cmd, arg, RESP_48, true, true, true).is_some()
+            && self.wait_normal_int(NI_XFER_COMPLETE);
+        if ok && self.r8(REG_ADMA_ERROR) & 0b111 != 0 { ok = false; }
+        if ok && !is_write {
+            mm::dma_cache::invalidate_range(bvirt, len);
+            core::ptr::copy_nonoverlapping(bvirt as *const u8, buf, len);
+        }
+        // Leave Host Control 1 with SDMA selected, as PIO transfers expect.
+        let hc = self.r8(REG_HOST_CONTROL1);
+        self.w8(REG_HOST_CONTROL1, hc & !HC1_DMA_MASK);
+        ok
+    }
+
+    /// Multi-block span: ADMA2 when available, PIO otherwise or when the DMA
+    /// attempt fails (controller reset first, so the PIO retry starts clean).
+    unsafe fn do_io_multi(&self, is_write: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
+        if DMA_ON.load(Ordering::Relaxed) && DMA_READY.load(Ordering::Acquire)
+            && count * SECTOR_SIZE <= BOUNCE_BYTES
+            && !DMA_BUSY.swap(true, Ordering::Acquire)
+        {
+            let ok = self.do_io_multi_dma(is_write, sector, count, buf);
+            DMA_BUSY.store(false, Ordering::Release);
+            if ok { return true; }
+            self.abort_multi();
+            if DMA_FAILS.fetch_add(1, Ordering::Relaxed) + 1 >= DMA_FAIL_LIMIT {
+                DMA_ON.store(false, Ordering::Relaxed);
+            }
+        }
+        self.do_io_multi_pio(is_write, sector, count, buf)
+    }
+
+    /// Probe-time proof, read-only: the first 16 sectors through ADMA2 must be
+    /// byte-identical to the same read through PIO. Any mismatch or error
+    /// disables DMA for good. Returns true when DMA stays on.
+    unsafe fn dma_selftest(&self) -> bool {
+        let mut a = [0u8; 16 * SECTOR_SIZE];
+        let mut b = [0u8; 16 * SECTOR_SIZE];
+        let pio_ok = self.do_io_multi_pio(false, 0, 16, a.as_mut_ptr());
+        let dma_ok = pio_ok && self.do_io_multi_dma(false, 0, 16, b.as_mut_ptr());
+        if !(pio_ok && dma_ok && a == b) {
+            self.abort_multi();
+            return false;
+        }
+        true
+    }
+}
 
 // SD command indices used by this driver
 const CMD_GO_IDLE_STATE:      u8 = 0;
@@ -610,7 +761,7 @@ impl SdhciDevice {
     /// One command per span instead of one per sector: on a real card every
     /// CMD24 is a separate program cycle (~1 ms), which capped writes at
     /// ~0.5 MB/s; CMD25 lets the card stream the whole span.
-    unsafe fn do_io_multi(&self, is_write: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
+    unsafe fn do_io_multi_pio(&self, is_write: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
         let arg = if self.high_capacity { sector as u32 } else { (sector * SECTOR_SIZE as u64) as u32 };
         let cmd = if is_write { CMD_WRITE_MULTIPLE_BLOCK } else { CMD_READ_MULTIPLE_BLOCK };
 
@@ -766,28 +917,30 @@ impl SdhciDevice {
                 w.copy_from_slice(&x.to_le_bytes());
             }
         };
-        let mut wb = alloc::vec![0u8; 128 * SECTOR_SIZE];
-        let mut rb = alloc::vec![0u8; 128 * SECTOR_SIZE];
+        let mut wb = alloc::vec![0u8; DMA_MAX_SECTORS * SECTOR_SIZE];
+        let mut rb = alloc::vec![0u8; DMA_MAX_SECTORS * SECTOR_SIZE];
         p("[sdhci] sdtest start mib="); pd(mib as u64); p("\n");
         // Phase A: speed. 16 MiB sequential from the window start, 64 KiB spans.
-        let t_mib = 4u64;
-        let spans = (t_mib * 1048576 / 65536) as usize;
-        for (name, multi, is_write) in [("single write", false, true), ("single read", false, false),
-                                        ("multi write", true, true), ("multi read", true, false)] {
+        let dma_live = DMA_ON.load(Ordering::Relaxed) && DMA_READY.load(Ordering::Relaxed);
+        for (name, multi, is_write, sp, t_mib) in [("single write", false, true, 128usize, 4u64), ("single read", false, false, 128, 4),
+                                        ("multi write", true, true, 128, 4), ("multi read", true, false, 128, 4),
+                                        ("multi512k write", true, true, if dma_live { 1024 } else { 128 }, 16),
+                                        ("multi512k read", true, false, if dma_live { 1024 } else { 128 }, 16)] {
+            let spans = (t_mib * 1048576 / (sp * SECTOR_SIZE) as u64) as usize;
             let t0 = sched::monotonic_ns();
             let mut ok = true;
             for s in 0..spans {
                 if is_write { fill(&mut wb[..], 0x1234_5678 + s as u64); }
                 let b = if is_write { wb.as_mut_ptr() } else { rb.as_mut_ptr() };
-                if !self.scratch_io(is_write, multi, SCRATCH_FIRST + (s * 128) as u64, 128, b) { ok = false; break; }
-                if s % 16 == 0 { p("[sdhci] sdtest A "); p(name); p(" span "); pd(s as u64); p(" t_ms="); pd((sched::monotonic_ns() - t0) / 1_000_000); p("\n"); }
+                if !self.scratch_io(is_write, multi, SCRATCH_FIRST + (s * sp) as u64, sp, b) { ok = false; break; }
+                if s % 16 == 0 && !name.starts_with("multi") { p("[sdhci] sdtest A "); p(name); p(" span "); pd(s as u64); p(" t_ms="); pd((sched::monotonic_ns() - t0) / 1_000_000); p("\n"); }
             }
             let dt = (sched::monotonic_ns() - t0).max(1);
             p("[sdhci] sdtest speed "); p(name); p(": "); pd(t_mib * 1048576 * 1_000_000_000 / dt / 1024); p(" KiB/s ok="); pd(ok as u64); p("\n");
         }
         // Phase B: mixed-size multi writes, verified by single-sector readback
         // (writes) and multi readback (reads), plus guard sectors either side.
-        const SIZES: [usize; 13] = [1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64, 100, 128];
+        const SIZES: [usize; 16] = [1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64, 100, 128, 300, 512, 1024];
         let mut rng: u64 = 0x9e37_79b9_7f4a_7c15 ^ (sched::monotonic_ns() | 1);
         let (mut done, mut wbad, mut rbad, mut gbad, mut ioerr, mut iters) = (0u64, 0u32, 0u32, 0u32, 0u32, 0u64);
         let target = mib as u64 * 1048576;
@@ -795,7 +948,7 @@ impl SdhciDevice {
         while done < target {
             rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
             let n = SIZES[(rng >> 40) as usize % SIZES.len()];
-            let start = SCRATCH_FIRST + 1 + ((rng >> 8) % ((1 << 21) - 130));
+            let start = SCRATCH_FIRST + 1 + ((rng >> 8) % ((1 << 21) - 1100));
             let len = n * SECTOR_SIZE;
             fill(&mut wb[..len], rng);
             let guard = iters % 4 == 0;
@@ -2081,12 +2234,24 @@ pub fn init() {
             };
             #[cfg(not(feature = "rpi5"))]
             let n = 2;
+            // ADMA2: allocate the bounce buffer, then prove one read against PIO.
+            let dma_state: &str = if !DMA_ON.load(Ordering::Relaxed) { "off (sdhci.dma=0)" }
+            else if !MULTI_ON.load(Ordering::Relaxed) { DMA_ON.store(false, Ordering::Relaxed); "off (multi-block off)" }
+            else if let Some(ref d) = devs[1] {
+                if unsafe { d.r32(REG_CAPABILITIES) } & CAP_ADMA2 == 0 { DMA_ON.store(false, Ordering::Relaxed); "off (no ADMA2 capability)" }
+                else if !dma_alloc() { DMA_ON.store(false, Ordering::Relaxed); "off (no DMA memory)" }
+                else if unsafe { d.dma_selftest() } { "ADMA2 (32-bit descriptors, bounce below 4 GiB)" }
+                else { DMA_ON.store(false, Ordering::Relaxed); "off (selftest failed)" }
+            } else { "off" };
+            crate::kenv::pci::serial_debug("[sdhci] DMA: ");
+            crate::kenv::pci::serial_debug(dma_state);
+            crate::kenv::pci::serial_debug(" (sdhci.dma=0 opts out)\n");
             dbg(b']');
             if MULTITEST.load(Ordering::Relaxed) {
                 if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
             }
             crate::kenv::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
-                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback) (sdhci.multi=1)\n"
+                "[sdhci] I/O mode: multi-block CMD18/CMD25 + auto-CMD12, PIO up to 64 KiB per command (ADMA2 per [sdhci] DMA line; single-sector fallback) (sdhci.multi=1)\n"
             } else {
                 "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"
             });
@@ -2176,7 +2341,7 @@ fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -
     }
     let mut i = 0;
     while i < total {
-        let n = (total - i).min(MULTI_MAX_BLOCKS);
+        let n = (total - i).min(span_max_blocks());
         let devs = DEVICES.lock();
         let dev = match devs.get(dev_idx) { Some(Some(d)) => d, _ => return false };
         let ok = dev.do_io_span(is_write, blk + i as u64, n, unsafe { buf.add(i * BLOCK_SIZE) });
