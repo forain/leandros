@@ -272,11 +272,13 @@ pub unsafe fn putc(c: u8) {
 /// output, and then one deadline per episode, as before.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn putc_patient(c: u8) {
-    putc_within(c, uart_tx_wait_cycles().saturating_mul(40), &USER_TX_WEDGED);
+    if !putc_within(c, uart_tx_wait_cycles().saturating_mul(40), &USER_TX_WEDGED) {
+        USER_TX_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn putc_within(c: u8, wait_cycles: u64, wedged: &core::sync::atomic::AtomicBool) {
+unsafe fn putc_within(c: u8, wait_cycles: u64, wedged: &core::sync::atomic::AtomicBool) -> bool {
     use core::arch::asm;
     use core::sync::atomic::Ordering::Relaxed;
 
@@ -316,7 +318,7 @@ unsafe fn putc_within(c: u8, wait_cycles: u64, wedged: &core::sync::atomic::Atom
         asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
         if lsr & 0x20 == 0 {
             UART_TX_DROPPED.fetch_add(1, Relaxed);
-            return;
+            return false;
         }
         wedged.store(false, Relaxed);
     } else {
@@ -328,7 +330,7 @@ unsafe fn putc_within(c: u8, wait_cycles: u64, wedged: &core::sync::atomic::Atom
             if rdtsc_raw().wrapping_sub(deadline) < (1u64 << 63) {
                 wedged.store(true, Relaxed);
                 UART_TX_DROPPED.fetch_add(1, Relaxed);
-                return;
+                return false;
             }
             core::hint::spin_loop();
         }
@@ -336,6 +338,7 @@ unsafe fn putc_within(c: u8, wait_cycles: u64, wedged: &core::sync::atomic::Atom
 
     // Send the character
     asm!("out dx, al", in("dx") 0x3F8u16, in("al") c, options(nomem, nostack));
+    true
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -378,6 +381,10 @@ static TX_WEDGED: core::sync::atomic::AtomicBool =
 /// next user write into single-probe drops, and vice versa.
 static USER_TX_WEDGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+/// Bytes of a user `write(2)` to the console dropped (subset of `UART_TX_DROPPED`).
+pub static USER_TX_DROPPED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Console bytes dropped because the UART transmitter never reported itself
 /// empty in time. Non-zero means console output was traded away to keep this

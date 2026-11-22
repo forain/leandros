@@ -37,6 +37,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "conloss"
+version = "0.1.0"
+
+[[package]]
 name = "dbusprobe"
 version = "0.1.0"
 dependencies = [

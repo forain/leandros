@@ -315,13 +315,17 @@ static TX_WEDGED: core::sync::atomic::AtomicBool =
 static USER_TX_WEDGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Bytes of a user `write(2)` to the console dropped (subset of `UART_TX_DROPPED`).
+pub static USER_TX_DROPPED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Console bytes dropped because the PL011 TX FIFO never drained in time. The
 /// x86_64 counterpart is `arch_x86_64::UART_TX_DROPPED`.
 pub static UART_TX_DROPPED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 pub unsafe fn putc(c: u8) {
-    putc_within(c, tx_wait_ticks(), &TX_WEDGED);
+    let _ = putc_within(c, tx_wait_ticks(), &TX_WEDGED);
 }
 
 /// `putc` for process-context console output (a user `write(2)` to the
@@ -330,13 +334,15 @@ pub unsafe fn putc(c: u8) {
 /// `arch_x86_64::putc_patient` for the measured loss this prevents (there the
 /// socket chardev buffers only ~278 one-byte writes on a Linux host).
 pub unsafe fn putc_patient(c: u8) {
-    putc_within(c, tx_wait_ticks().saturating_mul(20), &USER_TX_WEDGED);
+    if !putc_within(c, tx_wait_ticks().saturating_mul(20), &USER_TX_WEDGED) {
+        USER_TX_DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
-unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::AtomicBool) {
+unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::AtomicBool) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     // Basic check: if UART_BASE_ADDR is physical and MMU is on, we might fault.
-    if UART_BASE_ADDR == 0 { return; }
+    if UART_BASE_ADDR == 0 { return true; }
 
     // Deadline + wedge latch, for the same reason as the x86_64 16550 path (see
     // arch/x86_64/src/lib.rs::putc): `putc` runs in IRQ context, and a host
@@ -347,7 +353,7 @@ unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::Atomi
     if wedged.load(Relaxed) {
         if rd(FR) & FR_TXFF != 0 {
             UART_TX_DROPPED.fetch_add(1, Relaxed);
-            return;
+            return false;
         }
         wedged.store(false, Relaxed);
     } else {
@@ -363,12 +369,13 @@ unsafe fn putc_within(c: u8, wait_ticks: u64, wedged: &core::sync::atomic::Atomi
             if cntvct_raw().wrapping_sub(deadline) < (1u64 << 63) {
                 wedged.store(true, Relaxed);
                 UART_TX_DROPPED.fetch_add(1, Relaxed);
-                return;
+                return false;
             }
             core::hint::spin_loop();
         }
     }
     wr(DR, c as u32);
+    true
 }
 
 /// Software extension of the RX FIFO. `rx_rescue` (TX wait loop, any CPU,
@@ -572,7 +579,7 @@ pub static UART_RX_ERRORS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 pub unsafe fn has_data() -> bool {
-    if UART_BASE_ADDR == 0 { return false; }
+    if UART_BASE_ADDR == 0 { return true; }
     core::ptr::read_volatile(&raw const RX_HEAD) != core::ptr::read_volatile(&raw const RX_TAIL)
         || rd(FR) & FR_RXFE == 0
 }
