@@ -213,7 +213,14 @@ pub type TableFn = fn(idx: usize, name: &mut [u8; NAME_LEN]) -> Option<(usize, &
 
 static TABLES: AtomicUsize = AtomicUsize::new(0);
 const TABLES_DIR: &[u8] = b"/sys/firmware/acpi/tables";
-pub const SC_TABLES: u16 = SC_BASE | 0xF << 8 | 0xFF;
+// Must not collide with block.rs's NO_DEV (0xFFFF, /sys/class/block itself) or
+// LOOP_CONTROL (0xFFFE): both live above SC_BASE too, and with the tables dir
+// at 0xFFFF `ls /sys/class/block` listed the ACPI tables (DSDT, FACP).
+pub const SC_TABLES: u16 = SC_BASE | 0xF << 8 | 0xFD;
+
+/// True when `dev` of a `VnodeKind::SysBlock` is a sysclass overlay directory
+/// rather than a block-registry slot (block.rs reserves 0xFFFE/0xFFFF).
+pub fn is_overlay_dev(dev: u16) -> bool { dev >= SC_BASE && dev < 0xFFFE }
 
 pub fn set_acpi_tables(f: TableFn) {
     TABLES.store(f as usize, Ordering::Release);
@@ -441,4 +448,53 @@ fn normalize(p: &[u8]) -> alloc::vec::Vec<u8> {
     for c in comps { out.push(b'/'); out.extend_from_slice(c); }
     if out.is_empty() { out.push(b'/'); }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Path of an overlay directory from its `(dev, level)` id: what an O_PATH fd
+// of a synthesized directory answers to /proc/self/fd/N readlink, openat and
+// bind-mount source resolution. Generic on purpose: it walks the overlay from
+// its roots through `dir`/`dirent`, so every directory any overlay module can
+// resolve names its own path with no per-module inverse to keep in sync.
+
+const ROOTS: [&[u8]; 11] = [
+    b"/sys/class/power_supply", b"/sys/class/backlight", b"/sys/class/rtc", b"/sys/power",
+    b"/sys/devices/system/cpu", b"/sys/devices/cpu", b"/sys/firmware/acpi/tables",
+    b"/sys/class/drm", b"/sys/class/input", b"/sys/dev/char", b"/sys/dev/char/226:0",
+];
+
+/// First (breadth-first) path whose overlay directory id is `(dev, level)`.
+pub fn dir_path(dev: u16, level: u8) -> Option<alloc::vec::Vec<u8>> {
+    use alloc::vec::Vec;
+    let mut q: Vec<Vec<u8>> = ROOTS.iter().map(|r| r.to_vec()).collect();
+    // The DRM card directory sits under the card's real /sys/devices path.
+    if let Some(t) = super::sys_readlink(b"/sys/class/drm/card0") {
+        let mut p = b"/sys/class/drm/".to_vec();
+        p.extend_from_slice(&t);
+        q.push(normalize(&p));
+    }
+    let mut i = 0;
+    while i < q.len() && i < 600 {
+        let p = q[i].clone();
+        i += 1;
+        let Some((d, l)) = (if is_path(&p) || is_tables_path(&p) { dir_or_tables(&p) } else { None }) else { continue };
+        if d == dev && l == level { return Some(p); }
+        let mut name = [0u8; NAME_LEN];
+        for idx in 0..256 {
+            let Some((n, _)) = dirent(d, l, idx, &mut name) else { break };
+            // Symlinks (class/drm/card0, dev/char/226:0) are not directories of
+            // their own: the canonical path goes through the real tree.
+            if dirent_link(d, l, idx) { continue; }
+            let mut c = p.clone();
+            c.push(b'/');
+            c.extend_from_slice(&name[..n]);
+            q.push(c);
+        }
+    }
+    None
+}
+
+fn dir_or_tables(p: &[u8]) -> Option<(u16, u8)> {
+    if is_tables_dir(p) { return Some((SC_TABLES, LVL_SC_CLASS)); }
+    dir(p)
 }

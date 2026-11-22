@@ -563,7 +563,7 @@ SUITES = {
     "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
     # Synthetic sysfs: /sys/class/{drm,input} and the /sys/dev/char node
     # identity libdrm/udev consumers read (lane sysfs).
-    "sysfs": [SYSFS_CHECK],
+    "sysfs": [SYSFS_CHECK, "/bin/mnttest sysfsbind"],
     "syncfile": [SYNCFILE_CHECK],
     "cfgwrite": [CFGWRITE_CHECK],
     # Harness guard: a 4 KB typed line must reach the shell intact (brush
