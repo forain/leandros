@@ -53,7 +53,8 @@ def measure(arch):
 
 
 def reboot(arch):
-    """Fresh VM for a re-measure (runtests' VM is already up: stop it, start anew)."""
+    """Fresh VM per measurement. SELF_BOOTS: runtests stops its own VM before
+    this script (it boots, and finally stops, its own VM under its run id)."""
     drv = os.path.join(HERE, "driver.py")
     env = dict(os.environ)
     subprocess.run([sys.executable, drv, "stop"], env=env, capture_output=True, timeout=120)
@@ -76,7 +77,7 @@ def main():
     samples = []
     ok = True
     for attempt in range(3):
-        if attempt and not reboot(arch):
+        if not reboot(arch):
             ok = False
             print("uartgap_txgap_bounded: FAIL (re-boot for re-measure failed)")
             break
@@ -90,6 +91,7 @@ def main():
         samples.append(int(m.group(1)))
         if tcg or int(m.group(1)) <= LIMIT_US:
             break
+    subprocess.run([sys.executable, os.path.join(HERE, "driver.py"), "stop"], capture_output=True, timeout=120)
     if ok:
         mn = min(samples)
         ok = tcg or mn <= LIMIT_US
