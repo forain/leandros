@@ -77,11 +77,18 @@ use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 use crate::kenv::{mm, sched};
 
+/// Set once `init` returns: after that `dbg*` is a no-op. The rpi5 arm pokes the
+/// UART by physical address, valid only on the boot identity map; a runtime call
+/// (retune, error recovery, re-probe) from a user mm faults, and a fault while
+/// DEVICES is held wedges all block I/O. Runtime messages use `serial_debug`.
+static PROBE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Bring-up marker straight to the Pi's debug PL011, independent of the console
 /// stack. This driver runs before userspace and had never touched real silicon;
 /// when it stalls, the only question worth answering is *which* wait stalled.
 #[cfg(feature = "rpi5")]
 fn dbg(c: u8) {
+    if PROBE_DONE.load(core::sync::atomic::Ordering::Relaxed) { return; }
     const BASE: usize = 0x107D_0010_00;
     unsafe {
         let mut spins = 0u32;
@@ -105,6 +112,7 @@ fn dbg(c: u8) {
 /// this path.
 #[cfg(feature = "raspi4b")]
 fn dbg(c: u8) {
+    if PROBE_DONE.load(core::sync::atomic::Ordering::Relaxed) { return; }
     let base = mm::phys_to_virt(0xFE20_1000);
     unsafe {
         let mut spins = 0u32;
@@ -331,17 +339,24 @@ const CMD_TYPE_ABORT:    u16 = 0b11 << 6;
 const MULTI_MAX_SECTORS: usize = 128;
 /// Blocks (4 KiB) per multi-block command.
 const MULTI_MAX_BLOCKS: usize = MULTI_MAX_SECTORS / SECTORS_PER_BLOCK;
-/// Multi-block CMD18/CMD25 in use. OFF by default: on the real Pi 5 it
-/// broke inbound SSH with no transfer ever reporting an error (suspected
-/// silent data corruption; QEMU's SD model never showed it). `sdhci.multi=1`
-/// opts in (see `configure`). Also cleared (for good) after
-/// `MULTI_FALLBACK_LIMIT` transfers failed multi-block but then succeeded
-/// sector by sector.
-static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Multi-block CMD18/CMD25 in use. ON by default: proven bit-exact on the real
+/// card (`sdhci.sdtest=3072`: 3 GiB, 199570 mixed-size spans, wbad=rbad=gbad=ioerr=0)
+/// and soaked under F2FS writes with concurrent inbound SSH. 16-21 MB/s vs
+/// 0.5-1.6 MB/s single-sector. `sdhci.multi=0` disables (see `configure`). Also
+/// cleared (for good) after `MULTI_FALLBACK_LIMIT` transfers failed multi-block
+/// but then succeeded sector by sector.
+static MULTI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 /// `sdhci.multitest=1`: at probe, compare a single-sector read and a
 /// multi-block read of the first `MULTITEST_BLOCKS` blocks. Read-only.
 static MULTITEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 const MULTITEST_BLOCKS: usize = 1024; // 4 MiB
+/// `sdhci.sdtest=<MiB>`: speed table + write/readback proof inside the scratch window.
+static SDTEST_MIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SDTEST_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The raw scratch region (see pi-remote skill): the last 8 GiB of the card,
+/// 512-byte sectors, [FIRST, END). The only place `sdtest` may write.
+const SCRATCH_FIRST: u64 = 233_222_144;
+const SCRATCH_END: u64 = 249_999_360;
 
 /// Kernel command-line knobs, read before `init` probes the card:
 /// `sdhci.multi=1` (multi-block I/O) and `sdhci.multitest=1` (boot self-test).
@@ -355,7 +370,15 @@ pub fn configure(cmdline: &str) {
             "sdhci.multi=1" => MULTI_ON.store(true, Ordering::Relaxed),
             "sdhci.multi=0" => MULTI_ON.store(false, Ordering::Relaxed),
             "sdhci.multitest=1" => MULTITEST.store(true, Ordering::Relaxed),
-            _ => {}
+            "sdhci.uhs=1" => UHS_ON.store(true, Ordering::Relaxed),
+            "sdhci.uhs=0" => UHS_ON.store(false, Ordering::Relaxed),
+            _ => {
+                if let Some(v) = w.strip_prefix("sdhci.sdtest=") {
+                    let m: u32 = v.parse().unwrap_or(0);
+                    SDTEST_MIB.store(m, Ordering::Relaxed);
+                    SDTEST_PENDING.store(m > 0, Ordering::Relaxed);
+                }
+            }
         }
     }
 }
@@ -703,10 +726,118 @@ impl SdhciDevice {
         self.reset_cmd_dat();
     }
 
+    /// Raw sector I/O confined to the scratch window. Every access (reads
+    /// too) is range-checked here, the single chokepoint of `sdtest`.
+    unsafe fn scratch_io(&self, is_write: bool, multi: bool, sector: u64, count: usize, buf: *mut u8) -> bool {
+        if count == 0 || sector < SCRATCH_FIRST || sector.checked_add(count as u64).map_or(true, |e| e > SCRATCH_END) {
+            crate::kenv::pci::serial_debug("[sdhci] sdtest: RANGE VIOLATION refused\n");
+            return false;
+        }
+        let ok = if multi {
+            self.do_io_multi(is_write, sector, count, buf)
+        } else {
+            (0..count).all(|i| self.do_io_sector(is_write, sector + i as u64, buf.add(i * SECTOR_SIZE)))
+        };
+        if !ok { self.abort_multi(); }
+        ok
+    }
+
+    /// `sdhci.sdtest=<MiB>`: speed table and write/readback proof inside the
+    /// scratch window only (the last 8 GiB of the card, free of partitions).
+    /// Bypasses `MULTI_ON`; always exercises the raw multi/single paths.
+    unsafe fn sdtest(&self, mib: u32) {
+        let p = |s: &str| crate::kenv::pci::serial_debug(s);
+        let ph = |v: u64| {
+            let mut o = [0u8; 16];
+            for i in 0..16 { let nib = ((v >> (4 * (15 - i))) & 0xf) as u8; o[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 }; }
+            let s = o.iter().position(|&c| c != b'0').unwrap_or(15);
+            crate::kenv::pci::serial_debug(core::str::from_utf8(&o[s..]).unwrap_or("?"));
+        };
+        let pd = |mut v: u64| {
+            let mut o = [0u8; 20]; let mut i = 20;
+            if v == 0 { i -= 1; o[i] = b'0'; }
+            while v > 0 { i -= 1; o[i] = b'0' + (v % 10) as u8; v /= 10; }
+            crate::kenv::pci::serial_debug(core::str::from_utf8(&o[i..]).unwrap_or("?"));
+        };
+        let fill = |buf: &mut [u8], seed: u64| {
+            let mut x = seed | 1;
+            for w in buf.chunks_exact_mut(8) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                w.copy_from_slice(&x.to_le_bytes());
+            }
+        };
+        let mut wb = alloc::vec![0u8; 128 * SECTOR_SIZE];
+        let mut rb = alloc::vec![0u8; 128 * SECTOR_SIZE];
+        p("[sdhci] sdtest start mib="); pd(mib as u64); p("\n");
+        // Phase A: speed. 16 MiB sequential from the window start, 64 KiB spans.
+        let t_mib = 4u64;
+        let spans = (t_mib * 1048576 / 65536) as usize;
+        for (name, multi, is_write) in [("single write", false, true), ("single read", false, false),
+                                        ("multi write", true, true), ("multi read", true, false)] {
+            let t0 = sched::monotonic_ns();
+            let mut ok = true;
+            for s in 0..spans {
+                if is_write { fill(&mut wb[..], 0x1234_5678 + s as u64); }
+                let b = if is_write { wb.as_mut_ptr() } else { rb.as_mut_ptr() };
+                if !self.scratch_io(is_write, multi, SCRATCH_FIRST + (s * 128) as u64, 128, b) { ok = false; break; }
+                if s % 16 == 0 { p("[sdhci] sdtest A "); p(name); p(" span "); pd(s as u64); p(" t_ms="); pd((sched::monotonic_ns() - t0) / 1_000_000); p("\n"); }
+            }
+            let dt = (sched::monotonic_ns() - t0).max(1);
+            p("[sdhci] sdtest speed "); p(name); p(": "); pd(t_mib * 1048576 * 1_000_000_000 / dt / 1024); p(" KiB/s ok="); pd(ok as u64); p("\n");
+        }
+        // Phase B: mixed-size multi writes, verified by single-sector readback
+        // (writes) and multi readback (reads), plus guard sectors either side.
+        const SIZES: [usize; 13] = [1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 64, 100, 128];
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15 ^ (sched::monotonic_ns() | 1);
+        let (mut done, mut wbad, mut rbad, mut gbad, mut ioerr, mut iters) = (0u64, 0u32, 0u32, 0u32, 0u32, 0u64);
+        let target = mib as u64 * 1048576;
+        let mut g = [0u8; 2 * SECTOR_SIZE];
+        while done < target {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            let n = SIZES[(rng >> 40) as usize % SIZES.len()];
+            let start = SCRATCH_FIRST + 1 + ((rng >> 8) % ((1 << 21) - 130));
+            let len = n * SECTOR_SIZE;
+            fill(&mut wb[..len], rng);
+            let guard = iters % 4 == 0;
+            if guard {
+                fill(&mut g, rng ^ 0xdead_beef);
+                if !self.scratch_io(true, false, start - 1, 1, g.as_mut_ptr())
+                    || !self.scratch_io(true, false, start + n as u64, 1, g.as_mut_ptr().add(SECTOR_SIZE)) { ioerr += 1; }
+            }
+            if iters < 40 { p("[sdhci] sdtest B mw "); ph(start); p(" n="); pd(n as u64); p(if guard { " g\n" } else { "\n" }); }
+            if !self.scratch_io(true, true, start, n, wb.as_mut_ptr()) { ioerr += 1; iters += 1; p("[sdhci] sdtest B mw FAILED\n"); continue; }
+            if iters < 40 { p("[sdhci] sdtest B mw ok\n"); }
+            let mut bad = false;
+            if !self.scratch_io(false, false, start, n, rb.as_mut_ptr()) { ioerr += 1; }
+            else if rb[..len] != wb[..len] {
+                wbad += 1; bad = true;
+                let d = (0..len).find(|&i| rb[i] != wb[i]).unwrap_or(0);
+                if wbad <= 8 { p("[sdhci] sdtest WRITE MISMATCH sector "); ph(start); p(" n="); pd(n as u64); p(" first diff byte "); pd(d as u64); p("\n"); }
+            }
+            if !self.scratch_io(false, true, start, n, rb.as_mut_ptr()) { ioerr += 1; }
+            else if rb[..len] != wb[..len] {
+                rbad += 1;
+                if rbad <= 8 { p("[sdhci] sdtest MULTI-READ MISMATCH sector "); ph(start); p(" n="); pd(n as u64); p(if bad { " (write bad too)\n" } else { " (single read agrees with write)\n" }); }
+            }
+            if guard {
+                let mut r2 = [0u8; 2 * SECTOR_SIZE];
+                if !self.scratch_io(false, false, start - 1, 1, r2.as_mut_ptr())
+                    || !self.scratch_io(false, false, start + n as u64, 1, r2.as_mut_ptr().add(SECTOR_SIZE)) { ioerr += 1; }
+                else if r2 != g { gbad += 1; if gbad <= 8 { p("[sdhci] sdtest GUARD CLOBBERED at span sector "); ph(start); p(" n="); pd(n as u64); p("\n"); } }
+            }
+            done += len as u64; iters += 1;
+            if iters % 256 == 0 { p("[sdhci] sdtest progress MiB="); pd(done >> 20); p(" wbad="); pd(wbad as u64); p(" rbad="); pd(rbad as u64); p(" gbad="); pd(gbad as u64); p(" ioerr="); pd(ioerr as u64); p("\n"); }
+        }
+        p("[sdhci] sdtest DONE MiB="); pd(done >> 20); p(" iters="); pd(iters);
+        p(" wbad="); pd(wbad as u64); p(" rbad="); pd(rbad as u64); p(" gbad="); pd(gbad as u64); p(" ioerr="); pd(ioerr as u64);
+        p(if wbad == 0 && rbad == 0 && gbad == 0 && ioerr == 0 { " PASS\n" } else { " FAIL\n" });
+    }
+
     /// `nblocks` (1..=MULTI_MAX_BLOCKS) contiguous 4 KiB blocks. Multi-block
     /// first; on any failure the span is redone with the single-sector path,
     /// which stays the only path once multi-block has proven unreliable.
     fn do_io_span(&self, is_write: bool, blk: u64, nblocks: usize, buf: *mut u8) -> bool {
+        self.maybe_retune();
         if self.boot_fat {
             // Single-sector commands only (no multi-block), see `do_io`.
             return (0..nblocks).all(|j| self.do_io(is_write, blk + j as u64,
@@ -719,7 +850,7 @@ impl SdhciDevice {
                 return true;
             }
             let latched = LAST_FAIL.load(Ordering::Relaxed);
-            unsafe { self.abort_multi(); }
+            unsafe { self.abort_multi(); self.retune(); }
             let ok = (0..nblocks).all(|j| self.do_io(is_write, blk + j as u64,
                 unsafe { buf.add(j * BLOCK_SIZE) }));
             crate::kenv::pci::serial_debug(if is_write { "[sdhci] multi-block write" } else { "[sdhci] multi-block read" });
@@ -823,6 +954,7 @@ impl SdhciDevice {
                     // that follows, which is why a single failed write during
                     // mount turned into "execve /bin/login failed" much later.
                     self.reset_cmd_dat();
+                    self.retune();
                     dbg(b'~');
                     dbg(b'\n');
                 }
@@ -1301,6 +1433,369 @@ unsafe fn negotiate_bus(dev: &SdhciDevice, rca: u32, tran_speed_khz: u32) {
     dbg(b'\n');
 }
 
+// ── UHS-I (SDR50 / SDR104) ───────────────────────────────────────────────────
+//
+// `sdhci.uhs=1`. Mirrors what Linux's sdhci-brcmstb + mmc core do on this
+// board (DT: `vqmmc-supply` = `sd-io-1v8-reg`, a regulator-gpio on gio_aon 3,
+// high = 1.8 V, 5 ms settle; `vmmc-supply` = `sd-vcc-reg`, a regulator-fixed on
+// gio_aon 4 = SD_PWR_ON, high = on):
+//
+//   power-cycle card (3.3 V I/O) -> ACMD41 with S18R -> S18A? -> CMD11 ->
+//   stop clock, DAT0 low -> I/O regulator 1.8 V + Host Control 2 1.8 V enable
+//   -> 5 ms -> clock on, DAT[3:0] high -> CMD2/3/9/7 -> ACMD6 -> CMD6 SDR104
+//   (or SDR50) -> Host Control 2 mode, clock -> CMD19 tuning -> verify.
+//
+// Any failure after CMD11 (or any verify failure) returns `None` from the
+// attempt; `probe_card` then power-cycles the card through SD_PWR_ON (the same
+// software power cycle Linux does at every boot) and re-probes at 3.3 V HS.
+
+const REG_HOST_CONTROL2:  usize = 0x3E; // u16
+const REG_CAPABILITIES_1: usize = 0x44; // u32
+const HC2_MODE_MASK:   u16 = 0x7;
+const HC2_1V8:         u16 = 1 << 3;
+const HC2_EXEC_TUNING: u16 = 1 << 6;
+const HC2_SAMPLING:    u16 = 1 << 7;
+const PSTATE_DAT0:     u32 = 1 << 20;
+const PSTATE_DAT_ALL:  u32 = 0xF << 20;
+const CMD_VOLTAGE_SWITCH: u8 = 11;
+const CMD_SEND_TUNING:    u8 = 19;
+const CFG_OFF: usize = 0x400;
+
+static UHS_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static UHS_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static UHS_LAST_TUNE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static UHS_RETUNES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const UHS_RETUNE_NS: u64 = 4_000_000_000;
+
+fn delay_us(us: u64) { crate::kdiag::delay_us(us) }
+
+#[cfg(feature = "rpi5")]
+mod board {
+    use crate::bcm2712_gpio::{gpio_get, gpio_set_output, Chip};
+    pub fn available() -> bool { gpio_get(Chip::GioAon, 3).is_ok() && gpio_get(Chip::GioAon, 4).is_ok() }
+    pub fn io_1v8(on: bool) -> bool { gpio_set_output(Chip::GioAon, 3, on).is_ok() }
+    pub fn card_power(on: bool) -> bool { gpio_set_output(Chip::GioAon, 4, on).is_ok() }
+    pub fn io_is_1v8() -> bool { gpio_get(Chip::GioAon, 3).unwrap_or(false) }
+}
+#[cfg(not(feature = "rpi5"))]
+mod board {
+    pub fn available() -> bool { false }
+    pub fn io_1v8(_: bool) -> bool { false }
+    pub fn card_power(_: bool) -> bool { false }
+    pub fn io_is_1v8() -> bool { false }
+}
+
+impl SdhciDevice {
+    /// Software power cycle of the card (SD_PWR_ON low, I/O back to 3.3 V,
+    /// Host Control 2 cleared), exactly the reset a card left at 1.8 V needs.
+    /// Returns false (nothing changed) if the GPIO is not reachable.
+    unsafe fn card_power_cycle(&self) -> bool {
+        if !board::available() { return false; }
+        self.w16(REG_CLOCK_CONTROL, 0);
+        if !board::card_power(false) { return false; }
+        let _ = board::io_1v8(false);
+        self.w16(REG_HOST_CONTROL2, 0);
+        delay_us(200_000);
+        let ok = board::card_power(true);
+        delay_us(50_000);
+        ok
+    }
+
+    /// CMD11 + the host-side 1.8 V switch. False on any failure (the caller
+    /// power-cycles the card).
+    unsafe fn voltage_switch_1v8(&self) -> bool {
+        if self.send_command(CMD_VOLTAGE_SWITCH, 0, RESP_48, false, true, true).is_none() {
+            self.reset_cmd_dat();
+            dbg_str("[sdhci] uhs: CMD11 no response\n");
+            return false;
+        }
+        let cc = self.r16(REG_CLOCK_CONTROL);
+        self.w16(REG_CLOCK_CONTROL, cc & !CLK_SD_EN);
+        delay_us(2_000);
+        if self.r32(REG_PRESENT_STATE) & PSTATE_DAT0 != 0 {
+            dbg_str("[sdhci] uhs: DAT0 not low after CMD11\n");
+            return false;
+        }
+        if !board::io_1v8(true) { dbg_str("[sdhci] uhs: vqmmc gpio failed\n"); return false; }
+        self.w16(REG_HOST_CONTROL2, self.r16(REG_HOST_CONTROL2) | HC2_1V8);
+        delay_us(10_000);
+        if self.r16(REG_HOST_CONTROL2) & HC2_1V8 == 0 {
+            dbg_str("[sdhci] uhs: HC2 1.8V bit did not stick\n");
+            return false;
+        }
+        self.w16(REG_CLOCK_CONTROL, self.r16(REG_CLOCK_CONTROL) | CLK_SD_EN);
+        delay_us(10_000);
+        let ps = self.r32(REG_PRESENT_STATE);
+        self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
+        self.w16(REG_ERROR_INT_STATUS, EI_ALL);
+        if ps & PSTATE_DAT_ALL != PSTATE_DAT_ALL {
+            dbg_str("[sdhci] uhs: DAT lines not high after switch, pstate=");
+            dbg_hex(ps as u64);
+            dbg(b'\n');
+            return false;
+        }
+        true
+    }
+
+    /// Program a UHS timing: width 4, HC2 mode select, clock.
+    unsafe fn apply_uhs(&self, mode: u16, clk_sel: u16) {
+        let cc = self.r16(REG_CLOCK_CONTROL);
+        self.w16(REG_CLOCK_CONTROL, cc & !CLK_SD_EN);
+        let hc = self.r8(REG_HOST_CONTROL1);
+        self.w8(REG_HOST_CONTROL1, hc | HC1_DATA_WIDTH_4 | if mode != 0 { HC1_HIGH_SPEED } else { 0 });
+        let hc2 = self.r16(REG_HOST_CONTROL2);
+        self.w16(REG_HOST_CONTROL2, (hc2 & !(HC2_MODE_MASK | HC2_EXEC_TUNING | HC2_SAMPLING)) | mode);
+        self.w16(REG_CLOCK_CONTROL, clk_sel | CLK_INTERNAL_EN);
+        let mut spins: u32 = 0;
+        while self.r16(REG_CLOCK_CONTROL) & CLK_STABLE == 0 {
+            spins += 1;
+            if spins > SPIN_LIMIT { dbg(b'k'); break; }
+            core::hint::spin_loop();
+        }
+        self.w16(REG_CLOCK_CONTROL, self.r16(REG_CLOCK_CONTROL) | CLK_SD_EN);
+        delay_us(200);
+    }
+
+    /// SDHCI Execute Tuning with CMD19 (up to 40 tries). On failure the
+    /// previous Host Control 2 value (minus the tuning bit) is restored.
+    unsafe fn tune_sdr(&self, verbose: bool) -> bool {
+        let saved = self.r16(REG_HOST_CONTROL2);
+        self.w16(REG_HOST_CONTROL2, saved | HC2_EXEC_TUNING);
+        let mut done = false;
+        let mut errs = 0u32;
+        let mut iters = 0u32;
+        for _ in 0..40 {
+            iters += 1;
+            self.wait_cmd_inhibit_clear(true);
+            self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
+            self.w16(REG_ERROR_INT_STATUS, EI_ALL);
+            self.w16(REG_BLOCK_SIZE, 64);
+            self.w16(REG_BLOCK_COUNT, 1);
+            self.w16(REG_TRANSFER_MODE, TM_DIR_READ);
+            self.w32(REG_ARGUMENT1, 0);
+            self.w16(REG_COMMAND, ((CMD_SEND_TUNING as u16) << 8) | RESP_48 | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_DATA_PRESENT);
+            let mut got = false;
+            let mut spins: u32 = 0;
+            loop {
+                let st = self.r16(REG_NORMAL_INT_STATUS);
+                if st & NI_ERROR != 0 { break; }
+                if st & NI_BUF_READ_READY != 0 { got = true; break; }
+                spins += 1;
+                if spins > 4_000_000 { break; }
+                core::hint::spin_loop();
+            }
+            if got {
+                self.w16(REG_NORMAL_INT_STATUS, NI_BUF_READ_READY);
+                for _ in 0..16 { let _ = self.r32(REG_BUFFER_DATA); }
+                let t = self.r16(REG_NORMAL_INT_STATUS);
+                if t & NI_XFER_COMPLETE != 0 { self.w16(REG_NORMAL_INT_STATUS, NI_XFER_COMPLETE); }
+            } else {
+                errs += 1;
+                self.reset_cmd_dat();
+            }
+            if self.r16(REG_HOST_CONTROL2) & HC2_EXEC_TUNING == 0 { done = true; break; }
+        }
+        let hc2 = self.r16(REG_HOST_CONTROL2);
+        let ok = done && hc2 & HC2_SAMPLING != 0;
+        self.reset_cmd_dat();
+        if !ok {
+            self.w16(REG_HOST_CONTROL2, saved & !HC2_EXEC_TUNING);
+        }
+        // `dbg*` pokes UART10 by physical address: only valid at probe time
+        // (identity map); at runtime a retune must stay silent here.
+        if verbose {
+            dbg_str("[sdhci] uhs: tuning ");
+            dbg_str(if ok { "ok" } else { "FAILED" });
+            dbg_str(" iters=");
+            dbg_dec(iters);
+            dbg_str(" errs=");
+            dbg_dec(errs);
+            dbg_str(" hc2=");
+            dbg_hex(self.r16(REG_HOST_CONTROL2) as u64);
+            dbg(b'\n');
+        }
+        ok
+    }
+
+    unsafe fn log_cfg(&self) {
+        let c = self.base + CFG_OFF;
+        let r = |o: usize| ((c + o) as *const u32).mmio_read();
+        dbg_str("[sdhci] uhs: cfg ctrl=");
+        dbg_hex(r(0x00) as u64);
+        dbg_str(" pinsel=");
+        dbg_hex(r(0x44) as u64);
+        dbg_str(" max50=");
+        dbg_hex(r(0x1ac) as u64);
+        dbg_str(" iovdd1v8=");
+        dbg_dec(board::io_is_1v8() as u32);
+        dbg(b'\n');
+    }
+
+    /// Re-tune (periodic, or after an I/O error). Idle bus only.
+    unsafe fn retune(&self) {
+        if !UHS_ACTIVE.load(Ordering::Relaxed) { return; }
+        let ok = self.tune_sdr(false);
+        UHS_LAST_TUNE_NS.store(crate::kdiag::now_ns(), Ordering::Relaxed);
+        UHS_RETUNES.fetch_add(1, Ordering::Relaxed);
+        if !ok { crate::kenv::pci::serial_debug("[sdhci] uhs: retune failed, keeping previous sampling point\n"); }
+    }
+
+    #[inline]
+    fn maybe_retune(&self) {
+        if UHS_ACTIVE.load(Ordering::Relaxed) {
+            let now = crate::kdiag::now_ns();
+            if now.wrapping_sub(UHS_LAST_TUNE_NS.load(Ordering::Relaxed)) > UHS_RETUNE_NS {
+                unsafe { self.retune(); }
+            }
+        }
+    }
+
+    unsafe fn crc_chunks(&self, out: &mut [u32; 8], buf: &mut [u8; 16 * SECTOR_SIZE]) -> bool {
+        for (i, o) in out.iter_mut().enumerate() {
+            if !self.do_io_multi(false, (i * 16) as u64, 16, buf.as_mut_ptr()) {
+                self.reset_cmd_dat();
+                return false;
+            }
+            *o = crc32_update(0xFFFF_FFFF, buf);
+        }
+        true
+    }
+}
+
+/// UHS negotiation after the 1.8 V switch and card identification.
+/// False = give up (caller power-cycles and falls back to 3.3 V HS).
+unsafe fn negotiate_uhs(dev: &SdhciDevice, rca: u32) -> bool {
+    let spec = (dev.r16(REG_HOST_VERSION) & 0xFF) as u32;
+    let v3 = spec >= 2;
+    let caps = dev.r32(REG_CAPABILITIES);
+    let caps1 = dev.r32(REG_CAPABILITIES_1);
+    let caps_base_mhz = if v3 { (caps >> 8) & 0xFF } else { (caps >> 8) & 0x3F };
+    let base_khz = if caps_base_mhz != 0 { caps_base_mhz * 1000 } else { BASE_CLOCK_FALLBACK_KHZ };
+    dbg_str("[sdhci] uhs: caps=");
+    dbg_hex(caps as u64);
+    dbg_str(" caps1=");
+    dbg_hex(caps1 as u64);
+    dbg_str(" base=");
+    dbg_dec(base_khz);
+    dbg_str("kHz\n");
+    let can104 = caps1 & 2 != 0;
+    let can50 = caps1 & 1 != 0;
+
+    let floor = BusState { host_ctl: 0, clk_sel: CLK_DIV_MAX, clk_khz: base_khz / 510 };
+    let mut good = floor;
+    let mut reference = [0u8; SECTOR_SIZE];
+    if !dev.do_io_sector(false, 0, reference.as_mut_ptr()) { dev.reset_cmd_dat(); return false; }
+
+    // 4-bit, then 25 MHz at SDR12 timing.
+    if !(dev.app_cmd(rca)
+        && dev.send_command(ACMD_SET_BUS_WIDTH, 0b10, RESP_48, false, true, true).is_some())
+    {
+        dev.reset_cmd_dat();
+        dbg_str("[sdhci] uhs: ACMD6 failed\n");
+        return false;
+    }
+    let wide = BusState { host_ctl: HC1_DATA_WIDTH_4, ..good };
+    if !try_rung(dev, rca, &reference, floor, &mut good, wide) { return false; }
+    let (clk_sel, clk_khz) = clock_divider(base_khz, 25_000, v3);
+    let r25 = BusState { clk_sel, clk_khz, ..good };
+    if !try_rung(dev, rca, &reference, floor, &mut good, r25) { return false; }
+
+    // Supported functions.
+    let mut st = [0u8; SWITCH_STATUS_LEN];
+    if !dev.read_data_command(CMD_SWITCH_FUNC, 0x00FF_FFF1, &mut st) {
+        dev.reset_cmd_dat();
+        dbg_str("[sdhci] uhs: CMD6 query failed\n");
+        return false;
+    }
+    let bitmap = st[13];
+    dbg_str("[sdhci] uhs: card group1 bitmap=");
+    dbg_hex(bitmap as u64);
+    dbg(b'\n');
+
+    // Reference CRCs at the verified 25 MHz.
+    let mut buf = [0u8; 16 * SECTOR_SIZE];
+    let mut refcrc = [0u32; 8];
+    if !dev.crc_chunks(&mut refcrc, &mut buf) { return false; }
+
+    let cands: [(u16, u32, bool, &str); 2] = [
+        (3, 200_000, can104 && bitmap & 0x08 != 0, "SDR104"),
+        (2, 100_000, can50 && bitmap & 0x04 != 0, "SDR50"),
+    ];
+    for (func, khz, avail, name) in cands {
+        if !avail { continue; }
+        let (clk_sel, clk_khz) = clock_divider(base_khz, khz, v3);
+        if clk_khz * 4 < khz * 3 {
+            dbg_str("[sdhci] uhs: base clock too low for ");
+            dbg_str(name);
+            dbg(b'\n');
+            continue;
+        }
+        if !(dev.read_data_command(CMD_SWITCH_FUNC, 0x80FF_FFF0 | func as u32, &mut st)
+            && (st[16] & 0x0F) as u16 == func)
+        {
+            dev.reset_cmd_dat();
+            dbg_str("[sdhci] uhs: CMD6 switch refused for ");
+            dbg_str(name);
+            dbg(b'\n');
+            dev.apply_uhs(0, good.clk_sel);
+            continue;
+        }
+        {
+            // SD_PIN_SEL = card (Linux reads 2 here; we left whatever firmware set).
+            let pm = (dev.base + CFG_OFF + 0x44) as *mut u32;
+            let pv = pm.mmio_read();
+            if pv & 3 != 2 { pm.mmio_write((pv & !3) | 2); }
+        }
+        dev.apply_uhs(func, clk_sel);
+        if func == 3 {
+            // Linux reaches SDR104 on this controller; make sure the strap
+            // does not cap the clock at 50 MHz (SDIO_CFG_MAX_50MHZ_MODE).
+            let m = (dev.base + CFG_OFF + 0x1ac) as *mut u32;
+            let v = m.mmio_read();
+            dbg_str("[sdhci] uhs: max50 cfg before=");
+            dbg_hex(v as u64);
+            // Linux (sdhci-brcmstb) leaves 0x80000000: STRAP_OVERRIDE (bit 31) set,
+            // MAX_50MHZ_MODE_ENABLE (bit 0) clear. The previous revision wrote the
+            // inverse, which caps the clock path at 50 MHz and starves tuning.
+            if v & 1 != 0 || v & (1 << 31) == 0 {
+                m.mmio_write((v | (1u32 << 31)) & !1u32);
+                dbg_str(" -> ");
+                dbg_hex(m.mmio_read() as u64);
+            }
+            dbg(b'\n');
+            delay_us(5_000);
+        }
+        let mut ok = dev.tune_sdr(true);
+        if !ok && func == 3 {
+            delay_us(10_000);
+            ok = dev.tune_sdr(true);
+        }
+        ok = ok && dev.verify_bus(&reference);
+        if ok {
+            let mut c = [0u32; 8];
+            for _ in 0..4 {
+                if !dev.crc_chunks(&mut c, &mut buf) || c != refcrc { ok = false; break; }
+            }
+        }
+        if ok {
+            UHS_LAST_TUNE_NS.store(crate::kdiag::now_ns(), Ordering::Relaxed);
+            UHS_ACTIVE.store(true, Ordering::Relaxed);
+            dbg_str("[sdhci] UHS-I ");
+            dbg_str(name);
+            dbg_str(" active: bus width=4 clk=");
+            dbg_dec(clk_khz);
+            dbg_str("kHz (1.8V, tuned)\n");
+            return true;
+        }
+        dbg_str("[sdhci] uhs: ");
+        dbg_str(name);
+        dbg_str(" did not verify, stepping down\n");
+        dev.reset_cmd_dat();
+        dev.apply_uhs(0, good.clk_sel);
+    }
+    false
+}
+
 // ── Card bring-up ─────────────────────────────────────────────────────────────
 
 /// Real SD cards carry an MBR partition table (see
@@ -1408,7 +1903,26 @@ unsafe fn find_boot_partition(dev: &SdhciDevice) -> Option<(u64, u64)> {
 }
 
 unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
+    let uhs = UHS_ON.load(Ordering::Relaxed) && board::available();
+    if let Some(d) = probe_card_inner(base, uhs, uhs) { return Some(d); }
+    if uhs {
+        crate::kenv::pci::serial_debug("[sdhci] UHS bring-up failed: power-cycling the card, retrying at 3.3V HS\n");
+        UHS_ACTIVE.store(false, Ordering::Relaxed);
+        return probe_card_inner(base, false, true);
+    }
+    None
+}
+
+unsafe fn probe_card_inner(base: usize, uhs: bool, cycle: bool) -> Option<SdhciDevice> {
     let mut dev = SdhciDevice { base, high_capacity: false, partition_offset: 0, limit_blocks: 0, boot_fat: false };
+    // A card left at 1.8 V (previous kernel, Linux) cannot be talked to at
+    // 3.3 V: power-cycle it first. Also on every UHS attempt (known state).
+    if cycle || board::io_is_1v8() {
+        if dev.card_power_cycle() {
+            crate::kenv::pci::serial_debug("[sdhci] card power-cycled (SD_PWR_ON), I/O 3.3V\n");
+        }
+    }
+    if uhs { dev.log_cfg(); }
     dev.reset_and_init_clock();
 
     dev.send_command(CMD_GO_IDLE_STATE, 0, RESP_NONE, false, false, false)?;
@@ -1424,7 +1938,8 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     // until the card reports ready (response bit 31). R3 has no valid CRC
     // or command-index field, so both checks are disabled.
     let mut acmd41_tries: u32 = 0;
-    dev.high_capacity = loop {
+    let acmd41_arg: u32 = if uhs { 0x40FF_8000 | (1 << 24) } else { 0x40FF_8000 };
+    let (hc_bit, s18a) = loop {
         dev.send_command(CMD_APP_CMD, 0, RESP_48, false, true, true)?;
         // 0x40FF_8000 = HCS (bit 30) | VDD window 2.7-3.6V (bits 23:8 = 0xFF80).
         //
@@ -1440,9 +1955,9 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
         // probe — so 0xFF80 is exactly the window it supports. Bit 24 (S18R, the
         // 1.8V signalling request) is deliberately not set: nothing in this
         // driver implements the voltage switch that would have to follow.
-        let r = dev.send_command(ACMD_SD_SEND_OP_COND, 0x40FF_8000, RESP_48, false, false, false)?;
+        let r = dev.send_command(ACMD_SD_SEND_OP_COND, acmd41_arg, RESP_48, false, false, false)?;
         if r[0] & (1 << 31) != 0 {
-            break r[0] & (1 << 30) != 0;
+            break (r[0] & (1 << 30) != 0, r[0] & (1 << 24) != 0);
         }
         // Power-up can legitimately take ~1s of polling, but not forever: a
         // card that never sets the ready bit is a dead card, not a slow one.
@@ -1450,6 +1965,16 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
         if acmd41_tries > 100_000 { dbg(b'a'); return None; }
         core::hint::spin_loop();
     };
+    dev.high_capacity = hc_bit;
+    let mut uhs_live = false;
+    if uhs {
+        if s18a {
+            if !dev.voltage_switch_1v8() { return None; }
+            uhs_live = true;
+        } else {
+            crate::kenv::pci::serial_debug("[sdhci] uhs: card did not offer S18A, staying at 3.3V HS\n");
+        }
+    }
 
     dev.send_command(CMD_ALL_SEND_CID, 0, RESP_136, false, true, false)?;
 
@@ -1487,7 +2012,11 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     // which is the known-good configuration everything below degrades to. Wider
     // and faster from here is pure upside — `negotiate_bus` cannot fail, only
     // decline to improve — so it is not part of the `?` chain above.
-    negotiate_bus(&dev, rca, tran_speed_khz);
+    if uhs_live {
+        if !negotiate_uhs(&dev, rca) { return None; }
+    } else {
+        negotiate_bus(&dev, rca, tran_speed_khz);
+    }
 
     #[cfg(feature = "rpi5")]
     {
@@ -1565,6 +2094,7 @@ pub fn init() {
         }
         None => { dbg(b'-'); 0 }
     };
+    PROBE_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn device_count() -> usize {
@@ -1573,6 +2103,7 @@ pub fn device_count() -> usize {
 
 /// Read one 4096-byte block from device `dev_idx` at logical block `blk`.
 pub fn read_block(dev_idx: usize, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
+    maybe_sdtest();
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {
         dev.allowed(false, blk, 1) && dev.do_io_span(false, blk, 1, buf.as_mut_ptr())
@@ -1599,12 +2130,27 @@ pub fn write_blocks(dev_idx: usize, blk: u64, buf: &[u8]) -> bool {
     span_io(dev_idx, true, blk, buf.as_ptr() as *mut u8, buf.len())
 }
 
+/// Runs the `sdhci.sdtest` once, from the first block request (task context,
+/// so the tick window and watchdog keep working), before that request.
+fn maybe_sdtest() {
+    if SDTEST_PENDING.load(Ordering::Relaxed) && sched::current_pid() != 0 && !sched::irqctx::in_irq()
+        && SDTEST_PENDING.swap(false, Ordering::Relaxed) {
+        let devs = DEVICES.lock();
+        if let Some(Some(d1)) = devs.get(1) {
+            let raw = SdhciDevice { base: d1.base, high_capacity: d1.high_capacity,
+                partition_offset: 0, limit_blocks: 0, boot_fat: false };
+            unsafe { raw.sdtest(SDTEST_MIB.load(Ordering::Relaxed)); }
+        }
+    }
+}
+
 /// Contiguous span I/O, at most `MULTI_MAX_BLOCKS` per command and per
 /// `DEVICES` hold. Between chunks (lock dropped) the caller's CPU may be
 /// given to another task: the whole span is polled PIO on this CPU, and a
 /// multi-megabyte f2fs writeback otherwise keeps every task queued behind
 /// it (sshd's keepalive reply, for one) off this CPU until it ends.
 fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -> bool {
+    maybe_sdtest();
     if len == 0 || len % BLOCK_SIZE != 0 { return false; }
     let total = len / BLOCK_SIZE;
     {
