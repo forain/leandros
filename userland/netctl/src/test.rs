@@ -508,6 +508,70 @@ fn case_profiles() {
            "{:?}", r.as_ref().map(|r| (r.status, r.count)));
 }
 
+/// Run /bin/netctl with `args`, stdout+stderr captured; (exit code, output).
+fn run_netctl(args: &[&[u8]]) -> (i32, alloc::vec::Vec<u8>) {
+    use leandros_libc::syscall::{nr, syscall3};
+    let mut fds = [0i32; 2];
+    unsafe { syscall3(nr::PIPE2, fds.as_mut_ptr() as usize, 0, 0); }
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        unsafe {
+            syscall3(nr::DUP3, fds[1] as usize, 1, 0);
+            syscall3(nr::DUP3, fds[1] as usize, 2, 0);
+        }
+        sys_close(fds[0]);
+        sys_close(fds[1]);
+        let mut store: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec![b"netctl\0".to_vec()];
+        for a in args { let mut v = a.to_vec(); v.push(0); store.push(v); }
+        let mut ptrs: alloc::vec::Vec<*const u8> = store.iter().map(|v| v.as_ptr()).collect();
+        ptrs.push(core::ptr::null());
+        let env: [*const u8; 1] = [core::ptr::null()];
+        unsafe { leandros_libc::execve(b"/bin/netctl\0".as_ptr(), ptrs.as_ptr(), env.as_ptr()); }
+        exit(127);
+    }
+    sys_close(fds[1]);
+    let mut out = alloc::vec::Vec::new();
+    let mut buf = [0u8; 512];
+    while let Ok(k) = sys_read(fds[0], &mut buf) { if k == 0 { break; } out.extend_from_slice(&buf[..k]); }
+    sys_close(fds[0]);
+    let mut st = 0i32;
+    unsafe { wait4(pid, &mut st, 0, core::ptr::null_mut()); }
+    ((st >> 8) & 0xff, out)
+}
+
+fn has(o: &[u8], needle: &[u8]) -> bool { o.windows(needle.len()).any(|w| w == needle) }
+
+/// CLI conventions: -h/--help everywhere, unknown options are usage errors,
+/// `--` lets an SSID start with '-'. This guest has no Wi-Fi backend, so a
+/// connect that gets past parsing ends in an ioctl error (rc 1), never a usage
+/// error (rc 2) and never "connect accepted".
+fn case_cli() {
+    for cmd in [&b"connect"[..], b"save", b"scan", b"bss", b"disconnect", b"up", b"metric", b"radio",
+                b"forget", b"watch", b"status", b"ifaces", b"profiles", b"reload"] {
+        for h in [&b"--help"[..], b"-h"] {
+            let (rc, o) = run_netctl(&[cmd, h]);
+            let ok = rc == 0 && has(&o, b"usage: netctl") && !has(&o, b"connect:") && !has(&o, b"accepted");
+            check!("cli_help", ok, "{} {} rc={}", core::str::from_utf8(cmd).unwrap_or("?"), core::str::from_utf8(h).unwrap_or("?"), rc);
+        }
+    }
+    let (rc, o) = run_netctl(&[b"connect", b"MyNet", b"--help"]);
+    check!("cli_help_after_ssid", rc == 0 && has(&o, b"usage: netctl"), "rc={}", rc);
+    for args in [&[&b"connect"[..], b"--bogus"][..], &[b"connect", b"-x", b"pw"], &[b"save", b"--nope"],
+                 &[b"scan", b"-z"], &[b"disconnect", b"--wat"], &[b"watch", b"--wat"], &[b"forget", b"-q"],
+                 &[b"--bogus"], &[b"radio", b"on", b"-k"]] {
+        let (rc, o) = run_netctl(args);
+        check!("cli_unknown_option_rc2", rc == 2 && has(&o, b"usage:"), "{:?} rc={}", args.get(1).map(|a| core::str::from_utf8(a).unwrap_or("?")), rc);
+    }
+    let (rc, o) = run_netctl(&[b"connect", b"--", b"-weird-ssid"]);
+    check!("cli_dashdash_connect", rc == 1 && !has(&o, b"usage:"), "rc={}", rc);
+    let (rc, o) = run_netctl(&[b"connect", b"--", b"--help"]);
+    check!("cli_dashdash_help_is_ssid", rc == 1 && !has(&o, b"usage:"), "rc={}", rc);
+    let (rc, o) = run_netctl(&[b"connect", b"--", b"-weird-ssid", b"-pass"]);
+    check!("cli_dashdash_connect_pass", rc == 1 && !has(&o, b"usage:"), "rc={}", rc);
+    let (rc, _) = run_netctl(&[b"forget", b"--", b"-no-such-ssid"]);
+    check!("cli_dashdash_forget", rc == 1, "rc={}", rc);
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     if leandros_libc::geteuid() != 0 {
@@ -523,6 +587,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     case_permissions();
     case_stream();
     case_profiles();
+    case_cli();
     // Last: it takes eth0 down and up again (DHCP).
     case_wired_admin();
     let f = FAILS;
