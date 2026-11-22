@@ -244,7 +244,10 @@ fn send<D: Device>(s: &mut NetStack, dev: &mut D, ts: Instant, recs: &[Rec]) -> 
 /// pending work: smoltcp's own v1/v2 handling answers there.
 pub(crate) fn tick<D: Device>(s: &mut NetStack, dev: &mut D, sid: Sid, ts: Instant) {
     let now = sched::monotonic_ns();
-    let v3 = s.interface.igmp_version(ts) == 3;
+    // Linux runs no IGMP on loopback: it reports V3 in /proc/net/igmp but
+    // nothing is ever queued or sent there.
+    let lo = matches!(s.interface.hardware_addr(), HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 1])));
+    let v3 = s.interface.igmp_version(ts) == 3 && !lo;
     let mut recs: Vec<Rec> = Vec::new();
     let (mut chg, mut rep) = (false, 0usize);
     {

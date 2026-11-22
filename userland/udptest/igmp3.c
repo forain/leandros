@@ -263,8 +263,8 @@ static void igmp3_run(const char *N, void (*child_body)(int, char *)) {
 static void igmp3_reports(void) { igmp3_run("igmp3_reports", i3_reports_child); }
 static void igmp3_query(void) { igmp3_run("igmp3_query", i3_query_child); }
 
-/* /proc/net/igmp shows the version in force: V3 on the NICs (lo stays V2:
- * Linux does not run IGMP on loopback at all). */
+/* /proc/net/igmp shows the version in force: V3 on every interface, lo
+ * included (Linux shows lo as V3 although it runs no IGMP there). */
 static void igmp3_proc(void) {
     const char *N = "igmp3_proc";
     if (skipped(N)) return;
@@ -272,7 +272,11 @@ static void igmp3_proc(void) {
     ssize_t n = f >= 0 ? read(f, b, sizeof b - 1) : -1; if (f >= 0) close(f);
     if (n <= 0) { fail(N, "no /proc/net/igmp"); return; }
     b[n] = 0;
-    if (!strstr(b, "V3")) fail(N, "no interface reports V3: %.80s", b + 60);
+    if (!strstr(b, "V3")) { fail(N, "no interface reports V3: %.80s", b + 60); return; }
+    char *lo = strstr(b, "\tlo ");
+    if (!lo) { fail(N, "no lo line: %.80s", b); return; }
+    char *eol = strchr(lo, '\n'); if (eol) *eol = 0;
+    if (!strstr(lo, "V3")) fail(N, "lo is not V3: %s", lo);
     else pass(N);
 }
 
