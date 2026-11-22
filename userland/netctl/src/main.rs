@@ -41,6 +41,32 @@ fn usage() -> i32 {
     2
 }
 
+fn help() -> i32 {
+    sayln!("usage: netctl [status|ifaces|scan [IF]|bss [IF]|connect [--] SSID [PASS] [--if IF] [--bssid MAC] [--hidden] [--akm A]|connect --uuid UUID|disconnect [IF] [--keep-auto]|up IF|metric IF N|default|radio on|off [IF]|profiles|save [--] SSID [PASS] [--prio N] [--hidden] [--no-auto]|forget [--] SSID|UUID|reload|watch [--no-snapshot] [--for S] [--stamp]]");
+    sayln!("  -h, --help  show this help; use `--` before an SSID that starts with '-'");
+    0
+}
+
+fn is_opt(a: &[u8]) -> bool { a.len() > 1 && a[0] == b'-' }
+
+/// Options that consume the next argument (so `--if -h` is not a help request).
+fn takes_value(a: &[u8]) -> bool {
+    matches!(a, b"--if" | b"--bssid" | b"--uuid" | b"--akm" | b"--prio" | b"--for")
+}
+
+/// True when -h/--help appears as an option (before any `--`).
+unsafe fn wants_help(argc: usize, argv: *const *const u8) -> bool {
+    let mut i = 2;
+    while i < argc {
+        let a = arg(argv, i);
+        if a == b"--" { return false; }
+        if a == b"-h" || a == b"--help" { return true; }
+        if takes_value(a) { i += 1; }
+        i += 1;
+    }
+    false
+}
+
 fn fail(what: &str, e: i32) -> i32 {
     eprintln!("netctl: {}: {} ({})", what, errname(e), e);
     if e == EACCES || e == EPERM {
@@ -195,10 +221,29 @@ unsafe fn connect(argc: usize, argv: *const *const u8) -> i32 {
     let mut ifarg: Option<&[u8]> = None;
     let mut pos = 0;
     let mut akm_set = None;
+    let mut dd = false;
     let mut i = 2;
     while i < argc {
         let a = arg(argv, i);
         match a {
+            b"--" if !dd => dd = true,
+            _ if !dd && is_opt(a) && !matches!(a, b"--if" | b"--bssid" | b"--uuid" | b"--akm" | b"--hidden") => return usage(),
+            _ if dd => match pos {
+                0 => {
+                    if a.is_empty() || a.len() > SSID_MAX { return usage(); }
+                    c.ssid[..a.len()].copy_from_slice(a);
+                    c.ssid_len = a.len() as u8;
+                    c.flags |= connect_flags::INLINE;
+                    pos = 1;
+                }
+                1 => {
+                    if a.len() > SECRET_MAX { return usage(); }
+                    c.secret[..a.len()].copy_from_slice(a);
+                    c.secret_len = a.len() as u16;
+                    pos = 2;
+                }
+                _ => return usage(),
+            },
             b"--if" if i + 1 < argc => { ifarg = Some(arg(argv, i + 1)); i += 1; }
             b"--bssid" if i + 1 < argc => match parse_mac(arg(argv, i + 1)) {
                 Some(m) => { c.bssid = m; c.flags |= connect_flags::BSSID; i += 1; }
@@ -213,6 +258,7 @@ unsafe fn connect(argc: usize, argv: *const *const u8) -> i32 {
                 None => return usage(),
             },
             b"--hidden" => c.flags |= connect_flags::HIDDEN,
+            _ if is_opt(a) => return usage(),
             _ if pos == 0 => {
                 if a.is_empty() || a.len() > SSID_MAX { return usage(); }
                 c.ssid[..a.len()].copy_from_slice(a);
@@ -283,6 +329,7 @@ unsafe fn simple_if_cmd(argc: usize, argv: *const *const u8, radio: Option<bool>
     for i in first..argc {
         match arg(argv, i) {
             b"--keep-auto" if radio.is_none() => keep = true,
+            a if is_opt(a) => return usage(),
             a if ifarg.is_none() => ifarg = Some(a),
             _ => return usage(),
         }
@@ -340,10 +387,16 @@ unsafe fn save(argc: usize, argv: *const *const u8) -> i32 {
     let mut prio = 0i32;
     let mut hidden = false;
     let mut auto = true;
+    let mut dd = false;
     let mut i = 2;
     while i < argc {
         let a = arg(argv, i);
         match a {
+            b"--" if !dd => dd = true,
+            _ if !dd && is_opt(a) && !matches!(a, b"--prio" | b"--hidden" | b"--no-auto") => return usage(),
+            _ if dd && ssid.is_none() => ssid = Some(a),
+            _ if dd && pass.is_empty() => pass = a,
+            _ if dd => return usage(),
             b"--prio" if i + 1 < argc => {
                 let s = arg(argv, i + 1);
                 let (neg, d) = if s.first() == Some(&b'-') { (true, &s[1..]) } else { (false, s) };
@@ -354,6 +407,7 @@ unsafe fn save(argc: usize, argv: *const *const u8) -> i32 {
             }
             b"--hidden" => hidden = true,
             b"--no-auto" => auto = false,
+            _ if is_opt(a) => return usage(),
             _ if ssid.is_none() => ssid = Some(a),
             _ if pass.is_empty() => pass = a,
             _ => return usage(),
@@ -380,8 +434,10 @@ unsafe fn save(argc: usize, argv: *const *const u8) -> i32 {
 }
 
 unsafe fn forget(argc: usize, argv: *const *const u8) -> i32 {
-    if argc != 3 { return usage(); }
-    let key = arg(argv, 2);
+    let k = if argc == 4 && arg(argv, 2) == b"--" { 3 } else { 2 };
+    if argc != k + 1 { return usage(); }
+    let key = arg(argv, k);
+    if k == 2 && is_opt(key) { return usage(); }
     let uuid = util::uuid_from_str(key);
     let n = match open_rw() { Ok(n) => n, Err(e) => return fail("open /dev/netctl for writing", e) };
     let r = with_current(|list, gflags| {
@@ -458,6 +514,13 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     let argc = argc as usize;
     let cmd: &[u8] = if argc >= 2 { arg(argv, 1) } else { b"status" };
     let a2 = if argc >= 3 { Some(arg(argv, 2)) } else { None };
+    if !matches!(cmd, b"-h" | b"--help" | b"help") && wants_help(argc, argv) { return help(); }
+    // Subcommands without options reject anything that looks like one.
+    if matches!(cmd, b"scan" | b"bss" | b"up" | b"metric" | b"reload" | b"profiles" | b"status" | b"ifaces" | b"radio") {
+        let from = if cmd == b"radio" { 3 } else { 2 };
+        for i in from..argc { if is_opt(arg(argv, i)) && !(cmd == b"metric" && i == 3) { return usage(); } }
+    }
+    if cmd.len() > 1 && cmd[0] == b'-' && cmd != b"-h" && cmd != b"--help" { return usage(); }
     match cmd {
         b"status" => status(false),
         b"ifaces" => status(true),
@@ -522,7 +585,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
             }
             watch(snap, secs, stamp)
         }
-        b"-h" | b"--help" | b"help" => { usage(); 0 }
+        b"-h" | b"--help" | b"help" => help(),
         _ => usage(),
     }
 }
