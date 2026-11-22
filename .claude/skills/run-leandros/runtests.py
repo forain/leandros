@@ -646,6 +646,17 @@ def private_images(env, arch):
                 continue
             dst = os.path.join(d, name)
             imgclone.clone_file(src, dst)
+            # No reflink on this fs (ext4 farm): the clone was a multi-GB real copy still dirty
+            # in the page cache; its writeback storm would hit the guest's first reads (seconds
+            # of host I/O latency: f2fsatomictest's long-hold/WDOG gates). Flush before booting.
+            try:
+                fd = os.open(dst, os.O_RDWR)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
             env[var] = dst
             n += 1
     if not n:
