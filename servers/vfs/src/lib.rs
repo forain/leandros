@@ -6991,6 +6991,47 @@ pub fn set_dhcp_dns(servers: &[[u8; 4]]) {
     d.1 = n;
 }
 
+/// IPv6 name servers (RDNSS) and search domains (DNSSL) learned from router advertisements.
+static RA_DNS: Mutex<([[u8; 16]; 3], usize, [u8; 208], usize)> = Mutex::new(([[0; 16]; 3], 0, [0; 208], 0));
+
+/// Record the RDNSS servers / DNSSL domains (space separated) of the router advertisements;
+/// `/etc/resolv.conf` lists them after the DHCP servers (musl reads at most 3 nameservers).
+pub fn set_ra_dns(servers: &[[u8; 16]], search: &[u8]) {
+    let mut d = RA_DNS.lock();
+    let n = servers.len().min(3);
+    d.0[..n].copy_from_slice(&servers[..n]);
+    d.1 = n;
+    let m = search.len().min(208);
+    d.2[..m].copy_from_slice(&search[..m]);
+    d.3 = m;
+}
+
+/// RFC 5952 text of an IPv6 address (longest zero run of 2+ groups compressed).
+fn fmt_v6(a: &[u8; 16], out: &mut alloc::vec::Vec<u8>) {
+    let g: [u16; 8] = core::array::from_fn(|i| u16::from_be_bytes([a[2 * i], a[2 * i + 1]]));
+    let (mut bs, mut bl, mut i) = (0, 0, 0);
+    while i < 8 {
+        if g[i] == 0 {
+            let s = i; while i < 8 && g[i] == 0 { i += 1; }
+            if i - s > bl { bs = s; bl = i - s; }
+        } else { i += 1; }
+    }
+    if bl < 2 { bl = 0; }
+    let hex = b"0123456789abcdef";
+    let mut i = 0;
+    while i < 8 {
+        if bl > 0 && i == bs { out.extend_from_slice(b"::"); i += bl; continue; }
+        if i > 0 && !(bl > 0 && i == bs + bl) { out.push(b':'); }
+        let v = g[i];
+        let mut started = false;
+        for sh in [12, 8, 4, 0] {
+            let n = ((v >> sh) & 0xf) as usize;
+            if n != 0 || started || sh == 0 { out.push(hex[n]); started = true; }
+        }
+        i += 1;
+    }
+}
+
 /// The net server's `/proc/net/<name>` generator (`net_server::procnet`),
 /// registered at its init; 0 until then. A fn pointer, not a call, because
 /// the net server depends on this crate. It takes only net-server locks and
@@ -8066,17 +8107,31 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     // lease, the public resolvers are the fallback.
     if path == b"/etc/resolv.conf" {
         let (list, n) = *DHCP_DNS.lock();
+        let (l6, n6, sdom, ns) = *RA_DNS.lock();
+        let n6 = n6.min(3 - n.min(3));
         let mut p = 0;
-        if n == 0 {
+        if n == 0 && n6 == 0 {
             p = write_lit(buf, p, b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
         } else {
-            p = write_lit(buf, p, b"# from DHCP\n");
+            p = write_lit(buf, p, if n > 0 { b"# from DHCP\n" as &[u8] } else { b"# from RA\n" });
             for a in list[..n].iter() {
                 p = write_lit(buf, p, b"nameserver ");
                 for (i, o) in a.iter().enumerate() {
                     if i > 0 { p = write_lit(buf, p, b"."); }
                     p = write_u32(buf, p, *o as u32);
                 }
+                p = write_lit(buf, p, b"\n");
+            }
+            for a in l6[..n6].iter() {
+                let mut t = alloc::vec::Vec::new();
+                fmt_v6(a, &mut t);
+                p = write_lit(buf, p, b"nameserver ");
+                p = write_lit(buf, p, &t);
+                p = write_lit(buf, p, b"\n");
+            }
+            if ns > 0 {
+                p = write_lit(buf, p, b"search ");
+                p = write_lit(buf, p, &sdom[..ns]);
                 p = write_lit(buf, p, b"\n");
             }
         }
