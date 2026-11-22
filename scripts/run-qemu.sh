@@ -5,6 +5,36 @@
 set -e
 
 OS=$(uname -s)
+
+# Hermetic slirp DNS (Linux hosts). QEMU user-mode networking (libslirp) forwards the guest's
+# DNS queries (10.0.2.3) to the FIRST nameserver in the host /etc/resolv.conf and offers no
+# option to choose another. Behind Tailscale MagicDNS (100.100.100.100) that forwarder is
+# the weak link under load: tailscaled's UDP forwarder intermittently fails ("listen udp4 :0:
+# bind: address already in use"), so the guest sees lost DNS replies (nettest udp_dns_raw /
+# udp_getaddrinfo, udpselftest reply_after_dead, brtest masq/fwd cases, apk "DNS: transient
+# error"). So QEMU runs in a private user+mount namespace (no root needed) whose /etc/resolv.conf
+# lists the host's real upstream resolvers. The guest still resolves through its own resolver
+# code, slirp and a real DNS server: nothing is faked. LEANDROS_SLIRP_RESOLV=<file> picks the
+# file; =host disables this; default = $RESOLV_BACKUP (tailscale's pre-overwrite copy) when
+# the live resolv.conf's first nameserver is a Tailscale 100.64/10 address.
+if [ "$OS" = "Linux" ] && [ -z "${LEANDROS_SLIRP_NS:-}" ] && [ "${LEANDROS_SLIRP_RESOLV:-}" != "host" ]; then
+    _rf="${LEANDROS_SLIRP_RESOLV:-}"
+    if [ -z "$_rf" ]; then
+        _first=$(awk '$1=="nameserver"{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+        case "$_first" in
+            100.100.100.100|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*)
+                for _c in /etc/resolv.pre-tailscale-backup.conf /run/NetworkManager/no-stub-resolv.conf /run/NetworkManager/resolv.conf; do
+                    if [ -r "$_c" ] && grep -q '^nameserver' "$_c" && ! grep -q '^nameserver 100\.' "$_c"; then _rf="$_c"; break; fi
+                done ;;
+        esac
+    fi
+    if [ -n "$_rf" ] && [ -r "$_rf" ] && command -v unshare >/dev/null 2>&1 \
+        && unshare -Urm sh -c 'mount --bind "$1" /etc/resolv.conf' sh "$_rf" 2>/dev/null; then
+        export LEANDROS_SLIRP_NS=1
+        echo "slirp DNS upstream: $(awk '$1=="nameserver"{printf "%s ",$2}' "$_rf") (private resolv.conf $_rf)"
+        exec unshare -Urm sh -c 'mount --bind "$1" /etc/resolv.conf && shift && exec "$@"' sh "$_rf" "$0" "$@"
+    fi
+fi
 HOST_ARCH=$(uname -m)
 BOOT_MODE="uefi"
 ARCH="x86_64"
