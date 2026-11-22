@@ -1540,6 +1540,9 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             if dev_id == DEV_KEYBOARD || dev_kind(dev_id) == DEVKIND_KEYBOARD {
                 note_led_writes(pid, buf_ptr, count as usize);
             }
+            if dev_id >= FIXED_DEVICES && uinput::is_kind(dev_kind(dev_id)) {
+                uinput::ff_write(dev_id, pid, buf_ptr, count as usize);
+            }
             val_reply(count)
         }
         vfs_server::VFS_IOCTL => {
@@ -1694,6 +1697,13 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
                         copy_out(pid, arg_ptr, &buf[..n])
                     } else { zero_out(pid, arg_ptr, size) }
                 }
+                // Force feedback: EVIOCSFF / EVIOCRMFF / EVIOCGEFFECTS. Only a
+                // uinput node has an EV_FF driver (its owner); everything else
+                // reports no effects and ENOSYS, as an input_dev without ff.
+                0x80 | 0x81 | 0x84 if dev_id >= FIXED_DEVICES && uinput::is_kind(dev_kind(dev_id)) =>
+                    uinput::eviocff(dev_id, nr, open_id, pid, arg_ptr),
+                0x84 => { let _ = copy_out(pid, arg_ptr, &0i32.to_ne_bytes()); val_reply(0) }
+                0x80 | 0x81 => err_reply(-38),
                 0xa0 => { // EVIOCSCLOCKID(int) — stored as id+1, applied in `restamp` at read time
                     let mut clk = [0u8; 4];
                     if copy_in(pid, arg_ptr, &mut clk).is_none() { return err_reply(-14); }
@@ -1798,6 +1808,7 @@ pub fn handle(msg: &Message, _caller_pid: u32, _target_port: u32) -> Message {
             // queue so the pool is not held by a process that has exited.
             let open_id = arg(msg, 1) as u32;
             if open_id != 0 && open_id != CONSOLE_OPEN_ID {
+                uinput::ff_flush(open_id);
                 let f = unsafe { arch_interrupt_save() };
                 let mut st = STATE.lock();
                 if let Some(i) = st.find(dev_id as u32, open_id, 0) {
