@@ -1634,6 +1634,42 @@ static void t_fhandle_classes(void)
         if (fd >= 0) close(fd);
         if (mf >= 0) close(mf);
     }
+    /* cgroup2 (kernfs): ids are stable, per-cgroup, decode without a table; a
+     * removed cgroup is ESTALE, a recreated one gets a new id */
+    if (stat("/sys/fs/cgroup", &sb) == 0) {
+        (void)mount("cgroup2", "/sys/fs/cgroup", "cgroup2", 0, NULL);
+        const char *ca = "/sys/fs/cgroup/fhcga", *cb = "/sys/fs/cgroup/fhcgb";
+        rmdir(ca); rmdir(cb);
+        int mk = mkdir(ca, 0755) == 0 && mkdir(cb, 0755) == 0;
+        struct stat sa, sbb; struct fh20 ha, hb2, ha2;
+        memset(&ha, 0, sizeof ha); ha.hb = 20; memset(&hb2, 0, sizeof hb2); hb2.hb = 20;
+        int ra = mk && syscall(FH_N2H, AT_FDCWD, ca, &ha, &mid, 0) == 0;
+        int rb = mk && syscall(FH_N2H, AT_FDCWD, cb, &hb2, &mid, 0) == 0;
+        int mf = open("/sys/fs/cgroup", O_RDONLY | O_DIRECTORY);
+        int sta = ra && stat(ca, &sa) == 0, stb = rb && stat(cb, &sbb) == 0;
+        int idok = sta && stb && sa.st_ino != sbb.st_ino && ha.ino == sa.st_ino && hb2.ino == sbb.st_ino && ha.gen != 0;
+        int fa = (ra && mf >= 0) ? (int)syscall(FH_OPEN, mf, &ha, O_RDONLY) : -1;
+        struct stat so; int dec = fa >= 0 && fstat(fa, &so) == 0 && so.st_ino == sa.st_ino;
+        if (fa >= 0) close(fa);
+        int rd = mk && rmdir(ca) == 0;
+        long gone = (ra && mf >= 0) ? syscall(FH_OPEN, mf, &ha, O_RDONLY) : 0; e = errno;
+        int stl = gone == -1 && e == ESTALE;
+        int mk2 = mkdir(ca, 0755) == 0;
+        memset(&ha2, 0, sizeof ha2); ha2.hb = 20;
+        int rn = mk2 && syscall(FH_N2H, AT_FDCWD, ca, &ha2, &mid, 0) == 0;
+        int fresh = rn && ha2.ino != ha.ino;
+        long old = (ra && mf >= 0) ? syscall(FH_OPEN, mf, &ha, O_RDONLY) : 0; e = errno;
+        int oldstale = old == -1 && e == ESTALE;
+        long okb = (rb && mf >= 0) ? syscall(FH_OPEN, mf, &hb2, O_RDONLY) : -1;
+        int bgood = okb >= 0; if (okb >= 0) close((int)okb);
+        if (!(idok && dec && rd && stl && fresh && oldstale && bgood))
+            printf("  fhandle_cgroup2: mk=%d ra=%d rb=%d id=%d dec=%d rd=%d stale=%d(e=%d) fresh=%d oldstale=%d b=%d\n", mk, ra, rb, idok, dec, rd, stl, e, fresh, oldstale, bgood);
+        report("t_fhandle_cgroup2_distinct", idok);
+        report("t_fhandle_cgroup2_roundtrip", dec && bgood);
+        report("t_fhandle_cgroup2_rmdir_estale", rd && stl && fresh && oldstale);
+        rmdir(ca); rmdir(cb);
+        if (mf >= 0) close(mf);
+    }
     /* f2fs: a wrong i_generation is ESTALE, the right one opens */
     mkdir("/root/fhtest", 0755);
     struct statfs sf; int isf2 = statfs("/root/fhtest", &sf) == 0 && (unsigned long)sf.f_type == 0xF2F52010UL;
