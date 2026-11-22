@@ -82,8 +82,10 @@ LEANDROS_RUN_ID defaults to "runtests" (scopes driver.py's sockets/logs).
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "runtests")
@@ -607,6 +609,7 @@ def host_run(c, timeout, arch=None, scale=1.0):
     env = dict(os.environ)
     if arch:
         env["LEANDROS_TEST_ARCH"] = arch
+    priv = private_images(env, arch) if self_boots(c) else None
     t0 = time.time()
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
@@ -615,6 +618,51 @@ def host_run(c, timeout, arch=None, scale=1.0):
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
+    finally:
+        if priv:
+            shutil.rmtree(priv, ignore_errors=True)
+
+
+def private_images(env, arch):
+    """A self-booting host: suite gets its own copies of the repo's boot image, root
+    image and UEFI NVRAM (reflink/APFS clones, so nearly free). QEMU write-locks every
+    disk and pflash file, and these were the tree's shared ones: a second concurrent
+    suite of the same tree (another shard, another lane run on this box) died in its
+    first second with "Failed to get write lock", no output. Explicit
+    LEANDROS_DISK_IMAGE / LEANDROS_ROOT_IMAGE / LEANDROS_VARS_FD are left alone.
+    Returns the directory to delete afterwards (None when nothing was cloned)."""
+    import imgclone
+    if not arch:
+        return None
+    root = driver.REPO_ROOT
+    d = tempfile.mkdtemp(prefix=f".hsimg-{driver.RUN_ID or 'x'}-", dir=root)
+    n = 0
+    for a in [arch]:
+        for var, name in (("LEANDROS_DISK_IMAGE", f"leandros-limine-{a}.img"),
+                          ("LEANDROS_ROOT_IMAGE", f"f2fs-data0-{a}.img"),
+                          ("LEANDROS_VARS_FD", f"{a}_vars.fd")):
+            src = os.path.join(root, name)
+            if var in env or not os.path.exists(src):
+                continue
+            dst = os.path.join(d, name)
+            imgclone.clone_file(src, dst)
+            # No reflink on this fs (ext4 farm): the clone was a multi-GB real copy still dirty
+            # in the page cache; its writeback storm would hit the guest's first reads (seconds
+            # of host I/O latency: f2fsatomictest's long-hold/WDOG gates). Flush before booting.
+            try:
+                fd = os.open(dst, os.O_RDWR)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+            env[var] = dst
+            n += 1
+    if not n:
+        shutil.rmtree(d, ignore_errors=True)
+        return None
+    return d
 
 
 def boot_and_login(arch, mode, gpu, scale, run):
@@ -800,6 +848,17 @@ def main(argv):
                 else:
                     fcount = "0"
                 print(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s] fails={fcount}", flush=True)
+                if c.startswith("host:"):
+                    # every host suite's stdout+stderr, so a failure that dies in its first second is diagnosable
+                    lname = re.sub(r"[^A-Za-z0-9_.-]+", "_", c[len("host:"):]).strip("_")
+                    os.makedirs(os.path.join(rdir, "logs"), exist_ok=True)
+                    with open(os.path.join(rdir, "logs", f"{lname}.log"), "w") as lf:
+                        lf.write(r["output"])
+                    if not ok:
+                        tail = [l for l in r["output"].splitlines() if l.strip()][-15:]
+                        print("    --- last lines of host:" + c[len("host:"):] + " (full: logs/" + lname + ".log)\n"
+                              + "\n".join("    | " + l for l in tail) if tail else
+                              f"    --- host:{c[len('host:'):]} printed nothing (rc={rc})", flush=True)
                 res.write(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s]\n{r['output']}\n")
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
