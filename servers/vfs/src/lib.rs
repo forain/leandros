@@ -5242,16 +5242,34 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
             if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
             if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
             if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 {
-                let to = sched::link_redirect_take();
+                let taken = sched::link_redirect_take();
                 redirects += 1;
-                match to {
-                    Some(mut t) if p0.is_some() && p1.is_none() && redirects <= 8 => {
-                        t.push(0);
-                        redir = Some(t);
-                        continue;
+                // The path argument now: the original, or the previous redirect.
+                let cur: Option<Vec<u8>> = match (&redir, p0) {
+                    (Some(rp), _) => Some(rp[..rp.len() - 1].to_vec()),
+                    (None, Some((i, _))) => read_cstr_raw(arg(msg, i) as usize)
+                        .map(|(v, l)| normalize_abs_floor(&v[..l], 1)),
+                    _ => None,
+                };
+                let next = match (taken, cur) {
+                    (Some((walked, to)), Some(cur)) if p1.is_none() && redirects <= 8 => {
+                        // cur = <mount prefix> + walked + tail
+                        let mut tail: Option<usize> = None;
+                        let mut idx = 0;
+                        while idx + walked.len() <= cur.len() {
+                            let end = idx + walked.len();
+                            if cur[idx..end] == walked[..] && (end == cur.len() || cur[end] == b'/') {
+                                tail = Some(end); break;
+                            }
+                            idx += 1;
+                        }
+                        tail.map(|end| { let mut n = to.clone(); n.extend_from_slice(&cur[end..]); n })
                     }
-                    Some(_) if redirects > 8 => r = err_reply(-40),
-                    _ => r = err_reply(-2),
+                    _ => None,
+                };
+                match next {
+                    Some(mut n) => { n.push(0); redir = Some(n); continue; }
+                    None => r = err_reply(if redirects > 8 { -40 } else { -2 }),
                 }
             }
             if reply_val(&r) == VFS_ELINKRACE as i64 {

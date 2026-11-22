@@ -7086,7 +7086,7 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                     // resolving it (wrongly) inside this volume.
                     let mut full = target[..tlen].to_vec();
                     full.extend_from_slice(&buf[comp_end..len]);
-                    sched::link_redirect_set(&full);
+                    sched::link_redirect_set(&normalize_volume_path_floor(path, floor), &full);
                     ms.walk_err = sched::LINK_REDIRECT_ERR;
                     return 0;
                 }

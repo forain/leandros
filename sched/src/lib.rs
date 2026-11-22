@@ -9549,19 +9549,24 @@ pub(crate) fn klog_line(args: core::fmt::Arguments) {
 /// absolute path here (keyed by the calling task); the VFS then re-dispatches
 /// the operation on that path (Linux: `/var/run -> /run`).
 pub const LINK_REDIRECT_ERR: i32 = -4101;
-static LINK_REDIRECT: spin::Mutex<alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)>> =
+static LINK_REDIRECT: spin::Mutex<alloc::vec::Vec<(u32, alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)>> =
     spin::Mutex::new(alloc::vec::Vec::new());
 
-pub fn link_redirect_set(path: &[u8]) {
+/// `walked` is the path the server was resolving (a create's parent, say),
+/// `to` where its symlink resolution led; the caller appends whatever tail of
+/// its own path `walked` did not cover.
+pub fn link_redirect_set(walked: &[u8], to: &[u8]) {
     let me = current_pid();
     let mut t = LINK_REDIRECT.lock();
     t.retain(|e| e.0 != me);
-    t.push((me, path.to_vec()));
+    t.push((me, walked.to_vec(), to.to_vec()));
 }
 
-pub fn link_redirect_take() -> Option<alloc::vec::Vec<u8>> {
+/// (walked, to) of this task's pending redirect.
+pub fn link_redirect_take() -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
     let me = current_pid();
     let mut t = LINK_REDIRECT.lock();
     let i = t.iter().position(|e| e.0 == me)?;
-    Some(t.swap_remove(i).1)
+    let e = t.swap_remove(i);
+    Some((e.1, e.2))
 }
