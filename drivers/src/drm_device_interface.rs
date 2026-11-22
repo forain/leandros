@@ -2328,7 +2328,7 @@ pub fn pollfds_text(s: &mut alloc::string::String) {
         OUT_FENCE_REARMS.load(Ordering::Relaxed));
     match OUT_FENCES.try_lock() {
         Some(q) => for &(f, tok) in q.iter() {
-            let _ = writeln!(s, "  out fence={} slot={} retired={}", f, tok, (f <= floor) as u8);
+            let _ = writeln!(s, "  out fence={} slot={} retired={}", f, tok, crate::virtio_gpu::fence_done_lockfree(f) as u8);
         },
         None => { let _ = writeln!(s, "  out_fences busy"); }
     }
@@ -2336,7 +2336,7 @@ pub fn pollfds_text(s: &mut alloc::string::String) {
         Some(a) => for &(oid, cid, lf) in a.iter() {
             if oid == 0 { continue; }
             let _ = writeln!(s, "drm open={} ctx={} last_fence={} retired={} evtag_bit={}", oid, cid, lf,
-                (lf <= floor) as u8, drm_event_poll_tag(oid).trailing_zeros());
+                crate::virtio_gpu::fence_done_lockfree(lf) as u8, drm_event_poll_tag(oid).trailing_zeros());
         },
         None => { let _ = writeln!(s, "drm ctxs busy"); }
     }
@@ -2359,10 +2359,13 @@ pub fn pollfds_text(s: &mut alloc::string::String) {
 // so an fd closed before its fence retires cannot have its slot reused by a
 // stranger who then gets our signal.
 //
-// ORDER. `GPU_FENCE_FLOOR` is the lock-free "everything up to here retired"
-// mark `virtio_gpu` publishes; entries are only ever compared against it, so
-// a fence that retired out of order ahead of an older one signals when the
-// floor passes it — late by one older submission, never early.
+// ORDER. Entries are compared with `virtio_gpu::fence_done_lockfree`, the
+// lock-free "has fence N retired" test: N's own timeline floor (the legacy
+// global one for unringed/2D fences, a per-(context, ring) one for ringed
+// Venus fences) or the published retired-ahead set. A fence that retired out
+// of order ahead of an older one on ITS timeline signals when that timeline's
+// floor passes it, or at once if it is in the retired-ahead set; late by one
+// older submission of the same timeline at most, never early.
 static OUT_FENCES: Mutex<VecDeque<(u64, u64)>> = Mutex::new(VecDeque::new());
 static OUT_FENCES_N: AtomicUsize = AtomicUsize::new(0);
 static OUT_FENCE_SIGNAL: AtomicUsize = AtomicUsize::new(0);
@@ -9539,7 +9542,7 @@ impl DrmDeviceInterface {
                     let busy = e == crate::virtio_gpu::Submit3dErr::Busy;
                     drop(guard);
                     if busy { sched::yield_now("gpu-fence-ceiling"); }
-                    return Err(if busy { DriverError::Errno(11) } else { DriverError::Io });
+                    return Err(if busy { DriverError::Errno(11) } else if e == crate::virtio_gpu::Submit3dErr::BadRing { DriverError::Errno(22) } else { DriverError::Io });
                 }
             }
         };
