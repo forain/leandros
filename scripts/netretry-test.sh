@@ -5,7 +5,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir "$T/bin"; export PATH="$T/bin:$PATH" NET_RETRY_SLEEP=true TMPDIR="$T"
 # fake tool: FAKE_SEQ="6 6 0" = exit codes per call; FAKE_HTTP = status written to -D file on rc 22
-for tool in curl wget git; do
+for tool in curl wget git apk pip; do
 cat > "$T/bin/$tool" <<'F'
 #!/bin/sh
 n=$(cat "$FAKE_CNT" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$FAKE_CNT"
@@ -37,6 +37,17 @@ t "wget rc8 no retry"        net_wget "8 0" 200 "" 8 1
 t "git dns then ok"          net_git "128 0" 200 "fatal: unable to access 'u': Could not resolve host: github.com" 0 2
 t "git auth no retry"        net_git "128 0" 200 "fatal: Authentication failed" 128 1
 t "git 503 then ok"          net_git "128 0" 200 "fatal: unable to access: The requested URL returned error: 503" 0 2
+t "apk dns then ok"          net_apk "99 0" 200 "WARNING: fetching https://x/APKINDEX.tar.gz: DNS: transient error (try again later)" 0 2
+t "apk temp error then ok"   net_apk "99 0" 200 "ERROR: https://x: temporary error (try again later)" 0 2
+t "apk network error: bound" net_apk "99" 200 "ERROR: network error (check Internet connection and firewall)" 99 5
+t "apk unsatisfiable: no retry" net_apk "99 0" 200 "ERROR: unable to select packages: foo (no such package)" 99 1
+t "apk unsatisfiable2: no retry" net_apk "99 0" 200 "ERROR: unsatisfiable constraints: bar-1.0: breaks: world[bar=2]" 99 1
+t "apk bad signature: no retry" net_apk "99 0" 200 "ERROR: UNTRUSTED signature" 99 1
+t "apk success: one call"    net_apk "0" 200 "" 0 1
+t "pip dns then ok"          net_pip "1 0" 200 "WARNING: Retrying: Failed to establish a new connection: [Errno -3] Temporary failure in name resolution" 0 2
+t "pip timeout then ok"      net_pip "1 0" 200 "ReadTimeoutError: HTTPSConnectionPool: Read timed out." 0 2
+t "pip no dist: no retry"    net_pip "1 0" 200 "ERROR: No matching distribution found for nosuchpkg" 1 1
+t "pip 404: no retry"        net_pip "1 0" 200 "ERROR: HTTP error 404 while getting https://x" 1 1
 python3 -I - "$HERE" <<'P' || fail=1
 import sys, urllib.error, socket
 sys.path.insert(0, sys.argv[1])

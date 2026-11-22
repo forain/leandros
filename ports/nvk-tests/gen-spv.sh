@@ -18,6 +18,7 @@ cp "$HERE"/shaders/add.comp "$HERE"/shaders/triangle.vert "$HERE"/shaders/triang
 
 leandros_alpine_run --image "${GPU_BUILD_IMAGE:-alpine:3.21}" -v "$TMP:/w" -- sh -c '
   set -e
+  [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   apk add --no-cache shaderc >/dev/null
   cd /w
   glslc --target-env=vulkan1.0 -O -fshader-stage=compute  -mfmt=c -o add.inc  add.comp

@@ -15,6 +15,7 @@ case "$ARCH" in
 esac
 (
   set -e
+  [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21"; exit 3; }
   PKGS="gstreamer gstreamer-tools gst-plugins-base gst-plugins-good gst-libav gst-plugin-pipewire"
   DEVPKGS="pipewire-dev gstreamer-dev gst-plugins-base-dev glib-dev util-linux-dev pcre2-dev"

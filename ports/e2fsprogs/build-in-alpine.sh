@@ -12,6 +12,7 @@ case "$ARCH" in
 esac
 (
   set -e
+  [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21, got $(cat /etc/alpine-release)"; exit 3; }
   PKGS="e2fsprogs e2fsprogs-extra"
   if [ "$(uname -m)" = "$ARCH" ]; then
@@ -113,7 +114,7 @@ esac
   TARB=/out/e2fsprogs-$E2V.tar.xz
   if [ ! -s "$TARB" ]; then
     apk add --no-cache wget xz ca-certificates >/dev/null
-    wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
+    net_wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
     mv "$TARB.part" "$TARB"
   fi
   apk add --no-cache xz patch make pkgconf linux-headers util-linux-dev >/dev/null

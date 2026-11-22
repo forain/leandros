@@ -41,6 +41,7 @@ case "$ARCH" in
 esac
 (
   set -e
+  [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   [ "$(uname -m)" = "$ARCH" ] || { echo "container is $(uname -m), wanted $ARCH"; exit 3; }
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21, got $(cat /etc/alpine-release)"; exit 3; }
   apk add --no-cache xdg-desktop-portal glib-dev binutils file patchelf build-base
