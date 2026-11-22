@@ -26,10 +26,9 @@ LIMIT_US = 1500  # half the FIFO's 2.8 ms
 PASTE = b"#" + bytes((ord("a") + i % 26) for i in range(199)) + b"\r"
 
 
-def main():
-    arch = os.environ.get("LEANDROS_TEST_ARCH")
+def measure(arch):
+    """One boot: flood + paste, return (match-or-None, output)."""
     ser = driver._Serial()
-    fails = []
     try:
         box = {}
 
@@ -47,20 +46,43 @@ def main():
         r = driver.serial_run("cat /proc/sysstat", timeout=30, arch=arch, ser=ser)
         out = r.get("output", "")
         m = re.search(r"# uart txgap_us (\d+) irqlate_us (\d+) rescued (\d+) overruns (\d+)", out)
-        # txgap_us is wall time between UART FIFO writes: under TCG the host
-        # scheduler/translation stalls dominate it (aarch64 TCG box 1656us, Mac
-        # 10856us, both with 0 overruns), so only KVM guests are held
-        # to the FIFO budget; every guest must still lose no byte (overruns 0).
-        tcg = driver.accel_kind(arch) != "kvm"  # HVF on a shared Mac is as noisy as TCG (9347us seen)
-        # the PL011 gap counter is aarch64-only (x86 reads 0)
-        ok = m is not None and (int(m.group(1)) > 0 or arch != "aarch64") and\
-              (tcg or int(m.group(1)) <= LIMIT_US) and m.group(4) == "0"
-        print(f"uartgap_txgap_bounded: {'PASS' if ok else 'FAIL'} "
-              f"({m.group(0) if m else 'no # uart line: ' + out.strip()[-200:]}, limit {'none (not KVM)' if tcg else LIMIT_US})")
-        if not ok:
-            fails.append("txgap")
+        return m, out
     finally:
         ser.close()
+
+
+def main():
+    arch = os.environ.get("LEANDROS_TEST_ARCH")
+    fails = []
+    # txgap_us is wall time between UART FIFO writes: under TCG the host
+    # scheduler/translation stalls dominate it (aarch64 TCG box 1656us, Mac
+    # 10856us, both with 0 overruns), so only KVM guests are held
+    # to the FIFO budget; every guest must still lose no byte (overruns 0).
+    tcg = driver.accel_kind(arch) != "kvm"  # HVF on a shared Mac is as noisy as TCG (9347us seen)
+    # On KVM a descheduled vCPU inflates txgap (Pi 5: 3/18 runs over the
+    # bound, overruns always 0), so the gate is the MINIMUM over up to 3
+    # boots: a host-noise outlier cannot fail it, a real regression slows all.
+    # overruns 0 gates EVERY boot.
+    samples = []
+    ok = True
+    for attempt in range(3):
+        m, out = measure(arch)
+        # the PL011 gap counter is aarch64-only (x86 reads 0)
+        good = m is not None and (int(m.group(1)) > 0 or arch != "aarch64") and m.group(4) == "0"
+        if not good:
+            ok = False
+            print(f"uartgap_txgap_bounded: FAIL ({m.group(0) if m else 'no # uart line: ' + out.strip()[-200:]})")
+            break
+        samples.append(int(m.group(1)))
+        if tcg or int(m.group(1)) <= LIMIT_US:
+            break
+    if ok:
+        mn = min(samples)
+        ok = tcg or mn <= LIMIT_US
+        print(f"uartgap_txgap_bounded: {'PASS' if ok else 'FAIL'} "
+              f"(txgap min={mn} samples={samples}, overruns 0, limit {'none (not KVM)' if tcg else LIMIT_US})")
+    if not ok:
+        fails.append("txgap")
     print("uartgap", "FAIL" if fails else "PASS")
     return 1 if fails else 0
 
