@@ -90,6 +90,11 @@ pub mod hda {
 pub mod framebuffer;
 pub mod kms;
 pub mod kms_v3d;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
+pub mod hvs_plane;
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
+pub mod v3d_scanout;
+pub mod v3d_class;
 pub mod vector_font;
 pub mod glyphs;
 pub mod wcwidth;
@@ -181,6 +186,9 @@ pub mod bcm2712_otp;
 /// Pi 5 read-only HDMI0/1 boot probe (HDMI vs DVI, pixel clock, audio gate, MAI); rpi5 only.
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod hdmi_probe;
+/// Pi 5 read-only HVS boot probe, opt-in with `hvs.probe=1`; rpi5 only.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub mod hvs_probe;
 pub mod hdmi_audio;
 pub mod hdmi_plat;
 /// Pi 5 Wi-Fi boot bring-up: sdio2 host → firmware → "ver" (rpi5 only).
@@ -268,6 +276,7 @@ pub mod pi5_board;
 pub mod bcm2712_dma40;
 /// Broadcom V3D 7.1 GPU (Pi 5): register map, power-up, MMU. Pure logic
 /// everywhere; the hardware probe is rpi5-only.
+#[cfg(feature = "v3d")]
 pub mod v3d;
 
 /// Block-device trait and types every backend implements (always built).

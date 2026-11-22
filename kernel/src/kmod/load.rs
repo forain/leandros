@@ -84,7 +84,9 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         Err(e) => { log(&alloc::format!("[kmod] {:?} image refused: {:?}\n", src, e)); return Err(KmodErr::Elf(e)); }
     };
     let hdr = plan.hdr;
-    if super::autoload::blacklisted(super::name_str(&hdr.name)) {
+    // modules.blacklist stops boot-time and alias loads only; an explicit finit_module/init_module
+    // from root (kmodctl load) is deliberate and goes through, as with modprobe's blacklist.
+    if !matches!(src, Source::Syscall) && super::autoload::blacklisted(super::name_str(&hdr.name)) {
         log(&alloc::format!("[kmod] {} Blacklisted\n", super::name_str(&hdr.name)));
         return Err(KmodErr::Blacklisted);
     }

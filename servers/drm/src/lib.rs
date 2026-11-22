@@ -523,6 +523,8 @@ pub fn init(owner_pid: u32) -> Option<u32> {
     // `/proc/i915`: GT frequency + activity counters (absent until the i915
     // exec bring-up ran, so nothing appears on QEMU).
     vfs_server::set_proc_i915(drivers::i915::proc_text);
+    // `/proc/v3d_headless[_fb]`: the Pi 5 Headless scanout sink's frame count, CRC and surface.
+    vfs_server::set_proc_v3d_headless(drivers::drm_device_interface::proc_v3d_headless);
     // Throttled page-flip event delivery runs off the 100 Hz tick. This does NOT
     // displace the audio pump (register_tick_hook fills the next free slot).
     sched::register_tick_hook(drivers::drm_device_interface::drm_tick);

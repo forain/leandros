@@ -16,6 +16,7 @@ pub mod blk;
 pub mod ksync;
 pub mod plat;
 pub mod dma40;
+pub mod v3d;
 
 pub mod pci {
     use super::*;

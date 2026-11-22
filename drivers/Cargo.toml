@@ -23,6 +23,8 @@ usb-storage-module = ["usb/msc-module"]
 i915 = []
 virtio-gpu = []
 v3d = []
+# Scanout, KMS plane and DRM-side V3D plumbing: on for V3D=y and V3D=m, off for V3D=n.
+v3d-core = []
 # kmod L1c: misc driver gates (CONFIG_* -> drv-*). Off = stub module, same API.
 drv-virtio-rng = []
 drv-hda = []
