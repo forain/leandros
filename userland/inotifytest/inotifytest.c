@@ -1604,9 +1604,10 @@ static void t_fhandle_classes(void)
     long r = syscall(FH_N2H, AT_FDCWD, "/proc/self/status", &h, &mid, 0); int e = errno;
     report("t_fhandle_proc_eopnotsupp", r == -1 && e == EOPNOTSUPP);
     memset(&h, 0, sizeof h); h.hb = 20;
-    r = syscall(FH_N2H, AT_FDCWD, "/proc/self/status", &h, &mid, FH_AT_HANDLE_FID);
+    r = syscall(FH_N2H, AT_FDCWD, "/proc/version", &h, &mid, FH_AT_HANDLE_FID);
     int pm = open("/proc", O_RDONLY | O_DIRECTORY);
     long o = pm < 0 ? -1 : syscall(FH_OPEN, pm, &h, O_RDONLY); e = errno;
+    if (!(r == 0 && h.hb == 12 && o == -1 && e == EOPNOTSUPP)) printf("  fhandle_proc_fid: r=%ld hb=%u pm=%d o=%ld e=%d\n", r, h.hb, pm, o, e);
     report("t_fhandle_proc_fid_only", r == 0 && h.hb == 12 && o == -1 && e == EOPNOTSUPP);
     if (pm >= 0) close(pm);
     /* devpts, mqueue */
