@@ -401,8 +401,8 @@ needs only `libc.musl-<arch>.so.1`, so it runs in an Alpine root as it is. Neith
 nor npm is involved.
 
 ```sh
-/usr/sbin/claude-code-install   # once, as root: Alpine root /opt/alpine + the pinned release
-claude --version                # any user: 2.1.296 (Claude Code)
+/usr/sbin/claude-code-install   # once, as root: Alpine root /opt/alpine + the latest release (CLAUDE_CODE_VERSION pins one)
+claude --version                # any user: <version> (Claude Code)
 claude                          # the TUI; ~/.claude lives in the caller's real home
 alpine-run tmux                 # any other command of the Alpine root, as the caller
 ```
@@ -411,7 +411,7 @@ alpine-run tmux                 # any other command of the Alpine root, as the c
   - It stages `/opt/alpine` with `alpine-sysroot`. The packages are bash (the CLI's shell),
     curl, ca-certificates, ripgrep (its search tool) and git.
   - It downloads the musl package from `registry.npmjs.org` and checks it against the
-    sha512 that npm publishes for the pinned version.
+    sha512 that npm publishes for the version (the latest unless `CLAUDE_CODE_VERSION` pins one).
   - It unpacks the executable to `/opt/alpine/opt/claude-code/<version>/claude`. A
     *relative* link `usr/local/bin/claude` points at it, so the link resolves the same way
     inside and outside the root.
