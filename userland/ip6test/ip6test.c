@@ -812,6 +812,56 @@ static void test_slaac_addr(void) {
     CHECK("slaac_addr", ok);
 }
 
+/* RDNSS (RFC 8106): slirp's RA carries the v6 resolver; the net server stands in for the
+ * connection manager and lists it in /etc/resolv.conf (after any DHCP v4 servers), exactly the
+ * view NetworkManager/systemd-networkd give a Linux userland. */
+static int resolv_v6(char *out, size_t n) {
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    if (!f) return 0;
+    char b[256]; int found = 0;
+    while (!found && fgets(b, sizeof b, f)) {
+        char a[128];
+        if (sscanf(b, "nameserver %127s", a) == 1 && strchr(a, ':')) { snprintf(out, n, "%s", a); found = 1; }
+    }
+    fclose(f);
+    return found;
+}
+
+static void test_rdnss_resolv(void) {
+    char a[128] = "";
+    int ok = 0;
+    for (int i = 0; i < 100 && !ok; i++) {
+        ok = resolv_v6(a, sizeof a);
+        if (!ok) usleep(100000);
+    }
+    struct in6_addr x;
+    ok = ok && inet_pton(AF_INET6, a, &x) == 1 && !(x.s6_addr[0] == 0xfe && (x.s6_addr[1] & 0xc0) == 0x80);
+    if (!ok) printf("  resolv.conf v6 nameserver: '%s'\n", a);
+    CHECK("rdnss_resolv", ok);
+}
+
+/* The RDNSS server answers: a DNS query over v6 UDP gets a reply with our id (any rcode). */
+static void test_rdnss_query(void) {
+    char a[128] = "";
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d);
+    int ok = resolv_v6(a, sizeof a) && inet_pton(AF_INET6, a, &d.sin6_addr) == 1;
+    int s = ok ? socket(AF_INET6, SOCK_DGRAM, 0) : -1;
+    if (s < 0) { CHECK("rdnss_query", 0); return; }
+    d.sin6_family = AF_INET6; d.sin6_port = htons(53);
+    tmo(s, 3);
+    unsigned char q[] = {0x4b, 0x1d, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                         7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1};
+    unsigned char r[512];
+    ok = 0;
+    for (int i = 0; i < 3 && !ok; i++) {
+        if (sendto(s, q, sizeof q, 0, (struct sockaddr *)&d, sizeof d) < 0) break;
+        ssize_t n = recv(s, r, sizeof r, 0);
+        ok = n >= 12 && r[0] == 0x4b && r[1] == 0x1d && (r[2] & 0x80);
+    }
+    close(s);
+    CHECK("rdnss_query", ok);
+}
+
 static void test_ping6_global(void) {
     int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
     if (s < 0) { CHECK("ping6_global", 0); return; }
@@ -1060,6 +1110,8 @@ int main(int argc, char **argv) {
     test_ll_present();
     test_ping6_ll_router();
     test_slaac_addr();
+    test_rdnss_resolv();
+    test_rdnss_query();
     test_ping6_global();
     test_ping6_own_global();
     test_ll_noscope();
