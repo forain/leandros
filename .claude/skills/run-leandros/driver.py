@@ -381,11 +381,14 @@ def _pick_vnc_port():
     _release_vnc_pick() (after QEMU has bound it), so two starts cannot choose
     the same port."""
     global VENUS_VNC_PORT, VENUS_VNC_ADDR, _VNC_PICK_LOCK
-    if VNC_EXPLICIT:
-        return
     import fcntl
+    # Taken even with an explicit VNC port: the same host-wide lock also serializes the
+    # ssh hostfwd port pick (_ssh_host_port probes "free", QEMU binds later), so two
+    # starts on this box cannot choose one port and have the second QEMU die at once.
     _VNC_PICK_LOCK = open("/tmp/leandros-vnc-pick.lock", "w")
     fcntl.flock(_VNC_PICK_LOCK, fcntl.LOCK_EX)
+    if VNC_EXPLICIT:
+        return
     for p in range(VENUS_VNC_PORT, VENUS_VNC_PORT + 200):
         if _vnc_port_free(p):
             VENUS_VNC_PORT = p
@@ -406,6 +409,14 @@ def _release_vnc_pick(wait_bind=True):
         deadline = time.time() + 5
         while wait_bind and _vnc_port_free(VENUS_VNC_PORT) and time.time() < deadline:
             time.sleep(0.1)
+        try:  # the ssh hostfwd listener must exist before the next start probes ports
+            with open(SSH_STATE_FILE) as f:
+                h, sp = f.read().split()[:2]
+            deadline = time.time() + 5
+            while h == "127.0.0.1" and _port_free(int(sp)) and time.time() < deadline:
+                time.sleep(0.1)
+        except (OSError, ValueError):
+            pass
         _VNC_PICK_LOCK.close()
         _VNC_PICK_LOCK = None
 
@@ -1042,7 +1053,9 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         # ever binds — which used to make `start` report a launched guest
         # against a 0-byte serial log instead of failing (see cmd_start's
         # poll() check).
-        vars_fd = os.path.join(REPO_ROOT, "aarch64_vars.fd")
+        # LEANDROS_VARS_FD: a private NVRAM copy (runtests' host: suites; QEMU write-locks
+        # the file, so two VMs of one tree cannot share aarch64_vars.fd).
+        vars_fd = os.environ.get("LEANDROS_VARS_FD") or os.path.join(REPO_ROOT, "aarch64_vars.fd")
         if not os.path.exists(vars_fd):
             vars_tpl = _find_fw(AARCH64_VARS_PATHS)
             if not vars_tpl:
@@ -1108,7 +1121,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         if "CODE" in os.path.basename(fw):
             vars_tpl = _find_fw(X86_64_VARS_PATHS)
             if vars_tpl:
-                vars_fd = os.path.join(REPO_ROOT, "x86_64_vars.fd")
+                vars_fd = os.environ.get("LEANDROS_VARS_FD") or os.path.join(REPO_ROOT, "x86_64_vars.fd")
                 if not os.path.exists(vars_fd):
                     shutil.copyfile(vars_tpl, vars_fd)
                 vars_args = ["-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}"]
