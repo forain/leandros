@@ -4514,6 +4514,7 @@ static RAMFS: &[RamEntry] = &[
     RamEntry { path: b"/proc/net/tcp6",  data: b"" },
     RamEntry { path: b"/proc/net/if_inet6", data: b"" },
     RamEntry { path: b"/proc/net/ipv6_route", data: b"" },
+    RamEntry { path: b"/proc/net/dhcp6", data: b"" },
     RamEntry { path: b"/proc/net/udp6",  data: b"" },
     RamEntry { path: b"/proc/net/raw",   data: b"" },
     RamEntry { path: b"/proc/net/raw6",  data: b"" },
@@ -6993,13 +6994,21 @@ pub fn set_dhcp_dns(servers: &[[u8; 4]]) {
 
 /// IPv6 name servers (RDNSS) and search domains (DNSSL) learned from router advertisements.
 static RA_DNS: Mutex<([[u8; 16]; 3], usize, [u8; 208], usize)> = Mutex::new(([[0; 16]; 3], 0, [0; 208], 0));
+/// Interface name (NUL padded) scoping each RA/DHCPv6 server of `RA_DNS`; empty for a global one.
+static RA_SCOPE: Mutex<[[u8; 16]; 3]> = Mutex::new([[0; 16]; 3]);
 
 /// Record the RDNSS servers / DNSSL domains (space separated) of the router advertisements;
 /// `/etc/resolv.conf` lists them after the DHCP servers (musl reads at most 3 nameservers).
-pub fn set_ra_dns(servers: &[[u8; 16]], search: &[u8]) {
+pub fn set_ra_dns(servers: &[([u8; 16], &[u8])], search: &[u8]) {
     let mut d = RA_DNS.lock();
+    let mut sc = RA_SCOPE.lock();
     let n = servers.len().min(3);
-    d.0[..n].copy_from_slice(&servers[..n]);
+    for (i, (a, scope)) in servers[..n].iter().enumerate() {
+        d.0[i] = *a;
+        sc[i] = [0; 16];
+        let m = scope.len().min(15);
+        sc[i][..m].copy_from_slice(&scope[..m]);
+    }
     d.1 = n;
     let m = search.len().min(208);
     d.2[..m].copy_from_slice(&search[..m]);
@@ -8108,6 +8117,7 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
     if path == b"/etc/resolv.conf" {
         let (list, n) = *DHCP_DNS.lock();
         let (l6, n6, sdom, ns) = *RA_DNS.lock();
+        let scopes = *RA_SCOPE.lock();
         let n6 = n6.min(3 - n.min(3));
         let mut p = 0;
         if n == 0 && n6 == 0 {
@@ -8122,9 +8132,13 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
                 }
                 p = write_lit(buf, p, b"\n");
             }
-            for a in l6[..n6].iter() {
+            for (i, a) in l6[..n6].iter().enumerate() {
                 let mut t = alloc::vec::Vec::new();
                 fmt_v6(a, &mut t);
+                // A link-local server is only reachable through its interface: `addr%ifname`.
+                let sc = &scopes[i];
+                let sl = sc.iter().position(|&b| b == 0).unwrap_or(16);
+                if sl > 0 { t.push(b'%'); t.extend_from_slice(&sc[..sl]); }
                 p = write_lit(buf, p, b"nameserver ");
                 p = write_lit(buf, p, &t);
                 p = write_lit(buf, p, b"\n");

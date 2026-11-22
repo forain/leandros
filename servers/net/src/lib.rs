@@ -13,6 +13,7 @@ mod nlsock;
 mod nfnl;
 mod iface;
 mod ip6;
+mod dhcp6;
 mod vifsel;
 mod vif;
 pub mod tundev;
@@ -3141,6 +3142,7 @@ impl<'a> smoltcp::phy::Device for NicDevice {
         // This host's own multicast and broadcast first (see "Local copies").
         if let Some(f) = take_injected(self.netif.id) {
             self.batch += 1;
+            if f.len() >= 78 && f[12] == 0x86 && f[13] == 0xdd { ip6::dad_snoop(self.netif.id, &f[14..]); }
             return Some((RxToken { buf: f }, TxToken { netif: self.netif }));
         }
         let mut buf = [0u8; 2048];
@@ -3151,6 +3153,9 @@ impl<'a> smoltcp::phy::Device for NicDevice {
             stats.rx(len);
             if len >= 14 {
                 let eth_proto = u16::from_be_bytes([buf[12], buf[13]]);
+                // A tentative address is not in the stack yet, so smoltcp drops the DAD probe another
+                // node sends for it (solicited-node group not joined): look at it here.
+                if eth_proto == 0x86dd && len >= 78 { ip6::dad_snoop(self.netif.id, &buf[14..len]); }
                 if eth_proto == 0x0800 {
                     if len >= 34 {
                         let proto = buf[23];
@@ -3456,6 +3461,15 @@ fn loop_frame(s: &NetStack, src: IpAddress, sport: u16, dst: IpEndpoint, ttl: u8
 }
 
 /// Queue `frame` for stack `sid`'s receive side and wake the daemon.
+/// Test knob (root-only SIOCDEVPRIVATE ioctl): hand `frame` to NIC `nic`'s receive side as if it
+/// came off the wire. The guest has no other way to play a peer on the NIC's link (a router
+/// advertisement, a DHCPv6 server, a duplicate address). False for a NIC that does not exist.
+pub fn inject_test_frame(nic: u8, frame: alloc::vec::Vec<u8>) -> bool {
+    if frame.len() < 14 || drivers::netdev::get(nic as usize).is_none() { return false; }
+    inject_frame(nic as Sid + 1, frame);
+    true
+}
+
 fn inject_frame(sid: Sid, frame: alloc::vec::Vec<u8>) {
     if sid == LO {
         // The loopback stack's own device: the frame is received on its next poll.

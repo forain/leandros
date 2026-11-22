@@ -145,6 +145,13 @@ pub(crate) fn sync(nif: netdev::Netif, admin_down: bool) {
 
 /// `/proc/net/if_inet6`: `addr ifindex prefixlen scope flags name`, hex.
 pub(crate) fn proc_if_inet6(out: &mut impl Write) {
+    // A task in another netns sees that netns's own links (its lo and vifs), not the NICs.
+    let ns = sched::ns::netns_of(sched::current_pid() as u32);
+    if ns != 0 {
+        if !lo_addrs6(ns).is_empty() { let _ = writeln!(out, "00000000000000000000000000000001 01 80 10 80       lo"); }
+        crate::tunbe::proc_if_inet6(out, ns);
+        return;
+    }
     let _ = writeln!(out, "00000000000000000000000000000001 01 80 10 80       lo");
     for nif in netdev::iter() {
         let Some(a) = ll_cfg(nif.id) else { continue };
@@ -154,6 +161,10 @@ pub(crate) fn proc_if_inet6(out: &mut impl Write) {
             for b in g { let _ = write!(out, "{:02x}", b); }
             let _ = writeln!(out, " {:02x} 40 00 {:02x} {:>8}", nif.id as u32 + 2, 0x80 | dad_flags(nif.id, &g), nif.name());
         }
+        if let Some(g) = crate::dhcp6::addr_of(nif.id) {
+            for b in g { let _ = write!(out, "{:02x}", b); }
+            let _ = writeln!(out, " {:02x} 80 00 80 {:>8}", nif.id as u32 + 2, nif.name());
+        }
     }
     for &(idx, a, p) in STATIC_A.lock().iter() {
         let name = if idx == 1 { alloc::string::String::from("lo") } else { nic_of(idx).map(|n| alloc::string::String::from(n.name())).unwrap_or_default() };
@@ -161,7 +172,7 @@ pub(crate) fn proc_if_inet6(out: &mut impl Write) {
         for b in a { let _ = write!(out, "{:02x}", b); }
         let _ = writeln!(out, " {:02x} {:02x} {:02x} {:02x} {:>8}", idx, p, if is_link_local(&a) { 0x20 } else { 0 }, fl, name);
     }
-    crate::tunbe::proc_if_inet6(out);
+    crate::tunbe::proc_if_inet6(out, 0);
 }
 
 // ── Duplicate address detection (RFC 4862) of the NIC addresses ──────────────
@@ -234,6 +245,12 @@ fn dad_rx(id: u8, ip: &[u8]) -> bool {
     let mut hit = false;
     for d in NDAD.lock().iter_mut().filter(|d| d.id == id && d.addr == t && d.st != DadSt::Failed) { d.st = DadSt::Failed; hit = true; }
     hit
+}
+
+/// A received IPv6 packet (`ip` = past the Ethernet header) that is another node's DAD probe (a NS
+/// from `::`) for a pending address of NIC `id`: that address failed.
+pub(crate) fn dad_snoop(id: u8, ip: &[u8]) {
+    if ip.len() >= 64 && ip[0] >> 4 == 6 && ip[6] == 58 && ip[40] == 135 && ip[8..24].iter().all(|&b| b == 0) { dad_rx(id, ip); }
 }
 
 /// One DAD step for NIC `id` (its stack lock held): probes due, addresses that passed.
@@ -346,7 +363,7 @@ fn rdnss_update(id: usize, life: u32, addrs: &[[u8; 16]], now: u64) -> bool {
     let mut t = RDNSS.lock();
     let mut ch = false;
     for a in addrs {
-        if is_link_local(a) || *a == [0; 16] { continue; }
+        if a[0] == 0xff || *a == [0; 16] { continue; } // link-local ones are listed `addr%ifname`
         let pos = t.iter().position(|e| e.0 == id && e.1 == *a);
         match (pos, life) {
             (Some(i), 0) => { t.remove(i); ch = true; }
@@ -387,18 +404,27 @@ fn dns_next(id: usize) -> Option<u64> {
     RDNSS.lock().iter().filter(|e| e.0 == id).map(|e| e.2)
         .chain(DNSSL.lock().iter().filter(|e| e.0 == id).map(|e| e.2)).filter(|&e| e != ONE_SHOT).min()
 }
-/// Hand the merged v6 resolver state to /etc/resolv.conf.
-fn dns_publish() {
-    let mut servers: Vec<[u8; 16]> = Vec::new();
-    for e in RDNSS.lock().iter() { if !servers.contains(&e.1) { servers.push(e.1); } }
+/// Hand the merged v6 resolver state (RDNSS, then DHCPv6) to /etc/resolv.conf. A link-local
+/// server carries its interface as the scope (`fe80::1%eth0`, as NetworkManager writes it).
+pub(crate) fn dns_publish() {
+    let mut servers: Vec<([u8; 16], alloc::string::String)> = Vec::new();
+    let mut add = |id: usize, a: [u8; 16]| {
+        let scope = if is_link_local(&a) { alloc::string::String::from(nic_name(id)) } else { alloc::string::String::new() };
+        if !servers.iter().any(|e| e.0 == a && e.1 == scope) { servers.push((a, scope)); }
+    };
+    for e in RDNSS.lock().iter() { add(e.0, e.1); }
+    for (id, a) in crate::dhcp6::servers() { add(id, a); }
+    let sv: Vec<([u8; 16], &[u8])> = servers.iter().map(|e| (e.0, e.1.as_bytes())).collect();
     let mut search: Vec<u8> = Vec::new();
-    for e in DNSSL.lock().iter() {
-        if search.split(|&b| b == b' ').any(|w| w == &e.1[..]) { continue; }
-        if search.len() + e.1.len() + 1 > 200 { break; }
+    let mut doms: Vec<Vec<u8>> = DNSSL.lock().iter().map(|e| e.1.clone()).collect();
+    doms.extend(crate::dhcp6::domains());
+    for d in doms.iter() {
+        if search.split(|&b| b == b' ').any(|w| w == &d[..]) { continue; }
+        if search.len() + d.len() + 1 > 200 { break; }
         if !search.is_empty() { search.push(b' '); }
-        search.extend_from_slice(&e.1);
+        search.extend_from_slice(d);
     }
-    vfs::set_ra_dns(&servers, &search);
+    vfs::set_ra_dns(&sv, &search);
 }
 
 static RA_SEEN: Mutex<[bool; MAX_NETIF]> = Mutex::new([false; MAX_NETIF]);
@@ -414,6 +440,7 @@ pub(crate) fn attach(id: u8, set: &mut smoltcp::iface::SocketSet<'static>) {
     let h = set.add(raw::Socket::new(IpVersion::Ipv6, IpProtocol::Icmpv6, rx, tx));
     RAW.lock()[id as usize] = Some(h);
     SLAAC.lock()[id as usize] = Slaac::NONE;
+    crate::dhcp6::attach(id, set);
 }
 
 fn csum6(src: &[u8; 16], dst: &[u8; 16], p: &[u8]) -> u16 {
@@ -448,6 +475,7 @@ fn life(secs: u32, now: u64) -> u64 { if secs == u32::MAX { ONE_SHOT } else { no
 fn withdraw(id: usize, s: &mut crate::NetStack) {
     let st = core::mem::replace(&mut SLAAC.lock()[id], Slaac::NONE);
     RA_MTU.lock()[id] = 0;
+    crate::dhcp6::reset(id, s);
     if dns_expire(id, 0, true) { dns_publish(); }
     let sid = iface::sid_of(id as u8);
     if let Some((a, _)) = st.addr {
@@ -471,6 +499,7 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
     let icmp = &ip[40..];
     if icmp[0] != 134 || icmp[1] != 0 || !is_link_local(&src) { return; }
     RA_SEEN.lock()[id] = true;
+    crate::dhcp6::ra_flags(id, icmp[5], now);
     let sid = iface::sid_of(id as u8);
     let rlife = u16::from_be_bytes([icmp[6], icmp[7]]) as u32;
     let iid: [u8; 8] = match LL.lock()[id] { Some(l) => l[8..16].try_into().unwrap(), None => return };
@@ -572,7 +601,8 @@ pub(crate) fn slaac_pass(nif: netdev::Netif, s: &mut crate::NetStack, admin_down
     for p in &pkts { dad_rx(nif.id, p); }
     let dad = dad_pass(nif, s, h, now);
     let rs = slaac_inner(nif, s, admin_down, now, h, &pkts);
-    match (dad, rs) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) }
+    let d6 = crate::dhcp6::pass(nif, s, now);
+    [dad, rs, d6].into_iter().flatten().min()
 }
 
 fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, now: u64, h: SocketHandle, pkts: &[Vec<u8>]) -> Option<u64> {
@@ -675,6 +705,7 @@ pub(crate) fn addrs6() -> Vec<A6> {
         let idx = nif.id as u32 + 2;
         if let Some(a) = ll_cfg(nif.id) { v.push(A6 { index: idx, addr: a, prefix: 64, scope: 253, flags: 0x80 | dad_flags(nif.id, &a) }); }
         if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr { v.push(A6 { index: idx, addr: g, prefix: 64, scope: 0, flags: 0x80 | dad_flags(nif.id, &g) }); }
+        if let Some(g) = crate::dhcp6::addr_of(nif.id) { v.push(A6 { index: idx, addr: g, prefix: 128, scope: 0, flags: 0x80 }); }
     }
     for &(idx, a, p) in STATIC_A.lock().iter() { v.push(A6 { index: idx, addr: a, prefix: p, scope: scope_of(&a), flags: 0x80 | nic_of(idx).map_or(0, |n| dad_flags(n.id, &a)) }); }
     v

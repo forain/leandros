@@ -12850,6 +12850,19 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         return if sched::uaccess::write_user(arg, n.min(i32::MAX as isize) as i32) { 0 } else { -14 };
     }
 
+    // SIOCDEVPRIVATE: root-only test knob, `{ u32 ifindex; u32 len; u8 frame[len] }` is received by
+    // that NIC as if it came off the wire (a peer for RA / DHCPv6 / DAD tests).
+    if cmd == 0x89f0 && fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
+        if !sched::caps::ns_capable_in(sched::ns::owner_userns(2, 0), 12) { return -1; }
+        let (idx, len) = match (sched::uaccess::read_user::<u32>(arg), sched::uaccess::read_user::<u32>(arg + 4)) {
+            (Some(i), Some(l)) => (i, l as usize), _ => return -14,
+        };
+        if len == 0 || len > 1600 || idx < 2 || !validate_user_buf(arg + 8, len) { return -22; }
+        let mut f = alloc::vec![0u8; len];
+        if unsafe { sched::uaccess::copy_raw(f.as_mut_ptr(), (arg + 8) as *const u8, len) } != 0 { return -14; }
+        return if net_server::inject_test_frame((idx - 2) as u8, f) { 0 } else { -19 };
+    }
+
     // SIOCGIF* (getifaddrs' ioctl fallback, if_nameindex, if_indextoname,
     // nICEr's SIOCGIFFLAGS): answered from the net server's interface table
     // (`net_server::rtnetlink`). The user buffers are copied with no lock held.
