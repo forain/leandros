@@ -54,3 +54,4 @@ ports/gstreamer/out/
 /build/
 # Alpine appstream snapshot (ports/appstream-alpine/build.sh).
 ports/appstream-alpine/out/
+ports/libflatpak/out/
