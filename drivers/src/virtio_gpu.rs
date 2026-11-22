@@ -590,6 +590,29 @@ pub static LAST_PRESENT_FENCE: core::sync::atomic::AtomicU64 = core::sync::atomi
 /// runs from the tick and must not take `VIRTIO_GPU`.
 pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Lock-free mirror of `VirtioGpuDevice::fences_ahead` (fences retired ahead
+/// of an older unretired one), slot for slot. Lets the DRM layer retire an
+/// out-of-order fence without waiting for the global floor (design venusasync
+/// part C). Slots past `AHEAD_PUB_N` are not mirrored (such a fence waits for
+/// the floor, as before).
+const AHEAD_PUB_N: usize = 1024;
+static AHEAD_PUB: [core::sync::atomic::AtomicU64; AHEAD_PUB_N] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; AHEAD_PUB_N];
+
+/// Whether fence `id` has retired, without `VIRTIO_GPU`: `id <= floor` or
+/// published retired-ahead. The slots are scanned BEFORE the floor is read:
+/// a slot is cleared only after the floor covering it was stored, so a miss
+/// in the slots followed by the floor load never loses a retirement.
+pub fn fence_done_lockfree(id: u64) -> bool {
+    use core::sync::atomic::Ordering::{Acquire, SeqCst};
+    if id == 0 { return true; }
+    for a in AHEAD_PUB.iter() {
+        if a.load(Acquire) == id { return true; }
+    }
+    core::sync::atomic::fence(SeqCst);
+    id <= GPU_FENCE_FLOOR.load(Acquire)
+}
+
 /// Fence watchdog (`VirtioGpuDevice::fence_watchdog`): fenced work pending
 /// with no fence answered for this long means the host GPU is hung or lost.
 /// Linux's DRM scheduler job timeout is the same 10 s.
@@ -775,7 +798,7 @@ pub static CTRLQ_IRQS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 #[no_mangle]
 pub extern "C" fn virtio_gpu_msix_isr() {
     CTRLQ_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if !ctrlq_tick() { CTRLQ_ISR_LOCK_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed); kick_waiting_cpus(); }
+    if !ctrlq_tick_isr() { CTRLQ_ISR_LOCK_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed); kick_waiting_cpus(); }
 }
 
 /// `crate::irq` handler shape around [`virtio_gpu_msix_isr`].
@@ -822,7 +845,7 @@ extern "C" fn virtio_gpu_intx_isr(_ctx: usize) -> crate::irq::IrqReturn {
         if CTRLQ_IRQS.fetch_add(1, Relaxed) == 0 {
             crate::pci::serial_debug("[GPU] INTx: first control-queue completion interrupt\n");
         }
-        if !ctrlq_tick() { CTRLQ_ISR_LOCK_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed); kick_waiting_cpus(); }
+        if !ctrlq_tick_isr() { CTRLQ_ISR_LOCK_LOST.fetch_add(1, core::sync::atomic::Ordering::Relaxed); kick_waiting_cpus(); }
     }
     crate::irq::IrqReturn::Handled
 }
@@ -870,11 +893,19 @@ pub fn set_fence_event_hook(f: fn() -> bool) {
 /// Called from `drm_device_interface::drm_tick`. Returns false when the device
 /// lock was busy and nothing could be reaped: the completion interrupt then
 /// kicks every waiting CPU so each reaps for itself (`kick_waiting_cpus`).
+/// Completion-ISR entry: announce "a reap is owed" before the try_lock, so a
+/// holder releasing after our failed try_lock finishes the job (`GpuGuard::drop`).
+pub fn ctrlq_tick_isr() -> bool {
+    CTRLQ_IRQ_DEFERRED.swap(true, core::sync::atomic::Ordering::SeqCst);
+    ctrlq_tick()
+}
+
 pub fn ctrlq_tick() -> bool {
-    use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    use core::sync::atomic::Ordering::Release;
     let mut reaped = false;
     if let Some(mut g) = VIRTIO_GPU.try_lock() {
         reaped = true;
+        CTRLQ_IRQ_DEFERRED.store(false, core::sync::atomic::Ordering::SeqCst);
         if let Some(gpu) = g.as_mut() {
             if gpu.ctrlq_reap(false) { FENCE_EVENT_PENDING.store(true, Release); }
             if gpu.hold_poll(crate::snd::monotonic_us()) { FENCE_EVENT_PENDING.store(true, Release); }
@@ -883,6 +914,13 @@ pub fn ctrlq_tick() -> bool {
             }
         }
     }
+    fence_event_run();
+    reaped
+}
+
+/// Pay a pending fence notification (the DRM layer's hook). No device lock.
+fn fence_event_run() {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
     if FENCE_EVENT_PENDING.swap(false, AcqRel) {
         let p = FENCE_EVENT_HOOK.load(Acquire);
         if p != 0 {
@@ -896,7 +934,6 @@ pub fn ctrlq_tick() -> bool {
             }
         }
     }
-    reaped
 }
 
 
@@ -1828,6 +1865,9 @@ impl VirtioGpuDevice {
                     Some(i) => {
                         self.fences_ahead[i] = 0;
                         self.fence_floor = next;
+                        // Floor first, mirror slot cleared after (see `fence_done_lockfree`).
+                        GPU_FENCE_FLOOR.store(next, core::sync::atomic::Ordering::Release);
+                        if i < AHEAD_PUB_N { AHEAD_PUB[i].store(0, core::sync::atomic::Ordering::Release); }
                         if let Some(&t) = self.fences_ahead_t.get(i) { HOL_LAT.record(now.saturating_sub(t)); }
                     }
                     None => break,
@@ -1835,6 +1875,7 @@ impl VirtioGpuDevice {
             }
         } else if let Some(i) = self.fences_ahead.iter().position(|&f| f == 0) {
             self.fences_ahead[i] = id;
+            if i < AHEAD_PUB_N { AHEAD_PUB[i].store(id, core::sync::atomic::Ordering::Release); }
             if let Some(t) = self.fences_ahead_t.get_mut(i) { *t = now; }
             FENCES_RETIRED_AHEAD.fetch_add(1, Relaxed);
         } else {
@@ -3824,7 +3865,7 @@ impl GpuSync for VirtioGpuDevice {
 /// the device for everything else. Obtain with `lock_gpu`, which returns
 /// `None` when there is no device.
 pub struct GpuLocked {
-    guard: Option<sched::lockwatch::TrackedGuard<'static, Option<VirtioGpuDevice>>>,
+    guard: Option<GpuGuard>,
 }
 
 /// Lock the device for a caller that may issue synchronous commands; see
@@ -3869,8 +3910,63 @@ impl GpuSync for GpuLocked {
     }
 }
 
-pub static VIRTIO_GPU: sched::lockwatch::TrackedMutex<Option<VirtioGpuDevice>> =
-    sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_VIRTIO_GPU, None);
+pub static VIRTIO_GPU: GpuMutex =
+    GpuMutex(sched::lockwatch::TrackedMutex::new(sched::lockwatch::L_VIRTIO_GPU, None));
+
+/// `VIRTIO_GPU`: a `TrackedMutex` whose guard, once the lock is RELEASED,
+/// finishes the completion work an interrupt could not (design venusasync
+/// part B; Linux's `dequeue_ctrlq` takes the lock in process context so a
+/// completion is never lost, here the unlocking task plays that part).
+pub struct GpuMutex(sched::lockwatch::TrackedMutex<Option<VirtioGpuDevice>>);
+
+pub struct GpuGuard {
+    g: core::mem::ManuallyDrop<sched::lockwatch::TrackedGuard<'static, Option<VirtioGpuDevice>>>,
+}
+
+/// Set (SeqCst RMW) by the completion ISR BEFORE it tries the lock; cleared
+/// by whoever then reaps. A holder that releases after the ISR's failed
+/// try_lock therefore sees it in `GpuGuard::drop`.
+static CTRLQ_IRQ_DEFERRED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Completions paid by an unlocking task instead of the 100 Hz tick.
+pub static CTRLQ_UNLOCK_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+impl GpuMutex {
+    #[track_caller]
+    #[inline]
+    pub fn lock(&'static self) -> GpuGuard {
+        GpuGuard { g: core::mem::ManuallyDrop::new(self.0.lock()) }
+    }
+    #[inline]
+    pub fn try_lock(&'static self) -> Option<GpuGuard> {
+        self.0.try_lock().map(|g| GpuGuard { g: core::mem::ManuallyDrop::new(g) })
+    }
+}
+
+impl core::ops::Deref for GpuGuard {
+    type Target = Option<VirtioGpuDevice>;
+    #[inline]
+    fn deref(&self) -> &Self::Target { &**self.g }
+}
+impl core::ops::DerefMut for GpuGuard {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut **self.g }
+}
+
+impl Drop for GpuGuard {
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering::{Relaxed, SeqCst};
+        // SAFETY: dropped exactly once, here.
+        unsafe { core::mem::ManuallyDrop::drop(&mut self.g); }
+        // Lock released. Flags were set before release (ISR / reaps), read after.
+        if CTRLQ_IRQ_DEFERRED.swap(false, SeqCst) {
+            CTRLQ_UNLOCK_DRAINS.fetch_add(1, Relaxed);
+            ctrlq_tick();
+        } else if FENCE_EVENT_PENDING.load(Relaxed) {
+            CTRLQ_UNLOCK_DRAINS.fetch_add(1, Relaxed);
+            fence_event_run();
+        }
+    }
+}
 
 /// Whether the host negotiated `VIRTIO_GPU_F_VIRGL`, readable without taking
 /// [`VIRTIO_GPU`].
