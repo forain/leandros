@@ -9518,6 +9518,8 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         flags
     };
     let mut path = &pbuf[..plen];
+    // open of the /var/run symlink itself lists /run (see read_cstr_raw).
+    if path == b"/var/run" { path = b"/run"; }
 
     // Basic normalization: . to /, strip trailing slash
     if path == b"." {
@@ -13341,7 +13343,18 @@ fn read_cstr_raw(ptr: usize) -> Option<(Vec<u8>, usize)> {
     let mut len = 0usize;
     while len < HOST_PATH_MAX {
         if unsafe { *p.add(len) } == 0 {
-            let v = unsafe { core::slice::from_raw_parts(p, len) }.to_vec();
+            let mut v = unsafe { core::slice::from_raw_parts(p, len) }.to_vec();
+            // /var/run is a symlink to /run (Linux/Alpine), but /run is a VFS
+            // tmpfs intercepted ahead of the mount table, and the f2fs walk
+            // that follows the link re-roots "/run" in its own volume (the
+            // shadowed on-disk directory, which persists across reboots).
+            // Resolve the link here instead: a path below /var/run is a path
+            // below /run. /var/run itself stays the symlink for lstat and
+            // readlink.
+            if v.starts_with(b"/var/run/") {
+                v.drain(..4);
+                return Some((v.clone(), v.len()));
+            }
             return Some((v, len));
         }
         len += 1;

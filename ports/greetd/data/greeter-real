@@ -31,22 +31,10 @@ echo "GREETER-REAL: renderer=$LEANDROS_RENDERER_PATH GL_RENDERER='$LEANDROS_GL_R
 # "root" so cosmic-comp keeps its privileges; /bin/greeter-launch, the kiosk
 # child named in greetd.conf, is what drops to uid 990.
 
-# greetd binds its control socket at <dir>/greetd-<pid>.sock, and upstream
-# hardcodes <dir> = /run because on Linux /run is a tmpfs. On LeandrOS /run is
-# an ordinary f2fs directory and f2fs has no S_IFSOCK support, so that bind
-# fails with EOPNOTSUPP ("unable to open listener: Not supported (os error 95)")
-# before the greeter is ever spawned. The socket-capable mounts are /tmp,
-# /dev/shm and /run/user (servers/vfs TMPFS_ROOTS). GREETD_SOCK_DIR is
-# ports/greetd/patches/0003; unset, greetd behaves exactly as upstream.
-#
-# The directory is the GREETER ACCOUNT's runtime dir, not root's: the greeter
-# client connects to this socket as uid 990, and the VFS enforces search
-# permission on the path — a 0700 root /run/user/0 is EACCES for it. greetd
-# chowns the socket to default_session.user (root, because the compositor is
-# the session); /bin/greeter-launch re-chowns it to the greeter account before
-# dropping to it. See greeter-env.
-GREETD_SOCK_DIR=$GREETER_RUNTIME_DIR
-export GREETD_SOCK_DIR
+# greetd binds its control socket at /run/greetd-<pid>.sock (upstream's path;
+# /run is a tmpfs here as on Linux). greetd chowns the socket to
+# default_session.user (root, because the compositor is the session);
+# /bin/greeter-launch re-chowns it to the greeter account before dropping to it.
 
 cd "$XDG_RUNTIME_DIR"
 
