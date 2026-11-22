@@ -57,8 +57,15 @@ fn cs(s: &'static [u8]) -> *const c_char { s.as_ptr() as *const c_char }
 
 static mut FAILS: i32 = 0;
 fn check(name: &str, ok: bool) {
-    out(name);
-    if ok { out(": PASS\n"); } else { out(": FAIL\n"); unsafe { FAILS += 1; } }
+    // One write() per verdict line: console output must not splice into it.
+    let mut line = [0u8; 160];
+    let nb = name.as_bytes();
+    let vn = nb.len().min(140);
+    line[..vn].copy_from_slice(&nb[..vn]);
+    let suf: &[u8] = if ok { b": PASS\n" } else { b": FAIL\n" };
+    line[vn..vn + 7].copy_from_slice(suf);
+    unsafe { write(1, line.as_ptr() as *const c_void, vn + 7); }
+    if !ok { unsafe { FAILS += 1; } }
 }
 
 /// Run strtol; returns (value, consumed bytes, errno).
