@@ -722,13 +722,22 @@ impl Framebuffer {
     }
 
     /// Draw a double-width cell pair at `(x, y)`. Fullwidth ASCII (U+FF01..)
-    /// gets its ASCII glyph centred; everything else the console font has no
-    /// glyph for (CJK, emoji) gets a placeholder box two cells wide.
+    /// gets its ASCII glyph centred; CJK, kana, Hangul and emoji come from the
+    /// 16x16 table in [`crate::glyphs::wide_glyph`]; a wide code point it lacks
+    /// gets a placeholder box two cells wide.
     fn draw_wide(&mut self, x: usize, y: usize, u: u32, color: u32) {
         let (cw, ch) = (self.char_width, self.char_height);
         self.fill_rect(x, y, 2 * cw, ch, 0x000000);
         if (0xFF01..=0xFF5E).contains(&u) {
             self.draw_char_vector(x + cw / 2, y, (u - 0xFEE0) as u8 as char, color);
+            return;
+        }
+        if let Some(rows) = crate::glyphs::wide_glyph(u) {
+            for (gy, &r) in rows.iter().enumerate().take(ch) {
+                for gx in 0..16.min(2 * cw) {
+                    if r & (0x8000 >> gx) != 0 { self.set_pixel(x + gx, y + gy, color); }
+                }
+            }
             return;
         }
         if cw < 3 || ch < 3 { return; }

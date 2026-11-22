@@ -13,6 +13,8 @@ log
 # UEFI on every boot. Machine-local runtime state, not source.
 aarch64_vars.fd
 x86_64_vars.fd
+# runtests' per-host-suite private image copies (deleted after each suite)
+.hsimg-*/
 .!*!*
 
 # Downloaded RPi firmware blobs (start4.elf, fixup4.dat), cached by
