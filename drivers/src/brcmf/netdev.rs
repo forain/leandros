@@ -202,23 +202,37 @@ pub fn run_ctl<F: Fwil + 'static>(fw: F, ctl: Option<Box<dyn Ctl<F>>>) -> Option
             false
         }
     };
-    let mut r = BrcmfRadio { dev, bus_errs: 0, ctl, next_ctl_ms: 0, retry: None, retry_phase: 0 };
+    let ctl = ctl.map(|c| alloc::sync::Arc::new(sched::ksync::KMutex::new(c)));
+    let mut r = BrcmfRadio { dev, bus_errs: 0, ctl, ext_poll: false, next_ctl_ms: 0, retry: None, retry_phase: 0 };
     if ok {
         // Same as iwlwifi.mgr=1: the legacy network is the autoconnect profile
         // until netctl publishes the stored ones (which then include it).
         let legacy = legacy_creds();
         let mac = mac_address().unwrap_or([0; 6]);
+        let poller = r.ctl.clone();
+        r.ext_poll = true;
         let shared = alloc::sync::Arc::new(sched::ksync::KMutex::new(Some(r)));
         let res = crate::wifi_radio::register(Box::new(SharedRadio(shared.clone())), MGR_NAME, "brcmf", mac, brcmf_kick,
                                           legacy.as_ref().map(|(s, p)| (s.as_slice(), p.as_slice())));
         match res {
             Ok(done) => {
                 // The kernel runs the manager loop; wait for it to end (the bus is handed back below).
-                while !done.load(Ordering::Acquire) { sched::kthread::msleep(100); }
+                // The ctl file is read HERE, outside the radio lock: a slow or
+                // busy filesystem must never stall radio ops (f2fsnosleep).
+                let mut tick = 0u64;
+                while !done.load(Ordering::Acquire) {
+                    sched::kthread::msleep(100);
+                    tick += 1;
+                    if tick % (CTL_POLL_MS / 100).max(1) == 0 && CTL_PENDING.lock().is_none() {
+                        if let Some(t) = poller.as_ref().and_then(|c| c.lock().poll()) { *CTL_PENDING.lock() = Some(t); }
+                    }
+                }
             }
             Err(e) => log(&alloc::format!("could not register the radio class: {}", e)),
         }
         r = shared.lock().take().expect("radio taken back");
+        r.ext_poll = false;
+        *CTL_PENDING.lock() = None;
         *STATE.lock() = "stopped";
         log("manager loop ended");
     } else if r.ctl.is_some() {
@@ -426,7 +440,10 @@ fn set_link(up: bool) {
 pub struct BrcmfRadio<F: Fwil> {
     pub dev: Brcmf<F>,
     bus_errs: u32,
-    ctl: Option<Box<dyn Ctl<F>>>,
+    ctl: Option<alloc::sync::Arc<sched::ksync::KMutex<Box<dyn Ctl<F>>>>>,
+    /// True while the manager runs: the wifi-brcmf thread polls the ctl file
+    /// outside the radio lock and leaves the text in CTL_PENDING.
+    ext_poll: bool,
     next_ctl_ms: u64,
     /// `retry ...` text: the manager loop is wound down and the bus handed back.
     retry: Option<String>,
@@ -474,6 +491,9 @@ pub fn down_fail(d: Down) -> Fail {
     }
 }
 
+/// ctl command text read by the driver thread, consumed by check_ctl.
+static CTL_PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+
 fn now_ms() -> u64 { sched::monotonic_ns() / 1_000_000 }
 
 impl<F: Fwil> BrcmfRadio<F> {
@@ -504,7 +524,8 @@ impl<F: Fwil> BrcmfRadio<F> {
         *FW_CAPS.lock() = self.dev.caps.clone().unwrap_or_else(|| String::from("unknown (cap refused)"));
         *JOIN_OPTS.lock() = self.dev.opts.describe();
         *RSN_INFO.lock() = self.dev.rsn.lines().iter().map(|(k, v)| (*k, String::clone(v))).collect();
-        let Some(text) = self.ctl.as_mut().and_then(|c| c.poll()) else { return };
+        let polled = if self.ext_poll { CTL_PENDING.lock().take() } else { self.ctl.as_ref().and_then(|c| c.lock().poll()) };
+        let Some(text) = polled else { return };
         let text = String::from(text.trim());
         if let Some((m, y)) = cfg::parse_dp(&text) { apply_dp(m, y, "ctl"); return; }
         if let Some(n) = cfg::parse_dump(&text) {
@@ -541,7 +562,7 @@ impl<F: Fwil> BrcmfRadio<F> {
             }
             cfg::CtlCmd::Diag(lines) => {
                 log(&alloc::format!("ctl: diag: {}", self.dev.counters_line()));
-                if let Some(c) = self.ctl.as_mut() { c.diag(&mut self.dev.fw, lines); }
+                if let Some(c) = self.ctl.as_ref() { c.lock().diag(&mut self.dev.fw, lines); }
             }
             cfg::CtlCmd::Retry(_) => {
                 log("ctl: retry: stopping wifi0 and re-probing the chip");

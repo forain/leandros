@@ -327,6 +327,8 @@ SUITES = {
                 "host:blkhangtest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
                 "host:uartgaptest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
+                # Out-of-tree host suites that were solo-green 3x x86_64 KVM + aarch64 TCG (lane hostcov 2026-11-22): USB unplug, F2FS checkpoint, power control (~2-5 min each).
+                "host:usbunplugtest.py", "host:f2fscptest.py", "host:powerctltest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
                 "host:evbtntest.py", "host:evclocktest.py", "host:hidkeytest.py",
                 # Root `podman run --rm alpine echo hi` (OCI masked /proc paths; lane procbind). Skips without the alpine image.

@@ -651,6 +651,31 @@ build_gstreamer() {
     stage_container_port "$port" "$arch" gstreamer GStreamer GSTREAMER
 }
 
+# Function to stage libflatpak (ports/libflatpak): Alpine 3.21 flatpak's libflatpak.so.0
+# + closure for cosmic-store's `flatpak` feature, plus its -dev tree merged into the
+# cross sysroot. Same rules as GStreamer; LEANDROS_LIBFLATPAK_REBUILD=1 forces it,
+# LEANDROS_SKIP_LIBFLATPAK=1 skips it (cosmic-store then needs the feature removed).
+build_libflatpak() {
+    local arch="$1"
+    echo "📦 Staging $arch libflatpak..."
+    if [[ "${LEANDROS_SKIP_LIBFLATPAK:-0}" == 1 ]]; then
+        echo "⚠️  LEANDROS_SKIP_LIBFLATPAK=1, skipping"
+        return 0
+    fi
+    local port="$ROOT_DIR/ports/libflatpak"
+    local stamp="$port/out/$arch/.stamp"
+    if [[ "${LEANDROS_LIBFLATPAK_REBUILD:-0}" != 1 && -f "$stamp" ]] \
+       && leandros_port_fresh "$port" "$arch"; then
+        echo "  up to date ($port/out/$arch)"
+        local sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch"
+        if [[ -d "$port/out/$arch.sysroot" && -d "$sys" && ! -f "$sys/usr/lib/pkgconfig/flatpak.pc" ]]; then
+            cp -a -n "$port/out/$arch.sysroot/." "$sys/" && echo "  sysroot merged into $sys"
+        fi
+        return 0
+    fi
+    stage_container_port "$port" "$arch" libflatpak libflatpak LIBFLATPAK
+}
+
 # Function to stage PipeWire + WirePlumber (ports/pipewire)
 #
 # Alpine 3.21's prebuilt pipewire 1.2.7 + wireplumber 0.5 (container, like the
@@ -1185,6 +1210,7 @@ for arch in "${ARCHS[@]}"; do
     phase build_portal build_portal "$arch"
     phase build_pipewire build_pipewire "$arch"
     phase build_gstreamer build_gstreamer "$arch"
+    phase build_libflatpak build_libflatpak "$arch"
     phase build_alpine_pkgs build_alpine_pkgs "$arch"
     phase build_apk build_apk "$arch"
     phase build_bottom build_bottom "$arch"
