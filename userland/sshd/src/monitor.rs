@@ -284,6 +284,22 @@ impl Mon {
         true
     }
 
+    /// RevokedKeys: is the key (or certificate) listed? An unusable file refuses every key.
+    fn revoked(&self, eff: &Config, subject: &russh::keys::ssh_key::public::KeyData, cert: Option<&russh::keys::Certificate>) -> bool {
+        let Some(f) = eff.revoked_keys.as_deref() else { return false };
+        match crate::revoke::is_revoked(f, subject, cert) {
+            Ok(false) => false,
+            Ok(true) => {
+                log(&format!("{}: key is revoked (RevokedKeys {f})", self.peer));
+                true
+            }
+            Err(why) => {
+                log(&format!("{}: RevokedKeys file unusable, refusing public key authentication: {why}", self.peer));
+                true
+            }
+        }
+    }
+
     fn pubkey_ok(&self, user: &str, key: &PublicKey) -> Option<(User, crate::accounts::KeyOpts, Config)> {
         let eff = self.eff_for(user);
         if !eff.pubkey_auth {
@@ -292,6 +308,9 @@ impl Mon {
         let u = accounts::lookup_user(user)?;
         if let Err(why) = self.may_login(&eff, &u, false) {
             log(&format!("{}: publickey for {user}: {why}", self.peer));
+            return None;
+        }
+        if self.revoked(&eff, key.key_data(), None) {
             return None;
         }
         match accounts::key_authorized(&u, &eff.authorized_keys_file, key) {
@@ -343,6 +362,9 @@ impl Mon {
         if cert.cert_type() != russh::keys::ssh_key::certificate::CertType::User {
             return deny("not a user certificate");
         }
+        if self.revoked(&eff, cert.public_key(), Some(cert)) {
+            return deny("revoked");
+        }
         let now = now_secs();
         if cert.verify_signature().is_err() || now < cert.valid_after() || now >= cert.valid_before() {
             return deny("bad signature or outside its validity window");
@@ -350,6 +372,7 @@ impl Mon {
         // Who vouches for it: TrustedUserCAKeys (principal = the user name) or a cert-authority line.
         let mut line_opts: Option<crate::accounts::KeyOpts> = None;
         let mut principals: Option<String> = None;
+        let mut file_principal = false;
         let trusted = eff
             .trusted_user_ca_keys
             .as_deref()
@@ -369,8 +392,25 @@ impl Mon {
                 return deny("signed by an untrusted CA");
             }
         }
+        // TrustedUserCAKeys with an AuthorizedPrincipalsFile: its names replace the user name.
+        if trusted {
+            if let Some(pf) = eff.authorized_principals_file.as_deref() {
+                let names: Vec<String> = cert.valid_principals().to_vec();
+                match accounts::principals_match(&u, pf, &names) {
+                    Ok(Some(o)) => {
+                        if !self.opts_ok(user, &o) {
+                            return None;
+                        }
+                        line_opts = Some(o);
+                        file_principal = true;
+                    }
+                    Ok(None) => return deny("no principal listed in AuthorizedPrincipalsFile"),
+                    Err(why) => return deny(&format!("AuthorizedPrincipalsFile unusable: {why}")),
+                }
+            }
+        }
         // An empty principal list would match anyone: refuse it.
-        let allowed = match &principals {
+        let allowed = file_principal || match &principals {
             Some(list) => cert.valid_principals().iter().any(|p| crate::pattern_list_match(list, p)),
             None => cert.valid_principals().iter().any(|p| p == user),
         };

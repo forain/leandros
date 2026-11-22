@@ -23,6 +23,7 @@ mod cgsession;
 mod utmpx;
 #[path = "../../../lib/shadowhash/shadowhash.rs"]
 mod shadowhash;
+mod revoke;
 mod session;
 mod monitor;
 mod netchild;
@@ -85,6 +86,11 @@ pub struct Config {
     pub force_command: Option<String>,
     /// `TrustedUserCAKeys file`: CA public keys whose user certificates are accepted.
     pub trusted_user_ca_keys: Option<String>,
+    /// `AuthorizedPrincipalsFile file` (`none` = unset; tokens %u %h %U %%): principal names accepted
+    /// for certificates signed by a `TrustedUserCAKeys` CA, instead of the user name.
+    pub authorized_principals_file: Option<String>,
+    /// `RevokedKeys file`: plain public-key list or OpenSSH KRL; a listed key (or CA) is refused.
+    pub revoked_keys: Option<String>,
     /// `Match` blocks, in file order; applied per connection once the user is known.
     pub matches: Vec<MatchBlock>,
 }
@@ -96,7 +102,7 @@ pub enum TcpFwd { All, Local, Remote, No }
 #[derive(Clone, Debug, Default)]
 pub struct MatchBlock {
     pub all: bool,
-    /// (criterion, pattern list), criterion lowercase: user, group, address, localport.
+    /// (criterion, pattern list), criterion lowercase: user, group, host, address, localaddress, localport, rdomain.
     pub crit: Vec<(String, String)>,
     pub lines: Vec<(String, String)>,
 }
@@ -105,6 +111,7 @@ pub struct MatchBlock {
 const MATCH_KEYWORDS: &[&str] = &[
     "passwordauthentication", "pubkeyauthentication", "permitrootlogin", "allowtcpforwarding",
     "forcecommand", "permituserenvironment", "authorizedkeysfile", "devpasswordauthentication",
+    "authorizedprincipalsfile",
 ];
 
 /// OpenSSH pattern list: comma-separated `*`/`?` globs; a matching `!pattern`
@@ -138,6 +145,11 @@ impl Config {
                     "group" => groups.iter().any(|g| pattern_list_match(v, g)),
                     "address" => accounts::from_matches(v, peer.ip()),
                     "localport" => local.map_or(false, |l| pattern_list_match(v, &l.port().to_string())),
+                    // No reverse DNS here (OpenSSH UseDNS no): the client "host name" is its address.
+                    "host" => pattern_list_match(v, &accounts::ip_text(peer.ip())),
+                    "localaddress" => local.map_or(false, |l| accounts::from_matches(v, l.ip())),
+                    // There are no routing domains: every connection is in the "default" one.
+                    "rdomain" => pattern_list_match(v, "default"),
                     _ => false,
                 });
             if !ok {
@@ -185,6 +197,8 @@ impl Default for Config {
             allow_tcp_forwarding: TcpFwd::All,
             force_command: None,
             trusted_user_ca_keys: None,
+            authorized_principals_file: None,
+            revoked_keys: None,
             matches: Vec::new(),
         }
     }
@@ -266,6 +280,15 @@ fn apply_kw(cfg: &mut Config, key: &str, val: &str) -> Result<bool, String> {
             cfg.force_command = if val.is_empty() { return Err(err("ForceCommand needs a command".into())) }
                 else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
         }
+        "authorizedprincipalsfile" => {
+            cfg.authorized_principals_file =
+                if val.is_empty() { return Err(err("AuthorizedPrincipalsFile needs a file".into())) }
+                else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
+        "revokedkeys" => {
+            cfg.revoked_keys = if val.is_empty() { return Err(err("RevokedKeys needs a file".into())) }
+                else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
         "trustedusercakeys" => {
             cfg.trusted_user_ca_keys = if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
         }
@@ -285,7 +308,7 @@ fn parse_match(val: &str) -> Result<MatchBlock, String> {
     let mut b = MatchBlock::default();
     for p in t.chunks(2) {
         let c = p[0].to_ascii_lowercase();
-        if !matches!(c.as_str(), "user" | "group" | "address" | "localport") {
+        if !matches!(c.as_str(), "user" | "group" | "address" | "localport" | "host" | "localaddress" | "rdomain") {
             return Err(format!("unsupported Match criterion {}", p[0]));
         }
         b.crit.push((c, p[1].to_string()));
