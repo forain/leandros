@@ -4,7 +4,7 @@
 Against the ALREADY-RUNNING guest (serial shell, root), using only what the image ships
 (/usr/bin/flatpak, /usr/bin/ostree, /usr/bin/bwrap from ports/libflatpak; no apk, no network):
 build a local OSTree repo holding a minimal runtime (busybox.static from the image) and an app
-whose command prints a marker, add it as a --user file:// remote (no GPG), install both through
+whose command prints a marker, add it as a --user file:// remote (no GPG; own name: appstreamtest's 'lrepo' in the same guest must not be reused), install both through
 flatpak's FlatpakTransaction, RUN the app through flatpak's real bwrap sandbox as an unprivileged
 user (user + mount + pid namespaces, pivot_root, /app + /usr from the runtime), check the marker,
 then uninstall and check nothing is left.
@@ -41,11 +41,14 @@ flatpak build-export $T/repo $T/app >/dev/null 2>&1; echo EXPORT_APP_RC=$?
 flatpak build-update-repo $T/repo >/dev/null 2>&1; echo UPDATE_REPO_RC=$?
 chmod -R a+rX $T
 cat > $T/user.sh <<U
-flatpak --user remote-add --if-not-exists --no-gpg-verify lrepo file://$T/repo; echo ADD_RC=\$?
-flatpak --user install -y --noninteractive lrepo org.leandros.Platform//1 org.leandros.Hello >/dev/null 2>&1; echo INSTALL_RC=\$?
+flatpak --user remote-delete --force flatrepo >/dev/null 2>&1
+flatpak --user remote-add --no-gpg-verify flatrepo file://$T/repo; echo ADD_RC=\$?
+flatpak --user install -y --noninteractive flatrepo org.leandros.Platform//1 org.leandros.Hello >/tmp/flr-inst.out 2>&1; R=\$?; INSTALL_RC_=\$R; echo INSTALL_RC=\$R; tail -n 12 /tmp/flr-inst.out
+[ \$INSTALL_RC_ = 0 ] || { echo DIAG_REFS; ostree --repo=$T/repo refs; flatpak --user remotes -d; ls -la ~/.local/share/flatpak ~/.local/share/flatpak/repo; }
 echo LIST1=\$(flatpak --user list --columns=application | tr '\n' ,)
 flatpak --user run org.leandros.Hello; echo RUN_RC=\$?
 flatpak --user uninstall -y --noninteractive org.leandros.Hello org.leandros.Platform >/dev/null 2>&1; echo UNINSTALL_RC=\$?
+flatpak --user remote-delete --force flatrepo >/dev/null 2>&1
 echo LIST2=[\$(flatpak --user list --columns=application | tr '\n' ,)]
 U
 su leandro -c "sh $T/user.sh" 2>&1
@@ -58,7 +61,7 @@ def main():
     ser = driver._Serial()
     b = base64.b64encode(GUEST.encode()).decode()
     try:
-        r = driver.serial_run(f"echo {b} | base64 -d > /tmp/flatpak-guest.sh; /bin/sh /tmp/flatpak-guest.sh 2>&1 | grep -v '^\\[ *[0-9]' | tail -n 40",
+        r = driver.serial_run(f"echo {b} | base64 -d > /tmp/flatpak-guest.sh; /bin/sh /tmp/flatpak-guest.sh 2>&1 | grep -v '^\\[ *[0-9]' | tail -n 60",
                               timeout=900, arch=arch, ser=ser)
     finally:
         ser.close()
@@ -68,8 +71,8 @@ def main():
             "LIST1=org.leandros.Hello,org.leandros.Platform,", "FLATPAK_RUN_MARKER_OK uid=1000",
             "APPDATA_OK", "RUN_RC=0", "UNINSTALL_RC=0", "LIST2=[]", "FLATPAK_DONE"]
     missing = [n for n in need if n not in out]
-    if missing:
-        print("missing:", missing)
+    for n in need:
+        print(f"flatpak-{n.split('=')[0].split(' ')[0].lower()}: {'FAIL' if n in missing else 'PASS'}")
     print("flatpak", "FAIL" if missing else "PASS")
     return 1 if missing else 0
 
