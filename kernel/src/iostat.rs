@@ -160,6 +160,18 @@ fn isoch_report(window_ns: u64) {
     crate::serial_print_str(&line);
 }
 
+/// `[tx_dropped, user_tx_dropped]` for /proc/sysstat's `# uartdrop` line.
+#[no_mangle]
+pub extern "C" fn kernel_uart_tx_drops(out: *mut u64) {
+    if out.is_null() { return; }
+    use core::sync::atomic::Ordering::Relaxed;
+    #[cfg(target_arch = "aarch64")]
+    let v = [arch_aarch64::uart::UART_TX_DROPPED.load(Relaxed), arch_aarch64::uart::USER_TX_DROPPED.load(Relaxed)];
+    #[cfg(target_arch = "x86_64")]
+    let v = [arch_x86_64::UART_TX_DROPPED.load(Relaxed), arch_x86_64::USER_TX_DROPPED.load(Relaxed)];
+    unsafe { core::ptr::copy_nonoverlapping(v.as_ptr(), out, 2); }
+}
+
 /// `[txgap_us, irqlate_us, rescued, overruns]` for /proc/sysstat's `# uart`
 /// line (servers/vfs `gen_sysstat`). Zeros where there is no PL011 console.
 #[no_mangle]

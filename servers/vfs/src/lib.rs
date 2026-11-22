@@ -7199,6 +7199,14 @@ fn gen_sysstat() -> Option<VnodeKind> {
         unsafe { kernel_uart_rx_stats(u.as_mut_ptr()); }
         let _ = writeln!(s, "# uart txgap_us {} irqlate_us {} rescued {} overruns {}", u[0], u[1], u[2], u[3]);
     }
+    // Console bytes dropped on the UART (all writers / user write(2) only):
+    // user bytes must stay 0 (conlosstest).
+    {
+        extern "C" { fn kernel_uart_tx_drops(out: *mut u64); }
+        let mut d = [0u64; 2];
+        unsafe { kernel_uart_tx_drops(d.as_mut_ptr()); }
+        let _ = writeln!(s, "# uartdrop total {} user {}", d[0], d[1]);
+    }
     let _ = writeln!(s, "# t pid tgid cpu_ns sys_ns");
     for (pid, tgid, c, y) in tasks {
         let _ = writeln!(s, "t {} {} {} {}", pid, tgid, c, y);

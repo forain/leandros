@@ -1,0 +1,12 @@
+[package]
+name = "conloss"
+version.workspace = true
+edition.workspace = true
+build = "../muslrt/build.rs"
+
+[[bin]]
+name = "conloss"
+path = "src/main.rs"
+
+[dependencies]
+# Linked against librelibc.a like fdmaxtest (relibc_start_v1, fork, waitpid).

@@ -924,26 +924,56 @@ pub fn uart_irq_diag() -> UartIrqDiag {
     d
 }
 
+/// One console line assembled in memory and handed to the kernel's line-atomic
+/// console (`serial_print`: staged per CPU, queued whole behind the console
+/// lock) in ONE call. The `uart::serial_print_str` byte-at-a-time path these
+/// diagnostics used writes straight to the PL011 from any CPU, so a line printed
+/// while a user `write(2)` held the console was spliced into it byte by byte
+/// (lane conloss: `[uartirq] rx-pending` damaged 2-5 lines of a 20000-line
+/// burst on aarch64 TCG; no byte was lost on the way, QEMU logged the mix).
+struct DiagLine { buf: [u8; 640], len: usize }
+impl DiagLine {
+    fn new() -> Self { DiagLine { buf: [0; 640], len: 0 } }
+    fn s(&mut self, t: &str) {
+        for &b in t.as_bytes() {
+            if self.len < self.buf.len() { self.buf[self.len] = b; self.len += 1; }
+        }
+    }
+    /// 16 zero-padded hex digits, like `uart::print_hex`.
+    fn h(&mut self, n: usize) {
+        for i in (0..16).rev() {
+            let d = ((n as u64) >> (i * 4)) & 0xF;
+            let c = b"0123456789abcdef"[d as usize];
+            if self.len < self.buf.len() { self.buf[self.len] = c; self.len += 1; }
+        }
+    }
+    fn flush(&self) {
+        extern "C" { fn serial_print(ptr: *const u8, len: usize); }
+        unsafe { serial_print(self.buf.as_ptr(), self.len) }
+    }
+}
+
 /// Print a snapshot as one `[uartirq]` line, tagged with `when`.
 pub fn print_uart_irq_diag(when: &str, d: &UartIrqDiag) {
-    use crate::uart::{serial_print_str as s, print_hex as h};
-    s("[uartirq] "); s(when); s(" intid "); h(uart_intid() as usize);
-    s(" EL "); h(d.el as usize);
-    s(" D.ctlr "); h(d.gicd_ctlr as usize); s(" D.typer "); h(d.gicd_typer as usize);
-    s(" en "); h(d.enabled as usize); s(" pend "); h(d.pending as usize);
-    s(" act "); h(d.active as usize); s(" grp "); h(d.group as usize);
-    s(" tgt "); h(d.target as usize); s(" prio "); h(d.prio as usize);
-    s(" cfg "); h(d.cfg as usize);
-    s(" C.ctlr "); h(d.gicc_ctlr as usize); s(" C.pmr "); h(d.gicc_pmr as usize);
-    s(" C.rpr "); h(d.gicc_rpr as usize); s(" C.hppir "); h(d.gicc_hppir as usize);
-    s(" imsc "); h(d.imsc as usize); s(" ris "); h(d.ris as usize);
-    s(" mis "); h(d.mis as usize); s(" fr "); h(d.fr as usize); s(" cr "); h(d.cr as usize);
+    let mut l = DiagLine::new();
+    l.s("[uartirq] "); l.s(when); l.s(" intid "); l.h(uart_intid() as usize);
+    l.s(" EL "); l.h(d.el as usize);
+    l.s(" D.ctlr "); l.h(d.gicd_ctlr as usize); l.s(" D.typer "); l.h(d.gicd_typer as usize);
+    l.s(" en "); l.h(d.enabled as usize); l.s(" pend "); l.h(d.pending as usize);
+    l.s(" act "); l.h(d.active as usize); l.s(" grp "); l.h(d.group as usize);
+    l.s(" tgt "); l.h(d.target as usize); l.s(" prio "); l.h(d.prio as usize);
+    l.s(" cfg "); l.h(d.cfg as usize);
+    l.s(" C.ctlr "); l.h(d.gicc_ctlr as usize); l.s(" C.pmr "); l.h(d.gicc_pmr as usize);
+    l.s(" C.rpr "); l.h(d.gicc_rpr as usize); l.s(" C.hppir "); l.h(d.gicc_hppir as usize);
+    l.s(" imsc "); l.h(d.imsc as usize); l.s(" ris "); l.h(d.ris as usize);
+    l.s(" mis "); l.h(d.mis as usize); l.s(" fr "); l.h(d.fr as usize); l.s(" cr "); l.h(d.cr as usize);
     // Every non-zero ISPENDR word, `wN=bits` (INTID = 32*N + bit).
-    s(" spend");
+    l.s(" spend");
     for (w, &v) in d.spend.iter().enumerate() {
-        if v != 0 { s(" w"); h(w); s("="); h(v as usize); }
+        if v != 0 { l.s(" w"); l.h(w); l.s("="); l.h(v as usize); }
     }
-    s("\n");
+    l.s("\n");
+    l.flush();
 }
 
 /// Snapshot taken by the cpu0 tick the first time it finds RX bytes the
@@ -983,7 +1013,6 @@ pub fn uart_irq_diag_report() {
 /// `[uartirq] swpend intid N irqs A->B taken T pend P`.
 fn uart_irq_swpend_test() {
     use core::sync::atomic::{AtomicU64, AtomicU8};
-    use crate::uart::{serial_print_str as s, print_hex as h};
     static STATE: AtomicU8 = AtomicU8::new(0);
     static BEFORE: AtomicU64 = AtomicU64::new(0);
     if !cfg!(any(feature = "rpi5", feature = "raspi4b")) || !UART_IRQ_LIVE.load(Ordering::Acquire) { return; }
@@ -1000,8 +1029,10 @@ fn uart_irq_swpend_test() {
             let before = BEFORE.load(Ordering::Relaxed);
             let after = irqs.load(Ordering::Relaxed);
             let pend = unsafe { (gicd_r32(GICD_ISPENDR0 + (id / 32) * 4) >> (id % 32)) & 1 };
-            s("[uartirq] swpend intid "); h(id); s(" irqs "); h(before as usize); s("->"); h(after as usize);
-            s(" taken "); h((after != before) as usize); s(" pend "); h(pend as usize); s("\n");
+            let mut l = DiagLine::new();
+            l.s("[uartirq] swpend intid "); l.h(id); l.s(" irqs "); l.h(before as usize); l.s("->"); l.h(after as usize);
+            l.s(" taken "); l.h((after != before) as usize); l.s(" pend "); l.h(pend as usize); l.s("\n");
+            l.flush();
         }
         _ => {}
     }
