@@ -311,9 +311,7 @@ impl RebootCfg {
 }
 
 fn plog(s: &str) {
-    serial_print_str("[REBOOT] ");
-    serial_print_str(s);
-    serial_print_str("\n");
+    serial_print_str(&alloc::format!("[REBOOT] {}\n", s));
 }
 
 /// Phase 1 of the device quiesce (Linux `device_shutdown`), interrupts on,
@@ -360,9 +358,7 @@ fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) -> usize {
     let mut halted = 0;
     for line in drivers::usb_hcd::quiesce_all(cfg.xhci_hcrst, cfg.usb_vbus_off) {
         if line.contains(" halted in ") { halted += 1; }
-        serial_print_str("[REBOOT] ");
-        serial_print_str(&line);
-        serial_print_str("\n");
+        serial_print_str(&alloc::format!("[REBOOT] {}\n", line));
     }
     if cfg.busmaster_off {
         // kexec: the Intel IGD scanning out the handed-over framebuffer
@@ -568,9 +564,7 @@ fn nvidia_kexec_unload() {
     {
         let r = nvidia_rm::kexec::kexec_unload();
         for l in &r.lines {
-            serial_print_str("[KEXEC] ");
-            serial_print_str(l);
-            serial_print_str("\n");
+            serial_print_str(&alloc::format!("[KEXEC] {}\n", l));
         }
         if let Some((b, d, f)) = r.force_reset {
             crate::kexec::devreset::force_reset(b, d, f);
@@ -585,9 +579,7 @@ fn nvidia_kexec_unload() {
 fn kexec_hooks() {
     let lines = crate::pm2::kexec_quiesce();
     for l in lines {
-        serial_print_str("[KEXEC] ");
-        serial_print_str(&l);
-        serial_print_str("\n");
+        serial_print_str(&alloc::format!("[KEXEC] {}\n", l));
     }
 }
 

@@ -2152,11 +2152,7 @@ fn trace_fd_route(fd: usize, route: &str) {
 /// with no output.
 fn log_enosys(number: usize) -> isize {
     let _g = TRACE_LOCK.lock();
-    crate::serial_print_str("[SYSCALL] ENOSYS nr=");
-    crate::serial_print_hex(number);
-    crate::serial_print_str(" pid=");
-    crate::serial_print_hex(current_pid() as usize);
-    crate::serial_print_str("\n");
+    crate::serial_print_str(&alloc::format!("[SYSCALL] ENOSYS nr={:#x} pid={:#x}\n", number, current_pid() as usize));
     -38
 }
 

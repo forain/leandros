@@ -282,8 +282,13 @@ unsafe fn out_int(v: c_int) {
 }
 
 unsafe fn report(name: &[u8], passed: bool) -> bool {
-    out(name);
-    out(if passed { b": PASS\n" } else { b": FAIL\n" });
+    { // One write: a kernel console line must not splice into the verdict.
+        let mut vline = [0u8; 160];
+        let vn = name.len().min(140);
+        vline[..vn].copy_from_slice(&name[..vn]);
+        let vsuf: &[u8] = if passed { b": PASS\n" } else { b": FAIL\n" };
+        vline[vn..vn + 7].copy_from_slice(vsuf);
+        out(&vline[..vn + 7]); }
     passed
 }
 

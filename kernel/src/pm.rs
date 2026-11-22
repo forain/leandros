@@ -114,9 +114,7 @@ static STEPS: spin::Mutex<alloc::vec::Vec<crate::pm2::Step>> = spin::Mutex::new(
 static BUSY: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn line(out: &mut String, s: &str) {
-    crate::serial_print_str("[PM] ");
-    crate::serial_print_str(s);
-    crate::serial_print_str("\n");
+    crate::serial_print_str(&alloc::format!("[PM] {}\n", s));
     out.push_str(s);
     out.push('\n');
 }

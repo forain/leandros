@@ -21,7 +21,13 @@ const MNT: &[u8] = b"/tmp/fusemnt\0";
 
 fn say(s: &[u8]) { unsafe { write(1, s.as_ptr(), s.len()); } }
 fn verdict(name: &[u8], ok: bool) {
-    say(name); say(if ok { b": PASS\n" } else { b": FAIL\n" });
+    { // One write: a kernel console line must not splice into the verdict.
+        let mut vline = [0u8; 160];
+        let vn = name.len().min(140);
+        vline[..vn].copy_from_slice(&name[..vn]);
+        let vsuf: &[u8] = if ok { b": PASS\n" } else { b": FAIL\n" };
+        vline[vn..vn + 7].copy_from_slice(vsuf);
+        say(&vline[..vn + 7]); }
 }
 fn num(mut n: i64) {
     let mut b = [0u8; 24]; let mut i = 24; let neg = n < 0; if neg { n = -n; }

@@ -187,8 +187,13 @@ unsafe fn puti(n: isize) { if n < 0 { puts(b"-"); putn((-n) as u64) } else { put
 
 static mut FAILS: i32 = 0;
 unsafe fn report(name: &[u8], ok: bool) {
-    puts(name);
-    puts(if ok { b": PASS\n" } else { b": FAIL\n" });
+    { // One write: a kernel console line must not splice into the verdict.
+        let mut vline = [0u8; 160];
+        let vn = name.len().min(140);
+        vline[..vn].copy_from_slice(&name[..vn]);
+        let vsuf: &[u8] = if ok { b": PASS\n" } else { b": FAIL\n" };
+        vline[vn..vn + 7].copy_from_slice(vsuf);
+        puts(&vline[..vn + 7]); }
     if !ok { FAILS += 1; }
 }
 /// One diagnostic line for a failed expectation.

@@ -282,12 +282,13 @@ fn rusage_total_us(ru: &rusage) -> i64 {
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 unsafe fn report(name: &[u8], passed: bool) -> bool {
-    write(1, name.as_ptr(), name.len() - 1);
-    if passed {
-        write(1, b": PASS\n".as_ptr(), 7);
-    } else {
-        write(1, b": FAIL\n".as_ptr(), 7);
-    }
+    // One write(): a kernel console line must not splice into the verdict.
+    let mut vline = [0u8; 160];
+    let vn = (name.len() - 1).min(140);
+    vline[..vn].copy_from_slice(&name[..vn]);
+    let vsuf: &[u8] = if passed { b": PASS\n" } else { b": FAIL\n" };
+    vline[vn..vn + 7].copy_from_slice(vsuf);
+    write(1, vline.as_ptr(), vn + 7);
     passed
 }
 
