@@ -62,6 +62,49 @@ pub async fn run(c: zbus::Connection, with_portal: bool) -> (u32, u32) {
     }
     let c = &c;
 
+    // --- UPower KbdBacklight over a fake LED (the real tree has none in QEMU) ---
+    check!("UPower KbdBacklight fake LED", async {
+        use futures_util::StreamExt;
+        let dir = "/tmp/kbl-leds";
+        let led = format!("{dir}/hp::kbd_backlight");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(&led).map_err(|e| fail(format!("mkdir: {e}")))?;
+        std::fs::write(format!("{led}/max_brightness"), "2\n").map_err(|e| fail(format!("{e}")))?;
+        std::fs::write(format!("{led}/brightness"), "0\n").map_err(|e| fail(format!("{e}")))?;
+        const KP: &str = "/org/freedesktop/UPower/KbdBacklight";
+        const KI: &str = "org.freedesktop.UPower.KbdBacklight";
+        c.object_server().at(KP, crate::upower::KbdBacklight::new(dir)).await?;
+        tokio::spawn(crate::upower::kbd_watch(c.clone(), KP.to_string()));
+        let me = c.unique_name().ok_or_else(|| fail("no unique name"))?.to_string();
+        let proxy = zbus::Proxy::new(c, me.clone(), KP, KI).await?;
+        let mut sig = proxy.receive_signal("BrightnessChangedWithSource").await?;
+        let max: i32 = call(c, &me, KP, KI, "GetMaxBrightness", &()).await?;
+        if max != 2 { return Err(fail(format!("max {max} != 2"))); }
+        let cur: i32 = call(c, &me, KP, KI, "GetBrightness", &()).await?;
+        if cur != 0 { return Err(fail(format!("initial {cur} != 0"))); }
+        tokio::time::sleep(Duration::from_millis(600)).await; // watcher has seen 0
+        let _: () = call(c, &me, KP, KI, "SetBrightness", &(1i32,)).await?;
+        let cur: i32 = call(c, &me, KP, KI, "GetBrightness", &()).await?;
+        if cur != 1 { return Err(fail(format!("after set {cur} != 1"))); }
+        let on_disk = std::fs::read_to_string(format!("{led}/brightness")).unwrap_or_default();
+        if on_disk.trim() != "1" { return Err(fail(format!("sysfs holds {on_disk:?}"))); }
+        let m = tokio::time::timeout(Duration::from_secs(5), sig.next()).await.map_err(|_| fail("no signal after SetBrightness"))?
+            .ok_or_else(|| fail("signal stream ended"))?;
+        let (v, src): (i32, String) = m.body().deserialize()?;
+        if (v, src.as_str()) != (1, "external") { return Err(fail(format!("signal ({v},{src})"))); }
+        // The Fn key changes the LED behind the service's back.
+        std::fs::write(format!("{led}/brightness"), "2\n").map_err(|e| fail(format!("{e}")))?;
+        let m = tokio::time::timeout(Duration::from_secs(5), sig.next()).await.map_err(|_| fail("no signal after hw change"))?
+            .ok_or_else(|| fail("signal stream ended"))?;
+        let (v, src): (i32, String) = m.body().deserialize()?;
+        if (v, src.as_str()) != (2, "internal") { return Err(fail(format!("hw signal ({v},{src})"))); }
+        let bad: R<()> = call(c, &me, KP, KI, "SetBrightness", &(3i32,)).await;
+        if error_name(&bad) != "org.freedesktop.DBus.Error.InvalidArgs" { return Err(fail(format!("set 3: {}", error_name(&bad)))); }
+        c.object_server().remove::<crate::upower::KbdBacklight, _>(KP).await?;
+        let _ = std::fs::remove_dir_all(dir);
+        Ok::<_, zbus::Error>("max=2 set/get/signals ok")
+    });
+
     // --- xdg-desktop-portal (ports/portal) ---
     // The frontend waits for its cosmic backend (a Wayland client) at start-up,
     // so this only works inside a COSMIC session: `svc-test portal`.
