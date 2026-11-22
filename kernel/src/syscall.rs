@@ -17174,7 +17174,10 @@ fn sys_name_to_handle_at(dirfd: usize, path_ptr: usize, fh_ptr: usize, mnt_ptr: 
         let kp = if flags & AT_SYMLINK_FOLLOW != 0 { match follow_magic_final(kp) { Ok(p) => p, Err(e) => return e } } else { kp };
         kp.buf[..kp.buf.len() - 1].to_vec()
     };
-    let id = match vfs::fh_ident(&host) { Some(i) => i, None => return -95 };
+    let fid = flags & AT_HANDLE_FID != 0;
+    // procfs, devpts, mqueue, fuse: no export operations -> EOPNOTSUPP unless
+    // AT_HANDLE_FID (identity-only handle).
+    let id = match vfs::fh_ident_flags(&host, fid) { Some(i) => i, None => return -95 };
     if cap < 12 { uw::<u32>(fh_ptr, 12); return -75; }
     vfs::fh_remember(id, &host);
     uw::<u32>(fh_ptr, 12);
@@ -17186,8 +17189,10 @@ fn sys_name_to_handle_at(dirfd: usize, path_ptr: usize, fh_ptr: usize, mnt_ptr: 
 }
 
 /// open_by_handle_at(mount_fd, handle, flags): CAP_DAC_READ_SEARCH; the
-/// the owning filesystem finds the inode by number (f2fs, tmpfs; else the
-/// issued-handle table); ESTALE when the inode is gone or reused. `mount_fd` names the filesystem (its st_dev).
+/// owning filesystem finds the inode by number (f2fs, tmpfs; sysfs/cgroup2
+/// through the issued-handle table); ESTALE when the inode is gone or reused,
+/// EOPNOTSUPP on filesystems without export operations (procfs, devpts, mqueue,
+/// fuse). `mount_fd` names the filesystem (its st_dev).
 fn sys_open_by_handle_at(mount_fd: usize, fh_ptr: usize, flags: usize) -> isize {
     if !sched::caps::host_capable_of(current_pid(), 2 /*CAP_DAC_READ_SEARCH*/) { return -1; }
     if !validate_user_buf(fh_ptr, 20) { return -14; }
@@ -17198,6 +17203,7 @@ fn sys_open_by_handle_at(mount_fd: usize, fh_ptr: usize, flags: usize) -> isize 
     let mp = if d == AT_FDCWD { match resolve_ns(b".").and_then(KPath::from_ns) { Ok(k) => k.buf[..k.buf.len() - 1].to_vec(), Err(e) => return e } }
              else { match fd_host_path(d) { Some(h) => h, None => return -9 } };
     let gen: u32 = ur(fh_ptr + 16);
+    if vfs::fh_fs(&mp) == vfs::FhFs::NoExport { return -95; }
     match vfs::fh_lookup(&mp, vfs::fh_dev(&mp), ino, gen) {
         Some(p) => { let kp = KPath::raw(&p); vfs_open_resolved(kp.ptr(), open_flags_from_user(flags), 0) }
         None => -116,
