@@ -1122,6 +1122,9 @@ def main():
         _sysfs_attr("/sys/class/drm", _node, f"../..{_devrel}/drm/{_node}", 0o120777)
         _sysfs_attr("/sys/dev/char", f"{DRM_MAJOR}:{_minor}", f"../..{_devrel}/drm/{_node}", 0o120777)
 
+    # Linux has /sys/block (the whole-disk view); libflatpak's bwrap setup binds it unconditionally.
+    # The vfs synthesizes /sys/class/block, so the staged /sys/block points there.
+    _sysfs_attr("/sys", "block", "class/block", 0o120777)
     # /sys/class/input and /sys/dev/char/13:* are NOT staged: the vfs
     # synthesizes them from the live evdev registry (servers/vfs/src/sysinput.rs),
     # so hot-plugged nodes (event2..) appear and disappear with the device.

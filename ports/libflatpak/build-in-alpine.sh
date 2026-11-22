@@ -42,6 +42,9 @@ esac
   # libostree from that package), so `apk add ostree` is a no-op there -- ship the binary
   # too, or the package would be claimed but its command missing.
   mkdir -p "$S/usr/bin"; cp -L "$R/usr/bin/ostree" "$S/usr/bin/ostree"
+  # Same for the flatpak CLI (the closure names the flatpak package) and its sandbox
+  # helper bwrap: the in-guest flatpaktest runs apps through the real bwrap, network-free.
+  for b in flatpak bwrap; do cp -L "$R/usr/bin/$b" "$S/usr/bin/$b"; done
   # -- closure ------------------------------------------------------------------
   is_excluded() {
     case "$1" in
@@ -57,7 +60,7 @@ esac
     return 1
   }
   needed_of() { readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p'; }
-  { needed_of "$S/usr/lib/libflatpak.so.0"; needed_of "$S/usr/bin/ostree"; echo libflatpak.so.0; } > /tmp/queue
+  { needed_of "$S/usr/lib/libflatpak.so.0"; needed_of "$S/usr/bin/ostree"; needed_of "$S/usr/bin/flatpak"; needed_of "$S/usr/bin/bwrap"; echo libflatpak.so.0; } > /tmp/queue
   : > /tmp/seen; : > "$S/CLOSURE.txt"; : > /tmp/missing
   while [ -s /tmp/queue ]; do
     sort -u /tmp/queue > /tmp/q2; : > /tmp/queue

@@ -17988,6 +17988,10 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // A cgroupfs directory fd names its tree path, so openat/openat2
             // relative to it (crun) resolve.
             VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(*dev) => FdInfo::Cg(cgroupfs::dev_cg(*dev)),
+            // The synthesized /sys/class/block directory names itself, as on Linux:
+            // bwrap opens a bind source O_PATH and mounts /proc/self/fd/N, and
+            // flatpak binds /sys/block (-> class/block) into every sandbox.
+            VnodeKind::SysBlock { dev, level, .. } if *level == block::LVL_BLOCK && *dev == block::NO_DEV => FdInfo::Static(b"/sys/class/block"),
             VnodeKind::SockAlias { .. } => FdInfo::Static(b"socket:[0]"),
             VnodeKind::EpollFd { .. } => FdInfo::Static(b"anon_inode:[eventpoll]"),
             _ => FdInfo::Bad,
