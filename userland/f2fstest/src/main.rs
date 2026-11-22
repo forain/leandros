@@ -10,6 +10,7 @@ extern crate leandros_libc;
 use leandros_libc::*;
 
 mod bench;
+mod cfgpat;
 mod churn;
 mod commit;
 mod crash;
@@ -31,6 +32,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     // `f2fstest churn DIR [FACTOR]` / `f2fstest verify DIR`: see churn.rs.
     if argc >= 3 {
         let dir = arg(argv, 2);
+        if let Some(r) = cfgpat::dispatch(argc, argv, arg(argv, 1), dir) { return r; }
         match arg(argv, 1) {
             b"fsync" => return fsyncsub::fsync_paths(argc, argv),
             b"churn" => {

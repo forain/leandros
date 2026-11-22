@@ -82,8 +82,10 @@ LEANDROS_RUN_ID defaults to "runtests" (scopes driver.py's sockets/logs).
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 os.environ.setdefault("LEANDROS_RUN_ID", "runtests")
@@ -312,6 +314,8 @@ SUITES = {
                 # park narrow and wake on input / their deadline / a VT switch.
                 "host:kparkstest.py",
                 "host:sshsmoke.py",
+                # libflatpak appstream refresh from a local ostree remote: pull of appstream2/<arch> + extraction (lane appstream; needs network for apk).
+                "host:appstreamtest.py",
                 # Link flap/watch (own boot, ~110 s on both arches; lane suiteharness).
                 "host:netwatchtest.py",
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
@@ -327,6 +331,9 @@ SUITES = {
                 "host:f2fsnidtest.py",
                 # Unknown-outcome checkpoint commit: acked fsyncs survive (own boot, stops this VM).
                 "host:f2fscommittest.py",
+                # Atomic small writes: checkpoints per write (plain 1, cosmic-config 2) and power cuts
+                # between fsync / rename / dir fsync (lane f2fsckpt3; own boots, stops this VM).
+                "host:f2fsckpttest.py",
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 # A spin-locked caller reading a file (the wifi-brcmf ctl poll) must not stall f2fs
@@ -430,10 +437,12 @@ SUITES = {
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
+    "f2fsckpt": ["host:f2fsckpttest.py"],
     "f2fsgc": ["host:f2fsgctest.py"],
     "a64acpi": ["host:a64acpitest.py"],
     "blank": ["host:blanktest.py"],
     "portalshot": ["host:portalshottest.py"],
+    "appstream": ["host:appstreamtest.py"],
     # lane virglsuites: virgl COSMIC-session suites, each in its own boot (need a host GPU QEMU:
     # Mac GPU QEMU or the box); coreutils = uutils behaviour in a fresh brush guest (no GPU).
     "audio-session": ["host:virglsessiontest.py audio"],
@@ -561,7 +570,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900,
+HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "appstreamtest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
@@ -600,6 +609,7 @@ def host_run(c, timeout, arch=None, scale=1.0):
     env = dict(os.environ)
     if arch:
         env["LEANDROS_TEST_ARCH"] = arch
+    priv = private_images(env, arch) if self_boots(c) else None
     t0 = time.time()
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
@@ -608,6 +618,51 @@ def host_run(c, timeout, arch=None, scale=1.0):
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         return {"rc": None, "status": "timeout", "output": out, "secs": round(time.time() - t0, 1)}
+    finally:
+        if priv:
+            shutil.rmtree(priv, ignore_errors=True)
+
+
+def private_images(env, arch):
+    """A self-booting host: suite gets its own copies of the repo's boot image, root
+    image and UEFI NVRAM (reflink/APFS clones, so nearly free). QEMU write-locks every
+    disk and pflash file, and these were the tree's shared ones: a second concurrent
+    suite of the same tree (another shard, another lane run on this box) died in its
+    first second with "Failed to get write lock", no output. Explicit
+    LEANDROS_DISK_IMAGE / LEANDROS_ROOT_IMAGE / LEANDROS_VARS_FD are left alone.
+    Returns the directory to delete afterwards (None when nothing was cloned)."""
+    import imgclone
+    if not arch:
+        return None
+    root = driver.REPO_ROOT
+    d = tempfile.mkdtemp(prefix=f".hsimg-{driver.RUN_ID or 'x'}-", dir=root)
+    n = 0
+    for a in [arch]:
+        for var, name in (("LEANDROS_DISK_IMAGE", f"leandros-limine-{a}.img"),
+                          ("LEANDROS_ROOT_IMAGE", f"f2fs-data0-{a}.img"),
+                          ("LEANDROS_VARS_FD", f"{a}_vars.fd")):
+            src = os.path.join(root, name)
+            if var in env or not os.path.exists(src):
+                continue
+            dst = os.path.join(d, name)
+            imgclone.clone_file(src, dst)
+            # No reflink on this fs (ext4 farm): the clone was a multi-GB real copy still dirty
+            # in the page cache; its writeback storm would hit the guest's first reads (seconds
+            # of host I/O latency: f2fsatomictest's long-hold/WDOG gates). Flush before booting.
+            try:
+                fd = os.open(dst, os.O_RDWR)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+            env[var] = dst
+            n += 1
+    if not n:
+        shutil.rmtree(d, ignore_errors=True)
+        return None
+    return d
 
 
 def boot_and_login(arch, mode, gpu, scale, run):
@@ -793,6 +848,17 @@ def main(argv):
                 else:
                     fcount = "0"
                 print(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s] fails={fcount}", flush=True)
+                if c.startswith("host:"):
+                    # every host suite's stdout+stderr, so a failure that dies in its first second is diagnosable
+                    lname = re.sub(r"[^A-Za-z0-9_.-]+", "_", c[len("host:"):]).strip("_")
+                    os.makedirs(os.path.join(rdir, "logs"), exist_ok=True)
+                    with open(os.path.join(rdir, "logs", f"{lname}.log"), "w") as lf:
+                        lf.write(r["output"])
+                    if not ok:
+                        tail = [l for l in r["output"].splitlines() if l.strip()][-15:]
+                        print("    --- last lines of host:" + c[len("host:"):] + " (full: logs/" + lname + ".log)\n"
+                              + "\n".join("    | " + l for l in tail) if tail else
+                              f"    --- host:{c[len('host:'):]} printed nothing (rc={rc})", flush=True)
                 res.write(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s]\n{r['output']}\n")
                 res.flush()
                 entry["results"].append({"cmd": c, "rc": r["rc"], "status": r["status"],
