@@ -16,7 +16,7 @@ esac
 (
   set -e
   grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21"; exit 3; }
-  PKGS="flatpak"
+  PKGS="flatpak ostree"
   DEVPKGS="flatpak-dev ostree-dev json-glib-dev libxmlb-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""; APK="apk"
@@ -37,6 +37,10 @@ esac
   LIBFP=$(cd "$R/usr/lib" && ls libflatpak.so.0* | head -1)
   [ -n "$LIBFP" ] || { echo "libflatpak.so.0 not found in the flatpak packages"; exit 6; }
   cp -L "$R/usr/lib/$LIBFP" "$S/usr/lib/libflatpak.so.0"
+  # The ostree CLI: the image's apk db is told it provides `ostree` (the closure ships
+  # libostree from that package), so `apk add ostree` is a no-op there -- ship the binary
+  # too, or the package would be claimed but its command missing.
+  mkdir -p "$S/usr/bin"; cp -L "$R/usr/bin/ostree" "$S/usr/bin/ostree"
   # -- closure ------------------------------------------------------------------
   is_excluded() {
     case "$1" in
@@ -52,7 +56,7 @@ esac
     return 1
   }
   needed_of() { readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p'; }
-  { needed_of "$S/usr/lib/libflatpak.so.0"; echo libflatpak.so.0; } > /tmp/queue
+  { needed_of "$S/usr/lib/libflatpak.so.0"; needed_of "$S/usr/bin/ostree"; echo libflatpak.so.0; } > /tmp/queue
   : > /tmp/seen; : > "$S/CLOSURE.txt"; : > /tmp/missing
   while [ -s /tmp/queue ]; do
     sort -u /tmp/queue > /tmp/q2; : > /tmp/queue
