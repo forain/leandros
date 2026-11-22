@@ -3,8 +3,8 @@
 //! On a machine whose kernel exports no power_supply class (a desktop PC, QEMU)
 //! this reports what upower reports there: no devices, OnBattery = false, a
 //! DisplayDevice of Type Unknown with IsPresent = false ("battery-missing"),
-//! and a KbdBacklight with maximum 0 (with a `*kbd_backlight*` LED in
-//! `/sys/class/leds` it serves that LED, see [`KbdBacklight`]). On a laptop (the kernel's ACPI battery /
+//! and no KbdBacklight object (with a `*kbd_backlight*` LED in
+//! `/sys/class/leds` at start-up it serves that LED, see [`KbdBacklight`]). On a laptop (the kernel's ACPI battery /
 //! AC overlay) it exports `devices/battery_BAT0`, `devices/line_power_AC`, a
 //! DisplayDevice aggregating the batteries, OnBattery, and re-reads sysfs every
 //! 10 s, emitting PropertiesChanged for what moved.
@@ -433,8 +433,13 @@ pub async fn serve(builder: zbus::connection::Builder<'_>) -> zbus::Result<zbus:
         builder = builder.serve_at(ObjectPath::try_from(p.clone())?, Device { d: st.clone(), update_time: t.clone() })?;
         states.push((p, st, t));
     }
-    let conn = builder.serve_at(KBD_BACKLIGHT, KbdBacklight::from_env())?.name(NAME)?.build().await?;
-    tokio::spawn(kbd_watch(conn.clone(), KBD_BACKLIGHT.to_string()));
+    // Like upowerd: the KbdBacklight object exists only when a `*kbd_backlight*`
+    // LED does at start-up; without it COSMIC hides the slider.
+    let kbd = KbdBacklight::from_env();
+    let has_kbd = kbd.led().is_some();
+    if has_kbd { builder = builder.serve_at(KBD_BACKLIGHT, kbd)?; }
+    let conn = builder.name(NAME)?.build().await?;
+    if has_kbd { tokio::spawn(kbd_watch(conn.clone(), KBD_BACKLIGHT.to_string())); }
     if snap.is_some() {
         let c = conn.clone();
         tokio::spawn(async move {

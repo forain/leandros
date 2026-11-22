@@ -62,6 +62,20 @@ pub async fn run(c: zbus::Connection, with_portal: bool) -> (u32, u32) {
     }
     let c = &c;
 
+    // No LED -> no KbdBacklight object (stock upowerd), so the applet hides the slider.
+    check!("UPower KbdBacklight absent w/o LED", async {
+        let has = std::fs::read_dir("/sys/class/leds").map(|d| d.filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("kbd_backlight"))).unwrap_or(false);
+        if has { return Ok::<_, zbus::Error>("skipped (machine has a kbd LED)".to_string()); }
+        let r: R<i32> = call(c, "org.freedesktop.UPower", "/org/freedesktop/UPower/KbdBacklight",
+            "org.freedesktop.UPower.KbdBacklight", "GetMaxBrightness", &()).await;
+        match r {
+            Err(zbus::Error::MethodError(n, _, _)) if n.as_str().contains("Unknown") => Ok(format!("{n}")),
+            Err(e) => Err(fail(format!("expected UnknownObject, got {e}"))),
+            Ok(v) => Err(fail(format!("object present, max {v}"))),
+        }
+    });
+
     // --- UPower KbdBacklight over a fake LED (the real tree has none in QEMU) ---
     check!("UPower KbdBacklight fake LED", async {
         use futures_util::StreamExt;
@@ -102,7 +116,7 @@ pub async fn run(c: zbus::Connection, with_portal: bool) -> (u32, u32) {
         if error_name(&bad) != "org.freedesktop.DBus.Error.InvalidArgs" { return Err(fail(format!("set 3: {}", error_name(&bad)))); }
         c.object_server().remove::<crate::upower::KbdBacklight, _>(KP).await?;
         let _ = std::fs::remove_dir_all(dir);
-        Ok::<_, zbus::Error>("max=2 set/get/signals ok")
+        Ok::<_, zbus::Error>("max=2 set/get/signals ok".to_string())
     });
 
     // --- xdg-desktop-portal (ports/portal) ---
