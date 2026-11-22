@@ -595,23 +595,57 @@ pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// Lock-free mirror of `VirtioGpuDevice::fences_ahead` (fences retired ahead
 /// of an older unretired one), slot for slot. Lets the DRM layer retire an
 /// out-of-order fence without waiting for the global floor (design venusasync
-/// part C). Slots past `AHEAD_PUB_N` are not mirrored (such a fence waits for
-/// the floor, as before).
-const AHEAD_PUB_N: usize = 1024;
-static AHEAD_PUB: [core::sync::atomic::AtomicU64; AHEAD_PUB_N] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; AHEAD_PUB_N];
+/// part C). Segmented so it can grow without ever moving: chunk 0 is static,
+/// later chunks of `AHEAD_CHUNK` slots are allocated in task context by
+/// `ahead_reserve` (under the device lock, from `enqueue`) and never freed or
+/// moved, so a lock-free reader (tick, ISR) only ever sees a null or a final
+/// pointer. A slot is written only after its chunk exists; slots without a
+/// mirror just make that fence wait for the floor.
+const AHEAD_CHUNK: usize = 1024;
+/// Hard ceiling on fences retired ahead of a stalled one (effectively
+/// unreachable): beyond it fenced work is answered EAGAIN.
+const AHEAD_MAX: usize = 65536;
+static AHEAD_PUB: [core::sync::atomic::AtomicU64; AHEAD_CHUNK] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; AHEAD_CHUNK];
+static AHEAD_EXTRA: [core::sync::atomic::AtomicPtr<core::sync::atomic::AtomicU64>; AHEAD_MAX / AHEAD_CHUNK] =
+    [const { core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()) }; AHEAD_MAX / AHEAD_CHUNK];
+
+/// The mirror slot for table index `i`, if its chunk exists.
+fn ahead_pub_slot(i: usize) -> Option<&'static core::sync::atomic::AtomicU64> {
+    use core::sync::atomic::Ordering::Acquire;
+    let c = i / AHEAD_CHUNK;
+    if c == 0 { return Some(&AHEAD_PUB[i]); }
+    let p = AHEAD_EXTRA.get(c - 1)?.load(Acquire);
+    if p.is_null() { return None; }
+    // SAFETY: a published chunk is AHEAD_CHUNK slots, leaked, never freed.
+    Some(unsafe { &*p.add(i % AHEAD_CHUNK) })
+}
 
 /// Occupied retired-ahead slots (mirror of `VirtioGpuDevice::ahead_n`).
 static AHEAD_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Capacity of `fences_ahead` and the queue size it was derived from (stats,
-/// and the overflow test's bound).
+/// Capacity of `fences_ahead` and the queue size it tracks (stats).
 static AHEAD_CAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static AHEAD_QSIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Fenced submissions refused because the retired-ahead table was nearly full
-/// (a stalled fence with thousands retired behind it).
+/// Peak of `ahead_n`, and how many times the table was grown.
+static AHEAD_PEAK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static AHEAD_GROWTHS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Fenced submissions refused at the hard ceiling `AHEAD_MAX` (EAGAIN).
 static FENCE_SUBMIT_REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Retirements that found no slot (cannot happen while `enqueue` refuses).
+/// Retirements that found no slot: an invariant violation (`ahead_reserve`
+/// keeps `ahead_n + qsize` slots free), counted rather than jumping the floor.
 static FENCE_AHEAD_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Why `enqueue` refused: `Busy` = the retired-ahead ceiling (retry later,
+/// EAGAIN), `Other` = out of ring/memory (EIO as before).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnqErr { Busy, Other }
+
+/// True while fenced work is refused for want of retired-ahead slots (the
+/// ceiling). Callers turn a `submit_3d` failure into EAGAIN on this.
+pub fn fence_table_at_ceiling() -> bool {
+    AHEAD_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize
+        + AHEAD_QSIZE.load(core::sync::atomic::Ordering::Relaxed) as usize > AHEAD_MAX
+}
 
 /// Whether fence `id` has retired, without `VIRTIO_GPU`: `id <= floor` or
 /// published retired-ahead. The floor only rises, so a hit on it is final and
@@ -623,8 +657,16 @@ pub fn fence_done_lockfree(id: u64) -> bool {
     if id == 0 { return true; }
     if id <= GPU_FENCE_FLOOR.load(Acquire) { return true; }
     if AHEAD_COUNT.load(Acquire) != 0 {
-        for a in AHEAD_PUB.iter() {
-            if a.load(Acquire) == id { return true; }
+        for c in 0..=AHEAD_EXTRA.len() {
+            if c == 0 {
+                for a in AHEAD_PUB.iter() { if a.load(Acquire) == id { return true; } }
+            } else {
+                let p = AHEAD_EXTRA[c - 1].load(Acquire);
+                if p.is_null() { break; }
+                for k in 0..AHEAD_CHUNK {
+                    if unsafe { &*p.add(k) }.load(Acquire) == id { return true; }
+                }
+            }
         }
     }
     core::sync::atomic::fence(SeqCst);
@@ -793,9 +835,9 @@ pub fn fence_stats_text(s: &mut alloc::string::String) {
     let _ = writeln!(s, "irqs={} isr_lock_lost={} task_reap_events={} retired_ahead={}",
         CTRLQ_IRQS.load(Relaxed), CTRLQ_ISR_LOCK_LOST.load(Relaxed),
         TASK_REAP_EVENTS.load(Relaxed), FENCES_RETIRED_AHEAD.load(Relaxed));
-    let _ = writeln!(s, "unlock_drains={} ahead_n={} ahead_cap={} ahead_qsize={} submit_refused={} ahead_dropped={}",
-        CTRLQ_UNLOCK_DRAINS.load(Relaxed), AHEAD_COUNT.load(Relaxed), AHEAD_CAP.load(Relaxed),
-        AHEAD_QSIZE.load(Relaxed), FENCE_SUBMIT_REFUSED.load(Relaxed), FENCE_AHEAD_DROPPED.load(Relaxed));
+    let _ = writeln!(s, "unlock_drains={} ahead_n={} ahead_peak={} ahead_growths={} ahead_cap={} ahead_qsize={} submit_refused={} ahead_dropped={}",
+        CTRLQ_UNLOCK_DRAINS.load(Relaxed), AHEAD_COUNT.load(Relaxed), AHEAD_PEAK.load(Relaxed), AHEAD_GROWTHS.load(Relaxed),
+        AHEAD_CAP.load(Relaxed), AHEAD_QSIZE.load(Relaxed), FENCE_SUBMIT_REFUSED.load(Relaxed), FENCE_AHEAD_DROPPED.load(Relaxed));
     let _ = writeln!(s, "hook_lat_us n={} p50<={} p99<={} max={}",
         HOOK_LAT.n.load(Relaxed), HOOK_LAT.quantile_ub(500), HOOK_LAT.quantile_ub(990), HOOK_LAT.max.load(Relaxed));
     let _ = writeln!(s, "hol_us n={} p50<={} p99<={} max={}",
@@ -1655,9 +1697,9 @@ impl VirtioGpuDevice {
                     core::sync::atomic::Ordering::Release,
                 );
             }
-            // Cap = 4 x queue: `enqueue` refuses a fenced chain once fewer than a
-            // queue's worth of slots remain, so a slot always exists for every
-            // chain that can still retire (the floor is never jumped).
+            // Initial cap = 4 x queue; `ahead_reserve` (task context, from
+            // `enqueue`) grows it so a free slot always exists for every chain
+            // that can still retire (the floor is never jumped).
             self.fences_ahead = alloc::vec![0u64; (qsize * 4).max(1)];
             self.fences_ahead_t = alloc::vec![0u64; (qsize * 4).max(1)];
             AHEAD_CAP.store((qsize * 4).max(1) as u64, core::sync::atomic::Ordering::Relaxed);
@@ -1946,7 +1988,7 @@ impl VirtioGpuDevice {
                         self.fence_floor = next;
                         // Floor first, mirror slot cleared after (see `fence_done_lockfree`).
                         GPU_FENCE_FLOOR.store(next, Release);
-                        if i < AHEAD_PUB_N { AHEAD_PUB[i].store(0, Release); }
+                        if let Some(m) = ahead_pub_slot(i) { m.store(0, Release); }
                         AHEAD_COUNT.store(self.ahead_n as u64, Release);
                         if let Some(&t) = self.fences_ahead_t.get(i) { HOL_LAT.record(now.saturating_sub(t)); }
                     }
@@ -1957,12 +1999,13 @@ impl VirtioGpuDevice {
             self.fences_ahead[i] = id;
             self.ahead_n += 1;
             AHEAD_COUNT.store(self.ahead_n as u64, Release);
-            if i < AHEAD_PUB_N { AHEAD_PUB[i].store(id, Release); }
+            AHEAD_PEAK.fetch_max(self.ahead_n as u64, Relaxed);
+            if let Some(m) = ahead_pub_slot(i) { m.store(id, Release); }
             if let Some(t) = self.fences_ahead_t.get_mut(i) { *t = now; }
             FENCES_RETIRED_AHEAD.fetch_add(1, Relaxed);
         } else {
-            // No slot. `enqueue` refuses new fenced chains while fewer than a
-            // queue's worth of slots remain, so this cannot happen. NEVER
+            // No slot. `ahead_reserve` keeps ahead_n + qsize slots free, so this
+            // cannot happen (the counter would show it). NEVER
             // advance the floor here: that would signal an older unretired
             // fence (its syncobjs, out-fences, buffers) before the GPU is done.
             // The retirement is lost instead (the watchdog reports a hang).
@@ -2197,6 +2240,50 @@ impl VirtioGpuDevice {
         }
     }
 
+    /// Make sure the retired-ahead table has `ahead_n + qsize` free slots, so
+    /// every fenced chain that can still retire has a slot waiting (the ISR
+    /// never allocates and the floor never jumps past an unretired fence).
+    /// Grows in task context under the device lock: the table `Vec`s are only
+    /// touched under that lock, and the lock-free mirror grows by whole chunks
+    /// that never move. Refuses (`Busy`) only at `AHEAD_MAX`.
+    fn ahead_reserve(&mut self) -> Result<(), EnqErr> {
+        use core::sync::atomic::Ordering::{Relaxed, Release};
+        let q = AHEAD_QSIZE.load(Relaxed) as usize;
+        let need = self.ahead_n + q;
+        if need <= self.fences_ahead.len() { return Ok(()); }
+        if need > AHEAD_MAX {
+            FENCE_SUBMIT_REFUSED.fetch_add(1, Relaxed);
+            return Err(EnqErr::Busy);
+        }
+        let cur = self.fences_ahead.len();
+        let new_len = (cur * 2).max(need).div_ceil(AHEAD_CHUNK) * AHEAD_CHUNK;
+        let new_len = new_len.min(AHEAD_MAX.max(need));
+        let add = new_len - cur;
+        if self.fences_ahead.try_reserve_exact(add).is_err()
+            || self.fences_ahead_t.try_reserve_exact(add).is_err()
+        {
+            return Err(EnqErr::Other);
+        }
+        self.fences_ahead.resize(new_len, 0);
+        self.fences_ahead_t.resize(new_len, 0);
+        // Mirror chunks, best effort (an unmirrored slot only delays that fence
+        // to the floor). Chunk 0 is static.
+        let mut c = 1;
+        while c * AHEAD_CHUNK < new_len && c <= AHEAD_EXTRA.len() {
+            if AHEAD_EXTRA[c - 1].load(Relaxed).is_null() {
+                let mut v: Vec<core::sync::atomic::AtomicU64> = Vec::new();
+                if v.try_reserve_exact(AHEAD_CHUNK).is_err() { break; }
+                for _ in 0..AHEAD_CHUNK { v.push(core::sync::atomic::AtomicU64::new(0)); }
+                let p = alloc::boxed::Box::leak(v.into_boxed_slice()).as_mut_ptr();
+                AHEAD_EXTRA[c - 1].store(p, Release);
+            }
+            c += 1;
+        }
+        AHEAD_CAP.store(new_len as u64, Relaxed);
+        AHEAD_GROWTHS.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
     /// Build, record and kick one control-queue chain. The caller has already
     /// checked there is room. Returns the head descriptor and the fence id
     /// (0 if unfenced).
@@ -2207,14 +2294,9 @@ impl VirtioGpuDevice {
         resp_capacity: usize,
         fenced: bool,
         sync: bool,
-    ) -> Result<(u16, u64), ()> {
+    ) -> Result<(u16, u64), EnqErr> {
         let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
-        if fenced && self.ahead_n + AHEAD_QSIZE.load(core::sync::atomic::Ordering::Relaxed) as usize
-            > self.fences_ahead.len()
-        {
-            FENCE_SUBMIT_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            return Err(());
-        }
+        if fenced { self.ahead_reserve()?; }
         let fence_id = if fenced {
             let f = self.next_fence_id;
             self.next_fence_id = self.next_fence_id.wrapping_add(1).max(1);
@@ -2227,12 +2309,12 @@ impl VirtioGpuDevice {
         let resp_order = order_for_bytes(resp_capacity);
         let pay_order = order_for_bytes(payload.len().max(1));
 
-        let req_phys = mm::buddy::alloc(req_order).ok_or(())?;
+        let req_phys = mm::buddy::alloc(req_order).ok_or(EnqErr::Other)?;
         let resp_phys = match mm::buddy::alloc(resp_order) {
             Some(p) => p,
             None => {
                 mm::buddy::free(req_phys, req_order);
-                return Err(());
+                return Err(EnqErr::Other);
             }
         };
         let pay_phys = if payload.is_empty() {
@@ -2243,7 +2325,7 @@ impl VirtioGpuDevice {
                 None => {
                     mm::buddy::free(req_phys, req_order);
                     mm::buddy::free(resp_phys, resp_order);
-                    return Err(());
+                    return Err(EnqErr::Other);
                 }
             }
         };
@@ -2274,7 +2356,7 @@ impl VirtioGpuDevice {
             }
             core::ptr::write_bytes(mm::phys_to_virt(resp_phys) as *mut u8, 0, resp_capacity);
 
-            let q = self.queues[0].as_mut().ok_or(())?;
+            let q = self.queues[0].as_mut().ok_or(EnqErr::Other)?;
             let head_idx = q.add_desc(req_phys as u64, head.len() as u32, VIRTQ_DESC_F_NEXT);
             let mut last = head_idx;
             if !payload.is_empty() {
@@ -2294,7 +2376,7 @@ impl VirtioGpuDevice {
                 abandoned: false,
             });
 
-            let q = self.queues[0].as_mut().ok_or(())?;
+            let q = self.queues[0].as_mut().ok_or(EnqErr::Other)?;
             q.submit(head_idx);
             let notify_addr =
                 (notify_cfg as usize + q.notify_off as usize * mult as usize) as *mut u16;
@@ -2369,7 +2451,7 @@ impl VirtioGpuDevice {
         let payload = payload.unwrap_or(&[]);
         let need = if payload.is_empty() { 2 } else { 3 };
         if !self.ensure_ctrlq_room(need) { return Err(()); }
-        let (_, fence) = self.enqueue(head, payload, HDR_LEN, fenced, false)?;
+        let (_, fence) = self.enqueue(head, payload, HDR_LEN, fenced, false).map_err(|_| ())?;
         CTRLQ_ASYNC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(fence)
     }
@@ -2398,7 +2480,7 @@ impl VirtioGpuDevice {
         let need = if payload.is_empty() { 2 } else { 3 };
         if !self.ensure_ctrlq_room(need) { return Err(()); }
         let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
-        let (head_idx, _fence) = self.enqueue(head, payload, resp_capacity, fenced, true)?;
+        let (head_idx, _fence) = self.enqueue(head, payload, resp_capacity, fenced, true).map_err(|_| ())?;
         CTRLQ_SYNC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok((head_idx, hdr_type))
     }

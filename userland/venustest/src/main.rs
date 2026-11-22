@@ -966,6 +966,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
     }
     if !report(b"phase7_fence_fd_signals_within_2s", all_signalled) { failures += 1; }
 
+    let mut ud_start = u64::MAX;
     // ── 2b. Out-of-order retirement: the newer fence signals while the older is held ──
     // Park two fences, release only the NEWER one: its out-fence must signal at
     // once while the older stays pending (the lock-free retired-ahead path),
@@ -1006,42 +1007,46 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if !report(b"phase7b_reverse_release_older_signals_on_release", rel_all && older_signals) {
             failures += 1;
         }
-        if !report(b"phase7b_retired_ahead_and_unlock_drains_counted",
-                   ra0 != u64::MAX && ra1 > ra0 && ud0 != u64::MAX && ud1 > ud0) {
+        if !report(b"phase7b_retired_ahead_counted", ra0 != u64::MAX && ra1 > ra0) {
             failures += 1;
         }
+        ud_start = ud0;
     }
 
-    // ── 2c. Table overflow: a stalled fence is never signalled early ─────────
-    // Hold ONE fence, push fenced submissions behind it until the retired-ahead
-    // table is nearly full (the driver then refuses new fenced work instead of
-    // jumping the floor past the stalled fence). The held fence must stay
-    // unsignalled throughout and signal on release; submissions work again after.
+    // ── 2c. Deep retired-ahead: a stalled fence never refuses work ───────────
+    // Hold ONE fence and retire well over the old table limit (768 = 3 x queue)
+    // of fenced submissions behind it. Every submit must SUCCEED (the table
+    // grows; nothing is refused with EIO), the held fence must stay unsignalled
+    // throughout, then signal on release. Counters: peak depth and growth count.
     {
-        let cap = fence_stat(b"ahead_cap");
+        let cap0 = fence_stat(b"ahead_cap");
+        let growths0 = fence_stat(b"ahead_growths");
         let refused0 = fence_stat(b"submit_refused");
         let dropped0 = fence_stat(b"ahead_dropped");
+        let target: u64 = if cap0 != u64::MAX && cap0 + 512 > 2000 { cap0 + 512 } else { 2000 };
         let held3 = fence_hold_mode(3);
         let mut eh = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
         let okh = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eh as *mut _) == 0 && eh.fence_fd >= 3;
-        let mut refused = false;
-        let mut tries = 0u64;
-        let mut fails = 0u32;
-        if held3 && okh && cap != u64::MAX && cap != 0 {
-            while tries < cap * 4 + 256 && !refused && fails < 5000 {
+        let mut ok_n = 0u64;
+        let mut fails = 0u64;
+        let mut early = false;
+        if held3 && okh {
+            while ok_n + fails < target && fails < 16 {
                 let mut e = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
                 if ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e as *mut _) == 0 && e.fence_fd >= 3 {
                     close(e.fence_fd);
-                    tries += 1;
+                    ok_n += 1;
                 } else {
                     fails += 1;
-                    if fence_stat(b"submit_refused") > refused0 { refused = true; }
-                    else { let mut p = PollFd { fd: -1, events: 0, revents: 0 }; poll(&mut p as *mut PollFd, 0, 1); }
                 }
+                if ok_n % 256 == 0 && poll_in_ready(eh.fence_fd) { early = true; break; }
             }
         }
-        let still_held = okh && !poll_in_within(eh.fence_fd, 100);
+        let peak = fence_stat(b"ahead_peak");
+        let growths1 = fence_stat(b"ahead_growths");
+        let still_held = okh && !early && !poll_in_within(eh.fence_fd, 100);
         let dropped1 = fence_stat(b"ahead_dropped");
+        let refused1 = fence_stat(b"submit_refused");
         let rel = fence_hold_mode(0);
         let signals = okh && poll_in_within(eh.fence_fd, 2000);
         if okh { close(eh.fence_fd); }
@@ -1050,14 +1055,31 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let again = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3
             && poll_in_within(ea.fence_fd, 2000);
         if ea.fence_fd >= 3 { close(ea.fence_fd); }
-        out(b"  7c: held3="); out_u64(held3 as u64); out(b" okh="); out_u64(okh as u64); out(b" refused="); out_u64(refused as u64);
-        out(b" still_held="); out_u64(still_held as u64); out(b" tries="); out_u64(tries); out(b" fails="); out_u64(fails as u64);
-        out(b" cap="); out_u64(cap); out(b" dropped "); out_u64(dropped0); out(b"->"); out_u64(dropped1); out(b"\n");
-        if !report(b"phase7c_overflow_stalled_fence_stays_pending",
-                   held3 && okh && refused && still_held && dropped1 == dropped0) {
+        out(b"  7c: held3="); out_u64(held3 as u64); out(b" okh="); out_u64(okh as u64); out(b" ok_n="); out_u64(ok_n);
+        out(b" fails="); out_u64(fails); out(b" target="); out_u64(target); out(b" still_held="); out_u64(still_held as u64);
+        out(b" peak="); out_u64(peak); out(b" growths "); out_u64(growths0); out(b"->"); out_u64(growths1);
+        out(b" cap0="); out_u64(cap0); out(b" refused "); out_u64(refused0); out(b"->"); out_u64(refused1);
+        out(b" dropped "); out_u64(dropped0); out(b"->"); out_u64(dropped1); out(b"\n");
+        if !report(b"phase7c_deep_retired_ahead_all_submits_succeed",
+                   held3 && okh && ok_n == target && fails == 0 && refused1 == refused0 && dropped1 == dropped0) {
             failures += 1;
         }
-        if !report(b"phase7c_overflow_stalled_fence_signals_on_release", rel && signals && again) {
+        if !report(b"phase7c_deep_stalled_fence_stays_pending", still_held && peak != u64::MAX && peak >= target - 64) {
+            failures += 1;
+        }
+        if !report(b"phase7c_deep_table_grew", growths0 != u64::MAX && growths1 > growths0) {
+            failures += 1;
+        }
+        if !report(b"phase7c_deep_stalled_fence_signals_on_release", rel && signals && again) {
+            failures += 1;
+        }
+    }
+
+    // Unlock drains only happen when an interrupt loses the device lock, which a
+    // 2-submit window need not see; across 7b and the 2000-submit 7c it must.
+    {
+        let ud1 = fence_stat(b"unlock_drains");
+        if !report(b"phase7_unlock_drains_counted", ud_start != u64::MAX && ud1 != u64::MAX && ud1 > ud_start) {
             failures += 1;
         }
     }

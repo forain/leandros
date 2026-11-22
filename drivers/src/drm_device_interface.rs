@@ -9532,7 +9532,15 @@ impl DrmDeviceInterface {
         let fence = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
-            gpu.submit_3d(ctx, &cmds, ring_idx).map_err(|_| DriverError::Io)?
+            match gpu.submit_3d(ctx, &cmds, ring_idx) {
+                Ok(f) => f,
+                Err(()) => {
+                    let busy = crate::virtio_gpu::fence_table_at_ceiling();
+                    drop(guard);
+                    if busy { sched::yield_now("gpu-fence-ceiling"); }
+                    return Err(if busy { DriverError::Errno(11) } else { DriverError::Io });
+                }
+            }
         };
 
         // Attach the fence to every BO the submission named, and record it as
@@ -9931,6 +9939,10 @@ impl DrmDeviceInterface {
             };
             if sub.is_err() {
                 if phys != 0 { mm::buddy::free(phys, order); }
+                if crate::virtio_gpu::fence_table_at_ceiling() {
+                    sched::yield_now("gpu-fence-ceiling");
+                    return Err(DriverError::Errno(11));
+                }
                 return Err(DriverError::Io);
             }
         }
