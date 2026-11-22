@@ -736,6 +736,41 @@ unsafe fn fence_hold(on: bool) -> bool {
     ok
 }
 
+/// Fence-hold knob modes: 1 park all, 2 release newest only, 3 park only the
+/// first, 0 release everything.
+unsafe fn fence_hold_mode(m: u8) -> bool {
+    let f = open(b"/proc/drm/fence_hold\0".as_ptr(), 1 /* O_WRONLY */);
+    if f < 0 { return false; }
+    let v = [b'0' + m, b'\n'];
+    let ok = write(f, v.as_ptr() as *const c_void, 2) == 2;
+    close(f);
+    ok
+}
+
+/// One `key=value` counter of `/proc/drm/fence_stats` (u64::MAX if absent).
+unsafe fn fence_stat(key: &[u8]) -> u64 {
+    let f = open(b"/proc/drm/fence_stats\0".as_ptr(), 0);
+    if f < 0 { return u64::MAX; }
+    let mut buf = [0u8; 4096];
+    let n = read(f, buf.as_mut_ptr() as *mut c_void, buf.len());
+    close(f);
+    if n <= 0 { return u64::MAX; }
+    let b = &buf[..n as usize];
+    let mut i = 0;
+    while i + key.len() + 1 < b.len() {
+        if &b[i..i + key.len()] == key && b[i + key.len()] == b'='
+            && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\n')
+        {
+            let mut j = i + key.len() + 1;
+            let mut v = 0u64;
+            while j < b.len() && b[j].is_ascii_digit() { v = v * 10 + (b[j] - b'0') as u64; j += 1; }
+            return v;
+        }
+        i += 1;
+    }
+    u64::MAX
+}
+
 /// Print `/proc/drm/fence_stats` (completion-path counters) to the console.
 unsafe fn dump_fence_stats(tag: &[u8]) {
     let f = open(b"/proc/drm/fence_stats\0".as_ptr(), 0);
@@ -930,6 +965,102 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         }
     }
     if !report(b"phase7_fence_fd_signals_within_2s", all_signalled) { failures += 1; }
+
+    // ── 2b. Out-of-order retirement: the newer fence signals while the older is held ──
+    // Park two fences, release only the NEWER one: its out-fence must signal at
+    // once while the older stays pending (the lock-free retired-ahead path),
+    // then the older signals when released. Counters must show the ahead
+    // retirement and the unlock drains.
+    {
+        let ra0 = fence_stat(b"retired_ahead");
+        let ud0 = fence_stat(b"unlock_drains");
+        let held2 = fence_hold_mode(1);
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+        let mut eb = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+        let oka = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+        let okb = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3;
+        let mut both_pending = false;
+        let mut newer_signals = false;
+        let mut older_held = false;
+        let mut older_signals = false;
+        if held2 && oka && okb {
+            both_pending = !poll_in_within(ea.fence_fd, 50) && !poll_in_within(eb.fence_fd, 50);
+            let rel = fence_hold_mode(2);
+            newer_signals = rel && poll_in_within(eb.fence_fd, 1000);
+            older_held = !poll_in_within(ea.fence_fd, 100);
+        }
+        let rel_all = fence_hold_mode(0);
+        if oka { older_signals = poll_in_within(ea.fence_fd, 2000); }
+        if oka { close(ea.fence_fd); }
+        if okb { close(eb.fence_fd); }
+        let ra1 = fence_stat(b"retired_ahead");
+        let ud1 = fence_stat(b"unlock_drains");
+        out(b"  7b: held="); out_u64(held2 as u64); out(b" oka="); out_u64(oka as u64); out(b" okb="); out_u64(okb as u64);
+        out(b" both_pending="); out_u64(both_pending as u64); out(b" newer="); out_u64(newer_signals as u64);
+        out(b" older_held="); out_u64(older_held as u64); out(b" ra "); out_u64(ra0); out(b"->"); out_u64(ra1);
+        out(b" ud "); out_u64(ud0); out(b"->"); out_u64(ud1); out(b"\n");
+        if !report(b"phase7b_reverse_release_newer_signals_first",
+                   held2 && oka && okb && both_pending && newer_signals && older_held) {
+            failures += 1;
+        }
+        if !report(b"phase7b_reverse_release_older_signals_on_release", rel_all && older_signals) {
+            failures += 1;
+        }
+        if !report(b"phase7b_retired_ahead_and_unlock_drains_counted",
+                   ra0 != u64::MAX && ra1 > ra0 && ud0 != u64::MAX && ud1 > ud0) {
+            failures += 1;
+        }
+    }
+
+    // ── 2c. Table overflow: a stalled fence is never signalled early ─────────
+    // Hold ONE fence, push fenced submissions behind it until the retired-ahead
+    // table is nearly full (the driver then refuses new fenced work instead of
+    // jumping the floor past the stalled fence). The held fence must stay
+    // unsignalled throughout and signal on release; submissions work again after.
+    {
+        let cap = fence_stat(b"ahead_cap");
+        let refused0 = fence_stat(b"submit_refused");
+        let dropped0 = fence_stat(b"ahead_dropped");
+        let held3 = fence_hold_mode(3);
+        let mut eh = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+        let okh = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eh as *mut _) == 0 && eh.fence_fd >= 3;
+        let mut refused = false;
+        let mut tries = 0u64;
+        let mut fails = 0u32;
+        if held3 && okh && cap != u64::MAX && cap != 0 {
+            while tries < cap * 4 + 256 && !refused && fails < 5000 {
+                let mut e = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+                if ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e as *mut _) == 0 && e.fence_fd >= 3 {
+                    close(e.fence_fd);
+                    tries += 1;
+                } else {
+                    fails += 1;
+                    if fence_stat(b"submit_refused") > refused0 { refused = true; }
+                    else { let mut p = PollFd { fd: -1, events: 0, revents: 0 }; poll(&mut p as *mut PollFd, 0, 1); }
+                }
+            }
+        }
+        let still_held = okh && !poll_in_within(eh.fence_fd, 100);
+        let dropped1 = fence_stat(b"ahead_dropped");
+        let rel = fence_hold_mode(0);
+        let signals = okh && poll_in_within(eh.fence_fd, 2000);
+        if okh { close(eh.fence_fd); }
+        // Healthy again once the floor caught up.
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT, &stream, &[], 0);
+        let again = ioctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3
+            && poll_in_within(ea.fence_fd, 2000);
+        if ea.fence_fd >= 3 { close(ea.fence_fd); }
+        out(b"  7c: held3="); out_u64(held3 as u64); out(b" okh="); out_u64(okh as u64); out(b" refused="); out_u64(refused as u64);
+        out(b" still_held="); out_u64(still_held as u64); out(b" tries="); out_u64(tries); out(b" fails="); out_u64(fails as u64);
+        out(b" cap="); out_u64(cap); out(b" dropped "); out_u64(dropped0); out(b"->"); out_u64(dropped1); out(b"\n");
+        if !report(b"phase7c_overflow_stalled_fence_stays_pending",
+                   held3 && okh && refused && still_held && dropped1 == dropped0) {
+            failures += 1;
+        }
+        if !report(b"phase7c_overflow_stalled_fence_signals_on_release", rel && signals && again) {
+            failures += 1;
+        }
+    }
 
     // ── 3. Lifetime: 64 submits must consume no fds on net ───────────────────
     // [GUARD] Fails on an unpatched kernel because `first_fd` is 0, not >= 3.

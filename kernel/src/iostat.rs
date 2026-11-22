@@ -222,5 +222,5 @@ pub extern "C" fn kernel_drm_fence_hold_get() -> u32 {
 /// after 2 s), zero releases it.
 #[no_mangle]
 pub extern "C" fn kernel_drm_fence_hold_set(on: u32) {
-    drivers::virtio_gpu::fence_hold_set(on != 0);
+    drivers::virtio_gpu::fence_hold_set(on);
 }
