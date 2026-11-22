@@ -894,8 +894,15 @@ pub fn set_drm_sysfs_override(f: fn(&[u8], &mut [u8]) -> Option<usize>) {
 /// every path resolves exactly as before.
 static DRM_SYSFS_OVERRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+fn is_drm_sysfs_prefix(path: &[u8]) -> bool {
+    path.starts_with(b"/sys/dev/char/226:")
+        || path.starts_with(b"/sys/class/drm/")
+        || path.starts_with(b"/sys/devices/pci0000:00/")
+        || path.starts_with(b"/sys/bus/pci/devices/")
+}
+
 fn drm_sysfs_attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
-    if !path.starts_with(b"/sys/dev/char/226:") {
+    if !is_drm_sysfs_prefix(path) {
         return None;
     }
     let f = DRM_SYSFS_OVERRIDE.load(core::sync::atomic::Ordering::Acquire);
@@ -907,7 +914,7 @@ fn drm_sysfs_attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 fn is_drm_sysfs_override(path: &[u8]) -> bool {
-    if !path.starts_with(b"/sys/dev/char/226:") {
+    if !is_drm_sysfs_prefix(path) {
         return false;
     }
     let mut buf = [0u8; 512];
