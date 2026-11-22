@@ -12712,7 +12712,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
             } else if cur == 1 {
                 name[0] = b'.'; name[1] = b'.'; (2, true, 1)
             } else {
-                let r = if dev >= sysclass::SC_BASE {
+                let r = if sysclass::is_overlay_dev(dev) {
                     sysclass::dirent(dev, level, cur - 2, &mut name)
                 } else {
                     let mut n16 = [0u8; block::NAME_MAX];
@@ -12732,7 +12732,7 @@ fn handle_getdents64(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Messa
                 core::ptr::write(p as *mut u64, ino);
                 core::ptr::write(p.add(8) as *mut u64, 0u64);
                 core::ptr::write(p.add(16) as *mut u16, reclen as u16);
-                *p.add(18) = if is_dir { 4 } else if dev >= sysclass::SC_BASE && sysclass::dirent_link(dev, level, cur - 2) { 10 } else { 8 }; // DT_DIR / DT_LNK / DT_REG
+                *p.add(18) = if is_dir { 4 } else if sysclass::is_overlay_dev(dev) && sysclass::dirent_link(dev, level, cur - 2) { 10 } else { 8 }; // DT_DIR / DT_LNK / DT_REG
                 core::ptr::copy_nonoverlapping(name.as_ptr(), p.add(19), nlen);
                 *p.add(19 + nlen) = 0;
             }
@@ -17909,7 +17909,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
 }
 
 enum FdInfo { Static(&'static [u8]), Pipe(usize), RamData(*const u8), TmpIdx(usize),
-              Mounted(u32, u32), PtsSlave(u16), Cg(sched::cgroup::CgId), Bad }
+              Mounted(u32, u32), PtsSlave(u16), Cg(sched::cgroup::CgId), SysDir(u16, u8), Bad }
 
 fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Message {
     if buf_ptr == 0 || buf_len == 0 { return err_reply(-14); }
@@ -17988,10 +17988,11 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             // A cgroupfs directory fd names its tree path, so openat/openat2
             // relative to it (crun) resolve.
             VnodeKind::SysBlock { dev, .. } if cgroupfs::is_dev(*dev) => FdInfo::Cg(cgroupfs::dev_cg(*dev)),
-            // The synthesized /sys/class/block directory names itself, as on Linux:
-            // bwrap opens a bind source O_PATH and mounts /proc/self/fd/N, and
-            // flatpak binds /sys/block (-> class/block) into every sandbox.
-            VnodeKind::SysBlock { dev, level, .. } if *level == block::LVL_BLOCK && *dev == block::NO_DEV => FdInfo::Static(b"/sys/class/block"),
+            // Every synthesized sysfs directory (block registry and the
+            // sysclass/input/drm/cpu/ACPI overlays) names its own path, as on
+            // Linux: bwrap opens a bind source O_PATH and mounts
+            // /proc/self/fd/N, and flatpak binds /sys/block into every sandbox.
+            VnodeKind::SysBlock { dev, level, .. } => FdInfo::SysDir(*dev, *level),
             VnodeKind::SockAlias { .. } => FdInfo::Static(b"socket:[0]"),
             VnodeKind::EpollFd { .. } => FdInfo::Static(b"anon_inode:[eventpoll]"),
             _ => FdInfo::Bad,
@@ -17999,6 +18000,17 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
     };
     match info {
         FdInfo::Bad => err_reply(-9),
+        FdInfo::SysDir(dev, level) => {
+            let p = if sysclass::is_overlay_dev(dev) { sysclass::dir_path(dev, level) } else { block::sysfs_dir_path(dev, level) };
+            match p {
+                Some(p) => {
+                    let c = p.len().min(buf_len);
+                    unsafe { let _ = sched::uaccess::copy_raw(buf_ptr as *mut u8, p.as_ptr(), c); }
+                    val_reply(c as u64)
+                }
+                None => err_reply(-2),
+            }
+        }
         FdInfo::Mounted(port, file_id) => {
             let mut proxy = Message::empty();
             proxy.tag = VFS_FD_PATH;

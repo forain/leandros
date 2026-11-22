@@ -4683,7 +4683,101 @@ static void procbind_suite(void) {
     report("procbind_all_files_newns", r == 1);
 }
 
+/* Synthesized sysfs directories behave like Linux directories: an O_PATH fd
+ * names its own path, resolves openat() lookups and is a bind-mount source
+ * (bwrap: open O_PATH, mount /proc/self/fd/N; also open_tree/move_mount). Run
+ * by the sysfs suite as `mnttest sysfsbind`; /sys/class/block lists block
+ * devices only (the ACPI tables had leaked into it). */
+static int sfb_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+static int sfb_list(const char *dir, char ***out) {
+    DIR *d = opendir(dir); struct dirent *e; int n = 0, cap = 64;
+    if (!d) return -1;
+    char **v = calloc(cap, sizeof *v);
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        if (n == cap) { cap *= 2; v = realloc(v, cap * sizeof *v); }
+        v[n++] = strdup(e->d_name);
+    }
+    closedir(d); qsort(v, n, sizeof *v, sfb_cmp); *out = v; return n;
+}
+static int sfb_same(const char *a, const char *b, int *cnt) {
+    char **x = NULL, **y = NULL; int nx = sfb_list(a, &x), ny = sfb_list(b, &y), ok = nx >= 0 && nx == ny;
+    for (int i = 0; ok && i < nx; i++) ok = !strcmp(x[i], y[i]);
+    if (!ok) printf("  sfb: %s (%d) != %s (%d)\n", a, nx, b, ny);
+    if (cnt) *cnt = nx;
+    return ok;
+}
+static void sfb_case(const char *path, const char *tag, int idx) {
+    struct stat st; struct statfs sf; char name[160], lnk[256], proc[48], tgt[64];
+    if (stat(path, &st) != 0) { printf("sysfsbind_%s: SKIP\n", tag); return; }
+    snprintf(name, sizeof name, "sysfsbind_%s", tag);
+    int fd = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) { printf("  sfb: open %s errno=%d\n", path, errno); report(name, 0); return; }
+    snprintf(proc, sizeof proc, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(proc, lnk, sizeof lnk - 1);
+    if (n < 0) n = 0;
+    lnk[n] = 0;
+    char want[256]; if (!realpath(path, want)) strcpy(want, path);
+    int ok = strcmp(lnk, want) == 0;
+    if (!ok) printf("  sfb: readlink %s -> '%s' (want '%s')\n", path, lnk, want);
+    if (ok && fstatfs(fd, &sf) != 0) { printf("  sfb: fstatfs %s errno=%d\n", path, errno); ok = 0; }
+    /* openat-relative lookup of the first entry */
+    char **v = NULL; int cnt = sfb_list(path, &v);
+    if (ok && cnt > 0) {
+        struct stat s2; int cfd = openat(fd, v[0], O_PATH | O_CLOEXEC);
+        if (cfd < 0 || fstatat(fd, v[0], &s2, AT_SYMLINK_NOFOLLOW) != 0) { printf("  sfb: openat(%s,%s) errno=%d\n", path, v[0], errno); ok = 0; }
+        if (cfd >= 0) close(cfd);
+    }
+    if (ok) {
+        /* bind mount of the fd (bwrap) in a private mount namespace */
+        pid_t c = fork();
+        if (c == 0) {
+            int bad = 0, got;
+            if (unshare(CLONE_NEWNS) != 0) _exit(10);
+            mount_(NULL, "/", NULL, 0x40000UL | M_REC); /* MS_PRIVATE|MS_REC, best effort */
+            mkdir("/tmp/sfbroot", 0755);
+            if (mountd_("tmpfs", "/tmp/sfbroot", "tmpfs", 6, "mode=0755") != 0) _exit(11);
+            snprintf(tgt, sizeof tgt, "/tmp/sfbroot/b%d", idx); mkdir(tgt, 0755);
+            if (mount_(proc, tgt, NULL, M_BIND) != 0) { printf("  sfb: bind %s errno=%d\n", path, errno); _exit(12); }
+            if (!sfb_same(path, tgt, &got)) bad |= 1;
+            char t2[64]; snprintf(t2, sizeof t2, "/tmp/sfbroot/o%d", idx); mkdir(t2, 0755);
+            int tfd = otree(fd, "", OT_CLONE | OT_CLOEXEC | 0x1000U /*AT_EMPTY_PATH*/);
+            if (tfd < 0) { printf("  sfb: open_tree %s errno=%d\n", path, errno); bad |= 2; }
+            else if (omove(tfd, "", AT_FDCWD, t2, 4) != 0) { printf("  sfb: move_mount %s errno=%d\n", path, errno); bad |= 4; }
+            else if (!sfb_same(path, t2, NULL)) bad |= 8;
+            _exit(bad);
+        }
+        int ws = 0;
+        if (c < 0 || waitpid(c, &ws, 0) != c || !WIFEXITED(ws) || WEXITSTATUS(ws) != 0) { printf("  sfb: bind child status 0x%x\n", ws); ok = 0; }
+    }
+    close(fd);
+    report(name, ok);
+}
+static void sysfsbind_suite(void) {
+    static const char *P[] = {
+        "/sys/class/block", "/sys/class/drm", "/sys/class/input", "/sys/class/input/event0", "/sys/class/input/input0",
+        "/sys/dev/char", "/sys/firmware/acpi/tables", "/sys/devices/system/cpu", "/sys/class/power_supply",
+        "/sys/class/backlight", "/sys/class/rtc", "/sys/power", "/sys/class/drm/card0-HDMI-A-1", "/sys/class/block/vda",
+    };
+    for (unsigned i = 0; i < sizeof P / sizeof *P; i++) {
+        char tag[32]; snprintf(tag, sizeof tag, "d%u", i);
+        printf("sysfsbind: %s = %s\n", tag, P[i]);
+        sfb_case(P[i], tag, (int)i);
+    }
+    /* /sys/class/block lists block devices only, never ACPI table names */
+    char **v = NULL; int n = sfb_list("/sys/class/block", &v), bad = n < 0;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(v[i], "DSDT") || !strcmp(v[i], "FACP") || !strncmp(v[i], "SSDT", 4) || !strcmp(v[i], "ECDT")) bad = 1;
+    report("sysfsbind_block_no_acpi", !bad);
+    struct stat st;
+    if (stat("/sys/firmware/acpi/tables/DSDT", &st) == 0) {
+        n = sfb_list("/sys/firmware/acpi/tables", &v);
+        report("sysfsbind_acpi_tables_listed", n > 0);
+    }
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "sysfsbind")) { sysfsbind_suite(); return fails ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "filebind")) { filebind_suite(); return fails ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "bindbench")) { bindbench(); return 0; }

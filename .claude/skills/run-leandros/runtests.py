@@ -231,7 +231,7 @@ SUITES = {
     "orphanreuse": ["/bin/f2fstest orphanreuse /home/orphanreuse"],
     "regress": ["/bin/vttest", "/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/execdev", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
-                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", RAWLINE_CHECK, SYSFS_CHECK,
+                "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", RAWLINE_CHECK, SYSFS_CHECK, "/bin/mnttest sysfsbind",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
                 "/bin/f2fstest mmaporphan /root",
                 # Truncate of a file with cold node blocks: one fetch round (lane f2fshang).
@@ -563,7 +563,7 @@ SUITES = {
     "drm": ["/bin/drmsmoke", "/bin/gpuprobe gl"],
     # Synthetic sysfs: /sys/class/{drm,input} and the /sys/dev/char node
     # identity libdrm/udev consumers read (lane sysfs).
-    "sysfs": [SYSFS_CHECK],
+    "sysfs": [SYSFS_CHECK, "/bin/mnttest sysfsbind"],
     "syncfile": [SYNCFILE_CHECK],
     "cfgwrite": [CFGWRITE_CHECK],
     # Harness guard: a 4 KB typed line must reach the shell intact (brush
