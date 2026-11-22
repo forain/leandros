@@ -4753,10 +4753,11 @@ static void sfb_case(const char *path, const char *tag, int idx) {
     close(fd);
     report(name, ok);
 }
+static int n_class_block(void) { char **v = NULL; return sfb_list("/sys/class/block", &v); }
 static void sysfsbind_suite(void) {
     static const char *P[] = {
         "/sys/class/block", "/sys/class/drm", "/sys/class/input", "/sys/class/input/event0", "/sys/class/input/input0",
-        "/sys/dev/char", "/sys/firmware/acpi/tables", "/sys/devices/system/cpu", "/sys/class/power_supply",
+        "/sys/dev/char", "/sys/dev/block", "/sys/firmware/acpi/tables", "/sys/devices/system/cpu", "/sys/class/power_supply",
         "/sys/class/backlight", "/sys/class/rtc", "/sys/power", "/sys/class/drm/card0-HDMI-A-1", "/sys/class/block/vda",
     };
     for (unsigned i = 0; i < sizeof P / sizeof *P; i++) {
@@ -4769,6 +4770,24 @@ static void sysfsbind_suite(void) {
     for (int i = 0; i < n; i++)
         if (!strcmp(v[i], "DSDT") || !strcmp(v[i], "FACP") || !strncmp(v[i], "SSDT", 4) || !strcmp(v[i], "ECDT")) bad = 1;
     report("sysfsbind_block_no_acpi", !bad);
+    /* /sys/dev/block/<maj>:<min> -> ../../class/block/<name>, one per entry */
+    {
+        char **bl = NULL; int nb = sfb_list("/sys/dev/block", &bl), okb = nb > 0 && nb == n_class_block();
+        for (int i = 0; okb && i < nb; i++) {
+            char p[96], t[96], want[64]; struct stat lst, sst, cst;
+            snprintf(p, sizeof p, "/sys/dev/block/%s", bl[i]);
+            ssize_t r = readlink(p, t, sizeof t - 1);
+            if (r < 0) { printf("  blk: readlink %s: %d\n", p, errno); okb = 0; break; }
+            t[r] = 0;
+            snprintf(want, sizeof want, "/sys/class/block/%s", t + (strncmp(t, "../../class/block/", 18) ? 0 : 18));
+            if (strncmp(t, "../../class/block/", 18)) { printf("  blk: %s -> %s\n", p, t); okb = 0; break; }
+            if (lstat(p, &lst) != 0 || !S_ISLNK(lst.st_mode) || lst.st_size != r) { printf("  blk: lstat %s\n", p); okb = 0; break; }
+            if (stat(p, &sst) != 0 || !S_ISDIR(sst.st_mode) || stat(want, &cst) != 0 || sst.st_ino != cst.st_ino) { printf("  blk: stat %s vs %s\n", p, want); okb = 0; break; }
+            char dp[96], dv[32], devbuf[32]; snprintf(dp, sizeof dp, "%s/dev", p);
+            if (slurp(dp, devbuf, sizeof devbuf) > 0) { snprintf(dv, sizeof dv, "%s\n", bl[i]); if (strcmp(devbuf, dv)) { printf("  blk: %s = %s want %s", dp, devbuf, dv); okb = 0; break; } }
+        }
+        report("sysfsbind_dev_block_matches_class", okb);
+    }
     struct stat st;
     if (stat("/sys/firmware/acpi/tables/DSDT", &st) == 0) {
         n = sfb_list("/sys/firmware/acpi/tables", &v);

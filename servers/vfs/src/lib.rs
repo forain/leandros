@@ -9526,6 +9526,21 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = strip_trailing_slash(path);
     }
 
+    // /proc/self, /proc/thread-self: symlinks to a directory. O_NOFOLLOW alone
+    // is ELOOP; O_PATH|O_NOFOLLOW (fd of the link itself) is approximated by
+    // the directory fd.
+    let mut selfbuf = [0u8; 64];
+    let mut self_link: Option<u8> = None;
+    if let Some(n) = proc_self_target(path, &mut selfbuf) {
+        if flags & O_NOFOLLOW != 0 {
+            // O_PATH|O_NOFOLLOW: an fd of the link itself (fstat -> S_IFLNK,
+            // readlinkat(fd, "") -> target). Without O_PATH it is ELOOP.
+            if flags & O_PATH == 0 || flags & O_DIRECTORY != 0 { return err_reply(if flags & O_DIRECTORY != 0 { -20 } else { -40 }); }
+            self_link = Some(if path == b"/proc/thread-self" { LVL_SELF_THREAD } else { LVL_SELF });
+        }
+        path = &selfbuf[..n];
+    }
+
     // /dev/mqueue/<name>: an open of a POSIX message queue (mqueue mount).
     if let Some(name) = mqueue::path_name(path) {
         let r = mqueue::open_path(pid, name, flags);
@@ -9568,7 +9583,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     // A mapped tmpfs file that O_TRUNC emptied (its VMO id): every mapping
     // drops its pages after the open, with no VFS lock held.
     let mut trunc_zap: Option<u64> = None;
-    let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
+    let kind = if let Some(l) = self_link {
+        VnodeKind::SysBlock { dev: SELF_LINK_DEV, level: l, pos: 0 }
+    } else if let Some(lookup_path) = should_lookup_ramfs(path) {
         if lookup_path == b"/dev/null" {
             VnodeKind::DevNull
         } else if lookup_path == b"/dev/zero" {
@@ -15736,6 +15753,46 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
 /// semantics included: the return is `min(target_len, buf_len)` and the buffer
 /// is never NUL-terminated, exactly as readlink(2) specifies.
 ///
+/// `/proc/self` -> "/proc/<tgid>", `/proc/thread-self` -> "/proc/<tgid>/task/<tid>"
+/// (numbers in the reader's pid namespace): the directory the Linux symlink
+/// of that name resolves to. `path` is exactly the link, trailing slash gone.
+fn proc_self_target(path: &[u8], out: &mut [u8; 64]) -> Option<usize> {
+    if path != b"/proc/self" && path != b"/proc/thread-self" { return None; }
+    let me = sched::current_pid();
+    let mut p = 0usize;
+    let mut put = |s: &[u8], p: &mut usize| { out[*p..*p + s.len()].copy_from_slice(s); *p += s.len(); };
+    let num = |v: u32, d: &mut [u8; 10]| -> usize {
+        let (mut k, mut x) = (0usize, v);
+        let mut t = [0u8; 10];
+        loop { t[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+        for i in 0..k { d[i] = t[k - 1 - i]; }
+        k
+    };
+    let mut d = [0u8; 10];
+    put(b"/proc/", &mut p);
+    let k = num(pv(sched::tgid_of(me)), &mut d); put(&d[..k], &mut p);
+    if path == b"/proc/thread-self" {
+        put(b"/task/", &mut p);
+        let k = num(pv(me), &mut d); put(&d[..k], &mut p);
+    }
+    Some(p)
+}
+
+const SELF_LINK_DEV: u16 = sysclass::SC_BASE | 0xF << 8 | 0xFC;
+const LVL_SELF: u8 = 0xF1;
+const LVL_SELF_THREAD: u8 = 0xF2;
+
+/// Link text of an O_PATH fd of `/proc/self` or `/proc/thread-self`
+/// (`readlinkat(fd, "")`, fstat's st_size): the same target readlink gives.
+pub fn self_link_text(pid: u32, fd: usize, out: &mut [u8; 48]) -> Option<usize> {
+    let Some(VnodeKind::SysBlock { dev: SELF_LINK_DEV, level, .. }) = vfs_get_node_kind(pid, fd) else { return None };
+    let mut tb = [0u8; 64];
+    let n = proc_self_target(if level == LVL_SELF_THREAD { b"/proc/thread-self" } else { b"/proc/self" }, &mut tb)?;
+    let t = &tb[6..n];
+    out[..t.len()].copy_from_slice(t);
+    Some(t.len())
+}
+
 /// EINVAL (not ENOENT) for a path that exists but is not a symlink — callers
 /// including coreutils' `ls` use precisely that to tell the two apart.
 fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
@@ -17398,6 +17455,13 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             return ok_reply();
         }
     }
+    if let VnodeKind::SysBlock { dev: SELF_LINK_DEV, level, .. } = kind {
+        let level_ino = level as u64;
+        let mut t = [0u8; 48];
+        let n = self_link_text(pid, fd, &mut t).unwrap_or(0);
+        write_stat_full(stat_ptr, 0o120777, 1, n as u64, 0x5000_0f00 + level_ino, 0, 0);
+        return ok_reply();
+    }
     if let VnodeKind::SysBlock { dev, level, .. } = kind {
         write_stat_full(stat_ptr, S_IFDIR | 0o755, 1, 0,
                         0x5000_0000 + (dev as u64) * 8 + level as u64, 0, 0);
@@ -17611,6 +17675,22 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+
+    // /proc/self and /proc/thread-self are symlinks: lstat describes the link
+    // (S_IFLNK 0777, size = target length), stat the directory it names.
+    {
+        let mut tb = [0u8; 64];
+        let had_slash = path.len() > 1 && path.ends_with(b"/");
+        if let Some(n) = proc_self_target(strip_trailing_slash(path), &mut tb) {
+            if !follow && !had_slash {
+                write_stat_owned(stat_ptr, 0o120777, (n - 6) as u64, path_ino(strip_trailing_slash(path), 7), 0, 0);
+                return ok_reply();
+            }
+            let mut cb = [0u8; 65];
+            cb[..n].copy_from_slice(&tb[..n]);
+            return stat_common(cb.as_ptr() as usize, stat_ptr, follow);
+        }
+    }
 
     if let Some(name) = mqueue::path_name(strip_trailing_slash(path)) {
         return match mqueue::stat_path(sched::current_pid(), name) {

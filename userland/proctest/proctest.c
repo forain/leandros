@@ -464,6 +464,67 @@ static void lstat_magic(void) {
     pass(n);
 }
 
+/* /proc/self and /proc/thread-self are symlinks (lstat: S_IFLNK 0777, size =
+ * strlen(target)); every following call lands on the /proc/<tgid> directory. */
+static void proc_self_link(void) {
+    const char *n = "proc_self_link";
+    char want[32], tgt[64], tw[96];
+    snprintf(want, sizeof want, "%d", (int)getpid());
+    snprintf(tw, sizeof tw, "%d/task/%ld", (int)getpid(), (long)syscall(SYS_gettid));
+    const char *links[] = { "/proc/self", "/proc/thread-self" };
+    const char *wants[] = { want, tw };
+    for (int i = 0; i < 2; i++) {
+        const char *l = links[i];
+        struct stat st;
+        if (lstat(l, &st) != 0) { fail(n, "lstat %s: %s", l, strerror(errno)); return; }
+        if (!S_ISLNK(st.st_mode) || (st.st_mode & 0777) != 0777) { fail(n, "lstat %s: mode %o", l, st.st_mode); return; }
+        if (st.st_size != (off_t)strlen(wants[i])) { fail(n, "lstat %s: size %ld want %zu", l, (long)st.st_size, strlen(wants[i])); return; }
+        if (fstatat(AT_FDCWD, l, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(st.st_mode)) { fail(n, "fstatat NOFOLLOW %s", l); return; }
+        if (stat(l, &st) != 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0555) { fail(n, "stat %s: mode %o", l, st.st_mode); return; }
+        if (fstatat(AT_FDCWD, l, &st, 0) != 0 || !S_ISDIR(st.st_mode)) { fail(n, "fstatat %s not a dir", l); return; }
+        unsigned char sx[256];
+        memset(sx, 0, sizeof sx);
+        if (syscall(SYS_statx, AT_FDCWD, l, 0, 0x7ff, sx) != 0) { fail(n, "statx %s: %s", l, strerror(errno)); return; }
+        unsigned short m; memcpy(&m, sx + 28, 2);
+        if ((m & S_IFMT) != S_IFDIR) { fail(n, "statx %s mode %o not dir", l, m); return; }
+        memset(sx, 0, sizeof sx);
+        if (syscall(SYS_statx, AT_FDCWD, l, AT_SYMLINK_NOFOLLOW, 0x7ff, sx) != 0) { fail(n, "statx NOFOLLOW %s: %s", l, strerror(errno)); return; }
+        memcpy(&m, sx + 28, 2);
+        if ((m & S_IFMT) != S_IFLNK) { fail(n, "statx NOFOLLOW %s mode %o not link", l, m); return; }
+        ssize_t r = readlink(l, tgt, sizeof tgt - 1);
+        if (r < 0) { fail(n, "readlink %s: %s", l, strerror(errno)); return; }
+        tgt[r] = 0;
+        if (strcmp(tgt, wants[i])) { fail(n, "readlink %s = %s want %s", l, tgt, wants[i]); return; }
+        int fd = open(l, O_PATH | O_NOFOLLOW);
+        if (fd < 0) { fail(n, "open O_PATH|O_NOFOLLOW %s: %s", l, strerror(errno)); return; }
+        { /* the fd is the LINK itself */
+            struct stat fs; char rb[64];
+            if (fstat(fd, &fs) != 0 || !S_ISLNK(fs.st_mode) || fs.st_size != (off_t)strlen(wants[i])) { fail(n, "fstat of O_PATH|O_NOFOLLOW %s: mode %o size %ld", l, fs.st_mode, (long)fs.st_size); close(fd); return; }
+            ssize_t rr = readlinkat(fd, "", rb, sizeof rb - 1);
+            if (rr < 0) { fail(n, "readlinkat(fd,\"\") %s: %s", l, strerror(errno)); close(fd); return; }
+            rb[rr] = 0;
+            if (strcmp(rb, wants[i])) { fail(n, "readlinkat(fd,\"\") %s = %s want %s", l, rb, wants[i]); close(fd); return; }
+            if (fstatat(fd, "", &fs, AT_EMPTY_PATH) != 0 || !S_ISLNK(fs.st_mode)) { fail(n, "fstatat(fd,\"\",AT_EMPTY_PATH) not a link"); close(fd); return; }
+        }
+        close(fd);
+        fd = open(l, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) { fail(n, "open O_DIRECTORY %s: %s", l, strerror(errno)); return; }
+        if (fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)) { fail(n, "fstat of opened %s not a dir", l); close(fd); return; }
+        close(fd);
+        DIR *d = opendir(l);
+        if (!d) { fail(n, "opendir %s: %s", l, strerror(errno)); return; }
+        int saw = 0; struct dirent *e;
+        while ((e = readdir(d))) if (!strcmp(e->d_name, "status")) saw = 1;
+        closedir(d);
+        if (!saw) { fail(n, "opendir %s: no status entry", l); return; }
+    }
+    if (open("/proc/self", O_RDONLY | O_NOFOLLOW) >= 0 || errno != ELOOP) { fail(n, "open O_NOFOLLOW on link: %s (want ELOOP)", strerror(errno)); return; }
+    struct stat st1, st2;
+    snprintf(tw, sizeof tw, "/proc/%d", (int)getpid());
+    if (stat("/proc/self", &st1) != 0 || stat(tw, &st2) != 0 || st1.st_ino != st2.st_ino) { fail(n, "stat /proc/self ino != stat %s", tw); return; }
+    pass(n);
+}
+
 static void exec_proc_self_exe(void) {
     const char *n = "exec_proc_self_exe";
     fflush(stdout);
@@ -1604,6 +1665,7 @@ int main(int argc, char **argv) {
     sysstat_whole();
     sysstat_subrows();
     lstat_magic();
+    proc_self_link();
     exec_proc_self_exe();
     for (int i = 0; i < ndirs; i++) { fd_rename_follow(dirs[i]); fd_deleted(dirs[i]); }
 
