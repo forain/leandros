@@ -750,7 +750,7 @@ unsafe fn fence_hold(on: bool) -> bool {
     ok
 }
 
-/// Fence-hold knob modes: 1 park all, 2 release newest only, 3 park only the
+/// Fence-hold knob modes: 4 park the first per-context-timeline (ringed) fence, 1 park all, 2 release newest only, 3 park only the
 /// first, 0 release everything.
 unsafe fn fence_hold_mode(m: u8) -> bool {
     let f = open(b"/proc/drm/fence_hold\0".as_ptr(), 1 /* O_WRONLY */);
@@ -1085,6 +1085,68 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             failures += 1;
         }
         if !report(b"phase7c_deep_stalled_fence_signals_on_release", rel && signals && again) {
+            failures += 1;
+        }
+    }
+
+    // ── 2d. Per-context fence timelines: a stalled context holds back only itself ──
+    // Two opens (two contexts), each submitting a real, dispatchable Venus
+    // command (vkEnumerateInstanceVersion, no reply) on ring 0, which is what
+    // puts a fence on the context's own timeline (host retires it via the
+    // renderer context; a non-dispatchable stream would never retire). Hold the FIRST context's fence (knob mode 4: park only the
+    // first per-context-timeline fence); the OTHER context's fences, submitted
+    // afterwards, must signal promptly while the stalled one stays pending,
+    // and the stalled one signals on release.
+    {
+        let tl0 = fence_stat(b"tl_fences");
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let fb = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && fb >= 0 && ctx_init_venus(fa) && ctx_init_venus(fb);
+        let distinct = inited && ctx_id(fa) != ctx_id(fb);
+        let mut held4 = false;
+        let mut oka = false;
+        let mut okb = 0u32;
+        let mut b_signalled = 0u32;
+        let mut a_pending_after = false;
+        let mut a_signals = false;
+        let vstream: [u32; 5] = [188, 0, 1, 0, 0];
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        if distinct {
+            held4 = fence_hold_mode(4);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            // A fresh context per submission (a repeat of the same command on one
+            // ring does not retire on the host; unrelated to the timelines).
+            // fb itself submits once as well.
+            for k in 0..4 {
+                let fx = if k == 0 { fb } else { open(b"/dev/dri/card0\0".as_ptr(), O_RDWR) };
+                if fx < 0 || (k != 0 && !ctx_init_venus(fx)) { if k != 0 && fx >= 0 { close(fx); } continue; }
+                let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                    okb += 1;
+                    if poll_in_within(eb.fence_fd, 1000) { b_signalled += 1; }
+                    close(eb.fence_fd);
+                }
+                if k != 0 { close(fx); }
+            }
+            a_pending_after = oka && !poll_in_within(ea.fence_fd, 100);
+        }
+        let rel = fence_hold_mode(0);
+        if oka { a_signals = poll_in_within(ea.fence_fd, 2000); close(ea.fence_fd); }
+        if fa >= 0 { close(fa); }
+        if fb >= 0 { close(fb); }
+        let tl1 = fence_stat(b"tl_fences");
+        out(b"  7d: distinct="); out_u64(distinct as u64); out(b" held4="); out_u64(held4 as u64);
+        out(b" oka="); out_u64(oka as u64); out(b" okb="); out_u64(okb as u64);
+        out(b" b_signalled="); out_u64(b_signalled as u64); out(b" a_pending="); out_u64(a_pending_after as u64);
+        out(b" tl_fences "); out_u64(tl0); out(b"->"); out_u64(tl1); out(b"\n");
+        if !report(b"phase7d_timelines_two_contexts_stalled_one_other_signals",
+                   distinct && held4 && oka && okb == 4 && b_signalled == 4 && a_pending_after) {
+            failures += 1;
+        }
+        if !report(b"phase7d_timelines_stalled_context_signals_on_release", rel && a_signals) {
+            failures += 1;
+        }
+        if !report(b"phase7d_timelines_per_context_ids_used", tl0 != u64::MAX && tl1 >= tl0 + 5) {
             failures += 1;
         }
     }
