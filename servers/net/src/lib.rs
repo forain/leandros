@@ -3609,6 +3609,10 @@ pub(crate) fn make_loopback_stack() -> NetStack {
     config.random_seed = sched::ticks();
 
     let mut interface = Interface::new(config, &mut device, stack_now());
+    // v3 with no reports: `igmp3::tick` drops lo's pending work (Linux runs
+    // no IGMP on loopback but /proc/net/igmp shows V3), and smoltcp's own v2
+    // report on join is off while v3 is active.
+    interface.set_igmp_v3(true);
     interface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8)).unwrap();
         addrs.push(IpCidr::new(IpAddress::Ipv6(smoltcp::wire::Ipv6Address::LOOPBACK), 128)).unwrap();
