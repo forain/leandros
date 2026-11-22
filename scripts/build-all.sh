@@ -645,7 +645,7 @@ build_gstreamer() {
         # cosmic-player without glib-2.0.pc. Same no-clobber merge, here on the fresh path.
         local sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch"
         if [[ -d "$port/out/$arch.sysroot" && -d "$sys" && ! -f "$sys/usr/lib/pkgconfig/gstreamer-1.0.pc" ]]; then
-            cp -a -n "$port/out/$arch.sysroot/." "$sys/" && echo "  sysroot merged into $sys"
+            leandros_sysroot_merge "$port/out/$arch.sysroot" "$sys" && echo "  sysroot merged into $sys"
         fi
         return 0
     fi
@@ -670,7 +670,7 @@ build_libflatpak() {
         echo "  up to date ($port/out/$arch)"
         local sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch"
         if [[ -d "$port/out/$arch.sysroot" && -d "$sys" && ! -f "$sys/usr/lib/pkgconfig/flatpak.pc" ]]; then
-            cp -a -n "$port/out/$arch.sysroot/." "$sys/" && echo "  sysroot merged into $sys"
+            leandros_sysroot_merge "$port/out/$arch.sysroot" "$sys" && echo "  sysroot merged into $sys"
         fi
         return 0
     fi
