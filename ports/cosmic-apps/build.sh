@@ -41,9 +41,10 @@ feat_for() {
   case "$1" in
     cosmic-files) echo "--no-default-features --features bzip2,dbus-config,desktop,lzma-rust2,notify,wayland,wgpu" ;;
     cosmic-edit)  echo "--no-default-features --features dbus-config,wayland,wgpu" ;;
-    # No libflatpak (GLib/GIO) and no packagekit: appstream is pure Rust, so the
-    # store starts with no backend. Upstream feature flags only, no source patch.
-    cosmic-store) echo "--no-default-features --features dbus-config,desktop,logind,notify,packagekit,single-instance,wayland,wgpu,xdg-portal" ;;
+    # Upstream feature flags only, no source patch. `flatpak` links libflatpak.so.0
+    # (ports/libflatpak: Alpine flatpak 1.14 + closure, staged in the image, -dev tree
+    # merged into the cross sysroot) next to the PackageKit apk backend.
+    cosmic-store) echo "--no-default-features --features dbus-config,desktop,flatpak,logind,notify,packagekit,single-instance,wayland,wgpu,xdg-portal" ;;
     # Upstream default features (mpris-server, xdg-portal, wgpu, wayland); its
     # GStreamer stack comes from ports/gstreamer (merged into the sysroot).
     cosmic-player) echo "" ;;
