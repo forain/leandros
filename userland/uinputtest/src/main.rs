@@ -63,7 +63,21 @@ extern "C" {
     pub fn close(fd: c_int) -> c_int;
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    pub fn fork() -> c_int;
+    pub fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    pub fn usleep(us: u32) -> c_int;
 }
+
+const UI_SET_FFBIT: c_ulong = 0x4004556b;
+const UI_BEGIN_FF_UPLOAD: c_ulong = 0xc06855c8;
+const UI_END_FF_UPLOAD: c_ulong = 0x406855c9;
+const UI_BEGIN_FF_ERASE: c_ulong = 0xc00c55ca;
+const UI_END_FF_ERASE: c_ulong = 0x400c55cb;
+const EVIOCSFF: c_ulong = 0x40304580;
+const EVIOCRMFF: c_ulong = 0x40044581;
+const EVIOCGEFFECTS: c_ulong = 0x80044584;
+const EVIOCGBIT_FF: c_ulong = 0x80104535;
+const FFNAME: &[u8] = b"ff rumble test pad";
 
 
 fn report(name: &[u8], ok: bool) -> bool {
@@ -305,6 +319,151 @@ unsafe fn touchpad_test() -> i32 {
     close(efd);
     close(ufd);
     chk!(b"tp_node_gone", find_named(TPNAME).is_none());
+    fails + ff_test()
+}
+
+#[repr(C)]
+struct FfUpload { request_id: u32, retval: i32, effect: [u8; 48], old: [u8; 48] }
+#[repr(C)]
+struct FfErase { request_id: u32, retval: i32, effect_id: u32 }
+
+fn rumble_effect(id: i16) -> [u8; 48] {
+    let mut e = [0u8; 48];
+    e[0..2].copy_from_slice(&0x50u16.to_le_bytes());   // FF_RUMBLE
+    e[2..4].copy_from_slice(&id.to_le_bytes());
+    e[8..10].copy_from_slice(&1000u16.to_le_bytes());  // replay.length
+    e[16..18].copy_from_slice(&0x8000u16.to_le_bytes()); // strong_magnitude
+    e[18..20].copy_from_slice(&0x4000u16.to_le_bytes()); // weak_magnitude
+    e
+}
+
+/// Wait up to ~10 s for the owner fd to yield one input_event.
+unsafe fn ff_next(ufd: c_int) -> Option<Ev> {
+    let mut e = ev(9, 9, 9);
+    for _ in 0..1000 {
+        if read(ufd, &mut e as *mut Ev as *mut c_void, 24) == 24 { return Some(e); }
+        usleep(10_000);
+    }
+    None
+}
+
+/// Force feedback through uinput: the owner (this process) completes the
+/// upload/erase handshake for a client (a forked child) that does
+/// EVIOCSFF / play / EVIOCRMFF on the event node.
+unsafe fn ff_test() -> c_int {
+    let mut fails = 0;
+    macro_rules! chk { ($n:expr, $c:expr) => { if !report($n, $c) { fails += 1; } } }
+    let ufd = open(b"/dev/uinput\0".as_ptr(), O_RDWR | O_NONBLOCK);
+    chk!(b"ff_open_uinput", ufd >= 0);
+    if ufd < 0 { return fails; }
+    ioctl(ufd, UI_SET_EVBIT, 1);
+    ioctl(ufd, UI_SET_EVBIT, 0x15);
+    ioctl(ufd, UI_SET_KEYBIT, 0x130);
+    chk!(b"ff_setffbit_rumble", ioctl(ufd, UI_SET_FFBIT, 0x50) == 0);
+    chk!(b"ff_setffbit_range", ioctl(ufd, UI_SET_FFBIT, 200) < 0);
+    let mut su = UiSetup { bustype: 3, vendor: 0x1234, product: 0x5678, version: 1, name: [0; 80], ff: 4 };
+    su.name[..FFNAME.len()].copy_from_slice(FFNAME);
+    chk!(b"ff_dev_setup", ioctl(ufd, UI_DEV_SETUP, &su as *const UiSetup) == 0);
+    chk!(b"ff_create", ioctl(ufd, UI_DEV_CREATE) == 0);
+    let node = find_named(FFNAME);
+    chk!(b"ff_node_found", node.is_some());
+    let node = match node { Some(n) => n, None => { close(ufd); return fails; } };
+    let mut path = [0u8; 20];
+    path_of(node, &mut path);
+    let efd = open(path.as_ptr(), O_RDWR | O_NONBLOCK);
+    chk!(b"ff_open_event", efd >= 0);
+
+    let mut evb = [0u8; 4];
+    chk!(b"ff_evbit", ioctl(efd, EVIOCGBIT_EV, evb.as_mut_ptr()) >= 0 && evb[2] & (1 << 5) != 0);
+    let mut ffb = [0u8; 16];
+    chk!(b"ff_eviocgbit", ioctl(efd, EVIOCGBIT_FF, ffb.as_mut_ptr()) >= 0 && ffb[10] == 1 && ffb[0] == 0);
+    let mut nmax: i32 = -1;
+    chk!(b"ff_eviocgeffects", ioctl(efd, EVIOCGEFFECTS, &mut nmax as *mut i32) >= 0 && nmax == 4);
+    // Non-blocking failures that never reach the owner.
+    let mut bad = rumble_effect(-1);
+    bad[0..2].copy_from_slice(&0x53u16.to_le_bytes()); // FF_SPRING: not advertised
+    chk!(b"ff_upload_bad_type", ioctl(efd, EVIOCSFF, bad.as_ptr()) < 0);
+    chk!(b"ff_upload_bad_id", ioctl(efd, EVIOCSFF, rumble_effect(9).as_ptr()) < 0);
+    chk!(b"ff_erase_unused", ioctl(efd, EVIOCRMFF, 2) < 0);
+
+    // sysfs capabilities/ff must be non-zero for this node.
+    {
+        let mut sp = *b"/sys/class/input/event00/device/capabilities/ff\0\0\0";
+        let mut n = 0;
+        let s = b"/sys/class/input/event";
+        sp[..s.len()].copy_from_slice(s);
+        n += s.len();
+        let tail = b"/device/capabilities/ff\0";
+        if node >= 10 { sp[n] = b'0' + (node / 10) as u8; n += 1; }
+        sp[n] = b'0' + (node % 10) as u8; n += 1;
+        sp[n..n + tail.len()].copy_from_slice(tail);
+        let fd = open(sp.as_ptr(), O_RDONLY);
+        let mut b = [0u8; 64];
+        let r = if fd >= 0 { read(fd, b.as_mut_ptr() as *mut c_void, 64) } else { -1 };
+        if fd >= 0 { close(fd); }
+        let nz = r > 0 && b[..r as usize].iter().any(|&c| c != b'0' && c != b' ' && c != b'\n');
+        chk!(b"ff_sysfs_caps_nonzero", nz);
+    }
+
+    let pid = fork();
+    if pid == 0 {
+        // Client: upload, play, erase, each blocking on the owner.
+        let cfd = open(path.as_ptr(), O_RDWR);
+        if cfd < 0 { exit(10); }
+        let mut e = rumble_effect(-1);
+        if ioctl(cfd, EVIOCSFF, e.as_mut_ptr()) != 0 { exit(11); }
+        let id = i16::from_le_bytes([e[2], e[3]]);
+        if id != 0 { exit(12); }
+        let play = ev(0x15, id as u16, 1);
+        if write(cfd, &play as *const Ev as *const c_void, 24) != 24 { exit(13); }
+        // A second client (this process's other open) must not own it.
+        if ioctl(cfd, EVIOCRMFF, id as c_int) != 0 { exit(14); }
+        exit(0);
+    }
+    chk!(b"ff_fork", pid > 0);
+    // Owner: UI_FF_UPLOAD request.
+    let rq = ff_next(ufd);
+    chk!(b"ff_upload_request", matches!(rq, Some(r) if r.t == 0x101 && r.c == 1));
+    if let Some(r) = rq {
+        let mut up = FfUpload { request_id: r.v as u32, retval: 0, effect: [0; 48], old: [0; 48] };
+        chk!(b"ff_begin_upload", ioctl(ufd, UI_BEGIN_FF_UPLOAD, &mut up as *mut FfUpload) == 0);
+        chk!(b"ff_upload_payload", up.effect == rumble_effect(0) && up.old == [0u8; 48] && up.request_id == r.v as u32);
+        up.retval = 0;
+        chk!(b"ff_end_upload", ioctl(ufd, UI_END_FF_UPLOAD, &up as *const FfUpload) == 0);
+        chk!(b"ff_end_upload_twice", ioctl(ufd, UI_END_FF_UPLOAD, &up as *const FfUpload) < 0);
+    }
+    let pl = ff_next(ufd);
+    chk!(b"ff_play_event", matches!(pl, Some(p) if p.t == 0x15 && p.c == 0 && p.v == 1));
+    let er = ff_next(ufd);
+    chk!(b"ff_erase_request", matches!(er, Some(r) if r.t == 0x101 && r.c == 2));
+    if let Some(r) = er {
+        let mut ea = FfErase { request_id: r.v as u32, retval: 0, effect_id: 99 };
+        chk!(b"ff_begin_erase", ioctl(ufd, UI_BEGIN_FF_ERASE, &mut ea as *mut FfErase) == 0 && ea.effect_id == 0);
+        chk!(b"ff_end_erase", ioctl(ufd, UI_END_FF_ERASE, &ea as *const FfErase) == 0);
+    }
+    let mut st: c_int = -1;
+    chk!(b"ff_client_ok", pid > 0 && waitpid(pid, &mut st, 0) == pid && st == 0);
+
+    // A failing owner (retval -EINVAL) fails the client's upload.
+    let pid2 = fork();
+    if pid2 == 0 {
+        let cfd = open(path.as_ptr(), O_RDWR);
+        if cfd < 0 { exit(10); }
+        let mut e = rumble_effect(-1);
+        exit(if ioctl(cfd, EVIOCSFF, e.as_mut_ptr()) < 0 { 0 } else { 21 });
+    }
+    if let Some(r) = ff_next(ufd) {
+        let mut up = FfUpload { request_id: r.v as u32, retval: -22, effect: [0; 48], old: [0; 48] };
+        ioctl(ufd, UI_BEGIN_FF_UPLOAD, &mut up as *mut FfUpload);
+        up.retval = -22;
+        ioctl(ufd, UI_END_FF_UPLOAD, &up as *const FfUpload);
+    }
+    st = -1;
+    chk!(b"ff_owner_error_propagates", pid2 > 0 && waitpid(pid2, &mut st, 0) == pid2 && st == 0);
+
+    close(efd);
+    close(ufd);
+    chk!(b"ff_node_gone", find_named(FFNAME).is_none());
     fails
 }
 
