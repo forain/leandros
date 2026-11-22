@@ -41,7 +41,7 @@ Usage: `nvktest [--icd PATH] [--timeout-ms=N] [--watchdog-s=N] [--out-dir=DIR] [
 ports/nvk-tests/build.sh all   # or x86_64 / aarch64
 ```
 
-The build runs in Alpine 3.21 containers of each arch (x86_64 runs emulated on
+The build runs in Alpine 3.24 containers of each arch (x86_64 runs emulated on
 an arm64 Mac). It uses Vulkan headers from `$MESA_SRC/include` and patches the
 soname to `libc.so`. The output goes to
 `${LEANDROS_ARTIFACTS:-~/code/leandros-artifacts}/nvk-tests/stage-<arch>/usr/bin/nvktest`.

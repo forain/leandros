@@ -1,16 +1,16 @@
 #!/bin/sh
 # build.sh <x86_64|aarch64|all> — PipeWire + WirePlumber for LeandrOS.
 #
-#   1. build-in-alpine.sh (Alpine 3.21 of the target arch: podman/docker on
+#   1. build-in-alpine.sh (Alpine 3.24 of the target arch: podman/docker on
 #      the host, a chroot staged with apk.static inside LeandrOS):
-#      prebuilt pipewire 1.2.7 + wireplumber 0.5 + their closure, ELF-fixed for
+#      prebuilt pipewire + wireplumber 0.5 + their closure, ELF-fixed for
 #      the guest, plus leandros-snd-sink (and pw-screencast-probe) compiled
 #      against pipewire-dev -> out/<arch>.alpine/.
 #   2. Assemble out/<arch>/: the rootfs-shaped tree scripts/mkfs-f2fs-populated.py
 #      overlays onto the image (same rules as ports/portal and ports/firefox),
 #      with the config drop-ins from ports/pipewire/data and a 440 Hz test tone.
 #      The real libpipewire-0.3.so.0 here REPLACES the inert stub that
-#      cosmic-settings-daemon and the portal were linked against (same 1.2.7 ABI).
+#      cosmic-settings-daemon and the portal were linked against (same ABI).
 # Per-arch log: out/<arch>.log ('=== rc=N arch=A ===' last).
 set -eu
 WHAT="${1:?usage: $0 <x86_64|aarch64|all>}"

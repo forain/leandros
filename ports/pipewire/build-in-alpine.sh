@@ -1,13 +1,13 @@
 #!/bin/sh
-# build-in-alpine.sh <x86_64|aarch64> — stage Alpine 3.21's prebuilt PipeWire
-# 1.2.7 + WirePlumber 0.5 for LeandrOS, and compile leandros-snd-sink (and the
+# build-in-alpine.sh <x86_64|aarch64> — stage Alpine 3.24's prebuilt PipeWire
+# + WirePlumber for LeandrOS, and compile leandros-snd-sink (and the
 # ScreenCast probe) against pipewire-dev in the same container.
 #
-# Runs INSIDE an Alpine 3.21 container of the TARGET architecture (same release
-# as ports/portal and ports/firefox, so musl 1.2.5 and the GLib ABI match). The
+# Runs INSIDE an Alpine 3.24 container of the TARGET architecture (same release
+# as ports/portal and ports/firefox, so musl and the GLib ABI match). The
 # shipped cosmic-settings-daemon and xdg-desktop-portal-cosmic were linked
-# against an inert libpipewire stub generated from 1.2.7 headers
-# (~/code/leandros-artifacts/pipewire-gap): this real 1.2.7 library is the same
+# against an inert libpipewire stub generated from the pipewire headers
+# (~/code/leandros-artifacts/pipewire-gap): this real library is the same
 # ABI, so they need no rebuild.
 #
 # Mounts (driven by ports/pipewire/build.sh):
@@ -27,7 +27,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21, got $(cat /etc/alpine-release)"; exit 3; }
+  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
   # pipewire-pulse: the PulseAudio protocol server (module-protocol-pulse
   # under `pipewire -c pipewire-pulse.conf`). Firefox's cubeb, like most
   # desktop apps, only speaks PulseAudio (libpulse, staged by ports/firefox);

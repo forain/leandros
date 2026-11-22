@@ -38,14 +38,14 @@ gst_pipewire_clock_get_internal_time (GstClock * clock)
     return pclock->last_time;
 
   now = pw_stream_get_nsec(s->pwstream);
-#if 0
+#if 1
   struct pw_time t;
   if (s->pwstream == NULL ||
       pw_stream_get_time_n (s->pwstream, &t, sizeof(t)) < 0 ||
       t.rate.denom == 0)
     return pclock->last_time;
 
-  result = gst_util_uint64_scale_int (t.ticks, GST_SECOND * t.rate.num, t.rate.denom);
+  result = gst_util_uint64_scale (t.ticks, GST_SECOND * t.rate.num, t.rate.denom);
   result += now - t.now;
 
   result += pclock->time_offset;

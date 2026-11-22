@@ -90,3 +90,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 
 - venusisr follow-up: per-context fence timelines like Linux (one stalled context's fence currently holds back the global fence floor and everyone's retired-ahead depth; table grows to AHEAD_MAX=65536 then EAGAIN). Also a venustest 7c variant on the syncobj path.
+
+## Alpine release unified (lane alpmesa, 2026-11-22)
+- Every port/container script now takes its Alpine release from `ports/alpine/toolchain.lock` via `scripts/lib/alpine-release.sh` (ALPINE_REL / ALPINE_IMAGE, sourced by `scripts/container-lib.sh`): was 3.21 in mesa, nvk-tests, pipewire, gstreamer, portal, libflatpak, e2fsprogs, dualboot fixture, linuxcmp. Bumping `alpine-lock.py refresh` moves them all.
+- Mesa 25.3.6 source unchanged (3 LeandrOS patches apply clean); ship-set rebuilt on 3.24 (LLVM/clang 22, apk rust-bindgen + meson, no edge pin). gst-pipewire vendored sources rebased to 1.6.8 (data/gst-pipewire-1.6.8, sink pool wake-up fix re-applied; build fails loudly if Alpine's pipewire moves). e2fsprogs built with -std=gnu17 (gcc 15).
+- Open: stage aarch64 ship-set on 3.24 was built under qemu-user; real-GPU (laptop/PC/Pi) runs of the 3.24 stage not done.
