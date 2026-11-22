@@ -1938,6 +1938,13 @@ unsafe fn negotiate_uhs(dev: &SdhciDevice, rca: u32) -> bool {
             dbg_str(" active: bus width=4 clk=");
             dbg_dec(clk_khz);
             dbg_str("kHz (1.8V, tuned)\n");
+            // dbg* only reaches the debug UART; mirror the verdict into the
+            // kernel log so dmesg shows which mode the card runs in.
+            crate::kenv::pci::serial_debug("[sdhci] UHS-I ");
+            crate::kenv::pci::serial_debug(name);
+            crate::kenv::pci::serial_debug(" active: bus width=4 clk=");
+            crate::kenv::pci::serial_debug_dec(clk_khz as u64);
+            crate::kenv::pci::serial_debug("kHz (1.8V, tuned)\n");
             return true;
         }
         dbg_str("[sdhci] uhs: ");
@@ -2057,6 +2064,13 @@ unsafe fn find_boot_partition(dev: &SdhciDevice) -> Option<(u64, u64)> {
 
 unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
     let uhs = UHS_ON.load(Ordering::Relaxed) && board::available();
+    if !uhs {
+        crate::kenv::pci::serial_debug(if !UHS_ON.load(Ordering::Relaxed) {
+            "[sdhci] UHS not used: disabled (sdhci.uhs=0)\n"
+        } else {
+            "[sdhci] UHS not used: SD I/O voltage / power GPIOs unavailable on this board\n"
+        });
+    }
     if let Some(d) = probe_card_inner(base, uhs, uhs) { return Some(d); }
     if uhs {
         crate::kenv::pci::serial_debug("[sdhci] UHS bring-up failed: power-cycling the card, retrying at 3.3V HS\n");
@@ -2125,7 +2139,7 @@ unsafe fn probe_card_inner(base: usize, uhs: bool, cycle: bool) -> Option<SdhciD
             if !dev.voltage_switch_1v8() { return None; }
             uhs_live = true;
         } else {
-            crate::kenv::pci::serial_debug("[sdhci] uhs: card did not offer S18A, staying at 3.3V HS\n");
+            crate::kenv::pci::serial_debug("[sdhci] UHS not used: card did not offer S18A in ACMD41, staying at 3.3V HS\n");
         }
     }
 
