@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--crashpt N] [--wseed N] [--cmdline "k=v ..."] [--keep] [--linux]
+"""f2fscrashtest.py [aarch64|x86_64] [--iters N] [--mode mix|kill|crashpt] [--seed S] [--crashpt N] [--wseed N] [--cmdline "k=v ..."] [--keep] [--keep-fail DIR] [--linux]
 
 Crash consistency of f2fs (lane f2fsync), on a fresh 64 MiB volume attached
 as an extra disk (run id `<caller>-f2fscr`). Every iteration:
@@ -36,6 +36,12 @@ hold F2FSINTEROP_LOCK=$SP/lock.sh): `fsck.f2fs --dry-run` of the crashed image
 recover_* lines logged), umount, `fsck.f2fs --dry-run` of the result (must be
 rc 0), and the recovered image is fetched back and checked by the usual
 crashscan against the claims (every fsynced file's content and size).
+--keep-fail DIR (lane f2fsmiss): every iteration's crashed image (pre-recovery),
+the workload text and the crash-boot guest log are held until its recovery check;
+on a failing iteration they are copied to DIR/<arch>-seed<S>-it<N>/ together with
+the post-recovery (umounted) image, the recovery-boot guest log + dmesg, both scan
+outputs and a params.txt. The workload is deterministic in --wseed but the kill
+instant is wall-clock random, so a replay re-runs the same file mix, not the same cut.
 Re-run one failure with the params printed per iteration
 (`--wseed W --crashpt C --mode crashpt|kill --iters 1`).
 """
@@ -140,6 +146,11 @@ def selftest():
     for a, b in (("U 6[F2FS] x\n99\n", "U 699"), ("N 6[   31.2] [IRQ] y\n99 4096\n", "N 699 4096"),
                  ("[IRQ] z\nN 5 7\n", "N 5 7")):
         assert b in unsplice(a), (a, unsplice(a))
+    # a lost "N 58 / U 26" pair must not make n26 a durability claim; the newest 32 stay claims
+    c = Claims()
+    c.parse("\n".join(f"N {i} 8" for i in range(0, 100) if i != 58))
+    c.finish()
+    assert c.lost_n == [58] and 26 in c.unlinked and 66 in c.unlinked and 67 not in c.unlinked, (c.lost_n, sorted(c.unlinked))
     print("selftest: PASS")
 
 
@@ -156,6 +167,23 @@ class Claims:
         self.min_gen = None    # oldest rewrite gen whose W line arrived (gens start at 1)
         self.uncaptured = 0    # blocks of a gen older than the capture's first W line
         self.setup = False
+        self.lost_n = []       # ids between the first and last N line whose N line never arrived
+        self.inferred_u = 0    # fsynced new files taken as unlinked: their U line was lost
+
+    def finish(self):
+        """Claim lines can be lost on the console (lane f2fsmiss: "N 58" and "U 26" absent from the raw
+        serial log while n59.. and the later scan prove the workload went on). The workload gives every
+        new file id a slot (id % 32) and unlinks the slot's previous file right after claiming it, so once
+        N lines of id+33 or later arrived, the unlink of n<id> was issued (not durable, so the file may be
+        present or absent, never required). Without this a lost U line is a false "fsynced but missing"."""
+        if not self.n:
+            return
+        lo, hi = min(self.n), max(self.n)
+        self.lost_n = [i for i in range(lo, hi + 1) if i not in self.n]
+        for i in list(self.n):
+            if i + 33 <= hi and i not in self.unlinked:
+                self.unlinked.add(i)
+                self.inferred_u += 1
 
     def parse(self, text):
         for raw in text.splitlines():
@@ -259,6 +287,7 @@ def main(argv):
     arch, iters, mode, seed, keep = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 6, "mix", None, False
     extra_cmd = ""
     linux = False
+    keepfail = None
     fixed_cp = fixed_ws = None
     i = 0
     while i < len(argv):
@@ -279,6 +308,8 @@ def main(argv):
             fixed_ws = int(argv[i + 1]); i += 1
         elif a == "--keep":
             keep = True
+        elif a == "--keep-fail":
+            keepfail = os.path.abspath(argv[i + 1]); i += 1
         elif a == "--linux":
             linux = True
         else:
@@ -332,6 +363,7 @@ def main(argv):
         driver.cmd_stop()
 
     prev = None   # (dir, claims) to verify on the next boot
+    pk = {}       # --keep-fail: pre-recovery artefacts of the iteration awaiting its check
     for it in range(iters + 1):
         last = it == iters
         how = None
@@ -359,6 +391,7 @@ def main(argv):
             pdir, claims, ppre = prev
             r = run(f"/bin/f2fstest crashscan {pdir}", 300)
             scan = r["output"]
+            scans = [scan]
             if "SCAN_DONE" not in scan:
                 fails.append(f"iter {it - 1}: crashscan did not finish: {scan[-300:]}")
             else:
@@ -368,6 +401,7 @@ def main(argv):
                     # crashscan only reads: a torn console line does not repeat.
                     print("    rescan: " + "; ".join(errs[:4]), flush=True)
                     r2 = run(f"/bin/f2fstest crashscan {pdir}", 300)
+                    scans.append(r2["output"])
                     if "SCAN_DONE" in r2["output"]:
                         errs = [e.replace("no scan line", "no scan line twice").replace("fsynced but missing", "fsynced but missing in both scans")
                                 for e in claims.check(r2["output"])]
@@ -388,8 +422,27 @@ def main(argv):
                     fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
                     if ppre and os.path.exists(ppre):
                         keep_failed(out, ppre, f"it{it - 1}-prelinux", seed, "image before Linux recovery", arch)
+            dm = run("dmesg 2>/dev/null | tail -150", 60)["output"] if keepfail and fails else ""
             run(f"rm -rf {pdir}", 300)
             r = run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
+            if keepfail and fails and fails[-1].startswith(f"iter {it - 1}:"):
+                kdir = os.path.join(keepfail, f"{arch}-seed{seed}-it{it - 1}")
+                os.makedirs(kdir, exist_ok=True)
+                for src_, dst_ in ((pk.get("img"), "crashed.img"), (img, "recovered.img"),
+                                   (pk.get("work"), "work.txt"), (pk.get("log"), "crash-boot-serial.log"),
+                                   (driver.SERIAL_FULL_LOG, "recovery-boot-serial.log")):
+                    if src_ and os.path.exists(src_):
+                        subprocess.run(["cp", "-c", src_, os.path.join(kdir, dst_)], check=False, stderr=subprocess.DEVNULL)
+                        if not os.path.exists(os.path.join(kdir, dst_)):
+                            shutil.copyfile(src_, os.path.join(kdir, dst_))
+                for n_, t_ in enumerate(scans):
+                    with open(os.path.join(kdir, f"scan{n_}.txt"), "w") as f:
+                        f.write(t_)
+                with open(os.path.join(kdir, "dmesg.txt"), "w") as f:
+                    f.write(dm)
+                with open(os.path.join(kdir, "params.txt"), "w") as f:
+                    f.write(f"{pk.get('params')}\nerrors: {fails[-1]}\n")
+                print(f"    kept failing iteration in {kdir}", flush=True)
             ok, detail = fsck(img, strict_leaks=True)
             print(f"iter {it - 1}: fsck after recovery + umount: {'PASS' if ok else 'FAIL'}\n    {detail}", flush=True)
             if not ok:
@@ -434,6 +487,10 @@ def main(argv):
                 f.write(text)
         claims = Claims()
         claims.parse(text)
+        claims.finish()
+        if claims.lost_n or claims.inferred_u:
+            print(f"    note: {len(claims.lost_n)} N claim line(s) lost on the console (ids {claims.lost_n[:8]}); "
+                  f"{claims.inferred_u} unlinks inferred from the slot rule", flush=True)
         ops = text.count("\n")
         print(f"iter {it}: {how}{(' ' + cmdline) if cmdline else ''}: workload printed {ops} lines "
               f"(setup {'done' if claims.setup else 'NOT done'}; {len(claims.a)} append files, "
@@ -457,6 +514,19 @@ def main(argv):
                 fails.append(f"iter {it}: Linux recovery: {ldet} (seed={seed} wseed={wseed} how={how} cmdline={cmdline!r})")
                 keep_failed(out, img, f"it{it}-linux", seed, f"how={how} wseed={wseed} cmdline={cmdline!r}", arch)
                 break
+        if keepfail:
+            pk = {"params": f"seed={seed} it={it} how={how} wseed={wseed} cmdline={cmdline!r}",
+                  "img": os.path.join(out, "keepfail-crashed.img"), "work": os.path.join(out, "keepfail-work.txt"),
+                  "log": os.path.join(out, "keepfail-crash-serial.log")}
+            for src_, dst_ in ((img, pk["img"]), (driver.SERIAL_FULL_LOG, pk["log"])):
+                if os.path.exists(dst_):
+                    os.unlink(dst_)
+                if os.path.exists(src_):
+                    subprocess.run(["cp", "-c", src_, dst_], check=False, stderr=subprocess.DEVNULL)
+                    if not os.path.exists(dst_):
+                        shutil.copyfile(src_, dst_)
+            with open(pk["work"], "w") as f:
+                f.write(text)
         prev = (d, claims, pre)
     if not keep and os.path.exists(boot_copy):
         os.unlink(boot_copy)
