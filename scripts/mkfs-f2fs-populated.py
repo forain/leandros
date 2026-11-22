@@ -150,19 +150,18 @@ def _greetd_stage_dir(arch):
 
 
 def _check_greetd_fresh(path):
-    """Refuse a greetd whose embedded PAM shim predates sha512-crypt shadow.
+    """Refuse a greetd that predates the real-PAM link (no libpam.so.0 NEEDED).
 
-    /etc/shadow holds `$6$rounds=` hashes; an old greetd only verifies
-    `$sha256$` and every greeter login fails with pam_authenticate AUTH_ERR
-    (L11.15). The shim's `rounds=` parser string is the marker. If the
+    Auth is Alpine's Linux-PAM + pam_unix; an old shim-linked greetd would
+    fail every greeter login. If the
     greetd.srchash sidecar (written by build.sh) exists it must match the
     current session-leandros sources. File mtimes are NOT compared: a fresh git
     worktree gives every source a new mtime."""
     with open(path, "rb") as f:
         data = f.read()
     problems = []
-    if b"rounds=" not in data:
-        problems.append("lacks the sha512-crypt 'rounds=' marker")
+    if b"libpam.so.0" not in data:
+        problems.append("is not linked against the real libpam.so.0")
     sidecar = path + ".srchash"
     if os.path.exists(sidecar):
         with open(sidecar) as f:

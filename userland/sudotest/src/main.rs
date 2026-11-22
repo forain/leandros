@@ -318,6 +318,41 @@ fn main() {
     let o = run(LEANDRO, &[SUDO, "-K"], &[], "");
     t.check("leandro: sudo -K (drop cached credentials)", o.code == 0, &o);
 
+    // AT_SECURE: a setuid dynamic binary must ignore LD_PRELOAD (musl would
+    // otherwise abort the exec with "Error loading shared library").
+    let o = run(LEANDRO, &[SUDO, "-S", "id"], &[("LD_PRELOAD", "/nonexistent/evil.so")], "leandro\n");
+    t.check(
+        "leandro: setuid sudo ignores LD_PRELOAD (AT_SECURE)",
+        o.code == 0 && o.stdout.contains("uid=0(root)") && !o.all().contains("Error loading"),
+        &o,
+    );
+    let o = run(LEANDRO, &[SU, "-c", "id", "root"], &[("LD_PRELOAD", "/nonexistent/evil.so")], "root\n");
+    t.check(
+        "leandro: setuid su ignores LD_PRELOAD (AT_SECURE)",
+        o.code == 0 && o.stdout.contains("uid=0(root)") && !o.all().contains("Error loading"),
+        &o,
+    );
+    // A locked account (`passwd -l`: "!" prefix on the hash) is refused even
+    // with the right password; unlocking restores it.
+    if let Ok(orig) = std::fs::read_to_string("/etc/shadow") {
+        let locked: String = orig
+            .lines()
+            .map(|l| if l.starts_with("leandro:") { format!("leandro:!{}", &l["leandro:".len()..]) } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if std::fs::write("/etc/shadow", &locked).is_ok() {
+            let _ = run(LEANDRO, &[SUDO, "-K"], &[], "");
+            let o = run(LEANDRO, &[SUDO, "-S", "id"], &[], "leandro\n");
+            t.check("leandro: locked (passwd -l) account rejected by sudo", o.code != 0 && !o.stdout.contains("uid=0"), &o);
+            let o = run(GREETER, &[SU, "-c", "id", "leandro"], &[], "leandro\n");
+            t.check("locked account rejected by su", o.code != 0 && !o.stdout.contains("uid=1000"), &o);
+            let _ = std::fs::write("/etc/shadow", &orig);
+            let o = run(LEANDRO, &[SUDO, "-S", "id"], &[], "leandro\n");
+            t.check("leandro: unlocked account works again", o.code == 0 && o.stdout.contains("uid=0(root)"), &o);
+        }
+    }
+
     let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
     t.check(
         "leandro: sudo -n id without cached credentials fails",
