@@ -32,9 +32,7 @@ static mut CANARY: [u64; 512] = [0; 512];
 const CANARY_PAT: u64 = 0x5333_5F43_414E_4152;
 
 fn say(s: &str) {
-    crate::serial_print_str("[PM] ");
-    crate::serial_print_str(s);
-    crate::serial_print_str("\n");
+    crate::serial_print_str(&alloc::format!("[PM] {}\n", s));
 }
 
 #[inline] unsafe fn outb(p: u16, v: u8) { asm!("out dx, al", in("dx") p, in("al") v, options(nomem, nostack)); }

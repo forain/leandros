@@ -148,8 +148,13 @@ fn report_num(name: &[u8], v: u64) {
 
 fn report(name: &[u8], ok: bool) -> bool {
     unsafe {
-        write(1, name.as_ptr() as *const c_void, name.len());
-        write(1, if ok { b": PASS\n".as_ptr() } else { b": FAIL\n".as_ptr() } as *const c_void, 7);
+        { // One write: a kernel console line must not splice into the verdict.
+        let mut vline = [0u8; 160];
+        let vn = name.len().min(140);
+        vline[..vn].copy_from_slice(&name[..vn]);
+        let vsuf: &[u8] = if ok { b": PASS\n" } else { b": FAIL\n" };
+        vline[vn..vn + 7].copy_from_slice(vsuf);
+        write(1, vline.as_ptr() as *const c_void, vn + 7); }
     }
     ok
 }

@@ -14,7 +14,7 @@ extern crate leandros_libc;
 use leandros_libc::{
     write, STDOUT_FILENO, getpid, execve, sched_yield, mount, pivot_root, mkdir, chown, chmod,
     open, read, close, dup3, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND,
-    fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec, unlink,
+    fork as libc_fork, wait4, setsid, ioctl, usleep, exit, clock_gettime, timespec, unlink,
 };
 #[path = "../../../lib/utmpx/utmpx.rs"]
 mod utmpx;
@@ -368,7 +368,7 @@ unsafe fn shutdown_system(action: PowerAction, ctl: i32) -> ! {
             }
         } else {
             write_str("[init] Unmounting ");
-            write(STDOUT_FILENO, mp.as_ptr(), mp.len());
+            out_bytes(&mp[..mp.len()]);
             write_str("\n");
             if syscall2(nr::UMOUNT2, path.as_ptr() as usize, 0) < 0 {
                 syscall5(nr::MOUNT, 0, path.as_ptr() as usize, 0, MS_REMOUNT | MS_RDONLY, 0);
@@ -1318,7 +1318,7 @@ unsafe fn sweep_strays(login_pid: i32, logger_pid: i32) {
                         write_str("init: killing stray pid ");
                         write_u32(pid);
                         write_str(" (");
-                        write(STDOUT_FILENO, comm.as_ptr(), len);
+                        out_bytes(&comm[..len as usize]);
                         write_str(")\n");
                         syscall2(nr::KILL, pid as usize, SIGKILL);
                         killed_this_pass += 1;
@@ -1468,7 +1468,7 @@ unsafe fn dump_dm_log_tail() {
         }
         if k == 0 { continue; }
         write_str("greetd.log| ");
-        write(STDOUT_FILENO, clean.as_ptr(), k);
+        out_bytes(&clean[..k as usize]);
         write_str("\n");
     }
     write_str("---- end of greetd.log ----\n");
@@ -2142,7 +2142,7 @@ unsafe fn seed_home_dir(home: &[u8], uid: u32, gid: u32) {
         chown(p.as_ptr(), uid, gid);
     }
     write_str("init: created ");
-    write(STDOUT_FILENO, home.as_ptr(), home.len());
+    out_bytes(&home[..]);
     write_str("\n");
 }
 
@@ -2387,14 +2387,50 @@ unsafe fn cg_write(path: &[u8], data: &[u8]) -> bool {
     r == data.len() as isize
 }
 
+// Console output is line-buffered: pieces accumulate here and go out in ONE
+// write() per completed line, so a kernel console line cannot splice into the
+// middle of an "[init] ..." line (the harnesses match whole lines). init is
+// single-threaded; fork() below flushes any partial line first.
+static mut OUT_BUF: [u8; 512] = [0u8; 512];
+static mut OUT_LEN: usize = 0;
+
+unsafe fn out_flush_upto(n: usize) {
+    let buf = &mut *core::ptr::addr_of_mut!(OUT_BUF);
+    if n == 0 { return; }
+    write(STDOUT_FILENO, buf.as_ptr(), n);
+    let len = OUT_LEN;
+    buf.copy_within(n..len, 0);
+    OUT_LEN = len - n;
+}
+
+/// Flush a trailing partial line too (before fork/exit, or on overflow).
+unsafe fn out_flush() {
+    out_flush_upto(OUT_LEN);
+}
+
+unsafe fn fork() -> i32 {
+    out_flush();
+    libc_fork()
+}
+
+unsafe fn out_bytes(b: &[u8]) {
+    let buf = &mut *core::ptr::addr_of_mut!(OUT_BUF);
+    for &c in b {
+        if OUT_LEN == buf.len() { out_flush(); }
+        buf[OUT_LEN] = c;
+        OUT_LEN += 1;
+        if c == b'\n' { out_flush(); }
+    }
+}
+
 unsafe fn write_str(s: &str) {
-    write(STDOUT_FILENO, s.as_ptr(), s.len());
+    out_bytes(s.as_bytes());
 }
 
 unsafe fn write_u32(mut n: u32) {
     let mut buf = [0u8; 10];
     if n == 0 {
-        write(STDOUT_FILENO, b"0".as_ptr(), 1);
+        out_bytes(b"0");
         return;
     }
     let mut i = 10usize;
@@ -2403,5 +2439,5 @@ unsafe fn write_u32(mut n: u32) {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    write(STDOUT_FILENO, buf.as_ptr().add(i), 10 - i);
+    out_bytes(&buf[i..]);
 }

@@ -96,8 +96,13 @@ unsafe fn say_num(n: u64) {
 }
 
 unsafe fn report(name: &[u8], ok: bool) -> bool {
-    say(name);
-    say(if ok { b": PASS\n" } else { b": FAIL\n" });
+    { // One write: a kernel console line must not splice into the verdict.
+        let mut vline = [0u8; 160];
+        let vn = name.len().min(140);
+        vline[..vn].copy_from_slice(&name[..vn]);
+        let vsuf: &[u8] = if ok { b": PASS\n" } else { b": FAIL\n" };
+        vline[vn..vn + 7].copy_from_slice(vsuf);
+        say(&vline[..vn + 7]); }
     ok
 }
 

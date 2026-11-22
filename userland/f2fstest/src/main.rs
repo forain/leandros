@@ -450,11 +450,12 @@ unsafe fn test_f2fs_statfs_reclaim() -> bool {
 }
 
 unsafe fn report(name: &[u8], passed: bool) -> bool {
-    write(STDOUT_FILENO, name.as_ptr(), name.len() - 1); // drop the NUL terminator
-    if passed {
-        write(STDOUT_FILENO, b": PASS\n".as_ptr(), 7);
-    } else {
-        write(STDOUT_FILENO, b": FAIL\n".as_ptr(), 7);
-    }
+    // One write(): a kernel console line must not splice into the verdict.
+    let mut vline = [0u8; 160];
+    let vn = (name.len() - 1).min(140);
+    vline[..vn].copy_from_slice(&name[..vn]);
+    let vsuf: &[u8] = if passed { b": PASS\n" } else { b": FAIL\n" };
+    vline[vn..vn + 7].copy_from_slice(vsuf);
+    write(STDOUT_FILENO, vline.as_ptr(), vn + 7);
     passed
 }
