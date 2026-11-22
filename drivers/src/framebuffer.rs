@@ -820,6 +820,16 @@ impl Framebuffer {
             }
             return;
         }
+        if let Some(rows) = crate::glyphs::narrow_glyph(u) {
+            let (cw, ch) = (self.char_width, self.char_height);
+            self.fill_rect(x, y, cw, ch, 0x000000);
+            for (gy, &row) in rows.iter().enumerate().take(ch) {
+                for gx in 0..8.min(cw) {
+                    if row & (0x80 >> gx) != 0 { self.set_pixel(x + gx, y + gy, color); }
+                }
+            }
+            return;
+        }
         if let Some((base, mark)) = crate::wcwidth::decompose(u) {
             self.draw_char_vector(x, y, base as char, color);
             // overlay_mark works at the cursor; position it by hand here.

@@ -1823,6 +1823,68 @@ unsafe fn t_wide_glyphs(tty0: c_int) -> bool {
     report(b"wide_glyphs", ok)
 }
 
+/// Narrow non-ASCII code points must draw their real Unifont glyph (precomposed
+/// Latin, Cyrillic, Greek) or the box-drawing line, not an ASCII stand-in.
+/// One sample per text row on a free VT; each 8x16 cell is read back through
+/// /dev/fb0 and compared with the expected bitmap rows.
+unsafe fn t_latin_glyphs(tty0: c_int) -> bool {
+    let fb = open(b"/dev/fb0\0".as_ptr(), 0);
+    if fb < 0 { out(b"  fb0 open failed\n"); return report(b"latin_glyphs", false); }
+    let mut info = [0u32; 8];
+    if ioctl(fb, 0x4600, info.as_mut_ptr() as *mut c_void) != 0 || info[6] != 32 {
+        out(b"  FBIOGET_VSCREENINFO failed\n"); close(fb); return report(b"latin_glyphs", false);
+    }
+    let pitch = info[7] as i64;
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { close(fb); return report(b"latin_glyphs", false); }
+    let sid = login_pause(fd);
+    let mut ok = switch_to(tty0, free as usize);
+    sleep_ms(300);
+    let msg = "\x1b[2J\x1b[1;1H\u{e9}\x1b[2;1H\u{416}\x1b[3;1H\u{3a9}\x1b[4;1H\u{2500}";
+    write(fd, msg.as_ptr() as *const c_void, msg.len());
+    sleep_ms(500);
+    // Unifont 18.0.01 rows (bit 7 = leftmost); [3] is the box line, checked below.
+    let want: [[u8; 16]; 3] = [
+        [0x00, 0x00, 0x0C, 0x30, 0x00, 0x00, 0x3C, 0x42, 0x42, 0x7E, 0x40, 0x40, 0x42, 0x3C, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x49, 0x49, 0x2A, 0x2A, 0x1C, 0x1C, 0x2A, 0x2A, 0x49, 0x49, 0x00, 0x00],
+        [0x00, 0x00, 0x00, 0x00, 0x3E, 0x41, 0x41, 0x41, 0x41, 0x41, 0x22, 0x14, 0x14, 0x77, 0x00, 0x00],
+    ];
+    let mut k = 0usize;
+    while k < 4 {
+        let mut got = [0u8; 16];
+        let mut y = 0usize;
+        while y < 16 {
+            let mut row = [0u32; 8];
+            lseek(fb, (k * 16 + y) as i64 * pitch, 0);
+            read(fb, row.as_mut_ptr() as *mut c_void, 32);
+            let mut x = 0usize;
+            while x < 8 { if row[x] & 0xFFFFFF != 0 { got[y] |= 0x80 >> x; } x += 1; }
+            y += 1;
+        }
+        let good = if k < 3 {
+            got == want[k]
+        } else {
+            // box line: some row fully lit, every other row blank
+            let mut full = 0usize; let mut other = 0usize;
+            for &b in got.iter() { if b == 0xFF { full += 1 } else if b != 0 { other += 1 } }
+            full >= 1 && other == 0
+        };
+        out(b"  latin sample "); out_num(k); out(b" match="); out_num(good as usize); out(b"\n");
+        if !good { ok = false; }
+        k += 1;
+    }
+    switch_to(tty0, 1);
+    sleep_ms(100);
+    login_resume(sid);
+    close(fd);
+    close(fb);
+    report(b"latin_glyphs", ok)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let argc = argc_c as isize;
@@ -1869,7 +1931,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 41usize;
+    let total = 42usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1912,6 +1974,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_emu_wide_overwrite() { passed += 1; }
     if t_emu_wide_wrap() { passed += 1; }
     if t_wide_glyphs(tty0) { passed += 1; }
+    if t_latin_glyphs(tty0) { passed += 1; }
 
     // Whatever happened, leave the machine usable: VT 1, text mode, the
     // default keyboard mode. A suite that fails halfway through a KD_GRAPHICS
