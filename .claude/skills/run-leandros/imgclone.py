@@ -5,6 +5,10 @@ import subprocess
 import sys
 
 
+# argv prefix for a copy-on-write clone: APFS `cp -c` on macOS, reflink elsewhere (GNU cp -c is not a clone flag)
+CPC = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=auto", "--sparse=always"]
+
+
 def clone_file(src, dst):
     """Copy a disk image keeping it cheap: APFS clone / reflink when possible,
     else a sparse copy (a plain copy would turn holes into real blocks)."""

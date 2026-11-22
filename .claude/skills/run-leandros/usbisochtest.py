@@ -14,6 +14,7 @@ Pass criteria (on the host-side WAV):
 
 Usage: LEANDROS_RUN_ID=<id> python3 usbisochtest.py [aarch64|x86_64]
 """
+import imgclone
 import json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +37,7 @@ def cmdline_image(arch, run_id):
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
     img = os.path.join(REPO, f"usbisoch-boot-{run_id}.img")
     if os.path.exists(img): os.unlink(img)
-    if subprocess.run(["cp", "-c", src, img], stderr=subprocess.DEVNULL).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, img], stderr=subprocess.DEVNULL).returncode != 0:
         import shutil; shutil.copyfile(src, img)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, CMDLINE],
                    check=True, stdout=subprocess.DEVNULL)

@@ -86,13 +86,13 @@ def main(argv):
     tmp = tempfile.mkdtemp(prefix="nmreal-")
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.path.join(REPO, f"leandros-limine-{arch}.img")
-    if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, img], capture_output=True).returncode != 0:
         imgclone.clone_file(src, img)
     # The root filesystem too: the test saves a Wi-Fi profile in
     # /etc/leandros/network, which must not reach the build image.
     root = os.path.join(tmp, f"root-{arch}.img")
     rsrc = os.path.join(REPO, f"f2fs-data0-{arch}.img")
-    if subprocess.run(["cp", "-c", rsrc, root], capture_output=True).returncode != 0:
+    if subprocess.run([*imgclone.CPC, rsrc, root], capture_output=True).returncode != 0:
         imgclone.clone_file(rsrc, root)
 
     run_id = f"{caller}-nmreal" if caller else "nmreal"

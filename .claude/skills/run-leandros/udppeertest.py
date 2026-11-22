@@ -603,7 +603,7 @@ def main(argv):
             print(f"udppeertest: missing image {src}")
             shutil.rmtree(tmp, ignore_errors=True)
             return 1
-        if subprocess.run(["cp", "-c", src, dst], capture_output=True).returncode != 0:
+        if subprocess.run([*imgclone.CPC, src, dst], capture_output=True).returncode != 0:
             imgclone.clone_file(src, dst)
 
     # The wire: the peer binds P, QEMU's dgram netdev binds Q.

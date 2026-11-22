@@ -110,6 +110,7 @@ DRV = os.path.join(HERE, "driver.py")
 sys.path.insert(0, HERE)
 os.chdir(REPO)
 import driver  # noqa: E402
+import imgclone  # noqa: E402
 
 LONGLINE_CHECK = (
     "__n=0; "
@@ -944,7 +945,7 @@ def main(argv):
         src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
         img = os.path.join(out, f"cmdline-{arch}.img")
         if os.path.exists(img): os.unlink(img)
-        if subprocess.run(["cp", "-c", src, img]).returncode != 0:
+        if subprocess.run([*imgclone.CPC, src, img]).returncode != 0:
             shutil.copyfile(src, img)
         subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, cmdline],
                        check=True, stdout=subprocess.DEVNULL)

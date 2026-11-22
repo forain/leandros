@@ -16,6 +16,7 @@ Phase 2 (not ready, `--notready` or default both): boot with the fault knob
 
 Usage: LEANDROS_RUN_ID=<lane> python3 usbunplugtest.py [aarch64|x86_64] [unplug|notready|fastreplug|hub|hid|all]
 """
+import imgclone
 import hashlib, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -154,7 +155,7 @@ def phase_notready(arch, run_id, env):
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
     bimg = os.path.join(REPO, f"usbunplug-boot-{run_id}.img")
     if os.path.exists(bimg): os.unlink(bimg)
-    if subprocess.run(["cp", "-c", src, bimg]).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, bimg]).returncode != 0:
         import shutil; shutil.copyfile(src, bimg)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), bimg, "usbms.notready_ms=12000"],
                    check=True, stdout=subprocess.DEVNULL)

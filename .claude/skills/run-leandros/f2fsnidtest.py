@@ -10,6 +10,7 @@ boot: mount cleanly, create 3000 symlinks + 300 files, `sha256sum -c` the
 manifest: every pre-existing file must be unchanged (before the fix, new
 symlinks reused live nids and overwrote them). Then fsck-f2fs.py. Exit 0 iff PASS.
 """
+import imgclone
 import os
 import hostclean
 import shutil
@@ -104,7 +105,7 @@ def main(argv):
     if cmdline is not None:
         bc = os.path.join(out, f"boot-{arch}.img")
         src = os.path.join(REPO, f"leandros-limine-{arch}.img")
-        subprocess.run(["cp", "-c", src, bc], check=False)
+        subprocess.run([*imgclone.CPC, src, bc], check=False)
         if not os.path.exists(bc):
             shutil.copyfile(src, bc)
         subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), bc, cmdline], check=True)

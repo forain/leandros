@@ -81,7 +81,7 @@ def main(argv):
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.path.join(REPO, f"leandros-limine-{arch}.img")
     # APFS clone when possible (instant), plain copy otherwise.
-    if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, img], capture_output=True).returncode != 0:
         imgclone.clone_file(src, img)
     r = subprocess.run([os.path.join(REPO, "scripts/set-image-cmdline.sh"), img, f"wifisim.selftest={level}"],
                        capture_output=True, text=True)

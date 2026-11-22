@@ -13,6 +13,7 @@ Exit 0 iff all pass.
 --keep-fail DIR: for a failing iteration keep the pre-recovery crashed image, the raw workload
 console text, the scan output and a directory listing of the missing keys under DIR.
 """
+import imgclone
 import os, random, re, shutil, signal, subprocess, sys, time
 import hostclean
 
@@ -213,7 +214,7 @@ def main(argv):
             continue
         hard_kill()
         if os.environ.get("F2FSFULL_KEEP"):  # keep each crashed image for offline fsck/debugging
-            subprocess.run(["cp", "-c", img, os.path.join(out, f"crashed-iter{it}.img")])
+            subprocess.run([*imgclone.CPC, img, os.path.join(out, f"crashed-iter{it}.img")])
         acked = {int(x) for x in re.findall(r"^ACK (\d+)", text, re.M)}
         dels = {int(x) for x in re.findall(r"^DEL (\d+)", text, re.M)}
         if dels:  # fullchurn deletes 0..D-1 in order: a later DEL proves the earlier keys were unlinked
