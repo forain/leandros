@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/netretry.sh"
 # LeandrOS Cross-Platform Build Script
 # Builds userland, kernel, and generates disk images
 
@@ -147,7 +148,7 @@ download_limine() {
     
     (
         cd "$LIMINE_CACHE_DIR" || exit 1
-        curl -L -o "limine-$version-binary.tar.gz" "$url"
+        net_curl -fL -o "limine-$version-binary.tar.gz" "$url"
         tar -xzf "limine-$version-binary.tar.gz"
         mv "Limine-${major_version}.x-binary" "limine-$version-binary"
         rm "limine-$version-binary.tar.gz"

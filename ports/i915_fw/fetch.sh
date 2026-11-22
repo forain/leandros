@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Intel Gen9 display firmware the i915 driver can load from
 # linux-firmware into $I915_FW_CACHE (default ~/.cache/leandros/i915).
 #
@@ -41,7 +42,7 @@ for entry in "${FILES[@]}"; do
         continue
     fi
     tmp="$out.part"
-    if ! curl -sfL --retry 3 -o "$tmp" "$BASE/$name?h=$TAG"; then
+    if ! net_curl -sfL --retry 3 -o "$tmp" "$BASE/$name?h=$TAG"; then
         echo "i915_fw: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi

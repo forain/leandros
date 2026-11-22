@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Build and stage the LeandrOS D-Bus session package — static musl, both arches.
 #
 # busd 0.5.0 (crates.io) with every *.patch in this directory applied in name
@@ -61,7 +62,7 @@ esac
 
 mkdir -p "$WORK"
 if [ ! -f "$WORK/busd-$VERSION.crate" ]; then
-  curl -sSL -o "$WORK/busd-$VERSION.crate" \
+  net_curl -sSL -o "$WORK/busd-$VERSION.crate" \
     "https://static.crates.io/crates/busd/busd-$VERSION.crate"
 fi
 

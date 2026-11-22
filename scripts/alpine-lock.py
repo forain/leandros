@@ -33,6 +33,9 @@ import tarfile
 import tempfile
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import netretry  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import apkdb  # noqa: E402
@@ -80,11 +83,17 @@ def adir(arch):
 
 def download(url, dest):
     last = None
+
+    def fetch():
+        with urllib.request.urlopen(url, timeout=60) as r, open(dest + ".part", "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(dest + ".part", dest)
+
+    # netretry retries only transient failures (DNS, connect, timeout, 429/5xx) with backoff;
+    # other failures (incl. 404) get the original 3 plain attempts, as before.
     for _ in range(3):
         try:
-            with urllib.request.urlopen(url, timeout=60) as r, open(dest + ".part", "wb") as f:
-                shutil.copyfileobj(r, f)
-            os.replace(dest + ".part", dest)
+            netretry.retry(fetch, url)
             return
         except Exception as e:  # noqa: BLE001
             last = e

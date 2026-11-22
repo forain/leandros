@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Realtek RTL8168-family PHY/MAC patch files ("rtl_nic/*.fw") from
 # linux-firmware into $RTL_NIC_CACHE (default ~/.cache/leandros/rtl_nic).
 # scripts/mkfs-f2fs-populated.py stages whatever is there as
@@ -54,7 +55,7 @@ for entry in "${FILES[@]}"; do
         continue
     fi
     tmp="$out.part"
-    if ! curl -sfL --retry 3 -o "$tmp" "$BASE/$name?h=$TAG"; then
+    if ! net_curl -sfL --retry 3 -o "$tmp" "$BASE/$name?h=$TAG"; then
         echo "rtl_nic: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi

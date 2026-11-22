@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Intel Wi-Fi firmware the kernel's iwlwifi driver loads
 # (drivers/src/iwlwifi.rs) from linux-firmware into $IWLWIFI_CACHE (default
 # ~/.cache/leandros/iwlwifi). scripts/mkfs-f2fs-populated.py stages whatever
@@ -41,7 +42,7 @@ for entry in "${FILES[@]}"; do
         continue
     fi
     tmp="$out.part"
-    if ! curl -sfL --retry 3 -o "$tmp" "$BASE/$name?h=$TAG"; then
+    if ! net_curl -sfL --retry 3 -o "$tmp" "$BASE/$name?h=$TAG"; then
         echo "iwlwifi: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi

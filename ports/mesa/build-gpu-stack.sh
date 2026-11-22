@@ -1,4 +1,5 @@
 #!/bin/sh
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # build-gpu-stack.sh <x86_64|aarch64> — build the GPU Mesa ship-set
 # (zink+virgl+softpipe[+v3d] megadriver, Venus ICD, Vulkan loader) in an Alpine
 # container of the target architecture (inside LeandrOS: a chroot'ed Alpine
@@ -55,7 +56,7 @@ if [ "$NVK" = 1 ]; then
     [ -n "$url" ] && [ -n "$fn" ] && [ -n "$want" ] || continue
     if [ ! -f "$CACHE/crates/$fn" ]; then
       echo "fetching crate $fn"
-      curl -fsSL --retry 3 -o "$CACHE/crates/$fn.part" "$url" || { echo "❌ cannot fetch $url"; rm -f "$CACHE/crates/$fn.part"; exit 1; }
+      net_curl -fsSL --retry 3 -o "$CACHE/crates/$fn.part" "$url" || { echo "❌ cannot fetch $url"; rm -f "$CACHE/crates/$fn.part"; exit 1; }
       mv "$CACHE/crates/$fn.part" "$CACHE/crates/$fn"
     fi
     got=$( (sha256sum "$CACHE/crates/$fn" 2>/dev/null || shasum -a 256 "$CACHE/crates/$fn") | cut -d' ' -f1)

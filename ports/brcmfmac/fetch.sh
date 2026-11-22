@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Wi-Fi firmware the Raspberry Pi 5's CYW43455 (brcmfmac family)
 # needs from RPi-Distro/firmware-nonfree into $BRCMFMAC_CACHE (default
 # ~/.cache/leandros/brcmfmac). scripts/mkfs-f2fs-populated.py stages whatever
@@ -51,7 +52,7 @@ for entry in "${FILES[@]}"; do
     tmp="$out.part"
     ok=1
     for _hop in 1 2 3; do
-        if ! curl -sfL --retry 3 -o "$tmp" "$BASE/$src"; then ok=0; break; fi
+        if ! net_curl -sfL --retry 3 -o "$tmp" "$BASE/$src"; then ok=0; break; fi
         # raw.githubusercontent serves a git symlink as its target path (one short line).
         if [[ $(wc -c < "$tmp") -lt 128 ]] && [[ $(wc -l < "$tmp") -eq 0 ]] && [[ "$(tr -d '[:print:]' < "$tmp")" == "" ]] && [[ "$(cat "$tmp")" == *[./]* ]] && [[ "$(cat "$tmp")" != *=* ]]; then
             src="$(norm "$(dirname "$src")/$(cat "$tmp")")"

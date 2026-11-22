@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Intel Bluetooth firmware the kernel's btusb driver loads
 # (drivers/src/bt/usb.rs + btintel.rs: the 8265's bootloader image and its
 # DDC parameters) from linux-firmware into $INTEL_BT_CACHE (default
@@ -37,7 +38,7 @@ for entry in "${FILES[@]}"; do
         continue
     fi
     tmp="$out.part"
-    if ! curl -sfL --retry 3 -o "$tmp" "$BASE/intel/$name?h=$TAG"; then
+    if ! net_curl -sfL --retry 3 -o "$tmp" "$BASE/intel/$name?h=$TAG"; then
         echo "intel-bt: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi

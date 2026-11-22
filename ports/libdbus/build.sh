@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Build libdbus-1 (the reference C client library only -- no dbus-daemon, no
 # tools) for the guest, because cosmic-applet-bluetooth reaches org.bluez
 # through bluer 0.17 -> dbus 0.9 -> libdbus-sys, which links libdbus-1.so.3.
@@ -31,7 +32,7 @@ esac
 mkdir -p "$W/src" "$W/logs"
 tarball="$W/src/dbus-$VER.tar.xz"
 if [[ ! -f "$tarball" ]]; then
-  curl -fsSL -o "$tarball.part" "https://dbus.freedesktop.org/releases/dbus/dbus-$VER.tar.xz"
+  net_curl -fsSL -o "$tarball.part" "https://dbus.freedesktop.org/releases/dbus/dbus-$VER.tar.xz"
   mv "$tarball.part" "$tarball"
 fi
 got=$({ sha256sum "$tarball" 2>/dev/null || shasum -a 256 "$tarball"; } | cut -d" " -f1)

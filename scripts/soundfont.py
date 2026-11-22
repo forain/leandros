@@ -14,6 +14,8 @@ import subprocess
 import tarfile
 import tempfile
 
+import netretry
+
 ARCHIVE = "fluid-soundfont_3.1.orig.tar.gz"
 URL = "https://deb.debian.org/debian/pool/main/f/fluid-soundfont/" + ARCHIVE
 ARCHIVE_SHA256 = "2621acaa1c78e4abdb24bdd163230cc577e61276936d6aa6e3180582142f0343"
@@ -46,8 +48,10 @@ def stage():
     if not archive.exists() or digest(archive) != ARCHIVE_SHA256:
         with tempfile.TemporaryDirectory(dir=cache) as temporary:
             download = Path(temporary) / ARCHIVE
-            subprocess.run(["curl", "--fail", "--location", "--retry", "3",
-                            "--output", str(download), URL], check=True)
+            rc = netretry.curl_retry(["--fail", "--location", "--retry", "3",
+                                      "--output", str(download), URL])
+            if rc:
+                raise subprocess.CalledProcessError(rc, "curl")
             if digest(download) != ARCHIVE_SHA256:
                 raise SystemExit("Fluid R3 source archive SHA256 mismatch")
             os.replace(download, archive)
