@@ -21,6 +21,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+# SELF_BOOTS: one fresh VM per sample, under our own run id (as reboottest.py).
+os.environ["LEANDROS_RUN_ID"] = f"{os.environ.get('LEANDROS_RUN_ID', 'x')}-uartgap"
+os.environ.pop("LEANDROS_NO_REBOOT", None)
 import driver  # noqa: E402
 
 LIMIT_US = 1500  # half the FIFO's 2.8 ms
@@ -53,13 +56,17 @@ def measure(arch):
 
 
 def reboot(arch):
-    """Fresh VM per measurement. SELF_BOOTS: runtests stops its own VM before
-    this script (it boots, and finally stops, its own VM under its run id)."""
+    """Stop any VM of our run id, boot a fresh one and log in."""
     drv = os.path.join(HERE, "driver.py")
     env = dict(os.environ)
+    arch = arch or "aarch64"
     subprocess.run([sys.executable, drv, "stop"], env=env, capture_output=True, timeout=120)
-    r = subprocess.run([sys.executable, drv, "start", arch or "aarch64"], env=env, capture_output=True, text=True, timeout=900)
-    return r.returncode == 0
+    r = subprocess.run([sys.executable, drv, "start", arch], env=env, capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        return False
+    lg = subprocess.run([sys.executable, drv, "login", "root", "root", str(int(120 * driver.wait_scale(arch, "uefi")))],
+                        env=env, capture_output=True, text=True, timeout=1200)
+    return lg.returncode == 0
 
 
 def main():
@@ -91,7 +98,7 @@ def main():
         samples.append(int(m.group(1)))
         if tcg or int(m.group(1)) <= LIMIT_US:
             break
-    subprocess.run([sys.executable, os.path.join(HERE, "driver.py"), "stop"], capture_output=True, timeout=120)
+    subprocess.run([sys.executable, os.path.join(HERE, "driver.py"), "stop"], env=dict(os.environ), capture_output=True, timeout=120)
     if ok:
         mn = min(samples)
         ok = tcg or mn <= LIMIT_US
