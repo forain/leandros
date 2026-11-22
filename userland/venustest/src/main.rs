@@ -1508,6 +1508,24 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
 
         let win_mib_raw = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_MIB);
         let win_mib = if win_mib_raw == u64::MAX { 0 } else { win_mib_raw };
+        // The span count and LAST_OFF are device-global. Another GPU client
+        // (a COSMIC session started by greetd; runtests passes nvrm.desktop=0
+        // for exactly this reason) allocates and frees host-visible spans
+        // while this runs, so the two window checks below would race with it
+        // and fail "intermittently" for reasons that are not a kernel bug.
+        // Say so as ONE explicit failing verdict instead of two baffling leak
+        // reports. The probe fd holds no context; this fd holds one, so >= 255
+        // free slots means nobody else is on the device.
+        let probe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let free_ctx = if probe >= 0 { getparam_quiet(probe, VIRTGPU_PARAM_LEANDROS_FREE_CTXS) } else { u64::MAX };
+        if probe >= 0 { close(probe); }
+        let sole_client = free_ctx == u64::MAX || free_ctx >= 255;
+        if !sole_client {
+            out(b"  another process holds a GPU context (free slots = ");
+            out_u64(free_ctx);
+            out(b"): window span counts are device-global; boot with nvrm.desktop=0\n");
+        }
+        if !report(b"host3d_sole_gpu_client", sole_client) { failures += 1; }
         let spans_before = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
         out(b"  host-visible window = ");
         out_u64(win_mib);
@@ -1655,7 +1673,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             out_param(spans_after);
             out(b"\n");
         }
-        if !report(b"host3d_window_spans_released", released) { failures += 1; }
+        if sole_client && !report(b"host3d_window_spans_released", released) { failures += 1; }
 
         if win_mib == 0 {
             // No window advertised (this Mac's plain virtio-gpu-pci, or any host
@@ -1669,7 +1687,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
                 // window otherwise idle, first-fit must hand the same offset back
                 // every time. A bump allocator passes every other check here and
                 // fails this one.
-                if !report(b"host3d_window_offset_reused", offsets_reused) { failures += 1; }
+                if sole_client && !report(b"host3d_window_offset_reused", offsets_reused) { failures += 1; }
             }
         }
     }
