@@ -428,6 +428,15 @@ unsafe fn getparam(fd: c_int, param: u64, name: &[u8]) -> u64 {
     gp.value
 }
 
+/// True when no other process holds a GPU context (the probe fd holds none,
+/// and the caller's own context, if any, accounts for at most one slot of 256).
+unsafe fn sole_gpu_client() -> bool {
+    let probe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let free = if probe >= 0 { getparam_quiet(probe, VIRTGPU_PARAM_LEANDROS_FREE_CTXS) } else { u64::MAX };
+    if probe >= 0 { close(probe); }
+    free == u64::MAX || free >= 255
+}
+
 /// A GETPARAM probe that prints nothing. Same contract as `getparam`:
 /// `u64::MAX` means the ioctl itself failed.
 unsafe fn getparam_quiet(fd: c_int, param: u64) -> u64 {
@@ -1812,7 +1821,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             let spans1 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
             out(b"  window spans with A mapped = "); out_param(spans0);
             out(b", after both gone = "); out_param(spans1); out(b"\n");
-            if !report(b"BLOBWIN_SPAN_RETURNED_AFTER_MUNMAP", spans1.wrapping_add(1) == spans0) { failures += 1; }
+            // The span count is device-global: another GPU client (a COSMIC
+            // session) moves it. One explicit verdict instead of a racy check.
+            let sole_4c2 = sole_gpu_client();
+            if !sole_4c2 {
+                out(b"  another process holds a GPU context: span count is device-global; boot with nvrm.desktop=0\n");
+                if !report(b"blobwin_sole_gpu_client", false) { failures += 1; }
+            } else if !report(b"BLOBWIN_SPAN_RETURNED_AFTER_MUNMAP", spans1.wrapping_add(1) == spans0) { failures += 1; }
         }
     }
 
@@ -2288,7 +2303,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             if !init_ok[i] { out(b"(init-failed)"); }
         }
         out(b"\n");
-        if !report(b"phase3_16_contexts_distinct", distinct_ok) { failures += 1; }
+        // Other contexts opening/closing while the slots are probed make the
+        // count (and so this check) racy: say so once instead.
+        if free != u64::MAX && free < 255 {
+            out(b"  another process holds a GPU context (free slots = "); out_u64(free);
+            out(b"): boot with nvrm.desktop=0\n");
+            if !report(b"phase3_sole_gpu_client", false) { failures += 1; }
+        } else if !report(b"phase3_16_contexts_distinct", distinct_ok) { failures += 1; }
 
         // The 17th must fail the ioctl outright…
         let refused = opened == n_try && !init_ok[n_ctx];
