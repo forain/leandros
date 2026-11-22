@@ -1,11 +1,12 @@
-//! `f2fstest fullchurn DIR SEED [ITERS]` / `f2fstest fullscan DIR KMAX` (lane f2fsfull).
+//! `f2fstest fullchurn DIR SEED [ITERS]` / `f2fstest fullscan DIR KMAX [KMIN]` (lane f2fsfull).
 //!
 //! fullchurn: fill the volume holding DIR to ~98% with 1 MiB files, then churn
 //! small files (create+fsync, rename, unlink) until ENOSPC has been seen many
 //! times. Every failure must be ENOSPC (never EIO/other). Prints `ACK k` after
 //! an fsync returned, `DEL k` / `REN k` before unlinking / renaming it, and
 //! `FULL_DONE enospc=N ops=M` at the end. fullscan prints `P <name> OK|BAD`
-//! for every s<k>/t<k> (k < KMAX) that exists, so a host can compare with the
+//! for every s<k>/t<k> (KMIN <= k < KMAX) that exists, then `SCAN_DONE found=N` (N = P lines the guest
+//! printed, so a host can tell console lines lost on the way), so a host can compare with the
 //! claims after a crash.
 
 use leandros_libc::*;
@@ -92,6 +93,7 @@ pub unsafe fn fullchurn(dir: &[u8], seed: u64, iters: u64) -> i32 {
                 Ok(()) => { out(b"ACK "); out_dec(next); out(b"\n"); next += 1; }
                 Err(ENOSPC) => {
                     enospc += 1;
+                    out(b"ENS "); out_dec(next); out(b"\n");
                     // Make room again: drop the newest fill file.
                     if n > 0 { n -= 1; unlink(path(&mut pb, dir, b"f", Some(n))); }
                 }
@@ -147,15 +149,20 @@ pub unsafe fn fullchurn(dir: &[u8], seed: u64, iters: u64) -> i32 {
     bad
 }
 
-pub unsafe fn fullscan(dir: &[u8], kmax: u64) -> i32 {
+pub unsafe fn fullscan(dir: &[u8], kmax: u64, kmin: u64) -> i32 {
     let mut pb = [0u8; 256];
     let mut vb = [0u8; 4096];
     let mut exp = [0u8; 4096];
-    for k in 0..kmax {
+    let mut found = 0u64;
+    for k in kmin..kmax {
         for nm in [b"s", b"t"] {
             let p = path(&mut pb, dir, nm, Some(k));
             let fd = open(p, O_RDONLY, 0);
-            if fd < 0 { continue; }
+            if fd < 0 {
+                let e = errno();
+                if e != 2 { out(b"E "); out(nm); out_dec(k); out(b" open errno="); out_dec(e); out(b"\n"); }
+                continue;
+            }
             let (mut i, mut good) = (0u64, true);
             loop {
                 let r = read(fd, vb.as_mut_ptr(), 4096);
@@ -165,10 +172,11 @@ pub unsafe fn fullscan(dir: &[u8], kmax: u64) -> i32 {
                 i += 1;
             }
             close(fd);
+            found += 1;
             out(b"P "); out(nm); out_dec(k);
             out(if good && i > 0 { b" OK\n" } else { b" BAD\n" });
         }
     }
-    out(b"SCAN_DONE\n");
+    out(b"SCAN_DONE found="); out_dec(found); out(b"\n");
     0
 }

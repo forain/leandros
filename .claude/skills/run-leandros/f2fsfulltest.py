@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""f2fsfulltest.py [aarch64|x86_64] [--iters N] [--seed S]
+"""f2fsfulltest.py [aarch64|x86_64] [--iters N] [--seed S] [--keep-fail DIR]
 
 Near-full volume + metadata churn (lane f2fsfull, L4.11). On a fresh 64 MiB
 f2fs volume `f2fstest fullchurn` fills it to ~98%, then churns small files
@@ -10,6 +10,8 @@ killed at the first failure, then: fsck of the crashed image, remount,
 `f2fstest fullscan`, every fsynced file (ACK k) not being deleted must be
 present and whole, no file may be torn; umount, fsck --strict-leaks.
 Exit 0 iff all pass.
+--keep-fail DIR: for a failing iteration keep the pre-recovery crashed image, the raw workload
+console text, the scan output and a directory listing of the missing keys under DIR.
 """
 import os, random, re, shutil, signal, subprocess, sys, time
 import hostclean
@@ -48,12 +50,14 @@ def main(argv):
     if "--selftest" in argv:
         return selftest()
     arch, iters, seed = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 4, int(time.time())
+    keep_dir = None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in ("aarch64", "x86_64"): arch = a
         elif a == "--iters": iters = int(argv[i + 1]); i += 1
         elif a == "--seed": seed = int(argv[i + 1]); i += 1
+        elif a == "--keep-fail": keep_dir = os.path.abspath(argv[i + 1]); i += 1
         else: sys.exit(__doc__)
         i += 1
     rnd = random.Random(seed)
@@ -76,13 +80,12 @@ def main(argv):
         extra = os.environ.get("F2FSFULL_CMDLINE", "")  # e.g. f2fs.lxchain=1
         if extra: cmdline = f"{cmdline or ''} {extra}".strip()
         if os.path.exists(boot_copy): os.unlink(boot_copy)
+        # Always boot a private copy: the shared image would be write-locked by a concurrent run.
+        shutil.copyfile(src, boot_copy)
         if cmdline:
-            shutil.copyfile(src, boot_copy)
             subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), boot_copy, cmdline],
                            check=True, stdout=subprocess.DEVNULL)
-            os.environ["LEANDROS_DISK_IMAGE"] = boot_copy
-        else:
-            os.environ.pop("LEANDROS_DISK_IMAGE", None)
+        os.environ["LEANDROS_DISK_IMAGE"] = boot_copy
         driver.cmd_start(arch)
         driver.cmd_login("root", "root", timeout=int(90 * driver.wait_scale(arch)))
 
@@ -102,6 +105,7 @@ def main(argv):
         return [l for l in log.splitlines() if "F2FS" in l and ("in place" in l or "refused" in l or "emergency" in l)]
 
     prev = None
+    pre_img = ""
     for it in range(iters + 2):
         crash = it > 0 and it <= iters
         cmdline = f"f2fs.crashpt={rnd.randint(200, 30000)} f2fs.crashpt_mount=2" if crash else None
@@ -109,7 +113,7 @@ def main(argv):
         if not mount():
             fails.append(f"iter {it}: mount failed"); hard_kill(); break
         if prev is not None:
-            pd, acked, dels, kmax = prev
+            pd, acked, dels, kmax, rens, enos, prev_text = prev
             if os.environ.get("F2FSFULL_KEEP"):
                 try:
                     lg = open(driver.SERIAL_FULL_LOG, errors="replace").read()
@@ -123,13 +127,46 @@ def main(argv):
                 present.setdefault(int(m.group(2)), []).append((m.group(1), m.group(3)))
             errs = []
             if "SCAN_DONE" not in scan: errs.append("scan did not finish")
+            for l in re.findall(r"^E [st]\d+ open errno=\d+", scan, re.M): errs.append(f"open failed: {l}")
             for k, v in present.items():
                 if any(x[1] == "BAD" for x in v): errs.append(f"k{k} torn/garbled")
-            for k in acked - dels:
-                if k not in present: errs.append(f"k{k} fsynced but missing")
+            # The scan's P lines travel over the console, which has been seen to drop lines (lane f2fsmiss).
+            # The guest prints how many P lines it emitted (SCAN_DONE found=N): a key absent from the parsed
+            # output is only excused when lines are provably missing (found > parsed) AND an individual
+            # re-probe of that key finds it whole; anything else stays a failure.
+            mf = re.search(r"SCAN_DONE found=(\d+)", scan)
+            nparsed = len(re.findall(r"^P [st]\d+ (?:OK|BAD)", scan, re.M))
+            lost = (int(mf.group(1)) - nparsed) if mf else 0
+            if lost: print(f"    note: {lost} scan line(s) lost on the console (guest found {mf.group(1)}, host parsed {nparsed})", flush=True)
+            for k in sorted(acked - dels):
+                if k in present: continue
+                if lost > 0:
+                    pr = run(f"/bin/f2fstest fullscan {pd} {k + 1} {k}", 120)
+                    if re.search(rf"^P [st]{k} OK", pr, re.M) and "SCAN_DONE" in pr:
+                        lost -= 1
+                        print(f"    note: k{k} present on re-probe (its scan line was lost)", flush=True)
+                        continue
+                errs.append(f"k{k} fsynced but missing")
             print(f"iter {it - 1}: recovered: {'PASS' if not errs else 'FAIL'} ({len(acked)} acked, {len(present)} present)", flush=True)
             for e in errs[:10]: print("    ", e, flush=True)
-            if errs: fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
+            if errs:
+                fails.append(f"iter {it - 1}: {len(errs)} recovery errors")
+                miss = sorted(k for k in acked - dels if k not in present)[:5]
+                lst = ""
+                for k in miss:
+                    ctx = (f"k{k}: ACK seen={k in acked} ACK k-1/k+1={k - 1 in acked}/{k + 1 in acked} "
+                           f"REN seen={k in rens} ENOSPC-retried={k in enos}")
+                    print("    ", ctx, flush=True)
+                    lst += ctx + "\n" + run(f"ls -l {pd} | grep -E ' [st]{k}$'; echo LS_END; wc -c {pd}/s{k} {pd}/t{k}; echo WC_END", 60) + "\n"
+                if keep_dir:
+                    kd = os.path.join(keep_dir, f"{arch}-seed{seed}-it{it - 1}")
+                    os.makedirs(kd, exist_ok=True)
+                    if os.path.exists(pre_img): shutil.copyfile(pre_img, os.path.join(kd, "crashed.img"))
+                    open(os.path.join(kd, "work.txt"), "w").write(prev_text)
+                    open(os.path.join(kd, "scan.txt"), "w").write(scan)
+                    open(os.path.join(kd, "missing.txt"), "w").write(lst)
+                    open(os.path.join(kd, "dmesg.txt"), "w").write(run("dmesg 2>/dev/null | tail -300", 60))
+                    print(f"    kept evidence in {kd}", flush=True)
             # fsck the recovered tree BEFORE deleting it: dentry damage in the test
             # directory is invisible once `rm -rf` has dropped it.
             run("umount /mnt/cr && sync && echo UMOUNT_OK", 120)
@@ -184,13 +221,17 @@ def main(argv):
             if gaps:
                 print(f"iter {it}: WARNING lost {len(gaps)} DEL console line(s), e.g. {gaps[:5]}", flush=True)
             dels = set(range(max(dels) + 1))
+        rens = {int(x) for x in re.findall(r"^REN (\d+)", text, re.M)}
+        enos = {int(x) for x in re.findall(r"^ENS (\d+)", text, re.M)}
         kmax = max(acked | {0})
+        pre_img = os.path.join(out, "pre-recovery.img")
+        if keep_dir: shutil.copyfile(img, pre_img)
         print(f"iter {it}: {cmdline}: {len(acked)} acked, {len(dels)} deleted, "
               f"{'full' if 'FILLED' in text else 'still filling'}", flush=True)
         ok, detail = cr.fsck(img, strict_leaks=False)
         print(f"iter {it}: fsck of crashed image: {'PASS' if ok else 'FAIL'} {detail}", flush=True)
         if not ok: fails.append(f"iter {it}: fsck of crashed image")
-        prev = (d, acked, dels, kmax)
+        prev = (d, acked, dels, kmax, rens, enos, text)
     if os.path.exists(boot_copy): os.unlink(boot_copy)
     print(f"f2fsfulltest: {'PASS' if not fails else 'FAIL'} {fails}")
     return 0 if not fails else 1
