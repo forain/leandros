@@ -338,7 +338,7 @@ SUITES = {
                 "host:f2fscommittest.py",
                 # Atomic small writes: checkpoints per write (plain 1, cosmic-config 2) and power cuts
                 # between fsync / rename / dir fsync (lane f2fsckpt3; own boots, stops this VM).
-                "host:f2fsckpttest.py",
+                "host:f2fsckpttest.py", "host:f2fsfulltest.py",
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 # A spin-locked caller reading a file (the wifi-brcmf ctl poll) must not stall f2fs

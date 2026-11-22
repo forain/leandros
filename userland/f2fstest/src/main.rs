@@ -61,7 +61,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
                 let num = |i: usize, d: u64| if argc as usize > i {
                     arg(argv, i).iter().fold(0u64, |a, &c| a * 10 + (c.wrapping_sub(b'0')) as u64)
                 } else { d };
-                return if arg(argv, 1) == b"fullscan" { full::fullscan(dir, num(3, 100000)) }
+                return if arg(argv, 1) == b"fullscan" { full::fullscan(dir, num(3, 100000), num(4, 0)) }
                        else { full::fullchurn(dir, num(3, 1), num(4, 4000)) };
             }
             b"ostree" => {
