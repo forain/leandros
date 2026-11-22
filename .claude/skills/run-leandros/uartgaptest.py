@@ -14,6 +14,7 @@ console scrolls), the host pastes a long line at full speed.
 """
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -51,6 +52,15 @@ def measure(arch):
         ser.close()
 
 
+def reboot(arch):
+    """Fresh VM for a re-measure (runtests' VM is already up: stop it, start anew)."""
+    drv = os.path.join(HERE, "driver.py")
+    env = dict(os.environ)
+    subprocess.run([sys.executable, drv, "stop"], env=env, capture_output=True, timeout=120)
+    r = subprocess.run([sys.executable, drv, "start", arch or "aarch64"], env=env, capture_output=True, text=True, timeout=900)
+    return r.returncode == 0
+
+
 def main():
     arch = os.environ.get("LEANDROS_TEST_ARCH")
     fails = []
@@ -66,6 +76,10 @@ def main():
     samples = []
     ok = True
     for attempt in range(3):
+        if attempt and not reboot(arch):
+            ok = False
+            print("uartgap_txgap_bounded: FAIL (re-boot for re-measure failed)")
+            break
         m, out = measure(arch)
         # the PL011 gap counter is aarch64-only (x86 reads 0)
         good = m is not None and (int(m.group(1)) > 0 or arch != "aarch64") and m.group(4) == "0"
