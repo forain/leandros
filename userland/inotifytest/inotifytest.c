@@ -1592,6 +1592,67 @@ static void t_fhandle_follow(void)
     rmdir("/root/fhtest");
 }
 
+/* Per-filesystem handle classes (Linux exportfs): no-export filesystems answer
+ * EOPNOTSUPP (AT_HANDLE_FID still identifies), kernfs round-trips, f2fs rejects
+ * a wrong generation with ESTALE. */
+#define FH_AT_HANDLE_FID 0x200
+static void t_fhandle_classes(void)
+{
+    struct fh20 h; int mid;
+    /* procfs: no export ops */
+    memset(&h, 0, sizeof h); h.hb = 20;
+    long r = syscall(FH_N2H, AT_FDCWD, "/proc/self/status", &h, &mid, 0); int e = errno;
+    report("t_fhandle_proc_eopnotsupp", r == -1 && e == EOPNOTSUPP);
+    memset(&h, 0, sizeof h); h.hb = 20;
+    r = syscall(FH_N2H, AT_FDCWD, "/proc/self/status", &h, &mid, FH_AT_HANDLE_FID);
+    int pm = open("/proc", O_RDONLY | O_DIRECTORY);
+    long o = pm < 0 ? -1 : syscall(FH_OPEN, pm, &h, O_RDONLY); e = errno;
+    report("t_fhandle_proc_fid_only", r == 0 && h.hb == 12 && o == -1 && e == EOPNOTSUPP);
+    if (pm >= 0) close(pm);
+    /* devpts, mqueue */
+    struct stat sb;
+    if (stat("/dev/pts", &sb) == 0) {
+        memset(&h, 0, sizeof h); h.hb = 20;
+        r = syscall(FH_N2H, AT_FDCWD, "/dev/pts", &h, &mid, 0); e = errno;
+        report("t_fhandle_devpts_eopnotsupp", r == -1 && e == EOPNOTSUPP);
+    }
+    if (stat("/dev/mqueue", &sb) == 0) {
+        memset(&h, 0, sizeof h); h.hb = 20;
+        r = syscall(FH_N2H, AT_FDCWD, "/dev/mqueue", &h, &mid, 0); e = errno;
+        report("t_fhandle_mqueue_eopnotsupp", r == -1 && e == EOPNOTSUPP);
+    }
+    /* sysfs (kernfs): encode and decode round-trip */
+    if (stat("/sys/kernel", &sb) == 0) {
+        memset(&h, 0, sizeof h); h.hb = 20;
+        r = syscall(FH_N2H, AT_FDCWD, "/sys/kernel", &h, &mid, 0);
+        int mf = open("/sys", O_RDONLY | O_DIRECTORY);
+        int fd = (r == 0 && mf >= 0) ? (int)syscall(FH_OPEN, mf, &h, O_RDONLY) : -1;
+        struct stat so; int ok = fd >= 0 && fstat(fd, &so) == 0 && so.st_ino == sb.st_ino;
+        if (!ok) printf("  fhandle_sysfs: r=%ld mf=%d fd=%d errno=%d\n", r, mf, fd, errno);
+        report("t_fhandle_sysfs_roundtrip", ok);
+        if (fd >= 0) close(fd);
+        if (mf >= 0) close(mf);
+    }
+    /* f2fs: a wrong i_generation is ESTALE, the right one opens */
+    mkdir("/root/fhtest", 0755);
+    struct statfs sf; int isf2 = statfs("/root/fhtest", &sf) == 0 && (unsigned long)sf.f_type == 0xF2F52010UL;
+    if (isf2) {
+        char p[64] = "/root/fhtest/gen2"; int f = open(p, O_CREAT | O_WRONLY, 0644); if (f >= 0) close(f);
+        memset(&h, 0, sizeof h); h.hb = 20;
+        r = syscall(FH_N2H, AT_FDCWD, p, &h, &mid, 0);
+        int mf = open("/root/fhtest", O_RDONLY | O_DIRECTORY);
+        int good = r == 0 && mf >= 0 && h.gen != 0;
+        int gfd = good ? (int)syscall(FH_OPEN, mf, &h, O_RDONLY) : -1;
+        h.gen ^= 0x5a5a;
+        long bad = good ? syscall(FH_OPEN, mf, &h, O_RDONLY) : 0; e = errno;
+        report("t_fhandle_f2fs_wrong_gen", good && gfd >= 0 && bad == -1 && e == ESTALE);
+        if (gfd >= 0) close(gfd);
+        if (mf >= 0) close(mf);
+        unlink(p);
+    }
+    rmdir("/root/fhtest");
+}
+
 /* A listener process denies / allows the execve of /bin/true. */
 static int fan_exec_run(unsigned resp, int *evmask, int *child_rc)
 {
@@ -1804,6 +1865,7 @@ static void t_fan_fs_fid(void)
 static void t_hl_cases(void)
 {
     t_hl_self(); t_hl_unlink_one(); t_hl_link_after_watch();
+    t_fhandle_classes();
     t_fan_basic(); t_fan_mount(); t_fan_child(); t_fan_remove_flush(); t_fan_einval(); t_fan_eperm();
     t_fanperm_deny(); t_fanperm_allow(); t_fanperm_access(); t_fanperm_close_allows(); t_fanperm_self(); t_fanperm_einval(); t_fan_ignore();
     t_fan_hardlink();
