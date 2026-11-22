@@ -279,6 +279,16 @@ leandros_alpine_run() {
     esac
   done
   [ $# -gt 0 ] || { echo "leandros_alpine_run: no command" >&2; return 2; }
+  # retry helpers for apk/pip/wget inside the container (see scripts/lib/netretry.sh)
+  for _ar_nd in "${LEANDROS_NETRETRY_DIR:-}" "${ROOT:-/nonexistent}/scripts/lib" "${HERE:-/nonexistent}/../../scripts/lib"; do
+    if [ -f "$_ar_nd/netretry.sh" ]; then
+      _ar_nd=$(cd "$_ar_nd" && pwd)
+      _ar_cmnt="$_ar_cmnt -v $(_leandros_q "$_ar_nd:/netretry:ro")"
+      _ar_mlist="$_ar_mlist$_ar_nd:/netretry:ro
+"
+      break
+    fi
+  done
   if [ -z "${ALPINE_BACKEND:-}" ]; then
     leandros_pick_alpine || { echo "no Alpine backend: $ALPINE_WHY" >&2; return 1; }
   fi

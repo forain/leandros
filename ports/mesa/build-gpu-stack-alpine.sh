@@ -50,6 +50,7 @@ if [ "$INTEL" = 1 ]; then
 fi
 (
   set -e
+  [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   [ "$(uname -m)" = "$ARCH" ] || { echo "container is $(uname -m), wanted $ARCH"; exit 3; }
   apk add --no-cache build-base meson samurai bison flex python3 py3-mako \
     py3-packaging py3-yaml libdrm-dev wayland-dev wayland-protocols \

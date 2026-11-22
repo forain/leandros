@@ -78,3 +78,32 @@ net_git() {
         _ng_try=$((_ng_try + 1)); _ng_delay=$((_ng_delay * 2))
     done
 }
+
+# net_apk / net_pip: same policy for package managers run INSIDE the Alpine
+# build containers (busybox ash).  Retried only when stderr shows a transient
+# network error; unsatisfiable constraints / missing packages / bad signatures
+# fail at once.  stdout passes through untouched, stderr is replayed.
+_NET_APK_RE='temporary error|DNS[: ]|DNS lookup|network error|Network is unreachable|Could not resolve|Temporary failure in name resolution|Connection (timed out|refused|reset)|timed out|Operation timed out|Failed to connect|(HTTP|HTTPS)? ?(error )?(429|5[0-9][0-9])( |$)|Bad Gateway|Service Unavailable|Gateway Time-?out'
+_NET_PIP_RE='Failed to establish a new connection|Temporary failure in name resolution|Name or service not known|Connection (timed out|refused|reset|aborted)|ReadTimeoutError|ConnectTimeoutError|Max retries exceeded|Network is unreachable|(HTTP|Server) (Error|error)?:? ?(429|5[0-9][0-9])|Bad Gateway|Service Unavailable'
+
+_net_pkg() { # <name> <regex> cmd...
+    _np_name=$1; _np_re=$2; shift 2
+    _np_try=1; _np_delay=1
+    _np_err=$(mktemp "${TMPDIR:-/tmp}/netretry.XXXXXX") || { "$@"; return $?; }
+    while :; do
+        "$@" 2> "$_np_err"; _np_rc=$?
+        cat "$_np_err" >&2
+        if [ "$_np_rc" -eq 0 ]; then rm -f "$_np_err"; return 0; fi
+        if [ "$_np_try" -ge "$NET_RETRY_MAX" ] || ! grep -qiE "$_np_re" "$_np_err"; then
+            rm -f "$_np_err"; return "$_np_rc"
+        fi
+        _net_wait "$_np_name" "$_np_try" "$_np_rc" "transient network error" "$_np_delay"
+        _np_try=$((_np_try + 1)); _np_delay=$((_np_delay * 2))
+    done
+}
+net_apk() { _net_pkg apk "$_NET_APK_RE" command apk "$@"; }
+net_pip() { _net_pkg pip "$_NET_PIP_RE" command pip "$@"; }
+# net_shim: shadow apk/pip with the retrying versions for the rest of this
+# shell (container scripts: `. /netretry/netretry.sh; net_shim`).  Also covers
+# $APK="apk --root ..." since functions win over the binary.
+net_shim() { apk() { net_apk "$@"; }; pip() { net_pip "$@"; }; }

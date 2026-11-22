@@ -26,6 +26,7 @@ if [ "${1:-}" = "--in-container" ]; then
   set +e   # the subshell fails fast; the rc line below must still print
   (
     set -e
+    [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
     apk add --no-cache build-base patchelf file >/dev/null
     grep -c 0x07230203 /src/nvktest_spv.h
     cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
