@@ -89,7 +89,7 @@ config I915
 	default y
 
 config V3D
-	bool "Broadcom V3D / KMS"
+	tristate "Broadcom V3D / KMS"
 	depends on DRM && BOARD_RPI5
 	default y
 

@@ -113,3 +113,49 @@ pub mod sys_plat {
         pub fn kapi_rp1_irq_free(owner: KmodId, n: u32) -> i32;
     }
 }
+
+/// V3D (Pi 5) core services for the `v3d` module; every call returns -19 (or 0/false) off a Pi 5 or when V3D=n.
+pub mod sys_v3d {
+    use crate::{KIrqHandler, KmodId};
+    pub type BoHoldFn = unsafe extern "C" fn(u32, u32) -> i64;
+    pub type BoUnrefFn = unsafe extern "C" fn(u32);
+    pub type BoFenceFn = unsafe extern "C" fn(u32, u32, u64);
+    pub type QueueWaitFn = unsafe extern "C" fn(u64) -> i32;
+    pub type FenceAllocFn = unsafe extern "C" fn() -> u64;
+    pub type FenceDoneFn = unsafe extern "C" fn(u64) -> i32;
+    pub type FenceRetireFn = unsafe extern "C" fn(u64);
+    pub type VaAllocFn = unsafe extern "C" fn(u64) -> u64;
+    pub type VaFreeFn = unsafe extern "C" fn(u64);
+    pub type RegisterFn = unsafe extern "C" fn(KmodId, *const u8, usize) -> i32;
+    pub type ArmFn = unsafe extern "C" fn(*const u8, usize) -> i32;
+    pub type MboxPropertyFn = unsafe extern "C" fn(*const u32, usize, *mut u32, usize) -> i64;
+    pub type PmBaseFn = unsafe extern "C" fn() -> u64;
+    pub type IrqRequestSpiFn = unsafe extern "C" fn(KmodId, u32, KIrqHandler, usize) -> i64;
+    pub type IrqLineStateFn = unsafe extern "C" fn(u32) -> u32;
+    extern "C" {
+        /// > 0 BO object held, 0 dumb BO (no reference), -2 not reachable by this open.
+        pub fn kapi_v3d_bo_hold(handle: u32, open_id: u32) -> i64;
+        pub fn kapi_v3d_bo_unref(obj: u32);
+        pub fn kapi_v3d_bo_fence(handle: u32, open_id: u32, fence: u64);
+        /// Park the submitter up to 1 ms for queue room. 1 = a signal is pending (give up), 0 = retry.
+        pub fn kapi_v3d_queue_wait(deadline: u64) -> i32;
+        pub fn kapi_v3d_fence_alloc() -> u64;
+        pub fn kapi_v3d_fence_done(fence: u64) -> i32;
+        /// Wake sync-object waiters of `fence` (any context).
+        pub fn kapi_v3d_fence_retire(fence: u64);
+        /// Kernel-owned GPU VA span; 0 = none.
+        pub fn kapi_v3d_va_alloc(bytes: u64) -> u64;
+        pub fn kapi_v3d_va_free(va: u64);
+        /// Hand over the `KV3dOps` table (permanent). -22 bad size, -17 already set, -19 no V3D.
+        pub fn kapi_v3d_register(owner: KmodId, ops: *const u8, size: usize) -> i32;
+        /// Latch the backend armed and pick the scanout sink. -22 with no table.
+        pub fn kapi_v3d_arm(cmdline: *const u8, len: usize) -> i32;
+        /// One firmware property call, serialised with the kernel's own. Reply words copied out; count or -errno.
+        pub fn kapi_mbox_property(words: *const u32, n: usize, out: *mut u32, out_n: usize) -> i64;
+        /// Shared PM window virtual base, 0 if unmapped.
+        pub fn kapi_pm_base() -> u64;
+        /// GIC SPI `intid` (not PCI INTx). Line or -errno.
+        pub fn kapi_irq_request_spi(owner: KmodId, intid: u32, handler: KIrqHandler, ctx: usize) -> i64;
+        pub fn kapi_irq_line_state(id: u32) -> u32;
+    }
+}

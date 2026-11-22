@@ -51,6 +51,7 @@ members = [
     "modules/virtio-snd",
     "modules/hda",
     "modules/hdmi-audio",
+    "modules/v3d",
     "modules/uvc",
     "scripts/kmod/fixtures/badsym",
     "scripts/kmod/fixtures/baddep",

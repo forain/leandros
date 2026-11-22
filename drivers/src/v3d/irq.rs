@@ -203,14 +203,10 @@ pub use hw::*;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 mod hw {
     use super::*;
-    use crate::irq::{IrqReturn, IrqSource};
+    use crate::kenv::v3d::{IrqReturn, IrqSource};
     use core::cell::UnsafeCell;
     use core::fmt::Write;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-
-    extern "C" {
-        fn arch_irq_line_state(id: u32) -> u32;
-    }
 
     struct RegsCell(UnsafeCell<Option<&'static (dyn V3dRegs + Sync)>>);
     unsafe impl Sync for RegsCell {}
@@ -295,7 +291,7 @@ mod hw {
     struct Env { id: u32, counter: &'static AtomicU64 }
     impl SelftestEnv for Env {
         fn delivered(&self) -> u64 { self.counter.load(Ordering::Acquire) }
-        fn gic_state(&self) -> u32 { unsafe { arch_irq_line_state(self.id) } }
+        fn gic_state(&self) -> u32 { crate::kenv::v3d::irq_line_state(self.id) }
         fn cpu_irqs_masked(&self) -> bool {
             let daif: u64;
             unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack)); }
@@ -310,12 +306,12 @@ mod hw {
         READY.store(true, Ordering::Release);
         enable(regs, ver);
         let clock = super::super::mmu::CntClock;
-        let hub = match crate::irq::request_irq(IrqSource::Line(HUB_INTID), hub_isr, 0) {
+        let hub = match crate::kenv::v3d::request_irq(IrqSource::Line(HUB_INTID), hub_isr, 0) {
             Ok(h) => { core::mem::forget(h); selftest_line(regs, Block::Hub, HUB_INT_TFUC,
                 &Env { id: HUB_INTID, counter: &HUB_DELIVERED }, &clock, SELFTEST_TIMEOUT_US) }
             Err(_) => LineResult::Busy,
         };
-        let core = match crate::irq::request_irq(IrqSource::Line(CORE_INTID), core_isr, 0) {
+        let core = match crate::kenv::v3d::request_irq(IrqSource::Line(CORE_INTID), core_isr, 0) {
             Ok(h) => { core::mem::forget(h); selftest_line(regs, Block::Core, INT_FRDONE,
                 &Env { id: CORE_INTID, counter: &CORE_DELIVERED }, &clock, SELFTEST_TIMEOUT_US) }
             Err(_) => LineResult::Busy,

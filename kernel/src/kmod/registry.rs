@@ -133,6 +133,7 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::SND => super::exports::snd_release(),
         // The netif entry stays (name kept); its gate is closed for good, so nothing reaches the module.
         RegKind::NETDEV => true,
+        RegKind::V3D => { drivers::v3d_class::unregister(); true }
         _ => false,
     }
 }
@@ -151,6 +152,7 @@ pub fn busy_reason(id: KmodId) -> Option<&'static str> {
             }
             RegKind::SND => { if super::exports::snd_busy() { return Some("sound open"); } }
             RegKind::DRM | RegKind::KMS => return Some("display in use"),
+            RegKind::V3D => return Some("gpu in use"),
             _ => {}
         }
     }

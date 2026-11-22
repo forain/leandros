@@ -498,8 +498,8 @@ a real `SUBMIT_CL` queue (out-of-memory binner overflow, hang reset, multi-sync)
   carried the virtio-pci sysfs identity for card0/renderD128 and `pi-sync` skips `/sys/dev/char/226:*`.
   `scripts/pi-v3d-sysfs.sh` rewrites the identity to a platform device once per root. `es31test --fbo`
   and `vkprobe` ship in the aarch64 set. kmscube has no display path on the Pi yet.
-- `kexec` quiesces V3D (`pikexecdma2`); `v3d` is Y/N gated by the kernel-module work
-  ([kernel/modules.md](../kernel/modules.md)).
+- `kexec` quiesces V3D (`pikexecdma2`); `V3D` is a tristate (`y`/`m`/`n`) in the kernel-module work
+  ([kernel/modules.md](../kernel/modules.md)). Proven on the Pi: `=y` and `=m` both run kmscube at about 60 fps, `vkprobe` and `es31test` pass; with `=m` the kernel image contains no `v3d_real`/`ClQueue`. `scripts/pi-gpu-smoke.sh` scores 5/5 on `=y` or `=m` (run it with no compositor holding card0).
 
 ## Board support: watchdog, panic, fan, identity
 

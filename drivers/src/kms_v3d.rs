@@ -54,6 +54,55 @@ pub fn flip_log_due(n: u64) -> bool {
     n <= 8 || n.is_power_of_two()
 }
 
+/// DRM fourcc XR24 (XRGB8888) and AR24 (ARGB8888).
+pub const FOURCC_XR24: u32 = 0x3432_5258;
+pub const FOURCC_AR24: u32 = 0x3432_5241;
+
+/// May a v3d BO of `w`x`h`, `pitch` bytes per row and `size` bytes be wrapped in a scanout
+/// framebuffer? Linear XR24/AR24 only; the pitch may exceed `w * 4` (Mesa packs it tightly,
+/// other clients align it) but must hold a row and the BO must hold every row.
+pub fn fb_acceptable(fourcc: u32, w: u32, h: u32, pitch: u32, offset: u32, size: u64) -> bool {
+    if fourcc != FOURCC_XR24 && fourcc != FOURCC_AR24 { return false; }
+    if w == 0 || h == 0 || offset != 0 { return false; }
+    let Some(row) = w.checked_mul(4) else { return false };
+    if pitch < row || pitch % 4 != 0 { return false; }
+    (pitch as u64) * (h as u64 - 1) + row as u64 <= size
+}
+
+/// `v3d.headless=WxH` on the kernel command line: the opt-in RAM scanout surface size.
+pub fn parse_headless(cmdline: &str) -> Option<(u32, u32)> {
+    let v = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("v3d.headless="))?;
+    let (w, h) = v.split_once('x')?;
+    let (w, h): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+    if w < 16 || h < 16 || w > 4096 || h > 4096 { return None; }
+    Some((w, h))
+}
+
+const CRC_TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
+/// CRC-32 (IEEE, reflected) continuing from `crc` (start with 0).
+pub fn crc32(crc: u32, data: &[u8]) -> u32 {
+    let mut c = !crc;
+    for &b in data {
+        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 mod hw {
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -65,7 +114,7 @@ mod hw {
         V3D_FLIPS.load(Ordering::Relaxed)
     }
 
-    fn dc_range(va: usize, len: usize, clean: bool) {
+    pub fn dc_range(va: usize, len: usize, clean: bool) {
         let mut p = va & !63;
         let end = va + len;
         while p < end {
@@ -135,7 +184,7 @@ mod hw {
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub use hw::{flips, present};
+pub use hw::{dc_range, flips, present};
 
 #[cfg(test)]
 mod tests {
@@ -191,6 +240,21 @@ mod tests {
         assert!(dst[64..].iter().all(|&b| b == 0));
         // A row wider than either pitch copies nothing.
         assert_eq!(stride_copy(&src, 16, &mut dst, 32, 20, 4), 0);
+    }
+
+    #[test]
+    fn acceptance_headless_and_crc() {
+        assert!(fb_acceptable(FOURCC_XR24, 1920, 1080, 7680, 0, 7680 * 1080));
+        assert!(fb_acceptable(FOURCC_AR24, 1920, 1080, 8192, 0, 8192 * 1080));
+        assert!(!fb_acceptable(0x3231_564e, 64, 64, 256, 0, 1 << 20)); // NV12
+        assert!(!fb_acceptable(FOURCC_XR24, 64, 64, 255, 0, 1 << 20)); // pitch < w*4
+        assert!(!fb_acceptable(FOURCC_XR24, 64, 64, 256, 4, 1 << 20)); // offset
+        assert!(!fb_acceptable(FOURCC_XR24, 64, 64, 256, 0, 256 * 63)); // BO too small
+        assert_eq!(parse_headless("a v3d.headless=1280x720 b"), Some((1280, 720)));
+        assert_eq!(parse_headless("v3d.headless=1x1"), None);
+        assert_eq!(parse_headless("v3d.probe=1"), None);
+        assert_eq!(crc32(0, b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(crc32(0, b"1234"), b"56789"), 0xCBF4_3926);
     }
 
     #[test]

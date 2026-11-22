@@ -192,3 +192,71 @@ pub mod hdmi {
     /// Fallback SError checkpoint when the boot has not installed one.
     pub fn serror() -> Option<u64> { None }
 }
+
+/// What the V3D driver (`drivers/src/v3d`) needs from the kernel. The built-in build answers with the
+/// kernel's own functions; the module build (V3D=m) answers the same names through `kapi_mbox_property`,
+/// `kapi_pm_base`, `kapi_v3d_arm`, `kapi_v3d_va_alloc/free` and the existing irq/dma/fence exports.
+#[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d"))]
+pub mod v3d {
+    pub use crate::irq::{request_irq, IrqReturn, IrqSource};
+    pub use crate::pci::serial_debug;
+    pub use crate::rpi_mailbox::MBOX_BASE_PHYS;
+
+    pub mod mm { pub use ::mm::{buddy, kva, phys_to_virt}; }
+    pub mod sched { pub use ::sched::monotonic_ns; }
+
+    /// One firmware property-tag call (`kapi_mbox_property`).
+    ///
+    /// # Safety
+    /// Boot CPU only, nothing else touching the mailbox; `hhdm` as for `rpi_mailbox::property_call`.
+    pub unsafe fn mbox_property(hhdm: usize, words: &[u32]) -> Result<&'static [u32], crate::rpi_mailbox::MboxError> {
+        crate::rpi_mailbox::property_call(hhdm, words)
+    }
+    /// Record the ioremapped mailbox window (`kapi_mbox_property` owns it in the module build).
+    pub fn mbox_set_virt(virt: usize) { crate::rpi_mailbox::set_mbox_virt(virt) }
+    /// Shared PM window (`kapi_pm_base`).
+    pub fn pm_base() -> Option<usize> { crate::rpi_pm::base() }
+    /// Register the kexec stop hook (`kapi_dma_quiesce_register`).
+    pub fn dma_quiesce_register(name: &'static str, f: fn() -> bool) { super::dma_quiesce_register(name, f) }
+    /// Kernel-owned GPU VA (`kapi_v3d_va_alloc` / `kapi_v3d_va_free`).
+    pub fn va_alloc(bytes: u64) -> Option<u64> { crate::drm_device_interface::v3d_kernel_va_alloc(bytes) }
+    pub fn va_free(va: u64) { crate::drm_device_interface::v3d_kernel_va_free(va) }
+    /// Tell the DRM layer the hardware is up, then pick the scanout sink (`kapi_v3d_arm`).
+    pub fn arm(cmdline: &str, serror: crate::v3d::SerrorCheck) {
+        crate::drm_device_interface::v3d_arm_hw();
+        crate::v3d_scanout::register(cmdline, serror);
+    }
+    /// Hand the driver's `KV3dOps` table to core (`kapi_v3d_register`).
+    pub fn register_ops(t: &'static crate::v3d_class::KV3dOps) { crate::v3d_class::register(t); }
+    /// GIC line state for the IRQ self-test / poll fallback (`kapi_irq_line_state`).
+    pub fn irq_line_state(id: u32) -> u32 {
+        extern "C" { fn arch_irq_line_state(id: u32) -> u32; }
+        unsafe { arch_irq_line_state(id) }
+    }
+    pub fn alloc_fence_id() -> u64 { crate::drm_device_interface::v3d_alloc_fence_id() }
+    pub fn fence_signalled(f: u64) -> bool { crate::drm_device_interface::v3d_fence_signalled(f) }
+    pub fn syncobj_retire_fence(f: u64) { crate::drm_device_interface::syncobj_retire_fence(f) }
+
+    pub use crate::DriverError;
+    pub fn yield_now(why: &'static str) { ::sched::yield_now(why) }
+    /// Range-checked copy from user memory (`kapi_copy_from_user`).
+    pub fn copy_from_user(src: usize, buf: &mut [u8]) -> bool {
+        unsafe { ::sched::uaccess::copy_from_user(buf.as_mut_ptr(), src, buf.len()) == 0 }
+    }
+    /// Append the pending fences of in-sync `h` to `out`; no fence yet counts as satisfied.
+    pub fn syncobj_deps(h: u32, open_id: u32, out: &mut alloc::vec::Vec<u64>) -> Result<(), DriverError> {
+        match crate::drm_device_interface::syncobj_in_fences(h, open_id, 0) {
+            Ok(v) => { out.extend(v); Ok(()) }
+            Err(DriverError::InvalidParameter) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    pub fn syncobj_exists(h: u32, open_id: u32) -> bool { crate::drm_device_interface::syncobj_exists(h, open_id) }
+    pub fn syncobj_install(h: u32, open_id: u32, fence: u64) {
+        let _ = crate::drm_device_interface::syncobj_install(h, open_id, 0, fence);
+    }
+    pub fn bo_hold(h: u32, open_id: u32) -> i64 { crate::drm_device_interface::v3d_bo_hold(h, open_id) }
+    pub fn bo_unref(obj: u32) { crate::drm_device_interface::v3d_bo_unref(obj) }
+    pub fn bo_fence(h: u32, open_id: u32, f: u64) { crate::drm_device_interface::v3d_bo_fence(h, open_id, f) }
+    pub fn queue_wait(deadline: u64) -> bool { crate::drm_device_interface::v3d_queue_wait(deadline) }
+}
