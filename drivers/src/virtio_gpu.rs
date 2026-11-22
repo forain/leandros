@@ -640,6 +640,11 @@ static FENCE_AHEAD_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EnqErr { Busy, Other }
 
+/// `submit_3d` failure: `Busy` = retired-ahead fence ceiling (answer EAGAIN),
+/// `Other` = anything else (EIO). Decided under the device lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Submit3dErr { Busy, Other }
+
 /// True while fenced work is refused for want of retired-ahead slots (the
 /// ceiling). Callers turn a `submit_3d` failure into EAGAIN on this.
 pub fn fence_table_at_ceiling() -> bool {
@@ -2442,16 +2447,23 @@ impl VirtioGpuDevice {
     /// (`fence_retired`), and the DRM layer is told through `ctrlq_tick`.
     /// Ring full → bounded wait for the host, then Err.
     fn submit_async(&mut self, head: &[u8], payload: Option<&[u8]>, fenced: bool) -> Result<u64, ()> {
+        self.submit_async_e(head, payload, fenced).map_err(|_| ())
+    }
+
+    /// `submit_async` that keeps the enqueue error kind, so a caller can tell a
+    /// retired-ahead ceiling refusal (Busy) from a hard failure while it still
+    /// holds the device lock.
+    fn submit_async_e(&mut self, head: &[u8], payload: Option<&[u8]>, fenced: bool) -> Result<u64, EnqErr> {
         const HDR_LEN: usize = core::mem::size_of::<VirtioGpuCtrlHdr>();
-        if head.len() < HDR_LEN { return Err(()); }
+        if head.len() < HDR_LEN { return Err(EnqErr::Other); }
         if ctrlq_dead() {
             CTRLQ_TIMEOUTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            return Err(());
+            return Err(EnqErr::Other);
         }
         let payload = payload.unwrap_or(&[]);
         let need = if payload.is_empty() { 2 } else { 3 };
-        if !self.ensure_ctrlq_room(need) { return Err(()); }
-        let (_, fence) = self.enqueue(head, payload, HDR_LEN, fenced, false).map_err(|_| ())?;
+        if !self.ensure_ctrlq_room(need) { return Err(EnqErr::Other); }
+        let (_, fence) = self.enqueue(head, payload, HDR_LEN, fenced, false)?;
         CTRLQ_ASYNC.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Ok(fence)
     }
@@ -3447,7 +3459,7 @@ impl VirtioGpuDevice {
     /// The mismatch is reported, not turned into an error: it is a diagnosis of
     /// the host, and failing the ioctl on it would break clients on hosts that
     /// answer differently but work.
-    pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8], ring_idx: Option<u8>) -> Result<u64, ()> {
+    pub fn submit_3d(&mut self, ctx_id: u32, cmds: &[u8], ring_idx: Option<u8>) -> Result<u64, Submit3dErr> {
         // SUBMIT_3D carries an opaque, context-type-specific command stream —
         // Venus protocol for a capset-4 context, virgl commands for a virgl
         // one. The command is the same either way and needs only VIRGL; the
@@ -3458,10 +3470,10 @@ impl VirtioGpuDevice {
         // dies with "Backend initialized without output".
         if !self.has_feature(VIRTIO_GPU_F_VIRGL) {
             crate::pci::serial_debug("[GPU] submit_3d refused: host lacks VIRTIO_GPU_F_VIRGL\n");
-            return Err(());
+            return Err(Submit3dErr::Other);
         }
         if cmds.is_empty() {
-            return Err(());
+            return Err(Submit3dErr::Other);
         }
         #[repr(C, packed)]
         struct CmdSubmit {
@@ -3492,7 +3504,7 @@ impl VirtioGpuDevice {
         // not this response, and the fence is what a waiter consults — so the
         // caller has nothing to wait for here. The fence-echo liveness check
         // that used to run on the reply now runs in `ctrlq_reap`.
-        self.submit_async(bytes, Some(cmds), true)
+        self.submit_async_e(bytes, Some(cmds), true).map_err(|e| if e == EnqErr::Busy { Submit3dErr::Busy } else { Submit3dErr::Other })
     }
 
     /// Query the host for the preferred display mode via GET_DISPLAY_INFO.

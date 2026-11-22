@@ -9534,8 +9534,8 @@ impl DrmDeviceInterface {
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
             match gpu.submit_3d(ctx, &cmds, ring_idx) {
                 Ok(f) => f,
-                Err(()) => {
-                    let busy = crate::virtio_gpu::fence_table_at_ceiling();
+                Err(e) => {
+                    let busy = e == crate::virtio_gpu::Submit3dErr::Busy;
                     drop(guard);
                     if busy { sched::yield_now("gpu-fence-ceiling"); }
                     return Err(if busy { DriverError::Errno(11) } else { DriverError::Io });
@@ -9935,11 +9935,11 @@ impl DrmDeviceInterface {
             unsafe { ucp_in(cmds.as_mut_ptr(), req.cmd, cmds.len()); }
             let sub = {
                 let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
-                match guard.as_mut() { Some(gpu) => gpu.submit_3d(ctx, &cmds, None), None => Err(()) }
+                match guard.as_mut() { Some(gpu) => gpu.submit_3d(ctx, &cmds, None), None => Err(crate::virtio_gpu::Submit3dErr::Other) }
             };
-            if sub.is_err() {
+            if let Err(e) = sub {
                 if phys != 0 { mm::buddy::free(phys, order); }
-                if crate::virtio_gpu::fence_table_at_ceiling() {
+                if e == crate::virtio_gpu::Submit3dErr::Busy {
                     sched::yield_now("gpu-fence-ceiling");
                     return Err(DriverError::Errno(11));
                 }
