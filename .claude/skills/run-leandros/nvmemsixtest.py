@@ -17,6 +17,7 @@ ITS lane lands.
 
 Usage: LEANDROS_RUN_ID=<lane> python3 nvmemsixtest.py
 """
+import imgclone
 import hashlib, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +52,7 @@ def cpu_ticks(text):
 
 def one_mode(arch, run_id, mode, img, want_hash, base, check):
     boot_img = os.path.join(REPO, f"nvmemsix-{run_id}-{mode}-boot.img")
-    if subprocess.run(["cp", "-c", base, boot_img]).returncode != 0:
+    if subprocess.run([*imgclone.CPC, base, boot_img]).returncode != 0:
         import shutil; shutil.copyfile(base, boot_img)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), boot_img,
                     f"nvme.quirks=amzn nvme.msix={mode}"], check=True, stdout=subprocess.DEVNULL)

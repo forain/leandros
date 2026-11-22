@@ -9,6 +9,7 @@ checkpoint (56-200 s F2FS_MOUNTS holds). Gates: worst probe < 2 s, no `[F2FS] lo
 >= 1000 ms in the serial log, no `[WDOG]` line.
 Usage: LEANDROS_RUN_ID=<id> python3 f2fsatomictest.py [aarch64|x86_64]
 """
+import imgclone
 import os, re, shutil, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -45,7 +46,7 @@ def main():
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
     img = os.path.join(out, f"f2fsatomic-{arch}.img")
     if os.path.exists(img): os.unlink(img)
-    if subprocess.run(["cp", "-c", src, img], stderr=subprocess.DEVNULL).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, img], stderr=subprocess.DEVNULL).returncode != 0:
         shutil.copyfile(src, img)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, CMDLINE],
                    check=True, stdout=subprocess.DEVNULL)

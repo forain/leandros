@@ -16,6 +16,7 @@ leandros-sysbus[bluez] log lines (found through /proc/<pid>/fd/2).
 Same throwaway-clone, --keep, click/key/type/shot/stop and `run CMD` (root
 serial command) conventions as nmsession.py; LEANDROS_RUN_ID=gstsession.
 """
+import imgclone
 import json
 import os
 import re
@@ -148,7 +149,7 @@ def main():
         except OSError:
             pass
         src = os.path.join(REPO, src)
-        if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+        if subprocess.run([*imgclone.CPC, src, img], capture_output=True).returncode != 0:
             subprocess.run(["cp", src, img], check=True)
         os.environ[var] = img
     if "--real" in A:

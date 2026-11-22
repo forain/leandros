@@ -56,7 +56,7 @@ def main(argv):
         root = os.path.join(tmp, f"root-{tag}.img")
         for src, dst in ((os.path.join(REPO, f"leandros-limine-{arch}.img"), img),
                          (os.path.join(REPO, f"f2fs-data0-{arch}.img"), root)):
-            if subprocess.run(["cp", "-c", src, dst], capture_output=True).returncode != 0:
+            if subprocess.run([*imgclone.CPC, src, dst], capture_output=True).returncode != 0:
                 imgclone.clone_file(src, dst)
         r = subprocess.run([os.path.join(REPO, "scripts/set-image-cmdline.sh"), img, cmdline], capture_output=True, text=True)
         if r.returncode != 0:

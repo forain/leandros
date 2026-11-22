@@ -11,6 +11,7 @@ of the boot image, e.g. eth0:20000:20000:64:256:2 for a Wi-Fi-like 20 Mbit/s lin
 download must reach RATE_SHARE of the link rate and drop <= DROP_SHARE of its frames in the RX queue). Exit 0 iff PASS.
 Run id `<caller run id>-nettx`.
 """
+import imgclone
 import http.server
 import os
 import hostclean
@@ -62,7 +63,7 @@ def main(argv):
         import shutil
         img = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(driver.REPO_ROOT, f"leandros-limine-{arch}.img")
         timg = os.path.join(driver.REPO_ROOT, f"nettx-shape-{arch}.img")
-        if subprocess.run(["cp", "-c", img, timg], capture_output=True).returncode != 0:  # APFS clone; GNU cp has no -c
+        if subprocess.run([*imgclone.CPC, img, timg], capture_output=True).returncode != 0:  # APFS clone; GNU cp has no -c
             subprocess.run(["cp", "--sparse=always", img, timg], check=True)
         subprocess.run([os.path.join(driver.REPO_ROOT, "scripts/set-image-cmdline.sh"), timg, f"netshape={shape}"],
                        check=True, capture_output=True)

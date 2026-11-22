@@ -22,6 +22,7 @@ recovery, not a red/green guard for the atomic-context case.
 
 Usage: LEANDROS_RUN_ID=<lane> python3 usbstalltest.py [aarch64|x86_64]
 """
+import imgclone
 import hashlib, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,7 +90,7 @@ def cmdline_image(arch, run_id):
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
     img = os.path.join(REPO, f"usbstall-boot-{run_id}.img")
     if os.path.exists(img): os.unlink(img)
-    if subprocess.run(["cp", "-c", src, img]).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, img]).returncode != 0:
         import shutil; shutil.copyfile(src, img)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, STALL_CMDLINE],
                    check=True, stdout=subprocess.DEVNULL)

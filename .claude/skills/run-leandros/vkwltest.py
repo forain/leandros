@@ -16,6 +16,7 @@ non-x86_64 run (or a host without it) is a SKIP. VKWL_ROUTE=sw|nosw picks the
 Mesa WSI route (default sw: wl_shm buffers, the GPU still renders).
 GPU only: no software rendering anywhere on this path.
 """
+import imgclone
 import os
 import re
 import shutil
@@ -64,7 +65,7 @@ def main():
     img = os.path.join(out, f"cmdline-{ARCH}.img")
     if os.path.exists(img):
         os.unlink(img)
-    if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, img], capture_output=True).returncode != 0:
         shutil.copyfile(src, img)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, "nvrm.desktop=0"],
                    check=True, stdout=subprocess.DEVNULL)

@@ -6,6 +6,7 @@ flatpak install --user Flatseal (skipped if present), GUI `flatpak run` with WAY
 Session env (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, ...) is captured from a live session process: the
 first of cosmic-session/cosmic-comp/cosmic-panel/... whose /proc/<pid>/environ has a DBUS_SESSION_BUS_ADDRESS.
 Results land in <outdir>/flat.out. Host Mesa 26.x may SEGV QEMU at stop with --virgl: results before it are valid."""
+import imgclone
 import os, subprocess, sys, time
 os.environ.setdefault("LEANDROS_RUN_ID", "flatwin")
 os.environ.setdefault("LEANDROS_VNC_BASE", "5977")
@@ -26,7 +27,7 @@ for what, src, var in (("boot", f"leandros-limine-{arch}.img", "LEANDROS_DISK_IM
     except OSError: pass
     s = os.path.join(g.REPO, src)
     if subprocess.run(["cp", "--reflink=auto", s, img], capture_output=True).returncode != 0 and \
-       subprocess.run(["cp", "-c", s, img], capture_output=True).returncode != 0:
+       subprocess.run([*imgclone.CPC, s, img], capture_output=True).returncode != 0:
         subprocess.run(["cp", s, img], check=True)
     os.environ[var] = img
 if drv("start", arch, GPU, t=900) != 0:

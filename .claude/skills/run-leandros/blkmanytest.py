@@ -9,6 +9,7 @@ devices without a word, so with 8 extras the last three never appeared.
 
 Usage: LEANDROS_RUN_ID=<lane> python3 blkmanytest.py [aarch64|x86_64] [N]
 """
+import imgclone
 import os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +41,7 @@ def main():
     extra = []
     for i in range(n):
         img = os.path.join(tmp, f"d{i}.img")
-        if subprocess.run(["cp", "-c", base, img], capture_output=True).returncode != 0:
+        if subprocess.run([*imgclone.CPC, base, img], capture_output=True).returncode != 0:
             shutil.copyfile(base, img)
         extra.append(f"-drive if=none,id=bm{i},format=raw,file={img} "
                      f"-device virtio-blk-pci,drive=bm{i},disable-legacy=on")

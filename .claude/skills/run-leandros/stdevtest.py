@@ -12,6 +12,7 @@ Until 2026-10-26 the VFS hardcoded st_dev = 1 for every filesystem.
 
 Usage: LEANDROS_RUN_ID=<lane> python3 stdevtest.py [aarch64|x86_64]
 """
+import imgclone
 import os, re, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -38,7 +39,7 @@ def main():
     extra = []
     for i in range(2):
         img = os.path.join(tmp, f"d{i}.img")
-        if subprocess.run(["cp", "-c", base, img], capture_output=True).returncode != 0:
+        if subprocess.run([*imgclone.CPC, base, img], capture_output=True).returncode != 0:
             shutil.copyfile(base, img)
         # x86's base disks are transitional (legacy 0x1001) devices and the
         # kernel probes modern (0x1042) virtio-blk BEFORE legacy ones, so

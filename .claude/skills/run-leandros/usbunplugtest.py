@@ -16,6 +16,7 @@ Phase 2 (not ready, `--notready` or default both): boot with the fault knob
 
 Usage: LEANDROS_RUN_ID=<lane> python3 usbunplugtest.py [aarch64|x86_64] [unplug|notready|fastreplug|hub|hid|all]
 """
+import imgclone
 import hashlib, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +46,12 @@ def serial_log(run_id):
     try: log += open(f"/tmp/leandros-{run_id}-serial-full.log", errors="replace").read()
     except OSError: pass
     return log
+
+
+def gl_flags(arch):
+    """virgl where this host's QEMU has it; software GL otherwise (the Pi 5 KVM host's QEMU has no virglrenderer)."""
+    import driver
+    return ["--virgl"] if driver._gl_capable_qemu(f"qemu-system-{arch}") else []
 
 
 def boot(arch, env, *extra):
@@ -154,7 +161,7 @@ def phase_notready(arch, run_id, env):
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
     bimg = os.path.join(REPO, f"usbunplug-boot-{run_id}.img")
     if os.path.exists(bimg): os.unlink(bimg)
-    if subprocess.run(["cp", "-c", src, bimg]).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, bimg]).returncode != 0:
         import shutil; shutil.copyfile(src, bimg)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), bimg, "usbms.notready_ms=12000"],
                    check=True, stdout=subprocess.DEVNULL)
@@ -509,6 +516,11 @@ def phase_emptyhot(arch, run_id, env):
     """An xHCI with nothing plugged in at boot still sees its first hot-added
     keyboard and stick (lane udevhot2: the hot-plug scan and the HID poll used
     to start only when a device was present at probe)."""
+    if not gl_flags(arch):
+        # The keyboard binds to the virgl GPU's id; without GL (the Pi 5 KVM host's QEMU has no virglrenderer)
+        # there is no such head and the desktop is refused software rendering.
+        print("SKIP: (emptyhot) needs a QEMU with virgl")
+        return True
     ok = True
     ia = os.path.join(REPO, f"usbunplug-e-{run_id}.img")
     ha = make_img(ia)
@@ -517,7 +529,7 @@ def phase_emptyhot(arch, run_id, env):
     # virgl: its GPU has the id the hot-added keyboard binds to, so the
     # injected keys reach it and not virtio-keyboard.
     try:
-        if not boot(arch, env, "--virgl"): return False
+        if not boot(arch, env, *gl_flags(arch)): return False
         s0 = set(sh("ls /dev/input", 20).split())
         rc, o = drv("qmp", "device_add", json.dumps({"driver": "usb-kbd", "bus": "xhs.0", "id": "kbde", "display": "virglgpu"}), timeout=60)
         print(f"device_add usb-kbd rc={rc} {o.strip()[-100:]}")
@@ -620,7 +632,7 @@ def phase_readers(arch, run_id, env):
     node, one of them after open/close churn, three rounds, then the same on a hot-added
     usb-kbd. Each reader must see exactly KEY+SYN, KEY+SYN = 96 bytes, 2 key events."""
     e = dict(env); e["LEANDROS_USB_INPUT"] = "kbd,tablet"
-    if not boot(arch, e, "--virgl"): print("  boot failed"); return False
+    if not boot(arch, e, *gl_flags(arch)): print("  boot failed"); return False
     ok = True
     try:
         def rounds(tag, node):

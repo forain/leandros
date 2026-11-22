@@ -26,6 +26,7 @@ lane's QEMU is never touched.
 
 Output in <outdir>: desktop.png, serial-live.log, steps.json.
 """
+import imgclone
 import json
 import os
 import re
@@ -148,7 +149,7 @@ def main():
         except OSError:
             pass
         src = os.path.join(REPO, src)
-        if subprocess.run(["cp", "-c", src, img], capture_output=True).returncode != 0:
+        if subprocess.run([*imgclone.CPC, src, img], capture_output=True).returncode != 0:
             subprocess.run(["cp", src, img], check=True)
         os.environ[var] = img
     if "--real" in A:

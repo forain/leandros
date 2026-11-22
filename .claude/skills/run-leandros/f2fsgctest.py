@@ -89,7 +89,7 @@ def main(argv):
     if cmdline is not None:
         boot_copy = os.path.join(out, f"boot-{arch}.img")
         src = os.path.join(REPO, f"leandros-limine-{arch}.img")
-        subprocess.run(["cp", "-c", src, boot_copy], check=False)
+        subprocess.run([*imgclone.CPC, src, boot_copy], check=False)
         if not os.path.exists(boot_copy):
             imgclone.clone_file(src, boot_copy)
         subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), boot_copy, cmdline], check=True)

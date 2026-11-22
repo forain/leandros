@@ -61,6 +61,10 @@ def log_since(mark):
 
 def main():
     arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "aarch64")
+    if not driver._gl_capable_qemu(f"qemu-system-{arch}"):
+        # The greeter needs a GPU and refuses software rendering; the Pi 5 KVM host's QEMU has no virglrenderer.
+        print("powerctltest: SKIP (needs a QEMU with virgl)")
+        return 0
     scale = driver.wait_scale(arch)
     REPO = nms.REPO
     for what, src, var in (("boot", f"leandros-limine-{arch}.img", "LEANDROS_DISK_IMAGE"),

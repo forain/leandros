@@ -45,6 +45,7 @@ instant is wall-clock random, so a replay re-runs the same file mix, not the sam
 Re-run one failure with the params printed per iteration
 (`--wseed W --crashpt C --mode crashpt|kill --iters 1`).
 """
+import imgclone
 import os
 import hostclean
 import random
@@ -94,7 +95,7 @@ def keep_failed(out, img, tag, seed, params, arch):
             if os.path.exists(os.path.join(kd, old + ext)):
                 os.unlink(os.path.join(kd, old + ext))
     base = os.path.join(kd, f"{arch}-seed{seed}-{tag}")
-    subprocess.run(["cp", "-c", img, base + ".img"], check=False, stderr=subprocess.DEVNULL)
+    subprocess.run([*imgclone.CPC, img, base + ".img"], check=False, stderr=subprocess.DEVNULL)
     if not os.path.exists(base + ".img"):
         shutil.copyfile(img, base + ".img")
     with open(base + ".txt", "w") as f:
@@ -340,7 +341,7 @@ def main(argv):
         if os.path.exists(boot_copy):
             os.unlink(boot_copy)
         if cmdline:
-            subprocess.run(["cp", "-c", src, boot_copy], check=False, stderr=subprocess.DEVNULL)
+            subprocess.run([*imgclone.CPC, src, boot_copy], check=False, stderr=subprocess.DEVNULL)
             if not os.path.exists(boot_copy):
                 shutil.copyfile(src, boot_copy)
             subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), boot_copy, cmdline],
@@ -432,7 +433,7 @@ def main(argv):
                                    (pk.get("work"), "work.txt"), (pk.get("log"), "crash-boot-serial.log"),
                                    (driver.SERIAL_FULL_LOG, "recovery-boot-serial.log")):
                     if src_ and os.path.exists(src_):
-                        subprocess.run(["cp", "-c", src_, os.path.join(kdir, dst_)], check=False, stderr=subprocess.DEVNULL)
+                        subprocess.run([*imgclone.CPC, src_, os.path.join(kdir, dst_)], check=False, stderr=subprocess.DEVNULL)
                         if not os.path.exists(os.path.join(kdir, dst_)):
                             shutil.copyfile(src_, os.path.join(kdir, dst_))
                 for n_, t_ in enumerate(scans):
@@ -505,7 +506,7 @@ def main(argv):
         pre = None
         if linux:
             pre = os.path.join(out, f"pre-linux-{it}.img")
-            subprocess.run(["cp", "-c", img, pre], check=False, stderr=subprocess.DEVNULL)
+            subprocess.run([*imgclone.CPC, img, pre], check=False, stderr=subprocess.DEVNULL)
             if not os.path.exists(pre):
                 shutil.copyfile(img, pre)
             lok, ldet = linux_recover(img, out, it)
@@ -522,7 +523,7 @@ def main(argv):
                 if os.path.exists(dst_):
                     os.unlink(dst_)
                 if os.path.exists(src_):
-                    subprocess.run(["cp", "-c", src_, dst_], check=False, stderr=subprocess.DEVNULL)
+                    subprocess.run([*imgclone.CPC, src_, dst_], check=False, stderr=subprocess.DEVNULL)
                     if not os.path.exists(dst_):
                         shutil.copyfile(src_, dst_)
             with open(pk["work"], "w") as f:

@@ -12,6 +12,7 @@ Before the fix the fsync appended a roll-forward record to the old pack
 while the newer pack (the commit that "failed") won at the next mount: the
 acknowledged file was gone. Exit 0 iff the claim survived.
 """
+import imgclone
 import os
 import hostclean
 import signal
@@ -78,7 +79,7 @@ def main(argv):
         if os.path.exists(boot_copy):
             os.unlink(boot_copy)
         if cmdline:
-            subprocess.run(["cp", "-c", src, boot_copy], check=False, stderr=subprocess.DEVNULL)
+            subprocess.run([*imgclone.CPC, src, boot_copy], check=False, stderr=subprocess.DEVNULL)
             if not os.path.exists(boot_copy):
                 import shutil
                 shutil.copyfile(src, boot_copy)

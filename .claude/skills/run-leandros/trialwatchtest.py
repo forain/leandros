@@ -71,7 +71,7 @@ def main(argv):
     tmp = tempfile.mkdtemp(prefix="trialwatch-")
     img = os.path.join(tmp, f"boot-{arch}.img")
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
-    subprocess.run(["cp", "-c", src, img], check=False)
+    subprocess.run([*imgclone.CPC, src, img], check=False)
     if not os.path.exists(img):
         imgclone.clone_file(src, img)
         imgclone.ensure_remote_key(img)

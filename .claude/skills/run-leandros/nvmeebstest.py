@@ -16,6 +16,7 @@ serial `vol0123456789abcdef0`, a 4 KiB namespace 1 and a 512 B namespace 2:
 
 Usage: LEANDROS_RUN_ID=<lane> python3 nvmeebstest.py [aarch64|x86_64]
 """
+import imgclone
 import hashlib, json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +63,7 @@ def main():
     hb = hashlib.sha256(d1[40 * MIB:44 * MIB]).hexdigest()
     ha = hashlib.sha256(d1[:4 * MIB]).hexdigest()
     src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO, f"leandros-limine-{arch}.img")
-    if subprocess.run(["cp", "-c", src, boot]).returncode != 0:
+    if subprocess.run([*imgclone.CPC, src, boot]).returncode != 0:
         import shutil; shutil.copyfile(src, boot)
     subprocess.run([os.path.join(REPO, "scripts", "set-image-cmdline.sh"), boot,
                     "nvme.quirks=amzn"], check=True, stdout=subprocess.DEVNULL)
