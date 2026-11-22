@@ -2,7 +2,8 @@
 """LeandrOS QEMU driver for agent interaction.
 
 Usage:
-  driver.py start [aarch64|x86_64] [mode] [--venus|--virgl]  Launch QEMU, wait for shell prompt
+  driver.py start [aarch64|x86_64] [mode] [--venus|--virgl] [--no-desktop]  Launch QEMU, wait for shell prompt
+      (--no-desktop / LEANDROS_NO_DESKTOP=1: boot nvrm.desktop=0 so venustest/drmsmoke are the sole GPU client)
   driver.py cmd "<command>"           Send shell command, print output
   driver.py run "<command>" [timeout] [arch]
                                       Run a command and report its exit
@@ -2596,6 +2597,20 @@ if __name__ == "__main__":
         positional = [a for a in args[1:] if not a.startswith("--")]
         arch = positional[0] if len(positional) > 0 else "aarch64"
         mode = positional[1] if len(positional) > 1 else "uefi"
+        if "--no-desktop" in args[1:] or os.environ.get("LEANDROS_NO_DESKTOP") == "1":
+            # GPU-accounting tests (venustest, drmsmoke) must be the only GPU
+            # client: boot a private copy of the image with nvrm.desktop=0
+            # (what runtests does for them) so greetd starts no COSMIC.
+            import imgclone, shutil
+            src = os.environ.get("LEANDROS_DISK_IMAGE") or os.path.join(REPO_ROOT, f"leandros-limine-{arch}.img")
+            img = os.path.join(os.environ.get("FFSESSION_OUT", "/tmp"), f"nodesktop-{arch}.img")
+            if os.path.exists(img):
+                os.unlink(img)
+            if subprocess.run([*imgclone.CPC, src, img]).returncode != 0:
+                shutil.copyfile(src, img)
+            subprocess.run([os.path.join(REPO_ROOT, "scripts", "set-image-cmdline.sh"), img, "nvrm.desktop=0"],
+                           check=True, stdout=subprocess.DEVNULL)
+            os.environ["LEANDROS_DISK_IMAGE"] = img
         cmd_start(arch, mode, venus=(gpu == "venus"), virgl=(gpu == "virgl"))
     elif sub == "cmd":
         if len(args) < 2:
