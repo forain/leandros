@@ -145,7 +145,7 @@ fn f_event(ev: u32) { crate::hvs_plane::event(ev) }
 fn f_busy() -> bool { crate::hvs_plane::busy() }
 fn f_wait(timeout_ns: u64) -> bool { crate::hvs_plane::wait_idle(timeout_ns) }
 
-static HVS_FLIP: gpu_kms::KmsFlip = gpu_kms::KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait };
+static HVS_FLIP: gpu_kms::KmsFlip = gpu_kms::KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait, queue_async: None, frame: None, wait_frame: None };
 
 // ---- The KmsBackend -----------------------------------------------------------------------
 
