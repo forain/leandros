@@ -248,13 +248,13 @@ mod tests {
         assert!(!fw_run(&code, &mut Never, 500));
     }
 
-    /// The real linux-firmware files, when ports/rtl_nic/fetch.sh has fetched
+    /// The real linux-firmware files, when scripts/alpine_firmware.py has staged
     /// them: every one must parse and validate, and run to completion against
     /// a PHY whose registers read back what was written.
     #[test]
     fn real_firmware_files_parse() {
         let dir = std::env::var("RTL_NIC_CACHE").unwrap_or_else(|_| {
-            format!("{}/.cache/leandros/rtl_nic", std::env::var("HOME").unwrap_or_default())
+            format!("{}/.cache/leandros/alpine-fw/x86_64/current/lib/firmware/rtl_nic", std::env::var("HOME").unwrap_or_default())
         });
         let Ok(rd) = std::fs::read_dir(&dir) else { eprintln!("no {} (skipped)", dir); return };
         let mut n = 0;

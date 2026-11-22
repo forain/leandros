@@ -709,6 +709,8 @@ build_alpine_pkgs() {
     local arch="$1"
     echo "📦 Fetching $arch Alpine packages (lock)..."
     python3 "$ROOT_DIR/scripts/alpine-lock.py" fetch "$arch" || exit 1
+    # Device firmware blobs (iwlwifi, Intel BT, i915, r8169, CYW43455) from Alpine's linux-firmware-* packages.
+    python3 "$ROOT_DIR/scripts/alpine_firmware.py" fetch "$arch" || exit 1
 }
 
 # Function to stage apk-tools (ports/apk)
