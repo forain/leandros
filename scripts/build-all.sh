@@ -1098,32 +1098,30 @@ build_input_stack_shims() {
 # there; never silent in either place.
 stage_dbus_session() {
     local arch="$1"
+    # One job per port (BUILD_JOBS>1 runs them concurrently; they are independent builds with their own
+    # target dirs). busd then sysbus stay in one job: sysbus's .service files land in the busd package dir.
     echo "🚌 Building + staging D-Bus session package ($arch)..."
-    ./ports/busd/build.sh "$arch" || \
-        port_failed busd "$arch" "the staged busd would be stale"
-    # login1/locale1/UPower for the session, activated by busd from the
-    # .service files the step above staged (ports/dbus/session-pkg/services).
-    ./ports/sysbus/build.sh "$arch" || \
-        port_failed sysbus "$arch" "a .service file would name a binary that is not there"
-    # Alpine appstream snapshot for cosmic-store's PackageKit backend (kept
-    # when fresh or offline; mkfs stages it under /var/lib/swcatalog).
-    ./ports/appstream-alpine/build.sh "$arch" || \
-        port_failed appstream-alpine "$arch" "cosmic-store would list no Alpine apps"
-    # The panel's Network applet (talks to `leandros-sysbus networkmanager`).
-    # Needs the m6 cross toolchain; without it the panel has no Network entry.
-    ./ports/cosmic-applet-network/build.sh "$arch" || \
-        port_failed cosmic-applet-network "$arch" "no Network applet"
+    par_run port_busd_sysbus _dbus_ports "$arch"
+    # Alpine appstream snapshot for cosmic-store's PackageKit backend (kept when fresh or offline).
+    par_run port_appstream _port_step appstream-alpine "$arch" "cosmic-store would list no Alpine apps"
+    # The panel's Network applet (talks to `leandros-sysbus networkmanager`); needs the m6 cross toolchain.
+    par_run port_applet_network _port_step cosmic-applet-network "$arch" "no Network applet"
     # The panel's Bluetooth applet (bluer -> libdbus-1 -> `leandros-sysbus bluez`).
-    ./ports/cosmic-applet-bluetooth/build.sh "$arch" || \
-        port_failed cosmic-applet-bluetooth "$arch" "no Bluetooth applet"
-    ./ports/cosmic-applet-power/build.sh "$arch" || \
-        port_failed cosmic-applet-power "$arch" "no Power applet"
-    ./ports/cosmic-apps/build.sh "$arch" || \
-        port_failed cosmic-apps "$arch" "no Files/Edit/Screenshot apps"
-    ./ports/leandros-installer/build.sh "$arch" || \
-        port_failed leandros-installer "$arch" "no installer GUI"
-    ./ports/cosmic-applets-panel/build.sh "$arch" || \
-        port_failed cosmic-applets-panel "$arch" "no Time/Battery/Notifications/... applets"
+    par_run port_applet_bluetooth _port_step cosmic-applet-bluetooth "$arch" "no Bluetooth applet"
+    par_run port_applet_power _port_step cosmic-applet-power "$arch" "no Power applet"
+    par_run port_cosmic_apps _port_step cosmic-apps "$arch" "no Files/Edit/Screenshot apps"
+    par_run port_installer _port_step leandros-installer "$arch" "no installer GUI"
+    par_run port_applets_panel _port_step cosmic-applets-panel "$arch" "no Time/Battery/Notifications/... applets"
+    # the kernel does not read any port output (create_initrd, later, does): build it alongside
+    par_run kernel build_kernel "$arch"
+    par_wait || exit 1
+}
+_port_step() { # <port> <arch> <what is lost on failure>
+    ./ports/$1/build.sh "$2" || port_failed "$1" "$2" "$3"
+}
+_dbus_ports() {
+    _port_step busd "$1" "the staged busd would be stale"
+    _port_step sysbus "$1" "a .service file would name a binary that is not there"
 }
 
 # Main
@@ -1137,11 +1135,38 @@ for _tc_arch in aarch64 x86_64; do
     ./scripts/toolchain/mk-sysroot.sh "$_tc_arch" || { echo "❌ musl toolchain setup failed for $_tc_arch" >&2; exit 1; }
 done
 
-build_input_stack_shims
+# --- per-phase timing; BUILD_JOBS>1 runs the independent per-arch builds concurrently (see par_run) ---
+BUILD_T0=$SECONDS
+phase() { # <name> <cmd...>: run it, print its wall time (the status is the command's)
+    local n=$1 t=$SECONDS rc=0; shift
+    "$@" || rc=$?
+    echo "⏱ phase $n: $((SECONDS - t))s (rc=$rc, build total $((SECONDS - BUILD_T0))s)"
+    return $rc
+}
+PAR_DIR="${TMPDIR:-/tmp}/build-all-par.$$"; PAR_PIDS=(); PAR_NAMES=()
+par_run() { # <name> <cmd...>: like phase, but in the background when BUILD_JOBS > 1 (log shown by par_wait)
+    local n=$1; shift
+    if [[ "${BUILD_JOBS:-1}" -le 1 ]]; then phase "$n" "$@"; return; fi
+    mkdir -p "$PAR_DIR"
+    while (( $(jobs -rp | wc -l) >= BUILD_JOBS )); do sleep 1; done
+    ( phase "$n" "$@" ) > "$PAR_DIR/$n.log" 2>&1 &
+    PAR_PIDS+=($!); PAR_NAMES+=("$n")
+}
+par_wait() { # wait for every par_run job, print their logs in start order, fail when any failed
+    local i bad=0
+    for i in "${!PAR_PIDS[@]}"; do
+        wait "${PAR_PIDS[$i]}" || { bad=1; echo "❌ parallel build step ${PAR_NAMES[$i]} failed"; }
+        [[ -f "$PAR_DIR/${PAR_NAMES[$i]}.log" ]] && cat "$PAR_DIR/${PAR_NAMES[$i]}.log"
+    done
+    PAR_PIDS=(); PAR_NAMES=(); rm -rf "$PAR_DIR"
+    return $bad
+}
+
+phase input_stack_shims build_input_stack_shims
 
 # Doom's General MIDI music uses the same pinned SoundFont on both CPUs.
 if [[ -d "$(sibling_dir doomgeneric)" ]]; then
-    python3 "$ROOT_DIR/scripts/soundfont.py"
+    phase soundfont python3 "$ROOT_DIR/scripts/soundfont.py"
 fi
 
 # Determine architectures to build
@@ -1152,39 +1177,38 @@ else
 fi
 
 for arch in "${ARCHS[@]}"; do
-    build_userland "$arch"
-    build_doom "$arch"
-    build_floattest "$arch" || exit 1
-    build_memcpybench "$arch" || exit 1
-    build_mame "$arch"
-    build_portal "$arch"
-    build_pipewire "$arch"
-    build_gstreamer "$arch"
-    build_alpine_pkgs "$arch"
-    build_apk "$arch"
-    build_bottom "$arch"
-    build_brush "$arch"
-    build_coreutils "$arch"
-    build_spawnwedge "$arch"
-    build_killmt "$arch"
-    build_futextest "$arch"
-    build_schedstress "$arch"
-    build_nmtest "$arch"
-    build_procmax "$arch"
-    build_blanktest "$arch"
-    build_mintest "$arch"
-    build_greetdlogin "$arch"
-    build_claude_run "$arch"
-    build_sudo_rs "$arch"
-    build_sudotest "$arch"
-    build_sshd "$arch"
-    build_espctl "$arch"
-    build_leandros_install "$arch"
-    build_e2fsprogs "$arch"
-    build_disktester "$arch"
-    build_grep "$arch"
-    stage_dbus_session "$arch"
-    build_kernel "$arch"
+    phase build_userland build_userland "$arch"
+    phase build_doom build_doom "$arch"
+    phase build_floattest build_floattest "$arch" || exit 1
+    phase build_memcpybench build_memcpybench "$arch" || exit 1
+    phase build_mame build_mame "$arch"
+    phase build_portal build_portal "$arch"
+    phase build_pipewire build_pipewire "$arch"
+    phase build_gstreamer build_gstreamer "$arch"
+    phase build_alpine_pkgs build_alpine_pkgs "$arch"
+    phase build_apk build_apk "$arch"
+    phase build_bottom build_bottom "$arch"
+    phase build_brush build_brush "$arch"
+    phase build_coreutils build_coreutils "$arch"
+    phase build_spawnwedge build_spawnwedge "$arch"
+    phase build_killmt build_killmt "$arch"
+    phase build_futextest build_futextest "$arch"
+    phase build_schedstress build_schedstress "$arch"
+    phase build_nmtest build_nmtest "$arch"
+    phase build_procmax build_procmax "$arch"
+    phase build_blanktest build_blanktest "$arch"
+    phase build_mintest build_mintest "$arch"
+    phase build_greetdlogin build_greetdlogin "$arch"
+    phase build_claude_run build_claude_run "$arch"
+    phase build_sudo_rs build_sudo_rs "$arch"
+    phase build_sudotest build_sudotest "$arch"
+    phase build_sshd build_sshd "$arch"
+    phase build_espctl build_espctl "$arch"
+    phase build_leandros_install build_leandros_install "$arch"
+    phase build_e2fsprogs build_e2fsprogs "$arch"
+    phase build_disktester build_disktester "$arch"
+    phase build_grep build_grep "$arch"
+    phase stage_dbus_session stage_dbus_session "$arch"
     # The initrd is built after the kernel: module blobs are linked against the
     # kernel's exported symbols and keyed by its build-id.
     rm -rf "$ROOT_DIR/target/kmod/$arch"
@@ -1193,13 +1217,13 @@ for arch in "${ARCHS[@]}"; do
     fi
     # Rust modules (CONFIG_X=m, $KMOD_EXTRA); a no-op when there is nothing to build.
     KMOD_BOARD="$([[ "$arch" == "aarch64" && "$RPI5" == "true" ]] && echo rpi5 || { [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]] && echo raspi4b; } || true)" \
-        "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
-    create_initrd "$arch"
+        phase kmod_build "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
+    phase create_initrd create_initrd "$arch"
     # Fail the build when a shipped kernel variant has no lib/modules/<its build-id> (any =m set).
     python3 "$ROOT_DIR/scripts/kmod/bidcheck.py" build "$arch"
-    create_disk_image "$arch" "$LIMINE_DIR"
+    phase create_disk_image create_disk_image "$arch" "$LIMINE_DIR"
     echo "💾 Creating populated F2FS images for $arch..."
-    python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
+    phase mkfs_f2fs_populated python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
     # The persistent /home volume (vdc): user data, so never rewritten by a
     # build. Created when missing (8 GiB sparse), replaced once when it is an
     # old /data root clone, recreated only on --reset-home.
