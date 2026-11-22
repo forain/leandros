@@ -304,6 +304,103 @@ pub(crate) fn ra_mtu(sid: crate::Sid) -> Option<u32> {
     if id >= MAX_NETIF { return None; }
     match RA_MTU.lock()[id] { 0 => None, m => Some(m) }
 }
+/// RDNSS (RFC 8106 option 25) servers and DNSSL (option 31) search domains learned from RAs:
+/// (netif, address, expiry) / (netif, domain, expiry). Linux's kernel only hands the options to
+/// userspace (NetworkManager / systemd-networkd write resolv.conf); here the net server stands
+/// in for that manager and feeds `/etc/resolv.conf` (vfs::set_ra_dns), v4 DHCP servers first.
+static RDNSS: Mutex<Vec<(usize, [u8; 16], u64)>> = Mutex::new(Vec::new());
+static DNSSL: Mutex<Vec<(usize, Vec<u8>, u64)>> = Mutex::new(Vec::new());
+
+/// Parse an RDNSS option body (`o` = the whole option, length already checked to be a multiple
+/// of 8): (lifetime, addresses). None when malformed (RFC 8106: length >= 3 and odd).
+fn parse_rdnss(o: &[u8]) -> Option<(u32, Vec<[u8; 16]>)> {
+    if o.len() < 24 || (o.len() / 8) % 2 == 0 { return None; }
+    let life = u32::from_be_bytes(o[4..8].try_into().unwrap());
+    Some((life, o[8..].chunks_exact(16).map(|c| c.try_into().unwrap()).collect()))
+}
+
+/// Parse a DNSSL option: (lifetime, dotted domains). Compression is not allowed in DNSSL, a
+/// malformed name ends the list.
+fn parse_dnssl(o: &[u8]) -> Option<(u32, Vec<Vec<u8>>)> {
+    if o.len() < 16 { return None; }
+    let life = u32::from_be_bytes(o[4..8].try_into().unwrap());
+    let mut out = Vec::new();
+    let mut p = 8;
+    while p < o.len() && o[p] != 0 {
+        let mut name = Vec::new();
+        loop {
+            let l = *o.get(p)? as usize;
+            if l == 0 { p += 1; break; }
+            if l > 63 || p + 1 + l > o.len() { return Some((life, out)); }
+            if !name.is_empty() { name.push(b'.'); }
+            name.extend_from_slice(&o[p + 1..p + 1 + l]);
+            p += 1 + l;
+        }
+        if !name.is_empty() { out.push(name); }
+    }
+    Some((life, out))
+}
+
+/// Install/refresh (lifetime 0 deletes) RDNSS addresses of `id`; true if the set changed.
+fn rdnss_update(id: usize, life: u32, addrs: &[[u8; 16]], now: u64) -> bool {
+    let mut t = RDNSS.lock();
+    let mut ch = false;
+    for a in addrs {
+        if is_link_local(a) || *a == [0; 16] { continue; }
+        let pos = t.iter().position(|e| e.0 == id && e.1 == *a);
+        match (pos, life) {
+            (Some(i), 0) => { t.remove(i); ch = true; }
+            (Some(i), _) => t[i].2 = life_of(life, now),
+            (None, 0) => {}
+            (None, _) => { t.push((id, *a, life_of(life, now))); ch = true; }
+        }
+    }
+    ch
+}
+fn dnssl_update(id: usize, life: u32, doms: &[Vec<u8>], now: u64) -> bool {
+    let mut t = DNSSL.lock();
+    let mut ch = false;
+    for d in doms {
+        let pos = t.iter().position(|e| e.0 == id && e.1 == *d);
+        match (pos, life) {
+            (Some(i), 0) => { t.remove(i); ch = true; }
+            (Some(i), _) => t[i].2 = life_of(life, now),
+            (None, 0) => {}
+            (None, _) => { t.push((id, d.clone(), life_of(life, now))); ch = true; }
+        }
+    }
+    ch
+}
+fn life_of(secs: u32, now: u64) -> u64 { if secs == u32::MAX { ONE_SHOT } else { now.saturating_add(secs as u64 * SEC) } }
+
+/// Drop expired (or, with `all`, every) RDNSS/DNSSL entry of `id`; true if anything went.
+fn dns_expire(id: usize, now: u64, all: bool) -> bool {
+    let mut a = RDNSS.lock();
+    let n = a.len();
+    a.retain(|e| e.0 != id || (!all && e.2 > now));
+    let mut d = DNSSL.lock();
+    let m = d.len();
+    d.retain(|e| e.0 != id || (!all && e.2 > now));
+    a.len() != n || d.len() != m
+}
+fn dns_next(id: usize) -> Option<u64> {
+    RDNSS.lock().iter().filter(|e| e.0 == id).map(|e| e.2)
+        .chain(DNSSL.lock().iter().filter(|e| e.0 == id).map(|e| e.2)).filter(|&e| e != ONE_SHOT).min()
+}
+/// Hand the merged v6 resolver state to /etc/resolv.conf.
+fn dns_publish() {
+    let mut servers: Vec<[u8; 16]> = Vec::new();
+    for e in RDNSS.lock().iter() { if !servers.contains(&e.1) { servers.push(e.1); } }
+    let mut search: Vec<u8> = Vec::new();
+    for e in DNSSL.lock().iter() {
+        if search.split(|&b| b == b' ').any(|w| w == &e.1[..]) { continue; }
+        if search.len() + e.1.len() + 1 > 200 { break; }
+        if !search.is_empty() { search.push(b' '); }
+        search.extend_from_slice(&e.1);
+    }
+    vfs::set_ra_dns(&servers, &search);
+}
+
 static RA_SEEN: Mutex<[bool; MAX_NETIF]> = Mutex::new([false; MAX_NETIF]);
 pub(crate) fn ra_rcvd(id: usize) -> bool { id < MAX_NETIF && RA_SEEN.lock()[id] }
 static SLAAC: Mutex<[Slaac; MAX_NETIF]> = Mutex::new([Slaac::NONE; MAX_NETIF]);
@@ -351,6 +448,7 @@ fn life(secs: u32, now: u64) -> u64 { if secs == u32::MAX { ONE_SHOT } else { no
 fn withdraw(id: usize, s: &mut crate::NetStack) {
     let st = core::mem::replace(&mut SLAAC.lock()[id], Slaac::NONE);
     RA_MTU.lock()[id] = 0;
+    if dns_expire(id, 0, true) { dns_publish(); }
     let sid = iface::sid_of(id as u8);
     if let Some((a, _)) = st.addr {
         dad_forget(id as u8, &a);
@@ -377,6 +475,7 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
     let rlife = u16::from_be_bytes([icmp[6], icmp[7]]) as u32;
     let iid: [u8; 8] = match LL.lock()[id] { Some(l) => l[8..16].try_into().unwrap(), None => return };
     let mut changed = false;
+    let mut dns_changed = false;
     iface::serial(&[b"[NET] ra: ", alloc::format!("id={} router lifetime {} s\r\n", id, rlife).as_bytes()]);
     // Options.
     let mut o = &icmp[16..];
@@ -388,6 +487,12 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
                 let mut r = RA_MTU.lock();
                 if r[id] != m { r[id] = m; changed = true; }
             }
+        }
+        if o[0] == 25 {
+            if let Some((life, a)) = parse_rdnss(&o[..l]) { dns_changed |= rdnss_update(id, life, &a, now); }
+        }
+        if o[0] == 31 {
+            if let Some((life, d)) = parse_dnssl(&o[..l]) { dns_changed |= dnssl_update(id, life, &d, now); }
         }
         if o[0] == 3 && l == 32 && o[2] == 64 {
             let (flags, valid, pref) = (o[3], u32::from_be_bytes(o[4..8].try_into().unwrap()), u32::from_be_bytes(o[8..12].try_into().unwrap()));
@@ -420,6 +525,7 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
         }
         o = &o[l..];
     }
+    if dns_changed { dns_publish(); }
     // Router.
     let mut t = SLAAC.lock();
     if rlife == 0 {
@@ -479,6 +585,7 @@ fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, no
     }
     let autoconf = sched::ns::ipv6_conf(0, nif.name().as_bytes(), "autoconf") != 0;
     for p in pkts { handle_ra(id, s, p, now, autoconf); }
+    if dns_expire(id, now, false) { dns_publish(); }
     let st = SLAAC.lock()[id];
     if st.addr.map_or(false, |a| a.1 <= now) { withdraw_addr(id, s); iface::notify(nif.id); }
     if st.router.map_or(false, |r| r.1 <= now) {
@@ -510,6 +617,7 @@ fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, no
     }
     let mut next = ONE_SHOT;
     for e in [st.addr.map(|a| a.1), st.router.map(|r| r.1), st.pfx.map(|p| p.2)].into_iter().flatten() { next = next.min(e); }
+    if let Some(e) = dns_next(id) { next = next.min(e); }
     if next == ONE_SHOT { None } else { Some(next.saturating_sub(now).max(1_000_000)) }
 }
 
@@ -737,6 +845,25 @@ pub(crate) fn is_host6(a: &[u8; 16]) -> bool {
 #[cfg(test)]
 mod ra_mtu_tests {
     use super::*;
+    #[test]
+    fn rdnss_dnssl_parse() {
+        let mut o = alloc::vec![25u8, 3, 0, 0, 0, 0, 0x0e, 0x10];
+        let mut a = [0u8; 16]; a[0] = 0xfe; a[1] = 0xc0; a[15] = 3;
+        o.extend_from_slice(&a);
+        o.extend_from_slice(&[0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let (l, v) = parse_rdnss(&o).unwrap();
+        assert_eq!((l, v.len(), v[0]), (3600, 2, a));
+        assert!(parse_rdnss(&o[..16]).is_none());
+        assert!(parse_rdnss(&o[..8]).is_none());
+        // DNSSL "lan.example" + "x.org", padded to 8.
+        let mut d = alloc::vec![31u8, 0, 0, 0, 0, 0, 0, 60];
+        d.extend_from_slice(b"\x03lan\x07example\x00\x01x\x03org\x00");
+        while d.len() % 8 != 0 { d.push(0); }
+        d[1] = (d.len() / 8) as u8;
+        let (l, v) = parse_dnssl(&d).unwrap();
+        assert_eq!(l, 60);
+        assert_eq!(v, alloc::vec![b"lan.example".to_vec(), b"x.org".to_vec()]);
+    }
     #[test]
     fn ra_mtu_bounds() {
         assert_eq!(ra_mtu_ok(1279), None);
