@@ -2892,6 +2892,18 @@ def main():
     else:
         print(f"  (no GStreamer staged: {_gst_root} missing — ports/gstreamer/build.sh {arch})")
 
+    # ── libflatpak (optional, ports/libflatpak) ─────────────────────────────
+    # libflatpak.so.0 + closure (ostree, json-glib, libarchive, gpgme, ...) so
+    # cosmic-store's Flatpak backend starts without `apk add flatpak`. Same overlay rules.
+    _lfp_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              "..", "ports", "libflatpak", "out", arch))
+    if os.path.isfile(os.path.join(_lfp_root, "usr", "lib", "libflatpak.so.0")):
+        _lfp_n, _lfp_bytes, _lfp_won = _overlay_port_tree(_lfp_root)
+        print(f"  libflatpak: {_lfp_n} file(s), {_lfp_bytes // (1024 * 1024)} MiB "
+              f"from {_lfp_root}; image copy kept for {len(_lfp_won)}: {' '.join(sorted(_lfp_won))}")
+    else:
+        print(f"  (no libflatpak staged: {_lfp_root} missing — ports/libflatpak/build.sh {arch})")
+
     # ── e2fsprogs (optional, ports/e2fsprogs) ─────────────────────────────────
     # Alpine's e2fsck/resize2fs/dumpe2fs/e2undo/mke2fs in /usr/sbin (+ closure
     # in /usr/lib, /etc/mke2fs.conf). Also hard-linked into /bin (the console
