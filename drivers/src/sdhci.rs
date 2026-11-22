@@ -2251,7 +2251,7 @@ pub fn init() {
                 if let Some(ref d) = devs[1] { unsafe { d.multitest(); } }
             }
             crate::kenv::pci::serial_debug(if MULTI_ON.load(Ordering::Relaxed) {
-                "[sdhci] I/O mode: PIO multi-block CMD18/CMD25 + auto-CMD12, up to 64 KiB per command (single-sector fallback) (sdhci.multi=1)\n"
+                "[sdhci] I/O mode: multi-block CMD18/CMD25 + auto-CMD12, PIO up to 64 KiB per command (ADMA2 per [sdhci] DMA line; single-sector fallback) (sdhci.multi=1)\n"
             } else {
                 "[sdhci] I/O mode: PIO single-sector CMD17/CMD24 (multi-block off; sdhci.multi=1 enables it)\n"
             });
