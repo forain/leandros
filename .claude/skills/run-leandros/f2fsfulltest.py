@@ -50,6 +50,7 @@ def main(argv):
     if "--selftest" in argv:
         return selftest()
     arch, iters, seed = os.environ.get("LEANDROS_TEST_ARCH", "aarch64"), 4, int(time.time())
+    keep_dir = None
     i = 0
     while i < len(argv):
         a = argv[i]
