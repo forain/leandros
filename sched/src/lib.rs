@@ -9541,3 +9541,27 @@ pub(crate) fn klog_line(args: core::fmt::Arguments) {
     let s = alloc::fmt::format(args);
     f(s.as_bytes());
 }
+
+
+/// A filesystem server met an absolute symlink whose target lies in a tree the
+/// VFS serves itself (/run, /tmp, /dev, /proc): the volume walk cannot follow
+/// it. The server answers `LINK_REDIRECT_ERR` after parking the fully spliced
+/// absolute path here (keyed by the calling task); the VFS then re-dispatches
+/// the operation on that path (Linux: `/var/run -> /run`).
+pub const LINK_REDIRECT_ERR: i32 = -4101;
+static LINK_REDIRECT: spin::Mutex<alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)>> =
+    spin::Mutex::new(alloc::vec::Vec::new());
+
+pub fn link_redirect_set(path: &[u8]) {
+    let me = current_pid();
+    let mut t = LINK_REDIRECT.lock();
+    t.retain(|e| e.0 != me);
+    t.push((me, path.to_vec()));
+}
+
+pub fn link_redirect_take() -> Option<alloc::vec::Vec<u8>> {
+    let me = current_pid();
+    let mut t = LINK_REDIRECT.lock();
+    let i = t.iter().position(|e| e.0 == me)?;
+    Some(t.swap_remove(i).1)
+}

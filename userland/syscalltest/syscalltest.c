@@ -2608,7 +2608,8 @@ static void run_tmpfs(void) {
     ssize_t l = readlink("/var/run", lk, sizeof lk - 1);
     if (l < 0) { fail(n, "/var/run is not a symlink: %s", strerror(errno)); return; }
     lk[l] = 0;
-    if (strcmp(lk, "/run") && strcmp(lk, "../run")) { fail(n, "/var/run -> %s", lk); return; }
+    if (strcmp(lk, "/run")) { fail(n, "/var/run -> %s (want /run)", lk); return; }
+    { struct stat a1, a2; if (stat("/var/run", &a1) || stat("/run", &a2) || a1.st_dev != a2.st_dev || a1.st_ino != a2.st_ino) { fail(n, "stat /var/run is not /run"); return; } }
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     snprintf(a.sun_path, sizeof a.sun_path, "/run/runtmpfs-%d.sock", (int)getpid());
     unlink(a.sun_path);

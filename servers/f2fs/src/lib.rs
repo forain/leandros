@@ -7006,6 +7006,12 @@ impl MountState {
 /// intercepts ahead of the mount table (/tmp, /dev, /proc) resolves to 0 =
 /// ENOENT rather than crossing over. Links the other way (a tmpfs symlink
 /// naming an f2fs path) do work, because the VFS re-routes the resolved path.
+/// Absolute path inside a tree the VFS intercepts ahead of the mount table.
+fn vfs_served_tree(p: &[u8]) -> bool {
+    [&b"/run"[..], b"/tmp", b"/dev", b"/proc"].iter()
+        .any(|r| p == *r || (p.starts_with(r) && p[r.len()] == b'/'))
+}
+
 fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 {
     // Jail root in this volume's coordinates (empty = not confined here). An
     // absolute symlink target must re-anchor here, not at the volume root, or
@@ -7074,6 +7080,16 @@ fn resolve_path_ex(ms: &mut MountState, path: &[u8], follow_final: bool) -> u32 
                     spliced.extend_from_slice(bytes);
                     *n += bytes.len();
                 };
+                if target[0] == b'/' && jlen <= 1 && vfs_served_tree(&target[..tlen]) {
+                    // The target lies in a tree the VFS serves itself: hand the
+                    // spliced absolute path back for re-dispatch instead of
+                    // resolving it (wrongly) inside this volume.
+                    let mut full = target[..tlen].to_vec();
+                    full.extend_from_slice(&buf[comp_end..len]);
+                    sched::link_redirect_set(&full);
+                    ms.walk_err = sched::LINK_REDIRECT_ERR;
+                    return 0;
+                }
                 if target[0] == b'/' {
                     if jlen > 1 {
                         // Jailed: an absolute body is taken relative to the jail

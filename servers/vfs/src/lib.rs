@@ -5212,10 +5212,17 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         // answers VFS_ELINKRACE; redo the resolution at most twice, then ELOOP.
         let was_strict = sched::strict_links();
         let mut attempt = 0;
+        let mut redirects = 0u32;
+        // A filesystem answered LINK_REDIRECT_ERR: the (single) path argument
+        // continues at this absolute VFS-served path. NUL-terminated.
+        let mut redir: Option<Vec<u8>> = None;
         let out = loop {
             let mut b0: Vec<u8> = Vec::new();
             let mut b1: Vec<u8> = Vec::new();
             let mut m = *msg;
+            if let (Some(rp), Some((i, _)), None) = (&redir, p0, p1) {
+                m.data[i * 8..i * 8 + 8].copy_from_slice(&(rp.as_ptr() as u64).to_le_bytes());
+            }
             let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
             let mut r = match rewrite_one(&mut m, p0, &mut b0, &mut i0) {
                 Err(e) => err_reply(e),
@@ -5234,6 +5241,19 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
             let me = sched::current_pid();
             if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
             if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
+            if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 {
+                let to = sched::link_redirect_take();
+                redirects += 1;
+                match to {
+                    Some(mut t) if p0.is_some() && p1.is_none() && redirects <= 8 => {
+                        t.push(0);
+                        redir = Some(t);
+                        continue;
+                    }
+                    Some(_) if redirects > 8 => r = err_reply(-40),
+                    _ => r = err_reply(-2),
+                }
+            }
             if reply_val(&r) == VFS_ELINKRACE as i64 {
                 attempt += 1;
                 if attempt > 2 { r = err_reply(-40); } else { continue; }
@@ -5243,7 +5263,9 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         sched::set_strict_links(was_strict);
         return out;
     }
-    dispatch(msg, caller_pid)
+    let r = dispatch(msg, caller_pid);
+    if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 { let _ = sched::link_redirect_take(); return err_reply(-2); }
+    r
 }
 
 /// (parent, name) of a normalised path.
@@ -9518,8 +9540,6 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         flags
     };
     let mut path = &pbuf[..plen];
-    // open of the /var/run symlink itself lists /run (see read_cstr_raw).
-    if path == b"/var/run" { path = b"/run"; }
 
     // Basic normalization: . to /, strip trailing slash
     if path == b"." {
@@ -13343,18 +13363,7 @@ fn read_cstr_raw(ptr: usize) -> Option<(Vec<u8>, usize)> {
     let mut len = 0usize;
     while len < HOST_PATH_MAX {
         if unsafe { *p.add(len) } == 0 {
-            let mut v = unsafe { core::slice::from_raw_parts(p, len) }.to_vec();
-            // /var/run is a symlink to /run (Linux/Alpine), but /run is a VFS
-            // tmpfs intercepted ahead of the mount table, and the f2fs walk
-            // that follows the link re-roots "/run" in its own volume (the
-            // shadowed on-disk directory, which persists across reboots).
-            // Resolve the link here instead: a path below /var/run is a path
-            // below /run. /var/run itself stays the symlink for lstat and
-            // readlink.
-            if v.starts_with(b"/var/run/") {
-                v.drain(..4);
-                return Some((v.clone(), v.len()));
-            }
+            let v = unsafe { core::slice::from_raw_parts(p, len) }.to_vec();
             return Some((v, len));
         }
         len += 1;
