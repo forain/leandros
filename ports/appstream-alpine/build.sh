@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Alpine appstream snapshot cosmic-store reads (names, summaries,
 # icons for the apk packages of the image's Alpine branch).
 #
@@ -32,7 +33,7 @@ branch_of() {
   local lock="$ROOT/ports/alpine/$1.lock" b=""
   [[ -f "$lock" ]] && b="$(sed -n 's/^# release \(v[0-9.]*\).*/\1/p' "$lock" | head -1)"
   if [[ -z "$b" ]]; then
-    b="$(curl -fsSL --max-time 30 "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$1/latest-releases.yaml" \
+    b="$(net_curl -fsSL --max-time 30 "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$1/latest-releases.yaml" \
          | sed -n 's/^ *branch: *\(v[0-9.]*\).*/\1/p' | head -1 || true)"
   fi
   echo "$b"
@@ -51,7 +52,7 @@ for arch in "${ARCHES[@]}"; do
       if [[ -s "$dest" && -f "$out/branch" && "$(cat "$out/branch")" == "$branch" && -z "$(find "$dest" -mtime +7 2>/dev/null)" ]]; then
         continue   # fresh
       fi
-      if curl -fsSL --retry 2 --max-time 300 -o "$dest.tmp" "$BASE/$branch/$repo/$remote"; then
+      if net_curl -fsSL --retry 2 --max-time 300 -o "$dest.tmp" "$BASE/$branch/$repo/$remote"; then
         mv "$dest.tmp" "$dest"
         echo "appstream-alpine: $arch $branch/$repo/$remote ($(du -h "$dest" | cut -f1))"
       else

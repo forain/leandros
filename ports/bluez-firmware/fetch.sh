@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the Bluetooth patch firmware the Raspberry Pi 5's CYW43455 (BCM4345C0)
 # needs from RPi-Distro/bluez-firmware into $BTFW_CACHE (default
 # ~/.cache/leandros/bluez-firmware). scripts/mkfs-f2fs-populated.py stages it
@@ -36,7 +37,7 @@ for entry in "${FILES[@]}"; do
         continue
     fi
     tmp="$out.part"
-    if ! curl -sfL --retry 3 -o "$tmp" "$BASE/$src"; then
+    if ! net_curl -sfL --retry 3 -o "$tmp" "$BASE/$src"; then
         echo "bluez-firmware: download of $name failed" >&2
         rm -f "$tmp"; fail=1; continue
     fi

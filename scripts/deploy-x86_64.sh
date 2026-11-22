@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/netretry.sh"
 # Deploy the Leandros kernel to a USB drive for bare-metal x86-64 boot.
 #
 # Usage:
@@ -68,9 +69,9 @@ if [[ ! -f "$LIMINE_EFI" ]]; then
     echo "[limine] Downloading Limine $LIMINE_VERSION BOOTX64.EFI..."
     mkdir -p "$LIMINE_CACHE"
     if command -v curl &>/dev/null; then
-        curl -sSL --fail "$LIMINE_EFI_URL" -o "$LIMINE_EFI"
+        net_curl -sSL --fail "$LIMINE_EFI_URL" -o "$LIMINE_EFI"
     elif command -v wget &>/dev/null; then
-        wget -qO "$LIMINE_EFI" "$LIMINE_EFI_URL"
+        net_wget -qO "$LIMINE_EFI" "$LIMINE_EFI_URL"
     else
         die "Neither curl nor wget found."
     fi

@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Fetch the pinned OpenRM source tree and its matching GSP firmware into the
 # shared cache ($OPENRM_CACHE, default ~/.cache/leandros/openrm -- outside the
 # repo, so worktrees share one copy and nothing NVIDIA ships is committed).
@@ -39,7 +40,7 @@ verify() { # file expected
 fetch() { # url dest sha
     if [[ -f "$2" ]] && [[ "$(sha256 "$2")" == "$3" ]]; then return; fi
     echo "=== [openrm] downloading $1"
-    curl -fL --retry 3 -o "$2.part" "$1"
+    net_curl -fL --retry 3 -o "$2.part" "$1"
     mv "$2.part" "$2"
     verify "$2" "$3"
 }

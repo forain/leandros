@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Stage the cosmic-wallpapers images (data only) next to the Orion Nebula
 # default, in /usr/share/backgrounds/cosmic/, where cosmic-bg / cosmic-settings
 # look. The upstream checkout holds git-lfs pointers, so the originals are
@@ -20,7 +21,7 @@ for f in "$SRC"/original/*.jpg; do
   [[ "$n" == orion_nebula_nasa_heic0601a.jpg ]] && continue   # keep the staged default
   [[ -f "$DST/$n" ]] && continue
   tmp=$(mktemp -d)
-  curl -fsSL "https://media.githubusercontent.com/media/pop-os/cosmic-wallpapers/$REV/original/$n" -o "$tmp/$n"
+  net_curl -fsSL "https://media.githubusercontent.com/media/pop-os/cosmic-wallpapers/$REV/original/$n" -o "$tmp/$n"
   sips -Z 1280 -s format jpeg -s formatOptions 80 "$tmp/$n" --out "$DST/$n" >/dev/null
   rm -rf "$tmp"
   echo "staged $DST/$n"

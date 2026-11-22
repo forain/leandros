@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Build the LeandrOS greetd (login manager / greeter IPC daemon) — static musl,
 # both arches.
 #
@@ -52,7 +53,7 @@ SRC="$WORK/greetd-$PIN"
 
 mkdir -p "$WORK"
 if [ ! -d "$SRC" ]; then
-  git clone "$REPO" "$SRC"
+  net_git clone "$REPO" "$SRC"
   git -C "$SRC" checkout --detach "$PIN"
   git -C "$SRC" apply "$HERE/patches/0001-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0002-fakegreet-leandros.patch"

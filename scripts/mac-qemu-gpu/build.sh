@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(cd "$(dirname "$0")/.." && pwd)/lib/netretry.sh"
 # Build a standalone, CLI-driven QEMU for Apple Silicon macOS with host-GPU
 # virgl rendering: HVF + virtio-gpu-gl / virtio-vga-gl, virglrenderer on
 # ANGLE (OpenGL ES over Metal), egl-headless for offscreen use (pixels over
@@ -131,7 +132,7 @@ echo "prefix=$PREFIX work=$WORK SDKROOT=$SDKROOT"
 
 fetch() { # url sha256 file
     local f="$WORK/dl/$3"
-    if [ ! -f "$f" ]; then curl -fsSL --retry 3 -o "$f.part" "$1"; mv "$f.part" "$f"; fi
+    if [ ! -f "$f" ]; then net_curl -fsSL --retry 3 -o "$f.part" "$1"; mv "$f.part" "$f"; fi
     echo "$2  $f" | shasum -a 256 -c --status || { echo "checksum mismatch: $f" >&2; exit 1; }
 }
 unpack() { # file dest
@@ -142,7 +143,7 @@ done_stamp() { touch "$WORK/.stamp-$1"; echo "== $1 done"; }
 
 stage_gn() {
     stamp gn && return 0
-    rm -rf "$WORK/gn"; git clone -q "$GN_REPO" "$WORK/gn"
+    rm -rf "$WORK/gn"; net_git clone -q "$GN_REPO" "$WORK/gn"
     git -C "$WORK/gn" checkout -q "$GN_COMMIT"
     (cd "$WORK/gn" && AR=/usr/bin/ar python3 build/gen.py >/dev/null && ninja -C out gn)
     done_stamp gn
@@ -296,7 +297,7 @@ stage_venus() {
         [ -d "$BREW/opt/$f" ] || { echo "venus: brew install $f" >&2; exit 1; }
     done
     local src="$WORK/virglrenderer-venus"
-    [ -d "$src/.git" ] || git clone -q "$VENUS_VIRGL_REPO" "$src"
+    [ -d "$src/.git" ] || net_git clone -q "$VENUS_VIRGL_REPO" "$src"
     git -C "$src" checkout -q "$VENUS_VIRGL_COMMIT"
     (cd "$src" && rm -rf build
      PATH="$WORK/venv/bin:$PATH" meson setup build --prefix="$PREFIX-venus" --buildtype=release \

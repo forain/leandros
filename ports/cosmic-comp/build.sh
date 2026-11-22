@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
 # Rebuild cosmic-comp dec1ee86 with ports/cosmic-comp's patches and stage it at
 # $ART/m6-session-bins/out/cosmic-comp-<arch>. scripts/mkfs-f2fs-populated.py
 # prefers that path over the original M5 probe build (m3-gl-stack/out), and
@@ -20,7 +21,7 @@ if [ "$(uname)" = Darwin ] && [ -z "${SDKROOT:-}" ]; then
 fi
 
 if [ ! -d "$CC/.git" ]; then
-    git clone -q https://github.com/pop-os/cosmic-comp.git "$CC"
+    net_git clone -q https://github.com/pop-os/cosmic-comp.git "$CC"
     git -C "$CC" checkout -q "$COMP_REV"
 fi
 [ "$(git -C "$CC" rev-parse HEAD)" = "$COMP_REV" ] || { echo "cosmic-comp is not at $COMP_REV" >&2; exit 1; }
