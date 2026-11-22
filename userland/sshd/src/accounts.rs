@@ -136,6 +136,63 @@ fn strict_ok(path: &Path, user: &User) -> Result<(), String> {
     Ok(())
 }
 
+/// The text form of an address, an IPv4-mapped IPv6 one as plain IPv4.
+pub fn ip_text(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v| v.to_string()).unwrap_or_else(|| v6.to_string()),
+        v4 => v4.to_string(),
+    }
+}
+
+/// `AuthorizedPrincipalsFile` path: tokens %u (user), %U (uid), %h (home), %% ; a relative
+/// path is under the home. An unknown token is an error (the file is not used).
+pub fn principals_path(user: &User, file: &str) -> Result<PathBuf, String> {
+    let mut out = String::new();
+    let mut it = file.chars();
+    while let Some(c) = it.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('%') => out.push('%'),
+            Some('u') => out.push_str(&user.name),
+            Some('U') => out.push_str(&user.uid.to_string()),
+            Some('h') => out.push_str(&user.home),
+            other => return Err(format!("unsupported token %{} in AuthorizedPrincipalsFile", other.unwrap_or(' '))),
+        }
+    }
+    Ok(if out.starts_with('/') { PathBuf::from(out) } else { Path::new(&user.home).join(out) })
+}
+
+/// Principal names (one per line, optional key options in front) of the user's
+/// `AuthorizedPrincipalsFile`: the options of the first line naming one of `cert_principals`.
+/// The file and its directories obey StrictModes. `Ok(None)` = no line matches.
+pub fn principals_match(user: &User, file: &str, cert_principals: &[String]) -> Result<Option<KeyOpts>, String> {
+    let path = principals_path(user, file)?;
+    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    strict_ok(&path, user)?;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (opts, names) = if line.split_whitespace().count() > 1 {
+            let (o, n) = split_options(line);
+            (o, n)
+        } else {
+            ("", line)
+        };
+        let o = match parse_options(opts) {
+            Ok(o) => o,
+            Err(why) => {
+                crate::log(&format!("principals file of {}: line skipped: {why}", user.name));
+                continue;
+            }
+        };
+        if cert_principals.iter().any(|p| p == names.trim()) {
+            return Ok(Some(o));
+        }
+    }
+    Ok(None)
+}
+
 pub fn authorized_keys_path(user: &User, file: &str) -> PathBuf {
     let rel = file.replace("%u", &user.name).replace("%h", &user.home);
     if rel.starts_with('/') {

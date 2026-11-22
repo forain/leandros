@@ -5,3 +5,10 @@
 - User certificates: russh calls `auth_openssh_certificate` after it checked the cert signature and times; the "would this key do" probe only hands the inner public key to `auth_publickey_offered`, so the probe is answered "yes" whenever a CA exists (`cert_possible`) and `cert_ok` decides. CA = `TrustedUserCAKeys` or a `cert-authority` authorized_keys line (`principals=`, `from=`, `command=`, `expiry-time=`). ed25519, ecdsa and rsa user keys verified.
 - Tests: sshsmoke `cfg_*` / `cert_*` (a second root sshd on port 2222 reached with `ProxyCommand ssh -W`; guest has no setsid, so `trap '' HUP`). Fail-first: `SSHDCFG_UPLOAD=<old sshd binary>` runs the same steps against the pre-change sshd: 23 of the new steps fail. sshsmoke now needs ~250 s (HOST_TIMEOUTS 900).
 - Box regress: x86_64 PASS; aarch64 only the known brtest flake (passes alone).
+
+## Follow-up lane sshdcfg2 (2026-11-22)
+
+- `AuthorizedPrincipalsFile` (userland/sshd/src/accounts.rs `principals_match`): consulted for certificates signed by a `TrustedUserCAKeys` CA only (a `cert-authority` line keeps `principals=`); tokens `%u %U %h %%`, relative = under the home, `none` = the user name; one name per line with optional key options in front (`from=`, `command=`, ...); StrictModes applies to the file and its directories (a /tmp path is refused); a missing file or unknown token refuses the certificate. Match-able keyword.
+- `RevokedKeys` (userland/sshd/src/revoke.rs): plain key list or OpenSSH KRL (explicit keys, SHA256 fingerprints, per-CA serial lists/ranges/bitmaps and key ids, CA-less sections apply to every CA). A cert is revoked by its subject key, its CA key, itself (plain list) or serial/key id. An unreadable or malformed file refuses all public-key auth (as OpenSSH). Global-only keyword.
+- `Match Host|LocalAddress|RDomain` (main.rs `Config::effective`): Host = peer address text, LocalAddress = patterns/negation/CIDR, RDomain = `default`.
+- Live checks, both in sshsmoke `cfg_*`: PermitUserEnvironment yes + `environment=` (second sshd), and the `$sha256$` rehash with `/` remounted read-only (login works, hash stays legacy, failure logged; after remount rw it upgrades).

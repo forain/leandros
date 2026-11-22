@@ -642,7 +642,8 @@ def cert_run(ssh2, user, ukey, cert, cmd, extra=()):
 
 def sshdcfg(ssh, user, pw, tmp):
     """sshd_config Match blocks, ForceCommand, AllowTcpForwarding and user certificates
-    (TrustedUserCAKeys, authorized_keys cert-authority), on a second sshd (port 2222) reached
+    (TrustedUserCAKeys, authorized_keys cert-authority), AuthorizedPrincipalsFile, RevokedKeys (plain + KRL),
+    Match Host/LocalAddress/RDomain, PermitUserEnvironment and the read-only /etc rehash, on a second sshd (port 2222) reached
     through the first one with ProxyCommand -W."""
     import socket
     import threading
@@ -845,8 +846,245 @@ def sshdcfg(ssh, user, pw, tmp):
     step("cert_authority_command_option", out.strip() == "line-forced", f"rc={rc} out={out.strip()!r}")
     rc, out, err = cert_run(ssh2, user, uk, sign("ak7", ca, user, "-O", "force-command=echo other"), "id -un")
     step("cert_force_command_conflict", rc == 255, f"rc={rc}")
+    # --- Match Host / LocalAddress / RDomain ---------------------------------
     set_keys(ssh, user, pw, pub)
-    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
+
+    def match_case(name, crit, forced):
+        conf(f"Match {crit}\n  ForceCommand echo mx\n")
+        rc, out, err = login()
+        want = "mx" if forced else user
+        step(name, rc == 0 and out.strip() == want, f"rc={rc} out={out.strip()!r} want={want!r}")
+
+    match_case("cfg_match_host_pattern", "Host 127.0.0.*", True)
+    match_case("cfg_match_host_other", "Host 10.*,192.168.*", False)
+    match_case("cfg_match_host_negated", "Host !127.0.0.1,*", False)
+    match_case("cfg_match_host_star_negated_other", "Host *,!10.1.1.1", True)
+    match_case("cfg_match_host_and_user", f"Host 127.0.0.1 User {user}", True)
+    match_case("cfg_match_localaddress_cidr", "LocalAddress 127.0.0.0/8", True)
+    match_case("cfg_match_localaddress_other_cidr", "LocalAddress 10.0.0.0/8", False)
+    match_case("cfg_match_localaddress_list", "LocalAddress 192.168.0.0/16,127.0.0.1", True)
+    match_case("cfg_match_localaddress_negated", "LocalAddress 127.0.0.0/8,!127.0.0.1", False)
+    match_case("cfg_match_localaddress_exact", "LocalAddress 127.0.0.1", True)
+    match_case("cfg_match_rdomain_default", "RDomain default", True)
+    match_case("cfg_match_rdomain_other", "RDomain blue", False)
+    match_case("cfg_match_rdomain_negated", "RDomain !default", False)
+    match_case("cfg_match_rdomain_star", "RDomain *", True)
+    match_case("cfg_match_and_mismatch", "Host 127.0.0.1 LocalAddress 10.0.0.0/8", False)
+    match_case("cfg_match_and_all_match", f"Host 127.0.0.1 LocalAddress 127.0.0.0/8 RDomain default LocalPort {SSHD2_PORT}", True)
+
+    # --- AuthorizedPrincipalsFile (certificates signed by a TrustedUserCAKeys CA) ----
+    def put(path, data):
+        r = ssh.run(user, f"cat > {path}", key=True, stdin=data if isinstance(data, bytes) else data.encode())
+        return r[0] == 0
+
+    sudo_sh(ssh, user, pw, "mkdir -p /etc/ssh/principals; chmod 755 /etc/ssh/principals")
+    sudo_write(ssh, user, pw, f"/etc/ssh/principals/{user}", "# principals\ndeploy\n\nops\nrelease")
+    sudo_sh(ssh, user, pw, f"chmod 644 /etc/ssh/principals/{user}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\nAuthorizedPrincipalsFile /etc/ssh/principals/%u\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf1", ca, "deploy"), "id -un")
+    step("cfg_principals_file_listed", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf2", ca, "x,release"), "id -un")
+    step("cfg_principals_file_second_cert_principal", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf3", ca, user), "id -un")
+    step("cfg_principals_file_username_not_implicit", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf4", ca, "stranger"), "id -un")
+    step("cfg_principals_file_unlisted", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf5", ca, "# principals"), "id -un")
+    step("cfg_principals_file_comment_not_a_name", rc == 255, f"rc={rc}")
+    sudo_sh(ssh, user, pw, f"chmod 664 /etc/ssh/principals/{user}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf6", ca, "deploy"), "id -un")
+    step("cfg_principals_file_strict_modes", rc == 255, f"rc={rc}")
+    sudo_sh(ssh, user, pw, f"chmod 644 /etc/ssh/principals/{user}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\nAuthorizedPrincipalsFile /etc/ssh/principals/missing-%u\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf7", ca, user), "id -un")
+    step("cfg_principals_file_missing_refuses", rc == 255, f"rc={rc}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\nAuthorizedPrincipalsFile none\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf8", ca, user), "id -un")
+    step("cfg_principals_file_none_uses_username", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\nAuthorizedPrincipalsFile %h/.sshd-principals\n")
+    put(".sshd-principals", 'viahome\ncommand="echo princ-forced" cmdname\nfrom="10.99.*" remote-only\n')
+    sudo_sh(ssh, user, pw, f"chmod 600 ~{user}/.sshd-principals 2>/dev/null; chown {user} ~{user}/.sshd-principals 2>/dev/null; true")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf9", ca, "viahome"), "id -un")
+    step("cfg_principals_file_home_token", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf10", ca, "cmdname"), "id -un")
+    step("cfg_principals_file_line_command_option", rc == 0 and out.strip() == "princ-forced", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf11", ca, "remote-only"), "id -un")
+    step("cfg_principals_file_line_from_option", rc == 255, f"rc={rc}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\nAuthorizedPrincipalsFile %u/%q\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf12", ca, user), "id -un")
+    step("cfg_principals_file_unknown_token", rc == 255, f"rc={rc}")
+    sudo_write(ssh, user, pw, f"/etc/ssh/principals/%{user}", "pct")
+    sudo_sh(ssh, user, pw, f"chmod 644 /etc/ssh/principals/%{user}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\nAuthorizedPrincipalsFile /etc/ssh/principals/%%%u\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf13", ca, "pct"), "id -un")
+    step("cfg_principals_file_percent_token", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    # not consulted for a cert-authority line of authorized_keys (that has principals=)
+    conf("AuthorizedPrincipalsFile /etc/ssh/principals/missing-%u\n")
+    set_keys(ssh, user, pw, f"{pub}\ncert-authority {cap}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("pf14", ca, user), "id -un")
+    step("cfg_principals_file_not_for_cert_authority_line", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    set_keys(ssh, user, pw, pub)
+    sudo_sh(ssh, user, pw, "rm -rf /etc/ssh/principals")
+
+    # --- RevokedKeys: plain list ------------------------------------------------
+    cabits = open(ca + ".pub").read()
+    ca2bits = open(ca2 + ".pub").read()
+    ukbits = open(uk + ".pub").read()
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nRevokedKeys /tmp/sshdcfg-revoked\n")
+    put("/tmp/sshdcfg-revoked", "# nothing revoked yet\n" + ca2bits)
+    rc, out, err = login()
+    step("cfg_revoked_plain_other_key_listed_login_ok", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    c1 = sign("rv1")
+    rc, out, err = cert_run(ssh2, user, uk, c1, "id -un")
+    step("cfg_revoked_plain_cert_ok", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    put("/tmp/sshdcfg-revoked", "# the login key\n" + pub + "\n")
+    rc, out, err = login()
+    step("cfg_revoked_plain_key_refused", rc == 255, f"rc={rc}")
+    put("/tmp/sshdcfg-revoked", cabits)
+    rc, out, err = cert_run(ssh2, user, uk, sign("rv2"), "id -un")
+    step("cfg_revoked_plain_ca_refused", rc == 255, f"rc={rc}")
+    rc, out, err = login()
+    step("cfg_revoked_plain_ca_leaves_plain_key", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    put("/tmp/sshdcfg-revoked", ukbits)
+    rc, out, err = cert_run(ssh2, user, uk, sign("rv3"), "id -un")
+    step("cfg_revoked_plain_cert_subject_key_refused", rc == 255, f"rc={rc}")
+    put("/tmp/sshdcfg-revoked", open(c1).read())
+    rc, out, err = cert_run(ssh2, user, uk, c1, "id -un")
+    step("cfg_revoked_plain_cert_itself_refused", rc == 255, f"rc={rc}")
+    sudo_sh(ssh, user, pw, "rm -f /tmp/sshdcfg-revoked")
+    rc, out, err = login()
+    step("cfg_revoked_unreadable_refuses_key", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("rv4"), "id -un")
+    step("cfg_revoked_unreadable_refuses_cert", rc == 255, f"rc={rc}")
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nRevokedKeys none\n")
+    rc, out, err = login()
+    step("cfg_revoked_none_login_ok", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+
+    # --- RevokedKeys: OpenSSH binary KRL (ssh-keygen -k) -------------------------
+    def krl(name, spec, ca_pub=None):
+        sp, out = os.path.join(tmp, name + ".spec"), os.path.join(tmp, name + ".krl")
+        with open(sp, "w") as f:
+            f.write("\n".join(spec) + "\n")
+        if os.path.exists(out):
+            os.unlink(out)
+        r = subprocess.run(["ssh-keygen", "-q", "-k", "-f", out, *(["-s", ca_pub] if ca_pub else []), sp], capture_output=True)
+        if r.returncode != 0:
+            print(f"sshdcfg: ssh-keygen -k {name}: {r.stderr.decode(errors='replace')[-200:]!r}", flush=True)
+            return None
+        return open(out, "rb").read()
+
+    def use_krl(data):
+        return data is not None and put("/tmp/sshdcfg-revoked", data)
+
+    conf("TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nRevokedKeys /tmp/sshdcfg-revoked\n")
+    ok = use_krl(krl("k1", ["key: " + ca2bits.strip()]))
+    rc, out, err = login()
+    step("cfg_krl_unrelated_key_login_ok", ok and rc == 0 and out.strip() == user, f"ok={ok} rc={rc} err={err.strip()[-100:]!r}")
+    ok = use_krl(krl("k2", ["key: " + pub]))
+    rc, out, err = login()
+    step("cfg_krl_explicit_key_refused", ok and rc == 255, f"ok={ok} rc={rc}")
+    ok = use_krl(krl("k3", ["sha256: " + pub]))
+    rc, out, err = login()
+    step("cfg_krl_sha256_key_refused", ok and rc == 255, f"ok={ok} rc={rc}")
+    ok = use_krl(krl("k4", ["key: " + ca2bits.strip()]))
+    ok = use_krl(krl("k4b", ["sha256: " + ca2bits.strip()])) and ok
+    rc, out, err = login()
+    step("cfg_krl_sha256_other_key_login_ok", ok and rc == 0 and out.strip() == user, f"ok={ok} rc={rc} err={err.strip()[-100:]!r}")
+    ok = use_krl(krl("k5", ["key: " + cabits.strip()]))
+    rc, out, err = cert_run(ssh2, user, uk, sign("kr1"), "id -un")
+    step("cfg_krl_ca_key_refuses_cert", ok and rc == 255, f"ok={ok} rc={rc}")
+    ok = use_krl(krl("k6", ["key: " + ukbits.strip()]))
+    rc, out, err = cert_run(ssh2, user, uk, sign("kr2"), "id -un")
+    step("cfg_krl_cert_subject_key_refused", ok and rc == 255, f"ok={ok} rc={rc}")
+    ok = use_krl(krl("k7", ["serial: 1234", "serial: 2000-2005", "serial: 3001", "serial: 3003", "serial: 3005", "serial: 3007", "id: revoked-id"], ca + ".pub"))
+    for n, serial, expect in (("ser", "1234", False), ("rng_lo", "2000", False), ("rng_mid", "2003", False), ("rng_hi", "2005", False),
+                              ("rng_after", "2006", True), ("bm_hit", "3005", False), ("bm_gap", "3004", True), ("bm_last", "3007", False),
+                              ("unlisted", "77", True)):
+        rc, out, err = cert_run(ssh2, user, uk, sign("ks_" + n, ca, user, "-z", serial), "id -un")
+        step(f"cfg_krl_serial_{n}", ok and (rc == 0 and out.strip() == user if expect else rc == 255), f"ok={ok} serial={serial} rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("revoked-id"), "id -un")
+    step("cfg_krl_key_id_refused", ok and rc == 255, f"ok={ok} rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("other-id", ca, user, "-z", "55"), "id -un")
+    step("cfg_krl_other_key_id_ok", ok and rc == 0 and out.strip() == user, f"ok={ok} rc={rc} err={err.strip()[-100:]!r}")
+    ok = use_krl(krl("k8", ["serial: 4000"], ca2 + ".pub"))
+    rc, out, err = cert_run(ssh2, user, uk, sign("kc1", ca, user, "-z", "4000"), "id -un")
+    step("cfg_krl_serial_is_scoped_to_its_ca", ok and rc == 0 and out.strip() == user, f"ok={ok} rc={rc} err={err.strip()[-100:]!r}")
+    put("/tmp/sshdcfg-revoked", b"SSHKRL\n\x00\x00\x00\x00\x01garbage")
+    rc, out, err = login()
+    step("cfg_krl_malformed_refuses_key", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("kc2"), "id -un")
+    step("cfg_krl_malformed_refuses_cert", rc == 255, f"rc={rc}")
+
+    # --- PermitUserEnvironment yes + environment= (second config) ----------------
+    envkeys = f'environment="SSHSMOKE_ENV=seen",environment="SSHSMOKE_B=two words" {pub}'
+    set_keys(ssh, user, pw, envkeys)
+    conf("PermitUserEnvironment yes\n")
+    rc, out, err = login("echo [$SSHSMOKE_ENV][$SSHSMOKE_B]")
+    step("cfg_environment_option_permitted", rc == 0 and out.strip() == "[seen][two words]", f"rc={rc} out={out.strip()!r}")
+    rc, out, err = login("echo [$HOME][$USER]")
+    step("cfg_environment_option_keeps_login_env", rc == 0 and out.strip() != "[][]", f"rc={rc} out={out.strip()!r}")
+    conf("PermitUserEnvironment no\n")
+    rc, out, err = login("echo [$SSHSMOKE_ENV]")
+    step("cfg_environment_option_denied_when_no", rc == 0 and out.strip() == "[]", f"rc={rc} out={out.strip()!r}")
+    conf(f"PermitUserEnvironment no\nMatch User {user}\n  PermitUserEnvironment yes\n")
+    rc, out, err = login("echo [$SSHSMOKE_ENV]")
+    step("cfg_environment_option_via_match", rc == 0 and out.strip() == "[seen]", f"rc={rc} out={out.strip()!r}")
+    conf(f"PermitUserEnvironment yes\nMatch User {user}\n  PermitUserEnvironment no\n")
+    rc, out, err = login("echo [$SSHSMOKE_ENV]")
+    step("cfg_environment_option_match_turns_off", rc == 0 and out.strip() == "[]", f"rc={rc} out={out.strip()!r}")
+    set_keys(ssh, user, pw, pub)
+    conf("PermitUserEnvironment yes\n")
+    rc, out, err = login("echo [$SSHSMOKE_ENV]")
+    step("cfg_environment_permitted_but_none_set", rc == 0 and out.strip() == "[]", f"rc={rc} out={out.strip()!r}")
+
+    # --- $sha256$ rehash with a read-only root (/etc is on it) ---------------------
+    import hashlib
+    rc, orig, err = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+    if rc != 0 or f"\n{user}:" not in "\n" + orig:
+        step("cfg_rehash_readonly_etc", False, f"cannot read /etc/shadow rc={rc}")
+    else:
+        legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
+        lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
+        sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
+        conf("")
+        # The guest script remounts / read-only for a window, records what it sees, and remounts it read-write.
+        sudo_write(ssh, user, pw, "/tmp/sshdcfg-ro.sh", "\n".join([
+            "trap '' HUP",
+            "rm -f /tmp/sshdcfg-ro-*",
+            "sleep 3",
+            "mount -o remount,ro /",
+            "touch /etc/sshdcfg-ro-probe 2>/dev/null; echo $? > /tmp/sshdcfg-ro-probe",
+            "sleep 14",
+            f"grep '^{user}:' /etc/shadow | cut -d: -f2 | cut -c1-8 > /tmp/sshdcfg-ro-field",
+            "ls /etc/shadow.sshd-new > /tmp/sshdcfg-ro-new 2>&1; echo $? >> /tmp/sshdcfg-ro-new",
+            "cp /tmp/sshdcfg.log /tmp/sshdcfg-ro-log",
+            "mount -o remount,rw /",
+            "rm -f /etc/sshdcfg-ro-probe",
+            "chmod 644 /tmp/sshdcfg-ro-*",
+            "echo done > /tmp/sshdcfg-ro-done",
+        ]))
+        sudo_sh(ssh, user, pw, "chmod 755 /tmp/sshdcfg-ro.sh; sh /tmp/sshdcfg-ro.sh > /dev/null 2>&1 < /dev/null &")
+        time.sleep(7)  # the root is read-only from here on
+        rc, out, err = login(password=True)
+        step("cfg_rehash_readonly_login_still_works", rc == 0 and out.strip() == user, f"rc={rc} out={out.strip()!r} err={err.strip()[-100:]!r}")
+        for _ in range(40):
+            rc, done, _ = ssh.run(user, "cat /tmp/sshdcfg-ro-done", key=True)
+            if rc == 0 and "done" in done:
+                break
+            time.sleep(3)
+        rc, got, _ = ssh.run(user, "cd /tmp; cat sshdcfg-ro-probe sshdcfg-ro-field sshdcfg-ro-new sshdcfg-ro-log", key=True)
+        parts = got.splitlines()
+        step("cfg_rehash_etc_was_readonly", bool(parts) and parts[0].strip() not in ("", "0"), f"got={got[:200]!r}")
+        step("cfg_rehash_readonly_keeps_legacy_hash", len(parts) > 2 and parts[1].strip() == "$sha256$" and "No such file" in got, f"got={got[:300]!r}")
+        step("cfg_rehash_readonly_failure_logged", "shadow hash upgrade failed" in got and "upgraded from" not in got, f"got={got[-300:]!r}")
+        rc, out, err = login(password=True)
+        time.sleep(1)
+        rc2, after, _ = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+        new = [l for l in after.splitlines() if l.startswith(user + ":")]
+        step("cfg_rehash_after_remount_rw_upgrades", rc == 0 and bool(new) and new[0].split(":")[1].startswith("$6$"), f"rc={rc} field={(new[0][:30] if new else None)!r}")
+        sudo_write(ssh, user, pw, "/etc/shadow", orig)
+    set_keys(ssh, user, pw, pub)
+    sudo_sh(ssh, user, pw, "mount -o remount,rw / 2>/dev/null; kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*; rm -rf /etc/ssh/principals")
 
 
 PS_SSHD = r"""for p in /proc/[0-9]*; do
