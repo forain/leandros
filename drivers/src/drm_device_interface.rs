@@ -2384,7 +2384,7 @@ pub fn set_out_fence_signaller(f: fn(u64) -> bool) {
 pub fn out_fence_register(fence: u64, token: u64) -> bool {
     if fence == 0 { return false; }
     let mut q = OUT_FENCES.lock();
-    if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire) { return false; }
+    if crate::virtio_gpu::fence_done_lockfree(fence) { return false; }
     if q.len() >= MAX_OUT_FENCES { return false; }
     q.push_back((fence, token));
     OUT_FENCES_N.store(q.len(), Ordering::SeqCst);
@@ -2400,7 +2400,7 @@ pub fn out_fence_register(fence: u64, token: u64) -> bool {
     // behind a SeqCst fence, so at least one of us sees the other. If it is
     // us, re-arm the fence event so the next tick pays the entry.
     ::core::sync::atomic::fence(Ordering::SeqCst);
-    if fence <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::SeqCst) {
+    if crate::virtio_gpu::fence_done_lockfree(fence) {
         OUT_FENCE_REARMS.fetch_add(1, Ordering::Relaxed);
         crate::virtio_gpu::FENCE_EVENT_PENDING.store(true, Ordering::Release);
     }
@@ -2422,7 +2422,6 @@ fn out_fence_service() -> bool {
     if p == 0 { return true; }
     // SAFETY: only ever written by `set_out_fence_signaller` from a `fn(u64) -> bool`.
     let signal: fn(u64) -> bool = unsafe { ::core::mem::transmute::<usize, fn(u64) -> bool>(p) };
-    let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
     let mut q = match OUT_FENCES.try_lock() { Some(g) => g, None => return false };
     let mut complete = true;
     // Entries are in submission order but fences are per-open, so a retired
@@ -2431,7 +2430,7 @@ fn out_fence_service() -> bool {
     let mut i = 0;
     while i < q.len() {
         let (fence, token) = q[i];
-        if fence <= floor {
+        if crate::virtio_gpu::fence_done_lockfree(fence) {
             if signal(token) {
                 q.remove(i);
                 continue;
@@ -4114,7 +4113,7 @@ pub(crate) fn fence_is_done(f: FenceId) -> bool {
     // A virtio-gpu fence (EXECBUFFER out-syncobj, FENCE_FD_IN): retired once
     // the device's in-order floor has passed it, the same test the out-fence
     // eventfds use. The v3d stub has its own id space.
-    !v3d_active() && f <= crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire)
+    !v3d_active() && crate::virtio_gpu::fence_done_lockfree(f)
 }
 
 /// Wake syncobj waiters, if there are any. Task context (the ioctl paths).
@@ -4396,7 +4395,8 @@ pub fn syncobj_retire_fence(fence: u64) {
 fn syncobj_tick() {
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) == 0 { return; }
     let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed)
-        ^ crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Relaxed).rotate_left(32);
+        ^ crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Relaxed).rotate_left(32)
+        ^ crate::virtio_gpu::fences_retired_ahead().rotate_left(16);
     if SYNCOBJ_WAKE_SEEN.load(Ordering::Relaxed) != done {
         SYNCOBJ_WAKE_SEEN.store(done, Ordering::Relaxed);
         syncobj_try_wake();
@@ -5624,9 +5624,8 @@ pub fn ext_frame_stats_take() -> ExtFrameStats {
 /// IRQ context (the completion interrupt or the tick): try_lock only; false
 /// when a lock was busy and the fence hook should be called again.
 fn flip_fence_service() -> bool {
-    let floor = crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Acquire);
     let mut pend = match PENDING_FLIPS.try_lock() { Some(g) => g, None => return false };
-    let due = pend.front().map(|&(_, f, _, _)| f != 0 && f <= floor).unwrap_or(false);
+    let due = pend.front().map(|&(_, f, _, _)| f != 0 && crate::virtio_gpu::fence_done_lockfree(f)).unwrap_or(false);
     if !due { return true; }
     let mut ready = match READY_EVENTS.try_lock() { Some(g) => g, None => return false };
     let mut n = 0u64;
@@ -5636,7 +5635,7 @@ fn flip_fence_service() -> bool {
     let mut nopens = 0usize;
     let mut tags = 0u64;
     while let Some(&(_, f, _, _)) = pend.front() {
-        if f == 0 || f > floor { break; }
+        if f == 0 || !crate::virtio_gpu::fence_done_lockfree(f) { break; }
         if let Some((blob, _, _, o)) = pend.pop_front() {
             ready.push_back((o, blob));
             if !opens[..nopens].contains(&o) {
@@ -9533,7 +9532,15 @@ impl DrmDeviceInterface {
         let fence = {
             let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
             let gpu = guard.as_mut().ok_or(DriverError::NotFound)?;
-            gpu.submit_3d(ctx, &cmds, ring_idx).map_err(|_| DriverError::Io)?
+            match gpu.submit_3d(ctx, &cmds, ring_idx) {
+                Ok(f) => f,
+                Err(e) => {
+                    let busy = e == crate::virtio_gpu::Submit3dErr::Busy;
+                    drop(guard);
+                    if busy { sched::yield_now("gpu-fence-ceiling"); }
+                    return Err(if busy { DriverError::Errno(11) } else { DriverError::Io });
+                }
+            }
         };
 
         // Attach the fence to every BO the submission named, and record it as
@@ -9928,10 +9935,14 @@ impl DrmDeviceInterface {
             unsafe { ucp_in(cmds.as_mut_ptr(), req.cmd, cmds.len()); }
             let sub = {
                 let mut guard = crate::virtio_gpu::VIRTIO_GPU.lock();
-                match guard.as_mut() { Some(gpu) => gpu.submit_3d(ctx, &cmds, None), None => Err(()) }
+                match guard.as_mut() { Some(gpu) => gpu.submit_3d(ctx, &cmds, None), None => Err(crate::virtio_gpu::Submit3dErr::Other) }
             };
-            if sub.is_err() {
+            if let Err(e) = sub {
                 if phys != 0 { mm::buddy::free(phys, order); }
+                if e == crate::virtio_gpu::Submit3dErr::Busy {
+                    sched::yield_now("gpu-fence-ceiling");
+                    return Err(DriverError::Errno(11));
+                }
                 return Err(DriverError::Io);
             }
         }
