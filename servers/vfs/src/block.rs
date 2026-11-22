@@ -971,6 +971,27 @@ pub fn is_sysfs_path(path: &[u8]) -> bool {
     path == SYS_BLOCK || path.starts_with(b"/sys/class/block/")
 }
 
+/// Path of sysfs directory `(dev, level)` (the inverse of `sysfs_dir`), for the
+/// path an O_PATH fd of it reports.
+pub fn sysfs_dir_path(dev: u16, level: u8) -> Option<alloc::vec::Vec<u8>> {
+    let mut p = SYS_BLOCK.to_vec();
+    if level == LVL_BLOCK { return Some(p); }
+    let b = BDEVS.lock();
+    let d = dev as usize;
+    if d >= MAX_BDEV || !b[d].in_use { return None; }
+    p.push(b'/');
+    p.extend_from_slice(b[d].name());
+    drop(b);
+    let sub: &[u8] = match level {
+        LVL_DEV => return Some(p),
+        LVL_QUEUE => b"queue", LVL_DEVICE => b"device", LVL_LOOP => b"loop",
+        _ => return None,
+    };
+    p.push(b'/');
+    p.extend_from_slice(sub);
+    Some(p)
+}
+
 /// Resolve `path` to a sysfs *directory*, as `(registry slot, level)`.
 pub fn sysfs_dir(path: &[u8]) -> Option<(u16, u8)> {
     if path == SYS_BLOCK { return Some((NO_DEV, LVL_BLOCK)); }

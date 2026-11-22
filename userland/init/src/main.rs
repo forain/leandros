@@ -232,13 +232,35 @@ unsafe fn initctl_poll(ctl: i32, dm_pid: i32, login_pid: i32) -> Option<PowerAct
         }
     };
     let allowed = have_cred && (uid == 0 || in_local_session(pid, dm_pid, login_pid));
-    write_str("[init] ");
-    write_str(action.name());
-    write_str(" requested by pid ");
-    write_u32(pid);
-    write_str(" (uid ");
-    write_u32(uid);
-    write_str(if allowed { "): authorised\n" } else { "): DENIED (not root, not in a local session)\n" });
+    // One write(): piecewise writes let a kernel console line land mid-sentence
+    // and break the "<action> requested by pid" text the power tests look for.
+    let mut line_buf = [0u8; 160];
+    let mut ln = 0usize;
+    let mut put = |b: &[u8]| {
+        let k = b.len().min(line_buf.len() - ln);
+        line_buf[ln..ln + k].copy_from_slice(&b[..k]);
+        ln += k;
+    };
+    let put_u32 = |n: u32, put: &mut dyn FnMut(&[u8])| {
+        let mut d = [0u8; 10];
+        let mut i = 10usize;
+        let mut v = n;
+        loop {
+            i -= 1;
+            d[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 { break; }
+        }
+        put(&d[i..]);
+    };
+    put(b"[init] ");
+    put(action.name().as_bytes());
+    put(b" requested by pid ");
+    put_u32(pid, &mut put);
+    put(b" (uid ");
+    put_u32(uid, &mut put);
+    put(if allowed { &b"): authorised\n"[..] } else { &b"): DENIED (not root, not in a local session)\n"[..] });
+    write(STDOUT_FILENO, line_buf.as_ptr(), ln);
     if !allowed {
         write(c, b"denied\n".as_ptr(), 7);
         close(c);
