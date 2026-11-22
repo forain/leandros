@@ -9075,7 +9075,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
-                                     b"/proc/vtstat", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
+                                     b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
 /// The regular files `handle_open` generates through `gen_proc_system` (and
@@ -10014,6 +10014,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let mut buf = alloc::vec![0u8; 16384];
             let n = tty_server::vt::stats_text(&mut buf);
             match proc_snapshot(b"/tmp/.vtstat", &buf[..n], false) {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/vtgrid" {
+            // Full cell grid of VT 6 (the test VT), see `vt::grid_text`.
+            let mut buf = alloc::vec![0u8; 393216];
+            let n = tty_server::vt::grid_text(5, &mut buf);
+            match proc_snapshot(b"/tmp/.vtgrid", &buf[..n], false) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
