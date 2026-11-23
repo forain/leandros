@@ -1585,7 +1585,9 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         poll(core::ptr::null_mut(), 0, 100);
         let d_orph = ctrlq_stat(ctl, 7) == orph0;
         let d_recl = ctrlq_stat(ctl, 1) == recl0.wrapping_add(1);
-        let d_census = ctrlq_stat(ctl, 3) == base_inflight;
+        let recl_now = ctrlq_stat(ctl, 1);
+        let infl_now = ctrlq_stat(ctl, 3);
+        let d_census = infl_now == base_inflight;
         if oka { close(ea.fence_fd); }
         if fc >= 0 { close(fc); }
         if fb >= 0 { close(fb); }
@@ -1598,7 +1600,9 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         out(b" c1="); out_u64(c1_sig as u64); out(b" c3="); out_u64(c3_sig as u64); out(b" x="); out_u64(x_ok as u64); out(b"/"); out_u64(x_sig as u64); out(b" sh="); out_u64(sh as u64);
         out(b" a_pend="); out_u64(a_pending_c as u64); out(b" lost_same="); out_u64(c_lost_same as u64);
         out(b" d="); out_u64(d_poll as u64); out_u64(d_wait as u64); out_u64(d_orph as u64);
-        out_u64(d_recl as u64); out_u64(d_census as u64); out(b"\n");
+        out_u64(d_recl as u64); out_u64(d_census as u64);
+        out(b" recl="); out_u64(recl0); out(b"->"); out_u64(recl_now);
+        out(b" inflight="); out_u64(base_inflight); out(b"->"); out_u64(infl_now); out(b"\n");
         if !report(b"phase7h_a_orphaned_fence_setup", knob && inited && held && oka) { failures += 1; }
         if !report(b"phase7h_b_destroyed_ctx_fence_stays_pending",
                    b_poll && b_wait && b_cnt && b_unch) { failures += 1; }
