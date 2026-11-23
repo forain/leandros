@@ -245,13 +245,18 @@ const REAP_HARD_TICKS: u64 = 3000;
 /// alive past the owner's exit; this keeps the stacks for a bounded grace.
 /// `Some(queued bytes)` while stack `sid` is busy (a live connection holding unsent, unacked or unread bytes), else `None`.
 fn tcp_progress(sid: Sid) -> Option<usize> {
-    use smoltcp::socket::{tcp, AnySocket};
+    use smoltcp::socket::{tcp, udp, AnySocket};
     let st = crate::STACKS[sid as usize].lock();
     let s = st.as_ref()?;
     let mut busy = false;
     let mut bytes = 0usize;
     for (_, sock) in s.socket_set.iter() {
-        let Some(t) = tcp::Socket::downcast(sock) else { continue };
+        let Some(t) = tcp::Socket::downcast(sock) else {
+            // A datagram the owner sent just before exiting (a UDP server's last reply) is still queued
+            // for the daemon's next pass: Linux transmits at sendto time, so it must not be lost.
+            if udp::Socket::downcast(sock).map_or(false, |u| u.send_pending()) { busy = true; bytes += 1; }
+            continue
+        };
         match t.state() {
             tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {}
             tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => {
@@ -273,6 +278,13 @@ fn x_sids_peers(x: &Dying) -> Vec<Sid> {
     x.sids.iter().copied().chain(x.peers.iter().map(|&(_, s)| s)).collect()
 }
 
+/// Frames queued for stack-less port `sid` (a bridge port whose container end just sent them) that
+/// the daemon has not switched yet: freeing the port first would drop the exited process's last
+/// datagrams.
+fn port_rx_busy(sid: Sid) -> bool {
+    VIFS.lock()[sid as usize].as_ref().map_or(false, |x| !x.rxq.is_empty())
+}
+
 /// Free every dead namespace whose stacks have drained or whose grace ran
 /// out (`force`: all of them, for an exhausted sid table).
 fn finish_dying(force: bool) {
@@ -290,6 +302,10 @@ fn finish_dying(force: bool) {
                 let mut any = false;
                 for p in x_sids_peers(&d[i]) {
                     if let Some(b) = tcp_progress(p) { any = true; sum = sum.wrapping_add(b).wrapping_add(1); }
+                }
+                // A bridge peer port with received frames still queued for the daemon keeps the stack alive too.
+                for &(_, s) in d[i].peers.iter() {
+                    if port_rx_busy(s) { any = true; sum = sum.wrapping_add(1); }
                 }
                 // Progress (the queued bytes moved) restarts the grace, up to the hard cap.
                 if any && sum != d[i].mark && now < d[i].hard {

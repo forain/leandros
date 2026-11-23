@@ -4396,6 +4396,7 @@ fn syncobj_tick() {
     if SYNCOBJ_WAITERS.load(Ordering::Relaxed) == 0 { return; }
     let done = SYNCOBJ_FENCE_DONE.load(Ordering::Relaxed)
         ^ crate::virtio_gpu::GPU_FENCE_FLOOR.load(Ordering::Relaxed).rotate_left(32)
+        ^ crate::virtio_gpu::FENCE_FLOOR_EPOCH.load(Ordering::Relaxed).rotate_left(48)
         ^ crate::virtio_gpu::fences_retired_ahead().rotate_left(16);
     if SYNCOBJ_WAKE_SEEN.load(Ordering::Relaxed) != done {
         SYNCOBJ_WAKE_SEEN.store(done, Ordering::Relaxed);

@@ -11137,7 +11137,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let mut s = &b[..n];
                 while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
-                if s != b"0" && s != b"1" && s != b"2" && s != b"3" { return err_reply(-22); }
+                if s != b"0" && s != b"1" && s != b"2" && s != b"3" && s != b"4" { return err_reply(-22); }
                 extern "C" { fn kernel_drm_fence_hold_set(on: u32); }
                 unsafe { kernel_drm_fence_hold_set((s[0] - b'0') as u32) };
                 return val_reply(count as u64);
@@ -13913,6 +13913,8 @@ static FH_TABLE: Mutex<alloc::vec::Vec<((u64, u64), alloc::vec::Vec<u8>)>> = Mut
 
 pub fn fh_remember(id: (u64, u64), path: &[u8]) {
     if matches!(fh_fs(path), FhFs::NoExport) { return; }
+    // cgroup2 nodes decode by id (generation + slot): no table entry.
+    if cgroupfs::is_path(path) && cgroupfs::ino_gen(id.1).is_some() { return; }
     let mut t = FH_TABLE.lock();
     if let Some(e) = t.iter_mut().find(|e| e.0 == id) { e.1 = path.to_vec(); return; }
     if t.len() >= 4096 { t.remove(0); }
@@ -13971,6 +13973,7 @@ fn f2fs_ino_path(host: &[u8], ino: u64) -> Result<(&'static str, Vec<u8>, u32), 
 
 /// i_generation to put in a handle for `host` (0 where the filesystem has none).
 pub fn fh_gen(host: &[u8], id: (u64, u64)) -> u32 {
+    if cgroupfs::is_path(host) { return cgroupfs::ino_gen(id.1).unwrap_or(0); }
     if fh_fs(host) != FhFs::F2fs { return 0; }
     f2fs_ino_path(host, id.1).map(|r| r.2).unwrap_or(0)
 }
@@ -14009,6 +14012,10 @@ pub fn fh_lookup(mp: &[u8], dev: Option<u64>, ino: u64, gen: u32) -> Option<allo
         }
         FhFs::Kernfs | FhFs::Other => {}
     }
+    if cgroupfs::mounted() && path_under(mp, cgroupfs::ROOT) {
+        // cgroup2: the id carries slot + generation; a removed cgroup is ESTALE.
+        return cgroupfs::handle_path(ino, gen).ok();
+    }
     let (id, p) = FH_TABLE.lock().iter().find(|e| e.0 .1 == ino && dev.map_or(true, |d| d == e.0 .0)).map(|e| (e.0, e.1.clone()))?;
     if fh_ident(&p) == Some(id) { Some(p) } else { None }
 }
@@ -14037,7 +14044,7 @@ fn fan_fid_record(out: &mut Vec<u8>, ty: u8, id: (u64, u64), name: Option<&[u8]>
     out.extend_from_slice(&0x4ci32.to_le_bytes());
     out.extend_from_slice(&id.1.to_le_bytes());
     let hp = FH_TABLE.lock().iter().find(|e| e.0 == id).map(|e| e.1.clone());
-    let g = hp.map_or(0, |p| fh_gen(&p, id));
+    let g = match hp { Some(p) => fh_gen(&p, id), None => cgroupfs::ino_gen(id.1).filter(|_| cgroupfs::mounted() && cgroupfs::handle_path(id.1, 0).is_ok()).unwrap_or(0) };
     out.extend_from_slice(&g.to_le_bytes());
     if let Some(n) = name { out.extend_from_slice(n); out.push(0); }
     while (out.len()) % 4 != 0 { out.push(0); }
@@ -17394,7 +17401,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             let cg = cgroupfs::dev_cg(dev);
             let (u, g) = sched::cgroup::dir_owner(cg);
             write_stat_full(stat_ptr, S_IFDIR | 0o755, (2 + sched::cgroup::nr_children(cg)) as u64, 0,
-                            0x6000_0000 + (cg as u64) * 64, u, g);
+                            cgroupfs::dir_ino(cg), u, g);
             return ok_reply();
         }
     }
