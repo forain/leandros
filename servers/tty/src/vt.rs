@@ -164,6 +164,15 @@ struct Screen {
     utf8_acc: u32,
     /// Tab stops (`ESC H`, `CSI g`); every 8 columns until changed.
     tabs: crate::wcwidth::TabStops,
+    /// Last printed graphic character, for `CSI n b` (REP); 0 = none.
+    last_char: u32,
+    /// DECAWM (`CSI ? 7 h/l`); on by default.
+    autowrap: bool,
+    /// A character was just written in the last column: the cursor stays
+    /// there and the wrap to the next line happens only when the next
+    /// graphic character arrives (xterm / Linux `need_wrap`). Writing the
+    /// bottom-right cell therefore does not scroll.
+    wrap_pending: bool,
 }
 
 /// Low half of the second cell of a double-width character. Never a real code
@@ -185,6 +194,9 @@ impl Screen {
             utf8_left: 0,
             utf8_acc: 0,
             tabs: crate::wcwidth::TabStops::default_stops(),
+            last_char: 0,
+            autowrap: true,
+            wrap_pending: false,
         }
     }
 
@@ -197,6 +209,9 @@ impl Screen {
         self.params_len = 0;
         self.utf8_left = 0;
         self.tabs = crate::wcwidth::TabStops::default_stops();
+        self.last_char = 0;
+        self.autowrap = true;
+        self.wrap_pending = false;
     }
 
     #[inline]
@@ -270,6 +285,7 @@ impl Screen {
         match self.esc {
             ESC_GROUND => {}
             ESC_ESC => {
+                self.wrap_pending = false;
                 self.esc = match c {
                     b'[' => { self.params_len = 0; ESC_CSI }
                     b']' => ESC_OSC,
@@ -293,8 +309,22 @@ impl Screen {
                     }
                 } else if (0x40..=0x7e).contains(&c) {
                     let (params, len) = (self.params, self.params_len as usize);
-                    self.handle_csi(&params[..len], c, cols, rows);
                     self.esc = ESC_GROUND;
+                    if c == b'b' && params[..len].first() != Some(&b'?') {
+                        // REP: print the last graphic character n more times.
+                        let n = params[..len].iter().take_while(|b| b.is_ascii_digit())
+                            .fold(0usize, |a, b| (a * 10 + (b - b'0') as usize).min(65535)).max(1);
+                        let ch = self.last_char;
+                        if let Some(chr) = char::from_u32(ch).filter(|_| ch != 0) {
+                            let mut buf = [0u8; 4];
+                            let bytes = chr.encode_utf8(&mut buf).as_bytes();
+                            for _ in 0..n.min(cols * rows) {
+                                for &b in bytes { self.putc(b, cols, rows, scroll_rows); }
+                            }
+                        }
+                        return;
+                    }
+                    self.handle_csi(&params[..len], c, cols, rows);
                 } else {
                     self.esc = ESC_GROUND;
                 }
@@ -311,6 +341,7 @@ impl Screen {
             _ => { self.esc = ESC_GROUND; return; }
         }
 
+        if c < 0x20 { self.wrap_pending = false; }
         if c == b'\n' {
             self.cur_col = 0;
             self.cur_row += 1;
@@ -362,7 +393,14 @@ impl Screen {
             }
             let ch = ch.filter(|&u| crate::wcwidth::width(u) != 0);
             if let Some(ch) = ch {
+                self.last_char = ch;
                 let w = crate::wcwidth::width(ch);
+                if self.wrap_pending {
+                    self.wrap_pending = false;
+                    self.cur_col = 0;
+                    self.cur_row += 1;
+                    if self.cur_row as usize >= rows { self.scroll(rows, scroll_rows); }
+                }
                 // A double-width character that does not fit before the right
                 // margin wraps whole; the stranded last cell stays blank.
                 if w == 2 && self.cur_col as usize + 2 > cols && cols >= 2 {
@@ -378,8 +416,8 @@ impl Screen {
                 }
                 self.cur_col += 1;
                 if self.cur_col as usize >= cols {
-                    self.cur_col = 0;
-                    self.cur_row += 1;
+                    self.cur_col = (cols - 1) as u32;
+                    self.wrap_pending = self.autowrap;
                 }
             }
         }
@@ -420,8 +458,13 @@ impl Screen {
         };
 
         let (mut col, mut row) = (self.cur_col as usize, self.cur_row as usize);
+        if !matches!(final_byte, b'm' | b'h' | b'l') { self.wrap_pending = false; }
 
         match final_byte {
+            // DEC private modes: ?7 autowrap is the only one that changes the grid.
+            b'h' | b'l' if private => {
+                if params == b"?7" { self.autowrap = final_byte == b'h'; }
+            }
             _ if private => {}
             b'A' => row = row.saturating_sub(p(0, 1)),
             b'B' => row = (row + p(0, 1)).min(rows - 1),
@@ -447,11 +490,61 @@ impl Screen {
                 3 => self.tabs.clear_all(),
                 _ => {}
             },
+            // ICH / DCH / ECH: edit the cells of the cursor's row; the cursor stays.
+            b'@' => self.insert_chars(row, col, p(0, 1).max(1), cols),
+            b'P' => self.delete_chars(row, col, p(0, 1).max(1), cols),
+            b'X' => { let n = p(0, 1).max(1); self.blank_span(row, col, (col + n).min(cols)); }
+            // IL / DL: whole-screen region, cursor to column 0 (Linux).
+            b'L' => { self.insert_lines(row, p(0, 1).max(1), rows); col = 0; }
+            b'M' => { self.delete_lines(row, p(0, 1).max(1), rows); col = 0; }
             _ => {}
         }
 
         self.cur_col = col as u32;
         self.cur_row = row as u32;
+    }
+
+    /// ICH: insert `n` blanks at `col`, shifting the rest of the row right.
+    fn insert_chars(&mut self, row: usize, col: usize, n: usize, cols: usize) {
+        if row >= VT_ROWS || col >= cols { return; }
+        let cols = cols.min(VT_COLS);
+        let n = n.min(cols - col);
+        self.split_wide(row, col, col);
+        let base = row * VT_COLS;
+        self.cells.copy_within(base + col..base + cols - n, base + col + n);
+        for c in col..col + n { self.cells[base + c] = BLANK; }
+        // A wide pair cut at the right edge leaves a stranded lead cell.
+        if self.is_cont(cols - 1, row) { self.cells[base + cols - 1] = BLANK; }
+    }
+
+    /// DCH: delete `n` cells at `col`, pulling the rest of the row left.
+    fn delete_chars(&mut self, row: usize, col: usize, n: usize, cols: usize) {
+        if row >= VT_ROWS || col >= cols { return; }
+        let cols = cols.min(VT_COLS);
+        let n = n.min(cols - col);
+        self.split_wide(row, col, col + n);
+        let base = row * VT_COLS;
+        self.cells.copy_within(base + col + n..base + cols, base + col);
+        for c in cols - n..cols { self.cells[base + c] = BLANK; }
+        if self.is_cont(col, row) { self.cells[base + col] = BLANK; }
+    }
+
+    /// IL: insert `n` blank rows at `row`; rows below shift down.
+    fn insert_lines(&mut self, row: usize, n: usize, rows: usize) {
+        if row >= rows.min(VT_ROWS) { return; }
+        let rows = rows.min(VT_ROWS);
+        let n = n.min(rows - row);
+        self.cells.copy_within(row * VT_COLS..(rows - n) * VT_COLS, (row + n) * VT_COLS);
+        for r in row..row + n { self.blank_span(r, 0, VT_COLS); }
+    }
+
+    /// DL: delete `n` rows at `row`; rows below shift up.
+    fn delete_lines(&mut self, row: usize, n: usize, rows: usize) {
+        if row >= rows.min(VT_ROWS) { return; }
+        let rows = rows.min(VT_ROWS);
+        let n = n.min(rows - row);
+        self.cells.copy_within((row + n) * VT_COLS..rows * VT_COLS, row * VT_COLS);
+        for r in rows - n..rows { self.blank_span(r, 0, VT_COLS); }
     }
 
     fn erase_in_display(&mut self, mode: usize, cols: usize, rows: usize) {
@@ -2195,6 +2288,26 @@ impl core::fmt::Write for SliceWriter<'_> {
         self.len += n;
         Ok(())
     }
+}
+
+/// Render `/proc/vtgrid` (tests): the whole cell grid of VT index `vt`
+/// (0-based) as hex code points, one `row <r>:` line per row with trailing
+/// blanks trimmed, after a `vtgrid <vt+1> <cur_col> <cur_row>` header.
+/// `WIDE_CONT` shows as 80000000; a blank cell as 0.
+pub fn grid_text(vt: usize, buf: &mut [u8]) -> usize {
+    use core::fmt::Write;
+    let mut w = SliceWriter { buf, len: 0 };
+    if vt >= VT_COUNT { return 0; }
+    let s = SCREENS.lock();
+    let _ = writeln!(w, "vtgrid {} {} {}", vt + 1, s[vt].cur_col, s[vt].cur_row);
+    for r in 0..VT_ROWS {
+        let row = &s[vt].cells[r * VT_COLS..(r + 1) * VT_COLS];
+        let end = row.iter().rposition(|&c| c as u32 != 0).map_or(0, |i| i + 1);
+        let _ = write!(w, "row {}:", r);
+        for &c in &row[..end] { let _ = write!(w, " {:x}", c as u32); }
+        let _ = writeln!(w);
+    }
+    w.len
 }
 
 /// Render `/proc/vtstat` into `buf`; returns the length.
