@@ -98,10 +98,12 @@ pub unsafe fn trunc_cold(dir: &[u8]) -> i32 {
     // dnodes/16 = 250 / 1000 reruns and quadratic time. The healthy count is
     // 6..11 reruns depending on the volume's node layout (a fresh mkfs'd /home
     // needs more fetch passes than the populated root; x86_64 TCG measured 8
-    // on / and 11 on /home) and time is linear in dnodes (0.18 ms per dnode on
+    // on / and 11 on /home) and the time limits (5 s / 15 s, measured 1 s / 4 s idle
+    // on aarch64 TCG, 2.2 s for the 4000 case under a loaded 4-shard farm) are only a
+    // backstop; rounds is the precise check. Time is linear in dnodes (0.18 ms per dnode on
     // x86_64 TCG), so the limits leave headroom without hiding the bug.
-    if !one(dir, 4000, 16, 2000) { return 1; }
-    if !one(dir, 16000, 24, 6000) { return 1; }
+    if !one(dir, 4000, 16, 5000) { return 1; }
+    if !one(dir, 16000, 24, 15000) { return 1; }
     out(b"PASS trunc_cold\n");
     0
 }
