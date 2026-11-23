@@ -760,6 +760,8 @@ pub fn ctx_lost(ctx: u32) -> bool {
     (ctx as usize) < CTX_ID_POOL as usize && CTX_LOST[ctx as usize].load(core::sync::atomic::Ordering::Acquire)
 }
 static HOST_GPU_HUNG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Log quota for newly LOST contexts (separate from the hang-episode count).
+static CTX_LOST_LOGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HOST_HANGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Fences retired by the watchdog rather than by the host.
 pub static FENCES_WRITTEN_OFF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -825,6 +827,8 @@ const FENCE_HELD_MAX: usize = 64;
 /// Test knob mode 3: park only the first retiring fence.
 static FENCE_HOLD_ONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Mode 4: the hold window is the first PER-CONTEXT-timeline fence only.
+/// Test knob mode 5: the host "never answers" the first ringed fence (its reply is dropped before the reap retires it; the chain stays in flight).
+static FENCE_HOLD_DROP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static FENCE_HOLD_RING_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static FENCE_HOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCE_HELD_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -883,13 +887,15 @@ fn task_reap_event() {
 pub fn fence_hold_set(mode: u32) {
     use core::sync::atomic::Ordering::{Relaxed, Release};
     match mode {
-        1 | 3 | 4 => {
+        1 | 3 | 4 | 5 => {
             FENCE_HOLDS.fetch_add(1, Relaxed);
             if let Some(g) = VIRTIO_GPU.lock().as_mut() { g.hold_win_n = 0; }
-            FENCE_HOLD_ONE.store(mode == 3 || mode == 4, Relaxed);
-            FENCE_ALIVE_US.store(if mode == 4 { 10_000_000 } else { FENCE_ALIVE_US_DEFAULT }, Relaxed);
-            FENCE_HOLD_RING_ONLY.store(mode == 4, Relaxed);
-            let lim = if mode >= 3 { 20_000_000 } else { FENCE_HOLD_MAX_US };
+            FENCE_HOLD_ONE.store(mode >= 3, Relaxed);
+            FENCE_HOLD_DROP.store(mode == 5, Relaxed);
+            FENCE_ALIVE_US.store(if mode >= 4 { 10_000_000 } else { FENCE_ALIVE_US_DEFAULT }, Relaxed);
+            FENCE_HOLD_RING_ONLY.store(mode >= 4, Relaxed);
+            // Modes 4/5 (phase 7f) get a long auto-release so slow TCG cannot expire the hold mid-test.
+            let lim = if mode >= 4 { 40_000_000 } else if mode == 3 { 20_000_000 } else { FENCE_HOLD_MAX_US };
             FENCE_HOLD_UNTIL_US.store((crate::snd::monotonic_us() + lim).max(1), Release);
         }
         2 => {
@@ -897,6 +903,7 @@ pub fn fence_hold_set(mode: u32) {
             FENCE_EVENT_PENDING.store(true, Release);
         }
         _ => {
+            FENCE_HOLD_DROP.store(false, Relaxed);
             FENCE_HOLD_UNTIL_US.store(0, Release);
             if let Some(gpu) = VIRTIO_GPU.lock().as_mut() { gpu.hold_release(); }
             FENCE_EVENT_PENDING.store(true, Release);
@@ -2229,6 +2236,14 @@ impl VirtioGpuDevice {
                 q.last_used_idx = q.last_used_idx.wrapping_add(1);
                 CTRLQ_LAST_USED.store(q.last_used_idx as u32, core::sync::atomic::Ordering::Release);
             }
+            if e.fence_id != 0 && !e.sync
+                && FENCE_HOLD_DROP.load(core::sync::atomic::Ordering::Relaxed)
+                && FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire) != 0
+                && self.hold_win[..self.hold_win_n].contains(&e.fence_id)
+            {
+                // Test knob: the reply is swallowed; chain and fence stay in flight.
+                continue;
+            }
             if e.fence_id != 0 {
                 self.fence_retire_host(e.fence_id);
                 retired = true;
@@ -3477,7 +3492,7 @@ impl VirtioGpuDevice {
             chains += n;
         }
         if lost_n != 0 {
-            let k = HOST_HANGS.fetch_add(1, Relaxed);
+            let k = CTX_LOST_LOGS.fetch_add(1, Relaxed);
             if k < 8 {
                 crate::pci::serial_debug("[GPU] host context HUNG: a stuck timeline's context is LOST \
                     (submits ECANCELED); its fences stay pending until the host answers\n");
@@ -3488,8 +3503,10 @@ impl VirtioGpuDevice {
         FENCES_WRITTEN_OFF.fetch_add(total as u64, Relaxed);
         let tl = ((first_id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
         let whole_host = silent;
-        if whole_host && !host_gpu_hung() { HOST_GPU_HUNG.store(true, Relaxed); }
-        let k = HOST_HANGS.fetch_add(1, Relaxed);
+        // One count and one log line per hang episode (the first pass only).
+        let first_pass = !host_gpu_hung();
+        if whole_host && first_pass { HOST_GPU_HUNG.store(true, Relaxed); }
+        let k = if first_pass { HOST_HANGS.fetch_add(1, Relaxed) } else { 8 };
         if k < 8 {
             if whole_host {
                 crate::pci::serial_debug("[GPU] HOST GPU HUNG: no fence answered for ");

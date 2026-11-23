@@ -772,6 +772,11 @@ unsafe fn sync_file_status(fd: c_int) -> i32 {
     i32::from_ne_bytes([info[32], info[33], info[34], info[35]])
 }
 
+/// A pending, error-free fence: SYNC_IOC_FILE_INFO says 0 (active), or the
+/// fd is an eventfd-backed out-fence on which the ioctl does not exist
+/// (i32::MIN). Signalled (1) or an errno (negative) is a failure.
+fn status_pending_ok(st: i32) -> bool { st == 0 || st == i32::MIN }
+
 /// One `key=value` counter of `/proc/drm/fence_stats` (u64::MAX if absent).
 unsafe fn fence_stat(key: &[u8]) -> u64 {
     let f = open(b"/proc/drm/fence_stats\0".as_ptr(), 0);
@@ -1283,6 +1288,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
         }
         let a_still_pending = oka && !poll_in_ready(ea.fence_fd);
+        let a_ctx = if inited { ctx_id(fa) } else { 0 };
         let rel = fence_hold_mode(0);
         // Releasing the hold lets the host answer: the fence signals normally.
         let a_signals_on_release = oka && poll_in_within(ea.fence_fd, 4000);
@@ -1292,19 +1298,30 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         // held by "another process". The error is per fence, so it survives.
         let mut c_ok = 0u32;
         let mut c_sig = 0u32;
-        fb1(&mut c_ok, &mut c_sig);
+        let fc = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let mut c_reused = false;
+        if fc >= 0 && ctx_init_venus(fc) {
+            c_reused = a_ctx != 0 && ctx_id(fc) == a_ctx;
+            let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(eb.fence_fd, 4000) { c_sig += 1; }
+                close(eb.fence_fd);
+            }
+        }
+        if fc >= 0 { close(fc); }
         if oka { close(ea.fence_fd); }
         out(b"  7f: a_status="); out_u64((a_status as i64 + 1_000_000) as u64);
         out(b" lost_ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64);
         out(b" recycled_ok="); out_u64(c_ok as u64); out(b" sig="); out_u64(c_sig as u64); out(b"\n");
-        if !report(b"phase7f_stuck_fence_stays_pending_no_error", oka && a_still_pending) {
+        if !report(b"phase7f_stuck_fence_stays_pending_no_error", oka && a_still_pending && status_pending_ok(a_status)) {
             failures += 1;
         }
         if !report(b"phase7f_stuck_fence_signals_on_release", a_signals_on_release) { failures += 1; }
         if !report(b"phase7f_lost_context_submit_is_ecanceled", inited && lost_ret != 0 && lost_errno == 125) {
             failures += 1;
         }
-        if !report(b"phase7f_recycled_context_not_lost", c_ok == 1 && c_sig == 1) {
+        if !report(b"phase7f_recycled_context_not_lost", c_reused && c_ok == 1 && c_sig == 1) {
             failures += 1;
         }
         out(b"  7f: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
@@ -1321,6 +1338,70 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
                    b_ok == 5 && b_sig == 5 && b_ok2 == 1 && b_sig2 == 1 && hung_now == 0 && rel) {
             failures += 1;
         }
+    }
+
+    // ── 2f2. Host never answers the in-flight fence (production path) ──────
+    // Same as 2f, but knob mode 5 swallows the host's reply to A's fence, so
+    // the chain is really still in flight (not parked by the kernel). A's
+    // context must go LOST (ringed submit ECANCELED), its fence must stay
+    // pending (no early signal), and other contexts must be unaffected.
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let lost0 = fence_stat(b"ctx_lost");
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && ctx_init_venus(fa);
+        let mut held = false;
+        let mut oka = false;
+        let mut b_ok = 0u32;
+        let mut b_sig = 0u32;
+        let mut a_early = true;
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        if inited {
+            held = fence_hold_mode(5);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            for _ in 0..5 {
+                let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+                if fx >= 0 && ctx_init_venus(fx) {
+                    let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                    if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                        b_ok += 1;
+                        if poll_in_within(eb.fence_fd, 4000) { b_sig += 1; }
+                        close(eb.fence_fd);
+                    }
+                }
+                if fx >= 0 { close(fx); }
+                poll(core::ptr::null_mut(), 0, 1800);
+            }
+            a_early = oka && poll_in_within(ea.fence_fd, 8000);
+        }
+        let lost1 = fence_stat(b"ctx_lost");
+        let mut lost_ret = 0;
+        let mut lost_errno = 0;
+        if inited {
+            let mut e2 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            lost_ret = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e2 as *mut _);
+            lost_errno = *__errno_location();
+            if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
+        }
+        let a_pending = oka && !poll_in_ready(ea.fence_fd);
+        let a_status = if oka { sync_file_status(ea.fence_fd) } else { 0 };
+        let rel = fence_hold_mode(0);
+        if oka { close(ea.fence_fd); }
+        if fa >= 0 { close(fa); }
+        out(b"  7f2: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
+        out(b" b="); out_u64(b_ok as u64); out(b"/"); out_u64(b_sig as u64);
+        out(b" early="); out_u64(a_early as u64); out(b" status="); out_u64((a_status as i64 + 1_000_000) as u64);
+        out(b" lost "); out_u64(lost0); out(b"->"); out_u64(lost1);
+        out(b" ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64); out(b"\n");
+        if !report(b"phase7f2_unanswered_fence_stays_pending",
+                   inited && held && oka && !a_early && a_pending && status_pending_ok(a_status)) {
+            failures += 1;
+        }
+        if !report(b"phase7f2_unanswered_context_lost_submit_ecanceled",
+                   lost0 != u64::MAX && lost1 >= lost0 + 1 && lost_ret != 0 && lost_errno == 125) {
+            failures += 1;
+        }
+        if !report(b"phase7f2_other_context_unaffected", b_ok == 5 && b_sig == 5 && rel) { failures += 1; }
     }
 
     // ── 2g. Whole-host-silent write-off does NOT mark the context lost ──────
