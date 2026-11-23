@@ -1579,6 +1579,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let c_lost_same = ctrlq_stat(ctl, 9) == lost0;
         let c_orph = ctrlq_stat(ctl, 7) == orph0.wrapping_add(1);
         // d)
+        let infl_pre = ctrlq_stat(ctl, 3);
         let rel = fence_hold_mode(0);
         let d_poll = oka && poll_in_within(ea.fence_fd, 1000);
         let d_wait = sh == 0 || syncobj_wait_now(fb, sh) == 0;
@@ -1587,7 +1588,8 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let d_recl = ctrlq_stat(ctl, 1) == recl0.wrapping_add(1);
         let recl_now = ctrlq_stat(ctl, 1);
         let infl_now = ctrlq_stat(ctl, 3);
-        let d_census = infl_now == base_inflight;
+        // A's chain (and only it) is freed by the replay; C's last submit stays in flight (the host answers one fence per fresh ring).
+        let d_census = infl_now.wrapping_add(1) == infl_pre;
         if oka { close(ea.fence_fd); }
         if fc >= 0 { close(fc); }
         if fb >= 0 { close(fb); }
@@ -1602,7 +1604,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         out(b" d="); out_u64(d_poll as u64); out_u64(d_wait as u64); out_u64(d_orph as u64);
         out_u64(d_recl as u64); out_u64(d_census as u64);
         out(b" recl="); out_u64(recl0); out(b"->"); out_u64(recl_now);
-        out(b" inflight="); out_u64(base_inflight); out(b"->"); out_u64(infl_now); out(b"\n");
+        out(b" inflight="); out_u64(infl_pre); out(b"->"); out_u64(infl_now); out(b"\n");
         if !report(b"phase7h_a_orphaned_fence_setup", knob && inited && held && oka) { failures += 1; }
         if !report(b"phase7h_b_destroyed_ctx_fence_stays_pending",
                    b_poll && b_wait && b_cnt && b_unch) { failures += 1; }
