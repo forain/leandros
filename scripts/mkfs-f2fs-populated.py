@@ -45,6 +45,10 @@ def sibling_dir(name):
 BLOCK_SIZE     = 4096
 BLOCKS_PER_SEG = 512       # 2 MB segments (log_blocks_per_seg = 9)
 ROOT_LABEL     = "leandros-root"
+# Per-tree m6 staging dir (see scripts/lib/m6out.sh); shared dir = fallback baseline.
+M6_OUT_TREE = os.environ.get("LEANDROS_M6_OUT") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "target", "m6-out")
+M6_OUT_SHARED = os.path.join(os.environ.get("LEANDROS_ARTIFACTS") or os.path.expanduser("~/code/leandros-artifacts"), "m6-session-bins", "out")
 # Linux include/linux/f2fs_fs.h: CP_UMOUNT_FLAG is 0x1 (0x8 is CP_ERROR_FLAG).
 # The kernel's f2fs reports a newest checkpoint without it as an unclean shutdown.
 CP_UMOUNT_FLAG = 0x00000001
@@ -1411,8 +1415,9 @@ def main():
     # carries ports/cosmic-comp's patches (ports/cosmic-comp/build.sh);
     # else the original M5 probe build.
     cosmic_comp = os.environ.get("LEANDROS_COSMIC_COMP") or next(
-        (p for p in (os.path.expanduser(f"~/code/leandros-artifacts/{d}/cosmic-comp-{arch}")
-                     for d in ("m6-session-bins/out", "m3-gl-stack/out"))
+        (p for p in (os.path.join(d, f"cosmic-comp-{arch}")
+                     for d in (M6_OUT_TREE, M6_OUT_SHARED,
+                               os.path.expanduser("~/code/leandros-artifacts/m3-gl-stack/out")))
          if os.path.exists(p)), "")
     if cosmic_comp:
         print(f"  cosmic-comp: {cosmic_comp}")
@@ -1467,7 +1472,7 @@ def main():
     # the M3 GL + M4 input closures already packed (Wayland/EGL are dlopen'd, not
     # DT_NEEDED); only libudev (cosmic-settings) and the pipewire stub are new,
     # both already present. No source patches — feature flags only (see manifest).
-    m6_out = os.path.expanduser("~/code/leandros-artifacts/m6-session-bins/out")
+    m6_out = M6_OUT_TREE
     # LEANDROS_COSMIC_BINS_OVERLAY=<dir>: a file there named like one in
     # m6_out (e.g. m6-session-bins/out-wgpu/cosmic-greeter-x86_64, the wgpu
     # renderer builds from ports/cosmic-wgpu) is staged instead of it. Lets a
@@ -1475,6 +1480,11 @@ def main():
     m6_overlay = os.environ.get("LEANDROS_COSMIC_BINS_OVERLAY", "")
 
     def m6_pick(src):
+        # per-tree dir first; a file this tree never staged falls back to the shared baseline
+        if src.startswith(M6_OUT_TREE + "/") and not os.path.exists(src):
+            alt = os.path.join(M6_OUT_SHARED, src[len(M6_OUT_TREE) + 1:])
+            if os.path.exists(alt):
+                src = alt
         if m6_overlay:
             cand = os.path.join(os.path.expanduser(m6_overlay), os.path.basename(src))
             if os.path.exists(cand):
@@ -1967,8 +1977,9 @@ def main():
     # the exact revision cosmic-launcher's Cargo.lock pins (a332a3a, the
     # epoch-1.3.0 submodule), unmodified; the plugin.ron files come from the
     # same pinned checkout in the ../cosmic-epoch sibling.
-    popl_bin = os.path.expanduser(
-        f"~/code/leandros-artifacts/m6-session-bins/out/pop-launcher-{arch}")
+    popl_bin = os.path.join(M6_OUT_TREE, f"pop-launcher-{arch}")
+    if not os.path.exists(popl_bin):
+        popl_bin = os.path.join(M6_OUT_SHARED, f"pop-launcher-{arch}")
     #
     # The plugins are NOT optional. With none registered, the service answers
     # a Search by querying nobody, so `finished()` never runs and no Update is
