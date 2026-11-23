@@ -193,8 +193,16 @@ fn dmabuf_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize> {
 //                          u32 flags@68; u64 timestamp_ns@72; }   (80 bytes)
 
 fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize> {
-    let token = vfs::eventfd_sync_token(pid, fd)?;
-    let fence = sync_file::fence_of(token);
+    // A sync file proper, or the FENCE_FD_OUT out-fence of an EXECBUFFER
+    // (an eventfd noted with the GPU fence id): both answer FILE_INFO, so a
+    // written-off fence's error is visible on the fd Mesa holds.
+    let fence = match vfs::eventfd_sync_token(pid, fd) {
+        Some(token) => sync_file::fence_of(token),
+        None => match vfs::eventfd_fence_meta(pid, fd) {
+            Some((vfs::EVFD_ORIGIN_FENCE, f)) if cmd == SYNC_IOC_FILE_INFO && f != 0 => Fence::One(f),
+            _ => return None,
+        },
+    };
     match cmd {
         SYNC_IOC_SET_DEADLINE => Some(0),
         SYNC_IOC_MERGE => {
