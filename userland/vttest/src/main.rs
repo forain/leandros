@@ -1771,6 +1771,7 @@ const GRID_ROWS: usize = 72;
 const GRID_COLS: usize = 256;
 static mut GRID_BUF: [u8; 393216] = [0; 393216];
 static mut GRID: [[u32; GRID_COLS]; GRID_ROWS] = [[0; GRID_COLS]; GRID_ROWS];
+static mut GRIDBG: [[u8; GRID_COLS]; GRID_ROWS] = [[0; GRID_COLS]; GRID_ROWS];
 
 struct GridCur { col: u32, row: u32 }
 
@@ -1789,6 +1790,8 @@ unsafe fn grid_read() -> Option<GridCur> {
     close(fd);
     let g = &mut *core::ptr::addr_of_mut!(GRID);
     for r in 0..GRID_ROWS { for c in 0..GRID_COLS { g[r][c] = 0; } }
+    let gb = &mut *core::ptr::addr_of_mut!(GRIDBG);
+    for r in 0..GRID_ROWS { for c in 0..GRID_COLS { gb[r][c] = 0; } }
     let mut cur = GridCur { col: 0, row: 0 };
     let mut seen = false;
     for line in buf[..n].split(|&b| b == b'\n') {
@@ -1799,6 +1802,16 @@ unsafe fn grid_read() -> Option<GridCur> {
             i += 1; cur.col = parse_num(line, &mut i, 10);
             i += 1; cur.row = parse_num(line, &mut i, 10);
             seen = true;
+        } else if line.starts_with(b"bg ") {
+            i = 3;
+            let r = parse_num(line, &mut i, 10) as usize;
+            i += 1;
+            let mut c = 0usize;
+            while i < line.len() && c < GRID_COLS && r < GRID_ROWS {
+                i += 1;
+                gb[r][c] = parse_num(line, &mut i, 16) as u8;
+                c += 1;
+            }
         } else if line.starts_with(b"row ") {
             i = 4;
             let r = parse_num(line, &mut i, 10) as usize;
@@ -1816,6 +1829,7 @@ unsafe fn grid_read() -> Option<GridCur> {
 }
 
 unsafe fn gcell(r: usize, c: usize) -> u32 { (*core::ptr::addr_of!(GRID))[r][c] }
+unsafe fn gbg(r: usize, c: usize) -> u8 { (*core::ptr::addr_of!(GRIDBG))[r][c] }
 
 /// Console size of VT 6 as (cols, rows).
 unsafe fn emu_size(fd: c_int) -> (usize, usize) {
@@ -1955,6 +1969,38 @@ unsafe fn t_emu_wide_ranges() -> bool {
         k += 1;
     }
     report(b"emu_wide_ranges", ok)
+}
+
+
+/// DECSTBM region: LF at the bottom margin scrolls only the region, RI at the
+/// top margin scrolls it down, IL stays inside it, DECOM homes to the margin.
+unsafe fn t_emu_region() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_region", false); }
+    let cur = emu_grid(fd, b"1\r\n2\r\n3\r\n4\r\n5\r\n6\x1b[2;4r\x1b[4;1H\n\x1b[2;1H\x1bM\x1b[?6h\x1b[1;1HX\x1b[?6l\x1b[3;1H\x1b[L\x1b[r");
+    close(fd);
+    let want: [&[u8]; 6] = [b"1", b"X", b"", b"3", b"5", b"6"];
+    let mut ok = cur.as_ref().map_or(false, |c| c.col == 0 && c.row == 0);
+    for (r, w) in want.iter().enumerate() {
+        let mut i = 0usize;
+        while i < w.len() { if gcell(r, i) != w[i] as u32 { ok = false; } i += 1; }
+        if gcell(r, w.len()) != 0 { ok = false; }
+    }
+    if !ok { out(b"  region rows:"); for r in 0..6 { out(b" "); out_hex(gcell(r, 0)); } out(b"\n"); }
+    report(b"emu_region", ok)
+}
+
+/// SGR background, reverse, and background-colour erase.
+unsafe fn t_emu_sgr() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_sgr", false); }
+    let (cols, _) = emu_size(fd);
+    let cur = emu_grid(fd, b"\x1b[44mAB\x1b[0m C\x1b[7mD\x1b[0m\x1b[41m\x1b[K\x1b[0m");
+    close(fd);
+    let ok = cur.is_some() && gcell(0, 0) == b'A' as u32 && gbg(0, 0) == 4 && gbg(0, 1) == 4
+        && gbg(0, 2) == 0 && gbg(0, 3) == 0 && gbg(0, 4) == 15 && gbg(0, 5) == 1 && gbg(0, cols - 1) == 1;
+    if !ok { out(b"  sgr bg:"); for c in 0..7 { out(b" "); out_hex(gbg(0, c) as u32); } out(b"\n"); }
+    report(b"emu_sgr", ok)
 }
 
 static BTM_RAW: &[u8] = include_bytes!("../data/btm-100x30.raw");
@@ -2172,7 +2218,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 48usize;
+    let total = 50usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -2220,6 +2266,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_emu_autowrap() { passed += 1; }
     if t_emu_wide_ranges() { passed += 1; }
     if t_emu_btm_replay() { passed += 1; }
+    if t_emu_region() { passed += 1; }
+    if t_emu_sgr() { passed += 1; }
     if t_wide_glyphs(tty0) { passed += 1; }
     if t_latin_glyphs(tty0) { passed += 1; }
 

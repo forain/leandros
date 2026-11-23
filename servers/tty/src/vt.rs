@@ -151,8 +151,20 @@ struct Screen {
     cells: [u64; VT_COLS * VT_ROWS],
     cur_col: u32,
     cur_row: u32,
-    /// Current SGR foreground, XOR-encoded (see [`FG_XOR`]).
+    /// Effective SGR colours: the low 24 bits are the foreground, XOR-encoded
+    /// (see [`FG_XOR`]); the top byte is the background's xterm-256 palette
+    /// index (0 = default black), so a cell's upper word is exactly this.
     fg_enc: u32,
+    /// SGR state before bold/reverse are resolved into `fg_enc` (`sfg` XOR-encoded).
+    sfg: u32,
+    sbg: u8,
+    bold: bool,
+    rev: bool,
+    /// DECSTBM margins `[reg_top, reg_bot)`; `reg_bot == 0` = whole screen.
+    reg_top: u32,
+    reg_bot: u32,
+    /// DECOM.
+    origin: bool,
     /// `ESC 7` / `CSI s` save slot.
     saved_col: u32,
     saved_row: u32,
@@ -186,6 +198,13 @@ impl Screen {
             cur_col: 0,
             cur_row: 0,
             fg_enc: 0,
+            sfg: 0,
+            sbg: 0,
+            bold: false,
+            rev: false,
+            reg_top: 0,
+            reg_bot: 0,
+            origin: false,
             saved_col: 0,
             saved_row: 0,
             esc: ESC_GROUND,
@@ -205,6 +224,13 @@ impl Screen {
         self.cur_col = 0;
         self.cur_row = 0;
         self.fg_enc = 0;
+        self.sfg = 0;
+        self.sbg = 0;
+        self.bold = false;
+        self.rev = false;
+        self.reg_top = 0;
+        self.reg_bot = 0;
+        self.origin = false;
         self.esc = ESC_GROUND;
         self.params_len = 0;
         self.utf8_left = 0;
@@ -212,6 +238,48 @@ impl Screen {
         self.last_char = 0;
         self.autowrap = true;
         self.wrap_pending = false;
+    }
+
+    /// An erased cell: no glyph, the current background.
+    #[inline]
+    fn blank_cell(&self) -> u64 { ((self.fg_enc >> 24) as u64) << 56 }
+
+    /// Margins as `(top, bottom_exclusive)`.
+    fn region(&self, rows: usize) -> (usize, usize) {
+        let rows = rows.min(VT_ROWS);
+        let b = if self.reg_bot == 0 { rows } else { (self.reg_bot as usize).min(rows) };
+        ((self.reg_top as usize).min(b.saturating_sub(1)), b)
+    }
+
+    /// Scroll `[t, b)` up one row; the cursor stays.
+    fn region_up(&mut self, t: usize, b: usize) {
+        self.cells.copy_within((t + 1) * VT_COLS..b * VT_COLS, t * VT_COLS);
+        self.blank_span(b - 1, 0, VT_COLS);
+    }
+
+    /// Scroll `[t, b)` down one row; the cursor stays.
+    fn region_down(&mut self, t: usize, b: usize) {
+        self.cells.copy_within(t * VT_COLS..(b - 1) * VT_COLS, (t + 1) * VT_COLS);
+        self.blank_span(t, 0, VT_COLS);
+    }
+
+    /// Line feed: scroll the region at its bottom margin; with no region this
+    /// is the console's multi-row scroll at the screen end.
+    fn line_feed(&mut self, rows: usize, scroll_rows: usize) {
+        let (t, b) = self.region(rows);
+        if t == 0 && b == rows {
+            self.cur_row += 1;
+            if self.cur_row as usize >= rows { self.scroll(rows, scroll_rows); }
+        } else if self.cur_row as usize + 1 == b {
+            self.region_up(t, b);
+        } else if (self.cur_row as usize) + 1 < rows {
+            self.cur_row += 1;
+        }
+    }
+
+    fn abs_row(&self, r: usize, rows: usize) -> usize {
+        let (t, b) = self.region(rows);
+        if self.origin { (t + r).min(b - 1) } else { r.min(rows - 1) }
     }
 
     #[inline]
@@ -224,8 +292,8 @@ impl Screen {
     /// survives.
     fn split_wide(&mut self, row: usize, c0: usize, c1: usize) {
         if row >= VT_ROWS { return; }
-        if c0 > 0 && self.is_cont(c0, row) { self.cells[row * VT_COLS + c0 - 1] = BLANK; }
-        if c1 < VT_COLS && self.is_cont(c1, row) { self.cells[row * VT_COLS + c1] = BLANK; }
+        if c0 > 0 && self.is_cont(c0, row) { { let b = self.blank_cell(); self.cells[row * VT_COLS + c0 - 1] = b; } }
+        if c1 < VT_COLS && self.is_cont(c1, row) { { let b = self.blank_cell(); self.cells[row * VT_COLS + c1] = b; } }
     }
 
     #[inline]
@@ -239,7 +307,7 @@ impl Screen {
 
     /// The right half of a wide glyph: blank, so a repaint draws nothing there.
     fn put_cell_blank(&mut self, col: usize, row: usize) {
-        if col < VT_COLS && row < VT_ROWS { self.cells[row * VT_COLS + col] = BLANK; }
+        if col < VT_COLS && row < VT_ROWS { let b = self.blank_cell(); self.cells[row * VT_COLS + col] = b; }
     }
 
     /// Blank `[c0, c1)` of `row`.
@@ -248,7 +316,8 @@ impl Screen {
         let c1 = c1.min(VT_COLS);
         self.split_wide(row, c0.min(c1), c1);
         let base = row * VT_COLS;
-        for c in c0.min(c1)..c1 { self.cells[base + c] = BLANK; }
+        let b = self.blank_cell();
+        for c in c0.min(c1)..c1 { self.cells[base + c] = b; }
     }
 
     /// Mirror of `Framebuffer::scroll_px` in text terms: advance by
@@ -293,7 +362,14 @@ impl Screen {
                     b'7' => { self.saved_col = self.cur_col; self.saved_row = self.cur_row; ESC_GROUND }
                     b'8' => { self.cur_col = self.saved_col; self.cur_row = self.saved_row; ESC_GROUND }
                     // ESC M — reverse index.
-                    b'M' => { self.cur_row = self.cur_row.saturating_sub(1); ESC_GROUND }
+                    b'M' => {
+                        let (t, b) = self.region(rows);
+                        if self.cur_row as usize == t { self.region_down(t, b); }
+                        else { self.cur_row = self.cur_row.saturating_sub(1); }
+                        ESC_GROUND
+                    }
+                    b'D' => { self.line_feed(rows, scroll_rows); ESC_GROUND }
+                    b'E' => { self.cur_col = 0; self.line_feed(rows, scroll_rows); ESC_GROUND }
                     // ESC H — HTS, set a tab stop at the cursor.
                     b'H' => { self.tabs.set(self.cur_col as usize); ESC_GROUND }
                     _ => ESC_GROUND,
@@ -344,7 +420,7 @@ impl Screen {
         if c < 0x20 { self.wrap_pending = false; }
         if c == b'\n' {
             self.cur_col = 0;
-            self.cur_row += 1;
+            self.line_feed(rows, scroll_rows);
         } else if c == b'\r' {
             self.cur_col = 0;
         } else if c == b'\t' {
@@ -398,15 +474,13 @@ impl Screen {
                 if self.wrap_pending {
                     self.wrap_pending = false;
                     self.cur_col = 0;
-                    self.cur_row += 1;
-                    if self.cur_row as usize >= rows { self.scroll(rows, scroll_rows); }
+                    self.line_feed(rows, scroll_rows);
                 }
                 // A double-width character that does not fit before the right
                 // margin wraps whole; the stranded last cell stays blank.
                 if w == 2 && self.cur_col as usize + 2 > cols && cols >= 2 {
                     self.cur_col = 0;
-                    self.cur_row += 1;
-                    if self.cur_row as usize >= rows { self.scroll(rows, scroll_rows); }
+                    self.line_feed(rows, scroll_rows);
                 }
                 let (col, row) = (self.cur_col as usize, self.cur_row as usize);
                 self.put_cell(col, row, ch);
@@ -464,18 +538,32 @@ impl Screen {
             // DEC private modes: ?7 autowrap is the only one that changes the grid.
             b'h' | b'l' if private => {
                 if params == b"?7" { self.autowrap = final_byte == b'h'; }
+                if params == b"?6" {
+                    self.origin = final_byte == b'h';
+                    row = if self.origin { self.region(rows).0 } else { 0 };
+                    col = 0;
+                }
             }
             _ if private => {}
-            b'A' => row = row.saturating_sub(p(0, 1)),
-            b'B' => row = (row + p(0, 1)).min(rows - 1),
+            b'A' => { let t = self.region(rows).0; row = row.saturating_sub(p(0, 1)); if row < t && self.cur_row as usize >= t { row = t; } }
+            b'B' => { let bo = self.region(rows).1; let m = if (self.cur_row as usize) < bo { bo - 1 } else { rows - 1 }; row = (row + p(0, 1)).min(m); }
             b'C' => col = (col + p(0, 1)).min(cols - 1),
             b'D' => col = col.saturating_sub(p(0, 1)),
-            b'E' => { row = (row + p(0, 1)).min(rows - 1); col = 0; }
-            b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }
+            b'E' => { let bo = self.region(rows).1; let m = if (self.cur_row as usize) < bo { bo - 1 } else { rows - 1 }; row = (row + p(0, 1)).min(m); col = 0; }
+            b'F' => { let t = self.region(rows).0; row = row.saturating_sub(p(0, 1)); if row < t && self.cur_row as usize >= t { row = t; } col = 0; }
             b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),
-            b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),
+            b'd' => row = self.abs_row(p(0, 1).saturating_sub(1), rows),
+            b'r' => {
+                let (t, b) = (p(0, 1).max(1), p(1, rows).max(1));
+                if t < b && b <= rows {
+                    self.reg_top = (t - 1) as u32;
+                    self.reg_bot = b as u32;
+                    row = if self.origin { t - 1 } else { 0 };
+                    col = 0;
+                }
+            }
             b'H' | b'f' => {
-                row = p(0, 1).saturating_sub(1).min(rows - 1);
+                row = self.abs_row(p(0, 1).saturating_sub(1), rows);
                 col = p(1, 1).saturating_sub(1).min(cols - 1);
             }
             b'J' => self.erase_in_display(p(0, 0), cols, rows),
@@ -495,8 +583,8 @@ impl Screen {
             b'P' => self.delete_chars(row, col, p(0, 1).max(1), cols),
             b'X' => { let n = p(0, 1).max(1); self.blank_span(row, col, (col + n).min(cols)); }
             // IL / DL: whole-screen region, cursor to column 0 (Linux).
-            b'L' => { self.insert_lines(row, p(0, 1).max(1), rows); col = 0; }
-            b'M' => { self.delete_lines(row, p(0, 1).max(1), rows); col = 0; }
+            b'L' => { if self.in_region(row, rows) { self.insert_lines(row, p(0, 1).max(1), rows); col = 0; } }
+            b'M' => { if self.in_region(row, rows) { self.delete_lines(row, p(0, 1).max(1), rows); col = 0; } }
             _ => {}
         }
 
@@ -512,9 +600,10 @@ impl Screen {
         self.split_wide(row, col, col);
         let base = row * VT_COLS;
         self.cells.copy_within(base + col..base + cols - n, base + col + n);
-        for c in col..col + n { self.cells[base + c] = BLANK; }
+        let b = self.blank_cell();
+        for c in col..col + n { self.cells[base + c] = b; }
         // A wide pair cut at the right edge leaves a stranded lead cell.
-        if self.is_cont(cols - 1, row) { self.cells[base + cols - 1] = BLANK; }
+        if self.is_cont(cols - 1, row) { { let b = self.blank_cell(); self.cells[base + cols - 1] = b; } }
     }
 
     /// DCH: delete `n` cells at `col`, pulling the rest of the row left.
@@ -525,14 +614,20 @@ impl Screen {
         self.split_wide(row, col, col + n);
         let base = row * VT_COLS;
         self.cells.copy_within(base + col + n..base + cols, base + col);
-        for c in cols - n..cols { self.cells[base + c] = BLANK; }
-        if self.is_cont(col, row) { self.cells[base + col] = BLANK; }
+        let b = self.blank_cell();
+        for c in cols - n..cols { self.cells[base + c] = b; }
+        if self.is_cont(col, row) { { let b = self.blank_cell(); self.cells[base + col] = b; } }
+    }
+
+    fn in_region(&self, row: usize, rows: usize) -> bool {
+        let (t, b) = self.region(rows);
+        row >= t && row < b
     }
 
     /// IL: insert `n` blank rows at `row`; rows below shift down.
     fn insert_lines(&mut self, row: usize, n: usize, rows: usize) {
-        if row >= rows.min(VT_ROWS) { return; }
-        let rows = rows.min(VT_ROWS);
+        let rows = self.region(rows).1;
+        if row >= rows { return; }
         let n = n.min(rows - row);
         self.cells.copy_within(row * VT_COLS..(rows - n) * VT_COLS, (row + n) * VT_COLS);
         for r in row..row + n { self.blank_span(r, 0, VT_COLS); }
@@ -540,8 +635,8 @@ impl Screen {
 
     /// DL: delete `n` rows at `row`; rows below shift up.
     fn delete_lines(&mut self, row: usize, n: usize, rows: usize) {
-        if row >= rows.min(VT_ROWS) { return; }
-        let rows = rows.min(VT_ROWS);
+        let rows = self.region(rows).1;
+        if row >= rows { return; }
         let n = n.min(rows - row);
         self.cells.copy_within((row + n) * VT_COLS..rows * VT_COLS, row * VT_COLS);
         for r in rows - n..rows { self.blank_span(r, 0, VT_COLS); }
@@ -571,32 +666,29 @@ impl Screen {
         }
     }
 
-    fn apply_sgr(&mut self, nums: &[usize], present: &[bool]) {
-        const BASE: [u32; 8] = [
-            0x000000, 0xCD0000, 0x00CD00, 0xCDCD00,
-            0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
-        ];
-        const BRIGHT: [u32; 8] = [
-            0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00,
-            0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
-        ];
-
-        if nums.is_empty() || !present.first().copied().unwrap_or(false) {
-            self.fg_enc = 0xFFFFFF ^ FG_XOR;
-            if nums.len() <= 1 { return; }
-        }
-
+    fn apply_sgr(&mut self, nums: &[usize], _present: &[bool]) {
+        let mut sfg = self.sfg ^ FG_XOR;
         let mut i = 0;
         while i < nums.len() {
             match nums[i] {
-                0 | 39 => self.fg_enc = 0xFFFFFF ^ FG_XOR,
-                30..=37 => self.fg_enc = BASE[nums[i] - 30] ^ FG_XOR,
-                90..=97 => self.fg_enc = BRIGHT[nums[i] - 90] ^ FG_XOR,
-                38 => {
+                0 => { sfg = 0xFFFFFF; self.sbg = 0; self.bold = false; self.rev = false; }
+                1 => self.bold = true,
+                22 => self.bold = false,
+                7 => self.rev = true,
+                27 => self.rev = false,
+                30..=37 => sfg = SGR_BASE[nums[i] - 30],
+                90..=97 => sfg = SGR_BRIGHT[nums[i] - 90],
+                39 => sfg = 0xFFFFFF,
+                40..=47 => self.sbg = (nums[i] - 40) as u8,
+                100..=107 => self.sbg = (nums[i] - 100 + 8) as u8,
+                49 => self.sbg = 0,
+                38 | 48 => {
+                    let is_fg = nums[i] == 38;
                     match nums.get(i + 1) {
                         Some(5) => {
                             if let Some(&n) = nums.get(i + 2) {
-                                self.fg_enc = xterm256(n, &BASE, &BRIGHT) ^ FG_XOR;
+                                if is_fg { sfg = xterm256(n, &SGR_BASE, &SGR_BRIGHT); }
+                                else { self.sbg = n.min(255) as u8; }
                             }
                             i += 2;
                         }
@@ -604,7 +696,8 @@ impl Screen {
                             let r = nums.get(i + 2).copied().unwrap_or(0) as u32;
                             let g = nums.get(i + 3).copied().unwrap_or(0) as u32;
                             let b = nums.get(i + 4).copied().unwrap_or(0) as u32;
-                            self.fg_enc = ((r << 16) | (g << 8) | b) ^ FG_XOR;
+                            let c = (r << 16) | (g << 8) | b;
+                            if is_fg { sfg = c; } else { self.sbg = nearest256(c); }
                             i += 4;
                         }
                         _ => {}
@@ -614,7 +707,41 @@ impl Screen {
             }
             i += 1;
         }
+        self.sfg = sfg ^ FG_XOR;
+        let (fg, bgi) = sgr_resolve(sfg, self.sbg, self.bold, self.rev);
+        self.fg_enc = (fg ^ FG_XOR) | ((bgi as u32) << 24);
     }
+}
+
+const SGR_BASE: [u32; 8] = [
+    0x000000, 0xCD0000, 0x00CD00, 0xCDCD00,
+    0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+];
+const SGR_BRIGHT: [u32; 8] = [
+    0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00,
+    0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+];
+
+fn palette(n: u8) -> u32 { xterm256(n as usize, &SGR_BASE, &SGR_BRIGHT) }
+
+/// Transcribed from `nearest256` in `drivers/src/framebuffer.rs`.
+fn nearest256(c: u32) -> u8 {
+    let (r, g, b) = ((c >> 16) as i32 & 255, (c >> 8) as i32 & 255, c as i32 & 255);
+    let (mut best, mut bd) = (0u8, i32::MAX);
+    for n in 0..=255u8 {
+        let p = palette(n);
+        let (pr, pg, pb) = ((p >> 16) as i32 & 255, (p >> 8) as i32 & 255, p as i32 & 255);
+        let d = (r - pr) * (r - pr) + (g - pg) * (g - pg) + (b - pb) * (b - pb);
+        if d < bd { bd = d; best = n; if d == 0 { break; } }
+    }
+    best
+}
+
+/// Transcribed from `sgr_resolve` in `drivers/src/framebuffer.rs`.
+fn sgr_resolve(sfg: u32, sbg: u8, bold: bool, rev: bool) -> (u32, u8) {
+    let mut f = sfg;
+    if bold { for i in 0..8 { if f == SGR_BASE[i] { f = SGR_BRIGHT[i]; break; } } }
+    if rev { (palette(sbg), nearest256(f)) } else { (f, sbg) }
 }
 
 /// Transcribed from `xterm256` in `drivers/src/framebuffer.rs`; the mirror has
@@ -2292,7 +2419,7 @@ impl core::fmt::Write for SliceWriter<'_> {
 
 /// Render `/proc/vtgrid` (tests): the whole cell grid of VT index `vt`
 /// (0-based) as hex code points, one `row <r>:` line per row with trailing
-/// blanks trimmed, after a `vtgrid <vt+1> <cur_col> <cur_row>` header.
+/// blanks trimmed, with `bg <row>:` palette indices for rows that set a background, after a `vtgrid <vt+1> <cur_col> <cur_row>` header.
 /// `WIDE_CONT` shows as 80000000; a blank cell as 0.
 pub fn grid_text(vt: usize, buf: &mut [u8]) -> usize {
     use core::fmt::Write;
@@ -2306,6 +2433,13 @@ pub fn grid_text(vt: usize, buf: &mut [u8]) -> usize {
         let _ = write!(w, "row {}:", r);
         for &c in &row[..end] { let _ = write!(w, " {:x}", c as u32); }
         let _ = writeln!(w);
+        // Background palette index per cell, only for rows that use one.
+        let bend = row.iter().rposition(|&c| (c >> 56) != 0).map_or(0, |i| i + 1);
+        if bend != 0 {
+            let _ = write!(w, "bg {}:", r);
+            for &c in &row[..bend] { let _ = write!(w, " {:x}", (c >> 56) as u32); }
+            let _ = writeln!(w);
+        }
     }
     w.len
 }
