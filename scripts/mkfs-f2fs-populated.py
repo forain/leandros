@@ -1064,7 +1064,7 @@ def main():
     if os.environ.get("LEANDROS_BOARD") == "rpi5":
         m4_share_dirs.add("/sys/bus/platform")
     for d in ("/sys", "/sys/bus", "/sys/bus/pci", "/sys/bus/pci/devices",
-              "/sys/class", "/sys/class/block",
+              "/sys/class", "/sys/class/block", "/sys/dev/block",
               "/sys/class/drm", "/sys/class/input",
               "/sys/class/power_supply", "/sys/class/backlight",
               "/sys/firmware", "/sys/firmware/acpi", "/sys/firmware/acpi/tables",
