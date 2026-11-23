@@ -2067,6 +2067,13 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if p as isize == -1 { exit(2); }
             for pg in 0..PAGES { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
+            // Long mm syscalls right before exiting: the observer outlasts
+            // its spin on `busy`, parks, and is parked holding the address
+            // space when this process exits.
+            for i in 0..1024usize {
+                let prot = if i % 2 == 0 { PROT_READ } else { PROT_READ | PROT_WRITE };
+                leandros_libc::syscall::syscall3(SYS_MPROTECT_NR, p as usize, PAGES * PAGE, prot as usize);
+            }
             exit(0);
         }
         core::ptr::write_volatile(shared, pid as u64);
