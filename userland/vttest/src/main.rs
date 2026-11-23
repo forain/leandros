@@ -2003,6 +2003,63 @@ unsafe fn t_emu_sgr() -> bool {
     report(b"emu_sgr", ok)
 }
 
+/// ESC ( 0 line drawing, G1 via SO/SI, and ESC ( B back to ASCII.
+unsafe fn t_emu_acs() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_acs", false); }
+    let cur = emu_grid(fd, b"\x1b(0lqk\r\nx x\r\nmqj\x1b(B\r\nq\x1b)0\x0eq\x0fq\x1bcq");
+    close(fd);
+    let want: [&[u32]; 4] = [&[0x250C, 0x2500, 0x2510], &[0x2502, 0, 0x2502], &[0x2514, 0x2500, 0x2518],
+                             &[b'q' as u32, 0x2500, b'q' as u32, b'q' as u32]];
+    let mut ok = cur.is_some();
+    for (r, w) in want.iter().enumerate() {
+        for (c, &v) in w.iter().enumerate() { if gcell(r, c) != v { ok = false; } }
+    }
+    if !ok { out(b"  acs row0:"); for c in 0..3 { out(b" "); out_hex(gcell(0, c)); } out(b"\n"); }
+    report(b"emu_acs", ok)
+}
+
+/// Bold+reverse red set on a VT survives a switch away and back: the next
+/// character painted after the round trip still has the bright-red background.
+unsafe fn t_attr_switch(tty0: c_int) -> bool {
+    let fb = open(b"/dev/fb0\0".as_ptr(), 0);
+    if fb < 0 { return report(b"attr_switch", false); }
+    let mut free: c_int = -1;
+    ioctl(tty0, VT_OPENQRY, &mut free as *mut c_int as *mut c_void);
+    if !(2..=6).contains(&free) { free = 6; }
+    let path = [b'/', b'd', b'e', b'v', b'/', b't', b't', b'y', b'0' + free as u8, 0];
+    let fd = open(path.as_ptr(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if fd < 0 { close(fb); return report(b"attr_switch", false); }
+    let sid = login_pause(fd);
+    let mut ok = switch_to(tty0, free as usize);
+    sleep_ms(300);
+    let m = b"\x1b[2J\x1b[H\x1b[1;7;31mA";
+    write(fd, m.as_ptr() as *const c_void, m.len());
+    sleep_ms(300);
+    ok &= switch_to(tty0, 1);
+    sleep_ms(300);
+    ok &= switch_to(tty0, free as usize);
+    sleep_ms(300);
+    let m2 = b"\x1b[3;1H ";
+    write(fd, m2.as_ptr() as *const c_void, m2.len());
+    sleep_ms(300);
+    let mut info = [0u32; 8];
+    if ioctl(fb, 0x4600, info.as_mut_ptr() as *mut c_void) != 0 || info[6] != 32 { ok = false; }
+    let pitch = info[7] as i64;
+    // Row 2 (0-based), cell 0: a space drawn with the restored pen is a solid background.
+    let mut px = [0u32; 1];
+    lseek(fb, 2 * 16 * pitch + 4 * 0 + 0, 0);
+    read(fb, px.as_mut_ptr() as *mut c_void, 4);
+    let got = px[0] & 0xFFFFFF;
+    if got != 0xFF0000 { ok = false; out(b"  attr px="); out_hex(got); out(b"\n"); }
+    switch_to(tty0, 1);
+    sleep_ms(100);
+    login_resume(sid);
+    close(fd);
+    close(fb);
+    report(b"attr_switch", ok)
+}
+
 static BTM_RAW: &[u8] = include_bytes!("../data/btm-100x30.raw");
 static BTM_GRID: &[u8] = include_bytes!("../data/btm-100x30.grid");
 
@@ -2218,7 +2275,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 50usize;
+    let total = 52usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -2268,6 +2325,8 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_emu_btm_replay() { passed += 1; }
     if t_emu_region() { passed += 1; }
     if t_emu_sgr() { passed += 1; }
+    if t_emu_acs() { passed += 1; }
+    if t_attr_switch(tty0) { passed += 1; }
     if t_wide_glyphs(tty0) { passed += 1; }
     if t_latin_glyphs(tty0) { passed += 1; }
 

@@ -103,7 +103,7 @@ extern "C" {
     fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32);
     /// Park the console cursor at `(col, row)`, restore the SGR foreground and
     /// reset the escape parser, then flush the whole repaint in one transfer.
-    fn fb_vt_repaint_end(col: u32, row: u32, fg: u32);
+    fn fb_vt_repaint_end(col: u32, row: u32, fg: u32, sgr: u64);
     /// Enable or disable framebuffer console output. No clear, no banner.
     fn fb_vt_console_gate(enabled: bool);
     /// True while a DRM open holds the scanout.
@@ -165,6 +165,11 @@ struct Screen {
     reg_bot: u32,
     /// DECOM.
     origin: bool,
+    /// G0/G1 are DEC Special Graphics; `shift_out` selects G1 (SO/SI).
+    g0_gfx: bool,
+    g1_gfx: bool,
+    shift_out: bool,
+    cs_target: u8,
     /// `ESC 7` / `CSI s` save slot.
     saved_col: u32,
     saved_row: u32,
@@ -205,6 +210,10 @@ impl Screen {
             reg_top: 0,
             reg_bot: 0,
             origin: false,
+            g0_gfx: false,
+            g1_gfx: false,
+            shift_out: false,
+            cs_target: 0,
             saved_col: 0,
             saved_row: 0,
             esc: ESC_GROUND,
@@ -231,6 +240,9 @@ impl Screen {
         self.reg_top = 0;
         self.reg_bot = 0;
         self.origin = false;
+        self.g0_gfx = false;
+        self.g1_gfx = false;
+        self.shift_out = false;
         self.esc = ESC_GROUND;
         self.params_len = 0;
         self.utf8_left = 0;
@@ -358,7 +370,9 @@ impl Screen {
                 self.esc = match c {
                     b'[' => { self.params_len = 0; ESC_CSI }
                     b']' => ESC_OSC,
-                    b'(' | b')' | b'*' | b'+' | b'#' | b'%' => ESC_DISCARD1,
+                    b'(' | b')' => { self.cs_target = c; ESC_DISCARD1 }
+                    b'*' | b'+' | b'#' | b'%' => { self.cs_target = 0; ESC_DISCARD1 }
+                    b'c' => { self.g0_gfx = false; self.g1_gfx = false; self.shift_out = false; ESC_GROUND }
                     b'7' => { self.saved_col = self.cur_col; self.saved_row = self.cur_row; ESC_GROUND }
                     b'8' => { self.cur_col = self.saved_col; self.cur_row = self.saved_row; ESC_GROUND }
                     // ESC M — reverse index.
@@ -414,7 +428,14 @@ impl Screen {
                 self.esc = if c == b'\\' { ESC_GROUND } else { ESC_OSC };
                 return;
             }
-            _ => { self.esc = ESC_GROUND; return; }
+            _ => {
+                if self.esc == ESC_DISCARD1 {
+                    if self.cs_target == b'(' { self.g0_gfx = c == b'0'; }
+                    else if self.cs_target == b')' { self.g1_gfx = c == b'0'; }
+                }
+                self.esc = ESC_GROUND;
+                return;
+            }
         }
 
         if c < 0x20 { self.wrap_pending = false; }
@@ -425,6 +446,10 @@ impl Screen {
             self.cur_col = 0;
         } else if c == b'\t' {
             self.cur_col = self.tabs.next(self.cur_col as usize, 1, cols) as u32;
+        } else if c == 0x0e {
+            self.shift_out = true;
+        } else if c == 0x0f {
+            self.shift_out = false;
         } else if c == 0x08 {
             if self.cur_col > 0 {
                 self.cur_col -= 1;
@@ -437,7 +462,8 @@ impl Screen {
         } else {
             let ch = if c < 0x80 {
                 self.utf8_left = 0;
-                Some(c as u32)
+                let gfx = if self.shift_out { self.g1_gfx } else { self.g0_gfx };
+                Some(if gfx { acs_map(c).unwrap_or(c as u32) } else { c as u32 })
             } else if c & 0xE0 == 0xC0 {
                 self.utf8_left = 1; self.utf8_acc = (c & 0x1F) as u32; None
             } else if c & 0xF0 == 0xE0 {
@@ -746,6 +772,19 @@ fn sgr_resolve(sfg: u32, sbg: u8, bold: bool, rev: bool) -> (u32, u8) {
 
 /// Transcribed from `xterm256` in `drivers/src/framebuffer.rs`; the mirror has
 /// to resolve `SGR 38;5;n` to the same pixel value the console drew.
+/// DEC Special Graphics (`ESC ( 0`) → Unicode, for 0x5f..=0x7e.
+fn acs_map(c: u8) -> Option<u32> {
+    Some(match c {
+        0x5f => 0x00A0, 0x60 => 0x25C6, 0x61 => 0x2592, 0x66 => 0x00B0, 0x67 => 0x00B1,
+        0x6a => 0x2518, 0x6b => 0x2510, 0x6c => 0x250C, 0x6d => 0x2514, 0x6e => 0x253C,
+        0x6f => 0x23BA, 0x70 => 0x23BB, 0x71 => 0x2500, 0x72 => 0x23BC, 0x73 => 0x23BD,
+        0x74 => 0x251C, 0x75 => 0x2524, 0x76 => 0x2534, 0x77 => 0x252C, 0x78 => 0x2502,
+        0x79 => 0x2264, 0x7a => 0x2265, 0x7b => 0x03C0, 0x7c => 0x2260, 0x7d => 0x00A3,
+        0x7e => 0x00B7,
+        _ => return None,
+    })
+}
+
 fn xterm256(n: usize, base: &[u32; 8], bright: &[u32; 8]) -> u32 {
     match n {
         0..=7 => base[n],
@@ -1108,11 +1147,15 @@ fn repaint(idx: usize) {
         }
         unsafe { fb_vt_paint_row(r as u32, row_buf.as_ptr(), cols as u32) };
     }
-    let (col, row, fg) = {
+    let (col, row, fg, sgr) = {
         let s = SCREENS.lock();
-        (s[idx].cur_col, s[idx].cur_row, s[idx].fg_enc ^ FG_XOR)
+        let t = &s[idx];
+        let sgr = ((t.sfg ^ FG_XOR) as u64) | (t.sbg as u64) << 24 | (t.bold as u64) << 32
+            | (t.rev as u64) << 33 | (t.g0_gfx as u64) << 34 | (t.g1_gfx as u64) << 35
+            | (t.shift_out as u64) << 36;
+        (t.cur_col, t.cur_row, t.fg_enc ^ FG_XOR, sgr)
     };
-    unsafe { fb_vt_repaint_end(col, row, fg) };
+    unsafe { fb_vt_repaint_end(col, row, fg, sgr) };
 }
 
 /// Apply the console gate: the framebuffer console paints iff the active VT is

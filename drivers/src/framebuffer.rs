@@ -73,6 +73,19 @@ fn sgr_resolve(sfg: u32, sbg: u8, bold: bool, rev: bool) -> (u32, u8) {
     if rev { (palette(sbg), nearest256(f)) } else { (f, sbg) }
 }
 
+/// DEC Special Graphics (`ESC ( 0`) → Unicode, for 0x5f..=0x7e.
+fn acs_map(c: u8) -> Option<u32> {
+    Some(match c {
+        0x5f => 0x00A0, 0x60 => 0x25C6, 0x61 => 0x2592, 0x66 => 0x00B0, 0x67 => 0x00B1,
+        0x6a => 0x2518, 0x6b => 0x2510, 0x6c => 0x250C, 0x6d => 0x2514, 0x6e => 0x253C,
+        0x6f => 0x23BA, 0x70 => 0x23BB, 0x71 => 0x2500, 0x72 => 0x23BC, 0x73 => 0x23BD,
+        0x74 => 0x251C, 0x75 => 0x2524, 0x76 => 0x2534, 0x77 => 0x252C, 0x78 => 0x2502,
+        0x79 => 0x2264, 0x7a => 0x2265, 0x7b => 0x03C0, 0x7c => 0x2260, 0x7d => 0x00A3,
+        0x7e => 0x00B7,
+        _ => return None,
+    })
+}
+
 fn xterm256(n: usize, base: &[u32; 8], bright: &[u32; 8]) -> u32 {
     match n {
         0..=7   => base[n],
@@ -173,6 +186,12 @@ pub struct Framebuffer {
     /// DECSTBM margins in rows: `[reg_top, reg_bot)`; `reg_bot == 0` = whole screen.
     reg_top: usize,
     reg_bot: usize,
+    /// G0/G1 are DEC Special Graphics; `shift_out` selects G1 (SO/SI).
+    g0_gfx: bool,
+    g1_gfx: bool,
+    shift_out: bool,
+    /// Which designator (`(` or `)`) the next charset byte belongs to.
+    cs_target: u8,
     /// DECOM (`CSI ? 6 h`): CUP/VPA are relative to the top margin.
     origin: bool,
     /// Cursor saved by `ESC 7` / `CSI s`, restored by `ESC 8` / `CSI u`.
@@ -236,6 +255,10 @@ impl Framebuffer {
             reg_top: 0,
             reg_bot: 0,
             origin: false,
+            g0_gfx: false,
+            g1_gfx: false,
+            shift_out: false,
+            cs_target: 0,
             saved_cursor: (0, 0),
             tabs: crate::wcwidth::TabStops::default_stops(),
             wide: [[0; 4]; WIDE_ROWS],
@@ -386,7 +409,9 @@ impl Framebuffer {
                     b'[' => { self.params_len = 0; EscState::Csi }
                     b']' => EscState::Osc,
                     // Charset / DEC selectors take one more byte: ESC ( B, ESC # 8, …
-                    b'(' | b')' | b'*' | b'+' | b'#' | b'%' => EscState::Discard1,
+                    b'(' | b')' => { self.cs_target = c; EscState::Discard1 }
+                    b'*' | b'+' | b'#' | b'%' => { self.cs_target = 0; EscState::Discard1 }
+                    b'c' => { self.g0_gfx = false; self.g1_gfx = false; self.shift_out = false; EscState::Ground }
                     b'7' => { self.saved_cursor = (self.cursor_x, self.cursor_y); EscState::Ground }
                     b'8' => { let (x, y) = self.saved_cursor;
                               self.cursor_x = x; self.cursor_y = y; EscState::Ground }
@@ -447,6 +472,8 @@ impl Framebuffer {
                 return;
             }
             EscState::Discard1 => {
+                if self.cs_target == b'(' { self.g0_gfx = c == b'0'; }
+                else if self.cs_target == b')' { self.g1_gfx = c == b'0'; }
                 self.esc = EscState::Ground;
                 return;
             }
@@ -464,6 +491,10 @@ impl Framebuffer {
                 let col = self.tabs.next(self.col(), 1, cols);
                 self.cursor_x = col * self.char_width;
             }
+        } else if c == 0x0e {
+            self.shift_out = true;
+        } else if c == 0x0f {
+            self.shift_out = false;
         } else if c == b'\x08' {  // Backspace (ASCII 8)
             self.handle_backspace();
         } else {
@@ -472,12 +503,17 @@ impl Framebuffer {
                 if c < 0x80 {
                     // ASCII character
                     UTF8_STATE = (0, 0);
+                    let gfx = if self.shift_out { self.g1_gfx } else { self.g0_gfx };
+                    if let Some(u) = if gfx { acs_map(c) } else { None } {
+                        self.put_unicode(u);
+                    } else {
                     self.apply_pending_wrap();
                     let (col, row) = (self.col(), self.row());
                     self.split_wide(row, col, col + 1);
                     self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, self.fg);
                     self.last_char = c as u32;
                     self.cursor_x += self.char_width;
+                    }
                 } else if c & 0xE0 == 0xC0 {
                     // Start of 2-byte UTF-8
                     UTF8_STATE = (1, (c & 0x1F) as u32);
@@ -1460,7 +1496,7 @@ pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
 /// final byte of a sequence the outgoing VT was mid-way through, and a console
 /// left in `Csi` swallows the incoming VT's next few characters as parameters.
 #[no_mangle]
-pub extern "C" fn fb_vt_repaint_end(col: u32, row: u32, fg: u32) {
+pub extern "C" fn fb_vt_repaint_end(col: u32, row: u32, fg: u32, sgr: u64) {
     {
         let mut fb = KERNEL_FB.lock();
         if fb.char_width == 0 || fb.char_height == 0 { return; }
@@ -1470,10 +1506,19 @@ pub extern "C" fn fb_vt_repaint_end(col: u32, row: u32, fg: u32) {
         fb.fg = fg & 0x00FF_FFFF;
         fb.bgi = (fg >> 24) as u8;
         fb.bg = palette(fb.bgi);
-        fb.sfg = fb.fg;
-        fb.sbg = fb.bgi;
-        fb.bold = false;
-        fb.rev = false;
+        // `sgr` = sfg | sbg << 24 | bold << 32 | rev << 33 | g0 << 34 | g1 << 35 | SO << 36:
+        // the pen as the VT left it, so bold/reverse and the charset survive a switch.
+        fb.sfg = (sgr & 0x00FF_FFFF) as u32;
+        fb.sbg = (sgr >> 24) as u8;
+        fb.bold = sgr >> 32 & 1 != 0;
+        fb.rev = sgr >> 33 & 1 != 0;
+        fb.g0_gfx = sgr >> 34 & 1 != 0;
+        fb.g1_gfx = sgr >> 35 & 1 != 0;
+        fb.shift_out = sgr >> 36 & 1 != 0;
+        let (efg, ebg) = sgr_resolve(fb.sfg, fb.sbg, fb.bold, fb.rev);
+        fb.fg = efg;
+        fb.bgi = ebg;
+        fb.bg = palette(ebg);
         fb.esc = EscState::Ground;
         fb.params_len = 0;
     }
