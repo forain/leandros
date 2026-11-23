@@ -2052,6 +2052,10 @@ unsafe fn t_attr_switch(tty0: c_int) -> bool {
     read(fb, px.as_mut_ptr() as *mut c_void, 4);
     let got = px[0] & 0xFFFFFF;
     if got != 0xFF0000 { ok = false; out(b"  attr px="); out_hex(got); out(b"\n"); }
+    // Leave the pen default for the glyph tests that reuse this VT.
+    let rst = b"\x1b[0m\x1b[2J";
+    write(fd, rst.as_ptr() as *const c_void, rst.len());
+    sleep_ms(100);
     switch_to(tty0, 1);
     sleep_ms(100);
     login_resume(sid);
