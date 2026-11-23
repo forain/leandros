@@ -550,10 +550,12 @@ def sudo_sh(ssh, user, pw, script):
     return ssh.run(user, f"sudo -S -p '' sh -c \"{script}\"", key=True, stdin=(pw + "\n").encode())
 
 
-def sudo_write(ssh, user, pw, path, text):
-    """Replace `path` with `text` as root (single-quoted printf args; '$' escaped for the outer double quotes)."""
+def sudo_write(ssh, user, pw, path, text, then=""):
+    """Replace `path` with `text` as root (single-quoted printf args; '$' escaped for the outer double quotes).
+    `then` is more shell (no '$' or double quotes) run in the SAME sudo: with real PAM (musl crypt) a
+    legacy $sha256$ hash cannot authenticate sudo, so nothing may need a second sudo while one is planted."""
     args = " ".join("'" + l.replace("'", "'\\''") + "'" for l in text.splitlines())
-    return sudo_sh(ssh, user, pw, ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$"))
+    return sudo_sh(ssh, user, pw, ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$") + (f"; {then}" if then else ""))
 
 
 def accounts_extra(ssh, user, pw, tmp):
@@ -593,8 +595,7 @@ def accounts_extra(ssh, user, pw, tmp):
         return
     legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
     lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
-    rc, wout, err = sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
-    rc2, mid, _ = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+    rc, mid, err = sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n", then="cat /etc/shadow")
     primed = rc == 0 and f"{user}:$sha256$" in mid
     rc, out, err = ssh.run(user, "id -un", password=pw)
     login_ok = rc == 0 and out.strip() == user
@@ -1045,7 +1046,6 @@ def sshdcfg(ssh, user, pw, tmp):
     else:
         legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
         lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
-        sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
         conf("")
         # The guest script remounts / read-only for a window, records what it sees, and remounts it read-write.
         sudo_write(ssh, user, pw, "/tmp/sshdcfg-ro.sh", "\n".join([
@@ -1063,7 +1063,9 @@ def sshdcfg(ssh, user, pw, tmp):
             "chmod 644 /tmp/sshdcfg-ro-*",
             "echo done > /tmp/sshdcfg-ro-done",
         ]))
-        sudo_sh(ssh, user, pw, "chmod 755 /tmp/sshdcfg-ro.sh; sh /tmp/sshdcfg-ro.sh > /dev/null 2>&1 < /dev/null &")
+        # One sudo plants the legacy hash and starts the script (sudo cannot authenticate against it afterwards).
+        sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n",
+                   then="chmod 755 /tmp/sshdcfg-ro.sh; sh /tmp/sshdcfg-ro.sh > /dev/null 2>&1 < /dev/null &")
         time.sleep(7)  # the root is read-only from here on
         rc, out, err = login(password=True)
         step("cfg_rehash_readonly_login_still_works", rc == 0 and out.strip() == user, f"rc={rc} out={out.strip()!r} err={err.strip()[-100:]!r}")
