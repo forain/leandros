@@ -45,8 +45,7 @@ export PATH
 #     connect to the compositor's wayland-N. A 0700 root /run/user/0 is EACCES
 #     for it, so the greeter session uses the GREETER ACCOUNT's runtime dir,
 #     /run/user/990 (owned by it), and greeter-launch chowns the socket node
-#     to the account before dropping. greetd's control socket is bound in the
-#     same directory (GREETD_SOCK_DIR in /bin/greeter-real). The greeter
+#     to the account before dropping. greetd's control socket is /run/greetd-<pid>.sock. The greeter
 #     session is recognised by GREETD_SOCK: greetd's session worker putenv's
 #     it for the greeter session only, and cosmic-greeter forwards nothing
 #     but XDG_SESSION_TYPE/CURRENT_DESKTOP/SESSION_DESKTOP to the user session.

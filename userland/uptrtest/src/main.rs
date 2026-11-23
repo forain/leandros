@@ -605,18 +605,33 @@ static mut FAILS: i32 = 0;
 static mut PASSES: i32 = 0;
 
 unsafe fn verdict(name: &[u8], kind: Option<usize>, code: i32) {
-    out(name);
-    if let Some(k) = kind { out(b"/"); out(KIND_NAMES[k]); }
+    // The whole verdict line goes out in ONE write(): a kernel console line
+    // must not splice into it (the harness parses `<name>: FAIL`).
+    let mut line = [0u8; 200];
+    let mut n = 0usize;
+    let mut put = |s: &[u8], line: &mut [u8; 200], n: &mut usize| {
+        let m = s.len().min(line.len() - 1 - *n);
+        line[*n..*n + m].copy_from_slice(&s[..m]);
+        *n += m;
+    };
+    put(name, &mut line, &mut n);
+    if let Some(k) = kind { put(b"/", &mut line, &mut n); put(KIND_NAMES[k], &mut line, &mut n); }
     if code == 0 {
-        out(b": PASS\n");
+        put(b": PASS\n", &mut line, &mut n);
         PASSES += 1;
     } else {
-        out(b": FAIL code=");
-        out_num(code as usize);
-        if code >= 2000 { out(b" (timeout)"); } else if code >= 1000 { out(b" (killed by signal)"); }
-        out(b"\n");
+        put(b": FAIL code=", &mut line, &mut n);
+        let mut b = [0u8; 20];
+        let mut i = b.len();
+        let mut v = code as usize;
+        if v == 0 { i -= 1; b[i] = b'0'; }
+        while v > 0 { i -= 1; b[i] = b'0' + (v % 10) as u8; v /= 10; }
+        put(&b[i..], &mut line, &mut n);
+        if code >= 2000 { put(b" (timeout)", &mut line, &mut n); } else if code >= 1000 { put(b" (killed by signal)", &mut line, &mut n); }
+        put(b"\n", &mut line, &mut n);
         FAILS += 1;
     }
+    sys!(nr::WRITE, 1, line.as_ptr(), n);
 }
 
 unsafe fn cow_region_intact() -> bool {

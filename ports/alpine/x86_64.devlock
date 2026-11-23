@@ -1,0 +1,9 @@
+# release v3.24
+# build-time -dev packages for the cross sysroot; scripts/alpine-dev.py lock
+pkg dbus-dev 1.16.2-r2 main Q1/EvgIL5r2x2DIuR82KLw5LhuGiA= dcf7d0a629829cada0a5d0b7e38e271e158aeb65f4bafc623ad6addce1cd2949 -
+pkg libdisplay-info-dev 0.3.0-r0 main Q1hhjrqjiylYtrPKcitw8WkJHk4l8= c19c1ae597bf4a1ac84b562bdd7a49467297d75e795b519a6f4021b446705d2a -
+pkg libevdev-dev 1.13.6-r0 community Q1Ton2y/oUofSjukoOpU2neHwTEKQ= ebaa72399a71e88ecd15e34904ce6d09f92bdbd349ff0c8e6cecd6a0db7f78ea -
+pkg libinput-dev 1.31.3-r0 community Q1VwYG8pZGy6UsMRDco7pGPXsaGMA= 03e0a2c7f58b0d2223b610f1cc189741046454d6e5dbcc4f4c9fba38fa6c5f17 -
+pkg libxkbcommon-dev 1.13.1-r0 main Q1pYraO+Fb60N+N8nA8FVnH4SpMp8= 94fd46087a1830db5238a37cf913ebef8c831ea682d53d0a498b26637f5caa7c -
+pkg mtdev-dev 1.1.7-r0 community Q1XFcU4m6u0N7szk4OXsjvHBTcVOo= 41e263646b5cc5db2e7536438a1809f1a8bf42eb30b708c68f3dce15d2e8b4dc -
+pkg pixman-dev 0.46.4-r0 main Q13+6/9LusNBrQabNxXNz41W3LAZU= 2edda1c89519506bf5072552eb74aca859980aa3047aa7c53a6205d077ba7575 -

@@ -3,7 +3,7 @@
 # pinned cosmic-applets tree (e544cb5, epoch-1.3.0) with the m6 recipe, the
 # same way ports/pipewire/build.sh gets cosmic-applet-audio:
 #   m6-session-bins/build-rust.sh src/cosmic-applets <arch> -p cosmic-applet-bluetooth
-# It is unmodified upstream. It speaks org.bluez only through bluer 0.17.4 (libdbus-1, ports/libdbus),
+# It is unmodified upstream. It speaks org.bluez only through bluer 0.17.4 (libdbus-1, Alpine dbus-libs, ports/alpine),
 # which here reaches leandros-sysbus bluez (ports/sysbus/src/bluez).
 #
 # Output: ~/code/leandros-artifacts/m6-session-bins/out/cosmic-applet-bluetooth-<arch>
@@ -30,8 +30,8 @@ if [[ ! -x "$M6/build-rust.sh" || ! -d "$SRC/cosmic-applet-bluetooth" ]]; then
 fi
 
 for arch in "${ARCHES[@]}"; do
-  # libdbus-1 must be in the sysroot first (libdbus-sys finds it via pkg-config).
-  "$(dirname "$0")/../libdbus/build.sh" "$arch" > /dev/null
+  # libdbus-1 (Alpine dbus-dev + dbus-libs) must be in the sysroot first (libdbus-sys finds it via pkg-config).
+  python3 "$(dirname "$0")/../../scripts/alpine-dev.py" merge "$arch" "${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch" > /dev/null
   if ! "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-bluetooth > /dev/null; then
     echo "cosmic-applet-bluetooth: build failed for $arch (log: $M6/logs/cosmic-applets-$arch.log)" >&2
     exit 1
