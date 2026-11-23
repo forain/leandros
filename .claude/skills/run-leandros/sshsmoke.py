@@ -420,8 +420,8 @@ def errtxt(p):
 
 
 # What a refused forward looks like to the ssh client: -L gets "channel N: open failed: administratively prohibited"
-# (a connect failure to a missing target is NOT a refusal), -R gets "remote port forwarding failed".
-L_REFUSED = re.compile(r"administratively prohibited|open failed: (?!connect failed)")
+# (any other open failure, e.g. a connect failure to a missing target, is NOT a refusal), -R gets "remote port forwarding failed".
+L_REFUSED = re.compile(r"administratively prohibited")
 R_REFUSED = re.compile(r"forwarding failed|Could not request (?:local|remote) forwarding")
 
 
@@ -787,6 +787,8 @@ def sshdcfg(ssh, user, pw, tmp):
 
     threading.Thread(target=echo, daemon=True).start()
 
+    lastl = [""]
+
     def can_local():  # -L to the guest's own port 22 (the target is resolved by the guest); True / False (refused) / None
         lp = free_port()
         p = errwatch(fwd_client(ssh2, user, "-L", f"{lp}:127.0.0.1:22"))
@@ -794,6 +796,7 @@ def sshdcfg(ssh, user, pw, tmp):
         ok = got.startswith(b"SSH-")
         ref = not ok and refused_by(p, L_REFUSED)
         stop(p)
+        lastl[:] = [errtxt(p)[-200:]]
         return fwd_outcome(ok, ref)
 
     def can_remote():  # -R on the second sshd, read back through a -L on the first; True / False (refused) / None
@@ -822,7 +825,7 @@ def sshdcfg(ssh, user, pw, tmp):
     conf("AllowTcpForwarding yes\n")  # the key forbids it, the config allows
     l2 = can_local()
     set_keys(ssh, user, pw, pub)
-    step("cfg_allowtcpforwarding_most_restrictive", l is False and r is False and l2 is False, f"cfg_no: l={l} r={r} key_no: l={l2}")
+    step("cfg_allowtcpforwarding_most_restrictive", l is False and r is False and l2 is False, f"cfg_no: l={l} r={r} key_no: l={l2} err={lastl[0]!r}")
     srv.close()
 
     # --- user certificates --------------------------------------------------
