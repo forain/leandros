@@ -1,6 +1,6 @@
 #!/bin/sh
 # build.sh <x86_64|aarch64|all> -- GStreamer 1.24 (+ FFmpeg 6.1 plugin, PipeWire plugin) for LeandrOS.
-# build-in-alpine.sh (Alpine 3.21 container) stages out/<arch>.alpine/ (the image
+# build-in-alpine.sh (Alpine 3.24 container) stages out/<arch>.alpine/ (the image
 # tree, which scripts/mkfs-f2fs-populated.py overlays) and out/<arch>.sysroot/
 # (-dev files merged into the cross sysroot m3-gl-stack/sysroot-<arch> by this script).
 set -eu

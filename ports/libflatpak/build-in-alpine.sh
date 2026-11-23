@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-in-alpine.sh <x86_64|aarch64> -- stage Alpine 3.21's libflatpak.so.0 and
+# build-in-alpine.sh <x86_64|aarch64> -- stage Alpine 3.24's libflatpak.so.0 and
 # its DT_NEEDED closure (ostree, json-glib, libxmlb, libcurl, libarchive, gpgme,
 # polkit client libs ...) for LeandrOS, plus the -dev files (headers, .pc,
 # linkable .so) for the cross sysroot, so cosmic-store's `flatpak` feature
@@ -16,7 +16,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21"; exit 3; }
+  grep -q '^3\.24\.' /etc/alpine-release || { echo "want Alpine 3.24"; exit 3; }
   PKGS="flatpak ostree"
   DEVPKGS="flatpak-dev ostree-dev json-glib-dev libxmlb-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
