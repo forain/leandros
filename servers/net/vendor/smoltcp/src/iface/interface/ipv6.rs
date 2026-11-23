@@ -33,6 +33,34 @@ impl InterfaceInner {
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
         frag: &'frame mut FragmentsBuffer,
     ) -> Option<Packet<'frame>> {
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let reasm = Some((&mut frag.assembler, frag.reassembly_timeout));
+        #[cfg(not(feature = "proto-ipv4-fragmentation"))]
+        let _ = frag;
+        self.process_ipv6_inner(
+            sockets,
+            meta,
+            ipv6_packet,
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            reasm,
+        )
+    }
+
+    /// LEANDROS: `process_ipv6` with the reassembly state passed apart from the
+    /// `FragmentsBuffer`, so a caller whose packet borrows another field of the
+    /// buffer (6LoWPAN: the decompression buffer or the 6LoWPAN assembler) can
+    /// still hand over the assembler it does not hold. `None` drops IPv6
+    /// fragment headers instead of reassembling them.
+    pub(super) fn process_ipv6_inner<'frame>(
+        &mut self,
+        sockets: &mut SocketSet,
+        meta: PacketMeta,
+        ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+        #[cfg(feature = "proto-ipv4-fragmentation")] reasm: Option<(
+            &'frame mut PacketAssemblerSet<FragKey>,
+            Duration,
+        )>,
+    ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
         // LEANDROS: the traffic class, for IPV6_RECVTCLASS (see udp::Socket::process).
         self.rx_tos = ipv6_packet.traffic_class();
@@ -75,7 +103,8 @@ impl InterfaceInner {
                 return None;
             }
             let key = FragKey::Ipv6(Ipv6FragKey { src: ipv6_repr.src_addr, dst: ipv6_repr.dst_addr, ident: fr.ident });
-            let f = match frag.assembler.get(&key, self.now + frag.reassembly_timeout) {
+            let (assembler, timeout) = reasm?;
+            let f = match assembler.get(&key, self.now + timeout) {
                 Ok(f) => f,
                 Err(_) => {
                     net_debug!("No available packet assembler for fragmented packet");
