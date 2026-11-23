@@ -1552,9 +1552,11 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
                 if poll_in_within(ec.fence_fd, 4000) { c_sig += 1; c1_sig = true; }
                 close(ec.fence_fd);
             }
-            // 11 s, past mode 6's 10 s alive limit: other fresh contexts keep the
-            // host answering (never "silent"), the orphan outlives the limit.
-            for _ in 0..11 {
+            // 15 rounds (>= 13.5 s of sleep alone) since C's first fence signalled,
+            // past mode 6's 10 s alive limit even after C's answer refreshed the
+            // timeline: other fresh contexts keep the host answering (never
+            // "silent"), the orphan outlives the limit.
+            for _ in 0..15 {
                 let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
                 if fx >= 0 && ctx_init_venus(fx) {
                     let mut ex = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
@@ -1591,9 +1593,37 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         // A's chain (and only it) is freed by the replay; C's last submit stays in flight (the host answers one fence per fresh ring).
         let d_census = infl_now.wrapping_add(1) == infl_pre;
         if oka { close(ea.fence_fd); }
+        // Restore the drain before C closes: its unfenced e3 is never answered and
+        // must not leave an orphan behind for later phases.
+        if knob { ctx_drain_override(ctl, old_drain); }
         if fc >= 0 { close(fc); }
         if fb >= 0 { close(fb); }
-        if knob { ctx_drain_override(ctl, old_drain); }
+        poll(core::ptr::null_mut(), 0, 600);
+        let f_orph = ctrlq_stat(ctl, 7) == orph0;
+        let hung_h0 = fence_stat(b"hangs");
+        // e) an orphan alone on an idle host (no answers for > 10 s) is no host hang.
+        let mut e_ok = false;
+        let mut e_hung = false;
+        let mut e_rel = false;
+        let mut e_orph_back = false;
+        if knob {
+            let old2 = ctx_drain_override(ctl, 0);
+            let fe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            let held2 = fe >= 0 && ctx_init_venus(fe) && fence_hold_mode(6);
+            let mut ee = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            e_ok = held2 && ioctl(fe, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ee as *mut _) == 0 && ee.fence_fd >= 3;
+            if fe >= 0 { close(fe); }
+            poll(core::ptr::null_mut(), 0, 11500);
+            e_hung = fence_stat(b"hangs") != hung_h0 || fence_stat(b"hung_now") != 0;
+            e_rel = fence_hold_mode(0);
+            if e_ok {
+                poll_in_within(ee.fence_fd, 2000);
+                close(ee.fence_fd);
+            }
+            poll(core::ptr::null_mut(), 0, 300);
+            ctx_drain_override(ctl, old2);
+            e_orph_back = ctrlq_stat(ctl, 7) == orph0;
+        }
         if ctl >= 0 { close(ctl); }
         out(b"  7h: knob="); out_u64(knob as u64); out(b" oka="); out_u64(oka as u64);
         out(b" b="); out_u64(b_poll as u64); out_u64(b_wait as u64); out_u64(b_cnt as u64); out_u64(b_unch as u64);
@@ -1609,10 +1639,16 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if !report(b"phase7h_b_destroyed_ctx_fence_stays_pending",
                    b_poll && b_wait && b_cnt && b_unch) { failures += 1; }
         if !report(b"phase7h_c_reused_id_tenant_unaffected",
-                   idc != 0 && idc == ida && c_ok == 2 && c_sig == 2 && c3_sig && x_ok == 11 && x_sig == 11 && a_pending_c && !c_ecanceled
+                   idc != 0 && idc == ida && c_ok == 2 && c_sig == 2 && c3_sig && x_ok == 15 && x_sig == 15 && a_pending_c && !c_ecanceled
                    && c_lost_same && c_orph) { failures += 1; }
         if !report(b"phase7h_d_host_answer_signals_orphan",
                    rel && d_poll && d_wait && d_orph && d_recl && d_census) { failures += 1; }
+        // C's unfenced e3 is never answered, so its orphan (f_orph=0 right after close)
+        // heals only when the reused id's timeline is answered again: 7h-e's fence does that.
+        out(b"  7h: f_orph="); out_u64(f_orph as u64); out(b" e="); out_u64(e_ok as u64);
+        out_u64(!e_hung as u64); out_u64(e_rel as u64); out_u64(e_orph_back as u64); out(b"\n");
+        if !report(b"phase7h_e_orphan_on_idle_host_is_no_hang", e_ok && !e_hung && e_rel) { failures += 1; }
+        if !report(b"phase7h_f_orphan_heals_by_next_create_on_id", e_orph_back) { failures += 1; }
     }
 
     // Unlock drains only happen when an interrupt loses the device lock, which a

@@ -2257,8 +2257,8 @@ pub fn drm_release_open(open_id: u32) {
 
     // Let the context's in-flight fenced work retire BEFORE destroying it: the
     // host answers a context-ring fence only through its context, so a fence
-    // still outstanding at CTX_DESTROY is never answered (see
-    // `ctx_orphan_fences`). A client killed mid-frame has a submit or two in
+    // still outstanding at CTX_DESTROY becomes an orphan that
+    // signals only if the host answers it later (see `ctx_orphan_fences`). A client killed mid-frame has a submit or two in
     // flight that the GPU finishes within a frame; wait for that, bounded,
     // with the device lock released between looks.
     let t0 = crate::snd::monotonic_us();

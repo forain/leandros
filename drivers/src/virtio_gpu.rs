@@ -3494,6 +3494,7 @@ impl VirtioGpuDevice {
         let mut total = 0usize;
         let mut chains = 0usize;
         let mut lost_n = 0usize;
+        let mut real_n = 0usize; // written off, orphans excluded
         let mut first_id = 0u64;
         // Parked by the fence-hold test knob: the simulated "host never
         // retires it" case (answered, but not applied); same rule.
@@ -3510,6 +3511,7 @@ impl VirtioGpuDevice {
                 self.held[hi] = self.held[self.held_n];
                 self.held_t[hi] = self.held_t[self.held_n];
                 if first_id == 0 { first_id = id; }
+                real_n += 1;
                 // Ending the hold-one mode: nothing else is parked behind it.
                 FENCE_HOLD_ONE.store(false, Relaxed);
                 self.fence_complete(id);
@@ -3533,9 +3535,12 @@ impl VirtioGpuDevice {
                     n += 1;
                     e.fence_id = 0;
                     if e.orphaned {
-                        // Whole host silent: orphans are written off like any pending fence.
+                        // Whole host silent: orphans are written off like any pending fence,
+                        // but an orphan alone is no evidence of a hung host.
                         e.orphaned = false;
                         let _ = CTX_ORPHANS_NOW.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+                    } else {
+                        real_n += 1;
                     }
                     e.abandoned = true;
                 }
@@ -3557,6 +3562,8 @@ impl VirtioGpuDevice {
         CTX_CHAINS_PARKED.fetch_add(chains as u64, Relaxed);
         FENCES_WRITTEN_OFF.fetch_add(total as u64, Relaxed);
         let tl = ((first_id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
+        // Orphan-only write-offs stay quiet: no hang state, no count, no log.
+        if real_n == 0 { return total; }
         let whole_host = silent;
         // One count and one log line per hang episode (the first pass only).
         let first_pass = !host_gpu_hung();
@@ -3602,7 +3609,7 @@ impl VirtioGpuDevice {
             }
         }
         if total != 0 {
-            use core::sync::atomic::Ordering::{Relaxed, Release};
+            use core::sync::atomic::Ordering::Relaxed;
             CTX_ORPHANS_NOW.fetch_add(total as u64, Relaxed);
             if ctx_id != 0 && ctx_id < CTX_ID_POOL {
                 self.ctx_ids_parked[(ctx_id / 64) as usize] |= 1u64 << (ctx_id % 64);
@@ -3615,7 +3622,6 @@ impl VirtioGpuDevice {
                 crate::pci::serial_debug_hex(total as u32);
                 crate::pci::serial_debug(" (pending until the host answers)\n");
             }
-            let _ = Release;
         }
         total
     }
