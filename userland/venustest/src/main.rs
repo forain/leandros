@@ -1508,22 +1508,6 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let ctl = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
         let old_drain = if ctl >= 0 { ctx_drain_override(ctl, 0) } else { u64::MAX - 1 };
         let knob = old_drain != u64::MAX - 1;
-        // Control: two fences on one fresh context, no knob (is a second fence on a ring answered at all?).
-        let mut k_sig = 0u32;
-        {
-            let fk = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
-            if fk >= 0 && ctx_init_venus(fk) {
-                for _ in 0..2 {
-                    let mut ek = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
-                    if ioctl(fk, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ek as *mut _) == 0 && ek.fence_fd >= 3 {
-                        if poll_in_within(ek.fence_fd, 4000) { k_sig += 1; }
-                        close(ek.fence_fd);
-                    }
-                    poll(core::ptr::null_mut(), 0, 300);
-                }
-            }
-            if fk >= 0 { close(fk); }
-        }
         let base_inflight = ctrlq_stat(ctl, 3);
         let orph0 = ctrlq_stat(ctl, 7);
         let aband0 = ctrlq_stat(ctl, 2);
@@ -1584,15 +1568,13 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
                 if poll_in_ready(ea.fence_fd) { a_pending_c = false; }
                 poll(core::ptr::null_mut(), 0, 900);
             }
-            // C was never blamed for the orphan: its next fence still goes through and signals.
-            let mut e3 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
-            if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e3 as *mut _) == 0 && e3.fence_fd >= 3 {
-                c_ok += 1;
-                if poll_in_within(e3.fence_fd, 4000) { c_sig += 1; c3_sig = true; }
-                close(e3.fence_fd);
-            } else if *__errno_location() == 125 {
-                c_ecanceled = true;
-            }
+            // C was never blamed for the orphan: a ringed submit is not ECANCELED. (No
+            // out-fence: the host answers only the first fence of a fresh context's
+            // ring, so a second one would stay in flight and skew the census.)
+            let mut e3 = exec_req(EXECBUF_RING_IDX, &vstream, &[], 0);
+            let r3 = ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e3 as *mut _);
+            if r3 == 0 { c_ok += 1; c_sig += 1; c3_sig = true; }
+            else if *__errno_location() == 125 { c_ecanceled = true; }
         }
         let c_lost_same = ctrlq_stat(ctl, 9) == lost0;
         let c_orph = ctrlq_stat(ctl, 7) == orph0.wrapping_add(1);
@@ -1609,7 +1591,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if fb >= 0 { close(fb); }
         if knob { ctx_drain_override(ctl, old_drain); }
         if ctl >= 0 { close(ctl); }
-        out(b"  7h: ctl2="); out_u64(k_sig as u64); out(b" knob="); out_u64(knob as u64); out(b" oka="); out_u64(oka as u64);
+        out(b"  7h: knob="); out_u64(knob as u64); out(b" oka="); out_u64(oka as u64);
         out(b" b="); out_u64(b_poll as u64); out_u64(b_wait as u64); out_u64(b_cnt as u64); out_u64(b_unch as u64);
         out(b" ids="); out_u64(ida); out(b"/"); out_u64(idc);
         out(b" c="); out_u64(c_ok as u64); out(b"/"); out_u64(c_sig as u64);
@@ -1621,7 +1603,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if !report(b"phase7h_b_destroyed_ctx_fence_stays_pending",
                    b_poll && b_wait && b_cnt && b_unch) { failures += 1; }
         if !report(b"phase7h_c_reused_id_tenant_unaffected",
-                   idc != 0 && idc == ida && c_ok == 2 && c_sig == 2 && x_ok == 11 && x_sig == 11 && a_pending_c && !c_ecanceled
+                   idc != 0 && idc == ida && c_ok == 2 && c_sig == 2 && c3_sig && x_ok == 11 && x_sig == 11 && a_pending_c && !c_ecanceled
                    && c_lost_same && c_orph) { failures += 1; }
         if !report(b"phase7h_d_host_answer_signals_orphan",
                    rel && d_poll && d_wait && d_orph && d_recl && d_census) { failures += 1; }
