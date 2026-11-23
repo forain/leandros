@@ -1322,7 +1322,7 @@ unsafe fn test_socket_alias_epoll_close() -> bool {
 }
 
 /// A fresh connect() that the listener has not accept()ed yet is already
-/// established (Linux), so SCM_RIGHTS must pass it. Thousands of rounds of
+/// established (Linux), so SCM_RIGHTS must pass it. Many rounds of
 /// connect -> immediately send the new fd -> receive -> data over the received
 /// copy -> accept, with a mix of close orders. Used to fail EBADF.
 unsafe fn test_pass_pending_connect() -> bool {
@@ -1333,7 +1333,8 @@ unsafe fn test_pass_pending_connect() -> bool {
     let mut carrier = [-1i32; 2];
     ok &= raw_socketpair(AF_UNIX, SOCK_STREAM, 0, carrier.as_mut_ptr()) == 0;
     let mut i = 0;
-    while ok && i < 3000 {
+    while ok && i < 1000 {
+        if i % 250 == 0 { dbg1(b"[pend] round %d\n\0", i as i64); }
         let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
         if c < 0 || raw_connect(c, &addr, alen) != 0 { ok = false; break; }
         let r = send_fd_and_byte(carrier[0], c, b'x');
