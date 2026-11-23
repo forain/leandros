@@ -422,14 +422,23 @@ def errtxt(p):
 # What a refused forward looks like to the ssh client: -L gets "channel N: open failed: administratively prohibited"
 # (any other open failure, e.g. a connect failure to a missing target, is NOT a refusal), -R gets "remote port forwarding failed".
 L_REFUSED = re.compile(r"administratively prohibited")
+# ssh2 reaches its sshd through the first one (-W): a key with no-port-forwarding there ends it with this message
+STDIO_REFUSED = re.compile(r"stdio forwarding failed")
 R_REFUSED = re.compile(r"forwarding failed|Could not request (?:local|remote) forwarding")
 
 
-def refused_by(p, pat, grace=3.0):
-    """Positive evidence of refusal: the client's stderr (ssh logs it as the refusal arrives) matches `pat`."""
+def nref(p, pat):
+    return len(pat.findall(errtxt(p)))
+
+
+L_TIMES = 3  # a refused -L is refused on every connection; one failed open can be a transient (seen: "send failed: Bad file descriptor")
+
+
+def refused_by(p, pat, n=1, grace=8.0):
+    """Positive evidence of refusal: the client's stderr (ssh logs it as the refusal arrives) matches `pat` at least n times."""
     end = time.time() + grace
     while True:
-        if pat.search(errtxt(p)):
+        if nref(p, pat) >= n:
             return True
         if time.time() >= end:
             return False
@@ -541,8 +550,8 @@ def forwarding(ssh, user, pw, tmp):
         with_opts(opt)
         lp = free_port()
         p = errwatch(fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:22"))
-        got = tcp_exchange(lp, want=b"SSH-", wait=40, abort=lambda: L_REFUSED.search(errtxt(p)))
-        ref = not got.startswith(b"SSH-") and refused_by(p, L_REFUSED)
+        got = tcp_exchange(lp, want=b"SSH-", wait=40, abort=lambda: nref(p, L_REFUSED) >= L_TIMES)
+        ref = not got.startswith(b"SSH-") and refused_by(p, L_REFUSED, L_TIMES)
         stop(p)
         step(f"fwd_local_denied_{opt.replace('-', '_')}", ref, f"got={got[:20]!r} err={errtxt(p)[-150:]!r}")
         p = fwd_client(ssh, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
@@ -562,8 +571,8 @@ def forwarding(ssh, user, pw, tmp):
     step("fwd_permitopen_allowed", got.startswith(b"SSH-"), f"got={got[:20]!r}")
     lp = free_port()
     p = errwatch(fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:{echo_port}"))
-    got = tcp_exchange(lp, payload=b"x\n", want=b"x", wait=40, abort=lambda: L_REFUSED.search(errtxt(p)))
-    ref = b"x" not in got and refused_by(p, L_REFUSED)
+    got = tcp_exchange(lp, payload=b"x\n", want=b"x", wait=40, abort=lambda: nref(p, L_REFUSED) >= L_TIMES)
+    ref = b"x" not in got and refused_by(p, L_REFUSED, L_TIMES)
     stop(p)
     step("fwd_permitopen_refused", ref, f"got={got[:20]!r} err={errtxt(p)[-150:]!r}")
 
@@ -789,12 +798,12 @@ def sshdcfg(ssh, user, pw, tmp):
 
     lastl = [""]
 
-    def can_local():  # -L to the guest's own port 22 (the target is resolved by the guest); True / False (refused) / None
+    def can_local(pat=L_REFUSED, n=L_TIMES):  # -L to the guest's own port 22 (the target is resolved by the guest); True / False (refused) / None
         lp = free_port()
         p = errwatch(fwd_client(ssh2, user, "-L", f"{lp}:127.0.0.1:22"))
-        got = tcp_exchange(lp, want=b"SSH-", wait=40, abort=lambda: L_REFUSED.search(errtxt(p)))
+        got = tcp_exchange(lp, want=b"SSH-", wait=40, abort=lambda: nref(p, pat) >= n)
         ok = got.startswith(b"SSH-")
-        ref = not ok and refused_by(p, L_REFUSED)
+        ref = not ok and refused_by(p, pat, n)
         stop(p)
         lastl[:] = [errtxt(p)[-200:]]
         return fwd_outcome(ok, ref)
@@ -823,7 +832,7 @@ def sshdcfg(ssh, user, pw, tmp):
     l, r = can_local(), can_remote()
     set_keys(ssh, user, pw, f"no-port-forwarding {pub}")
     conf("AllowTcpForwarding yes\n")  # the key forbids it, the config allows
-    l2 = can_local()
+    l2 = can_local(STDIO_REFUSED, 1)  # the key blocks the -W hop of the second sshd's client
     set_keys(ssh, user, pw, pub)
     step("cfg_allowtcpforwarding_most_restrictive", l is False and r is False and l2 is False, f"cfg_no: l={l} r={r} key_no: l={l2} err={lastl[0]!r}")
     srv.close()
@@ -1325,9 +1334,9 @@ def sshdcfg2(ssh, user, pw, tmp):
         g = errwatch(fwd_client(ssh, user, "-R", f"{gs('a')}:127.0.0.1:{echo_port}"))
         wait_fwd(g, gs("a"))
         p = errwatch(fwd_client(ssh2, user, "-L", f"{hs('ha')}:{gs('a')}"))
-        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40, abort=lambda: L_REFUSED.search(errtxt(p)))
+        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40, abort=lambda: nref(p, L_REFUSED) >= L_TIMES)
         ok = b"ping-L" in got
-        ref = not ok and g.poll() is None and refused_by(p, L_REFUSED)  # the guest socket is there: only ssh2 can have refused
+        ref = not ok and g.poll() is None and refused_by(p, L_REFUSED, L_TIMES)  # the guest socket is there: only ssh2 can have refused
         stop(p)
         stop(g)
         diag.append(f"L:{got!r} p={errtxt(p)[-150:]!r} g={errtxt(g)[-150:]!r}")
