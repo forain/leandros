@@ -231,6 +231,7 @@ extern "C" {
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
     pub fn ftruncate(fd: c_int, length: i64) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    pub fn __errno_location() -> *mut c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
     /// Phase 6 needs this: it closes the exported fd and then asserts the
@@ -428,6 +429,15 @@ unsafe fn getparam(fd: c_int, param: u64, name: &[u8]) -> u64 {
     gp.value
 }
 
+/// True when no other process holds a GPU context (the probe fd holds none,
+/// and the caller's own context, if any, accounts for at most one slot of 256).
+unsafe fn sole_gpu_client() -> bool {
+    let probe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+    let free = if probe >= 0 { getparam_quiet(probe, VIRTGPU_PARAM_LEANDROS_FREE_CTXS) } else { u64::MAX };
+    if probe >= 0 { close(probe); }
+    free == u64::MAX || free >= 255
+}
+
 /// A GETPARAM probe that prints nothing. Same contract as `getparam`:
 /// `u64::MAX` means the ioctl itself failed.
 unsafe fn getparam_quiet(fd: c_int, param: u64) -> u64 {
@@ -617,7 +627,9 @@ fn report_ctx_ne(name: &[u8], other: u64, actual: u64) -> bool {
 
 /// Same CONTEXT_INIT(capset=Venus) call as the single-fd phase, factored out
 /// so phase 2 can issue it against several fds.
-unsafe fn ctx_init_venus(fd: c_int) -> bool {
+unsafe fn ctx_init_venus(fd: c_int) -> bool { ctx_init_venus_rings(fd, 1) }
+
+unsafe fn ctx_init_venus_rings(fd: c_int, rings: u64) -> bool {
     let params = [
         DrmVirtgpuContextSetParam {
             param: VIRTGPU_CONTEXT_PARAM_CAPSET_ID,
@@ -625,7 +637,7 @@ unsafe fn ctx_init_venus(fd: c_int) -> bool {
         },
         DrmVirtgpuContextSetParam {
             param: VIRTGPU_CONTEXT_PARAM_NUM_RINGS,
-            value: 1,
+            value: rings,
         },
     ];
     let mut init = DrmVirtgpuContextInit {
@@ -741,7 +753,7 @@ unsafe fn fence_hold(on: bool) -> bool {
     ok
 }
 
-/// Fence-hold knob modes: 1 park all, 2 release newest only, 3 park only the
+/// Fence-hold knob modes: 4 park the first per-context-timeline (ringed) fence, 1 park all, 2 release newest only, 3 park only the
 /// first, 0 release everything.
 unsafe fn fence_hold_mode(m: u8) -> bool {
     let f = open(b"/proc/drm/fence_hold\0".as_ptr(), 1 /* O_WRONLY */);
@@ -751,6 +763,19 @@ unsafe fn fence_hold_mode(m: u8) -> bool {
     close(f);
     ok
 }
+
+/// SYNC_IOC_FILE_INFO status of a sync file fd (0 active, 1 signalled,
+/// negative errno = the fence errored); i32::MIN if the ioctl fails.
+unsafe fn sync_file_status(fd: c_int) -> i32 {
+    let mut info = [0u8; 56];
+    if ioctl(fd, 0xC038_3E04 as c_ulong, info.as_mut_ptr()) != 0 { return i32::MIN; }
+    i32::from_ne_bytes([info[32], info[33], info[34], info[35]])
+}
+
+/// A pending, error-free fence: SYNC_IOC_FILE_INFO says 0 (active), or the
+/// fd is an eventfd-backed out-fence on which the ioctl does not exist
+/// (i32::MIN). Signalled (1) or an errno (negative) is a failure.
+fn status_pending_ok(st: i32) -> bool { st == 0 || st == i32::MIN }
 
 /// One `key=value` counter of `/proc/drm/fence_stats` (u64::MAX if absent).
 unsafe fn fence_stat(key: &[u8]) -> u64 {
@@ -1078,6 +1103,355 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if !report(b"phase7c_deep_stalled_fence_signals_on_release", rel && signals && again) {
             failures += 1;
         }
+    }
+
+    // ── 2d. Per-context fence timelines: a stalled context holds back only itself ──
+    // Two opens (two contexts), each submitting a real, dispatchable Venus
+    // command (vkEnumerateInstanceVersion, no reply) on ring 0, which is what
+    // puts a fence on the context's own timeline (host retires it via the
+    // renderer context; a non-dispatchable stream would never retire). Hold the FIRST context's fence (knob mode 4: park only the
+    // first per-context-timeline fence); the OTHER context's fences, submitted
+    // afterwards, must signal promptly while the stalled one stays pending,
+    // and the stalled one signals on release.
+    {
+        let tl0 = fence_stat(b"tl_fences");
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let fb = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && fb >= 0 && ctx_init_venus(fa) && ctx_init_venus(fb);
+        let distinct = inited && ctx_id(fa) != ctx_id(fb);
+        let mut held4 = false;
+        let mut oka = false;
+        let mut okb = 0u32;
+        let mut b_signalled = 0u32;
+        let mut a_pending_after = false;
+        let mut a_signals = false;
+        // vkEnumerateInstanceVersion, 16 bytes: cmd_type, cmd_flags, then the
+        // out pApiVersion as a simple-pointer marker (u64 1). The output value
+        // itself is not sent (Mesa's vn_encode_vkEnumerateInstanceVersion).
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        if distinct {
+            held4 = fence_hold_mode(4);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            // A fresh context per submission. With the correct 16-byte stream
+            // (checked against Mesa's vn_encode_vkEnumerateInstanceVersion) the
+            // host still retires only the FIRST ringed fence of a bare Venus
+            // context (no VkInstance/ring/queue timeline): the 2nd and later,
+            // on any ring, never answer. Host behaviour, unrelated to the
+            // guest timelines (the guest sends distinct ids per timeline).
+            // fb itself submits once as well.
+            for k in 0..4 {
+                let fx = if k == 0 { fb } else { open(b"/dev/dri/card0\0".as_ptr(), O_RDWR) };
+                if fx < 0 || (k != 0 && !ctx_init_venus(fx)) { if k != 0 && fx >= 0 { close(fx); } continue; }
+                let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                    okb += 1;
+                    if poll_in_within(eb.fence_fd, 1000) { b_signalled += 1; }
+                    close(eb.fence_fd);
+                }
+                if k != 0 { close(fx); }
+            }
+            a_pending_after = oka && !poll_in_within(ea.fence_fd, 100);
+        }
+        let rel = fence_hold_mode(0);
+        if oka { a_signals = poll_in_within(ea.fence_fd, 8000); close(ea.fence_fd); }
+        if fa >= 0 { close(fa); }
+        if fb >= 0 { close(fb); }
+        let tl1 = fence_stat(b"tl_fences");
+        out(b"  7d: distinct="); out_u64(distinct as u64); out(b" held4="); out_u64(held4 as u64);
+        out(b" oka="); out_u64(oka as u64); out(b" okb="); out_u64(okb as u64);
+        out(b" b_signalled="); out_u64(b_signalled as u64); out(b" a_pending="); out_u64(a_pending_after as u64);
+        out(b" tl_fences "); out_u64(tl0); out(b"->"); out_u64(tl1); out(b"\n");
+        if !report(b"phase7d_timelines_two_contexts_stalled_one_other_signals",
+                   distinct && held4 && oka && okb == 4 && b_signalled == 4 && a_pending_after) {
+            failures += 1;
+        }
+        if !report(b"phase7d_timelines_stalled_context_signals_on_release", rel && a_signals) {
+            failures += 1;
+        }
+        if !report(b"phase7d_timelines_per_context_ids_used", tl0 != u64::MAX && tl1 >= tl0 + 5) {
+            failures += 1;
+        }
+    }
+
+    // ── 2e. Rings of ONE context are separate timelines ────────────────────
+    // A context with two rings: the first ringed fence (ring 0) is held, a
+    // ring-1 fence of the same context must still signal, and ring 0 signals
+    // on release (Linux keys fence contexts per (context, ring)).
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let mut inited = false;
+        let mut held = false;
+        let mut ok0 = false;
+        let mut ok1 = false;
+        let mut r1_signals = false;
+        let mut r0_pending = false;
+        let mut r0_signals = false;
+        let mut rel = false;
+        // The host retires only the FIRST fence of a bare Venus context (see 7d):
+        // ring 1's fence retires only if it reaches the host before ring 0's has
+        // been answered, a race the slower TCG guest loses about half the time.
+        // So the pair is retried on a fresh context (up to 6 attempts); the
+        // guest-side assertion (ring 1 signals while ring 0 is held) must hold
+        // in at least one attempt.
+        for _attempt in 0..6 {
+            let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            inited = fa >= 0 && ctx_init_venus_rings(fa, 2);
+            held = false; ok0 = false; ok1 = false; r1_signals = false; r0_pending = false; r0_signals = false;
+            let mut e0 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            let mut e1 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            e1.ring_idx = 1;
+            if inited {
+                held = fence_hold_mode(4);
+                ok0 = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e0 as *mut _) == 0 && e0.fence_fd >= 3;
+                ok1 = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e1 as *mut _) == 0 && e1.fence_fd >= 3;
+                r1_signals = ok1 && poll_in_within(e1.fence_fd, 1500);
+                r0_pending = ok0 && !poll_in_within(e0.fence_fd, 100);
+            }
+            rel = fence_hold_mode(0);
+            if ok0 { r0_signals = poll_in_within(e0.fence_fd, 2000); close(e0.fence_fd); }
+            if ok1 { close(e1.fence_fd); }
+            if fa >= 0 { close(fa); }
+            if inited && held && ok0 && ok1 && r1_signals && r0_pending && rel && r0_signals { break; }
+        }
+        out(b"  7e: inited="); out_u64(inited as u64); out(b" held="); out_u64(held as u64);
+        out(b" ok0="); out_u64(ok0 as u64); out(b" ok1="); out_u64(ok1 as u64);
+        out(b" r1_signals="); out_u64(r1_signals as u64); out(b" r0_pending="); out_u64(r0_pending as u64); out(b"\n");
+        if !report(b"phase7e_rings_of_one_context_independent",
+                   inited && held && ok0 && ok1 && r1_signals && r0_pending) {
+            failures += 1;
+        }
+        if !report(b"phase7e_held_ring_signals_on_release", rel && r0_signals) { failures += 1; }
+    }
+
+    // ── 2f. Per-timeline watchdog: one stuck context is written off alone ───
+    // Context A's first ringed fence is held past the watchdog's 10 s limit
+    // (hold mode 4 parks it up to 20 s) while context B keeps submitting and
+    // being answered. A's fence must be written off by the watchdog (its fd
+    // signals while the hold is still on) without the host being declared
+    // hung, and B must be unaffected throughout (no EAGAIN, every fence signals).
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let wo0 = fence_stat(b"ctx_lost");
+        let hung0 = fence_stat(b"hangs");
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && ctx_init_venus(fa);
+        let mut held = false;
+        let mut oka = false;
+        let mut b_ok = 0u32;
+        let mut b_sig = 0u32;
+        let mut b_ok2 = 0u32;
+        let mut b_sig2 = 0u32;
+        let mut a_early = false;
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        let fb1 = |ok: &mut u32, sig: &mut u32| {
+            // Fresh context per fence (see 7d: one fence per bare context).
+            let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            if fx >= 0 && ctx_init_venus(fx) {
+                let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                    *ok += 1;
+                    if poll_in_within(eb.fence_fd, 4000) { *sig += 1; }
+                    close(eb.fence_fd);
+                }
+            }
+            if fx >= 0 { close(fx); }
+        };
+        if inited {
+            held = fence_hold_mode(4);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            // B traffic every 1.8 s while A ages (the host is never silent), then
+            // wait for the watchdog to write A off (10 s after it was parked),
+            // then one more B fence with the hold still on.
+            for _ in 0..5 {
+                fb1(&mut b_ok, &mut b_sig);
+                poll(core::ptr::null_mut(), 0, 1800);
+            }
+            // The host is alive, so A's context is LOST but A's fence must NOT
+            // signal early (Linux: a fence signals only when the host answers).
+            a_early = oka && !poll_in_within(ea.fence_fd, 8000);
+            fb1(&mut b_ok2, &mut b_sig2);
+        }
+        let wo1 = fence_stat(b"ctx_lost");
+        let hung1 = fence_stat(b"hangs");
+        let hung_now = fence_stat(b"hung_now");
+        // Guilty-context semantics: A's fence reports an error, A's context is
+        // LOST (ringed submit -> ECANCELED), other contexts keep working, and a
+        // context created after A is gone (its id recycled) is not LOST.
+        let a_status = if oka { sync_file_status(ea.fence_fd) } else { 0 };
+        let mut lost_ret = 0;
+        let mut lost_errno = 0;
+        if inited {
+            let mut e2 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            lost_ret = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e2 as *mut _);
+            lost_errno = *__errno_location();
+            if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
+        }
+        let a_still_pending = oka && !poll_in_ready(ea.fence_fd);
+        let a_ctx = if inited { ctx_id(fa) } else { 0 };
+        let rel = fence_hold_mode(0);
+        // Releasing the hold lets the host answer: the fence signals normally.
+        let a_signals_on_release = oka && poll_in_within(ea.fence_fd, 4000);
+        if fa >= 0 { close(fa); }
+        // The app is gone and its context id is free: recycle it (the next
+        // contexts reuse the lowest free ids) while A's out-fence fd is still
+        // held by "another process". The error is per fence, so it survives.
+        let mut c_ok = 0u32;
+        let mut c_sig = 0u32;
+        let fc = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let mut c_reused = false;
+        if fc >= 0 && ctx_init_venus(fc) {
+            c_reused = a_ctx != 0 && ctx_id(fc) == a_ctx;
+            let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(eb.fence_fd, 4000) { c_sig += 1; }
+                close(eb.fence_fd);
+            }
+        }
+        if fc >= 0 { close(fc); }
+        if oka { close(ea.fence_fd); }
+        out(b"  7f: a_status="); out_u64((a_status as i64 + 1_000_000) as u64);
+        out(b" lost_ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64);
+        out(b" recycled_ok="); out_u64(c_ok as u64); out(b" sig="); out_u64(c_sig as u64); out(b"\n");
+        if !report(b"phase7f_stuck_fence_stays_pending_no_error", oka && a_still_pending && status_pending_ok(a_status)) {
+            failures += 1;
+        }
+        if !report(b"phase7f_stuck_fence_signals_on_release", a_signals_on_release) { failures += 1; }
+        if !report(b"phase7f_lost_context_submit_is_ecanceled", inited && lost_ret != 0 && lost_errno == 125) {
+            failures += 1;
+        }
+        if !report(b"phase7f_recycled_context_not_lost", c_reused && c_ok == 1 && c_sig == 1) {
+            failures += 1;
+        }
+        out(b"  7f: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
+        out(b" b_ok="); out_u64(b_ok as u64); out(b" b_sig="); out_u64(b_sig as u64);
+        out(b" after_ok="); out_u64(b_ok2 as u64); out(b" after_sig="); out_u64(b_sig2 as u64);
+        out(b" a_written_off="); out_u64(a_early as u64);
+        out(b" written_off "); out_u64(wo0); out(b"->"); out_u64(wo1);
+        out(b" hangs "); out_u64(hung0); out(b"->"); out_u64(hung1); out(b" hung_now="); out_u64(hung_now); out(b"\n");
+        if !report(b"phase7f_watchdog_stuck_context_written_off_during_hold",
+                   inited && held && oka && a_early && wo0 != u64::MAX && wo1 >= wo0 + 1) {
+            failures += 1;
+        }
+        if !report(b"phase7f_watchdog_other_context_unaffected",
+                   b_ok == 5 && b_sig == 5 && b_ok2 == 1 && b_sig2 == 1 && hung_now == 0 && rel) {
+            failures += 1;
+        }
+    }
+
+    // ── 2f2. Host never answers the in-flight fence (production path) ──────
+    // Same as 2f, but knob mode 5 swallows the host's reply to A's fence, so
+    // the chain is really still in flight (not parked by the kernel). A's
+    // context must go LOST (ringed submit ECANCELED), its fence must stay
+    // pending (no early signal), and other contexts must be unaffected.
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let lost0 = fence_stat(b"ctx_lost");
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && ctx_init_venus(fa);
+        let mut held = false;
+        let mut oka = false;
+        let mut b_ok = 0u32;
+        let mut b_sig = 0u32;
+        let mut a_early = true;
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        if inited {
+            held = fence_hold_mode(5);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            for _ in 0..5 {
+                let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+                if fx >= 0 && ctx_init_venus(fx) {
+                    let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                    if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                        b_ok += 1;
+                        if poll_in_within(eb.fence_fd, 4000) { b_sig += 1; }
+                        close(eb.fence_fd);
+                    }
+                }
+                if fx >= 0 { close(fx); }
+                poll(core::ptr::null_mut(), 0, 1800);
+            }
+            a_early = oka && poll_in_within(ea.fence_fd, 8000);
+        }
+        let lost1 = fence_stat(b"ctx_lost");
+        let mut lost_ret = 0;
+        let mut lost_errno = 0;
+        if inited {
+            let mut e2 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            lost_ret = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e2 as *mut _);
+            lost_errno = *__errno_location();
+            if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
+        }
+        let a_pending = oka && !poll_in_ready(ea.fence_fd);
+        let a_status = if oka { sync_file_status(ea.fence_fd) } else { 0 };
+        let rel = fence_hold_mode(0);
+        if oka { close(ea.fence_fd); }
+        if fa >= 0 { close(fa); }
+        out(b"  7f2: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
+        out(b" b="); out_u64(b_ok as u64); out(b"/"); out_u64(b_sig as u64);
+        out(b" early="); out_u64(a_early as u64); out(b" status="); out_u64((a_status as i64 + 1_000_000) as u64);
+        out(b" lost "); out_u64(lost0); out(b"->"); out_u64(lost1);
+        out(b" ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64); out(b"\n");
+        if !report(b"phase7f2_unanswered_fence_stays_pending",
+                   inited && held && oka && !a_early && a_pending && status_pending_ok(a_status)) {
+            failures += 1;
+        }
+        if !report(b"phase7f2_unanswered_context_lost_submit_ecanceled",
+                   lost0 != u64::MAX && lost1 >= lost0 + 1 && lost_ret != 0 && lost_errno == 125) {
+            failures += 1;
+        }
+        if !report(b"phase7f2_other_context_unaffected", b_ok == 5 && b_sig == 5 && rel) { failures += 1; }
+    }
+
+    // ── 2g. Whole-host-silent write-off does NOT mark the context lost ──────
+    // One fence held past the 10 s limit while NOTHING else is answered: the
+    // host looks silent (a host-wide stall that recovers), so the write-off
+    // must not turn into a guilty-context verdict: no error status, no
+    // ECANCELED on the next ringed submit.
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && ctx_init_venus(fa);
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        let mut oka = false;
+        let mut a_wo = false;
+        if inited {
+            fence_hold_mode(4);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            a_wo = oka && poll_in_within(ea.fence_fd, 18000);
+        }
+        let st = if oka { sync_file_status(ea.fence_fd) } else { -1 };
+        let mut sub_errno = 0;
+        if inited {
+            let mut e2 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            let r = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e2 as *mut _);
+            sub_errno = if r == 0 { 0 } else { *__errno_location() };
+            if r == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
+        }
+        fence_hold_mode(0);
+        if oka { close(ea.fence_fd); }
+        if fa >= 0 { close(fa); }
+        out(b"  7g: a_written_off="); out_u64(a_wo as u64); out(b" status="); out_u64((st as i64 + 1_000_000) as u64);
+        out(b" submit_errno="); out_u64(sub_errno as u64); out(b"\n");
+        if !report(b"phase7g_whole_host_silent_writeoff_not_guilty",
+                   inited && oka && a_wo && sub_errno != 125) {
+            failures += 1;
+        }
+        // Let the host answer again so later phases start from a healthy state.
+        let mut c_ok = 0u32;
+        let mut c_sig = 0u32;
+        let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fx >= 0 && ctx_init_venus(fx) {
+            let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(eb.fence_fd, 4000) { c_sig += 1; }
+                close(eb.fence_fd);
+            }
+        }
+        if fx >= 0 { close(fx); }
+        if !report(b"phase7g_host_recovers_after_silent_writeoff", c_ok == 1 && c_sig == 1) { failures += 1; }
     }
 
     // Unlock drains only happen when an interrupt loses the device lock, which a
@@ -1750,7 +2124,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             let spans1 = getparam_quiet(fd, VIRTGPU_PARAM_LEANDROS_HOSTVIS_SPANS);
             out(b"  window spans with A mapped = "); out_param(spans0);
             out(b", after both gone = "); out_param(spans1); out(b"\n");
-            if !report(b"BLOBWIN_SPAN_RETURNED_AFTER_MUNMAP", spans1.wrapping_add(1) == spans0) { failures += 1; }
+            // The span count is device-global: another GPU client (a COSMIC
+            // session) moves it. One explicit verdict instead of a racy check.
+            let sole_4c2 = sole_gpu_client();
+            if !sole_4c2 {
+                out(b"  another process holds a GPU context: span count is device-global; boot with nvrm.desktop=0\n");
+                if !report(b"blobwin_sole_gpu_client", false) { failures += 1; }
+            } else if !report(b"BLOBWIN_SPAN_RETURNED_AFTER_MUNMAP", spans1.wrapping_add(1) == spans0) { failures += 1; }
         }
     }
 
@@ -2226,7 +2606,13 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
             if !init_ok[i] { out(b"(init-failed)"); }
         }
         out(b"\n");
-        if !report(b"phase3_16_contexts_distinct", distinct_ok) { failures += 1; }
+        // Other contexts opening/closing while the slots are probed make the
+        // count (and so this check) racy: say so once instead.
+        if free != u64::MAX && free < 255 {
+            out(b"  another process holds a GPU context (free slots = "); out_u64(free);
+            out(b"): boot with nvrm.desktop=0\n");
+            if !report(b"phase3_sole_gpu_client", false) { failures += 1; }
+        } else if !report(b"phase3_16_contexts_distinct", distinct_ok) { failures += 1; }
 
         // The 17th must fail the ioctl outright…
         let refused = opened == n_try && !init_ok[n_ctx];

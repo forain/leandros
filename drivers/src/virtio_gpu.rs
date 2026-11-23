@@ -115,6 +115,18 @@ pub struct VirtioGpuDevice {
     /// reaches them, so `fence_retired` is exact rather than a watermark that
     /// would declare an unfinished fence done because a later one finished.
     fence_floor: u64,
+    /// Per-(context, ring) fence timelines (Linux's per-ring fence contexts). A
+    /// ring-indexed fenced command of context `c` ring `r` is numbered
+    /// `(c*64+r) << FENCE_TL_SHIFT | seq` on its own timeline, `seq` from
+    /// `TL_NEXT_SEQ` (never reused, never 0), and its retirement is tracked
+    /// by `TL_FLOOR` (every seq `<=` it has retired). Timeline 0 is the
+    /// legacy global one (`next_fence_id`/`fence_floor`): unringed commands,
+    /// which the host retires in global submission order. One stalled context
+    /// therefore holds back only its own timeline.
+    /// Hold window (test knob): the first fenced ids submitted after the hold
+    /// began; only these are parked.
+    hold_win: [u64; 16],
+    hold_win_n: usize,
     /// Retired fence ids above `fence_floor`; 0 marks a free slot. Sized to the
     /// control queue, which bounds how many fences can be outstanding at all.
     fences_ahead: Vec<u64>,
@@ -122,6 +134,8 @@ pub struct VirtioGpuDevice {
     fences_ahead_t: Vec<u64>,
     /// Retirements parked by the fence-hold test knob (`FENCE_HOLD_UNTIL_US`).
     held: [u64; FENCE_HELD_MAX],
+    /// When each `held` entry was parked (us), for the watchdog.
+    held_t: [u64; FENCE_HELD_MAX],
     held_n: usize,
     /// Occupied `fences_ahead` slots.
     ahead_n: usize,
@@ -133,9 +147,6 @@ pub struct VirtioGpuDevice {
     /// `submit`/`submit_async` from task context. Capacity reserved at init so
     /// a push never allocates.
     deferred_free: Vec<(usize, usize)>,
-    /// Next 3D context id to hand out once the recycled pool is exhausted.
-    /// Context 0 means "no context".
-    next_ctx_id: u32,
     /// Context ids in use (bit n = id n, ids below `CTX_ID_POOL`).
     ctx_ids_used: [u64; (CTX_ID_POOL / 64) as usize],
     /// Ids whose destroyed context left a chain parked host-side.
@@ -592,6 +603,34 @@ pub static LAST_PRESENT_FENCE: core::sync::atomic::AtomicU64 = core::sync::atomi
 /// runs from the tick and must not take `VIRTIO_GPU`.
 pub static GPU_FENCE_FLOOR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Number of fence timelines: 0 = legacy global, 1..FENCE_TLS = per context id
+/// (`ctx_id < CTX_ID_POOL`). A fence id is `tl << FENCE_TL_SHIFT | seq`; the
+/// legacy ids are plain small numbers, so a host that compares ids (QEMU's
+/// legacy `fence_id <= retired`) never retires a ring fence by a legacy one.
+pub const FENCE_CTXS: usize = CTX_ID_POOL as usize;
+/// Rings per context (`VIRTGPU_CONTEXT_PARAM_NUM_RINGS` cap, Linux's 64).
+pub const FENCE_RINGS: usize = 64;
+pub const FENCE_TLS: usize = FENCE_CTXS * FENCE_RINGS;
+pub const FENCE_TL_SHIFT: u32 = 40;
+/// Timeline index of `(ctx, ring)`: `ctx << 6 | ring` (ctx 0 is legacy-only).
+const fn fence_tl_of(ctx: usize, ring: usize) -> usize { ctx * FENCE_RINGS + ring }
+/// Next seq of each timeline (never reused, never 0), under `VIRTIO_GPU`.
+static TL_NEXT_SEQ: [core::sync::atomic::AtomicU64; FENCE_TLS] =
+    [const { core::sync::atomic::AtomicU64::new(1) }; FENCE_TLS];
+/// When the host last answered a fence of each timeline (us), for the
+/// per-timeline watchdog.
+static TL_LAST_ANSWER_US: [core::sync::atomic::AtomicU64; FENCE_TLS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; FENCE_TLS];
+const FENCE_SEQ_MASK: u64 = (1u64 << FENCE_TL_SHIFT) - 1;
+/// Per-timeline floors (seq space), lock-free mirror of `tl_floor`; entry 0 is
+/// the legacy floor (== `GPU_FENCE_FLOOR`).
+static TL_FLOOR: [core::sync::atomic::AtomicU64; FENCE_TLS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; FENCE_TLS];
+/// Bumped on every floor movement of any timeline (syncobj wake hash).
+pub static FENCE_FLOOR_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Fenced submissions on a per-context timeline (stats).
+static TL_FENCES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Lock-free mirror of `VirtioGpuDevice::fences_ahead` (fences retired ahead
 /// of an older unretired one), slot for slot. Lets the DRM layer retire an
 /// out-of-order fence without waiting for the global floor (design venusasync
@@ -643,7 +682,7 @@ enum EnqErr { Busy, Other }
 /// `submit_3d` failure: `Busy` = retired-ahead fence ceiling (answer EAGAIN),
 /// `Other` = anything else (EIO). Decided under the device lock.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Submit3dErr { Busy, Other }
+pub enum Submit3dErr { Busy, Other, BadRing, Canceled }
 
 /// True while fenced work is refused for want of retired-ahead slots (the
 /// ceiling). Callers turn a `submit_3d` failure into EAGAIN on this.
@@ -660,7 +699,9 @@ pub fn fence_table_at_ceiling() -> bool {
 pub fn fence_done_lockfree(id: u64) -> bool {
     use core::sync::atomic::Ordering::{Acquire, SeqCst};
     if id == 0 { return true; }
-    if id <= GPU_FENCE_FLOOR.load(Acquire) { return true; }
+    let tl = ((id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
+    let seq = id & FENCE_SEQ_MASK;
+    if seq <= TL_FLOOR[tl].load(Acquire) { return true; }
     if AHEAD_COUNT.load(Acquire) != 0 {
         for c in 0..=AHEAD_EXTRA.len() {
             if c == 0 {
@@ -675,7 +716,7 @@ pub fn fence_done_lockfree(id: u64) -> bool {
         }
     }
     core::sync::atomic::fence(SeqCst);
-    id <= GPU_FENCE_FLOOR.load(Acquire)
+    seq <= TL_FLOOR[tl].load(Acquire)
 }
 
 /// Fence watchdog (`VirtioGpuDevice::fence_watchdog`): fenced work pending
@@ -685,7 +726,42 @@ const FENCE_HANG_US: u64 = 10_000_000;
 /// Once hung, how long a newer fence may stay unanswered before it is written
 /// off too (the host may have recovered; give it a moment to say so).
 const FENCE_HUNG_US: u64 = 1_000_000;
+/// Write-off limit of a stuck timeline while OTHER timelines are still being
+/// answered (the host is alive, so this one may be a legitimately long job):
+/// a late retirement after the write-off would be a use-after-free, so wait
+/// much longer than for the whole-host-silent case. Test knob mode 4 shortens it.
+const FENCE_ALIVE_US_DEFAULT: u64 = 60_000_000;
+static FENCE_ALIVE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(FENCE_ALIVE_US_DEFAULT);
+/// Guilty-context marking: a context one of whose timelines is stuck while the
+/// host still answers OTHER timelines is LOST: its ringed submits fail ECANCELED
+/// (`ctx_lost`). Its pending fences are NOT signalled: like Linux virtio-gpu, a
+/// fence signals only when the host answers (or the device is reset). An early
+/// signal would let `vkWaitForFences` succeed (sync_file poll is POLLIN for any
+/// signalled fence, error or not) while the host still uses the BO. A LOST
+/// timeline takes no new submits, so it adds nothing to the retired-ahead table
+/// beyond what is already in flight. Cleared in `ctx_free_id`.
+static CTX_LOST: [core::sync::atomic::AtomicBool; CTX_ID_POOL as usize] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; CTX_ID_POOL as usize];
+/// Contexts marked LOST by the watchdog (stat).
+static CTXS_LOST_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Mark the context of fence `id` LOST (ringed timelines only); true if newly marked.
+/// The WHOLE-HOST-SILENT write-off never calls this: a host-wide stall that
+/// recovers (the host Metal/HVF watchdog) must not kill COSMIC/Firefox.
+fn ctx_mark_lost(id: u64) -> bool {
+    use core::sync::atomic::Ordering::{Relaxed, AcqRel};
+    let tl = (id >> FENCE_TL_SHIFT) as usize;
+    if tl == 0 || tl >= FENCE_TLS { return false; }
+    let was = CTX_LOST[tl / FENCE_RINGS].swap(true, AcqRel);
+    if !was { CTXS_LOST_TOTAL.fetch_add(1, Relaxed); }
+    !was
+}
+/// Has the watchdog declared this context lost (ringed submits get ECANCELED)?
+pub fn ctx_lost(ctx: u32) -> bool {
+    (ctx as usize) < CTX_ID_POOL as usize && CTX_LOST[ctx as usize].load(core::sync::atomic::Ordering::Acquire)
+}
 static HOST_GPU_HUNG: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Log quota for newly LOST contexts (separate from the hang-episode count).
+static CTX_LOST_LOGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HOST_HANGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Fences retired by the watchdog rather than by the host.
 pub static FENCES_WRITTEN_OFF: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -697,9 +773,11 @@ pub fn host_gpu_hung() -> bool {
 }
 
 /// The host answered a fenced command: it is alive.
-fn host_fence_answered() {
+fn host_fence_answered(id: u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    LAST_FENCE_ANSWER_US.store(crate::snd::monotonic_us(), Relaxed);
+    let now = crate::snd::monotonic_us();
+    LAST_FENCE_ANSWER_US.store(now, Relaxed);
+    TL_LAST_ANSWER_US[((id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1)].store(now, Relaxed);
     if HOST_GPU_HUNG.swap(false, Relaxed) {
         crate::pci::serial_debug("[GPU] host answers fences again; GPU hang state cleared\n");
     }
@@ -716,7 +794,7 @@ pub static CTX_CHAINS_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic
 
 /// Context ids `1..CTX_ID_POOL` are recycled (lowest free first, like Linux's
 /// ida); above that they are handed out monotonically.
-const CTX_ID_POOL: u32 = 256;
+pub const CTX_ID_POOL: u32 = 320;
 
 /// A reap retired at least one fence and the DRM layer has not been told yet.
 /// Set under `VIRTIO_GPU` (any context), consumed by `ctrlq_tick`.
@@ -748,8 +826,10 @@ const FENCE_HOLD_MAX_US: u64 = 2_000_000;
 const FENCE_HELD_MAX: usize = 64;
 /// Test knob mode 3: park only the first retiring fence.
 static FENCE_HOLD_ONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Fence ids below this were submitted before the hold began and are never parked.
-static FENCE_HOLD_MIN_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Mode 4: the hold window is the first PER-CONTEXT-timeline fence only.
+/// Test knob mode 5: the host "never answers" the first ringed fence (its reply is dropped before the reap retires it; the chain stays in flight).
+static FENCE_HOLD_DROP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static FENCE_HOLD_RING_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static FENCE_HOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCE_HELD_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCE_HOLD_AUTO_RELEASES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -807,12 +887,15 @@ fn task_reap_event() {
 pub fn fence_hold_set(mode: u32) {
     use core::sync::atomic::Ordering::{Relaxed, Release};
     match mode {
-        1 | 3 => {
+        1 | 3 | 4 | 5 => {
             FENCE_HOLDS.fetch_add(1, Relaxed);
-            let min = VIRTIO_GPU.lock().as_ref().map(|g| g.next_fence_id).unwrap_or(0);
-            FENCE_HOLD_MIN_ID.store(min, Relaxed);
-            FENCE_HOLD_ONE.store(mode == 3, Relaxed);
-            let lim = if mode == 3 { 20_000_000 } else { FENCE_HOLD_MAX_US };
+            if let Some(g) = VIRTIO_GPU.lock().as_mut() { g.hold_win_n = 0; }
+            FENCE_HOLD_ONE.store(mode >= 3, Relaxed);
+            FENCE_HOLD_DROP.store(mode == 5, Relaxed);
+            FENCE_ALIVE_US.store(if mode >= 4 { 10_000_000 } else { FENCE_ALIVE_US_DEFAULT }, Relaxed);
+            FENCE_HOLD_RING_ONLY.store(mode >= 4, Relaxed);
+            // Modes 4/5 (phase 7f) get a long auto-release so slow TCG cannot expire the hold mid-test.
+            let lim = if mode >= 4 { 40_000_000 } else if mode == 3 { 20_000_000 } else { FENCE_HOLD_MAX_US };
             FENCE_HOLD_UNTIL_US.store((crate::snd::monotonic_us() + lim).max(1), Release);
         }
         2 => {
@@ -820,6 +903,7 @@ pub fn fence_hold_set(mode: u32) {
             FENCE_EVENT_PENDING.store(true, Release);
         }
         _ => {
+            FENCE_HOLD_DROP.store(false, Relaxed);
             FENCE_HOLD_UNTIL_US.store(0, Release);
             if let Some(gpu) = VIRTIO_GPU.lock().as_mut() { gpu.hold_release(); }
             FENCE_EVENT_PENDING.store(true, Release);
@@ -843,6 +927,9 @@ pub fn fence_stats_text(s: &mut alloc::string::String) {
     let _ = writeln!(s, "unlock_drains={} ahead_n={} ahead_peak={} ahead_growths={} ahead_cap={} ahead_qsize={} submit_refused={} ahead_dropped={}",
         CTRLQ_UNLOCK_DRAINS.load(Relaxed), AHEAD_COUNT.load(Relaxed), AHEAD_PEAK.load(Relaxed), AHEAD_GROWTHS.load(Relaxed),
         AHEAD_CAP.load(Relaxed), AHEAD_QSIZE.load(Relaxed), FENCE_SUBMIT_REFUSED.load(Relaxed), FENCE_AHEAD_DROPPED.load(Relaxed));
+    let _ = writeln!(s, "tl_fences={}", TL_FENCES.load(Relaxed));
+    let _ = writeln!(s, "watchdog written_off={} ctx_lost={} hangs={} hung_now={}",
+        FENCES_WRITTEN_OFF.load(Relaxed), CTXS_LOST_TOTAL.load(Relaxed), HOST_HANGS.load(Relaxed), host_gpu_hung() as u8);
     let _ = writeln!(s, "hook_lat_us n={} p50<={} p99<={} max={}",
         HOOK_LAT.n.load(Relaxed), HOOK_LAT.quantile_ub(500), HOOK_LAT.quantile_ub(990), HOOK_LAT.max.load(Relaxed));
     let _ = writeln!(s, "hol_us n={} p50<={} p99<={} max={}",
@@ -1558,15 +1645,17 @@ impl VirtioGpuDevice {
             intx: None,
             next_fence_id: 1,
             fence_floor: 0,
+            hold_win: [0; 16],
+            hold_win_n: 0,
             fences_ahead: Vec::new(),
             fences_ahead_t: Vec::new(),
             held: [0; FENCE_HELD_MAX],
+            held_t: [0; FENCE_HELD_MAX],
             ahead_n: 0,
             held_n: 0,
             inflight: Vec::new(),
             deferred_free: Vec::new(),
-            next_ctx_id: CTX_ID_POOL,
-            ctx_ids_used: [1; (CTX_ID_POOL / 64) as usize], // id 0 is never handed out
+            ctx_ids_used: { let mut a = [0u64; (CTX_ID_POOL / 64) as usize]; a[0] = 1; a }, // id 0 is never handed out
             ctx_ids_parked: [0; (CTX_ID_POOL / 64) as usize],
             next_3d_resource_id: 16,
             current_resource_id: 0,
@@ -1979,20 +2068,23 @@ impl VirtioGpuDevice {
     /// only advances over ids that have actually completed.
     fn fence_complete(&mut self, id: u64) {
         use core::sync::atomic::Ordering::{Relaxed, Release};
-        if id == 0 || id <= self.fence_floor { return; }
+        if id == 0 { return; }
+        let tl = ((id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
+        let seq = id & FENCE_SEQ_MASK;
+        let base = id & !FENCE_SEQ_MASK;
+        if seq <= TL_FLOOR[tl].load(Relaxed) { return; }
         let now = crate::snd::monotonic_us();
-        if id == self.fence_floor + 1 {
-            self.fence_floor = id;
-            // Fold in everything that had finished ahead of the floor.
+        if seq == TL_FLOOR[tl].load(Relaxed) + 1 {
+            TL_FLOOR[tl].store(seq, Release);
+            // Fold in everything that had finished ahead of this timeline's floor.
             while self.ahead_n != 0 {
-                let next = self.fence_floor + 1;
-                match self.fences_ahead.iter().position(|&f| f == next) {
+                let next = TL_FLOOR[tl].load(Relaxed) + 1;
+                match self.fences_ahead.iter().position(|&f| f == (base | next)) {
                     Some(i) => {
                         self.fences_ahead[i] = 0;
                         self.ahead_n -= 1;
-                        self.fence_floor = next;
                         // Floor first, mirror slot cleared after (see `fence_done_lockfree`).
-                        GPU_FENCE_FLOOR.store(next, Release);
+                        TL_FLOOR[tl].store(next, Release);
                         if let Some(m) = ahead_pub_slot(i) { m.store(0, Release); }
                         AHEAD_COUNT.store(self.ahead_n as u64, Release);
                         if let Some(&t) = self.fences_ahead_t.get(i) { HOL_LAT.record(now.saturating_sub(t)); }
@@ -2000,6 +2092,7 @@ impl VirtioGpuDevice {
                     None => break,
                 }
             }
+            if tl == 0 { self.fence_floor = TL_FLOOR[0].load(Relaxed); }
         } else if let Some(i) = self.fences_ahead.iter().position(|&f| f == 0) {
             self.fences_ahead[i] = id;
             self.ahead_n += 1;
@@ -2016,7 +2109,8 @@ impl VirtioGpuDevice {
             // The retirement is lost instead (the watchdog reports a hang).
             FENCE_AHEAD_DROPPED.fetch_add(1, Relaxed);
         }
-        GPU_FENCE_FLOOR.store(self.fence_floor, Release);
+        GPU_FENCE_FLOOR.store(TL_FLOOR[0].load(Relaxed), Release);
+        FENCE_FLOOR_EPOCH.fetch_add(1, Release);
         let _ = FIRST_RETIRE_US.compare_exchange(0, now.max(1), Relaxed, Relaxed);
     }
 
@@ -2026,8 +2120,8 @@ impl VirtioGpuDevice {
         let u = FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire);
         // Park only the 16 ids submitted right after the hold began: a busy
         // compositor would otherwise fill the parking list and end the hold.
-        let hmin = FENCE_HOLD_MIN_ID.load(core::sync::atomic::Ordering::Relaxed);
-        if u != 0 && (id < hmin || id >= hmin.saturating_add(16)) {
+        let in_win = self.hold_win[..self.hold_win_n].contains(&id);
+        if u != 0 && !in_win {
             self.fence_complete(id);
             return;
         }
@@ -2041,6 +2135,7 @@ impl VirtioGpuDevice {
             }
             if crate::snd::monotonic_us() < u && self.held_n < FENCE_HELD_MAX {
                 self.held[self.held_n] = id;
+                self.held_t[self.held_n] = crate::snd::monotonic_us();
                 self.held_n += 1;
                 FENCE_HELD_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return;
@@ -2058,14 +2153,17 @@ impl VirtioGpuDevice {
         let mut lo = 0;
         for i in 1..self.held_n { if self.held[i] < self.held[lo] { lo = i; } }
         let keep = self.held[lo];
+        let keep_t = self.held_t[lo];
         let n = self.held_n;
         let all = self.held;
         self.held_n = 1;
         self.held[0] = keep;
+        self.held_t[0] = keep_t;
         for i in 0..n { if all[i] != keep { self.fence_complete(all[i]); } }
     }
 
     fn hold_release(&mut self) {
+        FENCE_ALIVE_US.store(FENCE_ALIVE_US_DEFAULT, core::sync::atomic::Ordering::Relaxed);
         FENCE_HOLD_ONE.store(false, core::sync::atomic::Ordering::Relaxed);
         FENCE_HOLD_UNTIL_US.store(0, core::sync::atomic::Ordering::Release);
         let n = self.held_n;
@@ -2138,10 +2236,18 @@ impl VirtioGpuDevice {
                 q.last_used_idx = q.last_used_idx.wrapping_add(1);
                 CTRLQ_LAST_USED.store(q.last_used_idx as u32, core::sync::atomic::Ordering::Release);
             }
+            if e.fence_id != 0 && !e.sync
+                && FENCE_HOLD_DROP.load(core::sync::atomic::Ordering::Relaxed)
+                && FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire) != 0
+                && self.hold_win[..self.hold_win_n].contains(&e.fence_id)
+            {
+                // Test knob: the reply is swallowed; chain and fence stay in flight.
+                continue;
+            }
             if e.fence_id != 0 {
                 self.fence_retire_host(e.fence_id);
                 retired = true;
-                host_fence_answered();
+                host_fence_answered(e.fence_id);
                 // The one independent liveness signal for SUBMIT_3D: a reply
                 // that does not echo the fence came from somewhere other than
                 // the fence path, and the stream was very likely not executed.
@@ -2215,7 +2321,7 @@ impl VirtioGpuDevice {
     /// the id answers the parked command with its first fence on that ring,
     /// and the reap frees the chain. With ids never reused (as before) a
     /// parked chain held its descriptors and buffers until reboot.
-    fn ctx_alloc_id(&mut self) -> u32 {
+    fn ctx_alloc_id(&mut self) -> Option<u32> {
         let words = self.ctx_ids_used.len();
         for pass in 0..2 {
             for w in 0..words {
@@ -2224,17 +2330,20 @@ impl VirtioGpuDevice {
                 if cand != 0 {
                     let b = cand.trailing_zeros();
                     self.ctx_ids_used[w] |= 1u64 << b;
-                    return w as u32 * 64 + b;
+                    return Some(w as u32 * 64 + b);
                 }
             }
         }
-        let id = self.next_ctx_id;
-        self.next_ctx_id = self.next_ctx_id.wrapping_add(1).max(CTX_ID_POOL);
-        id
+        // Pool exhausted: no id beyond it (its fences would have no timeline of
+        // their own, the early-retire hazard). Linux refuses the same way.
+        None
     }
 
     fn ctx_free_id(&mut self, id: u32) {
         if id != 0 && id < CTX_ID_POOL {
+            // The id may be recycled: forget the guilty marking (the parked
+            // chains stay parked, see `ctx_ids_parked`).
+            CTX_LOST[id as usize].store(false, core::sync::atomic::Ordering::Release);
             self.ctx_ids_used[(id / 64) as usize] &= !(1u64 << (id % 64));
             // Still parked? Keep preferring it until its chains come back.
             let parked = self.inflight.iter().flatten()
@@ -2303,8 +2412,34 @@ impl VirtioGpuDevice {
         let hdr_type = u32::from_le_bytes(head[0..4].try_into().unwrap_or([0; 4]));
         if fenced { self.ahead_reserve()?; }
         let fence_id = if fenced {
-            let f = self.next_fence_id;
-            self.next_fence_id = self.next_fence_id.wrapping_add(1).max(1);
+            let hflags = u32::from_le_bytes(head[4..8].try_into().unwrap_or([0; 4]));
+            let hctx = u32::from_le_bytes(head[16..20].try_into().unwrap_or([0; 4])) as usize;
+            let ringed = hflags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0 && hctx >= 1;
+            let hring = head.get(20).copied().unwrap_or(0) as usize;
+            // A ringed command of a context or ring beyond the timeline space
+            // must not fall back to the legacy timeline (early retire): refuse.
+            if ringed && (hctx >= FENCE_CTXS || hring >= FENCE_RINGS) { return Err(EnqErr::Other); }
+            let f = if ringed {
+                let tl = fence_tl_of(hctx, hring);
+                let q = TL_NEXT_SEQ[tl].load(core::sync::atomic::Ordering::Relaxed);
+                let nq = (q + 1) & FENCE_SEQ_MASK;
+                TL_NEXT_SEQ[tl].store(if nq == 0 { 1 } else { nq }, core::sync::atomic::Ordering::Relaxed);
+                TL_FENCES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                ((tl as u64) << FENCE_TL_SHIFT) | q
+            } else {
+                let f = self.next_fence_id;
+                self.next_fence_id = (self.next_fence_id.wrapping_add(1) & FENCE_SEQ_MASK).max(1);
+                f
+            };
+            // Hold window: the first ids after the hold began (mode 4: the
+            // first per-context one only).
+            let hu = FENCE_HOLD_UNTIL_US.load(core::sync::atomic::Ordering::Acquire);
+            let ring_only = FENCE_HOLD_RING_ONLY.load(core::sync::atomic::Ordering::Relaxed);
+            let cap = if ring_only { 1 } else { self.hold_win.len() };
+            if hu != 0 && self.hold_win_n < cap && (!ring_only || f >> FENCE_TL_SHIFT != 0) {
+                self.hold_win[self.hold_win_n] = f;
+                self.hold_win_n += 1;
+            }
             f
         } else {
             0
@@ -3227,7 +3362,8 @@ impl VirtioGpuDevice {
     }
 
     pub fn fence_retired(&self, id: u64) -> bool {
-        id != 0 && (id <= self.fence_floor || self.fences_ahead.iter().any(|&f| f == id))
+        id != 0 && ((id & FENCE_SEQ_MASK) <= TL_FLOOR[((id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1)].load(core::sync::atomic::Ordering::Relaxed)
+            || self.fences_ahead.iter().any(|&f| f == id))
     }
 
     /// `fence_retired` after draining the used ring, for a waiter that needs
@@ -3275,23 +3411,74 @@ impl VirtioGpuDevice {
     /// written off. Tick context: no allocation, no lock beyond the device's.
     pub fn fence_watchdog(&mut self, now: u64) -> usize {
         use core::sync::atomic::Ordering::Relaxed;
-        let mut oldest = u64::MAX;
-        for e in self.inflight.iter().flatten() {
-            if e.fence_id != 0 && !e.sync && e.submitted_us < oldest { oldest = e.submitted_us; }
+        // Per timeline, not per device: a fence is stuck when it has been
+        // pending for the limit AND nothing on ITS timeline has been answered
+        // for that long. Answers of other contexts say nothing about it (one
+        // context's lost fence must not hide behind another's traffic, nor its
+        // later fences fill the retired-ahead table). The shorter post-hang
+        // limit applies only while the whole host has been silent.
+        let last_any = LAST_FENCE_ANSWER_US.load(Relaxed);
+        let silent = now.saturating_sub(last_any) >= FENCE_HANG_US;
+        let hung = host_gpu_hung() && silent;
+        let limit = if hung { FENCE_HUNG_US }
+            else if silent { FENCE_HANG_US }
+            else { FENCE_ALIVE_US.load(Relaxed) };
+        let stuck = |id: u64, t: u64| -> bool {
+            let tl = ((id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
+            let since = t.max(TL_LAST_ANSWER_US[tl].load(Relaxed));
+            // The legacy timeline (tl 0: 2D/unringed fences) keeps the plain
+            // 10 s Linux job timeout; only ringed timelines get the long
+            // "host is alive, may be a legitimately long job" limit.
+            // While the host answers other timelines only a ringed timeline
+            // can be guilty, once (a LOST context is not re-flagged); the
+            // legacy timeline is shared by everyone and never blamed.
+            if !silent && (tl == 0 || CTX_LOST[tl / FENCE_RINGS].load(Relaxed)) { return false; }
+            now.saturating_sub(since) >= limit
+        };
+        // Cheap exit: anything pending at all?
+        let mut any = self.held_n != 0;
+        if !any {
+            for e in self.inflight.iter().flatten() {
+                if e.fence_id != 0 && !e.sync { any = true; break; }
+            }
         }
-        if oldest == u64::MAX { return 0; }
-        let hung = host_gpu_hung();
-        let since = oldest.max(LAST_FENCE_ANSWER_US.load(Relaxed));
-        let limit = if hung { FENCE_HUNG_US } else { FENCE_HANG_US };
-        if now.saturating_sub(since) < limit { return 0; }
+        if !any { return 0; }
         let mut total = 0usize;
+        let mut chains = 0usize;
+        let mut lost_n = 0usize;
+        let mut first_id = 0u64;
+        // Parked by the fence-hold test knob: the simulated "host never
+        // retires it" case (answered, but not applied); same rule.
+        let mut hi = 0;
+        while hi < self.held_n {
+            let id = self.held[hi];
+            if stuck(id, self.held_t[hi]) {
+                if !silent { // host alive: context LOST, the fence stays parked
+                    if ctx_mark_lost(id) { lost_n += 1; }
+                    hi += 1;
+                    continue;
+                }
+                self.held_n -= 1;
+                self.held[hi] = self.held[self.held_n];
+                self.held_t[hi] = self.held_t[self.held_n];
+                if first_id == 0 { first_id = id; }
+                // Ending the hold-one mode: nothing else is parked behind it.
+                FENCE_HOLD_ONE.store(false, Relaxed);
+                self.fence_complete(id);
+                total += 1;
+            } else { hi += 1; }
+        }
         loop {
             let mut ids = [0u64; 16];
             let mut n = 0usize;
             for slot in self.inflight.iter_mut() {
                 if n == ids.len() { break; }
                 if let Some(e) = slot.as_mut() {
-                    if e.fence_id == 0 || e.sync { continue; }
+                    if e.fence_id == 0 || e.sync || !stuck(e.fence_id, e.submitted_us) { continue; }
+                    if !silent { // host alive: context LOST, the fence stays pending
+                        if ctx_mark_lost(e.fence_id) { lost_n += 1; }
+                        continue;
+                    }
                     ids[n] = e.fence_id;
                     n += 1;
                     e.fence_id = 0;
@@ -3299,21 +3486,43 @@ impl VirtioGpuDevice {
                 }
             }
             if n == 0 { break; }
+            if first_id == 0 { first_id = ids[0]; }
             for &id in &ids[..n] { self.fence_complete(id); }
             total += n;
+            chains += n;
         }
-        CTX_CHAINS_PARKED.fetch_add(total as u64, Relaxed);
-        FENCES_WRITTEN_OFF.fetch_add(total as u64, Relaxed);
-        if !hung {
-            HOST_GPU_HUNG.store(true, Relaxed);
-            let k = HOST_HANGS.fetch_add(1, Relaxed);
+        if lost_n != 0 {
+            let k = CTX_LOST_LOGS.fetch_add(1, Relaxed);
             if k < 8 {
+                crate::pci::serial_debug("[GPU] host context HUNG: a stuck timeline's context is LOST \
+                    (submits ECANCELED); its fences stay pending until the host answers\n");
+            }
+        }
+        if total == 0 { return 0; }
+        CTX_CHAINS_PARKED.fetch_add(chains as u64, Relaxed);
+        FENCES_WRITTEN_OFF.fetch_add(total as u64, Relaxed);
+        let tl = ((first_id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
+        let whole_host = silent;
+        // One count and one log line per hang episode (the first pass only).
+        let first_pass = !host_gpu_hung();
+        if whole_host && first_pass { HOST_GPU_HUNG.store(true, Relaxed); }
+        let k = if first_pass { HOST_HANGS.fetch_add(1, Relaxed) } else { 8 };
+        if k < 8 {
+            if whole_host {
                 crate::pci::serial_debug("[GPU] HOST GPU HUNG: no fence answered for ");
-                crate::pci::serial_debug_dec(now.saturating_sub(since) / 1000);
+                crate::pci::serial_debug_dec(now.saturating_sub(last_any) / 1000);
                 crate::pci::serial_debug(" ms; wrote off ");
                 crate::pci::serial_debug_dec(total as u64);
                 crate::pci::serial_debug(" pending fences (host GL context lost? check QEMU's stderr). \
                     GPU waits now return; rendering will be missing until the host answers again\n");
+            } else {
+                crate::pci::serial_debug("[GPU] host context HUNG: ctx ");
+                crate::pci::serial_debug_dec((tl / FENCE_RINGS) as u64);
+                crate::pci::serial_debug(" ring ");
+                crate::pci::serial_debug_dec((tl % FENCE_RINGS) as u64);
+                crate::pci::serial_debug(" fence unanswered; wrote off ");
+                crate::pci::serial_debug_dec(total as u64);
+                crate::pci::serial_debug(" fences of stuck timelines, others unaffected\n");
             }
         }
         total
@@ -3474,6 +3683,11 @@ impl VirtioGpuDevice {
         }
         if cmds.is_empty() {
             return Err(Submit3dErr::Other);
+        }
+        // A ringed submit needs its own timeline: refuse what has none.
+        if let Some(r) = ring_idx {
+            if ctx_id as usize >= FENCE_CTXS || r as usize >= FENCE_RINGS { return Err(Submit3dErr::BadRing); }
+            if ctx_lost(ctx_id) { return Err(Submit3dErr::Canceled); }
         }
         #[repr(C, packed)]
         struct CmdSubmit {
@@ -3814,7 +4028,10 @@ pub trait GpuSync {
         // Reserved before the round trip: a `GpuLocked` wait releases the
         // device lock, and a concurrent create must not pick the same id. A
         // failed create leaks the id, which is harmless.
-        let ctx_id = self.dev().ctx_alloc_id();
+        let Some(ctx_id) = self.dev().ctx_alloc_id() else {
+            crate::pci::serial_debug("[GPU] ctx_create refused: context id pool exhausted\n");
+            return Err(());
+        };
         let mut name = [0u8; 64];
         let n = debug_name.len().min(63);
         name[..n].copy_from_slice(&debug_name.as_bytes()[..n]);

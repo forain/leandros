@@ -1786,13 +1786,14 @@ unsafe fn t_wide_glyphs(tty0: c_int) -> bool {
     let sid = login_pause(fd);
     let mut ok = switch_to(tty0, free as usize);
     sleep_ms(300);
-    // CJK ideograph x2, kana, Hangul, BMP emoji (watch), SMP emoji (grinning face).
-    let msg = "\x1b[2J\x1b[1;1H\u{4e2d}\x1b[2;1H\u{6f22}\x1b[3;1H\u{3042}\x1b[4;1H\u{d55c}\x1b[5;1H\u{231a}\x1b[6;1H\u{1f600}";
+    // CJK ideograph x2, kana, Hangul, BMP emoji (watch), SMP emoji (grinning face), plus two
+    // code points outside the original emoji ranges (mahjong red dragon, melting face).
+    let msg = "\x1b[2J\x1b[1;1H\u{4e2d}\x1b[2;1H\u{6f22}\x1b[3;1H\u{3042}\x1b[4;1H\u{d55c}\x1b[5;1H\u{231a}\x1b[6;1H\u{1f600}\x1b[7;1H\u{1f004}\x1b[8;1H\u{1fae0}";
     write(fd, msg.as_ptr() as *const c_void, msg.len());
     sleep_ms(500);
-    let mut hashes = [0u64; 6];
+    let mut hashes = [0u64; 8];
     let mut k = 0usize;
-    while k < 6 {
+    while k < 8 {
         let (mut h, mut ink, mut same_as_box) = (0xcbf29ce484222325u64, 0usize, true);
         let mut y = 0usize;
         while y < 16 {
@@ -1819,7 +1820,7 @@ unsafe fn t_wide_glyphs(tty0: c_int) -> bool {
         k += 1;
     }
     let mut a = 0usize;
-    while a < 6 { let mut b = a + 1; while b < 6 { if hashes[a] == hashes[b] { ok = false; } b += 1; } a += 1; }
+    while a < 8 { let mut b = a + 1; while b < 8 { if hashes[a] == hashes[b] { ok = false; } b += 1; } a += 1; }
     switch_to(tty0, 1);
     sleep_ms(100);
     login_resume(sid);

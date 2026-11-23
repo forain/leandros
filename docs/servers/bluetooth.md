@@ -137,7 +137,7 @@ The Pi 5's CYW43455 Bluetooth is on `uarta` (`0x10_7d50_c000`). The device tree 
 `brcm,bcm7271-uart`, so it is an 8250-family 16550 (register shift 2, 96 MHz clock, divisor 52 at 115200
 and 2 at 3 Mbaud, `MCR.AFE` auto RTS/CTS), **not a PL011**; RX is polled because auto flow control holds the
 sender off. `bt::bringup` follows Linux `btbcm`/`hci_bcm` over a `Transport` trait: HCI Reset, Read Local
-Version, the BCM4345C0 minidriver and `.hcd` patchram (`BCM4345C0.hcd`, from `ports/bluez-firmware/fetch.sh`;
+Version, the BCM4345C0 minidriver and `.hcd` patchram (`BCM4345C0.hcd`, from Alpine's `linux-firmware-brcm` via `ports/alpine/firmware.list`;
 each record is validated, exactly one Launch RAM and last), 250 ms, Reset, `0xfc18` to switch to 3 Mbaud,
 then Read Version and Read BD_ADDR. The node `/dev/hci0` appears only after this succeeds. Knobs: `bt=0`
 skips Bluetooth, `bt.baud=N` picks the operational rate, `bt.fw=` the patch file.
@@ -176,7 +176,7 @@ resetting the controller (the root is on USB). `bt::usb_reasm` reassembles H4 pa
 `0xfc09` fragments (584092 bytes in 2361 fragments, 1331 ms in the lane's log), Intel Reset with the boot
 address, wait for the operational image, then the DDC file and the event mask. An already operational
 controller (warm reboot, kexec) skips the download. The firmware set (`ibt-12-16.sfi`/`.ddc`) is fetched by
-`ports/intel-bt/fetch.sh`. Knobs: `bt=0`, `btusb.fw=0`. The `btusb` thread is spawned only when a BT function
+Alpine's `linux-firmware-intel` via `ports/alpine/firmware.list`. Knobs: `bt=0`, `btusb.fw=0`. The `btusb` thread is spawned only when a BT function
 was enumerated, and it registers the same `/dev/hci0`.
 
 Hardening from review (`xhcisafe`): a failed xHCI endpoint disables only its slot, the transport claims the
