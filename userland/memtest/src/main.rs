@@ -2037,7 +2037,29 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
     const PAGES: usize = 1024;
     let mut worst = 0usize;
     let mut ok = true;
+    // [0]: pid of the child the observer hammers (0 = none yet).
+    let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
+    if shared as isize == -1 { return report(name, false); }
     for _ in 0..20 {
+        core::ptr::write_volatile(shared, 0);
+        // An observer hammers the child's /proc files while it faults its
+        // pages in and exits: a reader still holding the child's address
+        // space (parked on `busy`) at exit delays the free past wait4.
+        // Forked first so its own footprint is in `before`.
+        let hammer = fork();
+        if hammer == 0 {
+            let mut buf = [0u8; 1024];
+            let mut path = [0u8; 64];
+            loop {
+                let c = core::ptr::read_volatile(shared) as i32;
+                if c == 0 { continue; }
+                proc_path(c, b"status", &mut path);
+                slurp(&path, &mut buf);
+                proc_path(c, b"statm", &mut path);
+                slurp(&path, &mut buf);
+            }
+        }
         let before = free_ram();
         let pid = fork();
         if pid == 0 {
@@ -2047,8 +2069,11 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
             for pg in 0..PAGES { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
             exit(0);
         }
+        core::ptr::write_volatile(shared, pid as u64);
         let status = wait_status(pid);
         let after = free_ram();
+        syscall2(nr::KILL, hammer as usize, 9);
+        wait_status(hammer);
         let lost = before.saturating_sub(after) / PAGE;
         if lost > worst { worst = lost; }
         ok &= status == 0 && lost < 64;
