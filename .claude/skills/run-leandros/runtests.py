@@ -344,6 +344,8 @@ SUITES = {
                 # Atomic small writes: checkpoints per write (plain 1, cosmic-config 2) and power cuts
                 # between fsync / rename / dir fsync (lane f2fsckpt3; own boots, stops this VM).
                 "host:f2fsckpttest.py", "host:f2fsfulltest.py",
+                # Netwatch trial watch end to end through deploy-kernel (lane slowtier 2026-11-22; ~8 min x86_64 KVM, ~16 min aarch64 TCG, scheduled first as the longest shard job).
+                "host:trialwatchtest.py",
                 # Space reuse on a small f2fs volume: churn writes N x capacity,
                 # statfs/ENOSPC and fsck invariants (lane f2fsgc; own boot, stops this VM).
                 # A spin-locked caller reading a file (the wifi-brcmf ctl poll) must not stall f2fs

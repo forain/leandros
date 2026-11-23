@@ -54,32 +54,75 @@ feat_for() {
   esac
 }
 
+# Target dirs: cargo's fingerprint/metadata hash ignores the precise git rev of
+# a branch/tag dependency, so two apps locked to different libcosmic revs that
+# share one target dir overwrite each other's libcosmic/iced artifacts and every
+# switch between them recompiled ~18 crates (30-80 s) even with nothing changed
+# (7 apps, 3 revs, switched ~6 times: the 100-200 s "up to date" build). Apps
+# are therefore grouped by the libcosmic rev in their Cargo.lock; the first app
+# of a group (in ALL_APPS order) owns the group's target dir, the others symlink
+# to it. Apps without libcosmic join cosmic-files' group.
+ALL_APPS=(cosmic-files cosmic-edit cosmic-screenshot cosmic-store cosmic-player cosmic-monitor cosmic-initial-setup)
+rev_of() { grep -m1 -A3 'name = "libcosmic"' "$SRC/$1/Cargo.lock" 2>/dev/null | grep -o 'libcosmic.git[^"]*#[0-9a-f]*' | head -1 || true; }
+leader_of() {
+  local r a; r=$(rev_of "$1")
+  [[ -n "$r" ]] || { echo cosmic-files; return; }
+  for a in "${ALL_APPS[@]}"; do [[ "$(rev_of "$a")" == "$r" ]] && { echo "$a"; return; }; done
+  echo "$1"
+}
+
 # cosmic-store's reqwest pulls aws-lc-sys, whose C objects reference
 # __stack_chk_guard; the sysroot libc.so does not export it (same gap as
-# ports/mesa/ssp_guard.c), so link the same shim object in.
+# ports/mesa/ssp_guard.c), so link the same shim object in. Rustflags are part
+# of cargo's metadata hash, so the whole target-dir group builds with them
+# (a different flag set in one app would thrash the shared dir again).
 extra_for() {
-  [[ "$1" == cosmic-store ]] || return 0
+  [[ "$(leader_of "$1")" == cosmic-edit ]] || return 0
   local o="$M6/out/ssp_guard-$2.o"
   "$M6/toolchain/$2-linux-musl-cc" -fno-stack-protector -c "$(dirname "$0")/../mesa/ssp_guard.c" -o "$o" || return 1
   echo "--config=target.$2-unknown-linux-musl.rustflags=[\"-C\",\"link-arg=$o\"]"
 }
 
-for app in "${APPS[@]}"; do
+build_one() {
+  local app="$1" lead arch
   if [[ ! -f "$SRC/$app/Cargo.toml" ]]; then
     echo "cosmic-apps: no source at $SRC/$app -- not built (git clone https://github.com/pop-os/$app, tag epoch-1.3.0)" >&2
-    exit 1
+    return 1
   fi
-  # one shared cargo target dir (cosmic-files'), if the app has none of its own
-  if [[ "$app" != cosmic-files && ! -e "$SRC/$app/target" ]]; then
-    ln -s ../cosmic-files/target "$SRC/$app/target"
+  # target dir shared per libcosmic-rev group (see leader_of)
+  lead=$(leader_of "$app")
+  if [[ "$app" != "$lead" ]]; then
+    [[ "$(readlink "$SRC/$app/target" 2>/dev/null)" == "../$lead/target" ]] || { rm -f "$SRC/$app/target"; ln -s "../$lead/target" "$SRC/$app/target"; }
+  elif [[ -L "$SRC/$app/target" ]]; then
+    rm -f "$SRC/$app/target"   # was a symlink into another group's dir
   fi
+  mkdir -p "$SRC/$lead/target"
   sh "$M6/gen-cargo-config.sh" "$SRC/$app" > /dev/null
   for arch in "${ARCHES[@]}"; do
     if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" $(feat_for "$app") $(extra_for "$app" "$arch") > /dev/null; then
       echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
-      exit 1
+      return 1
     fi
     stage_file 0755 "$SRC/$app/target/$arch-unknown-linux-musl/release/$app" "$M6/out/$app-$arch"
     echo "staged $arch: $M6/out/$app-$arch"
   done
+}
+
+# Groups (distinct target dirs) build concurrently, apps inside a group in order.
+GROUPS_=()
+for app in "${APPS[@]}"; do
+  [[ -f "$SRC/$app/Cargo.toml" ]] || { build_one "$app"; exit 1; }
+  l=$(leader_of "$app"); found=0
+  for i in "${!GROUPS_[@]}"; do
+    [[ "${GROUPS_[$i]%% *}" == "$l" ]] && { GROUPS_[$i]+=" $app"; found=1; }
+  done
+  [[ $found -eq 1 ]] || GROUPS_+=("$l $app")
 done
+pids=()
+for g in "${GROUPS_[@]}"; do
+  ( set -e; for app in ${g#* }; do build_one "$app"; done ) &
+  pids+=($!)
+done
+rc=0
+for p in "${pids[@]}"; do wait "$p" || rc=1; done
+exit $rc

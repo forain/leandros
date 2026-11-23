@@ -30,7 +30,7 @@
 #                           root partition. The passphrase is never printed or logged.
 #   --authorized-keys FILE  (or $RPI5_AUTHORIZED_KEYS) public key(s) staged as
 #                           /root/.ssh/authorized_keys for sshd.
-# The CYW43455 firmware is fetched by ports/brcmfmac/fetch.sh into
+# The CYW43455 firmware comes from Alpine's linux-firmware packages (scripts/alpine_firmware.py) into
 # /lib/firmware/brcm/ on the root partition.
 #
 # Requires target/final-aarch64/{kernel,kernel-direct} and initrd-aarch64.cpio,
@@ -250,31 +250,17 @@ populate_f2fs_root() {
     info "Building populated F2FS root image (reuses userland build output)..."
     local tmp_img
     tmp_img="$(mktemp -t rpi5-f2fs-root)"
-    # CYW43455 firmware (pinned, sha256-checked) -> /lib/firmware/brcm/. Fetched as the
-    # invoking user so the cache lands in their home, not root's.
-    local cache_owner="${SUDO_USER:-}" brc_cache
+    # CYW43455 Wi-Fi + Bluetooth firmware -> /lib/firmware/brcm/, from Alpine's linux-firmware-brcm /
+    # -cypress (pinned in ports/alpine/firmware.lock). Fetched as the invoking user so the cache
+    # lands in their home, not root's; mkfs-f2fs-populated.py stages the decompressed files.
+    local cache_owner="${SUDO_USER:-}"
     if [[ -n "$cache_owner" ]]; then
-        brc_cache="${BRCMFMAC_CACHE:-$(eval echo "~$cache_owner")/.cache/leandros/brcmfmac}"
-        sudo -u "$cache_owner" env BRCMFMAC_CACHE="$brc_cache" "$REPO_ROOT/ports/brcmfmac/fetch.sh" >/dev/null \
-            || info "WARNING: ports/brcmfmac/fetch.sh failed; the card will lack /lib/firmware/brcm"
+        sudo -u "$cache_owner" python3 "$REPO_ROOT/scripts/alpine_firmware.py" fetch aarch64 >/dev/null \
+            || info "WARNING: alpine_firmware.py fetch failed; the card will lack /lib/firmware/brcm"
     else
-        brc_cache="${BRCMFMAC_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/brcmfmac}"
-        BRCMFMAC_CACHE="$brc_cache" "$REPO_ROOT/ports/brcmfmac/fetch.sh" >/dev/null \
-            || info "WARNING: ports/brcmfmac/fetch.sh failed; the card will lack /lib/firmware/brcm"
+        python3 "$REPO_ROOT/scripts/alpine_firmware.py" fetch aarch64 >/dev/null \
+            || info "WARNING: alpine_firmware.py fetch failed; the card will lack /lib/firmware/brcm"
     fi
-    export BRCMFMAC_CACHE="$brc_cache"
-    # Bluetooth patch firmware (BCM4345C0.hcd, pinned) -> /lib/firmware/brcm/.
-    local bt_cache
-    if [[ -n "$cache_owner" ]]; then
-        bt_cache="${BTFW_CACHE:-$(eval echo "~$cache_owner")/.cache/leandros/bluez-firmware}"
-        sudo -u "$cache_owner" env BTFW_CACHE="$bt_cache" "$REPO_ROOT/ports/bluez-firmware/fetch.sh" >/dev/null \
-            || info "WARNING: ports/bluez-firmware/fetch.sh failed; the card will lack BCM4345C0.hcd"
-    else
-        bt_cache="${BTFW_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros/bluez-firmware}"
-        BTFW_CACHE="$bt_cache" "$REPO_ROOT/ports/bluez-firmware/fetch.sh" >/dev/null \
-            || info "WARNING: ports/bluez-firmware/fetch.sh failed; the card will lack BCM4345C0.hcd"
-    fi
-    export BTFW_CACHE="$bt_cache"
 
     # Wi-Fi credentials: the SSID from --wifi-ssid (or an ssid= line in the file),
     # never from the file name (SSIDs are case-sensitive); psk= from the file.

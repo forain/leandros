@@ -695,12 +695,12 @@ mod tests {
         assert_eq!(parse_dmc(&bad, (b'B', b'0')), Err(FwParseError::BadCss));
     }
 
-    /// The real linux-firmware blob, when ports/i915_fw/fetch.sh has cached it
+    /// The real linux-firmware blob, when scripts/alpine_firmware.py has staged it
     /// (I915_DMC_BLOB overrides the path). Skipped when absent.
     #[test]
     fn dmc_parse_real_kbl_blob() {
         let path = std::env::var("I915_DMC_BLOB").unwrap_or_else(|_|
-            format!("{}/.cache/leandros/i915/kbl_dmc_ver1_04.bin", std::env::var("HOME").unwrap_or_default()));
+            format!("{}/.cache/leandros/alpine-fw/x86_64/current/lib/firmware/i915/kbl_dmc_ver1_04.bin", std::env::var("HOME").unwrap_or_default()));
         let b = match std::fs::read(&path) { Ok(b) => b, Err(_) => { eprintln!("skipped: no {path}"); return; } };
         let d = parse_dmc(&b, (b'B', b'0')).expect("kbl_dmc_ver1_04.bin must parse");
         assert_eq!(d.css_version, 0x0001_0004); // "ver1_04"
