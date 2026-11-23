@@ -353,6 +353,9 @@ fn main() {
         }
     }
 
+    // The unlocked-account check above authenticated and cached a timestamp: start the
+    // "no cached credentials" checks from a clean slate.
+    let _ = run(LEANDRO, &[SUDO, "-K"], &[], "");
     let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
     t.check(
         "leandro: sudo -n id without cached credentials fails",
