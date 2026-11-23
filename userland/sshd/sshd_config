@@ -32,7 +32,13 @@ Subsystem sftp /usr/lib/ssh/sftp-server
 # Certificates and revocation (OpenSSH semantics):
 #TrustedUserCAKeys /etc/ssh/user_ca.pub
 #AuthorizedPrincipalsFile /etc/ssh/principals/%u    # %u %U %h %%; names a TrustedUserCAKeys cert may use
+#AuthorizedPrincipalsCommand /etc/ssh/principals.sh %u %i   # absolute, root-owned, not group/other writable; tokens %% %C %D %F %f %h %i %K %k %s %T %t %U %u
+#AuthorizedPrincipalsCommandUser nobody                      # required with the command; prints one principal per line
+#AllowStreamLocalForwarding yes                  # ssh -L/-R to unix sockets (yes|all|local|remote|no)
+#StreamLocalBindMask 0177                        # umask for -R socket files
+#StreamLocalBindUnlink no                        # yes: remove a stale file before binding a -R socket
 #RevokedKeys /etc/ssh/revoked_keys                  # public key list or binary KRL; unreadable = no pubkey logins
+# -D is accepted (sshd never detaches). Match Host compares the client address text (as UseDNS no).
 # Match accepts User, Group, Host, Address, LocalAddress, LocalPort, RDomain (and "all"):
 #Match LocalAddress 10.0.0.0/8 Host !10.1.*
 #  ForceCommand internal-sftp

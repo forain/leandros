@@ -567,6 +567,92 @@ impl russh::server::Handler for Net {
         Ok(())
     }
 
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !self.authed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (ctl, peer) = (self.ctl.clone(), self.peer);
+        let path = socket_path.to_string();
+        tokio::spawn(async move {
+            let mut w = W::default();
+            w.str(path.as_bytes());
+            let Ok((f, fds)) = ctl.call(rpc::DIRECT_STREAMLOCAL, &w.0).await else { return };
+            if f.ty != rpc::FWD_FD || fds.len() != 1 {
+                for fd in fds {
+                    unsafe { libc::close(fd) };
+                }
+                log(&format!("{peer}: direct-streamlocal to {path} failed: {}", if f.ty == rpc::ERR { err_text(&f) } else { "unexpected reply".into() }));
+                return;
+            }
+            let std_s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fds[0]) };
+            let _ = std_s.set_nonblocking(true);
+            let Ok(mut sock) = tokio::net::UnixStream::from_std(std_s) else { return };
+            log(&format!("{peer}: direct-streamlocal -> {path}"));
+            reply.accept().await;
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+        });
+        Ok(())
+    }
+
+    async fn streamlocal_forward(&mut self, socket_path: &str, session: &mut Session) -> Result<bool, Self::Error> {
+        if !self.authed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let key = (socket_path.to_string(), 0u32);
+        if self.fwds.contains_key(&key) {
+            return Ok(false);
+        }
+        let mut w = W::default();
+        w.str(socket_path.as_bytes());
+        let Ok((f, fds)) = self.ctl.call(rpc::STREAMLOCAL_FORWARD, &w.0).await else { return Ok(false) };
+        if f.ty != rpc::FWD_LISTEN || fds.len() != 1 {
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            log(&format!("{}: streamlocal-forward {socket_path} failed: {}", self.peer, if f.ty == rpc::ERR { err_text(&f) } else { "unexpected reply".into() }));
+            return Ok(false);
+        }
+        let std_l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fds[0]) };
+        let _ = std_l.set_nonblocking(true);
+        let Ok(listener) = tokio::net::UnixListener::from_std(std_l) else { return Ok(false) };
+        log(&format!("{}: streamlocal-forward listening on {socket_path}", self.peer));
+        let handle = session.handle();
+        let path = socket_path.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let (handle, path) = (handle.clone(), path.clone());
+                tokio::spawn(async move {
+                    let ch = match handle.channel_open_forwarded_streamlocal(path).await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let mut stream = ch.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                });
+            }
+        });
+        self.fwds.insert(key, task.abort_handle());
+        Ok(true)
+    }
+
+    async fn cancel_streamlocal_forward(&mut self, socket_path: &str, _session: &mut Session) -> Result<bool, Self::Error> {
+        match self.fwds.remove(&(socket_path.to_string(), 0)) {
+            Some(h) => {
+                h.abort();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn tcpip_forward(&mut self, address: &str, port: &mut u32, session: &mut Session) -> Result<bool, Self::Error> {
         if !self.authed.load(Ordering::Acquire) {
             return Ok(false);
