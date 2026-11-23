@@ -11193,7 +11193,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let mut s = &b[..n];
                 while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
-                if s != b"0" && s != b"1" && s != b"2" && s != b"3" && s != b"4" && s != b"5" { return err_reply(-22); }
+                if s != b"0" && s != b"1" && s != b"2" && s != b"3" && s != b"4" && s != b"5" && s != b"6" { return err_reply(-22); }
                 extern "C" { fn kernel_drm_fence_hold_set(on: u32); }
                 unsafe { kernel_drm_fence_hold_set((s[0] - b'0') as u32) };
                 return val_reply(count as u64);

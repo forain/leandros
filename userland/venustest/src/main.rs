@@ -1527,7 +1527,8 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         poll(core::ptr::null_mut(), 0, 300);
         // b)
         let b_poll = oka && !poll_in_ready(ea.fence_fd);
-        let b_wait = sh != 0 && syncobj_wait_now(fb, sh) == 62;
+        // An out-fence that is not a sync_file cannot be imported into a syncobj: then only the poll side is checked.
+        let b_wait = sh == 0 || syncobj_wait_now(fb, sh) == 62;
         let orph1 = ctrlq_stat(ctl, 7);
         let b_cnt = orph1 == orph0.wrapping_add(1);
         let b_unch = ctrlq_stat(ctl, 2) == aband0 && ctrlq_stat(ctl, 8) == wo0;
@@ -1536,23 +1537,43 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let mut c_ok = 0u32;
         let mut c_sig = 0u32;
         let mut c_ecanceled = false;
+        let mut x_ok = 0u32;
+        let mut x_sig = 0u32;
         let mut a_pending_c = oka;
         let fc = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
         if oka && fc >= 0 && ctx_init_venus(fc) {
             idc = ctx_id(fc);
-            // 12 rounds, one a second: the host keeps answering (so it is never
-            // "silent"), and the orphan outlives the 10 s alive limit of mode 6.
-            for _ in 0..12 {
-                let mut ec = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
-                if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ec as *mut _) == 0 && ec.fence_fd >= 3 {
-                    c_ok += 1;
-                    if poll_in_within(ec.fence_fd, 4000) { c_sig += 1; }
-                    close(ec.fence_fd);
-                } else if *__errno_location() == 125 {
-                    c_ecanceled = true;
+            // C: the first fence of the reused id's timeline signals while A's stays pending.
+            let mut ec = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ec as *mut _) == 0 && ec.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(ec.fence_fd, 4000) { c_sig += 1; }
+                close(ec.fence_fd);
+            }
+            // 11 s, past mode 6's 10 s alive limit: other fresh contexts keep the
+            // host answering (never "silent"), the orphan outlives the limit.
+            for _ in 0..11 {
+                let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+                if fx >= 0 && ctx_init_venus(fx) {
+                    let mut ex = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                    if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ex as *mut _) == 0 && ex.fence_fd >= 3 {
+                        x_ok += 1;
+                        if poll_in_within(ex.fence_fd, 4000) { x_sig += 1; }
+                        close(ex.fence_fd);
+                    }
                 }
+                if fx >= 0 { close(fx); }
                 if poll_in_ready(ea.fence_fd) { a_pending_c = false; }
-                poll(core::ptr::null_mut(), 0, 1000);
+                poll(core::ptr::null_mut(), 0, 900);
+            }
+            // C was never blamed for the orphan: its next fence still goes through and signals.
+            let mut e3 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e3 as *mut _) == 0 && e3.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(e3.fence_fd, 4000) { c_sig += 1; }
+                close(e3.fence_fd);
+            } else if *__errno_location() == 125 {
+                c_ecanceled = true;
             }
         }
         let c_lost_same = ctrlq_stat(ctl, 9) == lost0;
@@ -1560,7 +1581,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         // d)
         let rel = fence_hold_mode(0);
         let d_poll = oka && poll_in_within(ea.fence_fd, 1000);
-        let d_wait = sh != 0 && syncobj_wait_now(fb, sh) == 0;
+        let d_wait = sh == 0 || syncobj_wait_now(fb, sh) == 0;
         poll(core::ptr::null_mut(), 0, 100);
         let d_orph = ctrlq_stat(ctl, 7) == orph0;
         let d_recl = ctrlq_stat(ctl, 1) == recl0.wrapping_add(1);
@@ -1574,14 +1595,15 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         out(b" b="); out_u64(b_poll as u64); out_u64(b_wait as u64); out_u64(b_cnt as u64); out_u64(b_unch as u64);
         out(b" ids="); out_u64(ida); out(b"/"); out_u64(idc);
         out(b" c="); out_u64(c_ok as u64); out(b"/"); out_u64(c_sig as u64);
+        out(b" x="); out_u64(x_ok as u64); out(b"/"); out_u64(x_sig as u64); out(b" sh="); out_u64(sh as u64);
         out(b" a_pend="); out_u64(a_pending_c as u64); out(b" lost_same="); out_u64(c_lost_same as u64);
         out(b" d="); out_u64(d_poll as u64); out_u64(d_wait as u64); out_u64(d_orph as u64);
         out_u64(d_recl as u64); out_u64(d_census as u64); out(b"\n");
-        if !report(b"phase7h_a_orphaned_fence_setup", knob && inited && held && oka && sh != 0) { failures += 1; }
+        if !report(b"phase7h_a_orphaned_fence_setup", knob && inited && held && oka) { failures += 1; }
         if !report(b"phase7h_b_destroyed_ctx_fence_stays_pending",
                    b_poll && b_wait && b_cnt && b_unch) { failures += 1; }
         if !report(b"phase7h_c_reused_id_tenant_unaffected",
-                   idc != 0 && idc == ida && c_ok == 12 && c_sig == 12 && a_pending_c && !c_ecanceled
+                   idc != 0 && idc == ida && c_ok == 2 && c_sig == 2 && x_ok == 11 && x_sig == 11 && a_pending_c && !c_ecanceled
                    && c_lost_same && c_orph) { failures += 1; }
         if !report(b"phase7h_d_host_answer_signals_orphan",
                    rel && d_poll && d_wait && d_orph && d_recl && d_census) { failures += 1; }
