@@ -8891,6 +8891,9 @@ pub fn exit(code: i32) -> ! {
 /// re-dispatch after a preemption never loads the freed root), and the drop
 /// waits out any in-flight `busy` holder exactly as `replace_address_space`
 /// does.
+/// Longest `release_exiting_address_space` waits for a transient mm holder.
+const PCWAIT_BOUND_NS: u64 = 20_000_000;
+
 fn release_exiting_address_space(pid: Pid) {
     let taken = {
         let mut rq = RUN_QUEUE.lock();
@@ -8937,6 +8940,33 @@ fn release_exiting_address_space(pid: Pid) {
             drop(rq);
             while as_drop_pending(tgid) { irq_window(); core::hint::spin_loop(); }
             rq = RUN_QUEUE.lock();
+        }
+        // A transient kernel holder (a /proc reader, a ptrace/remote-memory
+        // access that cloned the Arc) delays the drop past wait4. When no task
+        // shares the space (no CLONE_VM sharer, which would hold it for good),
+        // wait a bounded time for the holder to let go, so wait() is exact.
+        {
+            let deadline = monotonic_ns().saturating_add(PCWAIT_BOUND_NS);
+            loop {
+                let t = match rq.find_pid(pid) { Some(t) => t, None => return };
+                let a = match t.address_space.as_ref() { Some(a) => a, None => return };
+                if alloc::sync::Arc::strong_count(a) <= 1 { break; }
+                let mut shared = false;
+                for i in rq.live_slots() {
+                    if let Some(o) = rq.get(i) {
+                        if o.pid != pid {
+                            if let Some(oa) = o.address_space.as_ref() {
+                                if alloc::sync::Arc::ptr_eq(oa, a) { shared = true; break; }
+                            }
+                        }
+                    }
+                }
+                if shared || monotonic_ns() >= deadline { break; }
+                drop(rq);
+                irq_window();
+                core::hint::spin_loop();
+                rq = RUN_QUEUE.lock();
+            }
         }
         let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
         match t.address_space.as_ref() {

@@ -123,6 +123,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_write_truncate_unlink() { failures += 1; }
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
+    if !test_wait_releases_memory_exactly() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
@@ -2026,6 +2027,35 @@ unsafe fn test_pagecache_memory_returns() -> bool {
     write(STDOUT_FILENO, b" child_status=".as_ptr(), 14); print_dec(status as usize);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, status == 0 && lost < 64)
+}
+
+/// wait() is exact: the moment it returns, the child's address space is
+/// already released. Measured with no polling and no slack beyond a few pages
+/// of unrelated churn (the child maps and touches 1024 pages).
+unsafe fn test_wait_releases_memory_exactly() -> bool {
+    let name = b"wait_releases_memory_exactly\0";
+    const PAGES: usize = 1024;
+    let mut worst = 0usize;
+    let mut ok = true;
+    for _ in 0..20 {
+        let before = free_ram();
+        let pid = fork();
+        if pid == 0 {
+            let p = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if p as isize == -1 { exit(2); }
+            for pg in 0..PAGES { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
+            exit(0);
+        }
+        let status = wait_status(pid);
+        let after = free_ram();
+        let lost = before.saturating_sub(after) / PAGE;
+        if lost > worst { worst = lost; }
+        ok &= status == 0 && lost < 64;
+    }
+    write(STDOUT_FILENO, b"  worst_lost_pages=".as_ptr(), 19); print_dec(worst);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok)
 }
 
 

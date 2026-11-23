@@ -6,7 +6,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 ## Known bugs
 
-- **memtest `pagecache_memory_returns` flaked once in 19 under host load** (lane pcflake, 2026-11-23): the reaped child's address space (1161 pages) was still allocated when wait() returned; test now polls up to 2 s for the counter to settle (threshold unchanged). Which transient mm holder defeats `release_exiting_address_space` (sched/src/lib.rs) is not pinned down; a kernel-side bounded wait there would make wait() exact.
 - **Alpine replaces cross-built libs** (lane alplibs, 2026-11-22): libdbus, libxkbcommon, pixman, libdisplay-info, libinput/libevdev/mtdev, XKB data and kmscube are Alpine v3.24 packages in the image (`ports/alpine/world`); the cross sysroot gets the -dev halves from `scripts/alpine-dev.py` (devworld/devlock). Kept from source: libseat/libudev shims (no Alpine equivalent), libdrm and Mesa. ports/gstreamer|pipewire|libflatpak|e2fsprogs still stage from an Alpine 3.21 container (not moved to the lock). Not yet verified on real hardware.
 
 ### Kernel / VFS
