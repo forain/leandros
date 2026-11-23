@@ -709,6 +709,8 @@ build_alpine_pkgs() {
     local arch="$1"
     echo "📦 Fetching $arch Alpine packages (lock)..."
     python3 "$ROOT_DIR/scripts/alpine-lock.py" fetch "$arch" || exit 1
+    # Device firmware blobs (iwlwifi, Intel BT, i915, r8169, CYW43455) from Alpine's linux-firmware-* packages.
+    python3 "$ROOT_DIR/scripts/alpine_firmware.py" fetch "$arch" || exit 1
 }
 
 # Function to stage apk-tools (ports/apk)
@@ -1191,6 +1193,18 @@ par_wait() { # wait for every par_run job, print their logs in start order, fail
 }
 
 phase input_stack_shims build_input_stack_shims
+
+# Build-time Alpine -dev packages (dbus, xkbcommon, libinput, libevdev, mtdev, pixman, libdisplay-info) for
+# the cross sysroot (ports/alpine/devworld); the same package versions the image ships, pinned in <arch>.devlock.
+stage_alpine_dev_sysroot() {
+    local arch="$1" sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$1"
+    echo "📚 Merging Alpine -dev packages into the $arch cross sysroot..."
+    [[ -d "$sys" ]] || { echo "  no sysroot $sys; skipped"; return 0; }
+    python3 "$ROOT_DIR/scripts/alpine-dev.py" merge "$arch" "$sys"
+}
+for arch in aarch64 x86_64; do
+    [[ "$ARCH" == both || "$ARCH" == "$arch" ]] && phase "alpine_dev_$arch" stage_alpine_dev_sysroot "$arch"
+done
 
 # Doom's General MIDI music uses the same pinned SoundFont on both CPUs.
 if [[ -d "$(sibling_dir doomgeneric)" ]]; then

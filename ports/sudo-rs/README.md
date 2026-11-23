@@ -18,12 +18,8 @@ is satisfied by an empty `libpam.a` the build puts on the link path. The patch a
 adds an empty `[workspace]` so cargo does not treat the tree as a member of the
 LeandrOS repo-root workspace.
 
-**A pty follower has no chownable node** (`patches/0002-pty-chown-optional.patch`).
-With `use_pty` (the default) sudo and su run the command on a fresh pty and
-`chown("/dev/pts/<n>")` it to the target user. The VFS hands pty pairs out by
-number from `/dev/ptmx` and keeps no owner for them, so that chown is ENOENT and
-every command failed with "cannot execute". The failure is now a dev log line:
-the pty is private to the sudo that opened it either way.
+**A pty follower is chownable** with no patch: the VFS's devpts gives `/dev/pts/<n>` the
+opener's uid, group tty (5), mode 0620, and chown/chmod/stat work on it.
 
 **`/dev/tty` without a controlling terminal** needs no patch any more. The VFS
 used to answer `open("/dev/tty")` in a session with no controlling terminal with
@@ -62,10 +58,8 @@ pam-leandros, keyed on the service name:
 
 ## Credential cache
 
-sudo-rs keeps per-user records in `/run/user/.sudo-rs/ts/<uid>`
-(`patches/0005-timestamps-on-tmpfs.patch`: upstream's `/var/run` is plain f2fs
-here and would carry records across a reboot; `/run/user` is the tmpfs root,
-0755 root). A record is scoped to the controlling tty's session leader when
+sudo-rs keeps per-user records in upstream's `/var/run/sudo-rs/ts/<uid>`, i.e.
+`/run/sudo-rs/ts` (`/var/run` -> `/run`, a tmpfs, so records never survive a reboot). A record is scoped to the controlling tty's session leader when
 `/proc/self/stat` names a tty, and to the parent process otherwise. The VFS
 reports `tty_nr` 0, so the scope is always the parent -- the shell sudo was
 typed in -- identified by pid **and** `starttime`. `starttime` used to be the

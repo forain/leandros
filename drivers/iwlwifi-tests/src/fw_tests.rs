@@ -90,7 +90,7 @@ fn rejects_bad_files() {
 #[test]
 fn parses_real_8265_firmware() {
     let path = std::env::var("IWL_FW").unwrap_or_else(|_| {
-        format!("{}/.cache/leandros/iwlwifi/iwlwifi-8265-36.ucode", std::env::var("HOME").unwrap_or_default())
+        format!("{}/.cache/leandros/alpine-fw/x86_64/current/lib/firmware/iwlwifi-8265-36.ucode", std::env::var("HOME").unwrap_or_default())
     });
     let d = match std::fs::read(&path) {
         Ok(d) => d,

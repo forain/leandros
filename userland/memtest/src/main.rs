@@ -2009,7 +2009,17 @@ unsafe fn test_pagecache_memory_returns() -> bool {
     }
     let status = wait_status(pid);
     unlink(path.as_ptr());
-    let after = free_ram();
+    // The child's address space can outlive its wait(): a /proc observer
+    // (or any transient holder of the mm) delays the teardown, as on Linux
+    // where exit_mmap waits for the last mm_users. Poll a bounded time for
+    // the memory to come back; the threshold is unchanged.
+    let mut after = free_ram();
+    let mut tries = 0;
+    while before.saturating_sub(after) / PAGE >= 64 && tries < 200 {
+        usleep(10_000);
+        after = free_ram();
+        tries += 1;
+    }
     let lost = before.saturating_sub(after) / PAGE;
     write(STDOUT_FILENO, b"  file_pages=".as_ptr(), 13); print_dec(PAGES);
     write(STDOUT_FILENO, b" lost_pages=".as_ptr(), 12); print_dec(lost);

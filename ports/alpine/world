@@ -1,6 +1,5 @@
 # Alpine packages (latest stable, release recorded in the lock) shipped vanilla in the LeandrOS image (both arches).
 # `scripts/alpine-lock.py refresh <arch>` resolves this into <arch>.lock.
-# kmscube stays gl-stack-built (Alpine's depends on mesa-gl + gstreamer).
 apk-tools-static
 alpine-keys
 ca-certificates-bundle
@@ -38,3 +37,14 @@ shadow-subids
 containers-common
 nftables
 tzdata
+# Desktop input/GL userland that used to be cross-built (ports/input-stack, ports/gl-stack/build-kmscube.sh):
+# libinput's libevdev/mtdev/pixman/libxkbcommon/libdisplay-info (+ XKB data, libinput quirks) and kmscube.
+# libdrm and Mesa's EGL/GLES/gbm are held (ours); libudev/libseat are the LeandrOS shims.
+libxkbcommon
+xkeyboard-config
+libinput-libs
+libevdev
+mtdev
+pixman
+libdisplay-info
+kmscube
