@@ -550,10 +550,15 @@ def sudo_sh(ssh, user, pw, script):
     return ssh.run(user, f"sudo -S -p '' sh -c \"{script}\"", key=True, stdin=(pw + "\n").encode())
 
 
-def sudo_write(ssh, user, pw, path, text):
-    """Replace `path` with `text` as root (single-quoted printf args; '$' escaped for the outer double quotes)."""
+def write_cmd(path, text):
+    """Shell fragment replacing `path` with `text` (single-quoted printf args; '$' escaped for the outer double quotes)."""
     args = " ".join("'" + l.replace("'", "'\\''") + "'" for l in text.splitlines())
-    return sudo_sh(ssh, user, pw, ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$"))
+    return ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$")
+
+
+def sudo_write(ssh, user, pw, path, text):
+    """Replace `path` with `text` as root."""
+    return sudo_sh(ssh, user, pw, write_cmd(path, text))
 
 
 def accounts_extra(ssh, user, pw, tmp):
@@ -616,16 +621,17 @@ SSHD2_BIN = os.environ.get("SSHDCFG_BIN", "/usr/sbin/sshd")
 
 def sshd2_start(ssh, user, pw, conf, env="", flags=""):
     """(Re)start a second sshd (root, port 2222, config `conf`) in the guest; True when it listens."""
-    sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", conf)
-    sudo_write(ssh, user, pw, "/tmp/sshdcfg-start.sh", "\n".join([
+    start = "\n".join([
         "trap '' HUP",  # the ssh session's hangup must not take the daemon down (no setsid in the guest)
         "kill $(cat /tmp/sshdcfg.pid 2>/dev/null) 2>/dev/null; sleep 1",
         ": > /tmp/sshdcfg.log",
         f"{env} {SSHD2_BIN} {flags} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
         "echo $! > /tmp/sshdcfg.pid",
         "for i in 1 2 3 4 5 6 7 8 9 10; do grep -q ready /tmp/sshdcfg.log && exit 0; sleep 1; done; exit 1",
-    ]))
-    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshdcfg-start.sh")
+    ])
+    # one sudo round trip: write the config and the start script, run it
+    rc, out, err = sudo_sh(ssh, user, pw, write_cmd("/tmp/sshdcfg.conf", conf) + "; " + write_cmd("/tmp/sshdcfg-start.sh", start)
+                           + "; sh /tmp/sshdcfg-start.sh")
     if rc != 0:
         _, lg, _ = sudo_sh(ssh, user, pw, "cat /tmp/sshdcfg.log /tmp/sshdcfg-start.sh")
         print(f"sshdcfg: second sshd did not start: rc={rc} out={out.strip()[-200:]!r} err={err.strip()[-200:]!r} log={lg[-600:]!r}", flush=True)
@@ -746,11 +752,11 @@ def sshdcfg(ssh, user, pw, tmp):
         stop(p)
         return got.startswith(b"SSH-")
 
-    def can_remote():  # -R on the second sshd, read back through a -L on the first
+    def can_remote(w=40):  # -R on the second sshd, read back through a -L on the first
         rp, lp = free_port(), free_port()
         p = fwd_client(ssh2, user, "-R", f"127.0.0.1:{rp}:127.0.0.1:{echo_port}")
         p2 = fwd_client(ssh, user, "-L", f"{lp}:127.0.0.1:{rp}")
-        got = tcp_exchange(lp, payload=b"ping-R\n", want=b"ping-R", wait=40)
+        got = tcp_exchange(lp, payload=b"ping-R\n", want=b"ping-R", wait=w)
         stop(p)
         stop(p2)
         return b"ping-R" in got
@@ -758,14 +764,14 @@ def sshdcfg(ssh, user, pw, tmp):
     for mode, want_l, want_r in (("yes", True, True), ("all", True, True), ("local", True, False),
                                  ("remote", False, True), ("no", False, False)):
         conf(f"AllowTcpForwarding {mode}\n")
-        l, r = can_local(), can_remote()
+        l, r = can_local(), can_remote(40 if want_r else 8)  # a refused case needs no long wait
         step(f"cfg_allowtcpforwarding_{mode}", (l, r) == (want_l, want_r), f"local={l} remote={r}")
     conf(f"AllowTcpForwarding yes\nMatch User {user}\n  AllowTcpForwarding local\n")
-    l, r = can_local(), can_remote()
+    l, r = can_local(), can_remote(8)
     step("cfg_allowtcpforwarding_match", (l, r) == (True, False), f"local={l} remote={r}")
     set_keys(ssh, user, pw, pub)
     conf("AllowTcpForwarding no\n")  # the key allows forwarding, the config does not
-    l, r = can_local(), can_remote()
+    l, r = can_local(), can_remote(8)
     set_keys(ssh, user, pw, f"no-port-forwarding {pub}")
     conf("AllowTcpForwarding yes\n")  # the key forbids it, the config allows
     l2 = can_local()
@@ -1265,44 +1271,57 @@ def sshdcfg2(ssh, user, pw, tmp):
                 break
             time.sleep(1)
 
-    def can_local():  # ssh2 -L host-socket:guest-socket, the guest socket made by -R on the first sshd
+    def can_local(w=40):  # ssh2 -L host-socket:guest-socket, the guest socket made by -R on the first sshd
         clean("a", "ha")
         g = fwd_client(ssh, user, "-R", f"{gs('a')}:127.0.0.1:{echo_port}")
         wait_fwd(g, gs("a"))
         p = fwd_client(ssh2, user, "-L", f"{hs('ha')}:{gs('a')}")
-        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40)
+        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=w)
         stop(p)
         stop(g)
         diag.append(f"L:{got!r} p={p.stderr.read()[-150:]!r} g={g.stderr.read()[-150:]!r}")
         return b"ping-L" in got
 
-    def can_remote(extra=()):  # ssh2 -R guest-socket, read back through a -L on the first sshd
+    def can_remote(w=40):  # ssh2 -R guest-socket, read back through a -L on the first sshd
         clean("b", "hb")
         p = fwd_client(ssh2, user, "-o", "LogLevel=DEBUG1", "-R", f"{gs('b')}:127.0.0.1:{echo_port}")
         wait_fwd(p, gs("b"))
         p2 = fwd_client(ssh, user, "-o", "LogLevel=DEBUG1", "-L", f"{hs('hb')}:{gs('b')}")
-        got = unix_exchange(hs("hb"), payload=b"ping-R\n", want=b"ping-R", wait=40)
+        got = unix_exchange(hs("hb"), payload=b"ping-R\n", want=b"ping-R", wait=w)
         diag.append("first sshd: " + sudo_sh(ssh, user, pw, "tail -n 6 /var/log/sshd.log")[1].replace("\n", "|"))
         stop(p)
         stop(p2)
         diag.append(f"R:{got!r} p={p.stderr.read()[-700:]!r} p2={p2.stderr.read()[-700:]!r}")
         return b"ping-R" in got
 
+    def both(wl=40, wr=40):  # the two directions use disjoint sockets: run them side by side
+        res = {}
+        th = threading.Thread(target=lambda: res.update(r=can_remote(wr)))
+        th.start()
+        l = can_local(wl)
+        th.join()
+        return (l, res["r"])
+
+    def until_exit(p, limit):  # a refused forward ends the client at once; only an accepted one needs the full time
+        t0 = time.time()
+        while time.time() - t0 < limit and p.poll() is None:
+            time.sleep(0.25)
+
     for mode, want in (("yes", (True, True)), ("all", (True, True)), ("local", (True, False)),
                        ("remote", (False, True)), ("no", (False, False))):
         conf(f"AllowStreamLocalForwarding {mode}\n")
-        got = (can_local(), can_remote())
+        got = both(40 if want[0] else 8, 40 if want[1] else 8)
         lg = sudo_sh(ssh, user, pw, "grep -c . /dev/null; tail -n 12 /tmp/sshdcfg.log")[1].replace("\n", "|") if got != want else ""
         step(f"cfg2_streamlocal_{mode}", got == want, f"got={got} want={want} {lg}")
     conf("AllowTcpForwarding no\nAllowStreamLocalForwarding yes\n")
-    got = (can_local(), can_remote())
+    got = both()
     lg = sudo_sh(ssh, user, pw, "tail -c 1500 /tmp/sshdcfg.log")[1].replace("\n", "|") + " ".join(diag[-3:]) if got != (True, True) else ""
     step("cfg2_streamlocal_independent_of_tcp_no", got == (True, True), f"got={got} {lg}")
     conf("AllowTcpForwarding yes\nAllowStreamLocalForwarding no\n")
-    got = (can_local(), can_remote())
+    got = both(8, 8)
     step("cfg2_streamlocal_no_while_tcp_yes", got == (False, False), f"got={got}")
     conf(f"AllowStreamLocalForwarding yes\nMatch User {user}\n  AllowStreamLocalForwarding no\n")
-    got = (can_local(), can_remote())
+    got = both(8, 8)
     step("cfg2_streamlocal_match_no", got == (False, False), f"got={got}")
     sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", base + "AllowStreamLocalForwarding bogus\n")
     rc, out, err = sudo_sh(ssh, user, pw, f"{SSHD2_BIN} -t -f /tmp/sshdcfg.conf 2>&1; echo rc=\\$?")
@@ -1312,7 +1331,7 @@ def sshdcfg2(ssh, user, pw, tmp):
     conf("AllowStreamLocalForwarding yes\nAuthorizedKeysFile %h/.sd2-ak\n")  # only this sshd's key has the option
     clean("k")
     p = fwd_client(ssh2, user, "-R", f"{gs('k')}:127.0.0.1:{echo_port}")
-    time.sleep(4)
+    until_exit(p, 4)
     refused = p.poll() is not None
     stop(p)
     ssh.run(user, "rm -f ~/.sd2-ak ~/.apc-pf", key=True)
@@ -1328,7 +1347,7 @@ def sshdcfg2(ssh, user, pw, tmp):
         conf("AllowStreamLocalForwarding yes\n" + extra)
         clean("m")
         p = fwd_client(ssh2, user, "-R", f"{gs('m')}:127.0.0.1:{echo_port}")
-        time.sleep(3)
+        wait_fwd(p, gs("m"), 15)
         got = mode_of("m")
         stop(p)
         step(f"cfg2_streamlocal_bindmask_{tag}", got == want, f"got={got!r} want={want!r}")
@@ -1341,7 +1360,7 @@ def sshdcfg2(ssh, user, pw, tmp):
         clean("u")
         ssh.run(user, f"touch {gs('u')}", key=True)  # a stale file in the way
         p = fwd_client(ssh2, user, "-R", f"{gs('u')}:127.0.0.1:{echo_port}")
-        time.sleep(4)
+        until_exit(p, 4)
         alive = p.poll() is None
         stop(p)
         return alive
@@ -1352,7 +1371,7 @@ def sshdcfg2(ssh, user, pw, tmp):
     conf("AllowStreamLocalForwarding yes\n")
     clean("n")
     p = fwd_client(ssh2, user, "-R", "/tmp/sd2-no-such-dir/x.sock:127.0.0.1:%d" % echo_port)
-    time.sleep(4)
+    until_exit(p, 4)
     step("cfg2_streamlocal_bind_missing_dir_refused", p.poll() is not None, "forward into a missing directory was accepted")
     stop(p)
     clean("ho")
@@ -1597,8 +1616,13 @@ def privsep_stalled_monitor(ssh, user, pw):
     s.recv(256)
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
     time.sleep(1)
-    procs = sshd_procs(ssh, user, pw)
-    pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
+    pre = []
+    for _ in range(8):  # a slow guest may not have the pre-auth child listed after one second
+        procs = sshd_procs(ssh, user, pw)
+        pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
+        if pre:
+            break
+        time.sleep(1)
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]}")  # only the monitor hangs; the child stays live
     ok = bool(pre) and probe_eof(s, 40)
