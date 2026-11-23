@@ -23,7 +23,7 @@ GUEST = r'''A=$(uname -m)
 T=/tmp/flr; rm -rf $T; mkdir -p $T
 RT=$T/rt; mkdir -p $RT/usr/bin $RT/usr/lib $RT/files $RT/var
 cp /bin/busybox.static $RT/usr/bin/busybox
-for a in sh echo id cat ls uname test; do ln -s busybox $RT/usr/bin/$a; done
+for a in sh echo id cat ls uname test wc tr head sort grep mount readlink nc sleep; do ln -s busybox $RT/usr/bin/$a; done
 cat > $RT/metadata <<M
 [Runtime]
 name=org.leandros.Platform
@@ -39,15 +39,47 @@ echo APPDATA_OK > $T/app/files/share/marker
 flatpak build-finish --command=hello.sh $T/app >/dev/null 2>&1; echo FINISH_RC=$?
 flatpak build-export $T/repo $T/app >/dev/null 2>&1; echo EXPORT_APP_RC=$?
 flatpak build-update-repo $T/repo >/dev/null 2>&1; echo UPDATE_REPO_RC=$?
+mkdir -p $T/app2/files/bin $T/app2/var
+printf '[Application]\nname=org.leandros.Probe\nruntime=org.leandros.Platform/%s/1\nsdk=org.leandros.Platform/%s/1\n' $A $A > $T/app2/metadata
+cat > $T/app2/files/bin/probe.sh <<'P'
+#!/usr/bin/sh
+echo PROBE_START uid=$(id -u)
+test -f /.flatpak-info && echo PROBE_INFO_OK
+echo PROBE_DBUS_ENV=$DBUS_SESSION_BUS_ADDRESS
+test -S /run/user/1000/bus && echo PROBE_BUS_SOCKET_OK
+test -S /run/user/1000/wayland-0 && echo PROBE_WAYLAND_OK
+test -d /dev/dri && echo PROBE_DRI_DIR_OK
+echo PROBE_SYS_BLOCK=$(ls /sys/block | wc -l)
+echo PROBE_SYS_CLASS_BLOCK=$(ls /sys/class/block | wc -l)
+echo PROBE_SYS_DEVICES=$(ls /sys/devices | wc -l)
+echo PROBE_SYS_DEV=$(ls /sys/dev | tr '\n' ,)
+echo PROBE_SYS_DEV_BLOCK=$(ls /sys/dev/block | wc -l)
+echo PROBE_SYS_CLASS_DRM=$(ls /sys/class/drm 2>&1 | wc -l)
+test -d /proc/self && echo PROBE_PROC_OK
+echo PROBE_PROC_LS=$(ls /proc | tr '\\n' ,) PID=$$ TESTD=$(test -d /proc/$$ && echo y || echo n) SELFD=$(test -d /proc/self && echo y || echo n)
+echo PROBE_PROC_SELF=$(readlink /proc/self) PROC_N=$(ls /proc | wc -l)
+grep -E ' /(proc|sys)[ /]' /proc/self/mountinfo | head -n 12
+test -w /tmp && echo PROBE_TMP_OK
+P
+chmod 755 $T/app2/files/bin/probe.sh
+flatpak build-finish --command=probe.sh --socket=wayland --socket=session-bus --device=dri --share=network --share=ipc --talk-name=org.freedesktop.portal.Desktop --filesystem=xdg-download $T/app2 >/dev/null 2>&1; echo FINISH2_RC=$?
+flatpak build-export $T/repo $T/app2 >/dev/null 2>&1; echo EXPORT_APP2_RC=$?
+flatpak build-update-repo $T/repo >/dev/null 2>&1
 chmod -R a+rX $T
 cat > $T/user.sh <<U
 flatpak --user remote-delete --force flatrepo >/dev/null 2>&1
 flatpak --user remote-add --no-gpg-verify flatrepo file://$T/repo; echo ADD_RC=\$?
-flatpak --user install -y --noninteractive flatrepo org.leandros.Platform//1 org.leandros.Hello >/tmp/flr-inst.out 2>&1; R=\$?; INSTALL_RC_=\$R; echo INSTALL_RC=\$R; tail -n 12 /tmp/flr-inst.out
+flatpak --user install -y --noninteractive flatrepo org.leandros.Platform//1 org.leandros.Hello org.leandros.Probe >/tmp/flr-inst.out 2>&1; R=\$?; INSTALL_RC_=\$R; echo INSTALL_RC=\$R; tail -n 12 /tmp/flr-inst.out
 [ \$INSTALL_RC_ = 0 ] || { echo DIAG_REFS; ostree --repo=$T/repo refs; flatpak --user remotes -d; ls -la ~/.local/share/flatpak ~/.local/share/flatpak/repo; }
 echo LIST1=\$(flatpak --user list --columns=application | tr '\n' ,)
 flatpak --user run org.leandros.Hello; echo RUN_RC=\$?
-flatpak --user uninstall -y --noninteractive org.leandros.Hello org.leandros.Platform >/dev/null 2>&1; echo UNINSTALL_RC=\$?
+XR=/tmp/xdg-run-1000; rm -rf \$XR; mkdir -p \$XR; chmod 700 \$XR
+export XDG_RUNTIME_DIR=\$XR
+(/bin/busybox.static nc -lU \$XR/wayland-0 >/dev/null 2>&1 &)
+sleep 2
+dbus-run-session -- sh -c 'echo PROBE_HOSTBUS=\$DBUS_SESSION_BUS_ADDRESS; flatpak --user run org.leandros.Probe 2>&1; echo PROBE_RC=\$?'
+kill \$(jobs -p) 2>/dev/null; true
+flatpak --user uninstall -y --noninteractive org.leandros.Hello org.leandros.Probe org.leandros.Platform >/dev/null 2>&1; echo UNINSTALL_RC=\$?
 flatpak --user remote-delete --force flatrepo >/dev/null 2>&1
 echo LIST2=[\$(flatpak --user list --columns=application | tr '\n' ,)]
 U
@@ -61,16 +93,20 @@ def main():
     ser = driver._Serial()
     b = base64.b64encode(GUEST.encode()).decode()
     try:
-        r = driver.serial_run(f"echo {b} | base64 -d > /tmp/flatpak-guest.sh; /bin/sh /tmp/flatpak-guest.sh 2>&1 | grep -v '^\\[ *[0-9]' | tail -n 60",
+        r = driver.serial_run(f"echo {b} | base64 -d > /tmp/flatpak-guest.sh; /bin/sh /tmp/flatpak-guest.sh 2>&1 | grep -v '^\\[ *[0-9]' | tail -n 200",
                               timeout=900, arch=arch, ser=ser)
     finally:
         ser.close()
     out = r.get("output", "")
     print(out.strip()[-2500:])
     need = ["EXPORT_RT_RC=0", "EXPORT_APP_RC=0", "ADD_RC=0", "INSTALL_RC=0",
-            "LIST1=org.leandros.Hello,org.leandros.Platform,", "FLATPAK_RUN_MARKER_OK uid=1000",
+            "FINISH2_RC=0", "EXPORT_APP2_RC=0", "PROBE_START uid=1000", "PROBE_INFO_OK", "PROBE_TMP_OK", "PROBE_RC=0", "PROBE_BUS_SOCKET_OK", "PROBE_DRI_DIR_OK", "FLATPAK_RUN_MARKER_OK uid=1000",
             "APPDATA_OK", "RUN_RC=0", "UNINSTALL_RC=0", "LIST2=[]", "FLATPAK_DONE"]
     missing = [n for n in need if n not in out]
+    l1 = [l for l in out.splitlines() if l.startswith("LIST1=")]
+    if not l1 or not all(a in l1[0] for a in ("org.leandros.Hello", "org.leandros.Probe", "org.leandros.Platform")):
+        missing.append("LIST1")
+
     for n in need:
         print(f"flatpak-{n.split('=')[0].split(' ')[0].lower()}: {'FAIL' if n in missing else 'PASS'}")
     print("flatpak", "FAIL" if missing else "PASS")
