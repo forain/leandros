@@ -3606,6 +3606,27 @@ static int drm_pci_ids_spellings_case(int m) {
     }
     return 0;
 }
+/* Firefox's RDD/GPU broker policy is built from the files present in the DRM
+ * device directory, and everything else is denied; Intel's iHD VA-API driver
+ * readlink()s `device/driver` and opens `device/irq` and `device/resource`, so
+ * they must exist (a sparse sysfs made the sandboxed RDD die, errno 13). */
+static int drm_device_extras_case(int m) {
+    static const char *M[] = { "0", "128" };
+    char p[160], b[160]; struct stat st; int k, f; (void)m;
+    if (stat("/sys/dev/char/226:128/device/uevent", &st) != 0) return 0; /* no DRM device on this board */
+    for (k = 0; k < 2; k++) {
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/driver", M[k]);
+        ssize_t n = readlink(p, b, sizeof b - 1);
+        if (n <= 0) { printf("  drvx: readlink %s=%zd errno=%d\n", p, n, errno); return 10 + k; }
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/irq", M[k]);
+        if ((f = open(p, O_RDONLY)) < 0) { printf("  drvx: open %s errno=%d\n", p, errno); return 20 + k; }
+        close(f);
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/resource", M[k]);
+        if ((f = open(p, O_RDONLY)) < 0) { printf("  drvx: open %s errno=%d\n", p, errno); return 30 + k; }
+        close(f);
+    }
+    return 0;
+}
 static int drm_getdevice_ns_case(int m) {
     const char *R = "/sys/dev/char/226:128";
     char p[160], b[512], base[32]; struct stat st; int i, r;
@@ -3669,6 +3690,7 @@ static void filebind_suite(void) {
     report("devdri_realpath_in_userns", nn_in_child(devdri_realpath_ns_case, 0) & nn_in_child(devdri_realpath_ns_case, 2) & nn_in_child(devdri_realpath_ns_case, 6));
     report("drm_getdevice_in_flatpak_ns", nn_in_child(drm_getdevice_ns_case, 0) & nn_in_child(drm_getdevice_ns_case, 2));
     report("sysfs_drm_pci_ids_all_spellings", nn_in_child(drm_pci_ids_spellings_case, 0));
+    report("sysfs_drm_device_driver_irq_resource", nn_in_child(drm_device_extras_case, 0));
     report("devtty_opath_bind_rdev", nn_in_child(devtty_opath_bind_rdev_case, 0) & nn_in_child(devtty_opath_bind_rdev_case, 2));
     report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));

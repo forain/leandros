@@ -1108,6 +1108,18 @@ def main():
         _sysfs_attr(_devdir, "revision",         f"0x{PCI_REVISION:02x}\n")
         _sysfs_attr(_devdir, "class",            f"0x{PCI_CLASS:06x}\n")
         _sysfs_attr(_devdir, "config",           bytes(_cfg))
+        # Firefox's RDD broker policy is built from the files that exist in this
+        # directory; anything else is denied (EACCES, not ENOENT). Intel's iHD
+        # VA-API driver reads `driver` (readlink) and `irq`/`resource`, and dies
+        # in the sandbox when they are absent, as on a sparse sysfs.
+        _drv = next((l[7:] for l in _uevent.splitlines() if l.startswith("DRIVER=")), "")
+        if _drv:
+            _sysfs_attr(_devdir, "driver", _dev_to_sys + "/bus/pci/drivers/" + _drv, 0o120777)
+        _sysfs_attr(_devdir, "irq",       "0\n")
+        _sysfs_attr(_devdir, "resource",  "")
+        _sysfs_attr(_devdir, "modalias",  f"pci:v{PCI_VENDOR:08X}d{PCI_DEVICE:08X}sv{PCI_SUBVENDOR:08X}sd{PCI_SUBDEVICE:08X}bc03sc00i00\n")
+        _sysfs_attr(_devdir, "numa_node", "-1\n")
+        _sysfs_attr(_devdir, "enable",    "1\n")
     for _minor, _node in ((0, "card0"), (128, "renderD128")):
         _nd = f"{_devdir}/drm/{_node}"
         m4_share_dirs.add(_nd)
