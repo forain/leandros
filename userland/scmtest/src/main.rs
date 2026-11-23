@@ -1337,19 +1337,14 @@ unsafe fn test_pass_pending_connect() -> bool {
         if i % 250 == 0 { dbg1(b"[pend] round %d\n\0", i as i64); }
         let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
         if c < 0 || raw_connect(c, &addr, alen) != 0 { ok = false; break; }
-        if i == 0 { dbg1(b"[pend] step 0\n\0", 0); }
         let r = send_fd_and_byte(carrier[0], c, b'x');
         if r < 0 { dbg1(b"[pend] iter %d: sendmsg failed\n\0", i as i64); ok = false; close(c); break; }
-        if i == 0 { dbg1(b"[pend] step 1\n\0", 1); }
         let (n, _, got, _) = recv_fd_and_byte(carrier[1], 32, 0);
         if n != 1 || got < 0 { ok = false; close(c); break; }
         if i % 3 == 0 { close(c); }
-        if i == 0 { dbg1(b"[pend] step 2\n\0", 2); }
         let a = raw_accept(l);
         if a < 0 { ok = false; if i % 3 != 0 { close(c); } close(got); break; }
-        if i == 0 { dbg1(b"[pend] step 3\n\0", 3); }
         if write(got, b"y".as_ptr(), 1) != 1 { ok = false; }
-        if i == 0 { dbg1(b"[pend] step 4\n\0", 4); }
         let mut rb = [0u8; 1];
         if read(a, rb.as_mut_ptr(), 1) != 1 || rb[0] != b'y' { ok = false; }
         if i % 3 != 0 { close(c); }
