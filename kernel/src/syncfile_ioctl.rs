@@ -78,7 +78,7 @@ fn fence_of_fd(pid: u32, fd: i32) -> Option<Fence> {
 
 /// Mint a sync-file fd holding `fence` (O_CLOEXEC, as every Linux producer
 /// of one does). Returns the fd or a negative errno.
-fn mint(pid: u32, fence: Fence) -> isize {
+fn mint(pid: u32, fence: Fence, err: bool) -> isize {
     static SIGNALLER_INSTALLED: AtomicBool = AtomicBool::new(false);
     if !SIGNALLER_INSTALLED.swap(true, Ordering::AcqRel) {
         fn signal(slot: u64) -> bool { vfs::eventfd_slot_signal_unref(slot as usize) }
@@ -90,6 +90,9 @@ fn mint(pid: u32, fence: Fence) -> isize {
     if efd < 0 { return efd; }
     let token = sync_file::new_token();
     vfs::eventfd_note(pid, efd as usize, vfs::EVFD_ORIGIN_SYNC_FILE, token, [0; 16]);
+    // Ids already written off with an error (syncobj export of an errored
+    // fence, merge of errored files): the new sync file reports the error too.
+    if err || sync_file::fence_has_error(&fence) { sync_file::mark_errored(token); }
     if let Some(vfs::VnodeKind::EventFd { slot }) = vfs::vfs_get_node_kind(pid, efd as usize) {
         if sync_file::is_signaled(&fence) {
             vfs::eventfd_slot_signal(slot);
@@ -122,7 +125,7 @@ fn syncobj_export(pid: u32, fd: usize, arg: usize) -> Option<isize> {
         Ok(f) => f,
         Err(e) => return Some(-(e as isize)),
     };
-    let sfd = mint(pid, fence);
+    let sfd = mint(pid, fence, false);
     if sfd < 0 { return Some(sfd); }
     write_i32(arg + 8, sfd as i32);
     Some(0)
@@ -166,7 +169,7 @@ fn dmabuf_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize> {
             let flags = read_u32(arg);
             if !drivers::sync_file_core::resv_flags_valid(flags) { return Some(EINVAL); }
             let fence = sync_file::resv_export(obj, flags);
-            let sfd = mint(pid, fence);
+            let sfd = mint(pid, fence, false);
             if sfd < 0 { return Some(sfd); }
             write_i32(arg + 4, sfd as i32);
             Some(0)
@@ -212,7 +215,9 @@ fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize>
                 Some(f) => f,
                 None => return Some(EINVAL),
             };
-            let sfd = mint(pid, sync_file::merge(&fence, &other));
+            let tok_err = |fd: i32| vfs::eventfd_sync_token(pid, fd.max(0) as usize).map_or(false, sync_file::token_errored);
+            let err = tok_err(fd as i32) || tok_err(read_i32(arg + 32));
+            let sfd = mint(pid, sync_file::merge(&fence, &other), err);
             if sfd < 0 { return Some(sfd); }
             write_i32(arg + 36, sfd as i32);
             Some(0)
@@ -231,7 +236,8 @@ fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize>
             let mut nb = [0u8; 32];
             nb[..name.len()].copy_from_slice(name);
             if !sched::uaccess::write_user::<[u8; 32]>(arg, nb) { return Some(EFAULT); }
-            let errored = ids.iter().any(|&f| drivers::virtio_gpu::fence_errored(f));
+            let errored = ids.iter().any(|&f| drivers::virtio_gpu::fence_errored(f))
+                || vfs::eventfd_sync_token(pid, fd).map_or(false, sync_file::token_errored);
             write_i32(arg + 32, if errored { -110 } else { signaled as i32 });
             let want = read_u32(arg + 40);
             if want == 0 {

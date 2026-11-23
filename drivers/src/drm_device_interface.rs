@@ -4279,6 +4279,11 @@ fn syncobj_probe(
         let point = points.map_or(0, |p| p[i]);
         match s.payload.wait_state(point, flags, &fence_is_done) {
             WaitState::Signaled => {
+                // A fence signalled with an error (watchdog write-off) fails
+                // the wait, as a Linux fence with `error` set does (-EIO).
+                if let Lookup::Ready(f) = s.payload.lookup(point, &fence_is_done) {
+                    if crate::sync_file::fence_has_error(&f) { return (Err(DriverError::Errno(5)), false); }
+                }
                 if first.is_none() { first = Some(i as u32); }
             }
             WaitState::Pending => {
@@ -10403,7 +10408,11 @@ impl DrmDeviceInterface {
         // instead of reallocating; the resource cache hands busy BOs out
         // again). The host then uploaded the NEW bytes for the OLD draw:
         // stale, missing and misplaced content in Firefox's WebRender.
-        if probe(fence)? { return Ok(0); }
+        // A BO whose last fence was written off by the watchdog: -EIO.
+        let done_ok = |fence: u64| -> Result<usize, DriverError> {
+            if crate::virtio_gpu::fence_errored(fence) { Err(DriverError::Errno(5)) } else { Ok(0) }
+        };
+        if probe(fence)? { return done_ok(fence); }
         if w.flags & VIRTGPU_WAIT_NOWAIT != 0 { return Err(DriverError::Busy); }
 
         let dl = sched::monotonic_ns().saturating_add(15_000_000_000);
@@ -10415,7 +10424,7 @@ impl DrmDeviceInterface {
             sched::block_on_poll_prepare_masked(dl, tag);
             match probe(fence) {
                 Err(e) => { sched::block_on_poll_cancel(); break Err(e); }
-                Ok(true) => { sched::block_on_poll_cancel(); break Ok(0); }
+                Ok(true) => { sched::block_on_poll_cancel(); break done_ok(fence); }
                 Ok(false) => {}
             }
             if sched::monotonic_ns() >= dl || sched::has_deliverable_signal() {

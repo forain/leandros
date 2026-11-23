@@ -1280,12 +1280,21 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             lost_errno = *__errno_location();
             if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
         }
+        // Linux's sync_file poll: a signalled fence is POLLIN whatever its status.
+        let a_pollin = oka && poll_in_ready(ea.fence_fd);
         let rel = fence_hold_mode(0);
-        if oka { close(ea.fence_fd); }
         if fa >= 0 { close(fa); }
+        // The app is gone and its context id is free: recycle it (the next
+        // contexts reuse the lowest free ids) while A's out-fence fd is still
+        // held by "another process". The error is per fence, so it survives.
         let mut c_ok = 0u32;
         let mut c_sig = 0u32;
         fb1(&mut c_ok, &mut c_sig);
+        let mut d_ok = 0u32;
+        let mut d_sig = 0u32;
+        fb1(&mut d_ok, &mut d_sig);
+        let a_status_after = if oka { sync_file_status(ea.fence_fd) } else { 0 };
+        if oka { close(ea.fence_fd); }
         out(b"  7f: a_status="); out_u64((a_status as i64 + 1_000_000) as u64);
         out(b" lost_ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64);
         out(b" recycled_ok="); out_u64(c_ok as u64); out(b" sig="); out_u64(c_sig as u64); out(b"\n");
@@ -1298,6 +1307,11 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if !report(b"phase7f_recycled_context_not_lost", c_ok == 1 && c_sig == 1) {
             failures += 1;
         }
+        if !report(b"phase7f_error_survives_context_id_recycle",
+                   oka && a_status_after == -110 && d_ok == 1 && d_sig == 1) {
+            failures += 1;
+        }
+        if !report(b"phase7f_errored_fence_polls_pollin_like_linux", a_pollin) { failures += 1; }
         out(b"  7f: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
         out(b" b_ok="); out_u64(b_ok as u64); out(b" b_sig="); out_u64(b_sig as u64);
         out(b" after_ok="); out_u64(b_ok2 as u64); out(b" after_sig="); out_u64(b_sig2 as u64);
@@ -1312,6 +1326,56 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
                    b_ok == 5 && b_sig == 5 && b_ok2 == 1 && b_sig2 == 1 && hung_now == 0 && rel) {
             failures += 1;
         }
+    }
+
+    // ── 2g. Whole-host-silent write-off does NOT mark the context lost ──────
+    // One fence held past the 10 s limit while NOTHING else is answered: the
+    // host looks silent (a host-wide stall that recovers), so the write-off
+    // must not turn into a guilty-context verdict: no error status, no
+    // ECANCELED on the next ringed submit.
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && ctx_init_venus(fa);
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        let mut oka = false;
+        let mut a_wo = false;
+        if inited {
+            fence_hold_mode(4);
+            oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+            a_wo = oka && poll_in_within(ea.fence_fd, 18000);
+        }
+        let st = if oka { sync_file_status(ea.fence_fd) } else { -1 };
+        let mut sub_errno = 0;
+        if inited {
+            let mut e2 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            let r = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e2 as *mut _);
+            sub_errno = if r == 0 { 0 } else { *__errno_location() };
+            if r == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
+        }
+        fence_hold_mode(0);
+        if oka { close(ea.fence_fd); }
+        if fa >= 0 { close(fa); }
+        out(b"  7g: a_written_off="); out_u64(a_wo as u64); out(b" status="); out_u64((st as i64 + 1_000_000) as u64);
+        out(b" submit_errno="); out_u64(sub_errno as u64); out(b"\n");
+        if !report(b"phase7g_whole_host_silent_writeoff_not_guilty",
+                   inited && oka && a_wo && st >= 0 && sub_errno != 125) {
+            failures += 1;
+        }
+        // Let the host answer again so later phases start from a healthy state.
+        let mut c_ok = 0u32;
+        let mut c_sig = 0u32;
+        let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if fx >= 0 && ctx_init_venus(fx) {
+            let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(eb.fence_fd, 4000) { c_sig += 1; }
+                close(eb.fence_fd);
+            }
+        }
+        if fx >= 0 { close(fx); }
+        if !report(b"phase7g_host_recovers_after_silent_writeoff", c_ok == 1 && c_sig == 1) { failures += 1; }
     }
 
     // Unlock drains only happen when an interrupt loses the device lock, which a

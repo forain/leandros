@@ -737,31 +737,36 @@ static FENCE_ALIVE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// fences report an error (sync file status -ETIMEDOUT). Cleared in `ctx_free_id`.
 static CTX_LOST: [core::sync::atomic::AtomicBool; CTX_ID_POOL as usize] =
     [const { core::sync::atomic::AtomicBool::new(false) }; CTX_ID_POOL as usize];
-/// Range of written-off seqs per timeline (min 0 = none).
-static TL_WO_MIN: [core::sync::atomic::AtomicU64; FENCE_TLS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; FENCE_TLS];
-static TL_WO_MAX: [core::sync::atomic::AtomicU64; FENCE_TLS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; FENCE_TLS];
-/// Mark `id`'s context lost and the fence errored; call BEFORE signalling it.
+/// Written-off (errored) fence ids, recorded PER FENCE at write-off time. Fence
+/// ids are never reused (`TL_NEXT_SEQ`), so a record outlives the context id it
+/// came from: an errored fence exported to another process stays errored after
+/// the app exits and its context id is recycled. A bounded ring (the oldest
+/// record is overwritten after `ERRORED_RING` newer write-offs); 0 = empty.
+const ERRORED_RING: usize = 256;
+static ERRORED_IDS: [core::sync::atomic::AtomicU64; ERRORED_RING] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; ERRORED_RING];
+static ERRORED_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ERRORED_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Record `id` as errored (and, for a ringed timeline, its context LOST); call
+/// BEFORE signalling it. Only the PER-TIMELINE write-off uses this (the host
+/// answers other timelines, so this one is the guilty one). The whole-host-silent
+/// write-off deliberately does not: a host-wide stall that recovers (the host
+/// Metal/HVF watchdog case) must not kill COSMIC/Firefox.
 fn fence_mark_lost(id: u64) {
     use core::sync::atomic::Ordering::{Relaxed, Release};
+    let i = ERRORED_NEXT.fetch_add(1, Relaxed) % ERRORED_RING;
+    ERRORED_IDS[i].store(id, Release);
+    ERRORED_ANY.store(true, Release);
     let tl = (id >> FENCE_TL_SHIFT) as usize;
-    if tl == 0 || tl >= FENCE_TLS { return; }
-    let seq = id & FENCE_SEQ_MASK;
-    let mn = TL_WO_MIN[tl].load(Relaxed);
-    if mn == 0 || seq < mn { TL_WO_MIN[tl].store(seq, Relaxed); }
-    if seq > TL_WO_MAX[tl].load(Relaxed) { TL_WO_MAX[tl].store(seq, Relaxed); }
-    CTX_LOST[tl / FENCE_RINGS].store(true, Release);
+    if tl != 0 && tl < FENCE_TLS { CTX_LOST[tl / FENCE_RINGS].store(true, Release); }
 }
-/// Did the watchdog write this fence off (it never really retired)? Userspace
-/// sees it as a sync file status of -ETIMEDOUT (VK_ERROR_DEVICE_LOST in Mesa).
+/// Did the watchdog write this fence off (it never really retired)? Linux
+/// fences signalled with an error report it as status < 0 (sync file info,
+/// -EIO from syncobj / VIRTGPU_WAIT); here -ETIMEDOUT on the sync file.
 pub fn fence_errored(id: u64) -> bool {
-    use core::sync::atomic::Ordering::{Acquire, Relaxed};
-    let tl = (id >> FENCE_TL_SHIFT) as usize;
-    if tl == 0 || tl >= FENCE_TLS || !CTX_LOST[tl / FENCE_RINGS].load(Acquire) { return false; }
-    let seq = id & FENCE_SEQ_MASK;
-    let mn = TL_WO_MIN[tl].load(Relaxed);
-    mn != 0 && seq >= mn && seq <= TL_WO_MAX[tl].load(Relaxed)
+    use core::sync::atomic::Ordering::Acquire;
+    if id == 0 || !ERRORED_ANY.load(Acquire) { return false; }
+    ERRORED_IDS.iter().any(|a| a.load(Acquire) == id)
 }
 /// Has the watchdog declared this context lost (ringed submits get ECANCELED)?
 pub fn ctx_lost(ctx: u32) -> bool {
@@ -2337,11 +2342,6 @@ impl VirtioGpuDevice {
             // The id may be recycled: forget the guilty marking (the parked
             // chains stay parked, see `ctx_ids_parked`).
             CTX_LOST[id as usize].store(false, core::sync::atomic::Ordering::Release);
-            for r in 0..FENCE_RINGS {
-                let tl = fence_tl_of(id as usize, r);
-                TL_WO_MIN[tl].store(0, core::sync::atomic::Ordering::Relaxed);
-                TL_WO_MAX[tl].store(0, core::sync::atomic::Ordering::Relaxed);
-            }
             self.ctx_ids_used[(id / 64) as usize] &= !(1u64 << (id % 64));
             // Still parked? Keep preferring it until its chains come back.
             let parked = self.inflight.iter().flatten()
@@ -3424,7 +3424,11 @@ impl VirtioGpuDevice {
         let stuck = |id: u64, t: u64| -> bool {
             let tl = ((id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
             let since = t.max(TL_LAST_ANSWER_US[tl].load(Relaxed));
-            now.saturating_sub(since) >= limit
+            // The legacy timeline (tl 0: 2D/unringed fences) keeps the plain
+            // 10 s Linux job timeout; only ringed timelines get the long
+            // "host is alive, may be a legitimately long job" limit.
+            let lim = if tl == 0 { if hung { FENCE_HUNG_US } else { FENCE_HANG_US } } else { limit };
+            now.saturating_sub(since) >= lim
         };
         // Cheap exit: anything pending at all?
         let mut any = self.held_n != 0;
@@ -3447,7 +3451,7 @@ impl VirtioGpuDevice {
                 self.held[hi] = self.held[self.held_n];
                 self.held_t[hi] = self.held_t[self.held_n];
                 if first_id == 0 { first_id = id; }
-                fence_mark_lost(id);
+                if !silent { fence_mark_lost(id); }
                 // Ending the hold-one mode: nothing else is parked behind it.
                 FENCE_HOLD_ONE.store(false, Relaxed);
                 self.fence_complete(id);
@@ -3469,7 +3473,7 @@ impl VirtioGpuDevice {
             }
             if n == 0 { break; }
             if first_id == 0 { first_id = ids[0]; }
-            for &id in &ids[..n] { fence_mark_lost(id); self.fence_complete(id); }
+            for &id in &ids[..n] { if !silent { fence_mark_lost(id); } self.fence_complete(id); }
             total += n;
             chains += n;
         }
