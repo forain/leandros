@@ -102,9 +102,9 @@ fn hcd_validate_synthetic_and_errors() {
     assert_eq!(hcd::validate(&rec(0x0c03, &[])), Err(HcdError::BadOpcode(0, 0x0c03)));
 }
 
-/// The pinned BCM4345C0.hcd (bluez-firmware cdf61dc6), if cached.
+/// The pinned BCM4345C0.hcd (Alpine linux-firmware-brcm, same bytes as RPi-Distro bluez-firmware cdf61dc6), if cached.
 fn real_hcd() -> Option<Vec<u8>> {
-    let dir = std::env::var("BTFW_CACHE").unwrap_or_else(|_| format!("{}/.cache/leandros/bluez-firmware", std::env::var("HOME").unwrap_or_default()));
+    let dir = std::env::var("BTFW_CACHE").unwrap_or_else(|_| format!("{}/.cache/leandros/alpine-fw/aarch64/current/lib/firmware/brcm", std::env::var("HOME").unwrap_or_default()));
     std::fs::read(format!("{}/BCM4345C0.hcd", dir)).ok()
 }
 

@@ -317,18 +317,57 @@ pub fn write(pid: u32, cg: CgId, f: F, data: &[u8]) -> isize {
     }
 }
 
+/// Kernfs node id of a cgroup directory: (slot generation, slot) packed above
+/// 64 file ids, so it is stable for the cgroup's lifetime and never reused
+/// (the generation bumps whenever the slot is recreated). This is the cgroup
+/// id (st_ino == handle id, as on Linux kernfs); the handle generation is the
+/// slot generation.
+pub const INO_BASE: u64 = 0x6000_0000;
+pub fn dir_ino(cg: CgId) -> u64 {
+    INO_BASE + ((((cgroup::generation(cg) as u64) << 10) | (cg as u64 & 0x3FF)) * 64)
+}
+
+/// Handle generation carried by the id `ino` (None when it is not a cgroup id).
+pub fn ino_gen(ino: u64) -> Option<u32> {
+    if ino < INO_BASE + 64 { return None; }
+    let unit = (ino - INO_BASE) / 64;
+    let g = unit >> 10;
+    if g == 0 || g > u32::MAX as u64 { None } else { Some(g as u32) }
+}
+
+/// Decode a handle id: the absolute path of the cgroup directory or file it
+/// names. `Err` = ESTALE (the cgroup was removed, or its slot was reused).
+pub fn handle_path(ino: u64, gen: u32) -> Result<Vec<u8>, ()> {
+    let g = ino_gen(ino).ok_or(())?;
+    let unit = (ino - INO_BASE) / 64;
+    let off = ((ino - INO_BASE) % 64) as usize;
+    let cg = (unit & 0x3FF) as CgId;
+    if gen != 0 && gen != g { return Err(()); }
+    if !mounted() || !cgroup::alive(cg) || cgroup::generation(cg) != g { return Err(()); }
+    let mut p = Vec::from(ROOT);
+    let rel = cgroup::path_rel(cg, 0);
+    if rel != "/" { p.extend_from_slice(rel.as_bytes()); }
+    if off != 0 {
+        let f = *ALL.get(off - 1).ok_or(())?;
+        if !has_file(cg, f) { return Err(()); }
+        p.push(b'/');
+        p.extend_from_slice(fname(f).as_bytes());
+    }
+    Ok(p)
+}
+
 /// Stat answer: (mode, nlink, ino, uid, gid).
 pub fn stat(pid: u32, path: &[u8]) -> Option<(u32, u32, u64, u32, u32)> {
     match lookup(pid, path)? {
         Node::Dir(cg) => {
             let (u, g) = cgroup::dir_owner(cg);
-            Some((0o040755, 2 + cgroup::nr_children(cg), 0x6000_0000 + (cg as u64) * 64, u, g))
+            Some((0o040755, 2 + cgroup::nr_children(cg), dir_ino(cg), u, g))
         }
         Node::Static(d) => Some((0o100444, 1, 0x6000_0000 - 1, 0, 0)).map(|x| { let _ = d; x }),
         Node::File(cg, f) => {
             let (u, g) = cgroup::dir_owner(cg);
             Some((if f == F::Kill { 0o100200 } else if read_only(f) { 0o100444 } else { 0o100644 }, 1,
-                  0x6000_0000 + (cg as u64) * 64 + 1 + f as u64, u, g))
+                  dir_ino(cg) + 1 + f as u64, u, g))
         }
     }
 }

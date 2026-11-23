@@ -5212,10 +5212,17 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         // answers VFS_ELINKRACE; redo the resolution at most twice, then ELOOP.
         let was_strict = sched::strict_links();
         let mut attempt = 0;
+        let mut redirects = 0u32;
+        // A filesystem answered LINK_REDIRECT_ERR: the (single) path argument
+        // continues at this absolute VFS-served path. NUL-terminated.
+        let mut redir: Option<Vec<u8>> = None;
         let out = loop {
             let mut b0: Vec<u8> = Vec::new();
             let mut b1: Vec<u8> = Vec::new();
             let mut m = *msg;
+            if let (Some(rp), Some((i, _)), None) = (&redir, p0, p1) {
+                m.data[i * 8..i * 8 + 8].copy_from_slice(&(rp.as_ptr() as u64).to_le_bytes());
+            }
             let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
             let mut r = match rewrite_one(&mut m, p0, &mut b0, &mut i0) {
                 Err(e) => err_reply(e),
@@ -5234,6 +5241,28 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
             let me = sched::current_pid();
             if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
             if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
+            if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 {
+                let taken = sched::link_redirect_take();
+                redirects += 1;
+                // The path argument now: the original, or the previous redirect.
+                let cur: Option<Vec<u8>> = match (&redir, p0) {
+                    (Some(rp), _) => Some(rp[..rp.len() - 1].to_vec()),
+                    (None, Some((i, _))) => read_cstr_raw(arg(msg, i) as usize)
+                        .map(|(v, l)| normalize_abs_floor(&v[..l], 1)),
+                    _ => None,
+                };
+                let next = match (taken, cur) {
+                    (Some(t), Some(cur)) if p1.is_none() && redirects <= 8 => {
+                        sched::link_redirect_set(&t.0, &t.1);
+                        link_redirect_next(&cur)
+                    }
+                    _ => None,
+                };
+                match next {
+                    Some(mut n) => { n.push(0); redir = Some(n); continue; }
+                    None => r = err_reply(if redirects > 8 { -40 } else { -2 }),
+                }
+            }
             if reply_val(&r) == VFS_ELINKRACE as i64 {
                 attempt += 1;
                 if attempt > 2 { r = err_reply(-40); } else { continue; }
@@ -5243,7 +5272,9 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         sched::set_strict_links(was_strict);
         return out;
     }
-    dispatch(msg, caller_pid)
+    let r = dispatch(msg, caller_pid);
+    if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 { let _ = sched::link_redirect_take(); return err_reply(-2); }
+    r
 }
 
 /// (parent, name) of a normalised path.
@@ -9075,7 +9106,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
 const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
-                                     b"/proc/vtstat", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
+                                     b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
 /// The regular files `handle_open` generates through `gen_proc_system` (and
@@ -9526,6 +9557,21 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
         path = strip_trailing_slash(path);
     }
 
+    // /proc/self, /proc/thread-self: symlinks to a directory. O_NOFOLLOW alone
+    // is ELOOP; O_PATH|O_NOFOLLOW (fd of the link itself) is approximated by
+    // the directory fd.
+    let mut selfbuf = [0u8; 64];
+    let mut self_link: Option<u8> = None;
+    if let Some(n) = proc_self_target(path, &mut selfbuf) {
+        if flags & O_NOFOLLOW != 0 {
+            // O_PATH|O_NOFOLLOW: an fd of the link itself (fstat -> S_IFLNK,
+            // readlinkat(fd, "") -> target). Without O_PATH it is ELOOP.
+            if flags & O_PATH == 0 || flags & O_DIRECTORY != 0 { return err_reply(if flags & O_DIRECTORY != 0 { -20 } else { -40 }); }
+            self_link = Some(if path == b"/proc/thread-self" { LVL_SELF_THREAD } else { LVL_SELF });
+        }
+        path = &selfbuf[..n];
+    }
+
     // /dev/mqueue/<name>: an open of a POSIX message queue (mqueue mount).
     if let Some(name) = mqueue::path_name(path) {
         let r = mqueue::open_path(pid, name, flags);
@@ -9568,7 +9614,9 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
     // A mapped tmpfs file that O_TRUNC emptied (its VMO id): every mapping
     // drops its pages after the open, with no VFS lock held.
     let mut trunc_zap: Option<u64> = None;
-    let kind = if let Some(lookup_path) = should_lookup_ramfs(path) {
+    let kind = if let Some(l) = self_link {
+        VnodeKind::SysBlock { dev: SELF_LINK_DEV, level: l, pos: 0 }
+    } else if let Some(lookup_path) = should_lookup_ramfs(path) {
         if lookup_path == b"/dev/null" {
             VnodeKind::DevNull
         } else if lookup_path == b"/dev/zero" {
@@ -10014,6 +10062,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let mut buf = alloc::vec![0u8; 16384];
             let n = tty_server::vt::stats_text(&mut buf);
             match proc_snapshot(b"/tmp/.vtstat", &buf[..n], false) {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/vtgrid" {
+            // Full cell grid of VT 6 (the test VT), see `vt::grid_text`.
+            let mut buf = alloc::vec![0u8; 393216];
+            let n = tty_server::vt::grid_text(5, &mut buf);
+            match proc_snapshot(b"/tmp/.vtgrid", &buf[..n], false) {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -11137,7 +11193,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let mut s = &b[..n];
                 while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
-                if s != b"0" && s != b"1" && s != b"2" && s != b"3" { return err_reply(-22); }
+                if s != b"0" && s != b"1" && s != b"2" && s != b"3" && s != b"4" && s != b"5" { return err_reply(-22); }
                 extern "C" { fn kernel_drm_fence_hold_set(on: u32); }
                 unsafe { kernel_drm_fence_hold_set((s[0] - b'0') as u32) };
                 return val_reply(count as u64);
@@ -13913,6 +13969,8 @@ static FH_TABLE: Mutex<alloc::vec::Vec<((u64, u64), alloc::vec::Vec<u8>)>> = Mut
 
 pub fn fh_remember(id: (u64, u64), path: &[u8]) {
     if matches!(fh_fs(path), FhFs::NoExport) { return; }
+    // cgroup2 nodes decode by id (generation + slot): no table entry.
+    if cgroupfs::is_path(path) && cgroupfs::ino_gen(id.1).is_some() { return; }
     let mut t = FH_TABLE.lock();
     if let Some(e) = t.iter_mut().find(|e| e.0 == id) { e.1 = path.to_vec(); return; }
     if t.len() >= 4096 { t.remove(0); }
@@ -13971,6 +14029,7 @@ fn f2fs_ino_path(host: &[u8], ino: u64) -> Result<(&'static str, Vec<u8>, u32), 
 
 /// i_generation to put in a handle for `host` (0 where the filesystem has none).
 pub fn fh_gen(host: &[u8], id: (u64, u64)) -> u32 {
+    if cgroupfs::is_path(host) { return cgroupfs::ino_gen(id.1).unwrap_or(0); }
     if fh_fs(host) != FhFs::F2fs { return 0; }
     f2fs_ino_path(host, id.1).map(|r| r.2).unwrap_or(0)
 }
@@ -14009,6 +14068,10 @@ pub fn fh_lookup(mp: &[u8], dev: Option<u64>, ino: u64, gen: u32) -> Option<allo
         }
         FhFs::Kernfs | FhFs::Other => {}
     }
+    if cgroupfs::mounted() && path_under(mp, cgroupfs::ROOT) {
+        // cgroup2: the id carries slot + generation; a removed cgroup is ESTALE.
+        return cgroupfs::handle_path(ino, gen).ok();
+    }
     let (id, p) = FH_TABLE.lock().iter().find(|e| e.0 .1 == ino && dev.map_or(true, |d| d == e.0 .0)).map(|e| (e.0, e.1.clone()))?;
     if fh_ident(&p) == Some(id) { Some(p) } else { None }
 }
@@ -14037,7 +14100,7 @@ fn fan_fid_record(out: &mut Vec<u8>, ty: u8, id: (u64, u64), name: Option<&[u8]>
     out.extend_from_slice(&0x4ci32.to_le_bytes());
     out.extend_from_slice(&id.1.to_le_bytes());
     let hp = FH_TABLE.lock().iter().find(|e| e.0 == id).map(|e| e.1.clone());
-    let g = hp.map_or(0, |p| fh_gen(&p, id));
+    let g = match hp { Some(p) => fh_gen(&p, id), None => cgroupfs::ino_gen(id.1).filter(|_| cgroupfs::mounted() && cgroupfs::handle_path(id.1, 0).is_ok()).unwrap_or(0) };
     out.extend_from_slice(&g.to_le_bytes());
     if let Some(n) = name { out.extend_from_slice(n); out.push(0); }
     while (out.len()) % 4 != 0 { out.push(0); }
@@ -15520,6 +15583,24 @@ fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
 // /tmp/-/dev/shm/-/run/user mounts) back to the net server's listener.
 // Abstract-namespace sockets never reach here (net matches those by bytes).
 
+/// After a filesystem answered `LINK_REDIRECT_ERR`: the path `cur` (normalised
+/// absolute) continues at the redirect target, keeping whatever tail the
+/// filesystem's walk did not cover (a create's final name).
+fn link_redirect_next(cur: &[u8]) -> Option<Vec<u8>> {
+    let (walked, to) = sched::link_redirect_take()?;
+    let mut idx = 0;
+    while idx + walked.len() <= cur.len() {
+        let end = idx + walked.len();
+        if cur[idx..end] == walked[..] && (end == cur.len() || cur[end] == b'/') {
+            let mut n = to;
+            n.extend_from_slice(&cur[end..]);
+            return Some(n);
+        }
+        idx += 1;
+    }
+    None
+}
+
 /// bind(): create an S_IFSOCK node at `path`, tagged with the net server's
 /// `sock_id`. Intermediate components are followed through symlinks; the final
 /// component is created literally (bind does not follow a trailing symlink).
@@ -15529,7 +15610,8 @@ fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
 /// path is on no mount server). Sockets on mounted filesystems (f2fs) are a
 /// real S_IFSOCK inode plus an in-memory (path, inode) -> listener table
 /// (`mounted_sock_bind`).
-pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
+pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 { unix_bind_node_d(pid, path, sock_id, 0) }
+fn unix_bind_node_d(pid: u32, path: &[u8], sock_id: u64, depth: u32) -> i32 {
     let resolved = match tmp_resolve_links(path, false) {
         Ok(v)  => v,
         Err(e) => return e,
@@ -15537,7 +15619,14 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return mounted_sock_bind(rpath, sock_id),
+        None    => {
+            let r = mounted_sock_bind(rpath, sock_id);
+            if r != sched::LINK_REDIRECT_ERR { return r; }
+            return match link_redirect_next(rpath) {
+                Some(n) if depth < 8 => unix_bind_node_d(pid, &n, sock_id, depth + 1),
+                _ => -2,
+            };
+        }
     };
     if is_tmpfs_root(tpath) { return -17; }             // EEXIST — the mount root
     if tpath.len() > MAX_TMP_PATH - 1 { return -36; }   // ENAMETOOLONG
@@ -15661,7 +15750,8 @@ fn mounted_sock_resolve(pid: u32, rpath: &[u8]) -> i64 {
 /// there (e.g. zbus probing /run/dbus/system_bus_socket on a system with no
 /// system bus). EOPNOTSUPP stays reserved for bind, where it correctly says
 /// "this filesystem cannot host a socket node".
-pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
+pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 { unix_resolve_node_d(pid, path, 0) }
+fn unix_resolve_node_d(pid: u32, path: &[u8], depth: u32) -> i64 {
     let resolved = match tmp_resolve_links(path, true) {
         Ok(v)  => v,
         Err(e) => return e as i64,
@@ -15669,7 +15759,14 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return mounted_sock_resolve(pid, rpath),
+        None    => {
+            let r = mounted_sock_resolve(pid, rpath);
+            if r != sched::LINK_REDIRECT_ERR as i64 { return r; }
+            return match link_redirect_next(rpath) {
+                Some(n) if depth < 8 => unix_resolve_node_d(pid, &n, depth + 1),
+                _ => -2,
+            };
+        }
     };
     let cred = cred_of(pid);
     let tmp = TMP_FILES.lock();
@@ -15736,6 +15833,46 @@ fn handle_symlink(pid: u32, target_ptr: usize, link_ptr: usize) -> Message {
 /// semantics included: the return is `min(target_len, buf_len)` and the buffer
 /// is never NUL-terminated, exactly as readlink(2) specifies.
 ///
+/// `/proc/self` -> "/proc/<tgid>", `/proc/thread-self` -> "/proc/<tgid>/task/<tid>"
+/// (numbers in the reader's pid namespace): the directory the Linux symlink
+/// of that name resolves to. `path` is exactly the link, trailing slash gone.
+fn proc_self_target(path: &[u8], out: &mut [u8; 64]) -> Option<usize> {
+    if path != b"/proc/self" && path != b"/proc/thread-self" { return None; }
+    let me = sched::current_pid();
+    let mut p = 0usize;
+    let mut put = |s: &[u8], p: &mut usize| { out[*p..*p + s.len()].copy_from_slice(s); *p += s.len(); };
+    let num = |v: u32, d: &mut [u8; 10]| -> usize {
+        let (mut k, mut x) = (0usize, v);
+        let mut t = [0u8; 10];
+        loop { t[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+        for i in 0..k { d[i] = t[k - 1 - i]; }
+        k
+    };
+    let mut d = [0u8; 10];
+    put(b"/proc/", &mut p);
+    let k = num(pv(sched::tgid_of(me)), &mut d); put(&d[..k], &mut p);
+    if path == b"/proc/thread-self" {
+        put(b"/task/", &mut p);
+        let k = num(pv(me), &mut d); put(&d[..k], &mut p);
+    }
+    Some(p)
+}
+
+const SELF_LINK_DEV: u16 = sysclass::SC_BASE | 0xF << 8 | 0xFC;
+const LVL_SELF: u8 = 0xF1;
+const LVL_SELF_THREAD: u8 = 0xF2;
+
+/// Link text of an O_PATH fd of `/proc/self` or `/proc/thread-self`
+/// (`readlinkat(fd, "")`, fstat's st_size): the same target readlink gives.
+pub fn self_link_text(pid: u32, fd: usize, out: &mut [u8; 48]) -> Option<usize> {
+    let Some(VnodeKind::SysBlock { dev: SELF_LINK_DEV, level, .. }) = vfs_get_node_kind(pid, fd) else { return None };
+    let mut tb = [0u8; 64];
+    let n = proc_self_target(if level == LVL_SELF_THREAD { b"/proc/thread-self" } else { b"/proc/self" }, &mut tb)?;
+    let t = &tb[6..n];
+    out[..t.len()].copy_from_slice(t);
+    Some(t.len())
+}
+
 /// EINVAL (not ENOENT) for a path that exists but is not a symlink — callers
 /// including coreutils' `ls` use precisely that to tell the two apart.
 fn handle_readlink(path_ptr: usize, buf_ptr: usize, buf_len: usize) -> Message {
@@ -17394,9 +17531,16 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             let cg = cgroupfs::dev_cg(dev);
             let (u, g) = sched::cgroup::dir_owner(cg);
             write_stat_full(stat_ptr, S_IFDIR | 0o755, (2 + sched::cgroup::nr_children(cg)) as u64, 0,
-                            0x6000_0000 + (cg as u64) * 64, u, g);
+                            cgroupfs::dir_ino(cg), u, g);
             return ok_reply();
         }
+    }
+    if let VnodeKind::SysBlock { dev: SELF_LINK_DEV, level, .. } = kind {
+        let level_ino = level as u64;
+        let mut t = [0u8; 48];
+        let n = self_link_text(pid, fd, &mut t).unwrap_or(0);
+        write_stat_full(stat_ptr, 0o120777, 1, n as u64, 0x5000_0f00 + level_ino, 0, 0);
+        return ok_reply();
     }
     if let VnodeKind::SysBlock { dev, level, .. } = kind {
         write_stat_full(stat_ptr, S_IFDIR | 0o755, 1, 0,
@@ -17611,6 +17755,22 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     if stat_ptr == 0 { return err_reply(-14); }
     let (pbuf, plen) = match read_cstr_raw(path_ptr) { Some(r) => r, None => return err_reply(-14) };
     let path = &pbuf[..plen];
+
+    // /proc/self and /proc/thread-self are symlinks: lstat describes the link
+    // (S_IFLNK 0777, size = target length), stat the directory it names.
+    {
+        let mut tb = [0u8; 64];
+        let had_slash = path.len() > 1 && path.ends_with(b"/");
+        if let Some(n) = proc_self_target(strip_trailing_slash(path), &mut tb) {
+            if !follow && !had_slash {
+                write_stat_owned(stat_ptr, 0o120777, (n - 6) as u64, path_ino(strip_trailing_slash(path), 7), 0, 0);
+                return ok_reply();
+            }
+            let mut cb = [0u8; 65];
+            cb[..n].copy_from_slice(&tb[..n]);
+            return stat_common(cb.as_ptr() as usize, stat_ptr, follow);
+        }
+    }
 
     if let Some(name) = mqueue::path_name(strip_trailing_slash(path)) {
         return match mqueue::stat_path(sched::current_pid(), name) {
