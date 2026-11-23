@@ -229,7 +229,8 @@ def full(ssh, user, pw, tmp):
     step("bad_password_refused", rc == 255, f"rc={rc}")
 
     # public key: install, then BatchMode login
-    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ssh.key], check=True)
+    if not os.path.exists(ssh.key):  # options() already made it
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ssh.key], check=True)
     pub = open(ssh.key + ".pub", "rb").read()
     rc, out, err = ssh.run(user, "umask 077; mkdir -p .ssh && cat > .ssh/authorized_keys && echo ok",
                            password=pw, stdin=pub)
