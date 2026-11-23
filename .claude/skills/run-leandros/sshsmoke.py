@@ -387,7 +387,8 @@ def free_port():
 
 def fwd_client(ssh, user, *fwd):
     """ssh -N with -L/-R specs; ExitOnForwardFailure so a refused forward ends it."""
-    argv = ["ssh", *ssh.key_opts(), "-N", "-o", "ExitOnForwardFailure=yes", *fwd,
+    # LogLevel=INFO: at ERROR the client does not print "channel N: open failed: administratively prohibited" for a refused -L
+    argv = ["ssh", *["LogLevel=INFO" if o == "LogLevel=ERROR" else o for o in ssh.key_opts()], "-N", "-o", "ExitOnForwardFailure=yes", *fwd,
             "-p", str(ssh.port), f"{user}@{ssh.host}"]
     return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
