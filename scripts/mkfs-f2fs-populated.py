@@ -890,10 +890,7 @@ def main():
     dri = gl_lib("gbm/dri_gbm.so")
     if os.path.exists(dri):
         gbm_files.append(("dri_gbm.so", dri, 0o100755))
-    # kmscube itself (dynamic ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1).
-    kc = f"{gl_root}/out/kmscube-{arch}"
-    if os.path.exists(kc):
-        bin_files.append(("kmscube", kc, 0o100755))
+    # kmscube is Alpine's package (ports/alpine/world; /bin/kmscube -> /usr/bin/kmscube below).
 
     # ── M4 input/XKB ship set (anvil compositor) ──────────────────────────────
     # anvil (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) + the wl_shm/xdg_shell
@@ -920,9 +917,9 @@ def main():
     # here (libxkbcommon, libinput, ...) are upstream C, not built from this
     # repo, and always come from the blob.
     shim_build_dir = f"target/input-stack-sysroot/{arch}/usr/lib"
-    for so in ("libxkbcommon.so.0", "libdisplay-info.so.3", "libseat.so.1",
-               "libudev.so.1", "libinput.so.10", "libpixman-1.so.0",
-               "libmtdev.so.1", "libevdev.so.2"):
+    # libxkbcommon, libinput, libevdev, libmtdev, libpixman, libdisplay-info, the XKB data and the
+    # libinput quirks are Alpine packages now (ports/alpine/world).
+    for so in ("libseat.so.1", "libudev.so.1"):
         built = f"{shim_build_dir}/{so}"
         p = built if os.path.exists(built) else f"{m4_lib_dir}/{so}"
         if os.path.exists(p):
@@ -939,7 +936,7 @@ def main():
     m4_share_files = []
     m4_share_dirs  = set()
     m4_share_src   = f"{m4_root}/usr/share"
-    if os.path.isdir(m4_share_src):
+    if False and os.path.isdir(m4_share_src):   # XKB data + libinput quirks come from Alpine packages
         for dirpath, _dirnames, filenames in os.walk(m4_share_src):
             rel = os.path.relpath(dirpath, m4_root)   # e.g. usr/share/X11/xkb/symbols
             parts = rel.split("/")
@@ -1315,72 +1312,21 @@ def main():
     if os.path.isfile(_brcmfctl):
         bin_files.append(("brcmfctl", _brcmfctl, 0o100755))
 
-    # Realtek RTL8168-family PHY/MAC patches for the r8169 driver (x86_64
-    # PCs): /lib/firmware/rtl_nic/*.fw from the cache ports/rtl_nic/fetch.sh
-    # fills ($RTL_NIC_CACHE, default ~/.cache/leandros/rtl_nic).
-    # Redistributable but never committed; absent cache -> skipped (the
-    # driver works without them).
-    if arch == "x86_64":
-        _rtl_cache = os.path.expanduser(os.environ.get("RTL_NIC_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/rtl_nic")))
-        if os.path.isdir(_rtl_cache):
-            _rtl = sorted(f for f in os.listdir(_rtl_cache) if f.endswith(".fw"))
-            for _f in _rtl:
-                for d in ("/lib/firmware", "/lib/firmware/rtl_nic"):
-                    m4_share_dirs.add(d)
-                m4_share_files.append(("/lib/firmware/rtl_nic", _f, os.path.join(_rtl_cache, _f)))
-            if _rtl:
-                print(f"  rtl_nic firmware: {len(_rtl)} files in /lib/firmware/rtl_nic")
-
-    # Intel Wi-Fi (iwlwifi, x86_64 PCs/laptops): /lib/firmware/iwlwifi-*.ucode
-    # from the cache ports/iwlwifi/fetch.sh fills ($IWLWIFI_CACHE, default
-    # ~/.cache/leandros/iwlwifi). Redistributable, never committed; absent
-    # cache -> skipped (the driver then logs "firmware missing").
+    # Device firmware (iwlwifi, Intel BT, i915 DMC, r8169 PHY patches on x86_64;
+    # CYW43455 Wi-Fi + BT patch on aarch64): exactly the files the drivers load,
+    # taken from Alpine's linux-firmware-* packages at the locked release
+    # (ports/alpine/firmware.{list,lock}, scripts/alpine_firmware.py), decompressed
+    # to the plain paths the kernel requests. Not part of the apk db / world.
     # Wi-Fi credentials are NEVER in the repo: $LEANDROS_WIFI_CONF may name a
     # host file (`ssid=...` / `psk=...` lines) to stage as /etc/leandros/wifi.conf.
-    if arch == "x86_64":
-        _iwl_cache = os.path.expanduser(os.environ.get("IWLWIFI_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/iwlwifi")))
-        if os.path.isdir(_iwl_cache):
-            _iwl = sorted(f for f in os.listdir(_iwl_cache) if f.startswith("iwlwifi-") and f.endswith(".ucode"))
-            for _f in _iwl:
-                m4_share_dirs.add("/lib/firmware")
-                m4_share_files.append(("/lib/firmware", _f, os.path.join(_iwl_cache, _f)))
-            if _iwl:
-                print(f"  iwlwifi firmware: {', '.join(_iwl)} in /lib/firmware")
-    # Intel Bluetooth (btusb + btintel, x86_64 laptops): /lib/firmware/intel/
-    # ibt-*.{sfi,ddc} from the cache ports/intel-bt/fetch.sh fills
-    # ($INTEL_BT_CACHE, default ~/.cache/leandros/intel-bt). Absent -> skipped.
-    if arch == "x86_64":
-        _ibt_cache = os.path.expanduser(os.environ.get("INTEL_BT_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/intel-bt")))
-        if os.path.isdir(_ibt_cache):
-            _ibt = sorted(f for f in os.listdir(_ibt_cache) if f.startswith("ibt-") and (f.endswith(".sfi") or f.endswith(".ddc")))
-            for _f in _ibt:
-                for d in ("/lib/firmware", "/lib/firmware/intel"):
-                    m4_share_dirs.add(d)
-                m4_share_files.append(("/lib/firmware/intel", _f, os.path.join(_ibt_cache, _f)))
-            if _ibt:
-                print(f"  intel-bt firmware: {', '.join(_ibt)} in /lib/firmware/intel")
-    # Raspberry Pi 5 Wi-Fi (CYW43455, brcmfmac family): /lib/firmware/brcm/
-    # {cyw43455-sdio.bin, cyw43455-sdio.clm_blob, brcmfmac43455-sdio.raspberrypi,
-    # 5-model-b.txt} from the cache ports/brcmfmac/fetch.sh fills
-    # ($BRCMFMAC_CACHE, default ~/.cache/leandros/brcmfmac). Absent -> skipped.
-    if arch == "aarch64":
-        _brc_cache = os.path.expanduser(os.environ.get("BRCMFMAC_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/brcmfmac")))
-        if os.path.isdir(_brc_cache):
-            _brc = sorted(f for f in os.listdir(_brc_cache)
-                          if (f.startswith("cyw43455-sdio.") or f.startswith("brcmfmac43455-sdio.")) and not f.endswith(".part"))
-            for _f in _brc:
-                m4_share_dirs.update(("/lib/firmware", "/lib/firmware/brcm"))
-                m4_share_files.append(("/lib/firmware/brcm", _f, os.path.join(_brc_cache, _f)))
-            if _brc:
-                print(f"  brcmfmac firmware: {len(_brc)} files in /lib/firmware/brcm")
-        # Pi 5 Bluetooth patch (BCM4345C0.hcd) from ports/bluez-firmware/fetch.sh's
-        # cache ($BTFW_CACHE, default ~/.cache/leandros/bluez-firmware). Absent -> skipped.
-        _bt_cache = os.path.expanduser(os.environ.get("BTFW_CACHE", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "leandros/bluez-firmware")))
-        _bt_hcd = os.path.join(_bt_cache, "BCM4345C0.hcd")
-        if os.path.isfile(_bt_hcd):
-            m4_share_dirs.update(("/lib/firmware", "/lib/firmware/brcm"))
-            m4_share_files.append(("/lib/firmware/brcm", "BCM4345C0.hcd", _bt_hcd))
-            print("  Bluetooth firmware: /lib/firmware/brcm/BCM4345C0.hcd")
+    import alpine_firmware
+    _fw = alpine_firmware.stage(arch)
+    for _d, _n, _h, _s in _fw:
+        m4_share_dirs.add("/lib/firmware")
+        m4_share_dirs.add(_d)
+        m4_share_files.append((_d, _n, _h))
+    if _fw:
+        print(f"  firmware (Alpine): {len(_fw)} files in /lib/firmware ({sum(os.path.getsize(h) for _, _, h, _ in _fw)} bytes)")
     _wifi_conf = os.environ.get("LEANDROS_WIFI_CONF")
     if _wifi_conf and os.path.isfile(os.path.expanduser(_wifi_conf)):
         m4_share_dirs.add("/etc/leandros")
@@ -3003,6 +2949,7 @@ def main():
     # /bin compat names (PATH on the console login is /bin alone); symlinks, unowned by the db.
     for _n in ("git", "git-upload-pack", "git-receive-pack", "git-upload-archive", "less", "nano", "rg"):
         bin_files.append((_n, f"/usr/bin/{_n}".encode(), S_IFLNK | 0o777))
+    bin_files.append(("kmscube", b"/usr/bin/kmscube", S_IFLNK | 0o777))
     for _n in ("mkfs.fat", "mkfs.xfs"):
         bin_files.append((_n, f"/sbin/{_n}".encode(), S_IFLNK | 0o777))
 

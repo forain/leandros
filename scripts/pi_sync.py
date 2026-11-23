@@ -76,13 +76,11 @@ def build_manifest(out_dir, board, log, allow_missing=False):
     for k in ("LEANDROS_WIFI_CONF", "LEANDROS_AUTHORIZED_KEYS"):
         env.pop(k, None)          # never stage credentials into the manifest
     home = os.path.expanduser("~")
-    env.setdefault("BRCMFMAC_CACHE", os.path.join(home, ".cache/leandros/brcmfmac"))
-    env.setdefault("BTFW_CACHE", os.path.join(home, ".cache/leandros/bluez-firmware"))
     with open(log, "w") as lf:
-        for fetch in ("ports/brcmfmac/fetch.sh", "ports/bluez-firmware/fetch.sh"):
-            r = subprocess.run([os.path.join(REPO, fetch)], cwd=REPO, env=env, stdout=lf, stderr=lf)
+        for fetch in (["scripts/alpine_firmware.py", "fetch", "aarch64"],):
+            r = subprocess.run([sys.executable, os.path.join(REPO, fetch[0])] + fetch[1:], cwd=REPO, env=env, stdout=lf, stderr=lf)
             if r.returncode != 0:
-                print(f"WARNING: {fetch} failed (rc {r.returncode}); firmware may be missing, see {log}")
+                print(f"WARNING: {fetch[0]} failed (rc {r.returncode}); firmware may be missing, see {log}")
         if board:
             env["LEANDROS_BOARD"] = board
         else:

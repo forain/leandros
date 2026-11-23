@@ -6,8 +6,8 @@ publish = false
 
 # Host-only test crate: compiles drivers/src/bt/{h4,hcd,bringup}.rs via #[path]
 # and runs the Broadcom bring-up against a scripted controller. The real
-# BCM4345C0.hcd is used when ports/bluez-firmware/fetch.sh has cached it
-# ($BTFW_CACHE, default ~/.cache/leandros/bluez-firmware); otherwise those
+# BCM4345C0.hcd is used when scripts/alpine_firmware.py has staged it
+# ($BTFW_CACHE, default ~/.cache/leandros/alpine-fw/aarch64/current/lib/firmware/brcm); otherwise those
 # cases fall back to a synthetic image.
 # Run: cargo test --manifest-path drivers/bt-tests/Cargo.toml --target <host-triple>
 [workspace]

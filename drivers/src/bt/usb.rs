@@ -8,7 +8,7 @@
 //! out on EP0, its ACL on bulk OUT. SCO is not supported (dropped).
 //!
 //! Firmware: /lib/firmware/intel/ibt-<variant>-<revid>.{sfi,ddc}
-//! (ports/intel-bt/fetch.sh). Command line: `bt=0` skips the driver,
+//! (Alpine linux-firmware-intel, ports/alpine/firmware.list). Command line: `bt=0` skips the driver,
 //! `btusb.fw=0` skips the Intel download (controller used as found).
 use alloc::collections::VecDeque;
 use alloc::format;

@@ -1739,6 +1739,7 @@ static int nn_udp_serve(void) {
         if (!nn_poll(u, POLLIN, 15000)) return 11;
         ssize_t n = recvfrom(u, b, sizeof b, 0, (struct sockaddr *)&p, &pl);
         if (n < 0) return 12;
+        { char ip[32]; inet_ntop(AF_INET, &p.sin_addr, ip, sizeof ip); printf("DIAG udp_serve q%d from %s:%d len %u\n", i + 1, ip, ntohs(p.sin_port), (unsigned)pl); }
         if (sendto(u, "hi", 2, 0, (struct sockaddr *)&p, pl) != 2) return 13;
     }
     return 0;
@@ -1868,6 +1869,17 @@ static void nn_case(const char *name, int mode) {
         struct sockaddr_in from; socklen_t fl = sizeof from; memset(b, 0, sizeof b);
         got = sendto(u, "q2", 2, 0, (struct sockaddr *)&a, sizeof a) == 2 && nn_poll(u, POLLIN, 8000)
             && recvfrom(u, b, 2, 0, (struct sockaddr *)&from, &fl) == 2 && !strcmp(b, "hi");
+        if (!got) {
+            struct sockaddr_in lb; socklen_t ll = sizeof lb; memset(&lb, 0, sizeof lb); getsockname(u, (struct sockaddr *)&lb, &ll);
+            char b2[8]; ssize_t r2 = recvfrom(u, b2, sizeof b2, MSG_DONTWAIT, NULL, NULL);
+            printf("DIAG udp_local q2 lost: local port %d, late nonblocking recv=%zd errno=%d\n", ntohs(lb.sin_port), r2, errno);
+            nat_dump();
+            { FILE *df = fopen("/proc/net/dev", "r"); char dl[256]; while (df && fgets(dl, sizeof dl, df)) printf("DIAG dev %s", dl); if (df) fclose(df); }
+            { FILE *df = fopen("/proc/net/snmp", "r"); char dl[512]; while (df && fgets(dl, sizeof dl, df)) if (!strncmp(dl, "Udp", 3) || !strncmp(dl, "Ip:", 3)) printf("DIAG snmp %s", dl); if (df) fclose(df); }
+            FILE *uf = fopen("/proc/net/udp", "r"); char ul[256];
+            while (uf && fgets(ul, sizeof ul, uf)) printf("DIAG udp %s", ul);
+            if (uf) fclose(uf);
+        }
         snprintf(msg, sizeof msg, "%s: unconnected sendto 127.0.0.1:9090 is answered", name); CHECK(msg, got);
         char ip[32] = ""; inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
         snprintf(msg, sizeof msg, "%s: recvfrom reports 127.0.0.1:9090 (got %s:%d)", name, ip, ntohs(from.sin_port));
