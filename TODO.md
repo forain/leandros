@@ -96,3 +96,5 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 
 - venusisr follow-up: a venustest 7c variant on the syncobj path (per-context/ring timelines done by venustl+venusfollow).
+
+- ffvanilla laptop step 2026-11-23: stock Firefox VA-API fails with RDD sandbox on (iHD readlink EACCES -> RDD respawn loop; works with MOZ_DISABLE_RDD_SANDBOX=1); find the readlink path and allow it; about:support/WebRender-on-iris still to confirm. See orch/handoff/ffvanilla.md.
