@@ -7,7 +7,7 @@
 #   cd drivers/iwlwifi-tests && cargo test --target aarch64-apple-darwin
 #   (the repo's .cargo config defaults to the kernel target; name the host's)
 #
-# With the real firmware in ~/.cache/leandros/iwlwifi (ports/iwlwifi/fetch.sh)
+# With the real firmware in ~/.cache/leandros/alpine-fw/x86_64/current (scripts/alpine_firmware.py)
 # the parser is also checked against iwlwifi-8265-36.ucode.
 [package]
 name = "iwlwifi-tests"

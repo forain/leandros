@@ -7,7 +7,7 @@
 //! session command defaults to the `Exec=` line of
 //! /usr/share/wayland-sessions/cosmic.desktop, which is what cosmic-greeter
 //! starts for a keyboard login. The socket defaults to `$GREETD_SOCK`, else
-//! the newest `/run/user/990/greetd-*.sock` (docs/desktop/login.md).
+//! the newest `/run/greetd-*.sock` (docs/desktop/login.md).
 //!
 //! Protocol (greetd-ipc): every message is a native-endian u32 length followed
 //! by that many bytes of JSON. Requests: create_session,
@@ -120,7 +120,7 @@ fn find_sock() -> String {
             return s;
         }
     }
-    let dir = "/run/user/990";
+    let dir = "/run";
     let mut best: Option<(std::time::SystemTime, String)> = None;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {

@@ -1,0 +1,35 @@
+# Firmware the kernel drivers load, taken from Alpine's linux-firmware-* packages (see scripts/alpine_firmware.py).
+# <arch> <package> <member path in the apk (zstd is decompressed, symlinks followed)> <dest under /lib/firmware | ->
+# iwlwifi (drivers/src/iwlwifi.rs), Intel 8265
+x86_64 linux-firmware-intel lib/firmware/intel/iwlwifi/iwlwifi-8265-36.ucode.zst iwlwifi-8265-36.ucode
+# btusb + btintel (drivers/src/bt/usb.rs, btintel.rs)
+x86_64 linux-firmware-intel lib/firmware/intel/ibt-12-16.sfi.zst intel/ibt-12-16.sfi
+x86_64 linux-firmware-intel lib/firmware/intel/ibt-12-16.ddc.zst intel/ibt-12-16.ddc
+# i915 Gen9 display microcontroller (DMC)
+x86_64 linux-firmware-i915 lib/firmware/i915/kbl_dmc_ver1_04.bin.zst i915/kbl_dmc_ver1_04.bin
+# r8169 PHY/MAC patches
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168d-1.fw.zst rtl_nic/rtl8168d-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168d-2.fw.zst rtl_nic/rtl8168d-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168e-1.fw.zst rtl_nic/rtl8168e-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168e-2.fw.zst rtl_nic/rtl8168e-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168e-3.fw.zst rtl_nic/rtl8168e-3.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168f-1.fw.zst rtl_nic/rtl8168f-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168f-2.fw.zst rtl_nic/rtl8168f-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8411-1.fw.zst rtl_nic/rtl8411-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8411-2.fw.zst rtl_nic/rtl8411-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168g-2.fw.zst rtl_nic/rtl8168g-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168g-3.fw.zst rtl_nic/rtl8168g-3.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168h-2.fw.zst rtl_nic/rtl8168h-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8168fp-3.fw.zst rtl_nic/rtl8168fp-3.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8105e-1.fw.zst rtl_nic/rtl8105e-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8402-1.fw.zst rtl_nic/rtl8402-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8106e-1.fw.zst rtl_nic/rtl8106e-1.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8106e-2.fw.zst rtl_nic/rtl8106e-2.fw
+x86_64 linux-firmware-rtl_nic lib/firmware/rtl_nic/rtl8107e-2.fw.zst rtl_nic/rtl8107e-2.fw
+# Raspberry Pi 5 CYW43455: Alpine's own raspberrypi,5-model-b links (they point into linux-firmware-cypress)
+aarch64 linux-firmware-cypress lib/firmware/cypress/cyfmac43455-sdio-standard.bin.zst -
+aarch64 linux-firmware-brcm lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.bin.zst brcm/cyw43455-sdio.bin
+aarch64 linux-firmware-brcm lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.clm_blob.zst brcm/cyw43455-sdio.clm_blob
+aarch64 linux-firmware-brcm lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.txt.zst brcm/brcmfmac43455-sdio.raspberrypi,5-model-b.txt
+# Pi 5 Bluetooth patch (drivers/src/bt/boot.rs)
+aarch64 linux-firmware-brcm lib/firmware/brcm/BCM4345C0.raspberrypi,5-model-b.hcd.zst brcm/BCM4345C0.hcd

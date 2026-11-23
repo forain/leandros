@@ -489,6 +489,23 @@ pub fn path_for_rdev(major: u32, minor: u32, out: &mut alloc::vec::Vec<u8>) -> b
     }
 }
 
+/// The `idx`-th visible device's `(major, minor)`, in `/sys/class/block` order
+/// (the entries of `/sys/dev/block`).
+pub fn rdev_at(idx: usize) -> Option<(u32, u32)> {
+    let b = synced();
+    let e = b.iter().filter(|e| e.in_use && !e.special).nth(idx)?;
+    Some((e.major, e.minor))
+}
+
+/// Name of the visible device numbered `major:minor`, copied to `out`.
+pub fn name_of_rdev(major: u32, minor: u32, out: &mut [u8; NAME_MAX]) -> Option<usize> {
+    let b = synced();
+    let e = b.iter().find(|e| e.in_use && !e.special && e.major == major && e.minor == minor)?;
+    let n = e.nlen as usize;
+    out[..n].copy_from_slice(e.name());
+    Some(n)
+}
+
 /// Registry slots (with names) of `roots` and of every partition whose parent is one of them,
 /// one pass. BLKPG-created partitions live only here.
 pub fn family_slots(roots: &[u16]) -> alloc::vec::Vec<(u16, alloc::string::String)> {

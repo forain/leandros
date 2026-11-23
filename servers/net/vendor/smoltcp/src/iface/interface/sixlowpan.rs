@@ -16,6 +16,8 @@ impl InterfaceInner {
         payload: &'payload [u8],
         f: &'output mut FragmentsBuffer,
     ) -> Option<Packet<'output>> {
+        #[cfg(feature = "proto-ipv4-fragmentation")]
+        let mut reasm = None;
         let payload = match check!(SixlowpanPacket::dispatch(payload)) {
             #[cfg(not(feature = "proto-sixlowpan-fragmentation"))]
             SixlowpanPacket::FragmentHeader => {
@@ -40,7 +42,15 @@ impl InterfaceInner {
                     None,
                     &mut f.decompress_buf,
                 ) {
-                    Ok(len) => &f.decompress_buf[..len],
+                    Ok(len) => {
+                        // The packet borrows only `decompress_buf`; the IPv6
+                        // assembler stays free for an IPv6 Fragment header.
+                        #[cfg(feature = "proto-ipv4-fragmentation")]
+                        {
+                            reasm = Some((&mut f.assembler, f.reassembly_timeout));
+                        }
+                        &f.decompress_buf[..len]
+                    }
                     Err(e) => {
                         net_debug!("sixlowpan decompress failed: {:?}", e);
                         return None;
@@ -49,7 +59,15 @@ impl InterfaceInner {
             }
         };
 
-        self.process_ipv6(sockets, meta, &check!(Ipv6Packet::new_checked(payload)))
+        // A 6LoWPAN-reassembled packet borrows the assembler itself, so an IPv6
+        // Fragment header inside it is dropped (reasm stays None).
+        self.process_ipv6_inner(
+            sockets,
+            meta,
+            &check!(Ipv6Packet::new_checked(payload)),
+            #[cfg(feature = "proto-ipv4-fragmentation")]
+            reasm,
+        )
     }
 
     #[cfg(feature = "proto-sixlowpan-fragmentation")]

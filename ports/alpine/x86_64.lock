@@ -64,6 +64,7 @@ pkg iso-codes 4.20.1-r0 main Q1KM4rePbBg6erFi+CC8coaIDvGLU= 12cdc1d8b49f20640bd4
 pkg jansson 2.15.0-r0 main Q1stvtY3e3CwJPyWQOnjlB9nQqEvU= 7681b41486e1f2b2efce11875c839533464ae8857d30fc49130f0039c6585fdb -
 pkg json-c 0.18-r1 main Q12w0mSfr4pSQU34qdbkrNtgMDtAM= 22dc7a8fe3eda0d22635615cca682b2a575ef25e8c2f401445e12be4cbf77302 -
 pkg kbd-bkeymaps 2.8.0-r0 main Q13r6BB3hF1ldyeS+pNx8IifECuyE= 3d3e5bee73628f8eb3bf73c06ec1f99728969a3ebfab8e0bd5e8f07e39ef21d2 -
+pkg kmscube 0_git20220902-r1 community Q1ampv8Zm8maOhvy97P5JGKcEDRgc= e9d5baa9008aa5f1c006594fb7a4c7f7c4301f1e64f7fc333156222f00c5c726 -
 pkg lame-libs 3.100-r5 main Q1zEPleXcO8hgXJyg8pX+nhzxIQTE= 3f9df27e0451f8e1b32941c70bf73d7f3ec136b1b665921538f638d039a04e25 -
 pkg lcms2 2.19-r0 main Q1W5Tp72Knc1v0HtRficgyY9Lb0To= b4cb038af3c2f02bedd8456ae876c97ac0a9f29789add77871bfd6ce084ff136 -
 pkg less 702-r0 main Q1+O2c6d5nEDbZy2g06FiippNApsU= afa47eee1729eab04d6d72142c52dea513c756b71be91cc13756fa628282ec7e -
@@ -79,8 +80,10 @@ pkg libcap2 2.78-r0 main Q1Vi3y8KkXpS2XsFrXvtM0FK2izUs= 42886a7b4bcde26347c71292
 pkg libcrypto3 3.5.9-r0 main Q1HA3ulzTPIvyXzdGBkTu9cQ5t+wg= 6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689 -
 pkg libcurl 8.23.0-r0 main Q1etqr/7fR+stc096aUitDvGM3O9Q= 1f70ca404818805a6465b615bbfe84ef861488a963d7e630108ebd7fbaa51665 -
 pkg libdav1d 1.5.3-r0 main Q19QMIkG43lvBAaJ48gBGbWDlGvKY= 40a2b1b92cdcc6fd295934f799ee80ef67e2e384097624d565c6222d827f8480 -
+pkg libdisplay-info 0.3.0-r0 main Q16FqiHWPsPBVy6H426zLGEsA6E1Y= f356bc2fd3ea269f58de6688a550503318216bba87899281c36dbb16285f873c -
 pkg libeconf 0.8.3-r0 main Q1M57ga4q1Zc6sMwKtO44cuhd6S2g= 2a791c7957961f830cf31b04f35f814a63afcf633badc9052425ff1cf2f64380 -
 pkg libepoxy 1.5.10-r1 main Q1iS6WSUAECByRvzi3yg3GpUo0v1s= 0be13b4b524fe64315e0663ab615a244d75d7da73130ac1c630cd6096841444e -
+pkg libevdev 1.13.6-r0 community Q1YtxPcXa8eaavON1IS2FHS1qhjk0= b38a27a4ac55701fd2eb0032977af2664b6fc23b2f9c2cc6e893ad4452fd82d5 -
 pkg libevent 2.1.13-r0 main Q1TIJbQnE9pRM1Q0RaHlY1RiARvBw= 870d4b22a2e4068205b67bb8e4631342c9e84060d052fb36cf4721e18d4043a2 -
 pkg libexpat 2.10.0-r0 main Q1sJ3mbRK300qoX/3bSQgNsvVLmDY= e7e7408ea787ed06d00159b0ff1f9b65a63cf634f36d9e0fa7512ce2c489a503 -
 pkg libffi 3.5.2-r1 main Q1L3smH3/OzE7r2LMw5/b7gHE7/jo= 6da1a19313a40c56cac756fb11e2c4d5267831e1c22fc8323f24c943c94da6e0 -
@@ -93,6 +96,7 @@ pkg libgomp 15.2.0-r5 main Q1pQKGM0/KCNQbVAnY4xg2u5d+RbI= e7204aad00e31d544e0a34
 pkg libgpg-error 1.61-r0 main Q1ZfgHjZcNblBSC6Iv0KhFwKVvFBM= 580b80e679adda234e5d36e7633023c25cf20ce9fcf3ee8f9dd85ba578d886b6 -
 pkg libhwy 1.3.0-r0 community Q1GAAQbZLPQhQb7vW+q2kLsPICeUM= a4356d71e627b5321a89a3f4cce1d491950e2358fecafc01b89d2cabe8c9e473 -
 pkg libidn2 2.3.8-r0 main Q1WADRTOieFhSPTMwt90I1znrt+AA= 7d038ac558dde464964b033ce5126dd2eaf84cc414dc15e77c5424a321d0ebee -
+pkg libinput-libs 1.31.3-r0 community Q1BSKQigpXcvVkWtqW0NlGMb0GWHQ= f3b764d72c1913a8c9d781206fd365ecdfe088e0b09009831e7804627f5bd18d -
 pkg libintl 1.0-r0 main Q1KC1mQsyshyN+Q6hkFZ1zz1q+dVA= cb03919cba5624b5e8759d04f3b31913b02585355988b914bc31de4746ff5ef6 -
 pkg libjpeg-turbo 3.1.3-r0 main Q1XoUYPAUnQ5Fs2YfIwwW3cJrMu9k= 6299627dd0a9156a7463511e4915a6294dfb592d8b4bdf85e55265adf1b8ea04 -
 pkg libjxl 0.11.2-r1 community Q10z/SwefqrLFA3fS52GgPIRbOnts= 47730997ac8b0d08de5461c78a5c571af1b9e42283dc0da2af400acc60d02693 -
@@ -141,6 +145,7 @@ pkg libxfixes 6.0.2-r0 main Q1YnmzvrZmxx7WHqZGSYi5MOKepBQ= cb00578d1b83abe8baf29
 pkg libxft 2.3.9-r0 main Q1C2HfCg7rpmq+u+TvmD9kQ4y5n7s= eba6fd85599b4fedf3acdd3ad3e2eec84ea97a5ba8f1ac570fa1ee37a7d81420 -
 pkg libxi 1.8.4-r0 main Q1xp0EiK4oA9WiazjYa+whDLscsqo= e41ff864833603ab1065ac37680b47838436f78d4d9510604723341fcb933723 -
 pkg libxinerama 1.1.6-r0 main Q1X52Kyh8cfOkA/MPF16ynphurZSk= 9f780efb3cf675b5253b73b84f278b40757fa7869c6fe70a9790a73f4f7e810f -
+pkg libxkbcommon 1.13.1-r0 main Q1k65kXTCa2xzAK3z99tuh6ZUcGmg= f52efd26a9069b1c3edc89cab399f7f81bdc47c9e88a54e017c470bd9734b003 -
 pkg libxml2 2.13.9-r2 main Q1wsLLRGR93IyCrnjIrKm9StWnNto= 4b2f986159c659f014b942fe8a5d70c67af475153ca826c3dd53389eea46a300 -
 pkg libxrandr 1.5.5-r0 main Q1i0+76U2qePA1XSC599zZClNzDvU= c64856b77001cdf31a32841729b1950ad45e6981c16d09f9fdf08824ab1c0271 -
 pkg libxrender 0.9.13-r0 main Q1DklXQL0FWbe3slEhcQxshlkmGRQ= 724aa6c6353e70869e0eb5aa5461e8fc0753b99db765de47a3ae238573dbdcf8 -
@@ -148,6 +153,7 @@ pkg libxtst 1.2.6-r0 main Q1+bDvO4XyBbzUnEnKRKMYHuFbaXw= e6426212f638e23091a22e1
 pkg linux-pam 1.7.1-r2 main Q14CamClLTOrqb3liJtyHUfNplfUg= 73c327468bfd849bf078fb3d59516f1adc54685682dec6386d8d9d75c00e939d -
 pkg mkfontscale 1.2.4-r0 main Q1IEr/eAn2vx3CUim23zL477B3xK0= 2385a7aad3971fcad9d862cb90937e643e633b14bf4b91f8b8ce3040a1468d20 trigger
 pkg mpg123-libs 1.33.5-r0 main Q1YXsRtLXGCK9yVWd/kJmkt6zXQpA= 3cab9a9a4b414a77dd9947e227e32d6108361ebdf8c6c1ee61345d9c42abc6f3 -
+pkg mtdev 1.1.7-r0 community Q1YrMtgK+6kZoRAU479PQ5KLNs8c0= 004f42bc67bc0eb573d64d802c5f0325f49013cf4aa7576d4b571399df46f3f7 -
 pkg musl 1.2.6-r3 main Q1dw6DBNlY3O2Y12mX356Podtcoy8= e142255d0fa397f14318996bc10378093dcc069dc3dd1b6818c8f28a789c21da -
 pkg nano 9.3-r0 main Q14kE/4OPyVmCR+mcZm9u/D/YzQ+M= 57dde3acbbeaa017b5591e76d26a5056677272698f4c6f8ec398892be6230018 -
 pkg ncurses-terminfo-base 6.6_p20260516-r0 main Q1nVUdgo6cjuUsWAHB1gRoKOvxV1I= ce83be6d0bd10584a53c3a5868cc1595ce5f0f8e0b621f8f7f70b6144e521fc9 -
@@ -168,6 +174,7 @@ pkg passt 2026.05.26-r0 community Q1A/Vxhu4/tje6+GEwA/bPJvs35+c= 5e639bca07d012d
 pkg pciutils-libs 3.15.0-r0 main Q1QlzbDBVdJ8rw/n4h5Hxn+9rh7wc= 2905bb60e9bc41d208d62c7f6b238140117dde44254b0acc6e42834ede8e815c -
 pkg pcre2 10.49-r0 main Q17JkrALr3G7od2eIXlhP5IzrzXI0= 2919897914820f42a17a8d7d37df310d2dfad1c82ebe5f539cc5c765f916752a -
 pkg pinentry 1.3.2-r0 main Q1ArwCfj9sAcEPocakEgXxTTzPPUs= a95d99634b1f2398d27105e079c1a068cee60d14839e55678b0ce41f8c6a3a0f post-install,post-upgrade
+pkg pixman 0.46.4-r0 main Q17QqdMjF6NFxwcqertd9DGx5JFKs= 378550cbe348dda9b0733014375dba87a89f0077c5f3dbeba7dce8dbcdda707e -
 pkg pkgconf 2.5.1-r0 main Q1B0VN8FiPJzB3eATqTdiQ3m4d/d4= 20cc47b76b82e9424a35ecc4fdd7bd904ef49ada1684214910fae31bc0cab737 -
 pkg podman 5.8.10-r0 community Q1ZxOnFjcLKNrppTnjn0jgZ4l2jB8= 6f00b8d7a114677eb1084bf5d34e99194510dd591b1c65098d44959cd9ec7741 post-install,post-upgrade
 pkg rav1e-libs 0.8.1-r0 community Q14iG3pb7z45YtmbyOyO8dGzvQu58= 32424451f71961f317df5d521cf980ae6eac92aa60c47d5a7b22903c1d6009d4 -
@@ -193,6 +200,7 @@ pkg wayland-libs-server 1.25.0-r0 main Q1qRj74o+/2fDikXrMCk5XcNuuUuI= 044d9f2386
 pkg x264-libs 0.164.3108-r1 community Q1sbYPdIabvGVemIeMJtDVYKBi7pU= a88add71624fe099b76d3b8e69cb7f4507da6b65695be9e1f04fdb9a40799ba3 -
 pkg x265-libs 4.1-r0 main Q1bBdKRlA7sjMAMIttZn4xketqAZo= c33429b93d0c7c12beb79637c23d4a2f960153ff07ea86f47fc7fdc43e853e56 -
 pkg xfsprogs 7.0.1-r0 main Q1BQbG9ys84X3FopAXWG06uLyTtf0= acd93aeab5e2c28aca708e03796dd7f12c124cfb8831430b948fb6fb0bb1fa0d -
+pkg xkeyboard-config 2.47-r0 main Q1PfbagiMiXpAy99uo9SVbzfkrzqs= 8c8f9af2b78f8e955480aa88103e495d2637edac659a417075e877c88a41fed0 -
 pkg xvidcore 1.3.7-r2 community Q1Kdouwbh2Er48RDeOWHxWBW2Rfm0= 12d4497edecb8ae5f82fa149e1e9ecab3b2bb2644dfd3654dbcd3ee8ddd0f81b -
 pkg xz-libs 5.8.4-r0 main Q1hQEGWxhighYwF0xmO0WXRGLCluE= ab362dd515ead04c31a6c302163248da7aa4813e283c971e6dd3f789b453a1d9 -
 pkg zlib 1.4-r0 main Q14j+c5OMsvdJ78cidhOg7phxCkLw= 7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb -
@@ -213,11 +221,13 @@ held /bin/sh podman
 held /bin/sh shared-mime-info
 held /bin/sh slirp4netns
 held so:libEGL.so.1 firefox
+held so:libEGL.so.1 kmscube
 held so:libGL.so.1 firefox
+held so:libGLESv2.so.2 kmscube
 held so:libdrm.so.2 ffmpeg-libavutil
+held so:libdrm.so.2 kmscube
 held so:libdrm.so.2 libva
 held so:libdrm.so.2 libva-utils
-held so:libpixman-1.so.0 cairo
-held so:libpixman-1.so.0 firefox
-held so:libxkbcommon.so.0 gtk+3.0
+held so:libgbm.so.1 kmscube
+held so:libudev.so.1 libinput-libs
 generated 4d65de5fd9373b5ba82ef0d4a3e2bf823ef4c18851aef326f7bc299c6eac6937
