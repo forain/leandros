@@ -9388,7 +9388,9 @@ fn with_foreign_task_as<R>(pid: Pid, f: impl FnOnce(&mut mm::vmm::AddressSpace) 
     let cur = CURRENT_AS[unsafe { cpu_id() }].load(Ordering::Acquire);
     if core::ptr::eq(cur, alloc::sync::Arc::as_ptr(&a)) { return Some(Err(())); }
     FOREIGN_TASK_COPIES.fetch_add(1, Ordering::Relaxed);
-    if !acquire_foreign_as(&a, pid) { return None; }
+    let w = alloc::sync::Arc::downgrade(&a);
+    drop(a);
+    let a = acquire_foreign_as(&w, pid)?;
     lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
     // Exclusive under `busy`, as `lock_leader_address_space` hands it out.
     let p = alloc::sync::Arc::as_ptr(&a) as *mut mm::vmm::AddressSpace;
