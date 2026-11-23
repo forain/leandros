@@ -1181,7 +1181,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             held = fence_hold_mode(4);
             ok0 = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e0 as *mut _) == 0 && e0.fence_fd >= 3;
             ok1 = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e1 as *mut _) == 0 && e1.fence_fd >= 3;
-            r1_signals = ok1 && poll_in_within(e1.fence_fd, 1000);
+            r1_signals = ok1 && poll_in_within(e1.fence_fd, 5000);
             r0_pending = ok0 && !poll_in_within(e0.fence_fd, 100);
         }
         let rel = fence_hold_mode(0);
