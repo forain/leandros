@@ -238,7 +238,7 @@ const REAP_GRACE_TICKS: u64 = 200;
 /// lost bytes already delivered. Linux keeps such sockets (and their netns)
 /// alive past the owner's exit; this keeps the stacks for a bounded grace.
 fn tcp_busy(sid: Sid) -> bool {
-    use smoltcp::socket::{tcp, AnySocket};
+    use smoltcp::socket::{tcp, udp, AnySocket};
     let st = crate::STACKS[sid as usize].lock();
     let Some(s) = st.as_ref() else { return false };
     let busy = s.socket_set.iter().any(|(_, sock)| match tcp::Socket::downcast(sock) {
@@ -247,9 +247,18 @@ fn tcp_busy(sid: Sid) -> bool {
             tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => true,
             _ => t.send_queue() > 0 || t.recv_queue() > 0,
         },
-        None => false,
+        // A datagram the owner sent just before exiting (a UDP server's last reply) is still queued
+        // for the daemon's next pass: Linux transmits at sendto time, so it must not be lost.
+        None => udp::Socket::downcast(sock).map_or(false, |u| u.send_pending()),
     });
     busy
+}
+
+/// Frames queued for stack-less port `sid` (a bridge port whose container end just sent them) that
+/// the daemon has not switched yet: freeing the port first would drop the exited process's last
+/// datagrams.
+fn port_rx_busy(sid: Sid) -> bool {
+    VIFS.lock()[sid as usize].as_ref().map_or(false, |x| !x.rxq.is_empty())
 }
 
 /// Free every dead namespace whose stacks have drained or whose grace ran
@@ -265,7 +274,7 @@ fn finish_dying(force: bool) {
             let x = &d[i];
             // Stack locks are leaves: taking them under DYING is safe.
             let busy = !force && now < x.deadline
-                && (x.sids.iter().any(|&s| tcp_busy(s)) || x.peers.iter().any(|&(_, s)| tcp_busy(s)));
+                && (x.sids.iter().any(|&s| tcp_busy(s)) || x.peers.iter().any(|&(_, s)| tcp_busy(s) || port_rx_busy(s)));
             if busy { i += 1; } else { out.push(d.swap_remove(i)); }
         }
         out
