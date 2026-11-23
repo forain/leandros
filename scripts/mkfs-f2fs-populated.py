@@ -718,10 +718,12 @@ def main():
     # /etc/shadow — /bin/login's only source of password hashes. Salts are
     # fixed per user so this Python hasher and the Rust verifier in
     # userland/login/src/main.rs (verify_password) agree byte-for-byte.
+    # Full nine-field shadow(5) records: musl's getspnam() (unix_chkpwd under real
+    # Linux-PAM) rejects a line with fewer fields as "no such user".
     shadow_lines = (
-        f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
-        f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
-        "sshd:!:\n"
+        f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:20000:0:99999:7:::\n"
+        f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:20000:0:99999:7:::\n"
+        "sshd:!:20000:0:99999:7:::\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 

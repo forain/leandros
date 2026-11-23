@@ -3,6 +3,8 @@
  * (/proc/mntselftest) and ns-0 invariants. Output: "case: PASS|FAIL|SKIP". */
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <pwd.h>
+#include <shadow.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/ioctl.h>
@@ -4795,7 +4797,65 @@ static void sysfsbind_suite(void) {
     }
 }
 
+/* musl's getpw*()/getsp*() probe nscd with connect(/var/run/nscd/socket) and treat only
+ * ENOENT/ECONNREFUSED as "no nscd"; any other errno fails the lookup. /var/run is a symlink
+ * to /run (tmpfs), so connect() to a missing socket behind the symlink must be ENOENT. */
+static int nscd_conn_errno(const char *path) {
+    struct sockaddr_un a; memset(&a, 0, sizeof a); a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, path, sizeof a.sun_path - 1);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int r = connect(fd, (struct sockaddr *)&a, sizeof a);
+    int e = r < 0 ? errno : 0;
+    close(fd);
+    return e;
+}
+static int nscd_chk(const char *path, const char *tag) {
+    int e = nscd_conn_errno(path);
+    if (e != ENOENT) printf("  nscd %s %s: errno %d (want ENOENT %d)\n", tag, path, e, ENOENT);
+    return e == ENOENT;
+}
+static int nscd_root(int m) { (void)m; return nscd_chk("/var/run/nscd/socket", "root") & nscd_chk("/run/nscd/socket", "root") ? 0 : 1; }
+static int nscd_user(int m) {
+    (void)m;
+    if (setresgid(1000, 1000, 1000) < 0 || setresuid(1000, 1000, 1000) < 0) return 91;
+    return nscd_chk("/var/run/nscd/socket", "user") & nscd_chk("/run/nscd/socket", "user") ? 0 : 1;
+}
+static int nscd_suid(int m) { /* real uid 1000, effective + saved root: what a setuid-root helper looks like */
+    (void)m;
+    if (setresgid(1000, 0, 0) < 0 || setresuid(1000, 0, 0) < 0) return 91;
+    return nscd_chk("/var/run/nscd/socket", "suid") & nscd_chk("/run/nscd/socket", "suid") ? 0 : 1;
+}
+static int nscd_in_child(int (*fn)(int)) {
+    pid_t p = fork();
+    if (p < 0) return 0;
+    if (p == 0) _exit(fn(0));
+    int st = 0; waitpid(p, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+/* getpwnam/getspnam through the libc the PAM helpers use: NULL here is exactly unix_chkpwd's
+ * "could not obtain user info". */
+static int pw_look(int m) {
+    (void)m; errno = 0;
+    struct passwd *pw = getpwnam("root"); int e1 = errno; errno = 0;
+    struct spwd *sp = getspnam("root"); int e2 = errno;
+    if (!pw || !sp) printf("  pw: getpwnam=%p errno %d, getspnam=%p errno %d (uid %d euid %d)\n", (void *)pw, e1, (void *)sp, e2, (int)getuid(), (int)geteuid());
+    return pw && sp ? 0 : 1;
+}
+static int pw_suid(int m) { if (setresgid(1000, 0, 0) < 0 || setresuid(1000, 0, 0) < 0) return 91; return pw_look(m); }
+static void pw_suite(void) {
+    report("getpwnam_getspnam_root", nscd_in_child(pw_look));
+    report("getpwnam_getspnam_setuid", nscd_in_child(pw_suid));
+}
+static void nscd_suite(void) {
+    pw_suite();
+    report("nscd_connect_missing_root", nscd_in_child(nscd_root));
+    report("nscd_connect_missing_user", nscd_in_child(nscd_user));
+    report("nscd_connect_missing_setuid", nscd_in_child(nscd_suid));
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "nscd")) { nscd_suite(); return fails ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "sysfsbind")) { sysfsbind_suite(); return fails ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "filebind")) { filebind_suite(); return fails ? 1 : 0; }
     if (argc > 1 && !strcmp(argv[1], "bench")) { bench(); return 0; }
@@ -4836,6 +4896,7 @@ int main(int argc, char **argv) {
     strict_ns_suite();
     bindpin_suite();
     tmpfs_ino_suite();
+    nscd_suite();
     printf("%s\n", fails ? "mnttest: FAILED" : "mnttest: ALL PASSED");
     return fails ? 1 : 0;
 }
