@@ -1321,6 +1321,39 @@ unsafe fn test_socket_alias_epoll_close() -> bool {
     report(name, ok)
 }
 
+/// A fresh connect() that the listener has not accept()ed yet is already
+/// established (Linux), so SCM_RIGHTS must pass it. Thousands of rounds of
+/// connect -> immediately send the new fd -> receive -> data over the received
+/// copy -> accept, with a mix of close orders. Used to fail EBADF.
+unsafe fn test_pass_pending_connect() -> bool {
+    let name = b"pass_pending_connect";
+    let (addr, alen) = sockaddr_un::from_abstract(b"scm-pending-pass");
+    let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let mut ok = l >= 0 && raw_bind(l, &addr, alen) == 0 && raw_listen(l, 16) == 0;
+    let mut carrier = [-1i32; 2];
+    ok &= raw_socketpair(AF_UNIX, SOCK_STREAM, 0, carrier.as_mut_ptr()) == 0;
+    let mut i = 0;
+    while ok && i < 3000 {
+        let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        if c < 0 || raw_connect(c, &addr, alen) != 0 { ok = false; break; }
+        let r = send_fd_and_byte(carrier[0], c, b'x');
+        if r < 0 { dbg1(b"[pend] iter %d: sendmsg failed\n\0", i as i64); ok = false; close(c); break; }
+        let (n, got, _, _) = recv_fd_and_byte(carrier[1], 32, 0);
+        if n != 1 || got < 0 { ok = false; close(c); break; }
+        if i % 3 == 0 { close(c); }
+        let a = raw_accept(l);
+        if a < 0 { ok = false; if i % 3 != 0 { close(c); } close(got); break; }
+        if write(got, b"y".as_ptr(), 1) != 1 { ok = false; }
+        let mut rb = [0u8; 1];
+        if read(a, rb.as_mut_ptr(), 1) != 1 || rb[0] != b'y' { ok = false; }
+        if i % 3 != 0 { close(c); }
+        close(got); close(a);
+        i += 1;
+    }
+    close(carrier[0]); close(carrier[1]); close(l);
+    report(name, ok)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -1443,6 +1476,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_socket_alias_epoll_close() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
+    if !test_pass_pending_connect() { failures += 1; }
     if !test_seqpacket_short_path() { failures += 1; }
     if !test_seqpacket_short_path_forked() { failures += 1; }
     if !test_seqpacket_long_dir_via_procfd() { failures += 1; }
