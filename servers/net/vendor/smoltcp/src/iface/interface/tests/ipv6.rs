@@ -568,9 +568,11 @@ fn ndsic_neighbor_advertisement_ethernet(#[case] medium: Medium) {
         response
     );
 
+    // LEANDROS: the cache entry is keyed by the NA's target address (RFC 4861 7.2.5; Linux
+    // ndisc_recv_na() uses msg->target, net/ipv6/ndisc.c), not by the packet's IP source.
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::from_parts(&[0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002])),
+            &IpAddress::Ipv6(Ipv6Address::from_parts(&[0xfe80, 0, 0, 0, 0, 0, 0, 0x0002])),
             iface.inner.now,
         ),
         NeighborAnswer::Found(HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
@@ -678,9 +680,11 @@ fn ndsic_neighbor_advertisement_ieee802154(#[case] medium: Medium) {
         response
     );
 
+    // LEANDROS: the cache entry is keyed by the NA's target address (RFC 4861 7.2.5; Linux
+    // ndisc_recv_na() uses msg->target, net/ipv6/ndisc.c), not by the packet's IP source.
     assert_eq!(
         iface.inner.neighbor_cache.lookup(
-            &IpAddress::Ipv6(Ipv6Address::from_parts(&[0xfdbe, 0, 0, 0, 0, 0, 0, 0x0002])),
+            &IpAddress::Ipv6(Ipv6Address::from_parts(&[0xfe80, 0, 0, 0, 0, 0, 0, 0x0002])),
             iface.inner.now,
         ),
         NeighborAnswer::Found(HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(
