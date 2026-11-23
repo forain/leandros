@@ -57,7 +57,6 @@ if [ ! -d "$SRC" ]; then
   git -C "$SRC" checkout --detach "$PIN"
   git -C "$SRC" apply "$HERE/patches/0001-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0002-fakegreet-leandros.patch"
-  git -C "$SRC" apply "$HERE/patches/0003-socket-dir-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0004-trace-leandros.patch"
 fi
 

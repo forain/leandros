@@ -100,3 +100,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 
 
 - venusisr follow-up: a venustest 7c variant on the syncobj path (per-context/ring timelines done by venustl+venusfollow).
+- venusisr follow-up: per-context fence timelines like Linux (one stalled context's fence currently holds back the global fence floor and everyone's retired-ahead depth; table grows to AHEAD_MAX=65536 then EAGAIN). Also a venustest 7c variant on the syncobj path.
+
+- 2026-11-22 lane runtmpfs: /run tmpfs + devpts owner/chown were already in the VFS; /var/run/<x> now resolves to /run in the VFS (read_cstr_raw), sudo-rs 0002/0005 and greetd 0003 patches dropped, syscalltest run_tmpfs + pts_owner_user added. Open: namespace tasks (path_args) do not get the /var/run rewrite; f2fs symlinks into intercepted trees (/run,/tmp) still ENOENT in the f2fs walk.

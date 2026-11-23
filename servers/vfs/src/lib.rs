@@ -5212,10 +5212,17 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         // answers VFS_ELINKRACE; redo the resolution at most twice, then ELOOP.
         let was_strict = sched::strict_links();
         let mut attempt = 0;
+        let mut redirects = 0u32;
+        // A filesystem answered LINK_REDIRECT_ERR: the (single) path argument
+        // continues at this absolute VFS-served path. NUL-terminated.
+        let mut redir: Option<Vec<u8>> = None;
         let out = loop {
             let mut b0: Vec<u8> = Vec::new();
             let mut b1: Vec<u8> = Vec::new();
             let mut m = *msg;
+            if let (Some(rp), Some((i, _)), None) = (&redir, p0, p1) {
+                m.data[i * 8..i * 8 + 8].copy_from_slice(&(rp.as_ptr() as u64).to_le_bytes());
+            }
             let (mut i0, mut i1): (Option<u32>, Option<u32>) = (None, None);
             let mut r = match rewrite_one(&mut m, p0, &mut b0, &mut i0) {
                 Err(e) => err_reply(e),
@@ -5234,6 +5241,28 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
             let me = sched::current_pid();
             if !b0.is_empty() { mnt::callctx_clear(me, b0.as_ptr() as usize); }
             if !b1.is_empty() { mnt::callctx_clear(me, b1.as_ptr() as usize); }
+            if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 {
+                let taken = sched::link_redirect_take();
+                redirects += 1;
+                // The path argument now: the original, or the previous redirect.
+                let cur: Option<Vec<u8>> = match (&redir, p0) {
+                    (Some(rp), _) => Some(rp[..rp.len() - 1].to_vec()),
+                    (None, Some((i, _))) => read_cstr_raw(arg(msg, i) as usize)
+                        .map(|(v, l)| normalize_abs_floor(&v[..l], 1)),
+                    _ => None,
+                };
+                let next = match (taken, cur) {
+                    (Some(t), Some(cur)) if p1.is_none() && redirects <= 8 => {
+                        sched::link_redirect_set(&t.0, &t.1);
+                        link_redirect_next(&cur)
+                    }
+                    _ => None,
+                };
+                match next {
+                    Some(mut n) => { n.push(0); redir = Some(n); continue; }
+                    None => r = err_reply(if redirects > 8 { -40 } else { -2 }),
+                }
+            }
             if reply_val(&r) == VFS_ELINKRACE as i64 {
                 attempt += 1;
                 if attempt > 2 { r = err_reply(-40); } else { continue; }
@@ -5243,7 +5272,9 @@ pub(crate) fn handle_as(msg: &Message, caller_pid: u32) -> Message {
         sched::set_strict_links(was_strict);
         return out;
     }
-    dispatch(msg, caller_pid)
+    let r = dispatch(msg, caller_pid);
+    if reply_val(&r) == sched::LINK_REDIRECT_ERR as i64 { let _ = sched::link_redirect_take(); return err_reply(-2); }
+    r
 }
 
 /// (parent, name) of a normalised path.
@@ -15552,6 +15583,24 @@ fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
 // /tmp/-/dev/shm/-/run/user mounts) back to the net server's listener.
 // Abstract-namespace sockets never reach here (net matches those by bytes).
 
+/// After a filesystem answered `LINK_REDIRECT_ERR`: the path `cur` (normalised
+/// absolute) continues at the redirect target, keeping whatever tail the
+/// filesystem's walk did not cover (a create's final name).
+fn link_redirect_next(cur: &[u8]) -> Option<Vec<u8>> {
+    let (walked, to) = sched::link_redirect_take()?;
+    let mut idx = 0;
+    while idx + walked.len() <= cur.len() {
+        let end = idx + walked.len();
+        if cur[idx..end] == walked[..] && (end == cur.len() || cur[end] == b'/') {
+            let mut n = to;
+            n.extend_from_slice(&cur[end..]);
+            return Some(n);
+        }
+        idx += 1;
+    }
+    None
+}
+
 /// bind(): create an S_IFSOCK node at `path`, tagged with the net server's
 /// `sock_id`. Intermediate components are followed through symlinks; the final
 /// component is created literally (bind does not follow a trailing symlink).
@@ -15561,7 +15610,8 @@ fn push_decimal(buf: &mut Vec<u8>, mut n: u32) {
 /// path is on no mount server). Sockets on mounted filesystems (f2fs) are a
 /// real S_IFSOCK inode plus an in-memory (path, inode) -> listener table
 /// (`mounted_sock_bind`).
-pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
+pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 { unix_bind_node_d(pid, path, sock_id, 0) }
+fn unix_bind_node_d(pid: u32, path: &[u8], sock_id: u64, depth: u32) -> i32 {
     let resolved = match tmp_resolve_links(path, false) {
         Ok(v)  => v,
         Err(e) => return e,
@@ -15569,7 +15619,14 @@ pub fn unix_bind_node(pid: u32, path: &[u8], sock_id: u64) -> i32 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return mounted_sock_bind(rpath, sock_id),
+        None    => {
+            let r = mounted_sock_bind(rpath, sock_id);
+            if r != sched::LINK_REDIRECT_ERR { return r; }
+            return match link_redirect_next(rpath) {
+                Some(n) if depth < 8 => unix_bind_node_d(pid, &n, sock_id, depth + 1),
+                _ => -2,
+            };
+        }
     };
     if is_tmpfs_root(tpath) { return -17; }             // EEXIST — the mount root
     if tpath.len() > MAX_TMP_PATH - 1 { return -36; }   // ENAMETOOLONG
@@ -15693,7 +15750,8 @@ fn mounted_sock_resolve(pid: u32, rpath: &[u8]) -> i64 {
 /// there (e.g. zbus probing /run/dbus/system_bus_socket on a system with no
 /// system bus). EOPNOTSUPP stays reserved for bind, where it correctly says
 /// "this filesystem cannot host a socket node".
-pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
+pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 { unix_resolve_node_d(pid, path, 0) }
+fn unix_resolve_node_d(pid: u32, path: &[u8], depth: u32) -> i64 {
     let resolved = match tmp_resolve_links(path, true) {
         Ok(v)  => v,
         Err(e) => return e as i64,
@@ -15701,7 +15759,14 @@ pub fn unix_resolve_node(pid: u32, path: &[u8]) -> i64 {
     let rpath = &resolved[..];
     let tpath = match tmpfs_path(rpath) {
         Some(p) => p,
-        None    => return mounted_sock_resolve(pid, rpath),
+        None    => {
+            let r = mounted_sock_resolve(pid, rpath);
+            if r != sched::LINK_REDIRECT_ERR as i64 { return r; }
+            return match link_redirect_next(rpath) {
+                Some(n) if depth < 8 => unix_resolve_node_d(pid, &n, depth + 1),
+                _ => -2,
+            };
+        }
     };
     let cred = cred_of(pid);
     let tmp = TMP_FILES.lock();

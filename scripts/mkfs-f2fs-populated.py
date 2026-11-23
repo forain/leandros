@@ -3014,6 +3014,15 @@ def main():
             e["mode"] |= 0o4000
     _ap_hosts = {e["path"]: e["host"] for e in _ap_entries + _ap_gen if e["kind"] == "file"}
     alpine_files = []          # (image dir, name, host path | symlink bytes, full mode)
+    # /var/run is a symlink to /run (below): nothing may be staged inside an
+    # on-disk /var/run -- /run is a tmpfs, empty at boot. Entries a package
+    # ships there are re-rooted at /run (created at runtime by their service),
+    # and a shipped /var/run directory is dropped in favour of the link.
+    for _e in _ap_entries + _ap_gen:
+        if _e["path"].startswith("/var/run/"):
+            _e["path"] = "/run/" + _e["path"][len("/var/run/"):]
+    _ap_entries = [e for e in _ap_entries if not (e["path"] == "/var/run" and e["kind"] == "dir")]
+    _ap_gen = [e for e in _ap_gen if not (e["path"] == "/var/run" and e["kind"] == "dir")]
     _ap_dirs, _ap_dirmode = set(), {}
     for e in _ap_entries + _ap_gen:
         d, n = os.path.split(e["path"])
@@ -3031,7 +3040,7 @@ def main():
     # /var/run -> /run (conmon's default socket dir /var/run/crio; Alpine's
     # baselayout ships the link, a stripped image may not).
     if not any(e["path"] == "/var/run" for e in _ap_entries + _ap_gen):
-        alpine_files.append(("/var", "run", b"../run", S_IFLNK | 0o777))
+        alpine_files.append(("/var", "run", b"/run", S_IFLNK | 0o777))
         _ap_dirs.add("/var")
     # /var/tmp: containers/storage and podman stage image copies there
     _ap_dirs.add("/var/tmp")
