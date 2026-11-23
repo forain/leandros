@@ -1335,6 +1335,7 @@ unsafe fn test_pass_pending_connect() -> bool {
     let mut i = 0;
     while ok && i < 1000 {
         if i % 250 == 0 { dbg1(b"[pend] round %d\n\0", i as i64); }
+        if i == 0 { dbg1(b"[pend] step %d\n\0", 90); }
         let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
         if c < 0 || raw_connect(c, &addr, alen) != 0 { ok = false; break; }
         if i == 0 { dbg1(b"[pend] step 0\n\0", 0); }
