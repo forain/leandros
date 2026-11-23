@@ -218,17 +218,23 @@ fn reap(ns: u16) {
     // The namespace id is free for reuse from here on (its NETNS entry is
     // gone); its stacks and those of the veth peers it takes along live on
     // in DYING until their TCP traffic has drained (`finish_dying`).
-    DYING.lock().push(Dying { sids: st.sids, peers, deadline: sched::ticks() + REAP_GRACE_TICKS });
+    DYING.lock().push(Dying { sids: st.sids, peers, deadline: sched::ticks() + REAP_GRACE_TICKS, hard: sched::ticks() + REAP_HARD_TICKS, mark: usize::MAX });
     finish_dying(false);
 }
 
 /// A dead namespace whose stacks are not freed yet.
-struct Dying { sids: Vec<Sid>, peers: Vec<(u16, Sid)>, deadline: u64 }
+struct Dying { sids: Vec<Sid>, peers: Vec<(u16, Sid)>, deadline: u64, hard: u64, mark: usize }
 static DYING: Mutex<Vec<Dying>> = Mutex::new(Vec::new());
 
 /// Longest a dead namespace's stacks wait for their TCP traffic (2 s at
 /// 100 ticks/s): bounded, so a veth end still goes within seconds.
 const REAP_GRACE_TICKS: u64 = 200;
+
+/// Hard cap on a dead namespace's life while its TCP data keeps draining:
+/// the 2 s grace restarts whenever the queued bytes change (a loaded host can
+/// stretch a 192 KiB stream past a flat 2 s and the tail was dropped), but a
+/// stalled peer still frees the stacks 2 s after the last progress.
+const REAP_HARD_TICKS: u64 = 3000;
 
 /// Whether stack `sid` still carries TCP data in flight: an orphaned
 /// connection of the exited process whose reply or FIN is not yet acked, or a
@@ -237,21 +243,39 @@ const REAP_GRACE_TICKS: u64 = 200;
 /// last write() before exit never reached the peer, and the peer's read()
 /// lost bytes already delivered. Linux keeps such sockets (and their netns)
 /// alive past the owner's exit; this keeps the stacks for a bounded grace.
-fn tcp_busy(sid: Sid) -> bool {
+/// `Some(queued bytes)` while stack `sid` is busy (a live connection holding unsent, unacked or unread bytes), else `None`.
+fn tcp_progress(sid: Sid) -> Option<usize> {
     use smoltcp::socket::{tcp, udp, AnySocket};
     let st = crate::STACKS[sid as usize].lock();
-    let Some(s) = st.as_ref() else { return false };
-    let busy = s.socket_set.iter().any(|(_, sock)| match tcp::Socket::downcast(sock) {
-        Some(t) => match t.state() {
-            tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => false,
-            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => true,
-            _ => t.send_queue() > 0 || t.recv_queue() > 0,
-        },
-        // A datagram the owner sent just before exiting (a UDP server's last reply) is still queued
-        // for the daemon's next pass: Linux transmits at sendto time, so it must not be lost.
-        None => udp::Socket::downcast(sock).map_or(false, |u| u.send_pending()),
-    });
-    busy
+    let s = st.as_ref()?;
+    let mut busy = false;
+    let mut bytes = 0usize;
+    for (_, sock) in s.socket_set.iter() {
+        let Some(t) = tcp::Socket::downcast(sock) else {
+            // A datagram the owner sent just before exiting (a UDP server's last reply) is still queued
+            // for the daemon's next pass: Linux transmits at sendto time, so it must not be lost.
+            if udp::Socket::downcast(sock).map_or(false, |u| u.send_pending()) { busy = true; bytes += 1; }
+            continue
+        };
+        match t.state() {
+            tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {}
+            tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck => {
+                busy = true;
+                bytes += t.send_queue() + t.recv_queue();
+            }
+            _ => {
+                if t.send_queue() > 0 || t.recv_queue() > 0 {
+                    busy = true;
+                    bytes += t.send_queue() + t.recv_queue();
+                }
+            }
+        }
+    }
+    if busy { Some(bytes) } else { None }
+}
+
+fn x_sids_peers(x: &Dying) -> Vec<Sid> {
+    x.sids.iter().copied().chain(x.peers.iter().map(|&(_, s)| s)).collect()
 }
 
 /// Frames queued for stack-less port `sid` (a bridge port whose container end just sent them) that
@@ -271,10 +295,25 @@ fn finish_dying(force: bool) {
         let mut out = Vec::new();
         let mut i = 0;
         while i < d.len() {
-            let x = &d[i];
             // Stack locks are leaves: taking them under DYING is safe.
-            let busy = !force && now < x.deadline
-                && (x.sids.iter().any(|&s| tcp_busy(s)) || x.peers.iter().any(|&(_, s)| tcp_busy(s) || port_rx_busy(s)));
+            let mut busy = false;
+            if !force {
+                let mut sum = 0usize;
+                let mut any = false;
+                for p in x_sids_peers(&d[i]) {
+                    if let Some(b) = tcp_progress(p) { any = true; sum = sum.wrapping_add(b).wrapping_add(1); }
+                }
+                // A bridge peer port with received frames still queued for the daemon keeps the stack alive too.
+                for &(_, s) in d[i].peers.iter() {
+                    if port_rx_busy(s) { any = true; sum = sum.wrapping_add(1); }
+                }
+                // Progress (the queued bytes moved) restarts the grace, up to the hard cap.
+                if any && sum != d[i].mark && now < d[i].hard {
+                    d[i].mark = sum;
+                    d[i].deadline = (now + REAP_GRACE_TICKS).min(d[i].hard);
+                }
+                busy = any && now < d[i].deadline;
+            }
             if busy { i += 1; } else { out.push(d.swap_remove(i)); }
         }
         out
