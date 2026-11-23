@@ -432,3 +432,65 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         ]
     );
 }
+
+/// LEANDROS: the IPv6 reassembly state is passed apart from the `FragmentsBuffer`
+/// (`process_ipv6_inner`), because a 6LoWPAN packet borrows the buffer. With the
+/// assembler an IPv6 Fragment header reassembles; with `None` (what a
+/// 6LoWPAN-reassembled packet gets) the Fragment header is dropped.
+#[test]
+#[cfg(feature = "proto-sixlowpan-fragmentation")]
+fn test_ipv6_fragment_header_dropped_without_assembler() {
+    use crate::phy::Checksum;
+
+    let dst = Ipv6Address::new(0xfe80, 0x0, 0x0, 0x0, 0x92fc, 0x48c2, 0xa441, 0xfc76);
+    let src = Ipv6Address::new(0xfe80, 0x0, 0x0, 0x0, 0x4042, 0x4242, 0x4242, 0x0b1a);
+
+    // One IPv6 fragment: Fragment header (next=UDP, offset/flags, ident) + data.
+    let frag = |off_flags: u16, data: &[u8]| -> std::vec::Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x60;
+        let plen = (8 + data.len()) as u16;
+        p[4..6].copy_from_slice(&plen.to_be_bytes());
+        p[6] = 44; // Fragment
+        p[7] = 64;
+        p[8..24].copy_from_slice(&src.0);
+        p[24..40].copy_from_slice(&dst.0);
+        p.extend_from_slice(&[17, 0]);
+        p.extend_from_slice(&off_flags.to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 7]);
+        p.extend_from_slice(data);
+        p
+    };
+    // UDP 1234 -> 6969, length 12, then 4 payload bytes in the second fragment.
+    let first = frag(0x0001, &[0x04, 0xd2, 0x1b, 0x39, 0x00, 0x0c, 0x00, 0x00]);
+    let second = frag(0x0008, b"ping");
+
+    for with_assembler in [false, true] {
+        let (mut iface, mut sockets, _device) = setup(Medium::Ieee802154);
+        iface.update_ip_addrs(|ips| ips.push(IpCidr::Ipv6(Ipv6Cidr::new(dst, 10))).unwrap());
+        iface.inner.caps.checksum.udp = Checksum::None;
+        let handle = sockets.add(udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 1024]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY], vec![0; 1024]),
+        ));
+        sockets.get_mut::<udp::Socket>(handle).bind(6969).unwrap();
+
+        for bytes in [&first, &second] {
+            let reasm = with_assembler.then(|| {
+                (&mut iface.fragments.assembler, iface.fragments.reassembly_timeout)
+            });
+            let pkt = Ipv6Packet::new_checked(&bytes[..]).unwrap();
+            let _ = iface
+                .inner
+                .process_ipv6_inner(&mut sockets, PacketMeta::default(), &pkt, reasm);
+        }
+
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        if with_assembler {
+            let (data, _) = socket.recv().expect("reassembled datagram delivered");
+            assert_eq!(data, b"ping");
+        } else {
+            assert!(!socket.can_recv(), "Fragment header must be dropped");
+        }
+    }
+}

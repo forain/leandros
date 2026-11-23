@@ -6,8 +6,6 @@
 /bin/sh
 cmd:sh
 so:libdrm.so.2
-so:libpixman-1.so.0
-so:libxkbcommon.so.0
 so:libudev.so.1
 so:libseat.so.1
 mesa-egl

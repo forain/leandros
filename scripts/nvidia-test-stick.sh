@@ -133,7 +133,7 @@ fi
 
 # Realtek NIC PHY patches (small; optional for the driver, so a failed
 # download only warns).
-ports/rtl_nic/fetch.sh >/dev/null || echo "WARNING: ports/rtl_nic/fetch.sh failed; the stick may lack /lib/firmware/rtl_nic"
+python3 scripts/alpine_firmware.py fetch x86_64 >/dev/null || echo "WARNING: alpine_firmware.py fetch failed; the stick may lack /lib/firmware/rtl_nic"
 
 echo "=== [2/4] build (libnvrm.a, kernel --features nvidia, root image with firmware)"
 if [[ $QUICK == 1 ]]; then
@@ -183,11 +183,11 @@ python3 - "$OPENRM_FW_DIR" "$OPENRM_TAG" "${LEANDROS_ARTIFACTS:-$HOME/code/leand
 import os, sys, zlib, glob
 fw_dir, tag, art = sys.argv[1:4]
 files = [(os.path.join(fw_dir, n), f"/lib/firmware/nvidia/{tag}/{n}") for n in sorted(os.listdir(fw_dir)) if n.endswith(".bin")]
-for cand in ("ports/rtl_nic/firmware", os.path.join(art, "rtl_nic"), os.path.expanduser("~/.cache/leandros/rtl_nic")):
-    for p in sorted(glob.glob(os.path.join(cand, "**", "*.fw"), recursive=True)):
-        files.append((p, "/lib/firmware/rtl_nic/" + os.path.basename(p)))
-    if any(t.startswith("/lib/firmware/rtl_nic/") for _, t in files):
-        break
+sys.path.insert(0, "scripts")
+import alpine_firmware
+for d, n, h, _ in alpine_firmware.stage("x86_64"):
+    if d.endswith("/rtl_nic"):
+        files.append((h, d + "/" + n))
 for src, dst in files:
     data = open(src, "rb").read()
     print(f"    [FW] {dst}: {len(data)} bytes crc32={zlib.crc32(data):#010x}")
