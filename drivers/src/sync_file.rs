@@ -107,33 +107,6 @@ pub fn set_signaller(f: fn(u64) -> bool) {
     SIGNALLER.store(f as usize, Ordering::Release);
 }
 
-/// Sync files whose fence signalled WITH AN ERROR (a watchdog write-off), by
-/// token. The pending entry disappears at signalling, so the error is kept
-/// here; tokens are never reused. Bounded ring, oldest overwritten; 0 = empty.
-const ERR_TOKENS_N: usize = 256;
-static ERR_TOKENS: Mutex<[u64; ERR_TOKENS_N]> = Mutex::new([0; ERR_TOKENS_N]);
-static ERR_NEXT: AtomicUsize = AtomicUsize::new(0);
-
-/// Does `f` name a fence that was written off with an error?
-pub fn fence_has_error(f: &Fence) -> bool {
-    f.pending(&|_| false).iter().any(|&id| crate::virtio_gpu::fence_errored(id))
-}
-
-/// Record that sync file `token` holds an errored fence.
-pub fn mark_errored(token: u64) {
-    let mut t = ERR_TOKENS.lock();
-    if t.iter().any(|&x| x == token) { return; }
-    let i = ERR_NEXT.fetch_add(1, Ordering::Relaxed) % ERR_TOKENS_N;
-    t[i] = token;
-}
-
-/// Did sync file `token`'s fence signal with an error (Linux: fence status < 0)?
-pub fn token_errored(token: u64) -> bool {
-    if ERR_TOKENS.lock().iter().any(|&x| x == token) { return true; }
-    let t = PENDING.lock();
-    t.get(&token).map_or(false, |p| fence_has_error(&p.fence) && p.fence.is_done(&done))
-}
-
 pub fn new_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
@@ -194,17 +167,7 @@ pub fn tick() {
         Some(g) => g,
         None => return,
     };
-    t.retain(|tok, e| {
-        if !e.fence.is_done(&done) { return true; }
-        // Keep the error of a written-off fence past the entry's removal.
-        if fence_has_error(&e.fence) { if let Some(mut et) = ERR_TOKENS.try_lock() {
-            if !et.iter().any(|&x| x == *tok) {
-                let i = ERR_NEXT.fetch_add(1, Ordering::Relaxed) % ERR_TOKENS_N;
-                et[i] = *tok;
-            }
-        } else { return true; } }
-        !signal(e.slot)
-    });
+    t.retain(|_, e| !(e.fence.is_done(&done) && signal(e.slot)));
     PENDING_N.store(t.len(), Ordering::Relaxed);
 }
 

@@ -732,41 +732,28 @@ const FENCE_HUNG_US: u64 = 1_000_000;
 /// much longer than for the whole-host-silent case. Test knob mode 4 shortens it.
 const FENCE_ALIVE_US_DEFAULT: u64 = 60_000_000;
 static FENCE_ALIVE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(FENCE_ALIVE_US_DEFAULT);
-/// Guilty-context marking (Linux semantics): a context one of whose fences was
-/// written off is LOST: its ringed submits fail ECANCELED, and the written-off
-/// fences report an error (sync file status -ETIMEDOUT). Cleared in `ctx_free_id`.
+/// Guilty-context marking: a context one of whose timelines is stuck while the
+/// host still answers OTHER timelines is LOST: its ringed submits fail ECANCELED
+/// (`ctx_lost`). Its pending fences are NOT signalled: like Linux virtio-gpu, a
+/// fence signals only when the host answers (or the device is reset). An early
+/// signal would let `vkWaitForFences` succeed (sync_file poll is POLLIN for any
+/// signalled fence, error or not) while the host still uses the BO. A LOST
+/// timeline takes no new submits, so it adds nothing to the retired-ahead table
+/// beyond what is already in flight. Cleared in `ctx_free_id`.
 static CTX_LOST: [core::sync::atomic::AtomicBool; CTX_ID_POOL as usize] =
     [const { core::sync::atomic::AtomicBool::new(false) }; CTX_ID_POOL as usize];
-/// Written-off (errored) fence ids, recorded PER FENCE at write-off time. Fence
-/// ids are never reused (`TL_NEXT_SEQ`), so a record outlives the context id it
-/// came from: an errored fence exported to another process stays errored after
-/// the app exits and its context id is recycled. A bounded ring (the oldest
-/// record is overwritten after `ERRORED_RING` newer write-offs); 0 = empty.
-const ERRORED_RING: usize = 256;
-static ERRORED_IDS: [core::sync::atomic::AtomicU64; ERRORED_RING] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; ERRORED_RING];
-static ERRORED_NEXT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static ERRORED_ANY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Record `id` as errored (and, for a ringed timeline, its context LOST); call
-/// BEFORE signalling it. Only the PER-TIMELINE write-off uses this (the host
-/// answers other timelines, so this one is the guilty one). The whole-host-silent
-/// write-off deliberately does not: a host-wide stall that recovers (the host
-/// Metal/HVF watchdog case) must not kill COSMIC/Firefox.
-fn fence_mark_lost(id: u64) {
-    use core::sync::atomic::Ordering::{Relaxed, Release};
-    let i = ERRORED_NEXT.fetch_add(1, Relaxed) % ERRORED_RING;
-    ERRORED_IDS[i].store(id, Release);
-    ERRORED_ANY.store(true, Release);
+/// Contexts marked LOST by the watchdog (stat).
+static CTXS_LOST_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Mark the context of fence `id` LOST (ringed timelines only); true if newly marked.
+/// The WHOLE-HOST-SILENT write-off never calls this: a host-wide stall that
+/// recovers (the host Metal/HVF watchdog) must not kill COSMIC/Firefox.
+fn ctx_mark_lost(id: u64) -> bool {
+    use core::sync::atomic::Ordering::{Relaxed, AcqRel};
     let tl = (id >> FENCE_TL_SHIFT) as usize;
-    if tl != 0 && tl < FENCE_TLS { CTX_LOST[tl / FENCE_RINGS].store(true, Release); }
-}
-/// Did the watchdog write this fence off (it never really retired)? Linux
-/// fences signalled with an error report it as status < 0 (sync file info,
-/// -EIO from syncobj / VIRTGPU_WAIT); here -ETIMEDOUT on the sync file.
-pub fn fence_errored(id: u64) -> bool {
-    use core::sync::atomic::Ordering::Acquire;
-    if id == 0 || !ERRORED_ANY.load(Acquire) { return false; }
-    ERRORED_IDS.iter().any(|a| a.load(Acquire) == id)
+    if tl == 0 || tl >= FENCE_TLS { return false; }
+    let was = CTX_LOST[tl / FENCE_RINGS].swap(true, AcqRel);
+    if !was { CTXS_LOST_TOTAL.fetch_add(1, Relaxed); }
+    !was
 }
 /// Has the watchdog declared this context lost (ringed submits get ECANCELED)?
 pub fn ctx_lost(ctx: u32) -> bool {
@@ -934,8 +921,8 @@ pub fn fence_stats_text(s: &mut alloc::string::String) {
         CTRLQ_UNLOCK_DRAINS.load(Relaxed), AHEAD_COUNT.load(Relaxed), AHEAD_PEAK.load(Relaxed), AHEAD_GROWTHS.load(Relaxed),
         AHEAD_CAP.load(Relaxed), AHEAD_QSIZE.load(Relaxed), FENCE_SUBMIT_REFUSED.load(Relaxed), FENCE_AHEAD_DROPPED.load(Relaxed));
     let _ = writeln!(s, "tl_fences={}", TL_FENCES.load(Relaxed));
-    let _ = writeln!(s, "watchdog written_off={} hangs={} hung_now={}",
-        FENCES_WRITTEN_OFF.load(Relaxed), HOST_HANGS.load(Relaxed), host_gpu_hung() as u8);
+    let _ = writeln!(s, "watchdog written_off={} ctx_lost={} hangs={} hung_now={}",
+        FENCES_WRITTEN_OFF.load(Relaxed), CTXS_LOST_TOTAL.load(Relaxed), HOST_HANGS.load(Relaxed), host_gpu_hung() as u8);
     let _ = writeln!(s, "hook_lat_us n={} p50<={} p99<={} max={}",
         HOOK_LAT.n.load(Relaxed), HOOK_LAT.quantile_ub(500), HOOK_LAT.quantile_ub(990), HOOK_LAT.max.load(Relaxed));
     let _ = writeln!(s, "hol_us n={} p50<={} p99<={} max={}",
@@ -3427,8 +3414,11 @@ impl VirtioGpuDevice {
             // The legacy timeline (tl 0: 2D/unringed fences) keeps the plain
             // 10 s Linux job timeout; only ringed timelines get the long
             // "host is alive, may be a legitimately long job" limit.
-            let lim = if tl == 0 { if hung { FENCE_HUNG_US } else { FENCE_HANG_US } } else { limit };
-            now.saturating_sub(since) >= lim
+            // While the host answers other timelines only a ringed timeline
+            // can be guilty, once (a LOST context is not re-flagged); the
+            // legacy timeline is shared by everyone and never blamed.
+            if !silent && (tl == 0 || CTX_LOST[tl / FENCE_RINGS].load(Relaxed)) { return false; }
+            now.saturating_sub(since) >= limit
         };
         // Cheap exit: anything pending at all?
         let mut any = self.held_n != 0;
@@ -3440,6 +3430,7 @@ impl VirtioGpuDevice {
         if !any { return 0; }
         let mut total = 0usize;
         let mut chains = 0usize;
+        let mut lost_n = 0usize;
         let mut first_id = 0u64;
         // Parked by the fence-hold test knob: the simulated "host never
         // retires it" case (answered, but not applied); same rule.
@@ -3447,11 +3438,15 @@ impl VirtioGpuDevice {
         while hi < self.held_n {
             let id = self.held[hi];
             if stuck(id, self.held_t[hi]) {
+                if !silent { // host alive: context LOST, the fence stays parked
+                    if ctx_mark_lost(id) { lost_n += 1; }
+                    hi += 1;
+                    continue;
+                }
                 self.held_n -= 1;
                 self.held[hi] = self.held[self.held_n];
                 self.held_t[hi] = self.held_t[self.held_n];
                 if first_id == 0 { first_id = id; }
-                if !silent { fence_mark_lost(id); }
                 // Ending the hold-one mode: nothing else is parked behind it.
                 FENCE_HOLD_ONE.store(false, Relaxed);
                 self.fence_complete(id);
@@ -3465,6 +3460,10 @@ impl VirtioGpuDevice {
                 if n == ids.len() { break; }
                 if let Some(e) = slot.as_mut() {
                     if e.fence_id == 0 || e.sync || !stuck(e.fence_id, e.submitted_us) { continue; }
+                    if !silent { // host alive: context LOST, the fence stays pending
+                        if ctx_mark_lost(e.fence_id) { lost_n += 1; }
+                        continue;
+                    }
                     ids[n] = e.fence_id;
                     n += 1;
                     e.fence_id = 0;
@@ -3473,9 +3472,16 @@ impl VirtioGpuDevice {
             }
             if n == 0 { break; }
             if first_id == 0 { first_id = ids[0]; }
-            for &id in &ids[..n] { if !silent { fence_mark_lost(id); } self.fence_complete(id); }
+            for &id in &ids[..n] { self.fence_complete(id); }
             total += n;
             chains += n;
+        }
+        if lost_n != 0 {
+            let k = HOST_HANGS.fetch_add(1, Relaxed);
+            if k < 8 {
+                crate::pci::serial_debug("[GPU] host context HUNG: a stuck timeline's context is LOST \
+                    (submits ECANCELED); its fences stay pending until the host answers\n");
+            }
         }
         if total == 0 { return 0; }
         CTX_CHAINS_PARKED.fetch_add(chains as u64, Relaxed);

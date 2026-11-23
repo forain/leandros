@@ -1227,7 +1227,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
     // hung, and B must be unaffected throughout (no EAGAIN, every fence signals).
     {
         let vstream: [u32; 4] = [188, 0, 1, 0];
-        let wo0 = fence_stat(b"written_off");
+        let wo0 = fence_stat(b"ctx_lost");
         let hung0 = fence_stat(b"hangs");
         let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
         let inited = fa >= 0 && ctx_init_venus(fa);
@@ -1262,10 +1262,12 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
                 fb1(&mut b_ok, &mut b_sig);
                 poll(core::ptr::null_mut(), 0, 1800);
             }
-            a_early = oka && poll_in_within(ea.fence_fd, 8000);
+            // The host is alive, so A's context is LOST but A's fence must NOT
+            // signal early (Linux: a fence signals only when the host answers).
+            a_early = oka && !poll_in_within(ea.fence_fd, 8000);
             fb1(&mut b_ok2, &mut b_sig2);
         }
-        let wo1 = fence_stat(b"written_off");
+        let wo1 = fence_stat(b"ctx_lost");
         let hung1 = fence_stat(b"hangs");
         let hung_now = fence_stat(b"hung_now");
         // Guilty-context semantics: A's fence reports an error, A's context is
@@ -1280,9 +1282,10 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             lost_errno = *__errno_location();
             if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
         }
-        // Linux's sync_file poll: a signalled fence is POLLIN whatever its status.
-        let a_pollin = oka && poll_in_ready(ea.fence_fd);
+        let a_still_pending = oka && !poll_in_ready(ea.fence_fd);
         let rel = fence_hold_mode(0);
+        // Releasing the hold lets the host answer: the fence signals normally.
+        let a_signals_on_release = oka && poll_in_within(ea.fence_fd, 4000);
         if fa >= 0 { close(fa); }
         // The app is gone and its context id is free: recycle it (the next
         // contexts reuse the lowest free ids) while A's out-fence fd is still
@@ -1290,28 +1293,20 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let mut c_ok = 0u32;
         let mut c_sig = 0u32;
         fb1(&mut c_ok, &mut c_sig);
-        let mut d_ok = 0u32;
-        let mut d_sig = 0u32;
-        fb1(&mut d_ok, &mut d_sig);
-        let a_status_after = if oka { sync_file_status(ea.fence_fd) } else { 0 };
         if oka { close(ea.fence_fd); }
         out(b"  7f: a_status="); out_u64((a_status as i64 + 1_000_000) as u64);
         out(b" lost_ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64);
         out(b" recycled_ok="); out_u64(c_ok as u64); out(b" sig="); out_u64(c_sig as u64); out(b"\n");
-        if !report(b"phase7f_written_off_fence_reports_error", oka && a_status < 0 && a_status != i32::MIN) {
+        if !report(b"phase7f_stuck_fence_stays_pending_no_error", oka && a_still_pending) {
             failures += 1;
         }
+        if !report(b"phase7f_stuck_fence_signals_on_release", a_signals_on_release) { failures += 1; }
         if !report(b"phase7f_lost_context_submit_is_ecanceled", inited && lost_ret != 0 && lost_errno == 125) {
             failures += 1;
         }
         if !report(b"phase7f_recycled_context_not_lost", c_ok == 1 && c_sig == 1) {
             failures += 1;
         }
-        if !report(b"phase7f_error_survives_context_id_recycle",
-                   oka && a_status_after == -110 && d_ok == 1 && d_sig == 1) {
-            failures += 1;
-        }
-        if !report(b"phase7f_errored_fence_polls_pollin_like_linux", a_pollin) { failures += 1; }
         out(b"  7f: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
         out(b" b_ok="); out_u64(b_ok as u64); out(b" b_sig="); out_u64(b_sig as u64);
         out(b" after_ok="); out_u64(b_ok2 as u64); out(b" after_sig="); out_u64(b_sig2 as u64);
@@ -1359,7 +1354,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         out(b"  7g: a_written_off="); out_u64(a_wo as u64); out(b" status="); out_u64((st as i64 + 1_000_000) as u64);
         out(b" submit_errno="); out_u64(sub_errno as u64); out(b"\n");
         if !report(b"phase7g_whole_host_silent_writeoff_not_guilty",
-                   inited && oka && a_wo && st >= 0 && sub_errno != 125) {
+                   inited && oka && a_wo && sub_errno != 125) {
             failures += 1;
         }
         // Let the host answer again so later phases start from a healthy state.
