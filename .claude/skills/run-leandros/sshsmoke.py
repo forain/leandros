@@ -614,14 +614,14 @@ SSHD2_PORT = 2222
 SSHD2_BIN = os.environ.get("SSHDCFG_BIN", "/usr/sbin/sshd")
 
 
-def sshd2_start(ssh, user, pw, conf, env=""):
+def sshd2_start(ssh, user, pw, conf, env="", flags=""):
     """(Re)start a second sshd (root, port 2222, config `conf`) in the guest; True when it listens."""
     sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", conf)
     sudo_write(ssh, user, pw, "/tmp/sshdcfg-start.sh", "\n".join([
         "trap '' HUP",  # the ssh session's hangup must not take the daemon down (no setsid in the guest)
         "kill $(cat /tmp/sshdcfg.pid 2>/dev/null) 2>/dev/null; sleep 1",
         ": > /tmp/sshdcfg.log",
-        f"{env} {SSHD2_BIN} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
+        f"{env} {SSHD2_BIN} {flags} -f /tmp/sshdcfg.conf -p {SSHD2_PORT} -e </dev/null >/tmp/sshdcfg.log 2>&1 &",
         "echo $! > /tmp/sshdcfg.pid",
         "for i in 1 2 3 4 5 6 7 8 9 10; do grep -q ready /tmp/sshdcfg.log && exit 0; sleep 1; done; exit 1",
     ]))
@@ -870,6 +870,10 @@ def sshdcfg(ssh, user, pw, tmp):
     match_case("cfg_match_rdomain_negated", "RDomain !default", False)
     match_case("cfg_match_rdomain_star", "RDomain *", True)
     match_case("cfg_match_and_mismatch", "Host 127.0.0.1 LocalAddress 10.0.0.0/8", False)
+    # UseDNS no: the "host name" is the client address, so a name never matches.
+    match_case("cfg_match_host_name_not_resolved", "Host localhost", False)
+    match_case("cfg_match_host_negated_name", "Host *,!localhost", True)
+    match_case("cfg_match_host_dns_suffix_not_resolved", "Host *.localdomain", False)
     match_case("cfg_match_and_all_match", f"Host 127.0.0.1 LocalAddress 127.0.0.0/8 RDomain default LocalPort {SSHD2_PORT}", True)
 
     # --- AuthorizedPrincipalsFile (certificates signed by a TrustedUserCAKeys CA) ----
@@ -1085,6 +1089,282 @@ def sshdcfg(ssh, user, pw, tmp):
         sudo_write(ssh, user, pw, "/etc/shadow", orig)
     set_keys(ssh, user, pw, pub)
     sudo_sh(ssh, user, pw, "mount -o remount,rw / 2>/dev/null; kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*; rm -rf /etc/ssh/principals")
+
+
+def unix_exchange(path, payload=b"", want=b"", wait=25):
+    """Connect to the unix socket `path` until `want` shows up in the reply (or timeout)."""
+    import socket
+    end = time.time() + wait
+    got = b""
+    while time.time() < end:
+        try:
+            c = socket.socket(socket.AF_UNIX)
+            c.settimeout(5)
+            c.connect(path)
+            if payload:
+                c.sendall(payload)
+            got = b""
+            try:
+                while want not in got:
+                    d = c.recv(256)
+                    if not d:
+                        break
+                    got += d
+            except OSError:
+                pass
+            c.close()
+            if want in got:
+                return got
+        except OSError:
+            pass
+        time.sleep(1)
+    return got
+
+
+def sshdcfg2(ssh, user, pw, tmp):
+    """AuthorizedPrincipalsCommand, unix-socket (streamlocal) forwarding, -D and Match Host without DNS,
+    on a second sshd (port 2222) reached through the first one."""
+    import socket
+    import threading
+    pub = open(ssh.key + ".pub").read().strip()
+    set_keys(ssh, user, pw, pub)
+    ssh2 = Ssh("127.0.0.1", SSHD2_PORT, tmp)
+    ssh2.key = ssh.key
+    ssh2.known = os.path.join(tmp, "known_hosts2b")
+    ssh2.askpass = ssh.askpass
+    ssh2.proxy = " ".join(["ssh", *ssh.key_opts(), "-p", str(ssh.port), "-W", "%h:%p", f"{user}@{ssh.host}"])
+    base = "HostKey /etc/ssh/ssh_host_ed25519_key\nPermitRootLogin no\nPasswordAuthentication yes\nPubkeyAuthentication yes\n"
+
+    def conf(extra, flags=""):
+        ok = sshd2_start(ssh, user, pw, base + extra, flags=flags)
+        if not ok:
+            step("cfg2_second_sshd_starts", False, extra[:80].replace("\n", "|"))
+        return ok
+
+    def login(cmd="id -un"):
+        return ssh2.run(user, cmd, key=True)
+
+    # --- -D (foreground; sshd never detaches) ---------------------------------
+    if conf("", flags="-D"):
+        rc, out, err = login()
+        step("cfg2_dflag_serves", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = sudo_sh(ssh, user, pw, f"{SSHD2_BIN} -D -t -f /dev/null 2>&1; echo rc=\\$?")
+    step("cfg2_dflag_accepted_by_test_mode", "rc=0" in out and "usage" not in out, f"out={out.strip()[-120:]!r}")
+    rc, out, err = sudo_sh(ssh, user, pw, f"{SSHD2_BIN} -Z 2>&1; echo rc=\\$?")
+    step("cfg2_unknown_flag_still_usage", "usage" in out and "rc=2" in out, f"out={out.strip()[-120:]!r}")
+
+    # --- AuthorizedPrincipalsCommand -------------------------------------------
+    def keygen(*a):
+        return subprocess.run(["ssh-keygen", "-q", "-N", "", *a], capture_output=True).returncode == 0
+
+    ca, uk = os.path.join(tmp, "ca3"), os.path.join(tmp, "ukey3")
+    if not (keygen("-t", "ed25519", "-f", ca) and keygen("-t", "ed25519", "-f", uk)):
+        step("cfg2_keygen", False, "ssh-keygen failed")
+        return
+
+    def sign(n, principals=user, *opts):
+        cp = os.path.join(tmp, f"{n}.pub")
+        shutil.copy(uk + ".pub", cp)
+        r = subprocess.run(["ssh-keygen", "-q", "-s", ca, "-I", n, "-n", principals, "-z", "4242", *opts, cp], capture_output=True)
+        return os.path.join(tmp, f"{n}-cert.pub") if r.returncode == 0 else None
+
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg-ca.pub", open(ca + ".pub").read().strip())
+    # uploaded through stdin: the script holds double quotes that sudo_sh's quoting cannot carry
+    apc_text = "#!/bin/sh\necho \"$@\" > /tmp/apc.args\necho deploy\necho 'command=\"echo apc-forced\" cmdp'\n"
+    ssh.run(user, "cat > /tmp/apc.sh.new", key=True, stdin=apc_text.encode())
+    sudo_sh(ssh, user, pw, "cp /tmp/apc.sh.new /etc/ssh/apc.sh; chown 0:0 /etc/ssh/apc.sh; chmod 755 /etc/ssh/apc.sh; rm -f /tmp/apc.args")
+    ca_opts = "TrustedUserCAKeys /tmp/sshdcfg-ca.pub\nAuthorizedKeysFile /dev/null\n"
+    apc = "/etc/ssh/apc.sh"
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %u\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc1", "deploy"), "id -un")
+    step("cfg2_principals_command_listed", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc2", "stranger"), "id -un")
+    step("cfg2_principals_command_unlisted", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc3", user), "id -un")
+    step("cfg2_principals_command_username_not_implicit", rc == 255, f"rc={rc}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc4", "cmdp"), "id -un")
+    step("cfg2_principals_command_line_option", rc == 0 and out.strip() == "apc-forced", f"rc={rc} out={out.strip()!r}")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %u %i %s %U %% %t %D\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc5", "deploy"), "id -un")
+    rc2, args, _ = ssh.run(user, "cat /tmp/apc.args; id -u", key=True)
+    a = args.split()
+    step("cfg2_principals_command_tokens", rc == 0 and a[:5] == [user, "apc5", "4242", a[-1], "%"] and "default" in a and any("cert-v01" in x for x in a),
+         f"rc={rc} args={args.strip()!r}")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %u\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc6", "deploy"), "id -un")
+    step("cfg2_principals_command_needs_user", rc == 255, f"rc={rc}")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %q\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc7", "deploy"), "id -un")
+    step("cfg2_principals_command_unknown_token", rc == 255, f"rc={rc}")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %u\nAuthorizedPrincipalsCommandUser nobody-such\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc8", "deploy"), "id -un")
+    step("cfg2_principals_command_bad_user", rc == 255, f"rc={rc}")
+    sudo_sh(ssh, user, pw, "chmod 777 /etc/ssh/apc.sh")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %u\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc9", "deploy"), "id -un")
+    step("cfg2_principals_command_unsafe_modes", rc == 255, f"rc={rc}")
+    sudo_sh(ssh, user, pw, "chmod 755 /etc/ssh/apc.sh")
+    sudo_write(ssh, user, pw, "/etc/ssh/apc-fail.sh", "#!/bin/sh\necho deploy\nexit 3")
+    sudo_sh(ssh, user, pw, "chown 0:0 /etc/ssh/apc-fail.sh; chmod 755 /etc/ssh/apc-fail.sh")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand /etc/ssh/apc-fail.sh\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc10", "deploy"), "id -un")
+    step("cfg2_principals_command_failure_refuses", rc == 255, f"rc={rc}")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand /etc/ssh/missing.sh\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc11", "deploy"), "id -un")
+    step("cfg2_principals_command_missing_refuses", rc == 255, f"rc={rc}")
+    r = ssh.run(user, "echo viafile > ~/.apc-pf; chmod 600 ~/.apc-pf", key=True)
+    conf(f"{ca_opts}AuthorizedPrincipalsFile %h/.apc-pf\nAuthorizedPrincipalsCommand {apc} %u\nAuthorizedPrincipalsCommandUser {user}\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc12", "viafile"), "id -un")
+    step("cfg2_principals_file_and_command_file_hit", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc13", "deploy"), "id -un")
+    step("cfg2_principals_file_and_command_command_hit", rc == 0 and out.strip() == user, f"rc={rc} err={err.strip()[-100:]!r}")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc14", "neither"), "id -un")
+    step("cfg2_principals_file_and_command_neither", rc == 255, f"rc={rc}")
+    conf(f"{ca_opts}AuthorizedPrincipalsCommand {apc} %u\nAuthorizedPrincipalsCommandUser {user}\nMatch User {user}\n  AuthorizedPrincipalsCommand none\n")
+    rc, out, err = cert_run(ssh2, user, uk, sign("apc15", "deploy"), "id -un")
+    step("cfg2_principals_command_match_none", rc == 255, f"rc={rc}")
+    sudo_sh(ssh, user, pw, "rm -f /etc/ssh/apc.sh /etc/ssh/apc-fail.sh /tmp/apc.args")
+
+    # --- streamlocal forwarding --------------------------------------------------
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    echo_port = srv.getsockname()[1]
+
+    def echo():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                c.sendall(c.recv(256))
+            except OSError:
+                pass
+            c.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+    gs = lambda n: f"/tmp/sd2-{n}.sock"  # guest sockets
+    hs = lambda n: os.path.join(tmp, f"sd2-{n}.sock")  # host sockets
+
+    def clean(*names):
+        ssh.run(user, "rm -f " + " ".join(gs(n) for n in names), key=True)
+        for n in names:
+            try:
+                os.unlink(hs(n))
+            except OSError:
+                pass
+
+    diag = []
+
+    def wait_fwd(p, path, limit=60):
+        """Until the -R listener's socket exists in the guest, or the client gave up (ExitOnForwardFailure)."""
+        t0 = time.time()
+        while time.time() - t0 < limit and p.poll() is None:
+            if ssh.run(user, f"test -S {path}", key=True)[0] == 0:
+                break
+            time.sleep(1)
+
+    def can_local():  # ssh2 -L host-socket:guest-socket, the guest socket made by -R on the first sshd
+        clean("a", "ha")
+        g = fwd_client(ssh, user, "-R", f"{gs('a')}:127.0.0.1:{echo_port}")
+        wait_fwd(g, gs("a"))
+        p = fwd_client(ssh2, user, "-L", f"{hs('ha')}:{gs('a')}")
+        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=15)
+        stop(p)
+        stop(g)
+        diag.append(f"L:{got!r} p={p.stderr.read()[-150:]!r} g={g.stderr.read()[-150:]!r}")
+        return b"ping-L" in got
+
+    def can_remote(extra=()):  # ssh2 -R guest-socket, read back through a -L on the first sshd
+        clean("b", "hb")
+        p = fwd_client(ssh2, user, "-o", "LogLevel=DEBUG1", "-R", f"{gs('b')}:127.0.0.1:{echo_port}")
+        wait_fwd(p, gs("b"))
+        p2 = fwd_client(ssh, user, "-o", "LogLevel=DEBUG1", "-L", f"{hs('hb')}:{gs('b')}")
+        got = unix_exchange(hs("hb"), payload=b"ping-R\n", want=b"ping-R", wait=15)
+        diag.append("first sshd: " + sudo_sh(ssh, user, pw, "tail -n 6 /var/log/sshd.log")[1].replace("\n", "|"))
+        stop(p)
+        stop(p2)
+        diag.append(f"R:{got!r} p={p.stderr.read()[-700:]!r} p2={p2.stderr.read()[-700:]!r}")
+        return b"ping-R" in got
+
+    for mode, want in (("yes", (True, True)), ("all", (True, True)), ("local", (True, False)),
+                       ("remote", (False, True)), ("no", (False, False))):
+        conf(f"AllowStreamLocalForwarding {mode}\n")
+        got = (can_local(), can_remote())
+        lg = sudo_sh(ssh, user, pw, "grep -c . /dev/null; tail -n 12 /tmp/sshdcfg.log")[1].replace("\n", "|") if got != want else ""
+        step(f"cfg2_streamlocal_{mode}", got == want, f"got={got} want={want} {lg}")
+    conf("AllowTcpForwarding no\nAllowStreamLocalForwarding yes\n")
+    got = (can_local(), can_remote())
+    lg = sudo_sh(ssh, user, pw, "tail -c 1500 /tmp/sshdcfg.log")[1].replace("\n", "|") + " ".join(diag[-3:]) if got != (True, True) else ""
+    step("cfg2_streamlocal_independent_of_tcp_no", got == (True, True), f"got={got} {lg}")
+    conf("AllowTcpForwarding yes\nAllowStreamLocalForwarding no\n")
+    got = (can_local(), can_remote())
+    step("cfg2_streamlocal_no_while_tcp_yes", got == (False, False), f"got={got}")
+    conf(f"AllowStreamLocalForwarding yes\nMatch User {user}\n  AllowStreamLocalForwarding no\n")
+    got = (can_local(), can_remote())
+    step("cfg2_streamlocal_match_no", got == (False, False), f"got={got}")
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", base + "AllowStreamLocalForwarding bogus\n")
+    rc, out, err = sudo_sh(ssh, user, pw, f"{SSHD2_BIN} -t -f /tmp/sshdcfg.conf 2>&1; echo rc=\\$?")
+    step("cfg2_streamlocal_bad_value_rejected", "rc=0" not in out, f"out={out.strip()[-120:]!r}")
+    conf("AllowStreamLocalForwarding yes\n")
+    ssh.run(user, f"echo 'no-port-forwarding {pub}' > ~/.sd2-ak; chmod 600 ~/.sd2-ak", key=True)
+    conf("AllowStreamLocalForwarding yes\nAuthorizedKeysFile %h/.sd2-ak\n")  # only this sshd's key has the option
+    clean("k")
+    p = fwd_client(ssh2, user, "-R", f"{gs('k')}:127.0.0.1:{echo_port}")
+    time.sleep(4)
+    refused = p.poll() is not None
+    stop(p)
+    ssh.run(user, "rm -f ~/.sd2-ak ~/.apc-pf", key=True)
+    step("cfg2_streamlocal_key_no_port_forwarding", refused, "-R accepted although the key has no-port-forwarding")
+
+    # StreamLocalBindMask / StreamLocalBindUnlink
+    def mode_of(n):
+        rc, out, _ = ssh.run(user, f"ls -l {gs(n)} | cut -c1-10", key=True)
+        return out.strip()
+
+    for tag, extra, want in (("default", "", "srw-------"), ("0", "StreamLocalBindMask 0\n", "srwxrwxrwx"),
+                             ("077", "StreamLocalBindMask 077\n", "srwx------"), ("0117", "StreamLocalBindMask 0117\n", "srw-rw----")):
+        conf("AllowStreamLocalForwarding yes\n" + extra)
+        clean("m")
+        p = fwd_client(ssh2, user, "-R", f"{gs('m')}:127.0.0.1:{echo_port}")
+        time.sleep(3)
+        got = mode_of("m")
+        stop(p)
+        step(f"cfg2_streamlocal_bindmask_{tag}", got == want, f"got={got!r} want={want!r}")
+    sudo_write(ssh, user, pw, "/tmp/sshdcfg.conf", base + "StreamLocalBindMask 08\n")
+    rc, out, err = sudo_sh(ssh, user, pw, f"{SSHD2_BIN} -t -f /tmp/sshdcfg.conf 2>&1; echo rc=\\$?")
+    step("cfg2_streamlocal_bindmask_bad_rejected", "rc=0" not in out, f"out={out.strip()[-120:]!r}")
+
+    def stale_forward(extra):
+        conf("AllowStreamLocalForwarding yes\n" + extra)
+        clean("u")
+        ssh.run(user, f"touch {gs('u')}", key=True)  # a stale file in the way
+        p = fwd_client(ssh2, user, "-R", f"{gs('u')}:127.0.0.1:{echo_port}")
+        time.sleep(4)
+        alive = p.poll() is None
+        stop(p)
+        return alive
+
+    step("cfg2_streamlocal_bindunlink_default_refuses_stale", not stale_forward(""), "forward succeeded over a stale file")
+    step("cfg2_streamlocal_bindunlink_no_refuses_stale", not stale_forward("StreamLocalBindUnlink no\n"), "forward succeeded over a stale file")
+    step("cfg2_streamlocal_bindunlink_yes_replaces_stale", stale_forward("StreamLocalBindUnlink yes\n"), "forward failed with StreamLocalBindUnlink yes")
+    conf("AllowStreamLocalForwarding yes\n")
+    clean("n")
+    p = fwd_client(ssh2, user, "-R", "/tmp/sd2-no-such-dir/x.sock:127.0.0.1:%d" % echo_port)
+    time.sleep(4)
+    step("cfg2_streamlocal_bind_missing_dir_refused", p.poll() is not None, "forward into a missing directory was accepted")
+    stop(p)
+    clean("ho")
+    p = fwd_client(ssh2, user, "-L", f"{hs('ho')}:/tmp/sd2-no-listener.sock")
+    time.sleep(3)
+    got = unix_exchange(hs("ho"), payload=b"x\n", want=b"x", wait=6)
+    stop(p)
+    step("cfg2_streamlocal_direct_no_listener_closed", b"x" not in got, f"got={got!r}")
+    srv.close()
+    clean("a", "b", "ha", "hb", "m", "u", "n", "ho")
+    set_keys(ssh, user, pw, pub)
+    sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*")
 
 
 PS_SSHD = r"""for p in /proc/[0-9]*; do
@@ -1514,6 +1794,7 @@ def main(argv):
     forwarding(ssh, user, pw, tmp)
     accounts_extra(ssh, user, pw, tmp)
     sshdcfg(ssh, user, pw, tmp)
+    sshdcfg2(ssh, user, pw, tmp)
     if "--only-crash" in argv:
         for _ in range(int(os.environ.get("CRASH_REPEAT", "1"))):
             privsep_crash(ssh, user, pw)
