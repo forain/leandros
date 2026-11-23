@@ -1508,6 +1508,22 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let ctl = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
         let old_drain = if ctl >= 0 { ctx_drain_override(ctl, 0) } else { u64::MAX - 1 };
         let knob = old_drain != u64::MAX - 1;
+        // Control: two fences on one fresh context, no knob (is a second fence on a ring answered at all?).
+        let mut k_sig = 0u32;
+        {
+            let fk = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            if fk >= 0 && ctx_init_venus(fk) {
+                for _ in 0..2 {
+                    let mut ek = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                    if ioctl(fk, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ek as *mut _) == 0 && ek.fence_fd >= 3 {
+                        if poll_in_within(ek.fence_fd, 4000) { k_sig += 1; }
+                        close(ek.fence_fd);
+                    }
+                    poll(core::ptr::null_mut(), 0, 300);
+                }
+            }
+            if fk >= 0 { close(fk); }
+        }
         let base_inflight = ctrlq_stat(ctl, 3);
         let orph0 = ctrlq_stat(ctl, 7);
         let aband0 = ctrlq_stat(ctl, 2);
@@ -1593,7 +1609,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         if fb >= 0 { close(fb); }
         if knob { ctx_drain_override(ctl, old_drain); }
         if ctl >= 0 { close(ctl); }
-        out(b"  7h: knob="); out_u64(knob as u64); out(b" oka="); out_u64(oka as u64);
+        out(b"  7h: ctl2="); out_u64(k_sig as u64); out(b" knob="); out_u64(knob as u64); out(b" oka="); out_u64(oka as u64);
         out(b" b="); out_u64(b_poll as u64); out_u64(b_wait as u64); out_u64(b_cnt as u64); out_u64(b_unch as u64);
         out(b" ids="); out_u64(ida); out(b"/"); out_u64(idc);
         out(b" c="); out_u64(c_ok as u64); out(b"/"); out_u64(c_sig as u64);
