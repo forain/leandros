@@ -1186,13 +1186,20 @@ impl Mon {
                         Err(e) => fail(&format!("bind failed: {e}")),
                     }
                 } else {
-                    match std::os::unix::net::UnixStream::connect(&path) {
-                        Ok(s) => {
-                            if let Err(e) = rpc::send(b, rpc::FWD_FD, 0, &[], &[s.as_raw_fd()]) {
-                                fail(&format!("send failed: {e}"));
-                            }
+                    // Passing a freshly connected unix socket occasionally fails with EBADF on aarch64
+                    // (kernel); a new connection passes, so retry the whole step.
+                    let mut tries = 0;
+                    loop {
+                        match std::os::unix::net::UnixStream::connect(&path) {
+                            Ok(s) => match rpc::send(b, rpc::FWD_FD, 0, &[], &[s.as_raw_fd()]) {
+                                Ok(()) => break,
+                                Err(e) if tries >= 20 => fail(&format!("send failed: {e}")),
+                                Err(_) => {}
+                            },
+                            Err(e) => fail(&format!("connect failed: {e}")),
                         }
-                        Err(e) => fail(&format!("connect failed: {e}")),
+                        tries += 1;
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                 }
                 // Stay until the monitor has read the frame and hung up: exiting right after sendmsg
