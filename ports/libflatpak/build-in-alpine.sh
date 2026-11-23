@@ -17,7 +17,7 @@ esac
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   grep -q '^3\.24\.' /etc/alpine-release || { echo "want Alpine 3.24"; exit 3; }
-  PKGS="flatpak ostree"
+  PKGS="flatpak ostree xdg-dbus-proxy"
   DEVPKGS="flatpak-dev ostree-dev json-glib-dev libxmlb-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""; APK="apk"
@@ -43,7 +43,10 @@ esac
   mkdir -p "$S/usr/bin"; cp -L "$R/usr/bin/ostree" "$S/usr/bin/ostree"
   # Same for the flatpak CLI (the closure names the flatpak package) and its sandbox
   # helper bwrap: the in-guest flatpaktest runs apps through the real bwrap, network-free.
-  for b in flatpak bwrap; do cp -L "$R/usr/bin/$b" "$S/usr/bin/$b"; done
+  for b in flatpak bwrap xdg-dbus-proxy; do cp -L "$R/usr/bin/$b" "$S/usr/bin/$b"; done
+  # flatpak run of a real app: the filtered session bus needs xdg-dbus-proxy, and the
+  # document/host-command portal bridge in the sandbox is flatpak-session-helper.
+  mkdir -p "$S/usr/lib/flatpak"; SH=$(find "$R/usr" -name flatpak-session-helper | head -1); echo "session-helper: ${SH#$R}"; cp -L "$SH" "$S/usr/lib/flatpak/flatpak-session-helper"
   # -- closure ------------------------------------------------------------------
   is_excluded() {
     case "$1" in
@@ -59,7 +62,7 @@ esac
     return 1
   }
   needed_of() { readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p'; }
-  { needed_of "$S/usr/lib/libflatpak.so.0"; needed_of "$S/usr/bin/ostree"; needed_of "$S/usr/bin/flatpak"; needed_of "$S/usr/bin/bwrap"; echo libflatpak.so.0; } > $W/queue
+  { needed_of "$S/usr/lib/libflatpak.so.0"; needed_of "$S/usr/bin/ostree"; needed_of "$S/usr/bin/flatpak"; needed_of "$S/usr/bin/bwrap"; needed_of "$S/usr/bin/xdg-dbus-proxy"; needed_of "$S/usr/lib/flatpak/flatpak-session-helper"; echo libflatpak.so.0; } > $W/queue
   : > $W/seen; : > "$S/CLOSURE.txt"; : > $W/missing
   while [ -s $W/queue ]; do
     sort -u $W/queue > $W/q2; : > $W/queue

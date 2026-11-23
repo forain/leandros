@@ -36,8 +36,8 @@ screen off the screen. `/bin/greeter-fake` drives it.
 ## The LeandrOS deltas
 
 `patches/0001-leandros.patch` (26 lines) carries the first two;
-`patches/0002-fakegreet-leandros.patch` and `patches/0003-socket-dir-leandros.patch`
-were added during bring-up and are described after them.
+`patches/0002-fakegreet-leandros.patch`
+was added during bring-up and is described after them.
 
 **1. `/proc/self/exe` is not executable here.** greetd re-executes itself to
 create each session worker (`session/interface.rs`,
@@ -64,19 +64,9 @@ binds its socket in a tmpfs runtime dir, where neither of those is exercised,
 and it `.unwrap()`ed the result — a panic, not an error. `env::current_dir()` is
 already absolute, so the join is the same answer with none of that surface.
 
-**4. The control socket's directory is steerable**
-(`patches/0003-socket-dir-leandros.patch`). Upstream hardcodes
-`/run/greetd-<pid>.sock` because on Linux `/run` is a tmpfs. On LeandrOS `/run`
-is an ordinary f2fs directory and f2fs has no `S_IFSOCK` support, so that bind
-fails with `EOPNOTSUPP` — greetd prints
-`unable to open listener: Not supported (os error 95)` and exits before the
-greeter is ever spawned. The socket-capable mounts are `/tmp`, `/dev/shm` and
-`/run/user` (`servers/vfs`'s `TMPFS_ROOTS`). The patch reads `GREETD_SOCK_DIR`
-and defaults to `/run`, so unset it is byte-for-byte upstream; `/bin/greeter-real`
-sets it to `$XDG_RUNTIME_DIR`. The alternative fix is to make `/run` itself a
-tmpfs mount root in the VFS, which is the more Linux-faithful answer but shadows
-the image's `/run` contents and changes what `/run/user` means as a pool root —
-a kernel decision, not a port decision.
+**4. The control socket's directory** is upstream's `/run/greetd-<pid>.sock`
+unpatched (the former `GREETD_SOCK_DIR` patch is gone): `/run` is a tmpfs mounted by
+the VFS, as on Linux, so `AF_UNIX` bind works there.
 
 Everything else upstream does is either already supported or configured away —
 see the config file for the VT case.
@@ -239,8 +229,7 @@ socket inode for `AF_UNIX` connect, so a uid-990 client cannot reach anything
 under the `0700 root` `/run/user/0`, nor connect to a `0755 root` socket. The
 greeter phase therefore uses the **greeter account's own runtime directory**,
 `/run/user/990` (seeded 0700, owned by the account, by `userland/init` for every
-passwd account at boot): `/bin/greeter-real` points `GREETD_SOCK_DIR` there,
-`/etc/profile` selects it as `XDG_RUNTIME_DIR` for the session that carries
+passwd account at boot): `/etc/profile` selects it as `XDG_RUNTIME_DIR` for the session that carries
 `GREETD_SOCK` — the greeter session, the only one greetd's worker putenv's it
 for (so cosmic-comp binds `wayland-N` there). `XDG_SESSION_CLASS` cannot be the
 discriminator: the worker sets it for PAM and removes it again before

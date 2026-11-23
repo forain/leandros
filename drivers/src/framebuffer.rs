@@ -137,6 +137,14 @@ pub struct Framebuffer {
     /// surface cannot say which cells are halves of one, and overwriting or
     /// erasing half must blank the other.
     wide: [[u64; 4]; WIDE_ROWS],
+    /// Last printed graphic character, for `CSI n b` (REP); 0 = none.
+    last_char: u32,
+    /// DECAWM (`CSI ? 7 h/l`); on by default.
+    autowrap: bool,
+    /// Deferred wrap (xterm / Linux `need_wrap`): a character written in the
+    /// last column leaves the cursor there; the wrap happens when the next
+    /// graphic character arrives, so the bottom-right cell does not scroll.
+    wrap_pending: bool,
     /// Bounding box of pixels modified since the last flush, as
     /// `(min_x, min_y, max_x, max_y)` with the maxima exclusive.  Lets
     /// `fb_flush` transfer only the changed region to the GPU instead of the
@@ -176,6 +184,9 @@ impl Framebuffer {
             saved_cursor: (0, 0),
             tabs: crate::wcwidth::TabStops::default_stops(),
             wide: [[0; 4]; WIDE_ROWS],
+            last_char: 0,
+            autowrap: true,
+            wrap_pending: false,
             dirty: None,
         }
     }
@@ -315,6 +326,7 @@ impl Framebuffer {
         match self.esc {
             EscState::Ground => {}
             EscState::Esc => {
+                self.wrap_pending = false;
                 self.esc = match c {
                     b'[' => { self.params_len = 0; EscState::Csi }
                     b']' => EscState::Osc,
@@ -343,8 +355,23 @@ impl Framebuffer {
                     // Final byte — `params` is Copy, so take it by value to
                     // release the borrow before the &mut self dispatch.
                     let (params, len) = (self.params, self.params_len);
-                    self.handle_csi(&params[..len], c);
                     self.esc = EscState::Ground;
+                    if c == b'b' && params[..len].first() != Some(&b'?') {
+                        // REP: print the last graphic character n more times.
+                        let n = params[..len].iter().take_while(|b| b.is_ascii_digit())
+                            .fold(0usize, |a, b| (a * 10 + (b - b'0') as usize).min(65535)).max(1);
+                        let ch = self.last_char;
+                        if let Some(chr) = char::from_u32(ch).filter(|_| ch != 0) {
+                            let mut buf = [0u8; 4];
+                            let bytes = chr.encode_utf8(&mut buf).as_bytes();
+                            let cap = (self.cols() * self.rows()).max(1);
+                            for _ in 0..n.min(cap) {
+                                for &b in bytes { self.putc(b); }
+                            }
+                        }
+                        return;
+                    }
+                    self.handle_csi(&params[..len], c);
                 } else {
                     // A C0 control aborted the sequence; drop it and resync.
                     self.esc = EscState::Ground;
@@ -368,6 +395,7 @@ impl Framebuffer {
             }
         }
 
+        if c < 0x20 { self.wrap_pending = false; }
         if c == b'\n' {
             self.cursor_x = 0;
             self.cursor_y += self.char_height;
@@ -387,9 +415,11 @@ impl Framebuffer {
                 if c < 0x80 {
                     // ASCII character
                     UTF8_STATE = (0, 0);
+                    self.apply_pending_wrap();
                     let (col, row) = (self.col(), self.row());
                     self.split_wide(row, col, col + 1);
                     self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, self.fg);
+                    self.last_char = c as u32;
                     self.cursor_x += self.char_width;
                 } else if c & 0xE0 == 0xC0 {
                     // Start of 2-byte UTF-8
@@ -416,9 +446,9 @@ impl Framebuffer {
                     UTF8_STATE = (0, 0);
                 }
 
-                if self.cursor_x + self.char_width > self.width {
-                    self.cursor_x = 0;
-                    self.cursor_y += self.char_height;
+                if self.cursor_x + self.char_width > self.width && !self.base.is_null() {
+                    self.cursor_x = self.cols().saturating_sub(1) * self.char_width;
+                    self.wrap_pending = self.autowrap;
                 }
             }
         }
@@ -545,9 +575,13 @@ impl Framebuffer {
 
         let (cols, rows) = (self.cols(), self.rows());
         let (mut col, mut row) = (self.col(), self.row());
+        if !matches!(final_byte, b'm' | b'h' | b'l') { self.wrap_pending = false; }
 
         match final_byte {
-            _ if private => {}                                   // DEC private modes
+            b'h' | b'l' if private => {                          // DECSET / DECRST
+                if &params[..] == b"?7" { self.autowrap = final_byte == b'h'; }
+            }
+            _ if private => {}                                   // other DEC private modes
             b'A' => row = row.saturating_sub(p(0, 1)),            // CUU
             b'B' => row = (row + p(0, 1)).min(rows - 1),          // CUD
             b'C' => col = (col + p(0, 1)).min(cols - 1),          // CUF
@@ -577,10 +611,105 @@ impl Framebuffer {
                 3 => self.tabs.clear_all(),
                 _ => {}
             },
+            b'@' => self.insert_chars(row, col, p(0, 1).max(1)),             // ICH
+            b'P' => self.delete_chars(row, col, p(0, 1).max(1)),             // DCH
+            b'X' => {                                                        // ECH
+                let end = (col + p(0, 1).max(1)).min(cols);
+                self.erase_cells(row, col, end);
+            }
+            b'L' => { self.insert_lines(row, p(0, 1).max(1)); col = 0; }     // IL
+            b'M' => { self.delete_lines(row, p(0, 1).max(1)); col = 0; }     // DL
             _ => {}                                              // unimplemented — drop
         }
 
         self.set_cell(col, row);
+    }
+
+    /// Blank cells `[c0, c1)` of `row` (ECH, and the blanks ICH/DCH expose).
+    fn erase_cells(&mut self, row: usize, c0: usize, c1: usize) {
+        let (cw, chh) = (self.char_width, self.char_height);
+        if c0 >= c1 { return; }
+        self.split_wide(row, c0, c1);
+        self.fill_rect(c0 * cw, row * chh, (c1 - c0) * cw, chh, 0x000000);
+    }
+
+    /// Move `cells` cells of `row` from column `src` to `dst` (overlap-safe),
+    /// pixels and wide-start bits together.
+    fn move_cells(&mut self, row: usize, src: usize, dst: usize, cells: usize) {
+        if cells == 0 || src == dst { return; }
+        let (cw, chh) = (self.char_width, self.char_height);
+        let stride = self.pitch / 4;
+        let surf = self.surface();
+        if !self.base.is_null() {
+            for y in row * chh..((row + 1) * chh).min(self.height) {
+                unsafe {
+                    core::ptr::copy(surf.add(y * stride + src * cw), surf.add(y * stride + dst * cw), cells * cw);
+                }
+            }
+            self.mark_dirty(src.min(dst) * cw, row * chh, (cells + src.abs_diff(dst)) * cw, chh);
+        }
+        let mut bits = [false; 256];
+        for k in 0..cells.min(256) { bits[k] = self.wide_bit(row, src + k); }
+        for k in 0..cells.min(256) { self.wide_set(row, dst + k, bits[k]); }
+    }
+
+    /// `CSI n @` — insert blanks at the cursor, pushing the row's tail right.
+    fn insert_chars(&mut self, row: usize, col: usize, n: usize) {
+        let cols = self.cols();
+        if col >= cols { return; }
+        let n = n.min(cols - col);
+        self.split_wide(row, col, col);
+        self.move_cells(row, col, col + n, cols - col - n);
+        self.erase_cells(row, col, col + n);
+        // A wide pair pushed past the right edge leaves a stranded lead cell.
+        if cols >= 2 && self.wide_bit(row, cols - 1) { self.erase_cells(row, cols - 1, cols); }
+    }
+
+    /// `CSI n P` — delete cells at the cursor, pulling the row's tail left.
+    fn delete_chars(&mut self, row: usize, col: usize, n: usize) {
+        let cols = self.cols();
+        if col >= cols { return; }
+        let n = n.min(cols - col);
+        self.split_wide(row, col, col + n);
+        self.move_cells(row, col + n, col, cols - col - n);
+        self.erase_cells(row, cols - n, cols);
+    }
+
+    /// `CSI n L` — insert blank rows at `row`, pushing the rows below down.
+    fn insert_lines(&mut self, row: usize, n: usize) {
+        let (rows, chh) = (self.rows(), self.char_height);
+        if row >= rows { return; }
+        let n = n.min(rows - row);
+        self.move_rows(row, row + n, rows - row - n);
+        self.fill_rect(0, row * chh, self.width, n * chh, 0x000000);
+        for r in row..row + n { if r < WIDE_ROWS { self.wide[r] = [0; 4]; } }
+    }
+
+    /// `CSI n M` — delete rows at `row`, pulling the rows below up.
+    fn delete_lines(&mut self, row: usize, n: usize) {
+        let (rows, chh) = (self.rows(), self.char_height);
+        if row >= rows { return; }
+        let n = n.min(rows - row);
+        self.move_rows(row + n, row, rows - row - n);
+        self.fill_rect(0, (rows - n) * chh, self.width, n * chh, 0x000000);
+        for r in rows - n..rows { if r < WIDE_ROWS { self.wide[r] = [0; 4]; } }
+    }
+
+    /// Move `count` character rows from row `src` to row `dst` (overlap-safe).
+    fn move_rows(&mut self, src: usize, dst: usize, count: usize) {
+        if count == 0 || src == dst || self.base.is_null() { return; }
+        let chh = self.char_height;
+        let stride = self.pitch / 4;
+        let surf = self.surface();
+        unsafe {
+            core::ptr::copy(surf.add(src * chh * stride), surf.add(dst * chh * stride), count * chh * stride);
+        }
+        let (w, y) = (self.width, src.min(dst) * chh);
+        self.mark_dirty(0, y, w, (count + src.abs_diff(dst)) * chh);
+        let tmp: [[u64; 4]; WIDE_ROWS] = self.wide;
+        for k in 0..count {
+            if src + k < WIDE_ROWS && dst + k < WIDE_ROWS { self.wide[dst + k] = tmp[src + k]; }
+        }
     }
 
     /// `CSI <n> J` — 0: cursor to end of screen, 1: start of screen to cursor,
@@ -752,12 +881,23 @@ impl Framebuffer {
     }
 
     /// Place a decoded code point at the cursor and advance by its width.
+    /// Perform a wrap deferred by a write in the last column.
+    fn apply_pending_wrap(&mut self) {
+        if !self.wrap_pending { return; }
+        self.wrap_pending = false;
+        self.cursor_x = 0;
+        self.cursor_y += self.char_height;
+        if self.cursor_y + self.char_height > self.height { self.scroll_vector(); }
+    }
+
     fn put_unicode(&mut self, u: u32) {
         let mut w = crate::wcwidth::width(u);
         if w == 0 {
             if crate::wcwidth::is_combining(u) { self.overlay_mark(u); }
             return;
         }
+        self.apply_pending_wrap();
+        self.last_char = u;
         let cols = self.cols();
         if w == 2 && cols < 2 { w = 1; }
         if w == 2 && self.col() + 2 > cols {
