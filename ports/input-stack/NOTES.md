@@ -1,3 +1,5 @@
+> **2026-11-22 (lane alplibs):** libxkbcommon, pixman, libdisplay-info, libevdev, mtdev, libinput (and the XKB data and libinput quirks) are no longer cross-built here: the image ships Alpine's packages (`ports/alpine/world`) and the cross sysroot gets the matching -dev packages from `scripts/alpine-dev.py` (`ports/alpine/devworld`, pinned in `<arch>.devlock`). Only the two LeandrOS shims (libseat, libudev) remain in this port, because no Alpine package can provide them (no seatd/udev daemon here). The build scripts and meson cross files described below were removed; the text is history.
+
 # D3 Input-Stack — progress log & final report
 
 Workdir: `${LEANDROS_WORK:-~/.cache/leandros-work}/d3-input-stack`

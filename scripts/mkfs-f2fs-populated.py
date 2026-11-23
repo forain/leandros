@@ -890,10 +890,7 @@ def main():
     dri = gl_lib("gbm/dri_gbm.so")
     if os.path.exists(dri):
         gbm_files.append(("dri_gbm.so", dri, 0o100755))
-    # kmscube itself (dynamic ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1).
-    kc = f"{gl_root}/out/kmscube-{arch}"
-    if os.path.exists(kc):
-        bin_files.append(("kmscube", kc, 0o100755))
+    # kmscube is Alpine's package (ports/alpine/world; /bin/kmscube -> /usr/bin/kmscube below).
 
     # ── M4 input/XKB ship set (anvil compositor) ──────────────────────────────
     # anvil (ET_DYN, PT_INTERP=/lib/ld-musl-<arch>.so.1) + the wl_shm/xdg_shell
@@ -920,9 +917,9 @@ def main():
     # here (libxkbcommon, libinput, ...) are upstream C, not built from this
     # repo, and always come from the blob.
     shim_build_dir = f"target/input-stack-sysroot/{arch}/usr/lib"
-    for so in ("libxkbcommon.so.0", "libdisplay-info.so.3", "libseat.so.1",
-               "libudev.so.1", "libinput.so.10", "libpixman-1.so.0",
-               "libmtdev.so.1", "libevdev.so.2"):
+    # libxkbcommon, libinput, libevdev, libmtdev, libpixman, libdisplay-info, the XKB data and the
+    # libinput quirks are Alpine packages now (ports/alpine/world).
+    for so in ("libseat.so.1", "libudev.so.1"):
         built = f"{shim_build_dir}/{so}"
         p = built if os.path.exists(built) else f"{m4_lib_dir}/{so}"
         if os.path.exists(p):
@@ -939,7 +936,7 @@ def main():
     m4_share_files = []
     m4_share_dirs  = set()
     m4_share_src   = f"{m4_root}/usr/share"
-    if os.path.isdir(m4_share_src):
+    if False and os.path.isdir(m4_share_src):   # XKB data + libinput quirks come from Alpine packages
         for dirpath, _dirnames, filenames in os.walk(m4_share_src):
             rel = os.path.relpath(dirpath, m4_root)   # e.g. usr/share/X11/xkb/symbols
             parts = rel.split("/")
@@ -3002,6 +2999,7 @@ def main():
     # /bin compat names (PATH on the console login is /bin alone); symlinks, unowned by the db.
     for _n in ("git", "git-upload-pack", "git-receive-pack", "git-upload-archive", "less", "nano", "rg"):
         bin_files.append((_n, f"/usr/bin/{_n}".encode(), S_IFLNK | 0o777))
+    bin_files.append(("kmscube", b"/usr/bin/kmscube", S_IFLNK | 0o777))
     for _n in ("mkfs.fat", "mkfs.xfs"):
         bin_files.append((_n, f"/sbin/{_n}".encode(), S_IFLNK | 0o777))
 

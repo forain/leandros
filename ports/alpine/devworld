@@ -1,0 +1,11 @@
+# Build-time -dev packages (headers, .pc, linkable .so symlinks) merged into the cross sysroot
+# m3-gl-stack/sysroot-<arch> by scripts/alpine-dev.py; NEVER shipped in the image. Each one is
+# staged together with its locked runtime package (ports/alpine/<arch>.lock), so the sysroot's
+# libraries are byte-identical to the image's. Pinned in ports/alpine/<arch>.devlock.
+dbus-dev
+libxkbcommon-dev
+libinput-dev
+libevdev-dev
+mtdev-dev
+pixman-dev
+libdisplay-info-dev
