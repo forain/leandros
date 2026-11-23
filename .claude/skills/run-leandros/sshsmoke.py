@@ -1334,9 +1334,13 @@ def sshdcfg2(ssh, user, pw, tmp):
         g = errwatch(fwd_client(ssh, user, "-R", f"{gs('a')}:127.0.0.1:{echo_port}"))
         wait_fwd(g, gs("a"))
         p = errwatch(fwd_client(ssh2, user, "-L", f"{hs('ha')}:{gs('a')}"))
-        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40, abort=lambda: nref(p, L_REFUSED) >= L_TIMES)
+        def refused_now():  # the client's message AND sshd's own refusal line (a failed open for another reason, e.g.
+            # "send failed: Bad file descriptor", is also reported to the client as "administratively prohibited")
+            return nref(p, L_REFUSED) >= 1 and sudo_sh(ssh, user, pw, "grep -c 'forwarding disabled' /tmp/sshdcfg.log")[1].strip() not in ("", "0")
+
+        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40, abort=refused_now)
         ok = b"ping-L" in got
-        ref = not ok and g.poll() is None and refused_by(p, L_REFUSED, L_TIMES)  # the guest socket is there: only ssh2 can have refused
+        ref = not ok and g.poll() is None and refused_now()  # the guest socket is there: only ssh2 can have refused
         stop(p)
         stop(g)
         diag.append(f"L:{got!r} p={errtxt(p)[-150:]!r} g={errtxt(g)[-150:]!r}")
