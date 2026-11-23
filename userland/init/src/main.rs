@@ -587,6 +587,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // can need one.
     seed_runtime_dirs();
 
+    // 4c''. Pad short /etc/shadow records (older images) to nine fields so PAM's
+    // unix_chkpwd (musl getspnam) can read them: no lockout after an upgrade.
+    shadow_fix();
+
     // 4c'. The boot ESP's per-boot hook (userland/espctl): a one-shot trial
     // kernel that got this far makes the fallback entry the default again,
     // and ESP /leandros/authorized_keys is merged into root's keys. Before
@@ -916,6 +920,43 @@ unsafe fn esp_boot_hook() {
             return;
         }
         usleep(20_000);
+    }
+}
+
+/// Run `/usr/sbin/shadowfix` (rewrites only short shadow lines, atomically,
+/// idempotent) and wait for it, killing it after 10 s. Missing = nothing to do.
+unsafe fn shadow_fix() {
+    const PATH: &[u8] = b"/usr/sbin/shadowfix\0";
+    if !exists(PATH) {
+        return;
+    }
+    let pid = fork();
+    if pid == 0 {
+        let argv: [*const u8; 2] = [PATH.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(PATH.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid < 0 {
+        return;
+    }
+    let start = monotonic_ms();
+    loop {
+        let mut status = 0i32;
+        let r = wait4(pid, &mut status, 1, core::ptr::null_mut());
+        if r == pid || r < 0 {
+            if r == pid && status != 0 {
+                write_str("shadowfix exited nonzero\n");
+            }
+            return;
+        }
+        if monotonic_ms().saturating_sub(start) > 10_000 {
+            syscall2(nr::KILL, pid as usize, 9);
+            wait4(pid, &mut status, 0, core::ptr::null_mut());
+            write_str("shadowfix timed out; killed\n");
+            return;
+        }
+        usleep(10_000);
     }
 }
 

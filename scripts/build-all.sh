@@ -1029,6 +1029,18 @@ build_espctl() {
     "$ROOT_DIR/userland/espctl/build.sh" "$arch"
 }
 
+# shadowfix -- pads short /etc/shadow records to nine fields (userland/shadowfix),
+# installed as /usr/sbin/shadowfix; init runs it once per boot. Same shape as espctl.
+build_shadowfix() {
+    local arch="$1"
+    echo "🛡️  Building $arch shadowfix..."
+    if [[ ! -x "$ROOT_DIR/userland/shadowfix/build.sh" ]]; then
+        echo "⚠️  userland/shadowfix not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/shadowfix/build.sh" "$arch"
+}
+
 # leandros-install -- the installer backend (userland/leandros-install),
 # installed as /usr/sbin/leandros-install. Same shape as espctl.
 build_leandros_install() {
@@ -1247,6 +1259,7 @@ for arch in "${ARCHS[@]}"; do
     phase build_sudotest build_sudotest "$arch"
     phase build_sshd build_sshd "$arch"
     phase build_espctl build_espctl "$arch"
+    phase build_shadowfix build_shadowfix "$arch"
     phase build_leandros_install build_leandros_install "$arch"
     phase build_e2fsprogs build_e2fsprogs "$arch"
     phase build_disktester build_disktester "$arch"

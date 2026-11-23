@@ -355,7 +355,12 @@ fn main() {
 
     // The unlocked-account check above authenticated and cached a timestamp: start the
     // "no cached credentials" checks from a clean slate.
-    let _ = run(LEANDRO, &[SUDO, "-K"], &[], "");
+    // Linux sudo keys the timestamp on tty (or parent pid + session without one), so the
+    // same-parent success above IS cached: prove it, then prove `sudo -K` clears it.
+    let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
+    t.check("leandro: sudo -n id works from the timestamp the previous success cached", o.code == 0 && o.stdout.contains("uid=0(root)"), &o);
+    let o = run(LEANDRO, &[SUDO, "-K"], &[], "");
+    t.check("leandro: sudo -K succeeds", o.code == 0, &o);
     let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
     t.check(
         "leandro: sudo -n id without cached credentials fails",
@@ -412,6 +417,7 @@ fn main() {
     }
 
     pam_checks(&mut t);
+    shadow_migration_checks(&mut t);
     login_checks(&mut t);
     devtty_checks(&mut t);
     su_background(&mut t);
@@ -750,6 +756,53 @@ fn pam_checks(t: &mut T) {
         let (rc2, _) = pam_try("greetd", &u, "x");
         t.check(&format!("pam greetd: locked account {u} rejected"), rc != 0 && rc2 != 0, &none);
     }
+}
+
+/// Old images wrote two-field shadow lines (`user:HASH:`), which musl getspnam()
+/// (so unix_chkpwd, so PAM) rejects: a lockout. `/usr/sbin/shadowfix` (run by
+/// init each boot) pads them to nine fields. Short line without it: refused (the
+/// red case); with it: right password accepted, wrong one rejected, hash/owner/mode
+/// unchanged, second run a no-op; the image's own nine-field line works too.
+fn shadow_migration_checks(t: &mut T) {
+    use std::os::unix::fs::MetadataExt;
+    let none = Out { code: 0, stdout: String::new(), stderr: String::new() };
+    let Ok(orig) = std::fs::read_to_string("/etc/shadow") else { return };
+    let (mode0, uid0, gid0) = match std::fs::metadata("/etc/shadow") {
+        Ok(m) => (m.mode() & 0o7777, m.uid(), m.gid()),
+        Err(_) => return,
+    };
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("shadow: image-written (nine-field) account authenticates through PAM", rc == 0, &none);
+    let Some(hash) = orig.lines().find_map(|l| l.strip_prefix("leandro:").map(|r| r.split(':').next().unwrap_or("").to_string())) else { return };
+    let short: String = orig
+        .lines()
+        .map(|l| if l.starts_with("leandro:") { format!("leandro:{hash}:") } else { l.to_string() })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if std::fs::write("/etc/shadow", &short).is_err() {
+        return;
+    }
+    let (rc_red, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("shadow: short line without migration is refused (red case)", rc_red != 0, &none);
+    let o = run(As::Root, &["/usr/sbin/shadowfix"], &[], "");
+    t.check("shadow: shadowfix runs", o.code == 0, &o);
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("shadow: migrated short-line account authenticates through PAM", rc == 0, &none);
+    let (rc, _) = pam_try("greetd", "leandro", "wrong");
+    t.check("shadow: migrated account still rejects a wrong password", rc != 0, &none);
+    let after = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
+    t.check(
+        "shadow: migration keeps the hash and pads to nine fields",
+        after.lines().any(|l| l.starts_with(&format!("leandro:{hash}:")) && l.split(':').count() == 9),
+        &none,
+    );
+    let (m, u, g) = std::fs::metadata("/etc/shadow").map(|m| (m.mode() & 0o7777, m.uid(), m.gid())).unwrap_or((0, 1, 1));
+    t.check("shadow: migration keeps owner and mode", (m, u, g) == (mode0, uid0, gid0), &none);
+    let o = run(As::Root, &["/usr/sbin/shadowfix"], &[], "");
+    let again = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
+    t.check("shadow: migration is idempotent", o.code == 0 && again == after, &o);
+    let _ = std::fs::write("/etc/shadow", &orig);
 }
 
 /// /bin/login (console/VT sessions; no PAM): a failed attempt stalls ~1 s like

@@ -2123,6 +2123,14 @@ def main():
         m5_exec_files.append(("/usr/sbin", "espctl", p))
         m5_exec_files.append(("/usr/sbin", "mbrtool", p))
 
+    # shadowfix: pads short /etc/shadow records to nine fields (userland/
+    # shadowfix); init runs it once per boot so older roots still log in
+    # through PAM (musl getspnam() rejects short lines).
+    p = f"userland/shadowfix/target/{_musl_triple}/release/shadowfix"
+    if os.path.exists(p):
+        m4_share_dirs.add("/usr/sbin")
+        m5_exec_files.append(("/usr/sbin", "shadowfix", p))
+
     # leandros-install: the installer backend (userland/leandros-install),
     # run as root (the GUI goes through sudo): list disks, install to one.
     p = f"userland/leandros-install/target/{_musl_triple}/release/leandros-install"
