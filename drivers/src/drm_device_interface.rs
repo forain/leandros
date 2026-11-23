@@ -2258,7 +2258,7 @@ pub fn drm_release_open(open_id: u32) {
     // Let the context's in-flight fenced work retire BEFORE destroying it: the
     // host answers a context-ring fence only through its context, so a fence
     // still outstanding at CTX_DESTROY is never answered (see
-    // `ctx_abandon_fences`). A client killed mid-frame has a submit or two in
+    // `ctx_orphan_fences`). A client killed mid-frame has a submit or two in
     // flight that the GPU finishes within a frame; wait for that, bounded,
     // with the device lock released between looks.
     let t0 = crate::snd::monotonic_us();
@@ -2275,9 +2275,9 @@ pub fn drm_release_open(open_id: u32) {
 
     let mut guard = crate::virtio_gpu::lock_gpu();
     if let Some(gpu) = guard.as_mut() {
+        // Whatever did not retire in time stays pending (orphaned) until the
+        // host answers it; ctx_destroy marks the orphans.
         gpu.ctx_destroy(ctx);
-        // Whatever did not retire in time never will.
-        gpu.ctx_abandon_fences(ctx);
     }
 }
 
@@ -9701,9 +9701,12 @@ impl DrmDeviceInterface {
             if req.value == 0 { return Err(DriverError::InvalidParameter); }
             let sel = uread_user::<u32>(req.value as usize)?;
             let n: u64 = match sel {
-                0 => vg::CTX_CHAINS_PARKED.load(Relaxed),
+                0 => vg::CTX_CHAINS_PARKED.load(Relaxed) + vg::CTX_ORPHANS_NOW.load(Relaxed),
                 1 => vg::CTX_CHAINS_RECLAIMED.load(Relaxed),
                 2 => vg::CTX_FENCES_ABANDONED.load(Relaxed),
+                7 => vg::CTX_ORPHANS_NOW.load(Relaxed),
+                8 => vg::FENCES_WRITTEN_OFF.load(Relaxed),
+                9 => vg::CTXS_LOST_TOTAL.load(Relaxed),
                 3 | 4 => {
                     let g = crate::virtio_gpu::VIRTIO_GPU.lock();
                     g.as_ref().map(|d| d.inflight_census().0 as u64 * (sel == 3) as u64
