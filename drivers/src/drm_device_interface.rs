@@ -9542,7 +9542,7 @@ impl DrmDeviceInterface {
                     let busy = e == crate::virtio_gpu::Submit3dErr::Busy;
                     drop(guard);
                     if busy { sched::yield_now("gpu-fence-ceiling"); }
-                    return Err(if busy { DriverError::Errno(11) } else if e == crate::virtio_gpu::Submit3dErr::BadRing { DriverError::Errno(22) } else { DriverError::Io });
+                    return Err(if busy { DriverError::Errno(11) } else if e == crate::virtio_gpu::Submit3dErr::BadRing { DriverError::Errno(22) } else if e == crate::virtio_gpu::Submit3dErr::Canceled { DriverError::Errno(125) } else { DriverError::Io });
                 }
             }
         };

@@ -231,6 +231,7 @@ extern "C" {
     pub fn read(fd: c_int, buf: *mut c_void, count: size_t) -> isize;
     pub fn ftruncate(fd: c_int, length: i64) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    pub fn __errno_location() -> *mut c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
     /// Phase 6 needs this: it closes the exported fd and then asserts the
@@ -763,6 +764,14 @@ unsafe fn fence_hold_mode(m: u8) -> bool {
     ok
 }
 
+/// SYNC_IOC_FILE_INFO status of a sync file fd (0 active, 1 signalled,
+/// negative errno = the fence errored); i32::MIN if the ioctl fails.
+unsafe fn sync_file_status(fd: c_int) -> i32 {
+    let mut info = [0u8; 56];
+    if ioctl(fd, 0xC038_3E04 as c_ulong, info.as_mut_ptr()) != 0 { return i32::MIN; }
+    i32::from_ne_bytes([info[32], info[33], info[34], info[35]])
+}
+
 /// One `key=value` counter of `/proc/drm/fence_stats` (u64::MAX if absent).
 unsafe fn fence_stat(key: &[u8]) -> u64 {
     let f = open(b"/proc/drm/fence_stats\0".as_ptr(), 0);
@@ -1230,25 +1239,25 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let mut b_sig2 = 0u32;
         let mut a_early = false;
         let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        let fb1 = |ok: &mut u32, sig: &mut u32| {
+            // Fresh context per fence (see 7d: one fence per bare context).
+            let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            if fx >= 0 && ctx_init_venus(fx) {
+                let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
+                    *ok += 1;
+                    if poll_in_within(eb.fence_fd, 4000) { *sig += 1; }
+                    close(eb.fence_fd);
+                }
+            }
+            if fx >= 0 { close(fx); }
+        };
         if inited {
             held = fence_hold_mode(4);
             oka = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
             // B traffic every 1.8 s while A ages (the host is never silent), then
             // wait for the watchdog to write A off (10 s after it was parked),
             // then one more B fence with the hold still on.
-            let fb1 = |ok: &mut u32, sig: &mut u32| {
-                // Fresh context per fence (see 7d: one fence per bare context).
-                let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
-                if fx >= 0 && ctx_init_venus(fx) {
-                    let mut eb = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
-                    if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut eb as *mut _) == 0 && eb.fence_fd >= 3 {
-                        *ok += 1;
-                        if poll_in_within(eb.fence_fd, 4000) { *sig += 1; }
-                        close(eb.fence_fd);
-                    }
-                }
-                if fx >= 0 { close(fx); }
-            };
             for _ in 0..5 {
                 fb1(&mut b_ok, &mut b_sig);
                 poll(core::ptr::null_mut(), 0, 1800);
@@ -1259,9 +1268,36 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let wo1 = fence_stat(b"written_off");
         let hung1 = fence_stat(b"hangs");
         let hung_now = fence_stat(b"hung_now");
+        // Guilty-context semantics: A's fence reports an error, A's context is
+        // LOST (ringed submit -> ECANCELED), other contexts keep working, and a
+        // context created after A is gone (its id recycled) is not LOST.
+        let a_status = if oka { sync_file_status(ea.fence_fd) } else { 0 };
+        let mut lost_ret = 0;
+        let mut lost_errno = 0;
+        if inited {
+            let mut e2 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            lost_ret = ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e2 as *mut _);
+            lost_errno = *__errno_location();
+            if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
+        }
         let rel = fence_hold_mode(0);
         if oka { close(ea.fence_fd); }
         if fa >= 0 { close(fa); }
+        let mut c_ok = 0u32;
+        let mut c_sig = 0u32;
+        fb1(&mut c_ok, &mut c_sig);
+        out(b"  7f: a_status="); out_u64((a_status as i64 + 1_000_000) as u64);
+        out(b" lost_ret="); out_u64(lost_ret as i64 as u64); out(b" errno="); out_u64(lost_errno as u64);
+        out(b" recycled_ok="); out_u64(c_ok as u64); out(b" sig="); out_u64(c_sig as u64); out(b"\n");
+        if !report(b"phase7f_written_off_fence_reports_error", oka && a_status < 0 && a_status != i32::MIN) {
+            failures += 1;
+        }
+        if !report(b"phase7f_lost_context_submit_is_ecanceled", inited && lost_ret != 0 && lost_errno == 125) {
+            failures += 1;
+        }
+        if !report(b"phase7f_recycled_context_not_lost", c_ok == 1 && c_sig == 1) {
+            failures += 1;
+        }
         out(b"  7f: held="); out_u64(held as u64); out(b" oka="); out_u64(oka as u64);
         out(b" b_ok="); out_u64(b_ok as u64); out(b" b_sig="); out_u64(b_sig as u64);
         out(b" after_ok="); out_u64(b_ok2 as u64); out(b" after_sig="); out_u64(b_sig2 as u64);

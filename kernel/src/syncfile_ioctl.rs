@@ -223,7 +223,8 @@ fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize>
             let mut nb = [0u8; 32];
             nb[..name.len()].copy_from_slice(name);
             if !sched::uaccess::write_user::<[u8; 32]>(arg, nb) { return Some(EFAULT); }
-            write_i32(arg + 32, signaled as i32);
+            let errored = ids.iter().any(|&f| drivers::virtio_gpu::fence_errored(f));
+            write_i32(arg + 32, if errored { -110 } else { signaled as i32 });
             let want = read_u32(arg + 40);
             if want == 0 {
                 write_u32(arg + 40, n);
@@ -238,7 +239,8 @@ fn sync_file_ioctl(pid: u32, fd: usize, cmd: usize, arg: usize) -> Option<isize>
                 let done = f == 0 || sync_file::is_signaled(&Fence::One(f));
                 let mut eb = [0u8; 80];
                 eb[32..32 + drv.len()].copy_from_slice(drv);
-                eb[64..68].copy_from_slice(&(done as i32).to_ne_bytes());
+                let st: i32 = if done && drivers::virtio_gpu::fence_errored(f) { -110 } else { done as i32 };
+                eb[64..68].copy_from_slice(&st.to_ne_bytes());
                 if !sched::uaccess::write_user::<[u8; 80]>(e, eb) { return Some(EFAULT); }
             }
             write_u32(arg + 40, n);
