@@ -1538,6 +1538,8 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let mut c_sig = 0u32;
         let mut c_ecanceled = false;
         let mut x_ok = 0u32;
+        let mut c1_sig = false;
+        let mut c3_sig = false;
         let mut x_sig = 0u32;
         let mut a_pending_c = oka;
         let fc = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
@@ -1547,7 +1549,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             let mut ec = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
             if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ec as *mut _) == 0 && ec.fence_fd >= 3 {
                 c_ok += 1;
-                if poll_in_within(ec.fence_fd, 4000) { c_sig += 1; }
+                if poll_in_within(ec.fence_fd, 4000) { c_sig += 1; c1_sig = true; }
                 close(ec.fence_fd);
             }
             // 11 s, past mode 6's 10 s alive limit: other fresh contexts keep the
@@ -1570,7 +1572,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             let mut e3 = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
             if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e3 as *mut _) == 0 && e3.fence_fd >= 3 {
                 c_ok += 1;
-                if poll_in_within(e3.fence_fd, 4000) { c_sig += 1; }
+                if poll_in_within(e3.fence_fd, 4000) { c_sig += 1; c3_sig = true; }
                 close(e3.fence_fd);
             } else if *__errno_location() == 125 {
                 c_ecanceled = true;
@@ -1595,7 +1597,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         out(b" b="); out_u64(b_poll as u64); out_u64(b_wait as u64); out_u64(b_cnt as u64); out_u64(b_unch as u64);
         out(b" ids="); out_u64(ida); out(b"/"); out_u64(idc);
         out(b" c="); out_u64(c_ok as u64); out(b"/"); out_u64(c_sig as u64);
-        out(b" x="); out_u64(x_ok as u64); out(b"/"); out_u64(x_sig as u64); out(b" sh="); out_u64(sh as u64);
+        out(b" c1="); out_u64(c1_sig as u64); out(b" c3="); out_u64(c3_sig as u64); out(b" x="); out_u64(x_ok as u64); out(b"/"); out_u64(x_sig as u64); out(b" sh="); out_u64(sh as u64);
         out(b" a_pend="); out_u64(a_pending_c as u64); out(b" lost_same="); out_u64(c_lost_same as u64);
         out(b" d="); out_u64(d_poll as u64); out_u64(d_wait as u64); out_u64(d_orph as u64);
         out_u64(d_recl as u64); out_u64(d_census as u64); out(b"\n");
