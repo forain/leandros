@@ -1,6 +1,6 @@
 #!/bin/sh
-# build.sh <x86_64|aarch64|all> -- libflatpak (Alpine 3.21 flatpak) + closure for
-# cosmic-store's `flatpak` feature. build-in-alpine.sh (Alpine 3.21 container)
+# build.sh <x86_64|aarch64|all> -- libflatpak (Alpine 3.24 flatpak) + closure for
+# cosmic-store's `flatpak` feature. build-in-alpine.sh (Alpine 3.24 container)
 # stages out/<arch>.alpine/ (the image tree, overlaid by scripts/mkfs-f2fs-populated.py)
 # and out/<arch>.sysroot/ (-dev files merged into the cross sysroot
 # m3-gl-stack/sysroot-<arch> by this script, no clobber).

@@ -1,7 +1,7 @@
 #!/bin/sh
 # build-gpu-stack-alpine.sh — the GPU Mesa ship-set for LeandrOS COSMIC sessions.
 #
-# Runs INSIDE an Alpine 3.21 container of the TARGET architecture (native
+# Runs INSIDE an Alpine 3.24 container of the TARGET architecture (native
 # musl toolchain, no cross-compiler, no LLVM). Driven by ports/mesa/build-gpu-stack.sh,
 # which picks podman/docker and mounts:
 #   /work/mesa   Mesa 25.3.6 source (read-only is fine)
@@ -56,8 +56,7 @@ fi
     py3-packaging py3-yaml libdrm-dev wayland-dev wayland-protocols \
     expat-dev zlib-dev zstd-dev linux-headers pkgconf patchelf file \
     vulkan-headers vulkan-loader patch
-  apk add --no-cache -X https://dl-cdn.alpinelinux.org/alpine/edge/main --allow-untrusted \
-    libdisplay-info=0.3.0-r1 libdisplay-info-dev=0.3.0-r1
+  apk add --no-cache libdisplay-info-dev
   NVK="${NVK:-1}"
   VKDRV=virtio
   # v3dv (libvulkan_broadcom.so): the Raspberry Pi 5's Vulkan ICD. No LLVM.
@@ -69,13 +68,13 @@ fi
     [ "$NVK" = 1 ] && VKDRV=$VKDRV,nouveau
     [ "$INTEL" = 1 ] && apk add --no-cache glslang
     # NVK (nouveau ICD) needs: NAK (Rust: rustc >= 1.82, bindgen >= 0.71.1,
-    # libclang), Meson >= 1.7 (Alpine 3.21 ships 1.6), and mesa_clc +
+    # libclang), Meson >= 1.7 (Alpine 3.24 ships 1.11), and mesa_clc +
     # vtn_bindgen2 (LLVM/libclc/SPIRV-LLVM-Translator). mesa_clc is built in a
     # first, driver-less tree and installed to /tmp/clc-inst; the real tree
     # then uses -Dmesa-clc=system with LLVM DISABLED, so no LLVM ends up in any
     # shipped ELF.
-    apk add --no-cache rust cargo clang19-dev clang19-libclang llvm19-dev libclc libclc-dev \
-      spirv-llvm-translator-dev spirv-tools-dev py3-pip elfutils-dev cbindgen
+    apk add --no-cache rust cargo clang22-dev clang22-libclang llvm22-dev libclc libclc-dev \
+      spirv-llvm-translator-dev spirv-tools-dev elfutils-dev cbindgen rust-bindgen
     # Under qemu-user (an x86_64 container on an aarch64 Docker host) Alpine's
     # rustc/cargo abort at start-up inside scudo's 32-bit primary allocator
     # ("CHECK failed @ primary32.h"). They only link libscudo for their malloc,
@@ -86,15 +85,8 @@ fi
       echo 'int leandros_no_scudo;' > /tmp/noscudo.c
       cc -shared -fPIC -Wl,-soname,libscudo.so -o /usr/lib/libscudo.so /tmp/noscudo.c
     fi
-    pip install --no-cache-dir --break-system-packages 'meson==1.8.2'
-    # bindgen-cli: Alpine 3.21's is 0.70 (< 0.71.1). Built once per arch with
-    # a pinned version and cached in /cache (host: m3-gl-stack/nvk-cache).
-    BINDGEN_VER=0.72.1
-    if [ ! -x "/cache/bindgen-$BINDGEN_VER-$ARCH/bin/bindgen" ]; then
-      cargo install --locked --version "$BINDGEN_VER" --root "/cache/bindgen-$BINDGEN_VER-$ARCH" bindgen-cli
-    fi
-    export PATH="/cache/bindgen-$BINDGEN_VER-$ARCH/bin:/tmp/clc-inst/bin:$PATH"
-    export LIBCLANG_PATH=/usr/lib/llvm19/lib
+    export PATH="/tmp/clc-inst/bin:$PATH"
+    export LIBCLANG_PATH=/usr/lib/llvm22/lib
     rustc --version; bindgen --version; meson --version
   fi
   cc -fPIC -fno-stack-protector -c /src/ssp_guard.c -o /tmp/ssp_guard.o
