@@ -46,6 +46,32 @@ pub fn bl_set(duty: u32) -> bool {
     l.iter().any(|m| m.set.map_or(false, |f| f(m.ctx, duty)))
 }
 
+/// Keyboard backlight (`/sys/class/leds/<vendor>::kbd_backlight`): a hardware
+/// driver registers `get`/`set` (brightness on the LED's 0..=max scale) with
+/// `kbd_register`; `acpi_power.fake=1` serves a fake `hp::kbd_backlight`
+/// (max 2: off, low, high) whose level a test moves by writing
+/// `brightness_hw_changed`, as the Fn key would.
+#[derive(Clone, Copy)]
+pub struct KbdLed {
+    pub name: &'static str,
+    pub max: u32,
+    pub get: fn() -> Option<u32>,
+    pub set: fn(u32) -> bool,
+}
+static KBD: spin::Mutex<Option<KbdLed>> = spin::Mutex::new(None);
+static FAKE_KBD: AtomicU32 = AtomicU32::new(0);
+/// Last level the hardware (not userspace) set; `brightness_hw_changed`.
+static KBD_HW: AtomicU32 = AtomicU32::new(0);
+pub fn kbd_register(k: KbdLed) { *KBD.lock() = Some(k); }
+/// A hardware-initiated change (the Fn key), for `brightness_hw_changed`.
+pub fn kbd_hw_changed(level: u32) { KBD_HW.store(level, Ordering::Relaxed); }
+
+fn kbd_led() -> Option<(String, u32, u32)> {
+    if let Some(k) = *KBD.lock() { return (k.get)().map(|v| (k.name.to_string(), v, k.max)); }
+    if fake() { return Some(("hp::kbd_backlight".to_string(), FAKE_KBD.load(Ordering::Relaxed), 2)); }
+    None
+}
+
 fn fake_battery() -> BatteryInfo {
     BatteryInfo {
         present: true, status: acpi_power::ST_DISCHARGING, capacity: 76, energy_units: true,
@@ -139,6 +165,12 @@ fn attrs_of(class: &str, dev: &str) -> Option<Vec<(&'static str, String)>> {
             }
             _ => None,
         },
+        "leds" => {
+            let (name, cur, max) = kbd_led()?;
+            if dev != name { return None; }
+            Some(alloc::vec![("brightness", cur.to_string()), ("max_brightness", max.to_string()),
+                ("brightness_hw_changed", KBD_HW.load(Ordering::Relaxed).to_string())])
+        }
         _ => None,
     }
 }
@@ -154,6 +186,7 @@ fn dev_names(class: &str) -> Vec<String> {
             if intel_bl().is_some() { v.push("intel_backlight".to_string()); }
             else if acpi_power::acpi_backlight().is_some() { v.push("acpi_video0".to_string()); }
         }
+        "leds" => { if let Some((n, _, _)) = kbd_led() { v.push(n); } }
         _ => {}
     }
     v
@@ -195,7 +228,9 @@ pub fn read(class: &str, dev: &str, attr: &str, out: &mut [u8]) -> Option<usize>
 }
 
 pub fn writable(class: &str, dev: &str, attr: &str) -> bool {
-    class == "backlight" && attr == "brightness" && attrs_of(class, dev).is_some()
+    (class == "backlight" && attr == "brightness"
+        || class == "leds" && (attr == "brightness" || attr == "brightness_hw_changed" && fake() && KBD.lock().is_none()))
+        && attrs_of(class, dev).is_some()
 }
 
 /// Write `brightness` (decimal text). 0 or a negative errno.
@@ -203,6 +238,16 @@ pub fn write(class: &str, dev: &str, attr: &str, data: &[u8]) -> i32 {
     if !writable(class, dev, attr) { return -13; }
     let Ok(t) = core::str::from_utf8(data) else { return -22 };
     let Ok(v) = t.trim().parse::<u32>() else { return -22 };
+    if class == "leds" {
+        let Some((_, _, max)) = kbd_led() else { return -19 };
+        if v > max { return -22; }
+        if attr == "brightness_hw_changed" { FAKE_KBD.store(v, Ordering::Relaxed); KBD_HW.store(v, Ordering::Relaxed); return 0; }
+        let k = *KBD.lock();
+        return match k {
+            Some(k) => if (k.set)(v) { 0 } else { -5 },
+            None => { FAKE_KBD.store(v, Ordering::Relaxed); 0 }
+        };
+    }
     let ok = match dev {
         "intel_backlight" => {
             if crate::i915::backlight::get().is_some() { crate::i915::backlight::set(v) }

@@ -1,9 +1,9 @@
 #!/bin/sh
 # build.sh <x86_64|aarch64|all> — org.freedesktop.portal.Desktop for LeandrOS.
 #
-#   1. build-in-alpine.sh (Alpine 3.21 of the target arch: podman/docker on
+#   1. build-in-alpine.sh (Alpine 3.24 of the target arch: podman/docker on
 #      the host, a chroot staged with apk.static inside LeandrOS):
-#      the xdg-desktop-portal 1.18 frontend + xdg-permission-store + their
+#      the xdg-desktop-portal frontend + xdg-permission-store + their
 #      GLib closure, ELF-fixed for the guest -> out/<arch>.alpine/, and a GLib
 #      SDK -> out/sdk-<arch>/. Prebuilt, like ports/firefox: nothing compiles
 #      but two stubs, so the foreign arch under emulation is fine.

@@ -922,6 +922,55 @@ static void test_ping6_own_global(void) {
     CHECK("ping6_own_global", good == 4);
 }
 
+/* The router answers a ping to its link-local address: the recvfrom() source of the reply is
+ * fe80::2%eth0, so sin6_scope_id must be eth0's index (Linux fills it for link-local peers). */
+static void test_ll_recv_scope(void) {
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ll_recv_scope", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a = router_ll(), from; socklen_t fl = sizeof from;
+    unsigned want = if_nametoindex("eth0");
+    int ok = 0;
+    for (int seq = 1; seq <= 4 && !ok; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4324, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        for (int i = 0; i < 8; i++) {
+            fl = sizeof from; memset(&from, 0, sizeof from);
+            ssize_t m = recvfrom(s, r, sizeof r, 0, (struct sockaddr *)&from, &fl);
+            if (m < 8) break;
+            if (r[0] == ICMP6_ECHO_REPLY && ((r[6] << 8) | r[7]) == seq) { ok = 1; break; }
+        }
+    }
+    close(s);
+    if (ok) printf("  recvfrom scope_id %u want %u\n", from.sin6_scope_id, want);
+    CHECK("ll_recv_scope", ok && from.sin6_scope_id == want);
+}
+
+/* Ping our own link-local address through eth0: delivered locally, no wire. */
+static void test_ping6_own_ll(void) {
+    char line[128];
+    if (!if_inet6_find("eth0", "fe80", line, sizeof line)) { CHECK("ping6_own_ll", 0); return; }
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_own_ll", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    for (int i = 0; i < 16; i++) sscanf(line + 2 * i, "%2hhx", &a.sin6_addr.s6_addr[i]);
+    a.sin6_scope_id = if_nametoindex("eth0");
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4325, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping own fe80: %d/4\n", good);
+    CHECK("ping6_own_ll", good == 4);
+}
+
 static void test_ll_noscope(void) {
     struct sockaddr_in6 a = router_ll();
     a.sin6_port = htons(53);
@@ -1387,6 +1436,8 @@ int main(int argc, char **argv) {
     test_ping6_global();
     test_ping6_own_global();
     test_ll_noscope();
+    test_ping6_own_ll();
+    test_ll_recv_scope();
     test_ll_bind_scope();
     test_disable_ipv6();
     test_dad_sysctl();

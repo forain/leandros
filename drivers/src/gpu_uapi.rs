@@ -106,25 +106,61 @@ pub fn active() -> bool {
     !BACKEND.load(Ordering::Relaxed).is_null()
 }
 
-/// The PCI-attribute override the VFS consults for
-/// `/sys/dev/char/226:<minor>/device/<attr>` (registered with the VFS by the
-/// DRM server). `None` whenever no backend is registered, so the on-disk
-/// virtio stubs answer exactly as before.
+/// The staged PCI slot of the DRM device (scripts/mkfs-f2fs-populated.py
+/// PCI_SLOT_NAME); `/sys/devices/pci0000:00/<slot>` is the device directory.
+const DRM_PCI_SLOT: &[u8] = b"0000:00:04.0";
+
+/// The PCI attribute a sysfs path names, if the path is one of the DRM
+/// device's attribute files under any of the spellings Linux serves:
+/// `/sys/dev/char/226:{0,128}/device/<a>`, `/sys/class/drm/{card0,renderD128}/device/<a>`
+/// (with or without the `drm/<node>` hop under the device directory),
+/// `/sys/devices/pci0000:00/<slot>/<a>` and `/sys/bus/pci/devices/<slot>/<a>`.
+/// One implementation for every spelling, so they cannot disagree.
+fn drm_attr_of(path: &[u8]) -> Option<&[u8]> {
+    let node = |n: &[u8]| n == b"card0" || n == b"renderD128";
+    let rest = if let Some(r) = path.strip_prefix(b"/sys/dev/char/226:") {
+        let slash = r.iter().position(|&c| c == b'/')?;
+        if &r[..slash] != b"0" && &r[..slash] != b"128" {
+            return None;
+        }
+        r[slash..].strip_prefix(b"/device/")?
+    } else if let Some(r) = path.strip_prefix(b"/sys/class/drm/") {
+        let slash = r.iter().position(|&c| c == b'/')?;
+        if !node(&r[..slash]) {
+            return None;
+        }
+        r[slash..].strip_prefix(b"/device/")?
+    } else if let Some(r) = path.strip_prefix(b"/sys/devices/pci0000:00/") {
+        let r = r.strip_prefix(DRM_PCI_SLOT)?.strip_prefix(b"/")?;
+        match r.strip_prefix(b"drm/") {
+            Some(d) => {
+                let slash = d.iter().position(|&c| c == b'/')?;
+                if !node(&d[..slash]) {
+                    return None;
+                }
+                d[slash..].strip_prefix(b"/device/")?
+            }
+            None => r,
+        }
+    } else if let Some(r) = path.strip_prefix(b"/sys/bus/pci/devices/") {
+        r.strip_prefix(DRM_PCI_SLOT)?.strip_prefix(b"/")?
+    } else {
+        return None;
+    };
+    if rest.is_empty() || rest.contains(&b'/') {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+/// The PCI-attribute override the VFS consults for the DRM device's
+/// attribute files (see `drm_attr_of` for the spellings; registered with the
+/// VFS by the DRM server). `None` whenever no backend is registered, so the
+/// on-disk virtio stubs answer exactly as before.
 pub fn drm_sysfs_attr(path: &[u8], out: &mut [u8]) -> Option<usize> {
     let b = backend()?;
-    let rest = path.strip_prefix(b"/sys/dev/char/226:")?;
-    let (minor, attr) = {
-        let slash = rest.iter().position(|&c| c == b'/')?;
-        (&rest[..slash], &rest[slash..])
-    };
-    if minor != b"0" && minor != b"128" {
-        return None;
-    }
-    let attr = attr.strip_prefix(b"/device/")?;
-    if attr.is_empty() || attr.contains(&b'/') {
-        return None;
-    }
-    (b.sysfs_attr)(attr, out)
+    (b.sysfs_attr)(drm_attr_of(path)?, out)
 }
 
 /// A physical range (the backend's VRAM aperture) whose device mappings must
