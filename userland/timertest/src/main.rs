@@ -1446,7 +1446,9 @@ unsafe fn test_dead_local_tick() -> bool {
         pin(c);
         // Short poll deadlines: each takes the CPU through a one-shot and back
         // to periodic mode, where the stalled switch happens.
-        loop { sleep_ms(2); }
+        for _ in 0..300 { sleep_ms(2); }
+        // Then a nearly idle CPU: only its periodic tick can fire now.
+        loop { sleep_ms(200); }
     }
     sleep_ms(1500);
     let a = local_irqs(c).unwrap_or(0);
