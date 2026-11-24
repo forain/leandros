@@ -30,6 +30,7 @@ Options:
                              vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              audio-session|ffaudio|video|clickmove|udevhot|minimize|notifpanel|coreutils  host:virglsessiontest.py <name> (virgl COSMIC session suites, own boot; coreutils = brush guest; `virgl` = the first four)
+                             busdact  busd activation contract, no portal (slow service waited for, exit -> Spawn.ChildExited, never claims -> TimedOut at 120 s); ~2.5 min
                              portalshot host:portalshottest.py alone (live COSMIC session: portal Screenshot returns response 0 and a non-empty PNG)
                              cmdline  host:cmdlinetest.py alone (>1500-byte kernel command line: the last knob reaches /proc/cmdline; over-long line warns)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
@@ -291,6 +292,11 @@ SUITES = {
                 # xdg-desktop-portal activation (Screenshot/FileChooser, cosmic
                 # backend), timedate1, SwitcherooControl and the a11y bus.
                 "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus svc-test",
+                # busd activation vs the dbus-daemon contract, no portal: a service
+                # that claims its name after 40 s is waited for, one that exits
+                # unclaimed fails at once (Spawn.ChildExited), one that never claims
+                # fails at the 120 s cap with TimedOut, an unknown name is ServiceUnknown.
+                "/usr/libexec/leandros-sysbus activation-test",
                 # PackageKit facade over apk (cosmic-store backend): activation,
                 # resolve/search/install/remove through pkcon's client code,
                 # non-wheel refusal of the setuid helper. Needs network.
@@ -367,6 +373,7 @@ SUITES = {
     # /etc/resolv.conf, so it runs unchanged on slirp (10.0.2.x) and on
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
+    "busdact": ["/usr/libexec/leandros-sysbus activation-test"],
     "pktest": ["/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus pk-test"],
     "net": ["/bin/nettest"],
     "netlink": ["/bin/netlinktest"],
