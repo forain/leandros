@@ -23,6 +23,9 @@ use leandros_libc::{
     ioctl,
 };
 
+/// O_EXCL (Linux value, both arches).
+const O_EXCL_: i32 = 0o200;
+
 const TCGETS:  usize = 0x5401;
 const TCSETSF: usize = 0x5404;
 const TIOCGPTN: usize = 0x8004_5430;
@@ -161,10 +164,97 @@ unsafe fn authenticate(username: &str, password: &[u8]) -> Option<UserRec> {
     let (hash_buf, hash_len) = lookup_shadow(username)?;
     let hash_str = core::str::from_utf8(&hash_buf[..hash_len]).ok()?;
     if verify_password(hash_str, password) {
+        if hash_str.starts_with("$sha256$") {
+            rehash_legacy(username, password);
+        }
         Some(rec)
     } else {
         None
     }
+}
+
+/// A legacy `$sha256$` hash that just verified is replaced by a fresh-salted
+/// `$6$` one (PAM cannot verify `$sha256$`). Only the hash field changes; the
+/// new file is written beside /etc/shadow, fsynced, given the old owner and
+/// mode, and renamed over it. Any failure leaves /etc/shadow as it was.
+unsafe fn rehash_legacy(username: &str, password: &[u8]) {
+    use leandros_libc::syscall::{nr, syscall1, syscall2};
+    use leandros_libc::{fchmod, fchown, rename, unlink, O_CREAT};
+    let mut rnd = [0u8; 16];
+    let r = open(b"/dev/urandom\0".as_ptr(), O_RDONLY, 0);
+    if r < 0 {
+        return;
+    }
+    let n = read(r, rnd.as_mut_ptr(), 16);
+    close(r);
+    if n != 16 {
+        return;
+    }
+    let mut field = [0u8; 128];
+    let Some(flen) = shadowhash::upgrade_field(password, &rnd, &mut field) else { return };
+
+    let mut src = [0u8; 8192];
+    let fd = open(b"/etc/shadow\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 {
+        return;
+    }
+    // st_mode, st_uid, st_gid of the old file (kept on the new one).
+    let mut st = [0u8; 144];
+    let ok = syscall2(nr::FSTAT, fd as usize, st.as_mut_ptr() as usize) == 0;
+    let mut total = 0usize;
+    loop {
+        let m = read(fd, src.as_mut_ptr().add(total), src.len() - total);
+        if m <= 0 {
+            break;
+        }
+        total += m as usize;
+        if total == src.len() {
+            break;
+        }
+    }
+    close(fd);
+    // Too big to rewrite whole: leave it (the file would be truncated otherwise).
+    if !ok || total == src.len() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let (mo, uo, go) = (24usize, 28usize, 32usize);
+    #[cfg(not(target_arch = "x86_64"))]
+    let (mo, uo, go) = (16usize, 24usize, 28usize);
+    let rd = |o: usize| u32::from_ne_bytes([st[o], st[o + 1], st[o + 2], st[o + 3]]);
+    let (mode, uid, gid) = (rd(mo) & 0o7777, rd(uo), rd(go));
+
+    let mut out = [0u8; 8192];
+    let Some(olen) = shadowhash::replace_legacy_field(&src[..total], username.as_bytes(), &field[..flen], &mut out) else {
+        return;
+    };
+    let tmp = b"/etc/shadow.login-new\0";
+    unlink(tmp.as_ptr());
+    let w = open(tmp.as_ptr(), 1 | O_CREAT | O_EXCL_, 0o600);
+    if w < 0 {
+        return;
+    }
+    let mut done = 0usize;
+    let mut good = true;
+    while done < olen {
+        let m = write(w, out.as_ptr().add(done), olen - done);
+        if m <= 0 {
+            good = false;
+            break;
+        }
+        done += m as usize;
+    }
+    #[cfg(target_arch = "x86_64")]
+    const FSYNC: usize = 74;
+    #[cfg(not(target_arch = "x86_64"))]
+    const FSYNC: usize = 82;
+    good = good && fchown(w, uid, gid) == 0 && fchmod(w, mode) == 0 && syscall1(FSYNC, w as usize) == 0;
+    close(w);
+    if !good || rename(tmp.as_ptr(), b"/etc/shadow\0".as_ptr()) != 0 {
+        unlink(tmp.as_ptr());
+        return;
+    }
+    write_str("(password hash upgraded to sha512-crypt)\n");
 }
 
 unsafe fn lookup_passwd(username: &str) -> Option<UserRec> {

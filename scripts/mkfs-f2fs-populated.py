@@ -112,14 +112,18 @@ def elf_has_gnu_build_id(path):
 
 
 def _greetd_src_hash():
-    """sha256 over the session-leandros sources (sorted by name, concatenated).
+    """sha256 over the session-leandros sources (sorted by path), the patches
+    applied to upstream greetd (sorted), and session-leandros Cargo.toml/lock,
+    concatenated. A patch edit therefore re-keys the staged build.
     ports/greetd/build.sh writes the same value to greetd.srchash."""
     import hashlib
-    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "ports", "greetd", "session-leandros", "src")
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "greetd")
     h = hashlib.sha256()
-    for n in sorted(os.listdir(src_dir)):
-        with open(os.path.join(src_dir, n), "rb") as f:
+    names = ["session-leandros/src/" + n for n in sorted(os.listdir(os.path.join(base, "session-leandros", "src")))]
+    names += ["patches/" + n for n in sorted(os.listdir(os.path.join(base, "patches")))]
+    names += ["session-leandros/Cargo.toml", "session-leandros/Cargo.lock"]
+    for n in names:
+        with open(os.path.join(base, n), "rb") as f:
             h.update(f.read())
     return h.hexdigest()
 
@@ -724,6 +728,10 @@ def main():
         f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:20000:0:99999:7:::\n"
         f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:20000:0:99999:7:::\n"
         "sshd:!:20000:0:99999:7:::\n"
+        # Every passwd account has a shadow record, like Alpine's baselayout and every
+        # useradd/pwconv: PAM's unix_chkpwd says "no such user" for an account without one.
+        "cosmic-greeter:!:20000:0:99999:7:::\n"
+        "nobody:!:20000:0:99999:7:::\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
@@ -2126,10 +2134,13 @@ def main():
     # shadowfix: pads short /etc/shadow records to nine fields (userland/
     # shadowfix); init runs it once per boot so older roots still log in
     # through PAM (musl getspnam() rejects short lines).
+    # FATAL when missing: without it an older root stays locked out of real PAM.
     p = f"userland/shadowfix/target/{_musl_triple}/release/shadowfix"
-    if os.path.exists(p):
-        m4_share_dirs.add("/usr/sbin")
-        m5_exec_files.append(("/usr/sbin", "shadowfix", p))
+    if not os.path.exists(p):
+        sys.exit(f"mkfs: {p} missing; build it (userland/shadowfix/build.sh {arch}); "
+                 "an image without shadowfix locks older roots out of PAM")
+    m4_share_dirs.add("/usr/sbin")
+    m5_exec_files.append(("/usr/sbin", "shadowfix", p))
 
     # leandros-install: the installer backend (userland/leandros-install),
     # run as root (the GUI goes through sudo): list disks, install to one.
@@ -2969,6 +2980,14 @@ def main():
     # shadow-subids ships empty /etc/subuid|subgid; ours (etc_files) carry the rootless ranges
     _ap_entries = [e for e in _ap_entries if e["path"] not in ("/etc/subuid", "/etc/subgid")]
     _ap_owned = {e["path"]: e for e in _ap_entries if e["kind"] != "dir"}
+    # Real PAM needs the helper and the module in the image; a missing or non-setuid
+    # unix_chkpwd would only show up later as "cannot retrieve authentication info".
+    _chk = _ap_owned.get("/usr/sbin/unix_chkpwd")
+    if _chk is None or (_chk["mode"] & 0o7777) != 0o4755:
+        sys.exit("mkfs: /usr/sbin/unix_chkpwd missing or not 4755 in the Alpine set (linux-pam); "
+                 "real PAM cannot verify a non-root caller without it")
+    if not any(p.endswith("/pam_unix.so") for p in _ap_owned):
+        sys.exit("mkfs: pam_unix.so missing from the Alpine set (linux-pam)")
     _deny = re.compile(r"libEGL|libGLES|libgbm|libgallium|libvulkan|libdrm|libpipewire|libgst|libext2fs")
     _sh = {"n": 0, "diff": 0}
     def _shadow(d, n, h):

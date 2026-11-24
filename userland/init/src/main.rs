@@ -924,7 +924,7 @@ unsafe fn esp_boot_hook() {
 }
 
 /// Run `/usr/sbin/shadowfix` (rewrites only short shadow lines, atomically,
-/// idempotent) and wait for it, killing it after 10 s. Missing = nothing to do.
+/// idempotent) and wait for it, killing it after 10 s (non-blocking waits only). Missing = nothing to do.
 unsafe fn shadow_fix() {
     const PATH: &[u8] = b"/usr/sbin/shadowfix\0";
     if !exists(PATH) {
@@ -951,8 +951,16 @@ unsafe fn shadow_fix() {
             return;
         }
         if monotonic_ms().saturating_sub(start) > 10_000 {
+            // SIGKILL, then reap without ever blocking: a child stuck in an
+            // uninterruptible wait must not hold boot. Give it 1 s, then
+            // leave the zombie to the supervisor's reaper.
             syscall2(nr::KILL, pid as usize, 9);
-            wait4(pid, &mut status, 0, core::ptr::null_mut());
+            for _ in 0..100 {
+                if wait4(pid, &mut status, 1, core::ptr::null_mut()) != 0 {
+                    break;
+                }
+                usleep(10_000);
+            }
             write_str("shadowfix timed out; killed\n");
             return;
         }

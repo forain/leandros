@@ -57,7 +57,7 @@ fi
 rm -rf "$WORK/session-leandros"
 cp -R "$HERE/session-leandros" "$WORK/session-leandros"
 
-SRCHASH=$(cd "$HERE/session-leandros/src" && LC_ALL=C cat $(LC_ALL=C ls) | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1)
+SRCHASH=$(cd "$HERE" && LC_ALL=C cat $(LC_ALL=C ls session-leandros/src/*) $(LC_ALL=C ls patches/*) session-leandros/Cargo.toml session-leandros/Cargo.lock | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1)
 
 for arch in ${ARCHES:-aarch64 x86_64}; do
   KEYED="$SHIP/$arch/$SRCHASH"
