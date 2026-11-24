@@ -619,10 +619,8 @@ static LOCAL_TICKS: [AtomicU64; TIMER_MAX_CPUS] = [const { AtomicU64::new(0) }; 
 static REC_BY_STATE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Times the `timer.dead_delay` stall actually ran (the test requires exactly 1).
 static DBG_STALLS: AtomicU64 = AtomicU64::new(0);
-/// Stale one-shot deadlines ignored (fix 3), and one-shots armed by `arm_deadline`
-/// on a CPU silent for 3+ ticks (revives a dead tick without any fix).
+/// Stale one-shot deadlines ignored (fix 3).
 static STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
-static ARM_REVIVED: AtomicU64 = AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn arch_timer_debug(delay_cpu: i32, fixmask: u32) {
@@ -631,7 +629,7 @@ pub extern "C" fn arch_timer_debug(delay_cpu: i32, fixmask: u32) {
 }
 
 /// `out[0]` = dead ticks recovered by `check_alive` (all states), `out[1]` = `dead_delay` stalls consumed,
-/// `out[2..5]` = recoveries by state, `out[5]` stale ignored, `out[6]` arm revivals, `out[7..7+n]` = per-CPU timer interrupts.
+/// `out[2..5]` = recoveries by state, `out[5]` stale ignored, `out[6..6+n]` = per-CPU timer interrupts.
 #[no_mangle]
 pub extern "C" fn arch_timer_cpu_stats(out: *mut u64, n: usize) {
     unsafe {
@@ -639,8 +637,7 @@ pub extern "C" fn arch_timer_cpu_stats(out: *mut u64, n: usize) {
         out.add(1).write(DBG_STALLS.load(Ordering::Relaxed));
         for i in 0..3 { out.add(2 + i).write(REC_BY_STATE[i].load(Ordering::Relaxed)); }
         out.add(5).write(STALE_IGNORED.load(Ordering::Relaxed));
-        out.add(6).write(ARM_REVIVED.load(Ordering::Relaxed));
-        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(7 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
+        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(6 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
     }
 }
 
@@ -688,9 +685,6 @@ pub fn arm_deadline(deadline_ns: u64) {
         STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
     }
     if t < os {
-        // Programming a one-shot restarts the countdown: on a CPU that has been
-        // silent for 3 ticks this is what revives a dead periodic tick.
-        let silent = rdtsc().wrapping_sub(LAST_IRQ_TSC[cpu].load(Ordering::Relaxed)) > 3 * TSC_PER_TICK.load(Ordering::Relaxed);
         ONESHOT_TSC[cpu].store(t, Ordering::Relaxed);
         let want = tsc_delta_to_count(t.saturating_sub(rdtsc()));
         // CURR reads 0 when a one-shot already expired with its interrupt
@@ -698,7 +692,6 @@ pub fn arm_deadline(deadline_ns: u64) {
         // ONESHOT_TSC and program it, so leave the hardware alone.
         let cur = unsafe { apic::read(apic::LAPIC_TIMER_CURR) };
         if want < cur {
-            if silent { ARM_REVIVED.fetch_add(1, Ordering::Relaxed); }
             unsafe { program_oneshot(want); }
             LAPIC_STATE[cpu].store(ST_DEADLINE, Ordering::Relaxed);
         }

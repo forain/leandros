@@ -1520,7 +1520,6 @@ unsafe fn test_dead_local_tick() -> bool {
         print_kv(nm, statn(b"recovered_by_state", i).unwrap_or(99));
     }
     print_kv(b"dead_local_tick: stale_ignored = \0", stat(b"stale_ignored").unwrap_or(99));
-    print_kv(b"dead_local_tick: arm_revived = \0", stat(b"arm_revived").unwrap_or(99));
     if consumed != 1 { return fail(b"the stall did not run exactly once (stall_consumed != 1)"); }
     if !kvm { return report(name, rate >= 50); }
     // KVM, strict. fix 1 (count reload after the flip) keeps the tick alive,
