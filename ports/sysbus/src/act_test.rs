@@ -33,9 +33,22 @@ pub(crate) async fn claim(address: &str, name: &str, mode: &str) -> bool {
     if mode == "exit" {
         std::process::exit(3);
     }
+    if mode == "exit0" {
+        std::process::exit(0);
+    }
+    if mode == "sig" {
+        unsafe { libc::raise(libc::SIGKILL) };
+    }
+    if let Some(d) = mode.strip_prefix("daemon:") {
+        // "Daemonize": a detached grandchild claims the name after d seconds, this process exits 0.
+        let me = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+        let _ = std::process::Command::new(me).args(["act-claim", name, &format!("late:{d}")]).spawn();
+        std::process::exit(0);
+    }
+    let detached = mode.starts_with("late:");
     let parent = unsafe { libc::getppid() };
-    let alive = move || unsafe { libc::getppid() } == parent;
-    let delay: u64 = mode.strip_prefix("claim:").and_then(|d| d.parse().ok()).unwrap_or(u64::MAX);
+    let alive = move || detached || unsafe { libc::getppid() } == parent;
+    let delay: u64 = mode.strip_prefix("claim:").or(mode.strip_prefix("late:")).and_then(|d| d.parse().ok()).unwrap_or(u64::MAX);
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(delay.min(CAP_S + 60)) {
         if !alive() {
@@ -59,7 +72,8 @@ pub(crate) async fn claim(address: &str, name: &str, mode: &str) -> bool {
             return false;
         }
     };
-    while alive() {
+    let held = Instant::now();
+    while alive() && !(detached && held.elapsed() > Duration::from_secs(30)) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     drop(conn);
@@ -106,13 +120,33 @@ pub(crate) async fn run() -> (u32, u32) {
     svc("Slow", &format!("claim:{SLOW_S}"));
     svc("Exit", "exit");
     svc("Never", "never");
+    svc("Sig", "sig");
+    svc("ExitZero", "exit0");
+    svc("Daemon", "daemon:3");
     let _ = std::fs::write(
         format!("{dir}/session.conf"),
         format!("<busconfig><type>session</type><auth>EXTERNAL</auth><listen>{addr}</listen><servicedir>{dir}/services</servicedir></busconfig>\n"),
     );
-    let busd = std::env::var("BUSD_BIN").unwrap_or_else(|_| "/usr/libexec/busd".into());
-    let mut child = match std::process::Command::new(&busd)
-        .args(["--config", &format!("{dir}/session.conf"), "--address", &addr])
+    // ACT_REFERENCE=1: run the same cases against the reference dbus-daemon (evidence for the contract).
+    let reference = std::env::var("ACT_REFERENCE").is_ok();
+    let busd = if reference {
+        "/usr/bin/dbus-daemon".to_string()
+    } else {
+        std::env::var("BUSD_BIN").unwrap_or_else(|_| "/usr/libexec/busd".into())
+    };
+    if reference {
+        let _ = std::fs::write(
+            format!("{dir}/session.conf"),
+            format!("<busconfig><type>session</type><auth>EXTERNAL</auth><listen>{addr}</listen><servicedir>{dir}/services</servicedir><limit name=\"service_start_timeout\">{}</limit><policy context=\"default\"><allow send_type=\"method_call\"/><allow send_type=\"method_return\"/><allow send_type=\"error\"/><allow send_type=\"signal\"/><allow receive_type=\"method_call\"/><allow receive_type=\"method_return\"/><allow receive_type=\"error\"/><allow receive_type=\"signal\"/><allow own=\"*\"/></policy></busconfig>\n", CAP_S * 1000),
+        );
+    }
+    let mut cmd = std::process::Command::new(&busd);
+    if reference {
+        cmd.args(["--nofork", "--config-file", &format!("{dir}/session.conf")]);
+    } else {
+        cmd.args(["--config", &format!("{dir}/session.conf"), "--address", &addr]);
+    }
+    let mut child = match cmd
         .env("DBUS_SESSION_BUS_ADDRESS", &addr)
         .env("DBUS_STARTER_ADDRESS", &addr)
         .env_remove("DBUS_SYSTEM_BUS_ADDRESS")
@@ -130,11 +164,14 @@ pub(crate) async fn run() -> (u32, u32) {
     }
 
     let n = |s: &str| format!("org.leandros.ActTest.{s}");
-    let (slow, exit, never, nofile) = futures_util::future::join4(
-        ping(&addr, &n("Slow")),
-        ping(&addr, &n("Exit")),
-        ping(&addr, &n("Never")),
-        ping(&addr, &n("NoFile")),
+    let ((slow, exit, never, nofile), (sig, exitzero, daemon)) = futures_util::future::join(
+        futures_util::future::join4(
+            ping(&addr, &n("Slow")),
+            ping(&addr, &n("Exit")),
+            ping(&addr, &n("Never")),
+            ping(&addr, &n("NoFile")),
+        ),
+        futures_util::future::join3(ping(&addr, &n("Sig")), ping(&addr, &n("ExitZero")), ping(&addr, &n("Daemon"))),
     )
     .await;
     let secs = |d: Duration| d.as_secs_f32();
@@ -159,6 +196,28 @@ pub(crate) async fn run() -> (u32, u32) {
             && d >= Duration::from_secs(CAP_S - 5)
             && d < Duration::from_secs(CAP_S + 20),
         format!("{r:?} after {:.1}s (cap {CAP_S}s)", secs(d)),
+    );
+    let (r, d) = sig;
+    check(
+        "signal_unclaimed_fails_promptly",
+        matches!(&r, Err((en, m)) if en == "org.freedesktop.DBus.Error.Spawn.ChildSignaled" && m.contains("received signal 9"))
+            && d < Duration::from_secs(10),
+        format!("{r:?} after {:.1}s", secs(d)),
+    );
+    // dbus-daemon ignores exit status 0 (a program may daemonize): it keeps waiting.
+    let (r, d) = daemon;
+    check(
+        "daemonizing_service_exit0_then_claim_succeeds",
+        r.is_ok() && d >= Duration::from_secs(2) && d < Duration::from_secs(30),
+        format!("{r:?} after {:.1}s (parent exits 0, grandchild claims at 3s)", secs(d)),
+    );
+    let (r, d) = exitzero;
+    check(
+        "exit0_never_claims_waits_to_cap",
+        matches!(&r, Err((en, m)) if en == "org.freedesktop.DBus.Error.TimedOut" && m.contains("timed out"))
+            && d >= Duration::from_secs(CAP_S - 5)
+            && d < Duration::from_secs(CAP_S + 20),
+        format!("{r:?} after {:.1}s", secs(d)),
     );
     let (r, d) = nofile;
     check(

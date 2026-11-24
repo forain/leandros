@@ -18,9 +18,12 @@ Now, as dbus-daemon does:
     bus service_start_timeout); at the cap the caller gets
     org.freedesktop.DBus.Error.TimedOut "Failed to activate service 'N':
     timed out (service_start_timeout=120000ms)";
-  * a service that exits without claiming the name fails at once with
-    org.freedesktop.DBus.Error.Spawn.ChildExited "Process P exited with
-    status N before claiming `N`" (or "received signal S");
+  * a service that exits non-zero without claiming the name fails at once
+    with org.freedesktop.DBus.Error.Spawn.ChildExited "Process NAME exited
+    with status N", or Spawn.ChildSignaled "Process NAME received signal S"
+    (dbus-spawn-unix.c _dbus_babysitter_set_child_exit_error); exit status
+    0 is ignored and the wait goes on, as in bus/activation.c
+    pending_activation_finished_cb ("a program may (misguidedly) daemonize");
   * a failed exec replies Spawn.ExecFailed; a second caller waiting on the
     same activation follows the spawner's in-flight marker and fails with it;
   * ServiceUnknown is kept for a name no .service file provides.
@@ -69,7 +72,7 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
              .unwrap_or(true);
          if !first {
 -            return self.await_name_owner(name, ACTIVATION_TIMEOUT).await;
-+            return self.await_name_owner(name, None, "").await;
++            return self.await_name_owner(name, None).await;
          }
          let result = self.spawn_service(name, &service).await;
          if let Ok(mut set) = self.activating.lock() {
@@ -92,17 +95,16 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
 +        };
  
 -        self.await_name_owner(name, ACTIVATION_TIMEOUT).await
-+        self.await_name_owner(name, Some(&mut child), program).await
++        self.await_name_owner(name, Some(&mut child)).await
      }
  
      /// Poll the name registry until `name` has an owner or `timeout`
-@@ -251,16 +252,48 @@
+@@ -251,16 +252,55 @@
      async fn await_name_owner(
          &self,
          name: &WellKnownName<'_>,
 -        timeout: Duration,
-+        mut child: Option<&mut std::process::Child>,
-+        program: &str,
++        mut child: Option<&mut std::process::Child>
      ) -> std::result::Result<(), zbus::fdo::Error> {
 -        let deadline = tokio::time::Instant::now() + timeout;
 +        let started = tokio::time::Instant::now();
@@ -116,22 +118,30 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
 +            // The spawner polls its own child; a second caller waiting on
 +            // the same activation follows the spawner's in-flight marker.
 +            if let Some(c) = child.as_mut() {
-+                // dbus-daemon: a child that exits without claiming the name
-+                // fails the activation at once ("Process ... exited with
-+                // status N"), it does not wait out the start timeout.
++                // dbus-daemon (bus/activation.c pending_activation_finished_cb):
++                // a child that exits non-zero or on a signal without claiming
++                // the name fails the activation at once; exit status 0 is
++                // ignored (a program may daemonize).
 +                if let Ok(Some(status)) = c.try_wait() {
 +                    if self.name_registry.read().await.lookup(name.clone()).is_some() {
 +                        return Ok(());
 +                    }
-+                    return Err(zbus::fdo::Error::SpawnChildExited(format!(
-+                        "Process {} {} before claiming `{name}`",
-+                        program,
-+                        match (status.code(), status.signal()) {
-+                            (Some(code), _) => format!("exited with status {code}"),
-+                            (None, Some(sig)) => format!("received signal {sig}"),
-+                            _ => "terminated".to_string(),
-+                        }
-+                    )));
++                    // Exit status 0 is not a failure (bus/activation.c
++                    // pending_activation_finished_cb: a program may
++                    // misguidedly "daemonize", which looks like an exit, and
++                    // ignoring it closes the race with the child claiming
++                    // the name): keep waiting, up to the cap.
++                    if status.code() != Some(0) {
++                        return Err(match (status.code(), status.signal()) {
++                            (Some(code), _) => zbus::fdo::Error::SpawnChildExited(format!(
++                                "Process {name} exited with status {code}"
++                            )),
++                            (None, Some(sig)) => zbus::fdo::Error::SpawnChildSignaled(format!(
++                                "Process {name} received signal {sig}"
++                            )),
++                            _ => zbus::fdo::Error::Failed(format!("Process {name} exited abnormally")),
++                        });
++                    }
 +                }
 +            } else if !self.activating.lock().map(|set| set.contains(name.as_str())).unwrap_or(false) {
 +                // The spawner finished (and failed, or we would have seen the
@@ -149,7 +159,7 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
                  )));
              }
              tokio::time::sleep(ACTIVATION_POLL_INTERVAL).await;
-@@ -281,15 +314,18 @@
+@@ -281,15 +321,18 @@
      /// fast as it was before activation existed, so `send_msg` still falls
      /// through to `reply_service_unknown` promptly instead of ever
      /// re-introducing the hang that patch fixed.
@@ -172,7 +182,7 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
      }
  
      pub async fn add(
-@@ -525,11 +561,25 @@
+@@ -525,11 +568,26 @@
                  let dest = match owner {
                      Some(dest) => dest,
                      None => match self.activate_if_activatable(&name).await {
@@ -190,6 +200,7 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
 +                            // as dbus-daemon does.
 +                            let (en, text) = match &e {
 +                                zbus::fdo::Error::SpawnChildExited(t) => ("org.freedesktop.DBus.Error.Spawn.ChildExited", t.clone()),
++                                zbus::fdo::Error::SpawnChildSignaled(t) => ("org.freedesktop.DBus.Error.Spawn.ChildSignaled", t.clone()),
 +                                zbus::fdo::Error::SpawnExecFailed(t) => ("org.freedesktop.DBus.Error.Spawn.ExecFailed", t.clone()),
 +                                zbus::fdo::Error::TimedOut(t) => ("org.freedesktop.DBus.Error.TimedOut", t.clone()),
 +                                other => ("org.freedesktop.DBus.Error.ServiceUnknown", other.to_string()),
@@ -200,7 +211,7 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
                      },
                  };
                  self.send_msg_to_unique_name(msg, (&*dest).into()).await
-@@ -559,6 +609,15 @@
+@@ -559,6 +617,15 @@
      ///     address the error. `peer::Stream` sets the sender on everything it
      ///     admits, so this is belt and braces.
      async fn reply_service_unknown(&self, msg: &Message, name: &WellKnownName<'_>) {
@@ -216,7 +227,7 @@ Covered by `leandros-sysbus activation-test` (regress: busdact).
          let header = msg.header();
  
          if msg.message_type() != message::Type::MethodCall {
-@@ -578,23 +637,21 @@
+@@ -578,23 +645,21 @@
          // `Message::error` copies the incoming serial into `reply_serial` and
          // the incoming sender into `destination` by itself; only the sender
          // field has to be filled in, and it has to be the bus's own name.
