@@ -926,6 +926,16 @@ unsafe fn esp_boot_hook() {
 /// Run `/usr/sbin/shadowfix` (rewrites only short shadow lines, atomically,
 /// idempotent) and wait for it, killing it after 10 s (non-blocking waits only). Missing = nothing to do.
 unsafe fn shadow_fix() {
+    // An `apk upgrade linux-pam` on the live root reinstalls unix_chkpwd as
+    // Alpine ships it (2755 root:shadow); our shadow is 0600 root:root, so a
+    // non-root caller could no longer verify its own password. Restore the
+    // image arrangement (setuid root, 4755) every boot; chown first, it
+    // clears the setuid bit.
+    const CHK: &[u8] = b"/usr/sbin/unix_chkpwd\0";
+    if exists(CHK) {
+        chown(CHK.as_ptr(), 0, 0);
+        chmod(CHK.as_ptr(), 0o4755);
+    }
     const PATH: &[u8] = b"/usr/sbin/shadowfix\0";
     if !exists(PATH) {
         return;

@@ -419,6 +419,7 @@ fn main() {
     pam_checks(&mut t);
     shadow_migration_checks(&mut t);
     shadow_repair_checks(&mut t);
+    chkpwd_checks(&mut t);
     login_checks(&mut t);
     devtty_checks(&mut t);
     su_background(&mut t);
@@ -757,6 +758,40 @@ fn pam_checks(t: &mut T) {
         let (rc2, _) = pam_try("greetd", &u, "x");
         t.check(&format!("pam greetd: locked account {u} rejected"), rc != 0 && rc2 != 0, &none);
     }
+    // The real case: leandro with the RIGHT password but `!` in front of the
+    // hash (passwd -l) must be refused; unlocked again it must work (control).
+    if sh.lines().any(|l| l.starts_with("leandro:")) {
+        let lk: String = sh
+            .lines()
+            .map(|l| if l.starts_with("leandro:") { format!("leandro:!{}", &l["leandro:".len()..]) } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if std::fs::write("/etc/shadow", &lk).is_ok() {
+            let (rc, _) = pam_try("greetd", "leandro", "leandro");
+            let _ = std::fs::write("/etc/shadow", &sh);
+            t.check("pam greetd: locked leandro refused despite the right password", rc != 0, &none);
+            t.check("pam greetd: leandro accepted again once unlocked (control)", pam_try("greetd", "leandro", "leandro").0 == 0, &none);
+        }
+    }
+}
+
+/// /usr/sbin/unix_chkpwd is setuid root (4755): as uid 1000 it verifies only
+/// the caller's own account. Password goes in on stdin, NUL terminated.
+fn chkpwd_checks(t: &mut T) {
+    use std::os::unix::fs::MetadataExt;
+    const C: &str = "/usr/sbin/unix_chkpwd";
+    let Ok(m) = std::fs::metadata(C) else { return };
+    let none = Out { code: 0, stdout: String::new(), stderr: String::new() };
+    t.check("unix_chkpwd is 4755 root:root", m.mode() & 0o7777 == 0o4755 && m.uid() == 0 && m.gid() == 0, &none);
+    let o = run(LEANDRO, &[C, "leandro", "nullok"], &[], "leandro\0");
+    t.check("unix_chkpwd as uid 1000: own account, right password, accepted", o.code == 0, &o);
+    let o = run(LEANDRO, &[C, "leandro", "nullok"], &[], "wrong\0");
+    t.check("unix_chkpwd as uid 1000: own account, wrong password, refused", o.code != 0, &o);
+    let o = run(LEANDRO, &[C, "cosmic-greeter", "nullok"], &[], "x\0");
+    t.check("unix_chkpwd as uid 1000: another account refused", o.code != 0, &o);
+    let o = run(LEANDRO, &[C, "root", "nullok"], &[], "root\0");
+    t.check("unix_chkpwd as uid 1000: root refused even with root's password", o.code != 0, &o);
 }
 
 /// Old images wrote two-field shadow lines (`user:HASH:`), which musl getspnam()
@@ -889,27 +924,27 @@ fn shadow_repair_checks(t: &mut T) {
     t.check("crlf: shadowfix strips CR, PAM accepts (green)", o.code == 0 && !cur().contains('\r') && pam_try("greetd", "leandro", "leandro").0 == 0, &o);
     let rh = line_of(&orig, "root").split(':').nth(1).unwrap_or("").to_string();
     put(&replace("root", &format!("root:{rh}:0")));
+    t.check("root:H:0: short root record refused by PAM before the repair (red)", pam_try("greetd", "root", "root").0 != 0, &none);
     let o = fixbin(&[]);
     let rl = line_of(&cur(), "root");
     t.check("root:H:0 pads with an EMPTY lstchg (no forced change)", o.code == 0 && rl == format!("root:{rh}:::::::"), &Out { code: 0, stdout: rl.clone(), stderr: o.all() });
-    if rl == format!("root:{rh}:::::::") {
-        t.check("root:H:0 account passes PAM auth+acct (not NEW_AUTHTOK_REQD)", pam_try("greetd", "root", "root").0 == 0, &none);
-    }
+    t.check("root:H:0 account passes PAM auth+acct (not NEW_AUTHTOK_REQD)", pam_try("greetd", "root", "root").0 == 0, &none);
 
     // 5. passwd user with no shadow line: refused by --check, then given a locked record.
     let pw = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
     if pw.contains("cosmic-greeter:x:") {
         let o: Vec<&str> = orig.lines().filter(|l| !l.starts_with("cosmic-greeter:")).collect();
         put(&(o.join("\n") + "\n"));
+        t.check("missing user: PAM refuses the account with no record (red)", pam_try("greetd", "cosmic-greeter", "x").0 != 0, &none);
         let o1 = fixbin(&["--check"]);
         t.check("missing user: --check reports passwd account without shadow record (red)", o1.code != 0, &o1);
         let o2 = fixbin(&[]);
         let l = line_of(&cur(), "cosmic-greeter");
-        t.check("missing user: shadowfix adds a locked `!` record", o2.code == 0 && l.starts_with("cosmic-greeter:!:") && l.split(':').count() == 9, &Out { code: 0, stdout: l, stderr: o2.all() });
+        t.check("missing user: shadowfix adds a `*` record (no password, not `!`-locked)", o2.code == 0 && l.starts_with("cosmic-greeter:*:") && l.split(':').count() == 9, &Out { code: 0, stdout: l, stderr: o2.all() });
         let o3 = fixbin(&["--check"]);
         t.check("missing user: --check passes afterwards", o3.code == 0, &o3);
         let (rc, _) = pam_try("greetd", "cosmic-greeter", "x");
-        t.check("missing user: locked account rejected by PAM", rc != 0, &none);
+        t.check("missing user: passwordless `*` account rejected by PAM", rc != 0, &none);
         let again = cur();
         let o4 = fixbin(&[]);
         t.check("missing user: second shadowfix run is a no-op", o4.code == 0 && cur() == again, &o4);

@@ -178,8 +178,7 @@ unsafe fn authenticate(username: &str, password: &[u8]) -> Option<UserRec> {
 /// new file is written beside /etc/shadow, fsynced, given the old owner and
 /// mode, and renamed over it. Any failure leaves /etc/shadow as it was.
 unsafe fn rehash_legacy(username: &str, password: &[u8]) {
-    use leandros_libc::syscall::{nr, syscall1, syscall2};
-    use leandros_libc::{fchmod, fchown, rename, unlink, O_CREAT};
+    use leandros_libc::O_CREAT;
     let mut rnd = [0u8; 16];
     let r = open(b"/dev/urandom\0".as_ptr(), O_RDONLY, 0);
     if r < 0 {
@@ -193,6 +192,24 @@ unsafe fn rehash_legacy(username: &str, password: &[u8]) {
     let mut field = [0u8; 128];
     let Some(flen) = shadowhash::upgrade_field(password, &rnd, &mut field) else { return };
 
+    // Same lock as shadowfix and sshd (lckpwdf's /etc/.pwd.lock). The shadow
+    // file is read only after it is held; the lock fd is closed on return.
+    let lk = open(b"/etc/.pwd.lock\0".as_ptr(), 1 | O_CREAT, 0o600);
+    if lk < 0 {
+        return;
+    }
+    if leandros_libc::flock(lk, leandros_libc::LOCK_EX) != 0 {
+        close(lk);
+        return;
+    }
+    rehash_locked(username, &field[..flen]);
+    close(lk);
+}
+
+unsafe fn rehash_locked(username: &str, field: &[u8]) {
+    use leandros_libc::syscall::{nr, syscall1, syscall2};
+    use leandros_libc::{fchmod, fchown, rename, unlink, O_CREAT};
+    let flen = field.len();
     let mut src = [0u8; 8192];
     let fd = open(b"/etc/shadow\0".as_ptr(), O_RDONLY, 0);
     if fd < 0 {
@@ -228,8 +245,26 @@ unsafe fn rehash_legacy(username: &str, password: &[u8]) {
     let Some(olen) = shadowhash::replace_legacy_field(&src[..total], username.as_bytes(), &field[..flen], &mut out) else {
         return;
     };
-    let tmp = b"/etc/shadow.login-new\0";
-    unlink(tmp.as_ptr());
+    // /etc/shadow.login-new.<pid>: unique per process, O_EXCL below.
+    let mut tmpb = *b"/etc/shadow.login-new.\0\0\0\0\0\0\0\0\0\0\0\0";
+    let mut pid = leandros_libc::getpid() as u32;
+    let mut at = 22usize;
+    let mut digits = [0u8; 10];
+    let mut nd = 0;
+    loop {
+        digits[nd] = b'0' + (pid % 10) as u8;
+        nd += 1;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    while nd > 0 {
+        nd -= 1;
+        tmpb[at] = digits[nd];
+        at += 1;
+    }
+    let tmp = &tmpb;
     let w = open(tmp.as_ptr(), 1 | O_CREAT | O_EXCL_, 0o600);
     if w < 0 {
         return;

@@ -268,6 +268,21 @@ pub fn rehash_legacy(user: &User, password: &str) {
     if !crate::shadowhash::verify(&new_field, password.as_bytes()) {
         return;
     }
+    // Same lock as shadowfix and login (lckpwdf's /etc/.pwd.lock); the file is
+    // read again under it so a concurrent rewrite is never overwritten.
+    let _lock = {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let Ok(f) = fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open("/etc/.pwd.lock") else { return };
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return;
+        }
+        f
+    };
+    let Some(field) = shadow_field(&user.name) else { return };
+    if !field.starts_with("$sha256$") {
+        return;
+    }
     let Ok(text) = fs::read_to_string("/etc/shadow") else { return };
     let mut out = String::with_capacity(text.len() + 128);
     let mut done = false;
@@ -287,8 +302,8 @@ pub fn rehash_legacy(user: &User, password: &str) {
     }
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = "/etc/shadow.sshd-new";
-    let _ = fs::remove_file(tmp);
+    let tmp = format!("/etc/shadow.sshd-new.{}", std::process::id());
+    let tmp = tmp.as_str();
     let r = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(tmp).and_then(|mut f| {
         f.write_all(out.as_bytes())?;
         f.sync_all()

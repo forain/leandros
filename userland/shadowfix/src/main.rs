@@ -20,10 +20,13 @@
 //!    by a fresh-salted `$6$` hash of the same password, since PAM cannot verify
 //!    `$sha256$`. Every other hash is untouched;
 //!  * a /etc/passwd account (password field `x`) without a shadow record gets a
-//!    locked `name:!::0:99999:7:::` record. Linux does the same: pwconv(8)
-//!    creates missing shadow entries and useradd always writes one, and Alpine
-//!    ships `!` records for every system account; PAM's unix_chkpwd otherwise
-//!    answers "no such user" for them.
+//!    `name:*::0:99999:7:::` record (no password, NOT locked: `*` still allows
+//!    public key logins, as OpenSSH does for an account without a password;
+//!    `!` would lock it for every method, which a missing record never did).
+//!    pwconv(8) creates such entries; PAM's unix_chkpwd otherwise answers "no
+//!    such user" for them. Root's line is never added, and nothing is written
+//!    at all when the source is empty or has no root record (a truncated file
+//!    must not be "completed" into one that locks root out).
 //!
 //! The rewrite is crash safe: temp file in the same directory, fsync, rename,
 //! fsync of the directory; owner and mode are kept. Before the rename the new
@@ -188,10 +191,14 @@ pub fn fix(src: &[u8], passwd: &[u8], rnd: &mut dyn FnMut() -> Option<[u8; 16]>)
         out.extend_from_slice(&cand);
         out.push(b'\n');
     }
+    let have_root = names.iter().any(|n| n == b"root");
     for n in passwd_names(passwd) {
-        if !names.contains(&n) {
+        if have_root && n != b"root" && !names.contains(&n) {
+            if out.last().is_some_and(|&b| b != b'\n') {
+                out.push(b'\n');
+            }
             out.extend_from_slice(&n);
-            out.extend_from_slice(b":!::0:99999:7:::\n");
+            out.extend_from_slice(b":*::0:99999:7:::\n");
             rep.added.push(String::from_utf8_lossy(&n).into_owned());
             names.push(n);
         }
@@ -200,11 +207,12 @@ pub fn fix(src: &[u8], passwd: &[u8], rnd: &mut dyn FnMut() -> Option<[u8; 16]>)
     (changed.then_some(out), rep)
 }
 
-fn records(text: &[u8]) -> Vec<Vec<u8>> {
+/// (raw line, line without a trailing CR) for every non-empty line.
+fn records(text: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     text.split(|&b| b == b'\n')
-        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_vec())
+        .map(|l| (l, l.strip_suffix(b"\r").unwrap_or(l)))
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(r, s)| (r.to_vec(), s.to_vec()))
         .collect()
 }
 
@@ -216,8 +224,12 @@ fn guard(old: &[u8], new: &[u8], passwd: &[u8]) -> Result<(), String> {
         return Err("record count shrank".into());
     }
     let hash = |l: &[u8]| l.split(|&b| b == b':').nth(1).unwrap_or(&[]).to_vec();
-    for (i, ol) in o.iter().enumerate() {
-        let (nl, name) = (&n[i], name_of(ol));
+    for (i, (oraw, ol)) in o.iter().enumerate() {
+        let (nraw, nl) = (&n[i].0, &n[i].1);
+        let name = name_of(ol);
+        if !musl_ok(nl) && nraw != oraw {
+            return Err(format!("unrepairable record {i} would change"));
+        }
         if name_of(nl) != name {
             return Err(format!("record {i} name would change"));
         }
@@ -232,12 +244,22 @@ fn guard(old: &[u8], new: &[u8], passwd: &[u8]) -> Result<(), String> {
         }
     }
     let pn = passwd_names(passwd);
-    for l in &n[o.len()..] {
-        if hash(l) != b"!" || !pn.contains(&name_of(l).to_vec()) || o.iter().any(|x| name_of(x) == name_of(l)) {
+    if !o.is_empty() && !o.iter().any(|(_, l)| name_of(l) == b"root") {
+        return Err("no root record in the source".into());
+    }
+    for (_, l) in &n[o.len()..] {
+        if hash(l) != b"*" || name_of(l) == b"root" || !pn.contains(&name_of(l).to_vec()) || o.iter().any(|(_, x)| name_of(x) == name_of(l)) {
             return Err("unexpected added record".into());
         }
     }
     Ok(())
+}
+
+fn root_hash(src: &[u8]) -> Option<Vec<u8>> {
+    src.split(|&b| b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .find(|l| name_of(l) == b"root" && l.contains(&b':'))
+        .map(|l| l.split(|&b| b == b':').nth(1).unwrap_or(&[]).to_vec())
 }
 
 /// Problems that make real PAM fail (errors) and things worth knowing (warnings).
@@ -269,8 +291,13 @@ pub fn check(src: &[u8], passwd: &[u8]) -> (Vec<String>, Vec<String>) {
             }
         }
     }
-    if !names.contains(&b"root".to_vec()) {
-        bad.push("root: no shadow record".into());
+    match root_hash(src) {
+        None => bad.push("root: no shadow record".into()),
+        Some(h) if h.is_empty() => bad.push("root: empty password hash".into()),
+        Some(h) if h[0] == b'!' || h[0] == b'*' => {
+            bad.push("root: password is locked or unset (`!`/`*`)".into())
+        }
+        _ => {}
     }
     for n in passwd_names(passwd) {
         if !names.contains(&n) {
@@ -291,19 +318,35 @@ fn passwd_of(path: &str) -> Vec<u8> {
     fs::read(dir.join("passwd")).unwrap_or_default()
 }
 
+extern "C" {
+    fn flock(fd: i32, op: i32) -> i32;
+}
+
+/// Exclusive flock on `<dir>/.pwd.lock`, the same file sshd's and login's
+/// shadow rewrites lock (lckpwdf(3)'s name). Held until the File is dropped.
+fn lock_dir(path: &str) -> Option<fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let dir = Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let f = fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(dir.join(".pwd.lock")).ok()?;
+    (unsafe { flock(f.as_raw_fd(), 2) } == 0).then_some(f)
+}
+
 fn run(path: &str, rnd: &mut dyn FnMut() -> Option<[u8; 16]>) -> Result<Report, String> {
+    let _lock = lock_dir(path);
     let src = match fs::read(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Report::default()),
         Err(e) => return Err(format!("read {path}: {e}")),
     };
+    if root_hash(&src).is_none() {
+        return Err(format!("{path} is empty or has no root record; not touching it"));
+    }
     let passwd = passwd_of(path);
     let (new, rep) = fix(&src, &passwd, rnd);
     let Some(new) = new else { return Ok(rep) };
     guard(&src, &new, &passwd).map_err(|e| format!("internal check failed: {e}; not writing"))?;
     let meta = fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
-    let tmp = format!("{path}.shadowfix-new");
-    let _ = fs::remove_file(&tmp);
+    let tmp = format!("{path}.shadowfix-new.{}", std::process::id());
     let res = (|| -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
         f.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o7777))?;
@@ -458,7 +501,7 @@ mod tests {
         let o = o.unwrap();
         assert_eq!(
             o,
-            b"root:H:20000:0:99999:7:::\ncosmic-greeter:!::0:99999:7:::\nnobody:!::0:99999:7:::\n".to_vec()
+            b"root:H:20000:0:99999:7:::\ncosmic-greeter:*::0:99999:7:::\nnobody:*::0:99999:7:::\n".to_vec()
         );
         assert_eq!(rep.added.len(), 2);
         guard(src, &o, passwd).unwrap();
@@ -471,7 +514,7 @@ mod tests {
     fn guard_rejects_tampering() {
         assert!(guard(b"a:H:::::::\n", b"a:G:::::::\n", b"").is_err());
         assert!(guard(b"a:H:::::::\n", b"b:H:::::::\n", b"").is_err());
-        assert!(guard(b"a:H:::::::\n", b"a:H:::::::\nz:!::0:99999:7:::\n", b"").is_err());
+        assert!(guard(b"a:H:::::::\n", b"a:H:::::::\nz:*::0:99999:7:::\n", b"").is_err());
     }
 
     #[test]
@@ -498,10 +541,78 @@ mod tests {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
         let r = run(p.to_str().unwrap(), &mut rnd).unwrap();
         assert_eq!((r.padded, r.added.len()), (1, 1));
-        assert_eq!(fs::read(&p).unwrap(), b"root:HASH:::::::\nnobody:!::0:99999:7:::\n");
+        assert_eq!(fs::read(&p).unwrap(), b"root:HASH:::::::\nnobody:*::0:99999:7:::\n");
         assert_eq!(fs::metadata(&p).unwrap().mode() & 0o7777, 0o640);
         assert!(!run(p.to_str().unwrap(), &mut rnd).unwrap().changed());
         assert!(!dir.join("shadow.shadowfix-new").exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn added_records_are_star_not_bang_and_never_root() {
+        let passwd = b"root:x:0:0::/root:/bin/sh\nsvc:x:5:5::/:/bin/false\n";
+        // no root record: nothing is added, nothing is written
+        let (o, r) = fixed(b"svc2:H:\n", passwd);
+        assert!(r.added.is_empty());
+        assert_eq!(o.unwrap(), b"svc2:H:::::::\n".to_vec());
+        assert!(fixed(b"", passwd).0.is_none());
+        assert!(fixed(b"\n\n", passwd).0.is_none());
+        let (o, _) = fixed(b"root:H:20000:0:99999:7:::\n", passwd);
+        assert!(String::from_utf8(o.unwrap()).unwrap().contains("svc:*::0:99999:7:::\n"));
+    }
+
+    #[test]
+    fn run_refuses_empty_or_rootless_source() {
+        let dir = std::env::temp_dir().join(format!("shadowfix-e-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("passwd"), b"root:x:0:0::/root:/bin/sh\nsvc:x:5:5::/:/bin/false\n").unwrap();
+        let p = dir.join("shadow");
+        for body in [&b""[..], b"\n", b"svc:H:\n", b"# only a comment\n"] {
+            fs::write(&p, body).unwrap();
+            assert!(run(p.to_str().unwrap(), &mut rnd).is_err());
+            assert_eq!(fs::read(&p).unwrap(), body);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn check_root_must_be_usable() {
+        let pw = b"root:x:0:0::/root:/bin/sh\n";
+        for h in ["!", "*", "", "!$6$s$h", "*LK*"] {
+            let src = format!("root:{h}:20000:0:99999:7:::\n");
+            assert!(!check(src.as_bytes(), pw).0.is_empty(), "root hash {h:?}");
+        }
+        assert!(!check(b"svc:H:20000:0:99999:7:::\n", pw).0.is_empty());
+        assert!(!check(b"", pw).0.is_empty());
+        assert!(check(b"root:$6$s$h:20000:0:99999:7:::\n", pw).0.is_empty());
+    }
+
+    #[test]
+    fn unrepairable_last_line_without_newline_is_not_glued() {
+        let pw = b"root:x:0:0::/root:/bin/sh\nnobody:x:9:9::/:/bin/false\n";
+        let src = b"root:H:20000:0:99999:7:::\nsvc:H:1:0:99999:7:::junk";
+        let (o, r) = fixed(src, pw);
+        let o = o.unwrap();
+        assert_eq!(r.unrepairable, vec!["svc".to_string()]);
+        assert_eq!(o, b"root:H:20000:0:99999:7:::\nsvc:H:1:0:99999:7:::junk\nnobody:*::0:99999:7:::\n".to_vec());
+        guard(src, &o, pw).unwrap();
+    }
+
+    #[test]
+    fn trailing_comment_without_newline_does_not_block_repairs() {
+        let pw = b"root:x:0:0::/root:/bin/sh\nnobody:x:9:9::/:/bin/false\n";
+        let src = b"root:H:\n# end";
+        let (o, _) = fixed(src, pw);
+        let o = o.unwrap();
+        assert_eq!(o, b"root:H:::::::\n# end\nnobody:*::0:99999:7:::\n".to_vec());
+        guard(src, &o, pw).unwrap();
+    }
+
+    #[test]
+    fn guard_compares_unrepairable_lines_bytewise() {
+        let old = b"root:H:::::::\nsvc:H:1:0:99999:7:::junk\n";
+        assert!(guard(old, b"root:H:::::::\nsvc:H:1:0:99999:7:::junk2\n", b"").is_err());
+        assert!(guard(old, old, b"").is_ok());
+        assert!(guard(b"root:H:::::::\n# end", b"root:H:::::::\n# endx\n", b"").is_err());
     }
 }
