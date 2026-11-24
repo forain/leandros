@@ -20,6 +20,8 @@
 . "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+# QEMU-only test: the stick needs no Intel iris/ANV ship-set (write-usb.sh refuses otherwise)
+export LEANDROS_USB_ALLOW_GENERIC_GPU="${LEANDROS_USB_ALLOW_GENERIC_GPU:-1}"
 ARCH="${1:-aarch64}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"

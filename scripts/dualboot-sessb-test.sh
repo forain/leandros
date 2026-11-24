@@ -16,6 +16,8 @@
 . "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+# QEMU-only test: the stick needs no Intel iris/ANV ship-set (write-usb.sh refuses otherwise)
+export LEANDROS_USB_ALLOW_GENERIC_GPU="${LEANDROS_USB_ALLOW_GENERIC_GPU:-1}"
 ARCH="${1:-aarch64}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
@@ -36,7 +38,7 @@ ok() { echo "ok: $*"; }
 cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; rm -f "$STATE"; rm -f "${WORK:?}"/disk.img* "${WORK:?}"/stick.img* "${WORK:?}"/scratch.img*; }
 trap cleanup EXIT
 r() { $REMOTE run "$1" | tr -d '\r'; }
-dfguard() { local g; g=$(df -g "$HOME" | awk 'NR==2{print $4}'); [ "$g" -ge 25 ] || fail "only ${g} GiB free on the host; stop"; }
+dfguard() { local g; g=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}'); [ "$g" -ge 25 ] || fail "only ${g} GiB free on the host; stop"; }
 
 boot_vm() { # <log> <run-qemu args...>
     local log="$WORK/$1.log"; shift
