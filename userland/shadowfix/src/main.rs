@@ -318,17 +318,40 @@ fn passwd_of(path: &str) -> Vec<u8> {
     fs::read(dir.join("passwd")).unwrap_or_default()
 }
 
+const O_CLOEXEC: i32 = 0o2000000;
+#[cfg(target_arch = "x86_64")]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(not(target_arch = "x86_64"))]
+const O_NOFOLLOW: i32 = 0o100000;
+
 extern "C" {
     fn flock(fd: i32, op: i32) -> i32;
 }
 
-/// Exclusive flock on `<dir>/.pwd.lock`, the same file sshd's and login's
-/// shadow rewrites lock (lckpwdf(3)'s name). Held until the File is dropped.
+/// flock on `<dir>/.pwd.lock`, the same file sshd's and login's shadow rewrites
+/// lock (lckpwdf(3)'s name). LOCK_NB retried for about 2 s, then None: boot must
+/// never block on a stuck holder. Opened O_CLOEXEC|O_NOFOLLOW, created only if
+/// missing (a read-only /etc simply yields None). Held until the File is dropped.
 fn lock_dir(path: &str) -> Option<fs::File> {
     use std::os::unix::io::AsRawFd;
     let dir = Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let f = fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(dir.join(".pwd.lock")).ok()?;
-    (unsafe { flock(f.as_raw_fd(), 2) } == 0).then_some(f)
+    let lp = dir.join(".pwd.lock");
+    let open = |create: bool| {
+        fs::OpenOptions::new().write(true).create(create).truncate(false).mode(0o600).custom_flags(O_CLOEXEC | O_NOFOLLOW).open(&lp)
+    };
+    let f = match open(false) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => open(true).ok()?,
+        Err(_) => return None,
+    };
+    for _ in 0..40 {
+        if unsafe { flock(f.as_raw_fd(), 2 | 4) } == 0 {
+            return Some(f);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("shadowfix: {} busy for 2 s; continuing without the lock", lp.display());
+    None
 }
 
 fn run(path: &str, rnd: &mut dyn FnMut() -> Option<[u8; 16]>) -> Result<Report, String> {
@@ -347,6 +370,9 @@ fn run(path: &str, rnd: &mut dyn FnMut() -> Option<[u8; 16]>) -> Result<Report, 
     guard(&src, &new, &passwd).map_err(|e| format!("internal check failed: {e}; not writing"))?;
     let meta = fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
     let tmp = format!("{path}.shadowfix-new.{}", std::process::id());
+    if fs::symlink_metadata(&tmp).map(|m| m.file_type().is_file()).unwrap_or(false) {
+        let _ = fs::remove_file(&tmp);
+    }
     let res = (|| -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
         f.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o7777))?;

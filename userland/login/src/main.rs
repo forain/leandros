@@ -194,11 +194,29 @@ unsafe fn rehash_legacy(username: &str, password: &[u8]) {
 
     // Same lock as shadowfix and sshd (lckpwdf's /etc/.pwd.lock). The shadow
     // file is read only after it is held; the lock fd is closed on return.
-    let lk = open(b"/etc/.pwd.lock\0".as_ptr(), 1 | O_CREAT, 0o600);
+    // O_CLOEXEC|O_NOFOLLOW; created only if missing (a read-only /etc fails here).
+    // LOCK_NB retried ~2 s so a stuck holder cannot delay the login.
+    const O_CLOEXEC_: i32 = 0o2000000;
+    #[cfg(target_arch = "x86_64")]
+    const O_NOFOLLOW_: i32 = 0o400000;
+    #[cfg(not(target_arch = "x86_64"))]
+    const O_NOFOLLOW_: i32 = 0o100000;
+    let mut lk = open(b"/etc/.pwd.lock\0".as_ptr(), 1 | O_CLOEXEC_ | O_NOFOLLOW_, 0o600);
+    if lk < 0 {
+        lk = open(b"/etc/.pwd.lock\0".as_ptr(), 1 | O_CREAT | O_CLOEXEC_ | O_NOFOLLOW_, 0o600);
+    }
     if lk < 0 {
         return;
     }
-    if leandros_libc::flock(lk, leandros_libc::LOCK_EX) != 0 {
+    let mut got = false;
+    for _ in 0..40 {
+        if leandros_libc::flock(lk, leandros_libc::LOCK_EX | 4) == 0 {
+            got = true;
+            break;
+        }
+        leandros_libc::usleep(50_000);
+    }
+    if !got {
         close(lk);
         return;
     }
@@ -265,6 +283,7 @@ unsafe fn rehash_locked(username: &str, field: &[u8]) {
         at += 1;
     }
     let tmp = &tmpb;
+    unlink(tmp.as_ptr()); // stale same-pid temp (pid reuse); unlink never follows a link
     let w = open(tmp.as_ptr(), 1 | O_CREAT | O_EXCL_, 0o600);
     if w < 0 {
         return;

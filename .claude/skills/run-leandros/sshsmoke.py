@@ -1261,7 +1261,10 @@ def grace_for(ssh, user, pw):
     the guest's sudo latency (seconds on aarch64 TCG with real PAM). Never below the old 4 s."""
     t0 = time.time()
     sudo_sh(ssh, user, pw, "true")
-    return max(4, int(3 * (time.time() - t0)) + 4)
+    lat = time.time() - t0
+    g = min(30, max(4, int(3 * lat) + 4))
+    print(f"grace_for: sudo latency {lat:.1f} s -> LoginGraceTime {g}", flush=True)
+    return g
 
 
 def privsep_grace(ssh, user, pw, tmp):

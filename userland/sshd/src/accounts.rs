@@ -248,6 +248,30 @@ pub fn parse_expiry(v: &str) -> Option<u64> {
     u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
 }
 
+/// Exclusive flock on /etc/.pwd.lock, LOCK_NB retried for about 2 s. The file is
+/// opened O_CLOEXEC|O_NOFOLLOW and only created if missing (fails on a read-only /etc).
+fn lock_pwd() -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let path = "/etc/.pwd.lock";
+    let open = |create: bool| {
+        fs::OpenOptions::new().write(true).create(create).truncate(false).mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)
+    };
+    let f = match open(false) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => open(true)?,
+        Err(e) => return Err(e),
+    };
+    for _ in 0..40 {
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(f);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "lock busy"))
+}
+
 /// A legacy `$sha256$` field is replaced by a fresh `$6$rounds=65536$` sha512-crypt one,
 /// atomically (temp file + rename). Called only after the password verified.
 pub fn rehash_legacy(user: &User, password: &str) {
@@ -269,15 +293,14 @@ pub fn rehash_legacy(user: &User, password: &str) {
         return;
     }
     // Same lock as shadowfix and login (lckpwdf's /etc/.pwd.lock); the file is
-    // read again under it so a concurrent rewrite is never overwritten.
-    let _lock = {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
-        let Ok(f) = fs::OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open("/etc/.pwd.lock") else { return };
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    // read again under it so a concurrent rewrite is never overwritten. Bounded:
+    // a stuck holder must not delay a login, so give up after ~2 s.
+    let _lock = match lock_pwd() {
+        Ok(f) => f,
+        Err(e) => {
+            crate::log(&format!("{}: shadow hash upgrade failed: lock: {e}", user.name));
             return;
         }
-        f
     };
     let Some(field) = shadow_field(&user.name) else { return };
     if !field.starts_with("$sha256$") {
@@ -304,7 +327,17 @@ pub fn rehash_legacy(user: &User, password: &str) {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = format!("/etc/shadow.sshd-new.{}", std::process::id());
     let tmp = tmp.as_str();
+    // A stale temp of this pid (pid reuse after a crash): remove only a regular file, never follow a link.
+    if fs::symlink_metadata(tmp).map(|m| m.file_type().is_file()).unwrap_or(false) {
+        let _ = fs::remove_file(tmp);
+    }
+    let old = fs::metadata("/etc/shadow").ok();
     let r = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(tmp).and_then(|mut f| {
+        if let Some(m) = &old {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            f.set_permissions(fs::Permissions::from_mode(m.mode() & 0o7777))?;
+            std::os::unix::fs::chown(tmp, Some(m.uid()), Some(m.gid()))?;
+        }
         f.write_all(out.as_bytes())?;
         f.sync_all()
     });
