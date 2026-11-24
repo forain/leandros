@@ -1,6 +1,6 @@
 --- a/lib/ext2fs/ext2_fs.h
 +++ b/lib/ext2fs/ext2_fs.h
-@@ -870,6 +870,7 @@
+@@ -874,6 +874,7 @@
  #define EXT4_FEATURE_INCOMPAT_INLINE_DATA	0x8000 /* data in inode */
  #define EXT4_FEATURE_INCOMPAT_ENCRYPT		0x10000
  #define EXT4_FEATURE_INCOMPAT_CASEFOLD		0x20000
@@ -10,7 +10,7 @@
  static inline int ext2fs_has_feature_##name(struct ext2_super_block *sb) \
 --- a/lib/ext2fs/ext2fs.h
 +++ b/lib/ext2fs/ext2fs.h
-@@ -729,7 +729,8 @@
+@@ -732,7 +732,8 @@
  					 EXT4_FEATURE_INCOMPAT_ENCRYPT|\
  					 EXT4_FEATURE_INCOMPAT_CASEFOLD|\
  					 EXT4_FEATURE_INCOMPAT_CSUM_SEED|\

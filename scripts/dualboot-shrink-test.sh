@@ -16,6 +16,8 @@
 . "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+# QEMU-only test: the stick needs no Intel iris/ANV ship-set (write-usb.sh refuses otherwise)
+export LEANDROS_USB_ALLOW_GENERIC_GPU="${LEANDROS_USB_ALLOW_GENERIC_GPU:-1}"
 ARCH="${1:-aarch64}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
@@ -42,7 +44,7 @@ LI=/tmp/leandros-install
 GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-$ARCH}"
 P2=/dev/nvme0n1p2
 
-dfguard() { local g; g=$(df -g "$HOME" | awk 'NR==2{print $4}'); [ "$g" -ge 30 ] || fail "only ${g} GiB free on the host; stop"; }
+dfguard() { local g; g=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}'); [ "$g" -ge 30 ] || fail "only ${g} GiB free on the host; stop"; }
 fresh_disk() { # cp -c clones only (APFS), never a plain copy
     dfguard; rm -f "${DISK:?}" "${DISK:?}".*
     local f; for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fx-$ARCH/disk/")"; done
@@ -51,11 +53,20 @@ fresh_stick() { dfguard; rm -f "${STICK:?}"; clone_cp "$WORK/stick.base" "$STICK
 
 boot_vm() { # <log> <run-qemu args...>
     local log="$WORK/$1.log"; shift
+    # The hashed port can be taken by another lane's VM: walk up to the first free one.
+    while python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)"; do PORT=$((PORT + 1)); done
     echo "127.0.0.1 $PORT" > "$STATE"; rm -f "$QMP"
-    LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu "$@" -display none \
-        -qmp "unix:$QMP,server=on,wait=off" > "$log" 2>&1 < /dev/null &
-    QPID=$!
-    local i
+    local i try
+    for try in 1 2 3 4 5 6; do
+        LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu "$@" -display none \
+            -qmp "unix:$QMP,server=on,wait=off" > "$log" 2>&1 < /dev/null &
+        QPID=$!
+        # A just-killed VM may still hold the image write lock for a moment (26 GiB of page cache to drop): retry.
+        sleep 3
+        kill -0 "$QPID" 2>/dev/null && break
+        grep -q 'Failed to get "write" lock' "$log" || break
+        echo "(image still locked by the previous VM, retry $try)"; sleep 5; rm -f "$QMP"
+    done
     for i in $(seq 1 150); do
         kill -0 "$QPID" 2>/dev/null || { tail -5 "$log"; fail "QEMU exited early ($log)"; }
         if $REMOTE run true >/dev/null 2>&1; then ok "ssh up ($log)"; return 0; fi
