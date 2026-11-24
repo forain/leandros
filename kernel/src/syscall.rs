@@ -11752,6 +11752,15 @@ fn sys_readlinkat(dirfd: usize, path_ptr: usize, buf_ptr: usize, size: usize) ->
     // Resolve against the cwd first, so readlink("self/exe") from /proc — and
     // any other relative link probe — names the same file the rest of the
     // syscall surface would.
+    // readlinkat(fd, "") on an O_PATH|O_NOFOLLOW fd of /proc/self.
+    if dirfd != AT_FDCWD && path_ptr != 0 && validate_user_buf(path_ptr, 1) && ur::<u8>(path_ptr) == 0 {
+        let mut t = [0u8; 48];
+        if let Some(n) = vfs::self_link_text(current_pid(), dirfd, &mut t) {
+            let n = n.min(size);
+            if unsafe { sched::uaccess::copy_to_user(buf_ptr, t.as_ptr(), n) } != 0 { return -14; }
+            return n as isize;
+        }
+    }
     let kpath = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
     let path = kpath.bytes();
 
@@ -12848,6 +12857,19 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
         if n < 0 { return n; }
         // Written with no net-server lock held (the handler has returned).
         return if sched::uaccess::write_user(arg, n.min(i32::MAX as isize) as i32) { 0 } else { -14 };
+    }
+
+    // SIOCDEVPRIVATE: root-only test knob, `{ u32 ifindex; u32 len; u8 frame[len] }` is received by
+    // that NIC as if it came off the wire (a peer for RA / DHCPv6 / DAD tests).
+    if cmd == 0x89f0 && fd >= net_server::SOCK_FD_BASE && fd < EPOLL_FD_BASE {
+        if !sched::caps::ns_capable_in(sched::ns::owner_userns(2, 0), 12) { return -1; }
+        let (idx, len) = match (sched::uaccess::read_user::<u32>(arg), sched::uaccess::read_user::<u32>(arg + 4)) {
+            (Some(i), Some(l)) => (i, l as usize), _ => return -14,
+        };
+        if len == 0 || len > 1600 || idx < 2 || !validate_user_buf(arg + 8, len) { return -22; }
+        let mut f = alloc::vec![0u8; len];
+        if unsafe { sched::uaccess::copy_raw(f.as_mut_ptr(), (arg + 8) as *const u8, len) } != 0 { return -14; }
+        return if net_server::inject_test_frame((idx - 2) as u8, f) { 0 } else { -19 };
     }
 
     // SIOCGIF* (getifaddrs' ioctl fallback, if_nameindex, if_indextoname,

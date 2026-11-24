@@ -1765,6 +1765,241 @@ unsafe fn t_emu_wide_wrap() -> bool {
     report(b"emu_wide_wrap", ok)
 }
 
+// ── full-grid emulator tests (/proc/vtgrid) ───────────────────────────────────
+
+const GRID_ROWS: usize = 72;
+const GRID_COLS: usize = 256;
+static mut GRID_BUF: [u8; 393216] = [0; 393216];
+static mut GRID: [[u32; GRID_COLS]; GRID_ROWS] = [[0; GRID_COLS]; GRID_ROWS];
+
+struct GridCur { col: u32, row: u32 }
+
+/// Read `/proc/vtgrid` (VT 6's whole cell grid) into `GRID`; a 0x20 cell is
+/// normalised to blank (0) so a typed space equals an erased cell.
+unsafe fn grid_read() -> Option<GridCur> {
+    let fd = open(b"/proc/vtgrid\0".as_ptr(), 0);
+    if fd < 0 { return None; }
+    let buf = &mut *core::ptr::addr_of_mut!(GRID_BUF);
+    let mut n = 0usize;
+    loop {
+        let r = read(fd, buf.as_mut_ptr().add(n) as *mut c_void, buf.len() - n);
+        if r <= 0 { break; }
+        n += r as usize;
+    }
+    close(fd);
+    let g = &mut *core::ptr::addr_of_mut!(GRID);
+    for r in 0..GRID_ROWS { for c in 0..GRID_COLS { g[r][c] = 0; } }
+    let mut cur = GridCur { col: 0, row: 0 };
+    let mut seen = false;
+    for line in buf[..n].split(|&b| b == b'\n') {
+        let mut i;
+        if line.starts_with(b"vtgrid ") {
+            i = 7;
+            parse_num(line, &mut i, 10);
+            i += 1; cur.col = parse_num(line, &mut i, 10);
+            i += 1; cur.row = parse_num(line, &mut i, 10);
+            seen = true;
+        } else if line.starts_with(b"row ") {
+            i = 4;
+            let r = parse_num(line, &mut i, 10) as usize;
+            i += 1; // ':'
+            let mut c = 0usize;
+            while i < line.len() && c < GRID_COLS && r < GRID_ROWS {
+                i += 1;
+                let v = parse_num(line, &mut i, 16);
+                g[r][c] = if v == 0x20 { 0 } else { v };
+                c += 1;
+            }
+        }
+    }
+    if seen { Some(cur) } else { None }
+}
+
+unsafe fn gcell(r: usize, c: usize) -> u32 { (*core::ptr::addr_of!(GRID))[r][c] }
+
+/// Console size of VT 6 as (cols, rows).
+unsafe fn emu_size(fd: c_int) -> (usize, usize) {
+    let mut ws = [0u16; 4];
+    if ioctl(fd, TIOCGWINSZ, ws.as_mut_ptr() as *mut c_void) == 0 && ws[0] > 0 && ws[1] > 0 {
+        (ws[1] as usize, ws[0] as usize)
+    } else { (80, 25) }
+}
+
+unsafe fn emu_grid(fd: c_int, bytes: &[u8]) -> Option<GridCur> {
+    let pre = b"\x1bc\x1b[2J\x1b[H";
+    write(fd, pre.as_ptr() as *const c_void, pre.len());
+    write(fd, bytes.as_ptr() as *const c_void, bytes.len());
+    sleep_ms(300);
+    grid_read()
+}
+
+/// Writing the bottom-right cell must not scroll (deferred wrap): the cell
+/// holds the character, the cursor stays on it, the screen did not move; the
+/// next character then wraps to the line below.
+unsafe fn t_emu_wrap_deferred() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_wrap_deferred", false); }
+    let (cols, rows) = emu_size(fd);
+    let mut m = [0u8; 64];
+    let mut n = 0usize;
+    for b in b"TOP\x1b[" { m[n] = *b; n += 1; }
+    n += fmt_num(&mut m[n..], rows); m[n] = b';'; n += 1;
+    n += fmt_num(&mut m[n..], cols);
+    for b in b"HX" { m[n] = *b; n += 1; }
+    let cur = emu_grid(fd, &m[..n]);
+    close(fd);
+    let ok = match cur {
+        Some(c) => gcell(0, 0) == b'T' as u32 && gcell(rows - 1, cols - 1) == b'X' as u32
+            && c.col as usize == cols - 1 && c.row as usize == rows - 1,
+        None => false,
+    };
+    if !ok { out(b"  wrap_deferred: cols="); out_num(cols); out(b" rows="); out_num(rows);
+        out(b" top="); out_hex(gcell(0, 0)); out(b" last="); out_hex(gcell(rows - 1, cols - 1)); out(b"\n"); }
+    report(b"emu_wrap_deferred", ok)
+}
+
+unsafe fn fmt_num(b: &mut [u8], mut v: usize) -> usize {
+    let mut t = [0u8; 8]; let mut k = 0usize;
+    if v == 0 { b[0] = b'0'; return 1; }
+    while v > 0 { t[k] = b'0' + (v % 10) as u8; v /= 10; k += 1; }
+    for i in 0..k { b[i] = t[k - 1 - i]; }
+    k
+}
+
+/// ICH `@`, DCH `P`, ECH `X`, REP `b`.
+unsafe fn t_emu_edit_chars() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_edit_chars", false); }
+    // Row 1: abcdef, ICH 2 at col 3 -> ab..cdef; row 2: DCH 2 at col 1 of abcdef -> cdef;
+    // row 3: ECH 2 at col 3 of abcdef -> ab..ef; row 4: Q then REP 3 -> QQQQ.
+    let cur = emu_grid(fd, b"abcdef\x1b[1;3H\x1b[2@\x1b[2;1Habcdef\x1b[2;1H\x1b[2P\x1b[3;1Habcdef\x1b[3;3H\x1b[2X\x1b[4;1HQ\x1b[3b");
+    close(fd);
+    let row = |r: usize, want: &[u8]| -> bool {
+        let mut i = 0usize;
+        while i < want.len() { if gcell(r, i) != want[i] as u32 { return false; } i += 1; }
+        gcell(r, want.len()) == 0
+    };
+    let ok = cur.is_some()
+        && row(0, b"ab\0\0cdef") && row(1, b"cdef") && row(2, b"ab\0\0ef")
+        && row(3, b"QQQQ") && cur.as_ref().map_or(false, |c| c.col == 4 && c.row == 3);
+    report(b"emu_edit_chars", ok)
+}
+
+/// IL `L` and DL `M` (whole-screen region, cursor to column 0).
+unsafe fn t_emu_edit_lines() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_edit_lines", false); }
+    let cur = emu_grid(fd, b"A\r\nB\r\nC\x1b[2;3H\x1b[L");
+    let ok1 = cur.as_ref().map_or(false, |c| c.col == 0 && c.row == 1)
+        && gcell(0, 0) == b'A' as u32 && gcell(1, 0) == 0
+        && gcell(2, 0) == b'B' as u32 && gcell(3, 0) == b'C' as u32;
+    let b = b"\x1b[M";
+    write(fd, b.as_ptr() as *const c_void, b.len());
+    sleep_ms(300);
+    let cur2 = grid_read();
+    close(fd);
+    let ok2 = cur2.is_some() && gcell(0, 0) == b'A' as u32 && gcell(1, 0) == b'B' as u32
+        && gcell(2, 0) == b'C' as u32 && gcell(3, 0) == 0;
+    report(b"emu_edit_lines", ok1 && ok2)
+}
+
+/// DECAWM: `CSI ? 7 l` pins a character written past the last column onto it.
+unsafe fn t_emu_autowrap() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_autowrap", false); }
+    let (cols, _) = emu_size(fd);
+    let mut m = [0u8; 64];
+    let mut n = 0usize;
+    for b in b"\x1b[?7l\x1b[1;" { m[n] = *b; n += 1; }
+    n += fmt_num(&mut m[n..], cols);
+    for b in b"Hab\x1b[?7h" { m[n] = *b; n += 1; }
+    let cur = emu_grid(fd, &m[..n]);
+    close(fd);
+    let ok = cur.map_or(false, |c| c.row == 0) && gcell(0, cols - 1) == b'b' as u32 && gcell(1, 0) == 0;
+    report(b"emu_autowrap", ok)
+}
+
+/// Every East-Asian-Wide range the glyph table draws must also advance the
+/// cursor by two cells (one source of truth: drivers::wcwidth).
+unsafe fn t_emu_wide_ranges() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_wide_ranges", false); }
+    let cps: [u32; 16] = [0x2630, 0x2637, 0x268A, 0x4DC0, 0x4DFF, 0x16FE0, 0x18800, 0x1AFF0,
+                          0x1B000, 0x1D300, 0x1F004, 0x1F0CF, 0x1F18E, 0x1F191, 0x1F200, 0x1F7E0];
+    let more: [u32; 2] = [0x1FA70, 0x1FAF8];
+    let mut buf = [0u8; 256];
+    let mut n = 0usize;
+    let mut k = 0usize;
+    let all = cps.len() + more.len();
+    while k < all {
+        let cp = if k < cps.len() { cps[k] } else { more[k - cps.len()] };
+        for b in b"\x1b[" { buf[n] = *b; n += 1; }
+        n += fmt_num(&mut buf[n..], k + 1);
+        for b in b";1H" { buf[n] = *b; n += 1; }
+        if let Some(ch) = char::from_u32(cp) {
+            let mut e = [0u8; 4];
+            let s = ch.encode_utf8(&mut e);
+            for b in s.as_bytes() { buf[n] = *b; n += 1; }
+        }
+        buf[n] = b'X'; n += 1;
+        k += 1;
+    }
+    let cur = emu_grid(fd, &buf[..n]);
+    close(fd);
+    let mut ok = cur.is_some();
+    k = 0;
+    while k < all {
+        let cp = if k < cps.len() { cps[k] } else { more[k - cps.len()] };
+        let good = gcell(k, 0) == cp && gcell(k, 1) == WIDE_CONT && gcell(k, 2) == b'X' as u32;
+        if !good { out(b"  wide range U+"); out_hex(cp); out(b" not 2 cells\n"); ok = false; }
+        k += 1;
+    }
+    report(b"emu_wide_ranges", ok)
+}
+
+static BTM_RAW: &[u8] = include_bytes!("../data/btm-100x30.raw");
+static BTM_GRID: &[u8] = include_bytes!("../data/btm-100x30.grid");
+
+/// Replay a recorded `btm` frame (Alpine's bottom in the guest, 100x30) into
+/// the emulator and require the cell grid to equal the pyte reference grid.
+unsafe fn t_emu_btm_replay() -> bool {
+    let fd = open_emu_vt();
+    if fd < 0 { return report(b"emu_btm_replay", false); }
+    let (cols, rows) = emu_size(fd);
+    if cols < 100 || rows < 30 { close(fd); out(b"  console smaller than 100x30\n"); return report(b"emu_btm_replay", false); }
+    let pre = b"\x1bc\x1b[2J\x1b[H";
+    write(fd, pre.as_ptr() as *const c_void, pre.len());
+    let mut off = 0usize;
+    while off < BTM_RAW.len() {
+        let n = (BTM_RAW.len() - off).min(1024);
+        write(fd, BTM_RAW.as_ptr().add(off) as *const c_void, n);
+        off += n;
+    }
+    sleep_ms(500);
+    let cur = grid_read();
+    close(fd);
+    let mut ok = cur.is_some();
+    let mut bad = 0usize;
+    for line in BTM_GRID.split(|&b| b == b'\n') {
+        if !line.starts_with(b"row ") { continue; }
+        let mut i = 4;
+        let r = parse_num(line, &mut i, 10) as usize;
+        i += 1;
+        let mut c = 0usize;
+        while c < 100 {
+            let want = if i < line.len() { i += 1; parse_num(line, &mut i, 16) } else { 0 };
+            if gcell(r, c) != want {
+                if bad < 4 { out(b"  btm diverge row "); out_num(r); out(b" col "); out_num(c);
+                    out(b" ours "); out_hex(gcell(r, c)); out(b" want "); out_hex(want); out(b"\n"); }
+                bad += 1;
+            }
+            c += 1;
+        }
+    }
+    if bad != 0 { ok = false; out(b"  btm divergent cells: "); out_num(bad); out(b"\n"); }
+    report(b"emu_btm_replay", ok)
+}
+
 /// Double-width characters must reach the framebuffer as their own glyphs, not
 /// the two-cell placeholder box or a blank. Paints one sample per text row on a
 /// free VT, reads the live surface back through /dev/fb0 and fingerprints each
@@ -1937,7 +2172,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
 
     out(b"vttest: virtual consoles\n");
     let mut passed = 0usize;
-    let total = 42usize;
+    let total = 48usize;
 
     if t_open_and_state(tty0) { passed += 1; }
     if t_activate(tty0) { passed += 1; }
@@ -1979,6 +2214,12 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if t_emu_wide_advance() { passed += 1; }
     if t_emu_wide_overwrite() { passed += 1; }
     if t_emu_wide_wrap() { passed += 1; }
+    if t_emu_wrap_deferred() { passed += 1; }
+    if t_emu_edit_chars() { passed += 1; }
+    if t_emu_edit_lines() { passed += 1; }
+    if t_emu_autowrap() { passed += 1; }
+    if t_emu_wide_ranges() { passed += 1; }
+    if t_emu_btm_replay() { passed += 1; }
     if t_wide_glyphs(tty0) { passed += 1; }
     if t_latin_glyphs(tty0) { passed += 1; }
 

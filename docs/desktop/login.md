@@ -42,7 +42,7 @@ init
  └─ sh /bin/greeter-real          sources /bin/greeter-env and /bin/gpu-env;
      │                            exit 78 if there is no GPU renderer
      └─ greetd                    vt = "none", source_profile = true,
-         │                        control socket in /run/user/990 (GREETD_SOCK_DIR)
+         │                        control socket /run/greetd-<pid>.sock
          ├─ greeter session (user = "root"):
          │    sh -c '. /etc/profile; exec cosmic-comp /bin/greeter-launch --no-xwayland'
          │      └─ cosmic-comp (kiosk)  binds wayland-N in /run/user/990
@@ -56,8 +56,7 @@ init
 1. **`/bin/greeter-real`** sources `/bin/greeter-env` (shared with `greeter-fake`, so the
    two launches cannot drift) and `/bin/gpu-env`. With no hardware renderer it exits 78
    (`EX_CONFIG`); init reports that on the serial console once and stops respawning, so a
-   headless boot gets its serial login without a fork storm. (On a PC whose NVIDIA card is still booting GSP, `gpu-env` first polls `/proc/nvrm_state` — `absent`, `probing`, `ready` or `failed` — every 250 ms for up to 90 s, and init restarts the graphical login once if greetd exited 78 while the state was `probing`; without that the greeter, which now starts ~0.8 s after init on a fast root, found no renderer and was refused for good.) Otherwise it points
-   `GREETD_SOCK_DIR` at the greeter account's runtime directory and execs greetd.
+   headless boot gets its serial login without a fork storm. (On a PC whose NVIDIA card is still booting GSP, `gpu-env` first polls `/proc/nvrm_state` — `absent`, `probing`, `ready` or `failed` — every 250 ms for up to 90 s, and init restarts the graphical login once if greetd exited 78 while the state was `probing`; without that the greeter, which now starts ~0.8 s after init on a fast root, found no renderer and was refused for good.) Otherwise it execs greetd.
 2. **greetd** starts the greeter session as root:
    `cosmic-comp /bin/greeter-launch --no-xwayland`. cosmic-comp's kiosk mode is already the
    greeter-session lifecycle — it spawns its child once the compositor is up with
@@ -135,20 +134,14 @@ puts VT 2 into `KD_GRAPHICS` and believes it owns it.
 
 ### greetd's control socket cannot live in `/run`
 
-`/run` is ordinary f2fs, and f2fs has no `S_IFSOCK`, so upstream's hardcoded
-`/run/greetd-<pid>.sock` fails to bind with `EOPNOTSUPP` and greetd exits before the
-greeter is ever spawned. The socket-capable mounts are the tmpfs roots `/tmp`, `/dev/shm`
-and `/run/user`. A greetd patch makes the directory steerable through `GREETD_SOCK_DIR`
-(unset, it is byte-for-byte upstream). The alternative — making `/run` itself a tmpfs mount
-root in the VFS — is the more Linux-faithful answer, but it shadows the image's `/run`
-contents and changes what `/run/user` means as a pool root; that is a kernel decision, not
-a port decision, and was not taken.
+`/run` is a tmpfs (VFS `TMPFS_ROOTS`, as on Linux), so greetd binds upstream's
+`/run/greetd-<pid>.sock` unpatched.
 
 **Which directory**, since lane `perms` (2026-09-16): the VFS now enforces search
 permission on every path component and write permission on a socket inode for `AF_UNIX`
 `connect`, so a uid-990 client can reach nothing under a `0700 root` `/run/user/0`. The
 greeter phase therefore uses **the greeter account's own runtime directory,
-`/run/user/990`**: `greeter-real` puts greetd's socket there, and `/etc/profile` selects it
+`/run/user/990`**: `/etc/profile` selects it
 as `XDG_RUNTIME_DIR` for the session that carries `GREETD_SOCK` — the greeter session, the
 only one greetd's worker puts it in — so cosmic-comp binds `wayland-N` there too.
 `greeter-launch`, still root, then chowns both socket nodes to the account. That is
@@ -206,7 +199,6 @@ greetd is pinned at `d6733e9` (0.10.3-22) and carries three patches
 |---|---|
 | `0001-leandros.patch` | greetd re-executes itself via `/proc/self/exe` for each session worker; the VFS synthesises that path inside `readlink(2)` only, so `execve` on it is `ENOENT`. The patch resolves it with `current_exe()` before the fork. It also links `pam-leandros`. |
 | `0002-fakegreet-leandros.patch` | avoids `std::fs::canonicalize` (musl's `realpath` via `open(O_PATH)` + `/proc/self/fd`), which fakegreet `.unwrap()`ed |
-| `0003-socket-dir-leandros.patch` | `GREETD_SOCK_DIR`, above |
 
 Of the five workspace crates, `agreety` is not built (`/bin/login` has that role);
 `fakegreet` is.

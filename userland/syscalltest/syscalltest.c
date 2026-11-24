@@ -101,6 +101,7 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2548,6 +2549,92 @@ static void pts_owner(void) {
     else pass(n);
 }
 
+/* An unprivileged opener owns the pty it opens: devpts gives a new slave the
+ * opener's euid, group tty (5), mode 0620 (lane runtmpfs). */
+static void pts_owner_user(void) {
+    const char *n = "pts_owner_user";
+    if (geteuid() != 0) { skip(n, "needs root"); return; }
+    int pf[2];
+    if (pipe(pf) != 0) { fail(n, "pipe"); return; }
+    fflush(stdout);
+    pid_t p = fork();
+    if (p == 0) {
+        close(pf[0]);
+        if (setgid(1000) || setuid(1000)) _exit(5);
+        int m = posix_openpt(O_RDWR | O_NOCTTY);
+        if (m < 0) _exit(6);
+        grantpt(m); unlockpt(m);
+        char *sn = ptsname(m);
+        struct stat st;
+        if (!sn || stat(sn, &st) != 0) _exit(7);
+        int bad = st.st_uid != 1000 || st.st_gid != 5 ||
+                  ((st.st_mode & 07777) != 0620 && (st.st_mode & 07777) != 0600);
+        /* The owner may chmod its own pty; chown to another uid is refused. */
+        if (chmod(sn, 0600) != 0) bad |= 2;
+        if (chown(sn, 0, (gid_t)-1) == 0) bad |= 4;
+        char b = (char)bad;
+        if (write(pf[1], &b, 1) != 1) _exit(8);
+        _exit(0);
+    }
+    close(pf[1]);
+    char b = 99;
+    ssize_t r = read(pf[0], &b, 1);
+    close(pf[0]);
+    int s; waitpid(p, &s, 0);
+    if (r != 1 || !WIFEXITED(s) || WEXITSTATUS(s)) fail(n, "child failed: read %zd status %#x", r, s);
+    else if (b) fail(n, "unprivileged opener's pty wrong: flags %d", (int)b);
+    else pass(n);
+}
+
+/* /run is a tmpfs like Linux/Alpine: it holds unix sockets, is mode 0755, and
+ * /var/run is a symlink to it (lane runtmpfs). Emptiness at boot follows from
+ * tmpfs; the mount type is what a persistent f2fs /run would fail. */
+static void run_tmpfs(void) {
+    const char *n = "run_tmpfs";
+    FILE *f = fopen("/proc/mounts", "r");
+    char dev[256], dir[512], type[64], o[256];
+    int found = 0;
+    if (f) {
+        while (fscanf(f, "%255s %511s %63s %255s %*d %*d", dev, dir, type, o) == 4)
+            if (!strcmp(dir, "/run") && !strcmp(type, "tmpfs")) found = 1;
+        fclose(f);
+    }
+    if (!found) { fail(n, "/run is not a tmpfs mount in /proc/mounts"); return; }
+    struct stat st;
+    if (stat("/run", &st) != 0 || !S_ISDIR(st.st_mode) || (st.st_mode & 07777) != 0755 || st.st_uid != 0) {
+        fail(n, "/run mode %o uid %d (want dir 0755 root)", st.st_mode & 07777, (int)st.st_uid); return;
+    }
+    char lk[64];
+    ssize_t l = readlink("/var/run", lk, sizeof lk - 1);
+    if (l < 0) { fail(n, "/var/run is not a symlink: %s", strerror(errno)); return; }
+    lk[l] = 0;
+    if (strcmp(lk, "/run")) { fail(n, "/var/run -> %s (want /run)", lk); return; }
+    { struct stat a1, a2; if (stat("/var/run", &a1) || stat("/run", &a2) || a1.st_dev != a2.st_dev || a1.st_ino != a2.st_ino) { fail(n, "stat /var/run is not /run"); return; } }
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    snprintf(a.sun_path, sizeof a.sun_path, "/run/runtmpfs-%d.sock", (int)getpid());
+    unlink(a.sun_path);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0 || bind(s, (struct sockaddr *)&a, sizeof a) != 0 || listen(s, 1) != 0) {
+        fail(n, "bind/listen in /run: %s", strerror(errno)); if (s >= 0) close(s); unlink(a.sun_path); return;
+    }
+    /* Reachable through /var/run too, and it is a socket there. */
+    char via[128];
+    snprintf(via, sizeof via, "/var/run/runtmpfs-%d.sock", (int)getpid());
+    int ok = stat(via, &st) == 0 && S_ISSOCK(st.st_mode);
+    close(s); unlink(a.sun_path);
+    if (!ok) { fail(n, "socket not visible/typed through /var/run: %s", strerror(errno)); return; }
+    /* Created through /var/run, it must land in the tmpfs /run (not the
+     * persistent on-disk /run the tmpfs shadows). */
+    char dn[96], dv[96];
+    snprintf(dn, sizeof dn, "/run/runtmpfs-d%d", (int)getpid());
+    snprintf(dv, sizeof dv, "/var/run/runtmpfs-d%d", (int)getpid());
+    if (mkdir(dv, 0700) != 0) { fail(n, "mkdir via /var/run: %s", strerror(errno)); return; }
+    ok = stat(dn, &st) == 0 && S_ISDIR(st.st_mode);
+    rmdir(dn);
+    if (!ok) fail(n, "mkdir /var/run/x did not appear in /run");
+    else pass(n);
+}
+
 /* `mount -o remount,ro` shows as `ro` in /proc/mounts and ST_RDONLY in statfs. */
 static int mounts_flag(const char *mp, char *opts, size_t n) {
     FILE *f = fopen("/proc/mounts", "r");
@@ -2950,6 +3037,8 @@ int main(int argc, char **argv) {
     tmpfs_long_paths();
     comm_deep_path(self);
     pts_owner();
+    pts_owner_user();
+    run_tmpfs();
     mount_ro_flag();
     image_timestamps();
     proc_self_exe_access();
