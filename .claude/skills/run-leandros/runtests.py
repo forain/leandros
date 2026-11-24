@@ -614,7 +614,7 @@ HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
 # Skips exist only for the Pi 5 KVM runner (an aarch64 host), and only for HOST_NEEDS_GL. On any other
 # host (the x86_64 desktop) a suite that cannot run is a failure, never a skip.
 SKIP_ALLOWED = platform.machine() == "aarch64"
-EXCLUSIVE_HOST = {"listentagtest.py"}
+EXCLUSIVE_HOST = {"listentagtest.py", "uartgaptest.py"}
 HOST_NEEDS_GL = {"blanktest.py", "portalshottest.py", "powerctltest.py"}
 
 
