@@ -19,6 +19,7 @@ git in the guest (version, init/add/commit/log, clone over https).
 Prints `ssh_<step>: PASS|FAIL <detail>` per step and a summary; exit 0
 iff all passed.
 """
+import atexit
 import os
 import pty
 import re
@@ -1155,6 +1156,12 @@ def sshdcfg(ssh, user, pw, tmp):
     sudo_sh(ssh, user, pw, "mount -o remount,rw / 2>/dev/null; kill $(cat /tmp/sshdcfg.pid); rm -f /tmp/sshdcfg*; rm -rf /etc/ssh/principals")
 
 
+def _short_sock(d, name):
+    path = os.path.join(d, name)
+    assert len(path) <= 107, f"unix socket path too long ({len(path)}): {path}"
+    return path
+
+
 def unix_exchange(path, payload=b"", want=b"", wait=25, abort=None):
     """Connect to the unix socket `path` until `want` shows up in the reply (or timeout, or abort() says stop)."""
     import socket
@@ -1309,7 +1316,17 @@ def sshdcfg2(ssh, user, pw, tmp):
 
     threading.Thread(target=echo, daemon=True).start()
     gs = lambda n: f"/tmp/sd2-{n}.sock"  # guest sockets
-    hs = lambda n: os.path.join(tmp, f"sd2-{n}.sock")  # host sockets
+    # host sockets live in a short private dir: TMPDIR (<out>/sN/tmp, sharded) can be long enough to push a
+    # socket path past the 107-byte sun_path limit, and ssh -L then rejects the spec ("Bad local forwarding specification")
+    sockdir = tempfile.mkdtemp(prefix="s2-", dir="/tmp")
+    atexit.register(shutil.rmtree, sockdir, True)
+    hs = lambda n: _short_sock(sockdir, f"sd2-{n}.sock")  # host sockets
+
+    def client_gone(p, what):  # a client that already exited cannot forward: say why at once instead of timing out
+        if p.poll() is None:
+            return False
+        diag.append(f"{what} client exited rc={p.returncode}: {errtxt(p)[-300:]!r}")
+        return True
 
     def clean(*names):
         ssh.run(user, "rm -f " + " ".join(gs(n) for n in names), key=True)
@@ -1338,7 +1355,7 @@ def sshdcfg2(ssh, user, pw, tmp):
             # "send failed: Bad file descriptor", is also reported to the client as "administratively prohibited")
             return nref(p, L_REFUSED) >= 1 and sudo_sh(ssh, user, pw, "grep -c 'forwarding disabled' /tmp/sshdcfg.log")[1].strip() not in ("", "0")
 
-        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40, abort=refused_now)
+        got = unix_exchange(hs("ha"), payload=b"ping-L\n", want=b"ping-L", wait=40, abort=lambda: refused_now() or client_gone(p, "-L"))
         ok = b"ping-L" in got
         ref = not ok and g.poll() is None and refused_now()  # the guest socket is there: only ssh2 can have refused
         stop(p)
@@ -1351,7 +1368,7 @@ def sshdcfg2(ssh, user, pw, tmp):
         p = errwatch(fwd_client(ssh2, user, "-o", "LogLevel=DEBUG1", "-R", f"{gs('b')}:127.0.0.1:{echo_port}"))
         wait_fwd(p, gs("b"))
         p2 = errwatch(fwd_client(ssh, user, "-o", "LogLevel=DEBUG1", "-L", f"{hs('hb')}:{gs('b')}"))
-        got = unix_exchange(hs("hb"), payload=b"ping-R\n", want=b"ping-R", wait=40, abort=lambda: p.poll() is not None)
+        got = unix_exchange(hs("hb"), payload=b"ping-R\n", want=b"ping-R", wait=40, abort=lambda: p.poll() is not None or client_gone(p2, "-L"))
         ok = b"ping-R" in got
         ref = not ok and p.poll() is not None and refused_by(p, R_REFUSED)  # ExitOnForwardFailure ended the client
         diag.append("first sshd: " + sudo_sh(ssh, user, pw, "tail -n 6 /var/log/sshd.log")[1].replace("\n", "|"))
@@ -1441,11 +1458,13 @@ def sshdcfg2(ssh, user, pw, tmp):
     step("cfg2_streamlocal_bind_missing_dir_refused", p.poll() is not None, "forward into a missing directory was accepted")
     stop(p)
     clean("ho")
-    p = fwd_client(ssh2, user, "-L", f"{hs('ho')}:/tmp/sd2-no-listener.sock")
+    p = errwatch(fwd_client(ssh2, user, "-L", f"{hs('ho')}:/tmp/sd2-no-listener.sock"))
     time.sleep(3)
-    got = unix_exchange(hs("ho"), payload=b"x\n", want=b"x", wait=6)
+    alive = p.poll() is None  # the client must be up with its -L socket: a client that never started proves nothing
+    got = unix_exchange(hs("ho"), payload=b"x\n", want=b"x", wait=6) if alive else b""
+    err = "" if alive else errtxt(p)[-300:]
     stop(p)
-    step("cfg2_streamlocal_direct_no_listener_closed", b"x" not in got, f"got={got!r}")
+    step("cfg2_streamlocal_direct_no_listener_closed", alive and b"x" not in got, f"alive={alive} got={got!r} err={err!r}")
     srv.close()
     clean("a", "b", "ha", "hb", "m", "u", "n", "ho")
     set_keys(ssh, user, pw, pub)
