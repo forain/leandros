@@ -596,6 +596,7 @@ unsafe fn program_periodic() {
     {
         let per = TSC_PER_TICK.load(Ordering::Relaxed);
         let t0 = rdtsc();
+        DBG_STALLS.fetch_add(1, Ordering::Relaxed);
         while rdtsc().wrapping_sub(t0) < per + per / 2 {} // 15 ms
     }
     apic::write(apic::LAPIC_LVT_TIMER, LVT_PERIODIC);
@@ -607,12 +608,21 @@ unsafe fn program_periodic() {
 /// `timer.dead_delay=<cpu>` (debug, off = -1): stall 15 ms once between the
 /// two writes of `program_periodic` on that CPU, reproducing the dead tick.
 static DBG_DELAY_CPU: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
-/// `timer.fixmask=<m>` (debug, default 3): bit0 = reload count after the mode
-/// flip, bit1 = `check_alive` recovers a dead periodic tick.
-static DBG_FIXMASK: AtomicU32 = AtomicU32::new(3);
-/// Per CPU: timer interrupts taken, and dead ticks recovered by `check_alive`.
+/// `timer.fixmask=<m>` (debug, default 7): bit0 = fix 1, reload count after the
+/// mode flip; bit1 = fix 2, `check_alive` recovers a dead periodic tick;
+/// bit2 = fix 3, a stale one-shot deadline is ignored (`arm_deadline`,
+/// `check_alive`).
+static DBG_FIXMASK: AtomicU32 = AtomicU32::new(7);
+/// Per CPU: timer interrupts taken.
 static LOCAL_TICKS: [AtomicU64; TIMER_MAX_CPUS] = [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
-static DEAD_TICKS: AtomicU64 = AtomicU64::new(0);
+/// check_alive recoveries by the LAPIC state they found (periodic, deadline, realign).
+static REC_BY_STATE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Times the `timer.dead_delay` stall actually ran (the test requires exactly 1).
+static DBG_STALLS: AtomicU64 = AtomicU64::new(0);
+/// Stale one-shot deadlines ignored (fix 3), and one-shots armed by `arm_deadline`
+/// on a CPU silent for 3+ ticks (revives a dead tick without any fix).
+static STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
+static ARM_REVIVED: AtomicU64 = AtomicU64::new(0);
 
 #[no_mangle]
 pub extern "C" fn arch_timer_debug(delay_cpu: i32, fixmask: u32) {
@@ -620,12 +630,17 @@ pub extern "C" fn arch_timer_debug(delay_cpu: i32, fixmask: u32) {
     DBG_FIXMASK.store(fixmask, Ordering::Relaxed);
 }
 
-/// `out[0]` = dead ticks recovered, `out[1..=n]` = per-CPU timer interrupts.
+/// `out[0]` = dead ticks recovered by `check_alive` (all states), `out[1]` = `dead_delay` stalls consumed,
+/// `out[2..5]` = recoveries by state, `out[5]` stale ignored, `out[6]` arm revivals, `out[7..7+n]` = per-CPU timer interrupts.
 #[no_mangle]
 pub extern "C" fn arch_timer_cpu_stats(out: *mut u64, n: usize) {
     unsafe {
-        out.write(DEAD_TICKS.load(Ordering::Relaxed));
-        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(1 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
+        out.write((0..3).map(|i| REC_BY_STATE[i].load(Ordering::Relaxed)).sum());
+        out.add(1).write(DBG_STALLS.load(Ordering::Relaxed));
+        for i in 0..3 { out.add(2 + i).write(REC_BY_STATE[i].load(Ordering::Relaxed)); }
+        out.add(5).write(STALE_IGNORED.load(Ordering::Relaxed));
+        out.add(6).write(ARM_REVIVED.load(Ordering::Relaxed));
+        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(7 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
     }
 }
 
@@ -667,9 +682,15 @@ pub fn arm_deadline(deadline_ns: u64) {
     let mut os = ONESHOT_TSC[cpu].load(Ordering::Relaxed);
     // A deadline more than 4 ticks in the past will never fire (lost
     // interrupt): it must not shadow new, later deadlines.
-    if os != u64::MAX && rdtsc().wrapping_sub(os) < u64::MAX / 2
-        && rdtsc().wrapping_sub(os) > 4 * TSC_PER_TICK.load(Ordering::Relaxed) { os = u64::MAX; }
+    if DBG_FIXMASK.load(Ordering::Relaxed) & 4 != 0 && os != u64::MAX && rdtsc().wrapping_sub(os) < u64::MAX / 2
+        && rdtsc().wrapping_sub(os) > 4 * TSC_PER_TICK.load(Ordering::Relaxed) {
+        os = u64::MAX;
+        STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+    }
     if t < os {
+        // Programming a one-shot restarts the countdown: on a CPU that has been
+        // silent for 3 ticks this is what revives a dead periodic tick.
+        let silent = rdtsc().wrapping_sub(LAST_IRQ_TSC[cpu].load(Ordering::Relaxed)) > 3 * TSC_PER_TICK.load(Ordering::Relaxed);
         ONESHOT_TSC[cpu].store(t, Ordering::Relaxed);
         let want = tsc_delta_to_count(t.saturating_sub(rdtsc()));
         // CURR reads 0 when a one-shot already expired with its interrupt
@@ -677,6 +698,7 @@ pub fn arm_deadline(deadline_ns: u64) {
         // ONESHOT_TSC and program it, so leave the hardware alone.
         let cur = unsafe { apic::read(apic::LAPIC_TIMER_CURR) };
         if want < cur {
+            if silent { ARM_REVIVED.fetch_add(1, Ordering::Relaxed); }
             unsafe { program_oneshot(want); }
             LAPIC_STATE[cpu].store(ST_DEADLINE, Ordering::Relaxed);
         }
@@ -717,9 +739,10 @@ fn deadline_irq(cpu: usize, next_tick: u64) -> u32 {
     st
 }
 
-/// Self-check for a lost one-shot interrupt (the periodic tick cannot die on
-/// its own, a one-shot can): if this CPU is in a one-shot state and has taken
-/// no timer interrupt for 4 ticks, restore periodic mode. Called by the
+/// Self-check for a dead local timer: a lost one-shot interrupt, or a periodic
+/// tick killed by the `program_periodic` mode-flip race (see there). If this
+/// CPU has taken no timer interrupt for 4 ticks, restore periodic mode (a
+/// still-future one-shot deadline is kept for the next tick to program). Called by the
 /// scheduler wherever it opens an IRQ window. Returns true when it re-armed.
 pub fn check_alive() -> bool {
     let per = TSC_PER_TICK.load(Ordering::Relaxed);
@@ -741,8 +764,13 @@ pub fn check_alive() -> bool {
     if rdtsc().wrapping_sub(last) > 4 * per {
         // No logging here: this runs from IRQ-window and idle paths that may
         // hold or interrupt the console. The count is in /proc/leandros_timer.
-        if st == ST_PERIODIC { DEAD_TICKS.fetch_add(1, Ordering::Relaxed); }
-        ONESHOT_TSC[cpu].store(u64::MAX, Ordering::Relaxed);
+        REC_BY_STATE[(st as usize).min(2)].fetch_add(1, Ordering::Relaxed);
+        let os = ONESHOT_TSC[cpu].load(Ordering::Relaxed);
+        if DBG_FIXMASK.load(Ordering::Relaxed) & 4 != 0 && os != u64::MAX
+            && os.wrapping_sub(rdtsc()) >= u64::MAX / 2 { // already past: stale
+            ONESHOT_TSC[cpu].store(u64::MAX, Ordering::Relaxed);
+            STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { program_periodic(); }
         LAPIC_STATE[cpu].store(ST_PERIODIC, Ordering::Relaxed);
         LAST_IRQ_TSC[cpu].store(rdtsc(), Ordering::Relaxed);
