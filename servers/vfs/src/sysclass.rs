@@ -91,12 +91,13 @@ fn split(path: &[u8]) -> Option<Split<'_>> {
 
 /// True when `path` is inside an active overlay class directory.
 pub fn is_path(path: &[u8]) -> bool {
-    is_chardir(path) || super::sysinput::is_path(path) || super::sysdrm::is_path(path) || cpu_split(path).is_some() || split(path).is_some()
+    is_chardir(path) || is_blkdir(path) || is_blkentry(path) || super::sysinput::is_path(path) || super::sysdrm::is_path(path) || cpu_split(path).is_some() || split(path).is_some()
 }
 
 /// Resolve `path` to an overlay directory as `(dev, level)`.
 pub fn dir(path: &[u8]) -> Option<(u16, u8)> {
     if is_chardir(path) { return Some((CHAR_DEV, LVL_CHAR)); }
+    if is_blkdir(path) { return Some((BLK_DEV, LVL_BLK)); }
     if super::sysinput::is_path(path) { return super::sysinput::dir(path); }
     if super::sysdrm::is_path(path) { return super::sysdrm::dir(path); }
     if let Some(c) = cpu_split(path) { return cpu_dir(c); }
@@ -185,6 +186,7 @@ pub fn write(path: &[u8], data: &[u8]) -> i32 {
 pub fn dirent(dev: u16, level: u8, idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
     if dev == SC_TABLES { return tables_dirent(idx, out); }
     if dev == CHAR_DEV { return chardir_dirent(idx, out); }
+    if dev == BLK_DEV { return blkdir_dirent(idx, out); }
     if (dev >> 8) & 0xF == super::sysinput::SI_CLS { return super::sysinput::dirent(dev, level, idx, out); }
     if (dev >> 8) & 0xF == super::sysdrm::SD_CLS { return super::sysdrm::dirent(dev, level, idx, out); }
     if (dev >> 8) & 0xF == CPU_CLS as u16 { return cpu_dirent(dev, idx, out); }
@@ -360,9 +362,50 @@ fn chardir_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)>
     super::sysinput::char_dirent(idx, out)
 }
 
+// `/sys/dev/block`: `<major>:<minor>` symlinks to `../../class/block/<name>`,
+// one per entry of `/sys/class/block`.
+const BLK_CLS: u16 = 0xA;
+pub const LVL_BLK: u8 = 0xA0;
+pub const BLK_DEV: u16 = SC_BASE | BLK_CLS << 8 | 0xFF;
+
+fn is_blkdir(path: &[u8]) -> bool {
+    let mut p = path;
+    while p.len() > 1 && p[p.len() - 1] == b'/' { p = &p[..p.len() - 1]; }
+    p == b"/sys/dev/block" && super::block::rdev_at(0).is_some()
+}
+
+/// `(major, minor)` of a `/sys/dev/block/<maj>:<min>` path.
+fn blk_entry(path: &[u8]) -> Option<(u32, u32)> {
+    let mut p = path;
+    while p.len() > 1 && p[p.len() - 1] == b'/' { p = &p[..p.len() - 1]; }
+    let s = core::str::from_utf8(p.strip_prefix(b"/sys/dev/block/")?).ok()?;
+    let (a, b) = s.split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+fn is_blkentry(path: &[u8]) -> bool { blk_entry(path).is_some() && super::block::rdev_at(0).is_some() }
+
+fn blkdir_dirent(idx: usize, out: &mut [u8; NAME_LEN]) -> Option<(usize, bool)> {
+    use core::fmt::Write;
+    struct W<'a> { o: &'a mut [u8], p: usize }
+    impl Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let b = s.as_bytes();
+            if self.p + b.len() > self.o.len() { return Err(core::fmt::Error); }
+            self.o[self.p..self.p + b.len()].copy_from_slice(b);
+            self.p += b.len();
+            Ok(())
+        }
+    }
+    let (maj, min) = super::block::rdev_at(idx)?;
+    let mut w = W { o: &mut out[..], p: 0 };
+    let _ = write!(w, "{}:{}", maj, min);
+    Some((w.p, false))
+}
+
 /// Is entry `idx` of overlay directory `(dev, level)` a symlink (DT_LNK)?
 pub fn dirent_link(dev: u16, level: u8, idx: usize) -> bool {
-    if dev == CHAR_DEV { return true; }
+    if dev == CHAR_DEV || dev == BLK_DEV { return true; }
     match (dev >> 8) & 0xF {
         c if c == super::sysinput::SI_CLS => super::sysinput::dirent_link(level, idx),
         c if c == super::sysdrm::SD_CLS => super::sysdrm::dirent_link(level, idx),
@@ -372,6 +415,15 @@ pub fn dirent_link(dev: u16, level: u8, idx: usize) -> bool {
 
 /// Target of the generated symlink at `path` (readlink body); `None` when it is not one.
 pub fn link(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    if let Some((maj, min)) = blk_entry(path) {
+        let mut nb = [0u8; super::block::NAME_MAX];
+        let n = super::block::name_of_rdev(maj, min, &mut nb)?;
+        let pre = b"../../class/block/";
+        if pre.len() + n > out.len() { return None; }
+        out[..pre.len()].copy_from_slice(pre);
+        out[pre.len()..pre.len() + n].copy_from_slice(&nb[..n]);
+        return Some(pre.len() + n);
+    }
     if let Some(t) = super::sysdrm::link(path) {
         if t.len() > out.len() { return None; }
         out[..t.len()].copy_from_slice(&t);
@@ -387,7 +439,7 @@ pub fn link(path: &[u8], out: &mut [u8]) -> Option<usize> {
 /// Expand generated symlinks inside `path` (all components, and the last one
 /// only when `follow`). `Ok(None)` when none is met. The result is normalised.
 pub fn expand(path: &[u8], follow: bool) -> Result<Option<alloc::vec::Vec<u8>>, i32> {
-    if !(path.starts_with(b"/sys/dev/char/13:") || path.starts_with(b"/sys/class/input/")
+    if !(path.starts_with(b"/sys/dev/char/13:") || path.starts_with(b"/sys/dev/block/") || path.starts_with(b"/sys/class/input/")
         || path.starts_with(b"/sys/class/drm/card0") || path.starts_with(b"/sys/dev/char/226:0")) { return Ok(None); }
     let mut cur = path.to_vec();
     let mut hops = 0;
@@ -457,10 +509,10 @@ fn normalize(p: &[u8]) -> alloc::vec::Vec<u8> {
 // its roots through `dir`/`dirent`, so every directory any overlay module can
 // resolve names its own path with no per-module inverse to keep in sync.
 
-const ROOTS: [&[u8]; 11] = [
+const ROOTS: [&[u8]; 12] = [
     b"/sys/class/power_supply", b"/sys/class/backlight", b"/sys/class/rtc", b"/sys/power",
     b"/sys/devices/system/cpu", b"/sys/devices/cpu", b"/sys/firmware/acpi/tables",
-    b"/sys/class/drm", b"/sys/class/input", b"/sys/dev/char", b"/sys/dev/char/226:0",
+    b"/sys/class/drm", b"/sys/class/input", b"/sys/dev/char", b"/sys/dev/char/226:0", b"/sys/dev/block",
 ];
 
 /// First (breadth-first) path whose overlay directory id is `(dev, level)`.

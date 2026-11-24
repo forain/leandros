@@ -18,8 +18,7 @@ export PATH
 # Two of them. XDG_RUNTIME_DIR is greetd's own (root's, seeded 0700 root by the
 # VFS at boot) and is where the callers cd. GREETER_RUNTIME_DIR is the
 # cosmic-greeter ACCOUNT's, /run/user/<its uid>, 0700 and owned by it: that is
-# where greetd's control socket (GREETD_SOCK_DIR in greeter-real, fakegreet's
-# cwd in greeter-fake) and the greeter session's wayland socket (/etc/profile,
+# where fakegreet's socket (its cwd in greeter-fake) and the greeter session's wayland socket (/etc/profile,
 # greeter class) are bound, because the VFS enforces search permission on
 # every path component and AF_UNIX connect, and the greeter client runs as
 # uid 990 after /bin/greeter-launch drops to it. A root-owned 0700 /run/user/0
