@@ -2291,7 +2291,7 @@ def main():
                               "..", "ports", "portal", "out", arch, "usr", "lib")
     if os.path.isfile(os.path.join(_portal_pw, "libpipewire-0.3.so.0")):
         m6_pw_lib = os.path.normpath(_portal_pw)
-    # ports/pipewire stages the REAL libpipewire 1.2.7 (same ABI the stub was
+    # ports/pipewire stages the REAL libpipewire (same ABI the stub was
     # generated from); when it is staged the stub is not packed at all, and the
     # real library comes in with the rest of that tree (overlay further down).
     _pw_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -2752,7 +2752,7 @@ def main():
                 _stage_cosmic_default(f"{_theme}/v2/list_button", _v1)
 
     # ── Firefox (optional, ports/firefox) ────────────────────────────────────
-    # Alpine 3.21's prebuilt Firefox + its GTK3 closure + fonts, staged by
+    # Alpine 3.24's prebuilt Firefox + its GTK3 closure + fonts, staged by
     # ports/firefox/build.sh (scripts/build-all.sh runs it when docker/podman
     # is available) as a rootfs-shaped tree. Optional like doom/MAME: absent
     # output, nothing staged. The tree is overlaid onto the image as-is, with
@@ -2824,7 +2824,7 @@ def main():
               f"packing the inert libpipewire stub)")
 
     # ── xdg-desktop-portal (optional, ports/portal) ──────────────────────────
-    # org.freedesktop.portal.Desktop: Alpine 3.21's frontend + permission store
+    # org.freedesktop.portal.Desktop: Alpine 3.24's frontend + permission store
     # (+ GLib closure) and xdg-desktop-portal-cosmic, with their busd .service
     # files and cosmic.portal / portals.conf, staged by ports/portal/build.sh.
     # Same overlay rules as Firefox. Optional: absent output, nothing staged,
@@ -2840,7 +2840,7 @@ def main():
         print(f"  (no xdg-desktop-portal staged: {_xdp_root} missing — ports/portal/build.sh {arch})")
 
     # ── GStreamer (optional, ports/gstreamer) ───────────────────────────────
-    # Alpine 3.21's GStreamer 1.24 + plugins-base/good + gst-libav + the
+    # Alpine 3.24's GStreamer 1.24 + plugins-base/good + gst-libav + the
     # PipeWire plugin (cosmic-player's media stack), gst-launch/inspect, and a
     # short test clip. Shared libs (GLib, FFmpeg) are byte-identical to the
     # Firefox/PipeWire ports' copies, so overlaying them is free. Same overlay rules.

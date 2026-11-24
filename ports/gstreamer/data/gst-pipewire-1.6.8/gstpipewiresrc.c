@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <spa/param/video/format.h>
+#include <spa/pod/iter.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/result.h>
 
@@ -41,11 +42,14 @@ GST_DEBUG_CATEGORY_STATIC (pipewire_src_debug);
 #define GST_CAT_DEFAULT pipewire_src_debug
 
 #define DEFAULT_ALWAYS_COPY     false
-#define DEFAULT_MIN_BUFFERS     8
+#define DEFAULT_MIN_BUFFERS     1
 #define DEFAULT_MAX_BUFFERS     INT32_MAX
 #define DEFAULT_RESEND_LAST     false
 #define DEFAULT_KEEPALIVE_TIME  0
 #define DEFAULT_AUTOCONNECT     true
+#define DEFAULT_USE_BUFFERPOOL  USE_BUFFERPOOL_AUTO
+#define DEFAULT_ON_DISCONNECT   GST_PIPEWIRE_SRC_ON_DISCONNECT_NONE
+#define DEFAULT_PROVIDE_CLOCK   TRUE
 
 enum
 {
@@ -62,8 +66,30 @@ enum
   PROP_RESEND_LAST,
   PROP_KEEPALIVE_TIME,
   PROP_AUTOCONNECT,
+  PROP_USE_BUFFERPOOL,
+  PROP_ON_DISCONNECT,
+  PROP_PROVIDE_CLOCK,
 };
 
+GType
+gst_pipewire_src_on_disconnect_get_type (void)
+{
+  static gsize on_disconnect_type = 0;
+  static const GEnumValue on_disconnect[] = {
+    {GST_PIPEWIRE_SRC_ON_DISCONNECT_NONE, "GST_PIPEWIRE_SRC_ON_DISCONNECT_NONE", "none"},
+    {GST_PIPEWIRE_SRC_ON_DISCONNECT_EOS, "GST_PIPEWIRE_SRC_ON_DISCONNECT_EOS", "eos"},
+    {GST_PIPEWIRE_SRC_ON_DISCONNECT_ERROR, "GST_PIPEWIRE_SRC_ON_DISCONNECT_ERROR", "error"},
+    {0, NULL, NULL},
+  };
+
+  if (g_once_init_enter (&on_disconnect_type)) {
+    GType tmp =
+        g_enum_register_static ("GstPipeWireSrcOnDisconnect", on_disconnect);
+    g_once_init_leave (&on_disconnect_type, tmp);
+  }
+
+  return (GType) on_disconnect_type;
+}
 
 static GstStaticPadTemplate gst_pipewire_src_template =
 GST_STATIC_PAD_TEMPLATE ("src",
@@ -130,7 +156,11 @@ gst_pipewire_src_set_property (GObject * object, guint prop_id,
       break;
 
     case PROP_ALWAYS_COPY:
-      pwsrc->always_copy = g_value_get_boolean (value);
+      /* don't provide buffer if always copy*/
+      if (g_value_get_boolean (value))
+        pwsrc->use_bufferpool = USE_BUFFERPOOL_NO;
+      else
+        pwsrc->use_bufferpool = USE_BUFFERPOOL_YES;
       break;
 
     case PROP_MIN_BUFFERS:
@@ -155,6 +185,27 @@ gst_pipewire_src_set_property (GObject * object, guint prop_id,
 
     case PROP_AUTOCONNECT:
       pwsrc->autoconnect = g_value_get_boolean (value);
+      break;
+
+    case PROP_USE_BUFFERPOOL:
+      if(g_value_get_boolean (value))
+        pwsrc->use_bufferpool = USE_BUFFERPOOL_YES;
+      else
+        pwsrc->use_bufferpool = USE_BUFFERPOOL_NO;
+      break;
+
+    case PROP_ON_DISCONNECT:
+      pwsrc->on_disconnect = g_value_get_enum (value);
+      break;
+
+    case PROP_PROVIDE_CLOCK:
+      gboolean provide = g_value_get_boolean (value);
+      GST_OBJECT_LOCK (pwsrc);
+      if (provide)
+        GST_OBJECT_FLAG_SET (pwsrc, GST_ELEMENT_FLAG_PROVIDE_CLOCK);
+      else
+        GST_OBJECT_FLAG_UNSET (pwsrc, GST_ELEMENT_FLAG_PROVIDE_CLOCK);
+      GST_OBJECT_UNLOCK (pwsrc);
       break;
 
     default:
@@ -191,7 +242,7 @@ gst_pipewire_src_get_property (GObject * object, guint prop_id,
       break;
 
     case PROP_ALWAYS_COPY:
-      g_value_set_boolean (value, pwsrc->always_copy);
+      g_value_set_boolean (value, !pwsrc->use_bufferpool);
       break;
 
     case PROP_MIN_BUFFERS:
@@ -216,6 +267,22 @@ gst_pipewire_src_get_property (GObject * object, guint prop_id,
 
     case PROP_AUTOCONNECT:
       g_value_set_boolean (value, pwsrc->autoconnect);
+      break;
+
+    case PROP_USE_BUFFERPOOL:
+      g_value_set_boolean (value, !!pwsrc->use_bufferpool);
+      break;
+
+    case PROP_ON_DISCONNECT:
+      g_value_set_enum (value, pwsrc->on_disconnect);
+      break;
+
+    case PROP_PROVIDE_CLOCK:
+      gboolean result;
+      GST_OBJECT_LOCK (pwsrc);
+      result = GST_OBJECT_FLAG_IS_SET (pwsrc, GST_ELEMENT_FLAG_PROVIDE_CLOCK);
+      GST_OBJECT_UNLOCK (pwsrc);
+      g_value_set_boolean (value, result);
       break;
 
     default:
@@ -331,7 +398,8 @@ gst_pipewire_src_class_init (GstPipeWireSrcClass * klass)
                                                          "Always copy the buffer and data",
                                                          DEFAULT_ALWAYS_COPY,
                                                          G_PARAM_READWRITE |
-                                                         G_PARAM_STATIC_STRINGS));
+                                                         G_PARAM_STATIC_STRINGS |
+                                                         G_PARAM_DEPRECATED));
 
   g_object_class_install_property (gobject_class,
                                    PROP_MIN_BUFFERS,
@@ -387,6 +455,34 @@ gst_pipewire_src_class_init (GstPipeWireSrcClass * klass)
                                                          G_PARAM_READWRITE |
                                                          G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class,
+                                   PROP_USE_BUFFERPOOL,
+                                   g_param_spec_boolean ("use-bufferpool",
+                                                         "Use bufferpool",
+                                                         "Use bufferpool (default: true for video, false for audio)",
+                                                         DEFAULT_USE_BUFFERPOOL,
+                                                         G_PARAM_READWRITE |
+                                                         G_PARAM_STATIC_STRINGS));
+
+   g_object_class_install_property (gobject_class,
+                                    PROP_ON_DISCONNECT,
+                                    g_param_spec_enum ("on-disconnect",
+                                                       "On disconnect",
+                                                       "Action to take on disconnect",
+                                                        GST_TYPE_PIPEWIRE_SRC_ON_DISCONNECT,
+                                                        DEFAULT_ON_DISCONNECT,
+                                                        G_PARAM_READWRITE |
+                                                        G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class,
+                                   PROP_PROVIDE_CLOCK,
+                                   g_param_spec_boolean ("provide-clock",
+                                                         "Provide Clock",
+                                                         "Provide a clock to be used as the global pipeline clock",
+                                                         DEFAULT_PROVIDE_CLOCK,
+                                                         G_PARAM_READWRITE |
+                                                         G_PARAM_STATIC_STRINGS));
+
   gstelement_class->provide_clock = gst_pipewire_src_provide_clock;
   gstelement_class->change_state = gst_pipewire_src_change_state;
   gstelement_class->send_event = gst_pipewire_src_send_event;
@@ -427,7 +523,7 @@ gst_pipewire_src_init (GstPipeWireSrc * src)
 
   src->stream = gst_pipewire_stream_new (GST_ELEMENT (src));
 
-  src->always_copy = DEFAULT_ALWAYS_COPY;
+  src->use_bufferpool = DEFAULT_USE_BUFFERPOOL;
   src->min_buffers = DEFAULT_MIN_BUFFERS;
   src->max_buffers = DEFAULT_MAX_BUFFERS;
   src->resend_last = DEFAULT_RESEND_LAST;
@@ -435,6 +531,10 @@ gst_pipewire_src_init (GstPipeWireSrc * src)
   src->autoconnect = DEFAULT_AUTOCONNECT;
   src->min_latency = 0;
   src->max_latency = GST_CLOCK_TIME_NONE;
+  src->last_buffer_clock_time = GST_CLOCK_TIME_NONE;
+  src->n_buffers = 0;
+  src->flushing_on_remove_buffer = FALSE;
+  src->on_disconnect = DEFAULT_ON_DISCONNECT;
 
   src->transform_value = UINT32_MAX;
 }
@@ -442,11 +542,26 @@ gst_pipewire_src_init (GstPipeWireSrc * src)
 static gboolean
 buffer_recycle (GstMiniObject *obj)
 {
-  GstPipeWireSrc *src;
-  GstPipeWirePoolData *data;
+  GstPipeWirePoolData *data = gst_pipewire_pool_get_data (GST_BUFFER_CAST(obj));
+  GstPipeWireSrc *src = data->owner;
   int res;
 
-  data = gst_pipewire_pool_get_data (GST_BUFFER_CAST(obj));
+  if (src->flushing_on_remove_buffer) {
+    /*
+     * If a flush-start was initiated, this might be called by elements like
+     * queues downstream purging buffers from their internal queues. This can
+     * deadlock if queues use min-threshold-buffers/bytes/time with src_create
+     * trying to take the loop lock and buffer_recycle trying to take the loop
+     * lock down below. We return from here, to prevent deadlock with streaming
+     * thread in a queue thread.
+     *
+     * We will take care of queueing the buffer in on_remove_buffer.
+     */
+    GstBuffer *buffer = GST_BUFFER_CAST(obj);
+    GST_DEBUG_OBJECT (src,
+        "flush-start initiated, skipping buffer recycle %p", buffer);
+    return TRUE;
+  }
 
   GST_OBJECT_LOCK (data->pool);
   if (!obj->dispose) {
@@ -455,7 +570,6 @@ buffer_recycle (GstMiniObject *obj)
   }
 
   GST_BUFFER_FLAGS (obj) = data->flags;
-  src = data->owner;
 
   pw_thread_loop_lock (src->stream->core->loop);
   if (!obj->dispose) {
@@ -492,6 +606,8 @@ on_add_buffer (void *_data, struct pw_buffer *b)
   data->owner = pwsrc;
   data->queued = TRUE;
   GST_MINI_OBJECT_CAST (data->buf)->dispose = buffer_recycle;
+
+  pwsrc->n_buffers++;
 }
 
 static void
@@ -500,17 +616,76 @@ on_remove_buffer (void *_data, struct pw_buffer *b)
   GstPipeWireSrc *pwsrc = _data;
   GstPipeWirePoolData *data = b->user_data;
   GstBuffer *buf = data->buf;
+  gboolean flush_on_remove;
   int res;
 
-  GST_DEBUG_OBJECT (pwsrc, "remove buffer %p", buf);
+  GST_DEBUG_OBJECT (pwsrc, "remove buffer %p, queued: %d",
+      buf, data->queued);
 
   GST_MINI_OBJECT_CAST (buf)->dispose = NULL;
+
+  flush_on_remove =
+        pwsrc->on_disconnect == GST_PIPEWIRE_SRC_ON_DISCONNECT_ERROR ||
+        pwsrc->on_disconnect == GST_PIPEWIRE_SRC_ON_DISCONNECT_EOS;
+
+  if (flush_on_remove && !pwsrc->flushing_on_remove_buffer) {
+      pwsrc->flushing_on_remove_buffer = TRUE;
+
+      GST_DEBUG_OBJECT (pwsrc, "flush-start on remove buffer");
+      /*
+       * It is possible that when buffers are being removed, a downstream
+       * element can be holding on to a buffer or in the middle of rendering
+       * the same. Former is possible with queues min-threshold-buffers or
+       * similar. Latter can result in a crash during gst_video_frame_copy.
+       *
+       * We send a flush-start event downstream to make elements discard
+       * any buffers they may be holding on to as well as return from their
+       * chain function ASAP.
+       */
+      gst_pad_push_event (GST_BASE_SRC_PAD (pwsrc),
+          gst_event_new_flush_start ());
+  }
 
   if (data->queued) {
     gst_buffer_unref (buf);
   } else {
     if ((res = pw_stream_queue_buffer (pwsrc->stream->pwstream, b)) < 0)
-      GST_WARNING_OBJECT (pwsrc, "can't queue removed buffer %p, %s", buf, spa_strerror(res));
+      GST_WARNING_OBJECT (pwsrc, "can't queue removed buffer %p, %s",
+          buf, spa_strerror(res));
+    else
+      GST_DEBUG_OBJECT (pwsrc, "queued buffer %p", buf);
+  }
+
+  pwsrc->n_buffers--;
+
+  if (pwsrc->n_buffers == 0) {
+    GST_DEBUG_OBJECT (pwsrc, "removed all buffers");
+
+    pwsrc->flushing_on_remove_buffer = FALSE;
+
+    switch (pwsrc->on_disconnect) {
+      case GST_PIPEWIRE_SRC_ON_DISCONNECT_ERROR:
+        GST_DEBUG_OBJECT (pwsrc, "flush-stop on removing all buffers");
+        gst_pad_push_event (GST_BASE_SRC_PAD (pwsrc),
+            gst_event_new_flush_stop (FALSE));
+
+        GST_ELEMENT_ERROR (pwsrc, RESOURCE, NOT_FOUND,
+            ("all buffers have been removed"),
+            ("PipeWire link to remote node was destroyed"));
+        break;
+      case GST_PIPEWIRE_SRC_ON_DISCONNECT_EOS:
+        GST_DEBUG_OBJECT (pwsrc, "flush-stop on removing all buffers");
+        gst_pad_push_event (GST_BASE_SRC_PAD (pwsrc),
+            gst_event_new_flush_stop (FALSE));
+
+        GST_DEBUG_OBJECT (pwsrc, "sending eos downstream");
+        gst_pad_push_event (GST_BASE_SRC_PAD (pwsrc),
+            gst_event_new_eos());
+        break;
+      case GST_PIPEWIRE_SRC_ON_DISCONNECT_NONE:
+        GST_DEBUG_OBJECT (pwsrc, "stream closed or removed");
+        break;
+    }
   }
 }
 
@@ -541,6 +716,7 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
   struct spa_meta_header *h;
   struct spa_meta_region *crop;
   enum spa_meta_videotransform_value transform_value;
+  struct spa_meta_cursor *cursor;
   struct pw_time time;
   guint i;
 
@@ -594,7 +770,7 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     GST_BUFFER_DTS (buf) = b->time - pwsrc->delay;
   }
 
-  if (pwsrc->is_video) {
+  if (pwsrc->media_type == SPA_MEDIA_TYPE_video) {
     if (pwsrc->video_info.fps_n) {
       GST_BUFFER_DURATION (buf) = gst_util_uint64_scale (GST_SECOND,
           pwsrc->video_info.fps_d, pwsrc->video_info.fps_n);
@@ -605,8 +781,8 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
   }
 
   crop = data->crop;
-  if (crop) {
-    GstVideoCropMeta *meta = gst_buffer_get_video_crop_meta(buf);
+  if (crop && spa_meta_region_is_valid(crop)) {
+    GstVideoCropMeta *meta = gst_buffer_add_video_crop_meta(buf);
     if (meta) {
       meta->x = crop->region.position.x;
       meta->y = crop->region.position.y;
@@ -633,9 +809,19 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     pwsrc->transform_value = transform_value;
   }
 
-  if (pwsrc->is_video) {
-    gsize video_size = 0;
+  cursor = data->cursor;
+  if (cursor && cursor->id != 0) {
+    /* TODO: at some point, maybe we can figure out width and height from the bitmap,
+     * and even add that to the meta itself */
+    gst_buffer_add_video_region_of_interest_meta (buf, "cursor", cursor->position.x, cursor->position.y, 0, 0);
+  }
+
+  if (pwsrc->is_rawvideo) {
     GstVideoInfo *info = &pwsrc->video_info;
+    uint32_t n_datas = b->buffer->n_datas;
+    uint32_t n_planes = GST_VIDEO_INFO_N_PLANES (info);
+    gsize video_size = 0;
+
     GstVideoMeta *meta = gst_buffer_add_video_meta_full (buf, GST_VIDEO_FRAME_FLAG_NONE,
                              GST_VIDEO_INFO_FORMAT (info),
                              GST_VIDEO_INFO_WIDTH (info),
@@ -644,8 +830,10 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
                              info->offset,
                              info->stride);
 
-    for (i = 0; i < MIN (b->buffer->n_datas, GST_VIDEO_MAX_PLANES); i++) {
+    for (i = 0; i < MIN (n_datas, n_planes); i++) {
       struct spa_data *d = &b->buffer->datas[i];
+      /* don't add the chunk offset here, this is done below when we
+       * share/copy the memory in the target buffer below */
       meta->offset[i] = video_size;
       meta->stride[i] = d->chunk->stride;
 
@@ -653,23 +841,44 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     }
   }
 
+  if (b->buffer->n_datas != gst_buffer_n_memory(data->buf)) {
+      GST_ERROR_OBJECT(pwsrc, "n_datas != n_memory, (%d != %d)", b->buffer->n_datas, gst_buffer_n_memory(data->buf));
+  }
+
   for (i = 0; i < b->buffer->n_datas; i++) {
     struct spa_data *d = &b->buffer->datas[i];
+
+    if (d->chunk->size == 0) {
+      // Skip the 0 sized chunk, not adding to the buffer
+      GST_DEBUG_OBJECT(pwsrc, "Chunk size is 0, skipping");
+      continue;
+    }
+
     GstMemory *pmem = gst_buffer_peek_memory (data->buf, i);
     if (pmem) {
       GstMemory *mem;
-      if (!pwsrc->always_copy)
+      if (pwsrc->use_bufferpool != USE_BUFFERPOOL_NO)
         mem = gst_memory_share (pmem, d->chunk->offset, d->chunk->size);
       else
         mem = gst_memory_copy (pmem, d->chunk->offset, d->chunk->size);
       gst_buffer_insert_memory (buf, i, mem);
     }
-    if (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED)
+    if (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) {
+      GST_DEBUG_OBJECT(pwsrc, "Buffer corrupted");
       GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_CORRUPTED);
+    }
   }
-  if (!pwsrc->always_copy)
+  if (pwsrc->use_bufferpool != USE_BUFFERPOOL_NO)
     gst_buffer_add_parent_buffer_meta (buf, data->buf);
   gst_buffer_unref (data->buf);
+
+  if (gst_buffer_get_size(buf) == 0)
+  {
+    GST_ERROR_OBJECT(pwsrc, "Buffer is empty, dropping this");
+    gst_buffer_unref(buf);
+    buf = NULL;
+  }
+
   return buf;
 }
 
@@ -686,13 +895,29 @@ on_state_changed (void *data,
                   enum pw_stream_state state, const char *error)
 {
   GstPipeWireSrc *pwsrc = data;
+  GstState current_state = GST_ELEMENT_CAST (pwsrc)->current_state;
 
-  GST_DEBUG ("got stream state %s", pw_stream_state_as_string (state));
+  GST_DEBUG_OBJECT (pwsrc, "got stream state %s", pw_stream_state_as_string (state));
 
   switch (state) {
     case PW_STREAM_STATE_UNCONNECTED:
     case PW_STREAM_STATE_CONNECTING:
+      break;
     case PW_STREAM_STATE_PAUSED:
+      /*
+       * We may see a driver/quantum/clock rate change on switching audio
+       * sources. The same is not applicable for video.
+       *
+       * We post the clock lost message here to take care of a possible
+       * jump or shift in base_time/clock for the pipeline. Application
+       * must handle the clock lost message in it's bus handler by pausing
+       * the pipeline and then setting it back to playing.
+       */
+      if (current_state == GST_STATE_PLAYING && pwsrc->media_type == SPA_MEDIA_TYPE_audio)
+        gst_element_post_message (GST_ELEMENT_CAST (pwsrc),
+            gst_message_new_clock_lost (GST_OBJECT_CAST (pwsrc),
+                GST_CLOCK_CAST (pwsrc->stream->clock)));
+      break;
     case PW_STREAM_STATE_STREAMING:
       break;
     case PW_STREAM_STATE_ERROR:
@@ -832,6 +1057,44 @@ wait_started (GstPipeWireSrc *this)
   return state;
 }
 
+
+static enum pw_stream_state
+wait_negotiated (GstPipeWireSrc *this)
+{
+  enum pw_stream_state state;
+  const char *error = NULL;
+  struct timespec abstime;
+
+  pw_thread_loop_get_time (this->stream->core->loop, &abstime,
+                  GST_PIPEWIRE_DEFAULT_TIMEOUT * SPA_NSEC_PER_SEC);
+
+  while (TRUE) {
+    state = pw_stream_get_state (this->stream->pwstream, &error);
+
+    GST_DEBUG_OBJECT (this, "waiting for NEGOTIATED, now %s", pw_stream_state_as_string (state));
+    if (state == PW_STREAM_STATE_ERROR)
+      break;
+    if (this->flushing) {
+      state = PW_STREAM_STATE_ERROR;
+      break;
+    }
+
+    if (this->negotiated)
+      break;
+
+    if (this->autoconnect) {
+      if (pw_thread_loop_timed_wait_full (this->stream->core->loop, &abstime) < 0) {
+        state = PW_STREAM_STATE_ERROR;
+        break;
+      }
+    } else {
+      pw_thread_loop_wait (this->stream->core->loop);
+    }
+  }
+  GST_DEBUG_OBJECT (this, state != PW_STREAM_STATE_ERROR ? "got negotiated signal" : "error during negotiation");
+  return state;
+}
+
 static gboolean
 gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
 {
@@ -843,7 +1106,6 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
   g_autoptr (GPtrArray) possible = NULL;
   gboolean result = FALSE;
   const char *error = NULL;
-  struct timespec abstime;
   uint32_t target_id;
 
   /* first see what is possible on our source pad */
@@ -938,6 +1200,9 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
   GST_DEBUG_OBJECT (basesrc, "connect capture with path %s, target-object %s",
                     pwsrc->stream->path, pwsrc->stream->target_object);
 
+  gst_caps_replace (&pwsrc->possible_caps, possible_caps);
+  pwsrc->negotiated = FALSE;
+
   enum pw_stream_flags flags;
   flags = PW_STREAM_FLAG_DONT_RECONNECT |
 	  PW_STREAM_FLAG_ASYNC;
@@ -950,32 +1215,10 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
                      (const struct spa_pod **)possible->pdata,
                      possible->len);
 
-  pw_thread_loop_get_time (pwsrc->stream->core->loop, &abstime,
-                  GST_PIPEWIRE_DEFAULT_TIMEOUT * SPA_NSEC_PER_SEC);
-
-  pwsrc->possible_caps = possible_caps;
-  pwsrc->negotiated = FALSE;
-
-  while (TRUE) {
-    enum pw_stream_state state = pw_stream_get_state (pwsrc->stream->pwstream, &error);
-
-    GST_DEBUG_OBJECT (basesrc, "waiting for NEGOTIATED, now %s", pw_stream_state_as_string (state));
-    if (state == PW_STREAM_STATE_ERROR || pwsrc->flushing)
-      goto connect_error;
-
-    if (pwsrc->negotiated)
-      break;
-
-    if (pwsrc->autoconnect) {
-      if (pw_thread_loop_timed_wait_full (pwsrc->stream->core->loop, &abstime) < 0)
-        goto connect_error;
-    } else {
-      pw_thread_loop_wait (pwsrc->stream->core->loop);
-    }
-  }
+  if (wait_negotiated(pwsrc) == PW_STREAM_STATE_ERROR)
+    goto connect_error;
 
   negotiated_caps = g_steal_pointer (&pwsrc->caps);
-  pwsrc->possible_caps = NULL;
   pw_thread_loop_unlock (pwsrc->stream->core->loop);
 
   if (negotiated_caps == NULL)
@@ -983,7 +1226,7 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
 
   gst_pipewire_clock_reset (GST_PIPEWIRE_CLOCK (pwsrc->stream->clock), 0);
 
-  GST_DEBUG_OBJECT (pwsrc, "set format %" GST_PTR_FORMAT, negotiated_caps);
+  GST_INFO_OBJECT (pwsrc, "set format %" GST_PTR_FORMAT, negotiated_caps);
   result = gst_base_src_set_caps (GST_BASE_SRC (pwsrc), negotiated_caps);
   if (!result)
     goto no_caps;
@@ -1042,25 +1285,45 @@ handle_format_change (GstPipeWireSrc *pwsrc,
   if (param == NULL) {
     GST_DEBUG_OBJECT (pwsrc, "clear format");
     pwsrc->negotiated = FALSE;
-    pwsrc->is_video = FALSE;
+    pwsrc->media_type = SPA_MEDIA_TYPE_unknown;
     return;
   }
 
   pw_peer_caps = gst_caps_from_format (param);
-  if (pw_peer_caps) {
+
+  if (pw_peer_caps && pwsrc->possible_caps) {
+    GST_DEBUG_OBJECT (pwsrc, "peer caps %" GST_PTR_FORMAT, pw_peer_caps);
+    GST_DEBUG_OBJECT (pwsrc, "possible caps %" GST_PTR_FORMAT, pwsrc->possible_caps);
+
     pwsrc->caps = gst_caps_intersect_full (pw_peer_caps,
                                            pwsrc->possible_caps,
                                            GST_CAPS_INTERSECT_FIRST);
+
+  /*
+   * We expect pw_peer_caps to be fixed caps as we receive that from
+   * PipeWire. See pw_context_find_format() and SPA_PARAM_Format.
+   * possible_caps can be non-fixated caps based on what is downstream
+   * in the pipeline.
+   *
+   * The intersection result above might give us non-fixated caps. A
+   * possible scenario for this is the below pipeline.
+   * pipewiresrc ! audioconvert ! audio/x-raw,rate=44100,channels=2 ! ..
+   *
+   * So we fixate the caps explicitly here.
+   */
+    pwsrc->caps = gst_caps_fixate (pwsrc->caps);
     gst_caps_maybe_fixate_dma_format (pwsrc->caps);
   }
 
-  if (pwsrc->caps && gst_caps_is_fixed (pwsrc->caps)) {
+  if (pwsrc->caps) {
+    g_return_if_fail (gst_caps_is_fixed (pwsrc->caps));
+
     pwsrc->negotiated = TRUE;
 
     structure = gst_caps_get_structure (pwsrc->caps, 0);
     if (g_str_has_prefix (gst_structure_get_name (structure), "video/") ||
         g_str_has_prefix (gst_structure_get_name (structure), "image/")) {
-      pwsrc->is_video = TRUE;
+      pwsrc->media_type = SPA_MEDIA_TYPE_video;
 
 #ifdef HAVE_GSTREAMER_DMA_DRM
       if (gst_video_is_dma_drm_caps (pwsrc->caps)) {
@@ -1076,25 +1339,44 @@ handle_format_change (GstPipeWireSrc *pwsrc,
           pw_stream_set_error (pwsrc->stream->pwstream, -EINVAL, "internal error");
           return;
         }
+        pwsrc->is_rawvideo = TRUE;
       } else {
         gst_video_info_dma_drm_init (&pwsrc->drm_info);
 #endif
         gst_video_info_from_caps (&pwsrc->video_info, pwsrc->caps);
+
+        if (GST_VIDEO_FORMAT_INFO_IS_VALID_RAW (pwsrc->video_info.finfo)
+#ifdef HAVE_GSTREAMER_DMA_DRM
+            && GST_VIDEO_FORMAT_INFO_FORMAT (pwsrc->video_info.finfo) != GST_VIDEO_FORMAT_DMA_DRM
+#endif
+            )
+          pwsrc->is_rawvideo = TRUE;
+        else
+          pwsrc->is_rawvideo = FALSE;
+
 #ifdef HAVE_GSTREAMER_DMA_DRM
       }
 #endif
+    } else {
+      /* Don't provide bufferpool for audio if not requested by the
+       * application/user */
+      if (pwsrc->use_bufferpool != USE_BUFFERPOOL_YES)
+        pwsrc->use_bufferpool = USE_BUFFERPOOL_NO;
+
+      pwsrc->media_type = SPA_MEDIA_TYPE_audio;
     }
   } else {
     pwsrc->negotiated = FALSE;
-    pwsrc->is_video = FALSE;
+    pwsrc->media_type = SPA_MEDIA_TYPE_unknown;
+    pwsrc->is_rawvideo = FALSE;
   }
 
   if (pwsrc->caps) {
-    const struct spa_pod *params[4];
+    const struct spa_pod *params[10];
     struct spa_pod_builder b = { NULL };
-    uint8_t buffer[512];
+    uint8_t buffer[16384];
     uint32_t buffers = CLAMP (16, pwsrc->min_buffers, pwsrc->max_buffers);
-    int buffertypes;
+    int buffertypes, n_params = 0;
 
     buffertypes = (1<<SPA_DATA_DmaBuf);
     if (!spa_pod_find_prop (param, NULL, SPA_FORMAT_VIDEO_modifier)) {
@@ -1104,31 +1386,41 @@ handle_format_change (GstPipeWireSrc *pwsrc,
     GST_DEBUG_OBJECT (pwsrc, "we got format %" GST_PTR_FORMAT, pwsrc->caps);
 
     spa_pod_builder_init (&b, buffer, sizeof (buffer));
-    params[0] = spa_pod_builder_add_object (&b,
+    params[n_params++] = spa_pod_builder_add_object (&b,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers,
                                                             pwsrc->min_buffers,
                                                             pwsrc->max_buffers),
         SPA_PARAM_BUFFERS_blocks,  SPA_POD_CHOICE_RANGE_Int(0, 1, INT32_MAX),
-        SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
+        SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(0, 1, INT32_MAX),
         SPA_PARAM_BUFFERS_stride,  SPA_POD_CHOICE_RANGE_Int(0, 0, INT32_MAX),
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(buffertypes));
 
-    params[1] = spa_pod_builder_add_object (&b,
+    params[n_params++] = spa_pod_builder_add_object (&b,
         SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
         SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
         SPA_PARAM_META_size, SPA_POD_Int(sizeof (struct spa_meta_header)));
-    params[2] = spa_pod_builder_add_object (&b,
+    params[n_params++] = spa_pod_builder_add_object (&b,
         SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
         SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoCrop),
         SPA_PARAM_META_size, SPA_POD_Int(sizeof (struct spa_meta_region)));
-    params[3] = spa_pod_builder_add_object (&b,
+    params[n_params++] = spa_pod_builder_add_object (&b,
         SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
         SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoTransform),
         SPA_PARAM_META_size, SPA_POD_Int(sizeof (struct spa_meta_videotransform)));
+#define CURSOR_META_SIZE(width, height) \
+        (sizeof (struct spa_meta_cursor) + \
+         sizeof (struct spa_meta_bitmap) + width * height * 4)
+    params[n_params++] = spa_pod_builder_add_object (&b,
+        SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+        SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
+        SPA_PARAM_META_size,
+        SPA_POD_CHOICE_RANGE_Int (CURSOR_META_SIZE(384, 384),
+          sizeof (struct spa_meta_cursor),
+          CURSOR_META_SIZE(384, 384)));
 
     GST_DEBUG_OBJECT (pwsrc, "doing finish format");
-    pw_stream_update_params (pwsrc->stream->pwstream, params, SPA_N_ELEMENTS(params));
+    pw_stream_update_params (pwsrc->stream->pwstream, params, n_params);
   } else {
     GST_WARNING_OBJECT (pwsrc, "finish format with error");
     pw_stream_set_error (pwsrc->stream->pwstream, -EINVAL, "unhandled format");
@@ -1261,6 +1553,8 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
   GstBuffer *buf;
   gboolean update_time = FALSE, timeout = FALSE;
   GstCaps *caps = NULL;
+  struct timespec abstime = { 0, };
+  bool have_abstime = false;
 
   pwsrc = GST_PIPEWIRE_SRC (psrc);
 
@@ -1304,27 +1598,44 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
       update_time = TRUE;
       GST_LOG_OBJECT (pwsrc, "EOS, send last buffer");
       break;
-    } else if (timeout) {
-      if (pwsrc->last_buffer != NULL) {
-        update_time = TRUE;
-        buf = gst_buffer_ref(pwsrc->last_buffer);
-        GST_LOG_OBJECT (pwsrc, "timeout, send keepalive buffer");
-        break;
-      }
+    } else if (timeout && pwsrc->last_buffer != NULL) {
+      buf = gst_buffer_copy (pwsrc->last_buffer);
+      update_time = TRUE;
+      GST_LOG_OBJECT (pwsrc, "timeout, send keepalive buffer");
+      break;
     } else {
       buf = dequeue_buffer (pwsrc);
       GST_LOG_OBJECT (pwsrc, "popped buffer %p", buf);
       if (buf != NULL) {
-        if (pwsrc->resend_last || pwsrc->keepalive_time > 0)
-          gst_buffer_replace (&pwsrc->last_buffer, buf);
+        if (pwsrc->resend_last || pwsrc->keepalive_time > 0) {
+          GstClock *clock;
+          GstBuffer *old;
+
+          old = pwsrc->last_buffer;
+          pwsrc->last_buffer = gst_buffer_copy (buf);
+          gst_buffer_unref (old);
+          gst_buffer_add_parent_buffer_meta (pwsrc->last_buffer, buf);
+
+          clock = gst_element_get_clock (GST_ELEMENT_CAST (pwsrc));
+          if (clock != NULL) {
+            pwsrc->last_buffer_clock_time = gst_clock_get_time (clock);
+            gst_object_unref (clock);
+          } else {
+            pwsrc->last_buffer_clock_time = GST_CLOCK_TIME_NONE;
+          }
+        }
         break;
       }
     }
     timeout = FALSE;
     if (pwsrc->keepalive_time > 0) {
-      struct timespec abstime;
-      pw_thread_loop_get_time(pwsrc->stream->core->loop, &abstime,
-                      pwsrc->keepalive_time * SPA_NSEC_PER_MSEC);
+      if (!have_abstime) {
+        /* Record the time we want to timeout at once, for this loop -- the loop might get unrelated signal()s,
+        * and we don't want the keepalive time to get reset by that */
+        pw_thread_loop_get_time(pwsrc->stream->core->loop, &abstime,
+            pwsrc->keepalive_time * SPA_NSEC_PER_MSEC);
+        have_abstime = TRUE;
+      }
       if (pw_thread_loop_timed_wait_full (pwsrc->stream->core->loop, &abstime) == -ETIMEDOUT)
         timeout = TRUE;
     } else {
@@ -1337,21 +1648,33 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
 
   if (update_time) {
     GstClock *clock;
-    GstClockTime pts, dts;
+    GstClockTime current_clock_time;
 
     clock = gst_element_get_clock (GST_ELEMENT_CAST (pwsrc));
     if (clock != NULL) {
-      pts = dts = gst_clock_get_time (clock);
+      current_clock_time = gst_clock_get_time (clock);
       gst_object_unref (clock);
     } else {
-      pts = dts = GST_CLOCK_TIME_NONE;
+      current_clock_time = GST_CLOCK_TIME_NONE;
     }
 
-    GST_BUFFER_PTS (*buffer) = pts;
-    GST_BUFFER_DTS (*buffer) = dts;
+    if (GST_CLOCK_TIME_IS_VALID (current_clock_time) &&
+        GST_CLOCK_TIME_IS_VALID (pwsrc->last_buffer_clock_time) &&
+        GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (*buffer)) &&
+        GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (*buffer))) {
+      GstClockTime diff;
+
+      diff = current_clock_time - pwsrc->last_buffer_clock_time;
+
+      GST_BUFFER_PTS (*buffer) += diff;
+      GST_BUFFER_DTS (*buffer) += diff;
+    } else {
+      GST_BUFFER_PTS (*buffer) = GST_BUFFER_DTS (*buffer) = current_clock_time;
+    }
 
     GST_LOG_OBJECT (pwsrc, "Sending keepalive buffer pts/dts: %" GST_TIME_FORMAT
-      " (%" G_GUINT64_FORMAT ")", GST_TIME_ARGS (pts), pts);
+      " (%" G_GUINT64_FORMAT ")", GST_TIME_ARGS (current_clock_time),
+      current_clock_time);
   }
 
   return GST_FLOW_OK;
@@ -1395,6 +1718,7 @@ gst_pipewire_src_stop (GstBaseSrc * basesrc)
   pwsrc->eos = false;
   gst_buffer_replace (&pwsrc->last_buffer, NULL);
   gst_caps_replace(&pwsrc->caps, NULL);
+  gst_caps_replace(&pwsrc->possible_caps, NULL);
   pwsrc->transform_value = UINT32_MAX;
   pw_thread_loop_unlock (pwsrc->stream->core->loop);
 
@@ -1447,12 +1771,21 @@ gst_pipewire_src_change_state (GstElement * element, GstStateChange transition)
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
       /* uncork and start recording */
+      GST_DEBUG_OBJECT (this, "activating stream");
+
       pw_thread_loop_lock (this->stream->core->loop);
       pw_stream_set_active (this->stream->pwstream, true);
+      /* if state have been paused for longer time, the underlying node might
+       * be moved from idle to suspended, which would mean format cleared via
+       * handle_format_change. Wait for new format to avoid basesrc calling
+       * create() and get not-negotiated error as response. */
+      if (wait_negotiated(this) == PW_STREAM_STATE_ERROR)
+        goto open_failed;
       pw_thread_loop_unlock (this->stream->core->loop);
       break;
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
       /* stop recording ASAP by corking */
+      GST_DEBUG_OBJECT (this, "in-activating stream");
       pw_thread_loop_lock (this->stream->core->loop);
       pw_stream_set_active (this->stream->pwstream, false);
       pw_thread_loop_unlock (this->stream->core->loop);

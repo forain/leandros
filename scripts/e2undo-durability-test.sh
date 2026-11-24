@@ -1,7 +1,7 @@
 #!/bin/sh
 # e2undo-durability-test.sh [aarch64|x86_64] -- host-side proof (no QEMU) that
 # ports/e2fsprogs' patched libext2fs.so.2 keeps resize2fs's undo file durable.
-# In an Alpine 3.21 container: shrink an ext4 image with data placed high under
+# In an Alpine 3.24 container: shrink an ext4 image with data placed high under
 # `resize2fs -z`, kill -9 it at several moments, `e2undo`, and compare the image
 # byte for byte with the first 1 GiB of the pre-image (the part a regular-file
 # truncate cannot destroy). Runs the stock lib (expected to be able to
