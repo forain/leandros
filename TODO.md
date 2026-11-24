@@ -125,7 +125,6 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - Every port/container script now takes its Alpine release from `ports/alpine/toolchain.lock` via `scripts/lib/alpine-release.sh` (ALPINE_REL / ALPINE_IMAGE, sourced by `scripts/container-lib.sh`): was 3.21 in mesa, nvk-tests, pipewire, gstreamer, portal, libflatpak, e2fsprogs, dualboot fixture, linuxcmp. Bumping `alpine-lock.py refresh` moves them all.
 - Mesa 25.3.6 source unchanged (3 LeandrOS patches apply clean); ship-set rebuilt on 3.24 (LLVM/clang 22, apk rust-bindgen + meson, no edge pin). gst-pipewire vendored sources rebased to 1.6.8 (data/gst-pipewire-1.6.8, sink pool wake-up fix re-applied; build fails loudly if Alpine's pipewire moves). e2fsprogs built with -std=gnu17 (gcc 15).
 - Open: stage aarch64 ship-set on 3.24 was built under qemu-user; real-GPU (laptop/PC/Pi) runs of the 3.24 stage not done.
-- 2026-11-22 lane runtmpfs: /run tmpfs + devpts owner/chown were already in the VFS; /var/run/<x> now resolves to /run in the VFS (read_cstr_raw), sudo-rs 0002/0005 and greetd 0003 patches dropped, syscalltest run_tmpfs + pts_owner_user added. Open: namespace tasks (path_args) do not get the /var/run rewrite; f2fs symlinks into intercepted trees (/run,/tmp) still ENOENT in the f2fs walk.
 
 - ffvanilla laptop step 2026-11-23: stock Firefox VA-API fails with RDD sandbox on (iHD readlink EACCES -> RDD respawn loop; works with MOZ_DISABLE_RDD_SANDBOX=1); find the readlink path and allow it; about:support/WebRender-on-iris still to confirm. See orch/handoff/ffvanilla.md.
 
