@@ -480,9 +480,9 @@ fn dad_probes(sid: Sid) -> u8 {
 }
 
 /// `/proc/net/if_inet6` lines of the initial namespace's tun/tap/veth/bridge links.
-pub(crate) fn proc_if_inet6(out: &mut impl core::fmt::Write) {
-    for a in addrs6(0) {
-        let name = sid_by_ifindex(0, a.index).and_then(|s| {
+pub(crate) fn proc_if_inet6(out: &mut impl core::fmt::Write, ns: u16) {
+    for a in addrs6(ns) {
+        let name = sid_by_ifindex(ns, a.index).and_then(|s| {
             let v = VIFS.lock();
             v[s as usize].as_ref().map(|x| alloc::string::String::from_utf8_lossy(&x.name[..name_len(&x.name)]).into_owned())
         }).unwrap_or_default();
