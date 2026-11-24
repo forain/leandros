@@ -1,30 +1,8 @@
-// LeandrOS default prefs for Alpine's Firefox (ports/firefox). Staged by
-// scripts/mkfs-f2fs-populated.py as /usr/lib/firefox/defaults/pref/leandros-prefs.js,
-// next to Alpine's channel-prefs.js; Firefox reads every .js file there as a
-// default pref, so a profile can still override any of these.
-
-// GPU rendering only: hardware WebRender on our Mesa (zink, iris or virgl), forced
-// past the GPU blocklist, with the software-WebRender fallback disabled.
-pref("gfx.webrender.all", true);
-pref("gfx.webrender.software", false);
-pref("gfx.webrender.fallback.software", false);
-pref("layers.acceleration.force-enabled", true);
-pref("media.hardware-video-decoding.enabled", false);
-pref("media.ffmpeg.vaapi.enabled", false);
-
-// The content sandbox keeps Firefox's default level; /bin/firefox decides
-// whether the sandboxes are on (LEANDROS_FIREFOX_SANDBOX=0 turns them off).
-
-// JIT code W^X in content processes too. The kernel refuses a mapping that is
-// writable and executable at once, and with this off a content process's JIT
-// commits its code pages RWX, fails, and dies at startup in MOZ_CRASH(OOM).
-// The parent process always writes code W^X.
-pref("javascript.options.content_process_write_protect_code", true);
-
-// Bring-up: as few processes as Firefox allows.
-pref("fission.autostart", false);
-pref("dom.ipc.processCount", 1);
-pref("dom.ipc.processPrelaunch.enabled", false);
+// LeandrOS I/O and churn tuning for Alpine's Firefox (ports/firefox). Staged by
+// scripts/mkfs-f2fs-populated.py as /usr/lib/firefox/defaults/pref/leandros-tuning.js
+// beside leandros-policy.js. Nothing here touches rendering, media or process
+// model: those are Firefox's stock defaults. Only slow-storage / no-network
+// startup behaviour (root is F2FS on a USB stick) lives here.
 
 // Nothing on startup that needs the network or a service we do not have.
 pref("browser.startup.page", 0);
@@ -32,11 +10,6 @@ pref("browser.startup.homepage_override.mstone", "ignore");
 pref("browser.aboutwelcome.enabled", false);
 pref("browser.shell.checkDefaultBrowser", false);
 pref("browser.sessionstore.resume_from_crash", false);
-pref("app.update.auto", false);
-pref("app.update.enabled", false);
-pref("datareporting.policy.dataSubmissionEnabled", false);
-pref("datareporting.healthreport.uploadEnabled", false);
-pref("toolkit.telemetry.enabled", false);
 pref("network.captive-portal-service.enabled", false);
 pref("network.connectivity-service.enabled", false);
 pref("toolkit.startup.max_resumed_crashes", -1);
@@ -91,7 +64,6 @@ pref("urlclassifier.trackingTable", "");
 pref("urlclassifier.trackingAnnotationTable", "");
 pref("browser.urlbar.quicksuggest.enabled", false);
 // Telemetry, health report, crash reports, studies: off.
-pref("toolkit.telemetry.unified", false);
 pref("toolkit.telemetry.archive.enabled", false);
 pref("toolkit.telemetry.newProfilePing.enabled", false);
 pref("toolkit.telemetry.shutdownPingSender.enabled", false);
@@ -138,10 +110,3 @@ pref("media.gmp-manager.url", "");
 // every ~5 s). The certificates only help TLS servers that send an incomplete
 // chain; correctly configured sites (YouTube, Google, ...) do not need them.
 pref("security.remote_settings.intermediates.enabled", false);
-
-// VA-API hardware video decode (lane ffvaapi). On x86_64 Intel the iHD driver
-// is shipped and /bin/firefox selects it. On aarch64 there is no iHD, so
-// VA-API init fails and Firefox keeps software decode.
-pref("media.hardware-video-decoding.enabled", true);
-pref("media.ffmpeg.vaapi.enabled", true);
-pref("media.hardware-video-decoding.force-enabled", true);
