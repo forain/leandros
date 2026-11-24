@@ -246,6 +246,7 @@ pub fn addr_msg(l: &Link, a: [u8; 4], prefix: u8, seq: u32, pid: u32) -> Vec<u8>
     v
 }
 
+const IF_RS_SENT: u32 = 0x10;
 const IF_RA_RCVD: u32 = 0x20;
 const IF_READY: u32 = 0x8000_0000;
 
@@ -257,6 +258,8 @@ pub fn inet6_flags(addrs: &[A6], index: u32) -> u32 {
     if addrs.iter().any(|a| a.index == index && a.addr[0] == 0xfe && a.addr[1] & 0xc0 == 0x80 && a.flags & 0x40 == 0) { f |= IF_READY; }
     #[cfg(not(test))]
     if index >= 2 && super::ip6::ra_rcvd((index - 2) as usize) { f |= IF_RA_RCVD; }
+    #[cfg(not(test))]
+    if index >= 2 && super::ip6::rs_was_sent((index - 2) as usize) { f |= IF_RS_SENT; }
     f
 }
 
