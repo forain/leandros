@@ -20,6 +20,15 @@ use std::time::{Duration, Instant};
 const SLOW_S: u64 = 40;
 const CAP_S: u64 = 120;
 
+struct Obj;
+
+#[zbus::interface(name = "org.leandros.ActTest")]
+impl Obj {
+    fn hello(&self) -> bool {
+        true
+    }
+}
+
 pub(crate) async fn claim(address: &str, name: &str, mode: &str) -> bool {
     if mode == "exit" {
         std::process::exit(3);
@@ -37,7 +46,7 @@ pub(crate) async fn claim(address: &str, name: &str, mode: &str) -> bool {
     if delay == u64::MAX {
         return true; // "never": stay alive without claiming until busd goes away or the cap passes
     }
-    let conn = match zbus::connection::Builder::address(address).and_then(|b| b.name(name.to_owned())) {
+    let conn = match zbus::connection::Builder::address(address).and_then(|b| b.name(name.to_owned())).and_then(|b| b.serve_at("/", Obj)) {
         Ok(b) => match b.build().await {
             Ok(c) => c,
             Err(e) => {
@@ -69,6 +78,7 @@ async fn ping(addr: &str, name: &str) -> (Result<(), (String, String)>, Duration
         }
     }
     .await;
+    eprintln!("act-test: {name} -> {r:?} after {:.1}s", t0.elapsed().as_secs_f32());
     (r, t0.elapsed())
 }
 
