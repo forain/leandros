@@ -389,7 +389,9 @@ fn test_tcp_dup_syn_prefers_connection_over_listener() {
     let mut l = tcp_socket();
     l.listen(80).unwrap();
     let l = sockets.add(l);
-    assert_eq!(l, ph);
+    // LEANDROS: handles carry a slot generation (stale-handle hardening), so the reused
+    // slot is a different handle; the slot index is what Display prints.
+    assert_eq!(l.to_string(), ph.to_string());
     // The same SYN again.
     deliver_tcp(&mut iface, &mut sockets, &syn);
     assert_eq!(sockets.get::<tcp::Socket>(l).state(), tcp::State::Listen);
