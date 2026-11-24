@@ -51,6 +51,8 @@ fresh_stick() { dfguard; rm -f "${STICK:?}"; clone_cp "$WORK/stick.base" "$STICK
 
 boot_vm() { # <log> <run-qemu args...>
     local log="$WORK/$1.log"; shift
+    # The hashed port can be taken by another lane's VM: walk up to the first free one.
+    while python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)"; do PORT=$((PORT + 1)); done
     echo "127.0.0.1 $PORT" > "$STATE"; rm -f "$QMP"
     LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu "$@" -display none \
         -qmp "unix:$QMP,server=on,wait=off" > "$log" 2>&1 < /dev/null &
