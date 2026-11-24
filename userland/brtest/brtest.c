@@ -1946,8 +1946,9 @@ static void nn_case(const char *name, int mode) {
          * FIN_WAIT1/LAST_ACK; a userspace socket holds its netns (sk_alloc: sk_net_refcnt=1, get_net_track,
          * net/core/sock.c:2233-2235 v6.12), so cleanup_net (net_namespace.c:569, queued from __put_net :669) cannot run, and the
          * veth peer stays, until tcp_orphan_retries (8 when unset, tcp_timer.c:159-160) retransmits are spent: measured
-         * ~104 s on Linux 7.2 in `unshare -Urnm`. Ours frees the stacks and the peer ~1.1 s after the server exits (finish_dying
-         * grace, vif.rs), i.e. earlier than Linux. The host end would own the name vethN for the next case on Linux,
+         * ~104 s on Linux 7.2 in `unshare -Urnm`.
+         * The cause of the failure seen without this delete (next case still finding vethN after its 5 s wait) is not established:
+         * an isolated measurement of ours shows vethN gone ~1.1 s after the server exits. The next case needs the name free,
          * so delete it explicitly, which removes the peer as well. */
         int vi = link_get(s, "vethN", NULL, NULL);
         if (vi > 0) link_del(s, vi);
