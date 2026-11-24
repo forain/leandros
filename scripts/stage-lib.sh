@@ -1,4 +1,4 @@
-# Race-free staging into SHARED output dirs (e.g. ../leandros-artifacts/m6-session-bins/out)
+# Race-free staging into output dirs (per-tree target/m6-out, see scripts/lib/m6out.sh)
 # written by concurrent worktree builds. Source it; call: stage_file <mode> <src> <dst>
 # Writes a unique temp file in dst's directory, then rename(2)s it over dst, so
 # concurrent stagers never see "File exists" and readers never see a partial file.
