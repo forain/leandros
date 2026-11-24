@@ -35,21 +35,14 @@ stage_alpine() {
     [ -d "$d" ] || continue
     MNT="$MNT -v $d:/imglib/$n:ro"; n=$((n + 1))
   done
-  # Concurrent builds on one host (shared podman storage, mirrors) can lose a
-  # container start without a trace (log = only the rc line); retry those.
-  _try=1
-  while :; do
-    # shellcheck disable=SC2086
-    leandros_alpine_run --arch "$PLAT" $MNT -v "$SNAP:/src:ro" -v "$OUT:/out" \
-        -- sh /src/build-in-alpine.sh "$ARCH" > "$OUT/$ARCH.alpine.log" 2>&1 || true
-    tail -1 "$OUT/$ARCH.alpine.log" | grep -q '=== rc=0 ' && break
-    [ "$_try" -ge 3 ] && break
-    echo "libflatpak $ARCH: staging attempt $_try failed, retrying" >&2
-    cp "$OUT/$ARCH.alpine.log" "$OUT/$ARCH.alpine.log.try$_try" 2>/dev/null || true
-    sleep $((_try * 5 + $$ % 7)); _try=$((_try + 1))
-  done
+  # leandros_alpine_stage retries container-start losses (shared podman storage,
+  # mirrors) and keeps every failed attempt's log as $OUT/$ARCH.alpine.log.tryN.
+  _rc=0
+  # shellcheck disable=SC2086
+  leandros_alpine_stage "$OUT/$ARCH.alpine.log" --arch "$PLAT" $MNT -v "$SNAP:/src:ro" -v "$OUT:/out" \
+      -- sh /src/build-in-alpine.sh "$ARCH" || _rc=1
   rm -rf "$SNAP"
-  tail -1 "$OUT/$ARCH.alpine.log" | grep -q '=== rc=0 '
+  return $_rc
 }
 
 rc=0

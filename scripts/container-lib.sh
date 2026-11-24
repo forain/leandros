@@ -87,9 +87,16 @@ leandros_pick_container() {
 # leandros_port_srchash PORTDIR: content hash of every file of the port outside
 # out/ (paths + bytes, mtime-independent: a fresh git checkout touches every file).
 leandros_port_srchash() {
+  # An Alpine-staged port (has build-in-alpine.sh) is also a function of the
+  # image's Alpine lock (release + pins): fold its hash in, so a release bump can
+  # never reuse a tree built from the old one.
+  _ps_lock=""
+  if [ -f "$1/build-in-alpine.sh" ] && [ -f "$1/../alpine/toolchain.lock" ]; then
+    _ps_lock=$( { sha256sum "$1/../alpine/toolchain.lock" 2>/dev/null || shasum -a 256 "$1/../alpine/toolchain.lock"; } | cut -d' ' -f1)
+  fi
   ( cd "$1" && { if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && [ -n "$(git ls-files . | head -n 1)" ]; then
         git ls-files . | grep -v '^out/' | sed 's|^|./|'; else find . -path ./out -prune -o -type f -print; fi; } | LC_ALL=C sort \
-      | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done \
+      | { while IFS= read -r f; do printf '%s\n' "$f"; cat "$f"; done; [ -z "$_ps_lock" ] || printf 'alpine-lock %s\n' "$_ps_lock"; } \
       | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1 )
 }
 
@@ -342,10 +349,56 @@ leandros_alpine_run() {
     if [ "$_ar_image" = "$ALPINE_IMAGE" ]; then
       _ar_image=$(leandros_alpine_image "${_ar_arch:-}") || return 1
     fi
-    eval "\"\$CT\" run --rm $_ar_plat $_ar_cenv $_ar_cmnt $(_leandros_q "$_ar_image") \"\$@\""
+    # Shared package cache (apk packages+indexes per release, verified source
+    # tarballs); see net_apk / net_fetch_verified in scripts/lib/netretry.sh.
+    # LEANDROS_PKGCACHE=<dir> moves it, LEANDROS_PKGCACHE_OFF=1 disables it,
+    # LEANDROS_OFFLINE=1 forbids the network inside the build,
+    # LEANDROS_CT_ARGS adds extra `run` arguments (e.g. "--network=none --name X").
+    if [ "${LEANDROS_PKGCACHE_OFF:-0}" != 1 ]; then
+      _ar_pc=${LEANDROS_PKGCACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/leandros-pkgcache}
+      if mkdir -p "$_ar_pc/apk/$ALPINE_REL" "$_ar_pc/distfiles" 2>/dev/null; then
+        _ar_cmnt="$_ar_cmnt -v $(_leandros_q "$_ar_pc/apk/$ALPINE_REL:/apkcache") -v $(_leandros_q "$_ar_pc/distfiles:/distfiles")"
+      fi
+    fi
+    [ -z "${LEANDROS_OFFLINE:-}" ] || _ar_cenv="$_ar_cenv -e LEANDROS_OFFLINE=$LEANDROS_OFFLINE"
+    eval "\"\$CT\" run --rm ${LEANDROS_CT_ARGS:-} $_ar_plat $_ar_cenv $_ar_cmnt $(_leandros_q "$_ar_image") \"\$@\""
     return
   fi
   _leandros_alpine_run_local "$@"
+}
+
+# leandros_alpine_stage LOG [leandros_alpine_run args] -- CMD...
+# The one way a port runs its Alpine staging step. CMD must print
+# '=== rc=N arch=A ===' as its last line (rc=0 = success); LOG receives its
+# output. A container that dies without a trace (shared storage races, a hung
+# mirror) is retried up to LEANDROS_STAGE_TRIES (3) times with a pause; every
+# failed attempt's log is KEPT as LOG.tryN. After the last failure it returns 1
+# with a plain final message (port, what failed, how to read the log) on
+# stderr; it never returns 0 for a step whose log does not end in rc=0, so the
+# caller cannot ship a stale or half-written tree.
+leandros_alpine_stage() {
+  _as_log=$1; shift
+  _as_max=${LEANDROS_STAGE_TRIES:-3}; _as_try=1
+  while :; do
+    leandros_alpine_run "$@" > "$_as_log" 2>&1 || true
+    tail -n 1 "$_as_log" | grep -q '^=== rc=0 ' && return 0
+    cp "$_as_log" "$_as_log.try$_as_try" 2>/dev/null || true
+    # a deterministic failure (not a lost container or network) is not retried
+    if grep -qE 'unable to select packages|unsatisfiable constraints|UNTRUSTED|sha256 mismatch|not in the distfile cache' "$_as_log" \
+       && ! grep -qiE 'netretry:|temporary error|network|Could not resolve|DNS' "$_as_log"; then
+      break
+    fi
+    [ "$_as_try" -lt "$_as_max" ] || break
+    echo "leandros_alpine_stage: attempt $_as_try of $_as_max failed (log kept: $_as_log.try$_as_try), retrying" >&2
+    sleep $((_as_try * 5 + $$ % 7)); _as_try=$((_as_try + 1))
+  done
+  echo "ERROR: Alpine staging step failed after $_as_try attempt(s); last lines of $_as_log:" >&2
+  grep -m 4 -E 'ERROR' "$_as_log" | sed 's/^/    first errors: /' >&2
+  tail -n 8 "$_as_log" | sed 's/^/    /' >&2
+  grep -qE "ERROR: .*(cannot download|not in the distfile cache)|network error|DNS|Could not resolve|temporary error" "$_as_log" \
+    && echo "  cause looks like NETWORK: warm the cache once online (LEANDROS_PKGCACHE=${LEANDROS_PKGCACHE:-~/.cache/leandros-pkgcache}) or build with LEANDROS_OFFLINE=1 only after a warm run" >&2
+  echo "  logs: $_as_log and $_as_log.try1.. (kept)" >&2
+  return 1
 }
 
 _leandros_alpine_run_local() {

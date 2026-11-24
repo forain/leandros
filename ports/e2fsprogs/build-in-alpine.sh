@@ -112,11 +112,12 @@ esac
   # same 1.47.1 source with patches/undo-durable.patch and use it instead.
   E2V=1.47.1
   TARB=/out/e2fsprogs-$E2V.tar.xz
-  if [ ! -s "$TARB" ]; then
-    apk add --no-cache wget xz ca-certificates >/dev/null
-    net_wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
-    mv "$TARB.part" "$TARB"
-  fi
+  # sha256 pinned here (kernel.org's e2fsprogs-1.47.1.tar.xz); net_fetch_verified
+  # reuses TARB or the shared distfile cache when it matches, else downloads and
+  # refuses a file that does not.
+  E2SHA=5a33dc047fd47284bca4bb10c13cfe7896377ae3d01cb81a05d406025d99e0d1
+  apk add --no-cache wget xz ca-certificates >/dev/null
+  net_fetch_verified "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz" "$TARB" "$E2SHA" || exit 1
   apk add --no-cache xz patch make pkgconf linux-headers util-linux-dev >/dev/null
   [ "$(uname -m)" = "$ARCH" ] || $APK add --no-cache util-linux-dev >/dev/null
   B=/tmp/e2fs-build-$ARCH
