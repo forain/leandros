@@ -496,6 +496,9 @@ SUITES = {
              "host:f2fsfulltest.py", "host:trialwatchtest.py"],
     "rootpick": ["host:rootpicktest.py"],
     "cmdline": ["host:cmdlinetest.py"],
+    # Dead local LAPIC tick (lane deadtimer): the kernel stalls 15 ms inside the one-shot -> periodic
+    # switch on cpu1 (x86_64; own boot via cmdline timer.dead_delay=1); the CPU's tick must survive.
+    "deadtimer": ["/bin/timertest deadtick"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
@@ -918,6 +921,8 @@ def main(argv):
         cmds += SUITES[s]
     if "nitrox86" in suites:
         os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
+    if "deadtimer" in suites and cmdline is None:
+        cmdline = "timer.dead_delay=1"
     if "pidnszap" in suites and cmdline is None:
         cmdline = "pidns.zaptest=1"
     if "i915fake" in suites and cmdline is None:
