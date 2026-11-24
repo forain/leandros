@@ -2082,7 +2082,7 @@ unsafe fn wait_releases_memory(noise: bool) -> bool {
     let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE,
         MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
     if shared as isize == -1 { return report(name, false); }
-    for _ in 0..20 {
+    for _ in 0..60 {
         core::ptr::write_volatile(shared, 0);
         // An observer hammers the child's /proc files while it faults its
         // pages in and exits: a reader still holding the child's address
@@ -2152,7 +2152,7 @@ unsafe fn wait_releases_memory(noise: bool) -> bool {
     }
     if noisy > 0 { syscall2(nr::KILL, noisy as usize, 9); wait_status(noisy); }
     write(STDOUT_FILENO, b"  min_short_freed=".as_ptr(), 18); print_dec(min_freed);
-    write(STDOUT_FILENO, b" worst_lost_pages(info)=".as_ptr(), 25); print_dec(worst);
+    write(STDOUT_FILENO, b" worst_lost_pages(info)=".as_ptr(), 24); print_dec(worst);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, ok)
 }
