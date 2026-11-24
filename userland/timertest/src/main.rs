@@ -149,6 +149,7 @@ pub struct pollfd {
 }
 
 extern "C" {
+    pub fn sched_setaffinity(pid: c_int, size: usize, mask: *const c_void) -> c_int;
 
     pub fn puts(s: *const u8) -> i32;
     pub fn write(fd: i32, buf: *const u8, count: usize) -> isize;
@@ -207,8 +208,14 @@ pub type pthread_t = *mut c_void;
 
 
 #[no_mangle]
-pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
     let mut failures = 0;
+
+    // `timertest deadtick`: only the dead-local-tick test (needs the kernel
+    // command line `timer.dead_delay=<cpu>`; run by runtests suite deadtimer).
+    if argc > 1 && *(*argv.add(1)) == b'd' {
+        return if test_dead_local_tick() { 0 } else { 1 };
+    }
 
     if !test_timer_create_delete_slot_zero() { failures += 1; }
     if !test_timer_oneshot_signal_delivery() { failures += 1; }
@@ -1351,6 +1358,106 @@ unsafe fn test_timerfd_cancel_on_set() -> bool {
             | (quiet1 as u64) << 7 | (stepped_back as u64) << 8 | (b_ok as u64) << 9 | (quiet2 as u64) << 10);
     }
     report(name, ok)
+}
+
+// ── Dead local tick (program_periodic one-shot window) ──────────────────────
+//
+// With `timer.dead_delay=<cpu>` the kernel stalls 15 ms once between the two
+// LAPIC writes of its next one-shot -> periodic switch on that CPU. Unfixed,
+// the CPU's tick never comes back. Poll deadlines pinned to that CPU provoke
+// the switch; afterwards its per-CPU interrupt count (/proc/leandros_timer)
+// must keep rising at ~100 Hz. Skips (passes) where the line is absent.
+
+unsafe fn slurp(path: &[u8], buf: &mut [u8]) -> usize {
+    let fd = open(path.as_ptr(), 0);
+    if fd < 0 { return 0; }
+    let mut n = 0;
+    loop {
+        let r = read(fd, buf.as_mut_ptr().add(n), buf.len() - n);
+        if r <= 0 { break; }
+        n += r as usize;
+        if n == buf.len() { break; }
+    }
+    close(fd);
+    n
+}
+
+/// Field `idx` (0 = first number) of the `key` line, or None.
+fn field_of(buf: &[u8], key: &[u8], idx: usize) -> Option<u64> {
+    let mut i = 0;
+    while i + key.len() < buf.len() {
+        if (i == 0 || buf[i - 1] == b'\n') && &buf[i..i + key.len()] == key && buf[i + key.len()] == b' ' {
+            let mut j = i + key.len();
+            let mut k = 0;
+            loop {
+                while j < buf.len() && buf[j] == b' ' { j += 1; }
+                let mut v = 0u64;
+                let st = j;
+                while j < buf.len() && buf[j].is_ascii_digit() { v = v * 10 + (buf[j] - b'0') as u64; j += 1; }
+                if j == st { return None; }
+                if k == idx { return Some(v); }
+                k += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+unsafe fn local_irqs(cpu: usize) -> Option<u64> {
+    let mut b = [0u8; 4096];
+    let n = slurp(b"/proc/leandros_timer\0", &mut b);
+    let mut key = *b"cpuN irqs";
+    if cpu > 9 { return None; }
+    key[3] = b'0' + cpu as u8;
+    field_of(&b[..n], &key, 0)
+}
+
+unsafe fn dead_delay_cpu() -> Option<usize> {
+    let mut b = [0u8; 4096];
+    let n = slurp(b"/proc/cmdline\0", &mut b);
+    let key = b"timer.dead_delay=";
+    let mut i = 0;
+    while i + key.len() < n {
+        if &b[i..i + key.len()] == key {
+            let mut v = 0usize;
+            let mut j = i + key.len();
+            while j < n && b[j].is_ascii_digit() { v = v * 10 + (b[j] - b'0') as usize; j += 1; }
+            return Some(v);
+        }
+        i += 1;
+    }
+    None
+}
+
+unsafe fn pin(cpu: usize) {
+    let m: u64 = 1u64 << cpu;
+    sched_setaffinity(0, 8, &m as *const u64 as *const c_void);
+}
+
+unsafe fn test_dead_local_tick() -> bool {
+    let name = b"dead_local_tick\0";
+    let c = match dead_delay_cpu() { Some(c) => c, None => return report(name, true) };
+    if local_irqs(c).is_none() { return report(name, true); } // aarch64 / no such CPU
+    let other = if c == 0 { 1 } else { 0 };
+    pin(other);
+    let child = fork();
+    if child == 0 {
+        pin(c);
+        // Short poll deadlines: each takes the CPU through a one-shot and back
+        // to periodic mode, where the stalled switch happens.
+        for _ in 0..300 { sleep_ms(2); }
+        // Then a nearly idle CPU: only its periodic tick can fire now.
+        loop { sleep_ms(200); }
+    }
+    sleep_ms(1500);
+    let a = local_irqs(c).unwrap_or(0);
+    sleep_ms(1000);
+    let b = local_irqs(c).unwrap_or(0);
+    kill(child, 9);
+    waitpid(child, core::ptr::null_mut(), 0);
+    print_kv(b"dead_local_tick: irqs in 1s = \0", b.wrapping_sub(a));
+    report(name, b.wrapping_sub(a) >= 50)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

@@ -1,9 +1,9 @@
-//! Hook-backed `/sys/class/power_supply` and `/sys/class/backlight`.
+//! Hook-backed `/sys/class/power_supply`, `/sys/class/backlight` and `/sys/class/leds`.
 //!
 //! The VFS cannot depend on the drivers, so the kernel registers an [`Ops`]
 //! table (see `drivers::power_sysfs`). The overlay is NARROW ON PURPOSE (the
 //! 2026-09-15 /sys shadowing regression blacked out the desktop): only these
-//! two class directories, and only while a table is registered AND reports at
+//! few class directories, and only while a table is registered AND reports at
 //! least one device in that class. Otherwise every path resolves exactly as
 //! before (the on-disk /sys).
 //!
@@ -19,7 +19,7 @@ pub const LVL_SC_CLASS: u8 = 0xE0;
 pub const LVL_SC_DEV: u8 = 0xE1;
 pub const NAME_LEN: usize = 32;
 
-const CLASSES: [&str; 4] = ["power_supply", "backlight", "rtc", "power"];
+const CLASSES: [&str; 5] = ["power_supply", "backlight", "rtc", "power", "leds"];
 /// Index of the pseudo class served directly under `/sys/power` (files, no devices).
 const POWER: usize = 3;
 
@@ -142,7 +142,7 @@ pub const VIDEO_GID: u32 = 44;
 /// The only sysclass attribute group `video` may write.
 pub fn is_video_writable(path: &[u8]) -> bool {
     let Some(s) = split(path) else { return false };
-    if CLASSES[s.cls] != "backlight" || s.attr != Some("brightness") { return false; }
+    if !matches!(CLASSES[s.cls], "backlight" | "leds") || s.attr != Some("brightness") { return false; }
     is_writable(path)
 }
 
@@ -509,8 +509,8 @@ fn normalize(p: &[u8]) -> alloc::vec::Vec<u8> {
 // its roots through `dir`/`dirent`, so every directory any overlay module can
 // resolve names its own path with no per-module inverse to keep in sync.
 
-const ROOTS: [&[u8]; 12] = [
-    b"/sys/class/power_supply", b"/sys/class/backlight", b"/sys/class/rtc", b"/sys/power",
+const ROOTS: [&[u8]; 13] = [
+    b"/sys/class/power_supply", b"/sys/class/backlight", b"/sys/class/leds", b"/sys/class/rtc", b"/sys/power",
     b"/sys/devices/system/cpu", b"/sys/devices/cpu", b"/sys/firmware/acpi/tables",
     b"/sys/class/drm", b"/sys/class/input", b"/sys/dev/char", b"/sys/dev/char/226:0", b"/sys/dev/block",
 ];

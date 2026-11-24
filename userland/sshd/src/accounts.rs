@@ -578,3 +578,168 @@ pub fn trusted_cas(file: &str) -> Vec<PublicKey> {
         .filter_map(|l| PublicKey::from_openssh(l).ok())
         .collect()
 }
+
+/// Token values for `AuthorizedPrincipalsCommand` (`%%` needs none).
+pub struct CmdTokens<'a> {
+    pub user: &'a User,
+    pub cert: &'a russh::keys::Certificate,
+    pub conn_id: String,
+}
+
+fn b64_of(line: &str) -> String {
+    line.split_whitespace().nth(1).unwrap_or("").to_string()
+}
+
+fn expand_cmd_token(c: char, t: &CmdTokens) -> Result<String, String> {
+    use russh::keys::{HashAlg, PublicKey};
+    let ca = PublicKey::from(t.cert.signature_key().clone());
+    Ok(match c {
+        '%' => "%".into(),
+        'C' => t.conn_id.clone(),
+        'D' => "default".into(),
+        'F' => ca.fingerprint(HashAlg::Sha256).to_string(),
+        'f' => PublicKey::from(t.cert.public_key().clone()).fingerprint(HashAlg::Sha256).to_string(),
+        'h' => t.user.home.clone(),
+        'i' => t.cert.key_id().to_string(),
+        'K' => b64_of(&ca.to_openssh().map_err(|e| e.to_string())?),
+        'k' => b64_of(&t.cert.to_openssh().map_err(|e| e.to_string())?),
+        's' => t.cert.serial().to_string(),
+        'T' => ca.algorithm().to_string(),
+        't' => t.cert.algorithm().to_certificate_type().to_string(),
+        'U' => t.user.uid.to_string(),
+        'u' => t.user.name.clone(),
+        other => return Err(format!("unsupported token %{other} in AuthorizedPrincipalsCommand")),
+    })
+}
+
+/// Split `cmd` on whitespace (double quotes group), then expand `%` tokens in every word.
+pub fn expand_command(cmd: &str, t: &CmdTokens) -> Result<Vec<String>, String> {
+    let mut words: Vec<String> = Vec::new();
+    let (mut cur, mut inq, mut have) = (String::new(), false, false);
+    for c in cmd.chars() {
+        match c {
+            '"' => {
+                inq = !inq;
+                have = true;
+            }
+            c if c.is_whitespace() && !inq => {
+                if have {
+                    words.push(std::mem::take(&mut cur));
+                    have = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                have = true;
+            }
+        }
+    }
+    if have {
+        words.push(cur);
+    }
+    let mut out = Vec::new();
+    for w in words {
+        let mut s = String::new();
+        let mut it = w.chars();
+        while let Some(c) = it.next() {
+            if c == '%' {
+                s.push_str(&expand_cmd_token(it.next().ok_or("trailing % in AuthorizedPrincipalsCommand")?, t)?);
+            } else {
+                s.push(c);
+            }
+        }
+        out.push(s);
+    }
+    if out.is_empty() {
+        return Err("empty command".into());
+    }
+    Ok(out)
+}
+
+/// The command and every directory above it must be root-owned and not group/other writable.
+fn safe_command_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{}: not an absolute path", path.display()));
+    }
+    let mut p: Option<&Path> = Some(path);
+    while let Some(cur) = p {
+        let md = fs::metadata(cur).map_err(|e| format!("{}: {e}", cur.display()))?;
+        if md.uid() != 0 || md.mode() & 0o022 != 0 {
+            return Err(format!("{}: unsafe ownership or modes ({:o})", cur.display(), md.mode() & 0o7777));
+        }
+        p = cur.parent();
+    }
+    Ok(())
+}
+
+/// Run `argv` as `runas` (stdin null, stderr dropped, 10 s limit, 64 KiB of output); its stdout on success.
+pub fn run_command_as(runas: &User, argv: &[String]) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    safe_command_path(Path::new(&argv[0]))?;
+    let groups = groups_of(runas);
+    let (uid, gid) = (runas.uid, runas.gid);
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(move || {
+            if uid != 0
+                && (libc::setgroups(groups.len() as _, groups.as_ptr()) != 0
+                    || libc::setresgid(gid, gid, gid) != 0
+                    || libc::setresuid(uid, uid, uid) != 0)
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", argv[0]))?;
+    let mut out = child.stdout.take().ok_or("no stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut out).take(65536).read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{}: timed out", argv[0]));
+            }
+        }
+    };
+    let buf = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("{}: {status}", argv[0]));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Like [`principals_match`], on the text a command printed (no StrictModes: no file).
+pub fn principals_match_text(user: &User, text: &str, cert_principals: &[String]) -> Option<KeyOpts> {
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let (opts, names) = if line.split_whitespace().count() > 1 { split_options(line) } else { ("", line) };
+        let o = match parse_options(opts) {
+            Ok(o) => o,
+            Err(why) => {
+                crate::log(&format!("principals command of {}: line skipped: {why}", user.name));
+                continue;
+            }
+        };
+        if cert_principals.iter().any(|p| p == names.trim()) {
+            return Some(o);
+        }
+    }
+    None
+}

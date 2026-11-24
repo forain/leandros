@@ -1321,6 +1321,81 @@ unsafe fn test_socket_alias_epoll_close() -> bool {
     report(name, ok)
 }
 
+/// A fresh connect() that the listener has not accept()ed yet is already
+/// established (Linux), so SCM_RIGHTS must pass it. Many rounds of
+/// connect -> immediately send the new fd -> receive -> data over the received
+/// copy -> accept, with a mix of close orders. Used to fail EBADF.
+unsafe fn test_pass_pending_connect() -> bool {
+    let name = b"pass_pending_connect";
+    let (addr, alen) = sockaddr_un::from_abstract(b"scm-pending-pass");
+    let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let mut ok = l >= 0 && raw_bind(l, &addr, alen) == 0 && raw_listen(l, 16) == 0;
+    let mut carrier = [-1i32; 2];
+    ok &= raw_socketpair(AF_UNIX, SOCK_STREAM, 0, carrier.as_mut_ptr()) == 0;
+    let mut i = 0;
+    while ok && i < 3000 {
+        if i % 250 == 0 { dbg1(b"[pend] round %d\n\0", i as i64); }
+        let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+        if c < 0 || raw_connect(c, &addr, alen) != 0 { ok = false; break; }
+        let r = send_fd_and_byte(carrier[0], c, b'x');
+        if r < 0 { dbg1(b"[pend] iter %d: sendmsg failed\n\0", i as i64); ok = false; close(c); break; }
+        let (n, _, got, _) = recv_fd_and_byte(carrier[1], 32, 0);
+        if n != 1 || got < 0 { ok = false; close(c); break; }
+        if i % 3 == 0 { close(c); }
+        let a = raw_accept(l);
+        if a < 0 { ok = false; if i % 3 != 0 { close(c); } close(got); break; }
+        if write(got, b"y".as_ptr(), 1) != 1 { ok = false; }
+        let mut rb = [0u8; 1];
+        if read(a, rb.as_mut_ptr(), 1) != 1 || rb[0] != b'y' { ok = false; }
+        if i % 3 != 0 { close(c); }
+        close(got); close(a);
+        i += 1;
+    }
+    close(carrier[0]); close(carrier[1]); close(l);
+    report(name, ok)
+}
+
+/// A connection passed by SCM_RIGHTS before accept(), original closed, then
+/// the listener closed unaccepted: the holder of the passed copy must see the
+/// reset/EOF like on Linux, not wait forever (`unix_listener_gone` used to
+/// reset only the connector's own table entry, which the closed original no
+/// longer was).
+unsafe fn test_pass_pending_listener_close() -> bool {
+    let name = b"pass_pending_listener_close";
+    let (addr, alen) = sockaddr_un::from_abstract(b"scm-pending-lclose");
+    let l = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let mut ok = l >= 0 && raw_bind(l, &addr, alen) == 0 && raw_listen(l, 4) == 0;
+    let mut carrier = [-1i32; 2];
+    ok &= raw_socketpair(AF_UNIX, SOCK_STREAM, 0, carrier.as_mut_ptr()) == 0;
+    let c = raw_socket(AF_UNIX, SOCK_STREAM, 0);
+    let mut got = -1;
+    if ok && (c < 0 || raw_connect(c, &addr, alen) != 0) { ok = false; }
+    if ok {
+        if send_fd_and_byte(carrier[0], c, b'x') < 0 { ok = false; }
+        let (n, _, g, _) = recv_fd_and_byte(carrier[1], 32, 0);
+        if n != 1 || g < 0 { ok = false; } else { got = g; }
+    }
+    if c >= 0 { close(c); }
+    close(l);
+    if ok {
+        // EOF (0) or a reset (negative, not EAGAIN) within 3 s; EAGAIN throughout = hang.
+        let mut hung = true;
+        let mut t = 0;
+        while t < 60 {
+            let mut b = [0u8; 1];
+            let r = syscall6(nr::RECVFROM, got as usize, b.as_mut_ptr() as usize, 1, MSG_DONTWAIT as usize, 0, 0);
+            if r == 0 || (r < 0 && r != -11) { hung = false; break; }
+            sleep_ms(50);
+            t += 1;
+        }
+        if hung { dbg0(b"[lclose] passed copy still waiting after listener close\n\0"); }
+        ok = !hung;
+    }
+    if got >= 0 { close(got); }
+    close(carrier[0]); close(carrier[1]);
+    report(name, ok)
+}
+
 unsafe fn test_mincore() -> bool {
     let name = b"mincore";
     let page = 4096usize;
@@ -1443,6 +1518,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, envp: *const *c
     if !test_fork_dup2_low_exec() { failures += 1; }
     if !test_socket_alias_epoll_close() { failures += 1; }
     if !test_pass_connected_socket() { failures += 1; }
+    if !test_pass_pending_connect() { failures += 1; }
+    if !test_pass_pending_listener_close() { failures += 1; }
     if !test_seqpacket_short_path() { failures += 1; }
     if !test_seqpacket_short_path_forked() { failures += 1; }
     if !test_seqpacket_long_dir_via_procfd() { failures += 1; }

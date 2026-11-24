@@ -303,9 +303,10 @@ fn finish_dying(force: bool) {
                 for p in x_sids_peers(&d[i]) {
                     if let Some(b) = tcp_progress(p) { any = true; sum = sum.wrapping_add(b).wrapping_add(1); }
                 }
-                // A bridge peer port with received frames still queued for the daemon keeps the stack alive too.
+                // A bridge peer port with received frames still queued for the daemon keeps the stack alive too, but queued
+                // frames are not progress (a flow with no conntrack retransmits FINs forever): they stay out of `sum`.
                 for &(_, s) in d[i].peers.iter() {
-                    if port_rx_busy(s) { any = true; sum = sum.wrapping_add(1); }
+                    if port_rx_busy(s) { any = true; }
                 }
                 // Progress (the queued bytes moved) restarts the grace, up to the hard cap.
                 if any && sum != d[i].mark && now < d[i].hard {

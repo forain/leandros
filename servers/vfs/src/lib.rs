@@ -7688,6 +7688,27 @@ fn gen_pcsample() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.pcsample", s.as_bytes(), false)
 }
 
+/// `/proc/leandros_timer` (debug, x86_64): dead local-timer ticks recovered by
+/// `check_alive` and per-CPU timer interrupt counts (a CPU whose count stops
+/// rising has a dead local timer). Not part of /proc/stat, which stays
+/// Linux-identical.
+fn gen_leandros_timer() -> Option<VnodeKind> {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        extern "C" { fn arch_timer_cpu_stats(out: *mut u64, n: usize); }
+        let mut st = [0u64; 1 + 16];
+        let n = (sched::active_cpu_count()).min(16);
+        unsafe { arch_timer_cpu_stats(st.as_mut_ptr(), n); }
+        let _ = writeln!(s, "dead_recovered {}", st[0]);
+        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[1 + i]); }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = writeln!(s, "dead_recovered 0");
+    proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
+}
+
 /// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
 /// one makes Ready (`sched::wakestat`, always on, cumulative since boot —
 /// diff two reads), then, with `sched.wakestat=1` on the command line, which
@@ -9126,7 +9147,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// and what a `/proc/<pid>` directory lists. `/proc/<pid>/fd` is served too
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
-const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat",
+const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer",
                                      b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
@@ -10098,6 +10119,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             v
         } else if lookup_path == b"/proc/kmemstat" {
             match gen_kmemstat() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/leandros_timer" {
+            match gen_leandros_timer() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
