@@ -77,6 +77,11 @@ def main():
             ok = False; print("FAIL: a long hold >= 1 s")
         if "[WDOG]" in log:
             ok = False; print("FAIL: watchdog line in the serial log")
+            wl = [l for l in log.splitlines() if "[WDOG]" in l]
+            p0 = [l for l in wl if re.search(r"\bpid=0\b", l)]
+            print(f"WDOG lines: {len(wl)} (pid=0 dead-tick/host-steal: {len(p0)}, pid!=0: {len([l for l in wl if re.search(r'pid=[1-9]', l)])})")
+            for l in wl[:12]: print("  " + l[:220])
+            keep = os.path.join(out, "serial.log"); open(keep, "w").write(log); print("serial log kept: " + keep)
         if "spinfw: start" not in log:
             ok = False; print("FAIL: the spinfw knob never started")
     finally:
