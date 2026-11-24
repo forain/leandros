@@ -577,9 +577,56 @@ unsafe fn program_oneshot(count: u32) {
 /// take the BQL in that gap and spin re-arming a ~30 ns period forever (the
 /// same wedge the one-shot mode exists to avoid). Flipping the mode does not
 /// restart the countdown, so the tick phase is unchanged.
+///
+/// A third write reloads the count AFTER the flip. If the vCPU stalls (host
+/// steal) for >= one tick between the first write and the flip, the one-shot
+/// has already expired and its interrupt is pending; the flip does not restart
+/// the countdown (KVM keeps the expired timer), the pending interrupt finds
+/// ST_PERIODIC and programs nothing, and this CPU's tick is dead for good. The
+/// SDM says a write to the initial count restarts the countdown in whichever
+/// mode is current, so the final write makes the periodic timer live whatever
+/// happened in between.
 unsafe fn program_periodic() {
-    apic::write(apic::LAPIC_TIMER_INIT, TICKS_PER_IRQ.load(Ordering::Relaxed).max(1000));
+    let cnt = TICKS_PER_IRQ.load(Ordering::Relaxed).max(1000);
+    apic::write(apic::LAPIC_TIMER_INIT, cnt);
+    // Test knob (`timer.dead_delay=<cpu>`): stall once inside the window.
+    let c = super::smp::arch_cpu_id();
+    if DBG_DELAY_CPU.load(Ordering::Relaxed) == c as i32
+        && DBG_DELAY_CPU.compare_exchange(c as i32, -1, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        let per = TSC_PER_TICK.load(Ordering::Relaxed);
+        let t0 = rdtsc();
+        while rdtsc().wrapping_sub(t0) < per + per / 2 {} // 15 ms
+    }
     apic::write(apic::LAPIC_LVT_TIMER, LVT_PERIODIC);
+    if DBG_FIXMASK.load(Ordering::Relaxed) & 1 != 0 {
+        apic::write(apic::LAPIC_TIMER_INIT, cnt);
+    }
+}
+
+/// `timer.dead_delay=<cpu>` (debug, off = -1): stall 15 ms once between the
+/// two writes of `program_periodic` on that CPU, reproducing the dead tick.
+static DBG_DELAY_CPU: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+/// `timer.fixmask=<m>` (debug, default 3): bit0 = reload count after the mode
+/// flip, bit1 = `check_alive` recovers a dead periodic tick.
+static DBG_FIXMASK: AtomicU32 = AtomicU32::new(3);
+/// Per CPU: timer interrupts taken, and dead ticks recovered by `check_alive`.
+static LOCAL_TICKS: [AtomicU64; TIMER_MAX_CPUS] = [const { AtomicU64::new(0) }; TIMER_MAX_CPUS];
+static DEAD_TICKS: AtomicU64 = AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn arch_timer_debug(delay_cpu: i32, fixmask: u32) {
+    DBG_DELAY_CPU.store(delay_cpu, Ordering::Relaxed);
+    DBG_FIXMASK.store(fixmask, Ordering::Relaxed);
+}
+
+/// `out[0]` = dead ticks recovered, `out[1..=n]` = per-CPU timer interrupts.
+#[no_mangle]
+pub extern "C" fn arch_timer_cpu_stats(out: *mut u64, n: usize) {
+    unsafe {
+        out.write(DEAD_TICKS.load(Ordering::Relaxed));
+        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(1 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
+    }
 }
 
 /// Per AP: TSC at its most recent tick (APs keep no global time; this only
@@ -617,7 +664,12 @@ pub fn arm_deadline(deadline_ns: u64) {
     unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
     let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
     let t = ns_to_tsc(deadline_ns);
-    if t < ONESHOT_TSC[cpu].load(Ordering::Relaxed) {
+    let mut os = ONESHOT_TSC[cpu].load(Ordering::Relaxed);
+    // A deadline more than 4 ticks in the past will never fire (lost
+    // interrupt): it must not shadow new, later deadlines.
+    if os != u64::MAX && rdtsc().wrapping_sub(os) < u64::MAX / 2
+        && rdtsc().wrapping_sub(os) > 4 * TSC_PER_TICK.load(Ordering::Relaxed) { os = u64::MAX; }
+    if t < os {
         ONESHOT_TSC[cpu].store(t, Ordering::Relaxed);
         let want = tsc_delta_to_count(t.saturating_sub(rdtsc()));
         // CURR reads 0 when a one-shot already expired with its interrupt
@@ -638,6 +690,7 @@ pub fn arm_deadline(deadline_ns: u64) {
 fn deadline_irq(cpu: usize, next_tick: u64) -> u32 {
     let st = LAPIC_STATE[cpu].load(Ordering::Relaxed);
     let now = rdtsc();
+    LOCAL_TICKS[cpu].fetch_add(1, Ordering::Relaxed);
     LAST_IRQ_TSC[cpu].store(now, Ordering::Relaxed);
     let os = ONESHOT_TSC[cpu].load(Ordering::Relaxed);
     if os != u64::MAX && now >= os {
@@ -671,14 +724,25 @@ fn deadline_irq(cpu: usize, next_tick: u64) -> u32 {
 pub fn check_alive() -> bool {
     let per = TSC_PER_TICK.load(Ordering::Relaxed);
     if per == 0 { return false; }
-    let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
     let cpu = unsafe { super::smp::arch_cpu_id() }.min(TIMER_MAX_CPUS - 1);
     let last = LAST_IRQ_TSC[cpu].load(Ordering::Relaxed);
+    // Fast path (one rdtsc, no cli): a live CPU ticked within 4 periods.
+    if last == 0 || rdtsc().wrapping_sub(last) <= 4 * per { return false; }
+    let st = LAPIC_STATE[cpu].load(Ordering::Relaxed);
+    // A periodic timer cannot go quiet by itself, except through the
+    // program_periodic race (see there). `timer.fixmask` bit1 clear (debug
+    // knob, only settable on the command line) restores the old exemption.
+    if st == ST_PERIODIC && DBG_FIXMASK.load(Ordering::Relaxed) & 2 == 0 { return false; }
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem)); }
+    // Re-check with IRQs off: the tick may have landed meanwhile.
+    let last = LAST_IRQ_TSC[cpu].load(Ordering::Relaxed);
     let mut rearmed = false;
-    if LAPIC_STATE[cpu].load(Ordering::Relaxed) != ST_PERIODIC && last != 0
-        && rdtsc().wrapping_sub(last) > 4 * per
-    {
+    if rdtsc().wrapping_sub(last) > 4 * per {
+        // No logging here: this runs from IRQ-window and idle paths that may
+        // hold or interrupt the console. The count is in /proc/leandros_timer.
+        if st == ST_PERIODIC { DEAD_TICKS.fetch_add(1, Ordering::Relaxed); }
+        ONESHOT_TSC[cpu].store(u64::MAX, Ordering::Relaxed);
         unsafe { program_periodic(); }
         LAPIC_STATE[cpu].store(ST_PERIODIC, Ordering::Relaxed);
         LAST_IRQ_TSC[cpu].store(rdtsc(), Ordering::Relaxed);
