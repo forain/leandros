@@ -530,7 +530,12 @@ extern "C" {
     fn arch_interrupt_save() -> usize;
     fn arch_interrupt_restore(flags: usize);
 }
-const STAGE_CAP: usize = 240;
+/// A kernel line longer than this is cut (rarely: the [fsync] summary with five
+/// callers is ~1.1 KB); anything shorter is queued, popped and written whole.
+const STAGE_CAP: usize = 2048;
+/// Entries moved per pop / stack buffer; a line is written in pieces of this
+/// size under one hold of the console lock.
+const POP_CAP: usize = 256;
 /// Low 8 bits: the byte. `STAGE_DIRECT`: UART only (the `arch_serial_putc`
 /// path, which never mirrored to the framebuffer/VT).
 const STAGE_DIRECT: u16 = 0x100;
@@ -580,7 +585,7 @@ pub fn console_staging_enable() {
 /// console lock (panic path: its holder may be the thread that panicked).
 pub fn console_staging_disable_and_drain() {
     if !STAGING_ON.swap(false, core::sync::atomic::Ordering::AcqRel) { return; }
-    let mut out = [0u16; STAGE_CAP];
+    let mut out = [0u16; POP_CAP];
     // The outbox lock may be held by this very CPU (a panic inside
     // `stage_bytes`) — skip the queued lines rather than deadlock the panic.
     while !OUTBOX.is_locked() {
@@ -593,15 +598,21 @@ pub fn console_staging_disable_and_drain() {
         let f = unsafe { arch_interrupt_save() };
         let st = unsafe { &mut (*core::ptr::addr_of_mut!(STAGES))[cpu] };
         let n = st.len;
-        out[..n].copy_from_slice(&st.buf[..n]);
         st.len = 0;
         unsafe { arch_interrupt_restore(f) };
         // A partial line was never pushed to the klog ring (that happens per
-        // finished line in `stage_bytes`).
-        let mut lb = [0u8; STAGE_CAP];
-        for k in 0..n { lb[k] = out[k] as u8; }
-        klog::push_bytes(&lb[..n]);
-        write_tagged(&out[..n]);
+        // finished line in `stage_bytes`). Staging is off: nobody else
+        // touches this stage any more.
+        let st = unsafe { &(*core::ptr::addr_of!(STAGES))[cpu] };
+        let mut at = 0;
+        while at < n {
+            let m = (n - at).min(POP_CAP);
+            let mut lb = [0u8; POP_CAP];
+            for k in 0..m { lb[k] = st.buf[at + k] as u8; }
+            klog::push_bytes(&lb[..m]);
+            write_tagged(&st.buf[at..at + m]);
+            at += m;
+        }
     }
 }
 
@@ -615,7 +626,6 @@ fn stage_cpu() -> Option<usize> {
 /// Append to `cpu`'s stage; every finished line (or a full stage) moves to
 /// the outbox, which is then drained if the console lock is free.
 fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
-    let mut out = [0u16; STAGE_CAP];
     let mut queued = false;
     for &b in bytes {
         let tag = b as u16 | if direct { STAGE_DIRECT } else { 0 };
@@ -631,10 +641,14 @@ fn stage_bytes(cpu: usize, bytes: &[u8], direct: bool) {
             st.len = 0;
             // The whole line goes into the klog ring now, as one run (lane
             // loginhang), whatever happens to it on the UART/screen.
-            for k in 0..n { out[k] = st.buf[k]; }
-            let mut lb = [0u8; STAGE_CAP];
-            for k in 0..n { lb[k] = out[k] as u8; }
-            klog::push_bytes(&lb[..n]);
+            let mut at = 0;
+            while at < n {
+                let m = (n - at).min(POP_CAP);
+                let mut lb = [0u8; POP_CAP];
+                for k in 0..m { lb[k] = st.buf[at + k] as u8; }
+                klog::push_bytes(&lb[..m]);
+                at += m;
+            }
             let mut ob = outbox_lock();
             if ob.len + n <= OUTBOX_CAP {
                 for k in 0..n {
@@ -677,7 +691,7 @@ static OUTBOX_DROPPED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 
 /// Pop one line (up to and including '\n', or `out.len()` entries) from the
 /// outbox. Returns how many entries were copied; 0 when it is empty.
-fn outbox_pop_line(out: &mut [u16; STAGE_CAP]) -> usize {
+fn outbox_pop_line(out: &mut [u16; POP_CAP]) -> usize {
     let f = unsafe { arch_interrupt_save() };
     let mut ob = outbox_lock();
     let mut n = 0;
@@ -778,7 +792,7 @@ pub fn console_print_urgent(msg: &str) {
 /// written by the next printer, or at the latest by the iostat task's
 /// once-a-second kick.
 pub fn console_drain_outbox() {
-    let mut out = [0u16; STAGE_CAP];
+    let mut out = [0u16; POP_CAP];
     // Lane loginhang: also capped at DRAIN_MAX entries per call (~90 ms of a
     // 115200-baud UART with IRQs masked), not the whole 8 KiB outbox (~0.7 s).
     const DRAIN_MAX: usize = 1024;
@@ -800,11 +814,15 @@ pub fn console_drain_outbox() {
             klog::push_bytes(&b[..n]);
             for &c in &b[..n] { unsafe { serial_write_byte_direct_noklog(c) }; }
         }
-        while budget > 0 {
+        // A line is written whole under this hold of the lock: past the
+        // budget too, while the last piece popped did not end in '\n'.
+        let mut mid = false;
+        while budget > 0 || mid {
             let n = outbox_pop_line(&mut out);
             if n == 0 { break; }
             write_tagged(&out[..n]);
             budget = budget.saturating_sub(n);
+            mid = out[n - 1] & 0xFF != b'\n' as u16;
         }
         drop(g);
     }
