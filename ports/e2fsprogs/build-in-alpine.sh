@@ -117,6 +117,13 @@ esac
     net_wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
     mv "$TARB.part" "$TARB"
   fi
+  # Pinned from kernel.org's signed sha256sums.asc (v$E2V, fetched over https);
+  # a cached or downloaded tarball that does not match is refused and removed.
+  E2SHA=5a33dc047fd47284bca4bb10c13cfe7896377ae3d01cb81a05d406025d99e0d1
+  if [ "$(sha256sum "$TARB" | cut -d' ' -f1)" != "$E2SHA" ]; then
+    echo "e2fsprogs-$E2V.tar.xz sha256 mismatch (want $E2SHA); refusing" >&2
+    rm -f "$TARB" "$TARB.part"; exit 4
+  fi
   apk add --no-cache xz patch make pkgconf linux-headers util-linux-dev >/dev/null
   [ "$(uname -m)" = "$ARCH" ] || $APK add --no-cache util-linux-dev >/dev/null
   B=/tmp/e2fs-build-$ARCH
