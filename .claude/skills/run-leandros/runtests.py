@@ -24,6 +24,7 @@ Options:
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             failevid  host:failevidtest.py (failing suites leave <out>/fail/<NN>-<name>/ evidence)
                              harness   host:harnesstest.py (line-buffering, auto -D on host tracing, quoted-command survival)
                              nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
@@ -230,7 +231,7 @@ def rawline_run(c, timeout, arch):
 SUITES = {
     "ostree": ["/bin/f2fstest ostree /home/ostreetest 1 2 1500"],
     "orphanreuse": ["/bin/f2fstest orphanreuse /home/orphanreuse"],
-    "regress": ["/bin/vttest", "/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
+    "regress": ["/bin/vttest", "host:failevidtest.py", "/bin/sigtest", "/bin/sigtest2", "/bin/memtest", "/bin/scmtest", "/bin/fusetest",
                 "/bin/polltest", "/bin/fdmaxtest", "/bin/mqtest", "/bin/pipebw", "/bin/forktest", "/bin/shmtest", "/bin/exectest", "/bin/execdev", "/bin/memfdtest", "/bin/conmontest", "/bin/exitracetest", "/bin/pthreadtest", "/bin/futextest",
                 "/bin/epolltest", "/bin/strtest", "/bin/floattest", "/bin/uinputtest", RAWLINE_CHECK, SYSFS_CHECK, "/bin/mnttest sysfsbind",
                 # Unlinked file held only by a mapping is reclaimed (lane f2fsfu).
@@ -447,6 +448,7 @@ SUITES = {
     # --features rpi5 kernel compile-check (cargo check, no boot; integ lanes run it).
     "rpi5check": ["host:rpi5checktest.py"],
     "harness": ["host:harnesstest.py"],
+    "failevid": ["host:failevidtest.py"],
     "stdev": ["host:stdevtest.py"],
     "f2fsnid": ["host:f2fsnidtest.py"],
     "f2fscommit": ["host:f2fscommittest.py"],
@@ -616,6 +618,167 @@ HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
 SKIP_ALLOWED = platform.machine() == "aarch64"
 EXCLUSIVE_HOST = {"listentagtest.py", "uartgaptest.py"}
 HOST_NEEDS_GL = {"blanktest.py", "portalshottest.py", "powerctltest.py"}
+
+
+# ---- failure evidence -------------------------------------------------------
+# Serial logs (/tmp/leandros-<RUN_ID>-serial-full.log) are truncated by the next boot of the same
+# run id, so the moment a suite is bad its VM's evidence is copied into <out>/fail/<NN>-<name>/.
+# Nothing here can change a verdict: every step is guarded and any error is swallowed.
+EV_CAP = int(os.environ.get("RUNTESTS_EVIDENCE_CAP", str(200 * 1024 * 1024)))
+EV_FULL_MAX = 2 * 1024 * 1024      # a serial log smaller than this is copied whole
+EV_LOG_MAX = 16 * 1024 * 1024      # per-file cap for any copied log
+EV_HEAD_LINES = 400                # lines before the suite's start kept from a big shared log
+_ev = {"used": 0, "n": 0}
+
+
+def _ev_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _ev_room(n):
+    return _ev["used"] + n <= EV_CAP
+
+
+def _ev_write(path, data):
+    if isinstance(data, str):
+        data = data.encode(errors="replace")
+    if not _ev_room(len(data)):
+        data = data[:max(0, EV_CAP - _ev["used"])]
+        if not data:
+            return
+    with open(path, "wb") as f:
+        f.write(data)
+    _ev["used"] += len(data)
+
+
+def _ev_serial_slice(path, start_off):
+    """Portion of a shared VM log since the suite started plus 400 lines before it; whole log if small."""
+    size = _ev_size(path)
+    with open(path, "rb") as f:
+        if size < EV_FULL_MAX:
+            return f.read()
+        if start_off is None or start_off > size:  # log was truncated by a reboot: all of it
+            start_off = 0
+        f.seek(max(0, start_off - 256 * 1024))
+        before = f.read(start_off - max(0, start_off - 256 * 1024))
+        body = f.read(EV_LOG_MAX)
+    head = b"\n".join(before.split(b"\n")[-EV_HEAD_LINES:])
+    return head + b"\n=== SUITE STARTED HERE ===\n" + body
+
+
+def _ev_hmp(sock_path, cmds, timeout=3.0):
+    """Read-only HMP commands over the monitor socket (wedged VM state). Returns text."""
+    import socket
+    out = []
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        def rd():
+            buf = b""
+            try:
+                while True:
+                    ch = s.recv(65536)
+                    if not ch:
+                        break
+                    buf += ch
+                    if buf.rstrip().endswith(b"(qemu)") and len(ch) < 65536:
+                        break
+            except OSError:
+                pass
+            return buf.decode(errors="replace")
+        out.append(rd())
+        for cmd in cmds:
+            s.sendall(cmd.encode() + b"\n")
+            out.append(f"### {cmd}\n" + rd())
+    finally:
+        s.close()
+    return "\n".join(out)
+
+
+def snapshot_start():
+    """Taken before each suite: (monotonic time, wall time, size of this run's serial-full log)."""
+    return {"t": time.time(), "off": _ev_size(driver.SERIAL_FULL_LOG)}
+
+
+def save_evidence(out, idx, cmd, r, snap, arch, shared_vm):
+    """Copy the evidence of a bad suite into <out>/fail/<NN>-<name>/. Returns the dir or None."""
+    try:
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", cmd).strip("_")[:60] or "suite"
+        _ev["n"] += 1
+        d = os.path.join(out, "fail", f"{_ev['n']:02d}-{name}")
+        os.makedirs(d, exist_ok=True)
+        rid = driver.RUN_ID or ""
+        files = []
+        def step(fn):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+        step(lambda: _ev_write(os.path.join(d, "output.txt"), r.get("output") or ""))
+        def serial():
+            if shared_vm and os.path.exists(driver.SERIAL_FULL_LOG):
+                _ev_write(os.path.join(d, "serial-full.log"), _ev_serial_slice(driver.SERIAL_FULL_LOG, snap["off"]))
+            if cmd.startswith("host:"):
+                # host suite (own VMs under its own run ids): every log of this run touched since it started
+                import glob
+                for p in sorted(glob.glob(f"/tmp/leandros*{rid}*.log")):
+                    if "qemu-stderr" in p or p == driver.SERIAL_FULL_LOG and shared_vm or not os.path.isfile(p) or os.path.getmtime(p) < snap["t"]:
+                        continue
+                    with open(p, "rb") as f:
+                        sz = _ev_size(p)
+                        if sz > EV_LOG_MAX:
+                            f.seek(sz - EV_LOG_MAX)
+                        _ev_write(os.path.join(d, "host-" + os.path.basename(p)), f.read())
+        step(serial)
+        def qerr():
+            import glob
+            ps = ([driver.QEMU_STDERR_LOG] if shared_vm else []) + (
+                sorted(glob.glob(f"/tmp/leandros*{rid}*qemu-stderr.log")) if cmd.startswith("host:") else [])
+            for p in dict.fromkeys(ps):
+                if os.path.isfile(p) and (p == driver.QEMU_STDERR_LOG or os.path.getmtime(p) >= snap["t"]):
+                    with open(p, "rb") as f:
+                        _ev_write(os.path.join(d, "qemu-stderr.log" if p == driver.QEMU_STDERR_LOG else "host-" + os.path.basename(p)), f.read(EV_LOG_MAX))
+        step(qerr)
+        def hostinfo():
+            t = "loadavg: " + open("/proc/loadavg").read()
+            try:
+                t += "\ntop5 cpu:\n" + subprocess.run(["ps", "-eo", "pid,pcpu,pmem,etime,args", "--sort=-pcpu", "-ww"],
+                                                       capture_output=True, text=True, timeout=10).stdout.splitlines()[0:6].__str__().replace("', '", "\n").strip("[]'") + "\n"
+            except Exception:  # noqa: BLE001
+                pass
+            for p in ("cpu", "memory", "io"):
+                try:
+                    t += f"\n/proc/pressure/{p}:\n" + open(f"/proc/pressure/{p}").read()
+                except OSError:
+                    pass
+            _ev_write(os.path.join(d, "host.txt"), t)
+        step(hostinfo)
+        wedged = r.get("status") == "timeout" or r.get("rc") is None
+        def hmp():
+            if shared_vm and wedged and os.path.exists(driver.MONITOR_SOCK):
+                _ev_write(os.path.join(d, "monitor.txt"),
+                          _ev_hmp(driver.MONITOR_SOCK, ["info registers", "info lapic", "info status"]))
+        step(hmp)
+        def uptime():
+            if shared_vm and driver._qemu_pid() is not None:
+                u = driver.serial_run("cat /proc/uptime", timeout=10 if not wedged else 5, arch=arch)
+                _ev_write(os.path.join(d, "uptime.txt"), f"{u.get('status')} rc={u.get('rc')}\n{u.get('output')}\n")
+        step(uptime)
+        def summ():
+            shard = os.environ.get("LEANDROS_RUN_ID", "")
+            m = re.search(r"-s(\d+)$", shard)
+            _ev_write(os.path.join(d, "summary.json"), json.dumps(
+                {"suite": cmd, "rc": r.get("rc"), "status": r.get("status"), "secs": r.get("secs"),
+                 "shard": int(m.group(1)) if m else None, "run_id": shard,
+                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+        step(summ)
+        return d
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def host_run(c, timeout, arch=None, scale=1.0):
@@ -839,7 +1002,7 @@ def run_sharded(arch, tag, cmds, k, gpu, mode, base_timeout, cmdline, keep, repe
         make_shard_tree(tree)
         os.makedirs(os.path.join(sd, "tmp"), exist_ok=True)
         # a private TMPDIR on the data disk: host scripts' mkdtemp images no longer land on the (often full) tmpfs /tmp
-        env = dict(os.environ, LEANDROS_RUN_ID=f"{rid}-s{j}", FFSESSION_OUT=sd, TMPDIR=os.path.join(sd, "tmp"))
+        env = dict(os.environ, LEANDROS_RUN_ID=f"{rid}-s{j}", FFSESSION_OUT=sd, RUNTESTS_EVIDENCE_CAP=str(EV_CAP // max(1, len(bins))), TMPDIR=os.path.join(sd, "tmp"))
         argv = [sys.executable, os.path.join(tree, ".claude", "skills", "run-leandros", "runtests.py"), arch, tag,
                 "--timeout", str(base_timeout), "--mode", mode, "--gpu", gpu, "--repeat", str(repeat)]
         if cmdline is not None:
@@ -1020,6 +1183,10 @@ def main(argv):
         with open(os.path.join(rdir, "results.txt"), "w") as res:
             for c in cmds:
                 try:
+                    snap = snapshot_start()
+                except Exception:  # noqa: BLE001
+                    snap = {"t": time.time(), "off": None}
+                try:
                     if self_boots(c) and driver._qemu_pid() is not None:
                         subprocess.run([sys.executable, DRV, "stop"], capture_output=True, timeout=120)
                     elif not self_boots(c) and driver._qemu_pid() is None:
@@ -1064,6 +1231,10 @@ def main(argv):
                 else:
                     fcount = "0"
                 print(f"=== {c}: RC={rc} [{r['status']}, {r['secs']}s] fails={fcount}", flush=True)
+                if not ok or fails:
+                    evd = save_evidence(out, 0, c, r, snap, arch, not self_boots(c))
+                    if evd:
+                        print(f"    evidence: {evd}", flush=True)
                 if c.startswith("host:"):
                     # every host suite's stdout+stderr, so a failure that dies in its first second is diagnosable
                     lname = re.sub(r"[^A-Za-z0-9_.-]+", "_", c[len("host:"):]).strip("_")
