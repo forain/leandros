@@ -56,10 +56,17 @@ boot_vm() { # <log> <run-qemu args...>
     # The hashed port can be taken by another lane's VM: walk up to the first free one.
     while python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3); sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)"; do PORT=$((PORT + 1)); done
     echo "127.0.0.1 $PORT" > "$STATE"; rm -f "$QMP"
-    LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu "$@" -display none \
-        -qmp "unix:$QMP,server=on,wait=off" > "$log" 2>&1 < /dev/null &
-    QPID=$!
-    local i
+    local i try
+    for try in 1 2 3 4 5 6; do
+        LEANDROS_NET=user LEANDROS_SSH_PORT=$PORT "$ROOT/scripts/run-qemu.sh" "$ARCH" --uefi --no-gpu "$@" -display none \
+            -qmp "unix:$QMP,server=on,wait=off" > "$log" 2>&1 < /dev/null &
+        QPID=$!
+        # A just-killed VM may still hold the image write lock for a moment (26 GiB of page cache to drop): retry.
+        sleep 3
+        kill -0 "$QPID" 2>/dev/null && break
+        grep -q 'Failed to get "write" lock' "$log" || break
+        echo "(image still locked by the previous VM, retry $try)"; sleep 5; rm -f "$QMP"
+    done
     for i in $(seq 1 150); do
         kill -0 "$QPID" 2>/dev/null || { tail -5 "$log"; fail "QEMU exited early ($log)"; }
         if $REMOTE run true >/dev/null 2>&1; then ok "ssh up ($log)"; return 0; fi
