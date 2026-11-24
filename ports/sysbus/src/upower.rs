@@ -3,7 +3,8 @@
 //! On a machine whose kernel exports no power_supply class (a desktop PC, QEMU)
 //! this reports what upower reports there: no devices, OnBattery = false, a
 //! DisplayDevice of Type Unknown with IsPresent = false ("battery-missing"),
-//! and a KbdBacklight with maximum 0. On a laptop (the kernel's ACPI battery /
+//! and no KbdBacklight object (with a `*kbd_backlight*` LED in
+//! `/sys/class/leds` at start-up it serves that LED, see [`KbdBacklight`]). On a laptop (the kernel's ACPI battery /
 //! AC overlay) it exports `devices/battery_BAT0`, `devices/line_power_AC`, a
 //! DisplayDevice aggregating the batteries, OnBattery, and re-reads sysfs every
 //! 10 s, emitting PropertiesChanged for what moved.
@@ -312,26 +313,76 @@ impl Device {
     fn charge_threshold_settings_supported(&self) -> u32 { 0 }
 }
 
-/// No keyboard backlight: maximum 0, and the brightness never changes, so no
-/// BrightnessChanged is ever emitted (that signal is what pops the OSD).
-struct KbdBacklight;
+/// Default LED class directory; `LEANDROS_UPOWER_LEDS` overrides it (tests).
+pub const LEDS_DIR: &str = "/sys/class/leds";
+
+/// The keyboard backlight: the first `*kbd_backlight*` LED of the class
+/// directory, as upower picks it (`hp::kbd_backlight`, `tpacpi::kbd_backlight`,
+/// ...). Brightness is the LED's own scale (HP: 0 off, 1 low, 2 high). With no
+/// such LED the maximum is 0 and nothing is ever emitted.
+pub struct KbdBacklight {
+    dir: String,
+    /// Last brightness this service knew, so a change is announced once.
+    last: Arc<Mutex<i32>>,
+}
+
+impl KbdBacklight {
+    pub fn new(dir: &str) -> Self { KbdBacklight { dir: dir.to_string(), last: Arc::new(Mutex::new(-1)) } }
+    pub fn from_env() -> Self { Self::new(&std::env::var("LEANDROS_UPOWER_LEDS").unwrap_or_else(|_| LEDS_DIR.into())) }
+    fn led(&self) -> Option<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.dir).ok()?
+            .filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("kbd_backlight")).collect();
+        names.sort();
+        names.into_iter().next().map(|n| format!("{}/{n}", self.dir))
+    }
+    fn rd(&self, attr: &str) -> Option<i32> {
+        std::fs::read_to_string(format!("{}/{attr}", self.led()?)).ok()?.trim().parse().ok()
+    }
+}
+
+async fn kbd_emit(em: &SignalEmitter<'_>, v: i32, source: &str) {
+    let _ = KbdBacklight::brightness_changed(em, v).await;
+    let _ = KbdBacklight::brightness_changed_with_source(em, v, source).await;
+}
+
+/// Announce a brightness the hardware changed (the Fn keys): "internal", as
+/// upower reports a `brightness_hw_changed` event. Polls the LED every 250 ms.
+pub async fn kbd_watch(conn: zbus::Connection, path: String) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let Ok(iface) = conn.object_server().interface::<_, KbdBacklight>(path.as_str()).await else { continue };
+        let (cur, last) = { let k = iface.get().await; (k.rd("brightness"), k.last.clone()) };
+        let Some(cur) = cur else { continue };
+        let prev = std::mem::replace(&mut *last.lock().unwrap(), cur);
+        if prev >= 0 && prev != cur { kbd_emit(iface.signal_emitter(), cur, "internal").await; }
+    }
+}
 
 #[zbus::interface(name = "org.freedesktop.UPower.KbdBacklight")]
 impl KbdBacklight {
-    fn get_brightness(&self) -> i32 {
-        0
+    fn get_brightness(&self) -> zbus::fdo::Result<i32> {
+        if self.led().is_none() { return Ok(0); }
+        self.rd("brightness").ok_or_else(|| zbus::fdo::Error::Failed("cannot read keyboard backlight".into()))
     }
 
     fn get_max_brightness(&self) -> i32 {
-        0
+        self.rd("max_brightness").unwrap_or(0)
     }
 
-    fn set_brightness(&self, value: i32) -> zbus::fdo::Result<()> {
-        if value == 0 {
-            Ok(())
-        } else {
-            Err(zbus::fdo::Error::NotSupported("no keyboard backlight".into()))
+    async fn set_brightness(&self, value: i32, #[zbus(signal_emitter)] em: SignalEmitter<'_>) -> zbus::fdo::Result<()> {
+        let Some(led) = self.led() else {
+            return if value == 0 { Ok(()) } else { Err(zbus::fdo::Error::NotSupported("no keyboard backlight".into())) };
+        };
+        let max = self.rd("max_brightness").unwrap_or(0);
+        if value < 0 || value > max {
+            return Err(zbus::fdo::Error::InvalidArgs(format!("brightness {value} outside 0..{max}")));
         }
+        std::fs::write(format!("{led}/brightness"), value.to_string())
+            .map_err(|e| zbus::fdo::Error::Failed(format!("write brightness: {e}")))?;
+        let prev = std::mem::replace(&mut *self.last.lock().unwrap(), value);
+        if prev != value { kbd_emit(&em, value, "external").await; }
+        Ok(())
     }
 
     #[zbus(signal)]
@@ -382,7 +433,13 @@ pub async fn serve(builder: zbus::connection::Builder<'_>) -> zbus::Result<zbus:
         builder = builder.serve_at(ObjectPath::try_from(p.clone())?, Device { d: st.clone(), update_time: t.clone() })?;
         states.push((p, st, t));
     }
-    let conn = builder.serve_at(KBD_BACKLIGHT, KbdBacklight)?.name(NAME)?.build().await?;
+    // Like upowerd: the KbdBacklight object exists only when a `*kbd_backlight*`
+    // LED does at start-up; without it COSMIC hides the slider.
+    let kbd = KbdBacklight::from_env();
+    let has_kbd = kbd.led().is_some();
+    if has_kbd { builder = builder.serve_at(KBD_BACKLIGHT, kbd)?; }
+    let conn = builder.name(NAME)?.build().await?;
+    if has_kbd { tokio::spawn(kbd_watch(conn.clone(), KBD_BACKLIGHT.to_string())); }
     if snap.is_some() {
         let c = conn.clone();
         tokio::spawn(async move {

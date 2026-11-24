@@ -1632,6 +1632,17 @@ def privsep_hooks(ssh, user, pw, tmp):
         set_keys(ssh, user, pw, open(ssh.key + ".pub").read().strip())
 
 
+def wait_preauth(ssh, user, pw, limit=12):
+    """The sshd-preauth process list once the listener has forked it (it may lag well over 1 s on a loaded TCG
+    host); polled until it appears, then a short settle. LoginGraceTime 4 keeps the window open after the fork."""
+    t0 = time.time()
+    while True:
+        pre = [x for x in sshd_procs(ssh, user, pw) if x[2] == "sshd-preauth"]
+        if pre or time.time() - t0 > limit:
+            return pre
+        time.sleep(0.5)
+
+
 def privsep_grace(ssh, user, pw, tmp):
     """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
     conf = "LoginGraceTime 4\nPasswordAuthentication yes\n"
@@ -1655,9 +1666,8 @@ def privsep_grace(ssh, user, pw, tmp):
         step("privsep_grace_kill", False, "cannot reach the second sshd through the tunnel")
         return
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
-    time.sleep(1)
-    procs = sshd_procs(ssh, user, pw)
-    pre = [p for p, _, n in procs if n == "sshd-preauth"]
+    pre = wait_preauth(ssh, user, pw)
+    pre = [p for p, _, n in pre]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0]}")  # hung: it cannot disconnect itself
     ok = bool(pre) and probe_eof(s, 25)
@@ -1700,14 +1710,7 @@ def privsep_stalled_monitor(ssh, user, pw):
     s = socket.create_connection(("127.0.0.1", lp), timeout=10)
     s.recv(256)
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
-    time.sleep(1)
-    pre = []
-    for _ in range(8):  # a slow guest may not have the pre-auth child listed after one second
-        procs = sshd_procs(ssh, user, pw)
-        pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
-        if pre:
-            break
-        time.sleep(1)
+    pre = [(p, pp) for p, pp, n in wait_preauth(ssh, user, pw)]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]}")  # only the monitor hangs; the child stays live
     ok = bool(pre) and probe_eof(s, 40)

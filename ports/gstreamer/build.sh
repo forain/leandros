@@ -1,6 +1,6 @@
 #!/bin/sh
-# build.sh <x86_64|aarch64|all> -- GStreamer 1.24 (+ FFmpeg 6.1 plugin, PipeWire plugin) for LeandrOS.
-# build-in-alpine.sh (Alpine 3.21 container) stages out/<arch>.alpine/ (the image
+# build.sh <x86_64|aarch64|all> -- GStreamer (Alpine release of the image lock; + FFmpeg plugin, PipeWire plugin) for LeandrOS.
+# build-in-alpine.sh (Alpine 3.24 container) stages out/<arch>.alpine/ (the image
 # tree, which scripts/mkfs-f2fs-populated.py overlays) and out/<arch>.sysroot/
 # (-dev files merged into the cross sysroot m3-gl-stack/sysroot-<arch> by this script).
 set -eu
@@ -26,7 +26,7 @@ stage_alpine() {
   PLAT="${LEANDROS_PW_PLATFORM:-$PLAT}"
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/gstreamer-port-src.XXXXXX")
   cp "$HERE/build-in-alpine.sh" "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
-  mkdir -p "$SNAP/data" && cp -R "$HERE/data/gst-pipewire-1.2.7" "$SNAP/data/"
+  mkdir -p "$SNAP/data" && cp -R "$HERE"/data/gst-pipewire-* "$SNAP/data/"
   # ports/firefox/build.sh is gone (vanilla Alpine firefox); without it, pack everything
   { sed -n '/^cat > "\$SNAP\/image-sonames.txt"/,/^EOF/p' "$ROOT/ports/firefox/build.sh" 2>/dev/null || true; } \
     | sed '1d;$d' > "$SNAP/image-sonames.txt"

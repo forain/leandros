@@ -429,9 +429,12 @@ fn test_handle_other_arp_request(#[case] medium: Medium) {
         source_hardware_addr: remote_hw_addr,
         source_protocol_addr: remote_ip_addr,
         target_hardware_addr: EthernetAddress::default(),
-        target_protocol_addr: Ipv4Address([0x7f, 0x00, 0x00, 0x03]),
+        target_protocol_addr: Ipv4Address([192, 0, 2, 3]),
     };
 
+    // LEANDROS: the target must be outside 127.0.0.0/8. An interface holding a
+    // loopback address owns the whole block, as Linux's lo does (fib_local
+    // table: local 127.0.0.0/8 dev lo), so 127.0.0.3 is local and is answered.
     let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
     frame.set_dst_addr(EthernetAddress::BROADCAST);
     frame.set_src_addr(remote_hw_addr);

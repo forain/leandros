@@ -1,10 +1,10 @@
 #!/bin/sh
-# build-in-alpine.sh <x86_64|aarch64> -- stage Alpine 3.21's libflatpak.so.0 and
+# build-in-alpine.sh <x86_64|aarch64> -- stage Alpine 3.24's libflatpak.so.0 and
 # its DT_NEEDED closure (ostree, json-glib, libxmlb, libcurl, libarchive, gpgme,
 # polkit client libs ...) for LeandrOS, plus the -dev files (headers, .pc,
 # linkable .so) for the cross sysroot, so cosmic-store's `flatpak` feature
 # (the libflatpak crate, pkg-config `flatpak`) links and runs. Same Alpine
-# release and method as ports/gstreamer (musl 1.2.5, GLib 2.82): mkfs overlays
+# release and method as ports/gstreamer (same musl and GLib): mkfs overlays
 # the closure; the image's own copy of a soname wins.
 # Output: /out/<arch>.alpine/ (the image tree), /out/<arch>.sysroot/ (-dev).
 # Mounts: /src (this dir), /out, /leandros-libc, /imglib/N as in ports/gstreamer.
@@ -16,7 +16,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21"; exit 3; }
+  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL"; exit 3; }
   PKGS="flatpak ostree xdg-dbus-proxy"
   DEVPKGS="flatpak-dev ostree-dev json-glib-dev libxmlb-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then

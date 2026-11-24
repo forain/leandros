@@ -1,7 +1,7 @@
 #!/bin/sh
 # build.sh <x86_64|aarch64|all> -- e2fsprogs (e2fsck, resize2fs, dumpe2fs, e2undo, mke2fs) for LeandrOS.
 #
-#   1. build-in-alpine.sh (Alpine 3.21 of the target arch: podman/docker on the
+#   1. build-in-alpine.sh (Alpine 3.24 of the target arch: podman/docker on the
 #      host, a chroot staged with apk.static inside LeandrOS): Alpine's
 #      prebuilt e2fsprogs 1.47 + its DT_NEEDED closure, ELF-fixed for the guest
 #      (libc soname, the __stack_chk_guard shim) -> out/<arch>.alpine/.

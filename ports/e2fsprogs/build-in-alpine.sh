@@ -1,5 +1,5 @@
 #!/bin/sh
-# build-in-alpine.sh <x86_64|aarch64> -- stage Alpine 3.21's prebuilt e2fsprogs
+# build-in-alpine.sh <x86_64|aarch64> -- stage Alpine 3.24's prebuilt e2fsprogs
 # (e2fsck, mke2fs, dumpe2fs, e2undo from e2fsprogs; resize2fs from
 # e2fsprogs-extra) for LeandrOS at /usr/sbin, with their DT_NEEDED closure.
 # Same shape as ports/git. Mounts (driven by ports/e2fsprogs/build.sh):
@@ -13,7 +13,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q '^3\.21\.' /etc/alpine-release || { echo "want Alpine 3.21, got $(cat /etc/alpine-release)"; exit 3; }
+  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
   PKGS="e2fsprogs e2fsprogs-extra"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""
@@ -129,12 +129,12 @@ esac
   if [ "$(uname -m)" = "$ARCH" ]; then
     ( cd "$B/o" && ../e2fsprogs-$E2V/configure --prefix=/usr --enable-elf-shlibs \
         --disable-nls --disable-fsck --disable-uuidd --disable-libuuid --disable-libblkid \
-        CFLAGS="-O2" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
+        CFLAGS="-O2 -std=gnu17" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
   else
     ( cd "$B/o" && ../e2fsprogs-$E2V/configure --prefix=/usr --enable-elf-shlibs \
         --host=$ARCH-alpine-linux-musl --build=$(uname -m)-alpine-linux-musl \
         --disable-nls --disable-fsck --disable-uuidd --disable-libuuid --disable-libblkid \
-        BUILD_CC=cc CC="$CC" CFLAGS="-O2" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
+        BUILD_CC=cc CC="$CC" CFLAGS="-O2 -std=gnu17" >/dev/null && make -C lib/et all >/dev/null && make -C lib/ext2fs ext2_err.h >/dev/null && for d in e2p ext2fs; do make -j"$(nproc)" -C lib/$d all >/dev/null || exit 1; done )
   fi
   # e2fsck (unix.c) tests s_feature_incompat against the header macro, and e2undo gets
   # the E2UNDO_CRASH mode: both are rebuilt from the patched source, linked against the

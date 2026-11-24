@@ -1,4 +1,4 @@
-# xdg-desktop-portal 1.18 frontend (Alpine 3.21 build, ports/portal), activated
+# xdg-desktop-portal frontend (Alpine 3.24 build, ports/portal), activated
 # by the session busd on the first call to org.freedesktop.portal.Desktop.
 [D-BUS Service]
 Name=org.freedesktop.portal.Desktop

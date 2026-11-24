@@ -1,5 +1,6 @@
 import sys, os, io, tarfile, urllib.request
-base = "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/"
+_rel = os.environ.get("ALPINE_REL") or open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../ports/alpine/toolchain.lock")).readline().split("v")[-1].strip()
+base = f"https://dl-cdn.alpinelinux.org/alpine/v{_rel}/main/x86_64/"
 out = sys.argv[1]; want = sys.argv[2:]
 os.makedirs(out, exist_ok=True)
 idx = urllib.request.urlopen(base + "APKINDEX.tar.gz").read()
