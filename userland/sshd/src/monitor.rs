@@ -1007,10 +1007,11 @@ impl Mon {
             t.strip_prefix("/dev/").unwrap_or(t).as_bytes().to_vec(),
             user.name.as_bytes().to_vec(),
             self.peer.ip().to_string().into_bytes()));
+        let utmp_rec_parent = utmp_rec.clone();
         unsafe {
             cmd.pre_exec(move || {
                 if let Some((line, name, host)) = &utmp_rec {
-                    crate::utmpx::login(libc::getpid(), line, name, host, uid as u32);
+                    crate::utmpx::login(crate::utmpx::getpid(), line, name, host, uid as u32);
                 }
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 if let Some(p) = &scope_procs {
@@ -1040,7 +1041,16 @@ impl Mon {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().map_err(|e| format!("{prog}: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // The child may have written its record before exec/setup failed.
+                if let Some((line, ..)) = &utmp_rec_parent {
+                    crate::utmpx::logout_line(line);
+                }
+                return Err(format!("{prog}: {e}"));
+            }
+        };
         let pid = child.id() as i32;
         log(&format!(
             "{}: {} for {} (uid {}) pid {}{}",
