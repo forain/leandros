@@ -1942,16 +1942,19 @@ static void nn_case(const char *name, int mode) {
     system("nft delete table inet netavark");
     if (mode == 5) {
         system("nft delete table inet midflow");
-        /* Linux semantics, not a LeandrOS bug: the dropped established flow leaves the server's socket orphaned in
-         * FIN_WAIT1/LAST_ACK; a userspace socket holds its netns (sk_alloc: sk_net_refcnt=1, get_net_track,
-         * net/core/sock.c:2233-2235 v6.12), so cleanup_net (net_namespace.c:569, queued from __put_net :669) cannot run, and the
-         * veth peer stays, until tcp_orphan_retries (8 when unset, tcp_timer.c:159-160) retransmits are spent: measured
-         * ~104 s on Linux 7.2 in `unshare -Urnm`.
-         * The cause of the failure seen without this delete (next case still finding vethN after its 5 s wait) is not established:
-         * an isolated measurement of ours shows vethN gone ~1.1 s after the server exits. The next case needs the name free,
-         * so delete it explicitly, which removes the peer as well. */
+        /* The dropped established flow leaves the server's sockets retransmitting FINs that nothing ACKs (the flow's
+         * conntrack entry is gone). Once the bridge is deleted the daemon must still free the dead stack ~2 s after its last
+         * TCP progress: queued retransmits are not progress (servers/net/src/vif.rs finish_dying). Before that fix
+         * every retransmit restarted the grace and vethN outlived the server by ~12.8 s (x86_64 KVM, 3 runs); with it ~1.1-2 s.
+         * (Linux differs: the orphaned socket holds its netns ~104 s, so a Linux port of this check needs no bound.) */
+        link_del(s, bidx);
+        int ms = 0;
+        for (; ms < 35000 && link_get(s, "vethN", NULL, NULL) > 0; ms += 100) usleep(100000);
+        snprintf(msg, sizeof msg, "%s: vethN is freed within 4 s of the bridge going away (%d ms)", name, ms);
+        CHECK(msg, ms < 4000);
         int vi = link_get(s, "vethN", NULL, NULL);
         if (vi > 0) link_del(s, vi);
+        close(s); return;
     }
     link_del(s, bidx); close(s);
 }
