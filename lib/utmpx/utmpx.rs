@@ -268,6 +268,36 @@ pub fn logout_pid(pid: i32) -> bool {
     }
 }
 
+/// End the USER_PROCESS entry on `line` whatever its pid (a session whose
+/// leader never got to exec: the pid is unknown to the caller). Returns true
+/// if one was found.
+pub fn logout_line(line: &[u8]) -> bool {
+    unsafe {
+        let fd = open(UTMP_PATH, O_RDWR, 0);
+        if fd < 0 { return false; }
+        flock(fd, 2);
+        let mut idx: i64 = 0;
+        let mut b = [0u8; REC];
+        let mut found = false;
+        while read_full(fd, &mut b) == REC {
+            let o = Utmpx::from_bytes(&b);
+            if o.ut_type == USER_PROCESS && cstr_eq(&o.ut_line, line) {
+                let mut d = make(DEAD_PROCESS, o.ut_pid, &o.ut_line, b"", b"");
+                d.ut_id = o.ut_id;
+                lseek(fd, idx * REC as i64, 0);
+                write(fd, d.as_bytes());
+                wtmp_append(&d);
+                found = true;
+                break;
+            }
+            idx += 1;
+        }
+        flock(fd, 8);
+        close(fd);
+        found
+    }
+}
+
 /// Boot: empty utmp; BOOT_TIME + RUN_LVL into utmp and wtmp.
 pub fn boot() {
     ensure_dirs();

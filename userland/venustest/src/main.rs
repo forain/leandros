@@ -764,6 +764,43 @@ unsafe fn fence_hold_mode(m: u8) -> bool {
     ok
 }
 
+/// LeandrOS control-queue census (`VIRTGPU_PARAM_LEANDROS_CTRLQ_STAT`): 0 parked
+/// chains (+ orphans), 1 reclaimed, 2 abandoned fences, 3 in flight, 7 orphans
+/// now, 8 fences written off, 9 contexts lost. u64::MAX if unavailable.
+unsafe fn ctrlq_stat(fd: c_int, sel: u32) -> u64 {
+    let mut v: u32 = sel;
+    let mut gp = DrmVirtgpuGetparam { param: 0x1000_000A, value: &mut v as *mut u32 as u64 };
+    if ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &mut gp as *mut _) != 0 { return u64::MAX; }
+    v as u64
+}
+
+/// Root ioctl 0x100A: replace the context-close drain limit (us); u64::MAX =
+/// default, 0 = no drain. Returns the previous value (u64::MAX if it fails).
+unsafe fn ctx_drain_override(fd: c_int, us: u64) -> u64 {
+    let mut v = us;
+    if ioctl(fd, 0x100A as c_ulong, &mut v as *mut u64) != 0 { return u64::MAX - 1; }
+    v
+}
+
+/// Import a sync_file into a fresh syncobj of `fd`; the handle, 0 on failure.
+unsafe fn syncobj_from_sync_file(fd: c_int, sync_fd: c_int) -> u32 {
+    let mut c = [0u32; 2];
+    if ioctl(fd, 0xC008_64BF as c_ulong, c.as_mut_ptr()) != 0 { return 0; }
+    let mut h = [c[0], 1u32 /* IMPORT_SYNC_FILE */, sync_fd as u32, 0u32];
+    if ioctl(fd, 0xC010_64C2 as c_ulong, h.as_mut_ptr()) != 0 { return 0; }
+    c[0]
+}
+
+/// Non-blocking syncobj wait: 0 signalled, else the errno (62 = ETIME).
+unsafe fn syncobj_wait_now(fd: c_int, handle: u32) -> c_int {
+    let hs = [handle];
+    // struct drm_syncobj_wait { handles, timeout_nsec, count_handles:u32, flags:u32, first_signaled:u32, pad:u32 }
+    let mut raw = [0u8; 32];
+    raw[0..8].copy_from_slice(&(hs.as_ptr() as u64).to_ne_bytes());
+    raw[16..20].copy_from_slice(&1u32.to_ne_bytes());
+    if ioctl(fd, 0xC020_64C3 as c_ulong, raw.as_mut_ptr()) == 0 { 0 } else { *__errno_location() }
+}
+
 /// SYNC_IOC_FILE_INFO status of a sync file fd (0 active, 1 signalled,
 /// negative errno = the fence errored); i32::MIN if the ioctl fails.
 unsafe fn sync_file_status(fd: c_int) -> i32 {
@@ -1452,6 +1489,166 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         }
         if fx >= 0 { close(fx); }
         if !report(b"phase7g_host_recovers_after_silent_writeoff", c_ok == 1 && c_sig == 1) { failures += 1; }
+    }
+
+    // ── 7h. A destroyed context's fences stay pending until the host answers ─
+    // Linux: a virtio_gpu_fence outlives its context; only the host's answer
+    // (or a device reset) signals it. Knob mode 6 swallows the host's reply to
+    // A's ringed fence and stashes it; mode 0 replays it.
+    //   a) no close drain; A submits, its out-fence is exported to B's syncobj,
+    //      A closes (context destroyed with the fence unanswered).
+    //   b) 300 ms later the fence is still pending everywhere, one orphan, and
+    //      nothing was abandoned or written off.
+    //   c) C reuses the context id; its fences signal, A's stays pending, and
+    //      past the alive limit C is not LOST.
+    //   d) the stashed reply is replayed: A's fence signals, the orphan is
+    //      reclaimed and the census returns to baseline.
+    {
+        let vstream: [u32; 4] = [188, 0, 1, 0];
+        let ctl = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let old_drain = if ctl >= 0 { ctx_drain_override(ctl, 0) } else { u64::MAX - 1 };
+        let knob = old_drain != u64::MAX - 1;
+        let base_inflight = ctrlq_stat(ctl, 3);
+        let orph0 = ctrlq_stat(ctl, 7);
+        let aband0 = ctrlq_stat(ctl, 2);
+        let wo0 = ctrlq_stat(ctl, 8);
+        let lost0 = ctrlq_stat(ctl, 9);
+        let recl0 = ctrlq_stat(ctl, 1);
+        let fa = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let fb = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        let inited = fa >= 0 && ctx_init_venus(fa);
+        let ida = if inited { ctx_id(fa) } else { 0 };
+        let held = knob && fence_hold_mode(6);
+        let mut ea = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+        let oka = inited && held
+            && ioctl(fa, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ea as *mut _) == 0 && ea.fence_fd >= 3;
+        let sh = if oka && fb >= 0 { syncobj_from_sync_file(fb, ea.fence_fd) } else { 0 };
+        if fa >= 0 { close(fa); }
+        poll(core::ptr::null_mut(), 0, 300);
+        // b)
+        let b_poll = oka && !poll_in_ready(ea.fence_fd);
+        // An out-fence that is not a sync_file cannot be imported into a syncobj: then only the poll side is checked.
+        let b_wait = sh == 0 || syncobj_wait_now(fb, sh) == 62;
+        let orph1 = ctrlq_stat(ctl, 7);
+        let b_cnt = orph1 == orph0.wrapping_add(1);
+        let b_unch = ctrlq_stat(ctl, 2) == aband0 && ctrlq_stat(ctl, 8) == wo0;
+        // c)
+        let mut idc = 0u64;
+        let mut c_ok = 0u32;
+        let mut c_sig = 0u32;
+        let mut c_ecanceled = false;
+        let mut x_ok = 0u32;
+        let mut c1_sig = false;
+        let mut c3_sig = false;
+        let mut x_sig = 0u32;
+        let mut a_pending_c = oka;
+        let fc = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+        if oka && fc >= 0 && ctx_init_venus(fc) {
+            idc = ctx_id(fc);
+            // C: the first fence of the reused id's timeline signals while A's stays pending.
+            let mut ec = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            if ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ec as *mut _) == 0 && ec.fence_fd >= 3 {
+                c_ok += 1;
+                if poll_in_within(ec.fence_fd, 4000) { c_sig += 1; c1_sig = true; }
+                close(ec.fence_fd);
+            }
+            // 15 rounds (>= 13.5 s of sleep alone) since C's first fence signalled,
+            // past mode 6's 10 s alive limit even after C's answer refreshed the
+            // timeline: other fresh contexts keep the host answering (never
+            // "silent"), the orphan outlives the limit.
+            for _ in 0..15 {
+                let fx = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+                if fx >= 0 && ctx_init_venus(fx) {
+                    let mut ex = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+                    if ioctl(fx, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ex as *mut _) == 0 && ex.fence_fd >= 3 {
+                        x_ok += 1;
+                        if poll_in_within(ex.fence_fd, 4000) { x_sig += 1; }
+                        close(ex.fence_fd);
+                    }
+                }
+                if fx >= 0 { close(fx); }
+                if poll_in_ready(ea.fence_fd) { a_pending_c = false; }
+                poll(core::ptr::null_mut(), 0, 900);
+            }
+            // C was never blamed for the orphan: a ringed submit is not ECANCELED. (No
+            // out-fence: the host answers only the first fence of a fresh context's
+            // ring, so a second one would stay in flight and skew the census.)
+            let mut e3 = exec_req(EXECBUF_RING_IDX, &vstream, &[], 0);
+            let r3 = ioctl(fc, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut e3 as *mut _);
+            if r3 == 0 { c_ok += 1; c_sig += 1; c3_sig = true; }
+            else if *__errno_location() == 125 { c_ecanceled = true; }
+        }
+        let c_lost_same = ctrlq_stat(ctl, 9) == lost0;
+        let c_orph = ctrlq_stat(ctl, 7) == orph0.wrapping_add(1);
+        // d)
+        let infl_pre = ctrlq_stat(ctl, 3);
+        let rel = fence_hold_mode(0);
+        let d_poll = oka && poll_in_within(ea.fence_fd, 1000);
+        let d_wait = sh == 0 || syncobj_wait_now(fb, sh) == 0;
+        poll(core::ptr::null_mut(), 0, 100);
+        let d_orph = ctrlq_stat(ctl, 7) == orph0;
+        let d_recl = ctrlq_stat(ctl, 1) == recl0.wrapping_add(1);
+        let recl_now = ctrlq_stat(ctl, 1);
+        let infl_now = ctrlq_stat(ctl, 3);
+        // A's chain (and only it) is freed by the replay; C's last submit stays in flight (the host answers one fence per fresh ring).
+        let d_census = infl_now.wrapping_add(1) == infl_pre;
+        if oka { close(ea.fence_fd); }
+        // Restore the drain before C closes: its unfenced e3 is never answered and
+        // must not leave an orphan behind for later phases.
+        if knob { ctx_drain_override(ctl, old_drain); }
+        if fc >= 0 { close(fc); }
+        if fb >= 0 { close(fb); }
+        poll(core::ptr::null_mut(), 0, 600);
+        let f_orph = ctrlq_stat(ctl, 7) == orph0;
+        let hung_h0 = fence_stat(b"hangs");
+        // e) an orphan alone on an idle host (no answers for > 10 s) is no host hang.
+        let mut e_ok = false;
+        let mut e_hung = false;
+        let mut e_rel = false;
+        let mut e_orph_back = false;
+        if knob {
+            let old2 = ctx_drain_override(ctl, 0);
+            let fe = open(b"/dev/dri/card0\0".as_ptr(), O_RDWR);
+            let held2 = fe >= 0 && ctx_init_venus(fe) && fence_hold_mode(6);
+            let mut ee = exec_req(EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX, &vstream, &[], 0);
+            e_ok = held2 && ioctl(fe, DRM_IOCTL_VIRTGPU_EXECBUFFER, &mut ee as *mut _) == 0 && ee.fence_fd >= 3;
+            if fe >= 0 { close(fe); }
+            poll(core::ptr::null_mut(), 0, 11500);
+            e_hung = fence_stat(b"hangs") != hung_h0 || fence_stat(b"hung_now") != 0;
+            e_rel = fence_hold_mode(0);
+            if e_ok {
+                poll_in_within(ee.fence_fd, 2000);
+                close(ee.fence_fd);
+            }
+            poll(core::ptr::null_mut(), 0, 300);
+            ctx_drain_override(ctl, old2);
+            e_orph_back = ctrlq_stat(ctl, 7) == orph0;
+        }
+        if ctl >= 0 { close(ctl); }
+        out(b"  7h: knob="); out_u64(knob as u64); out(b" oka="); out_u64(oka as u64);
+        out(b" b="); out_u64(b_poll as u64); out_u64(b_wait as u64); out_u64(b_cnt as u64); out_u64(b_unch as u64);
+        out(b" ids="); out_u64(ida); out(b"/"); out_u64(idc);
+        out(b" c="); out_u64(c_ok as u64); out(b"/"); out_u64(c_sig as u64);
+        out(b" c1="); out_u64(c1_sig as u64); out(b" c3="); out_u64(c3_sig as u64); out(b" x="); out_u64(x_ok as u64); out(b"/"); out_u64(x_sig as u64); out(b" sh="); out_u64(sh as u64);
+        out(b" a_pend="); out_u64(a_pending_c as u64); out(b" lost_same="); out_u64(c_lost_same as u64);
+        out(b" d="); out_u64(d_poll as u64); out_u64(d_wait as u64); out_u64(d_orph as u64);
+        out_u64(d_recl as u64); out_u64(d_census as u64);
+        out(b" recl="); out_u64(recl0); out(b"->"); out_u64(recl_now);
+        out(b" inflight="); out_u64(infl_pre); out(b"->"); out_u64(infl_now); out(b"\n");
+        if !report(b"phase7h_a_orphaned_fence_setup", knob && inited && held && oka) { failures += 1; }
+        if !report(b"phase7h_b_destroyed_ctx_fence_stays_pending",
+                   b_poll && b_wait && b_cnt && b_unch) { failures += 1; }
+        if !report(b"phase7h_c_reused_id_tenant_unaffected",
+                   idc != 0 && idc == ida && c_ok == 2 && c_sig == 2 && c3_sig && x_ok == 15 && x_sig == 15 && a_pending_c && !c_ecanceled
+                   && c_lost_same && c_orph) { failures += 1; }
+        if !report(b"phase7h_d_host_answer_signals_orphan",
+                   rel && d_poll && d_wait && d_orph && d_recl && d_census) { failures += 1; }
+        // C's unfenced e3 is never answered, so its orphan (f_orph=0 right after close)
+        // heals only when the reused id's timeline is answered again: 7h-e's fence does that.
+        out(b"  7h: f_orph="); out_u64(f_orph as u64); out(b" e="); out_u64(e_ok as u64);
+        out_u64(!e_hung as u64); out_u64(e_rel as u64); out_u64(e_orph_back as u64); out(b"\n");
+        if !report(b"phase7h_e_orphan_on_idle_host_is_no_hang", e_ok && !e_hung && e_rel) { failures += 1; }
+        if !report(b"phase7h_f_orphan_heals_by_next_create_on_id", e_orph_back) { failures += 1; }
     }
 
     // Unlock drains only happen when an interrupt loses the device lock, which a

@@ -6387,6 +6387,11 @@ fn mount_referenced(port: u32, file_id: u32) -> bool {
     MOUNT_FDREFS.lock().iter().any(|e| e.0 == port && e.1 == file_id)
 }
 
+/// Open fd-table entries (plus queued copies) on block registry slot `dev`.
+pub(crate) fn blk_open_count(dev: u16) -> u32 {
+    BLK_FDREFS.get(dev as usize).map_or(0, |c| c.load(atomic::Ordering::Acquire))
+}
+
 #[inline]
 fn tmp_fdref_inc(kind: &VnodeKind) {
     match *kind {
@@ -8308,6 +8313,10 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         return Some(write_lit(buf, p, b"\n"));
     }
 
+    if path == b"/proc/partitions" {
+        return Some(block::proc_partitions(&mut buf[..]));
+    }
+
     if path == b"/proc/uptime" {
         let mut p = 0;
         p = write_u32(buf, p, uptime_sec as u32);
@@ -9155,7 +9164,7 @@ const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc
 /// the `/proc/sys/fs` ones), none of which is a RAMFS entry: stat must answer
 /// for them or they cannot be a bind-mount target.
 const PROC_SYSTEM_FILES: &[&[u8]] = &[b"/proc/meminfo", b"/proc/uptime", b"/proc/cmdline", b"/proc/nvrm_state",
-                                      b"/proc/loadavg", b"/proc/stat", b"/proc/mounts", b"/proc/interrupts",
+                                      b"/proc/loadavg", b"/proc/stat", b"/proc/mounts", b"/proc/partitions", b"/proc/interrupts",
                                       b"/proc/sys/fs/nr_open", b"/proc/sys/fs/file-max", b"/proc/sys/fs/file-nr",
                                       b"/proc/sys/fs/ovl_selftest", b"/proc/sys/kernel/random/boot_id", b"/proc/sys/kernel/random/uuid", b"/proc/kmod_initrd", b"/proc/kmod_buildid"];
 const PROC_PID_FILES: &[&[u8]] = &[b"stat", b"status", b"statm", b"cmdline", b"comm", b"maps", b"smaps",
@@ -10281,7 +10290,7 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/meminfo" || lookup_path == b"/proc/uptime"
                || lookup_path == b"/proc/cmdline" || lookup_path == b"/proc/nvrm_state"
-               || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat"
+               || lookup_path == b"/proc/loadavg" || lookup_path == b"/proc/stat" || lookup_path == b"/proc/partitions"
                || lookup_path == b"/proc/self" || lookup_path == b"/proc/mounts"
                || lookup_path == b"/proc/cpuinfo" || lookup_path == b"/proc/interrupts" || lookup_path == b"/etc/resolv.conf"
                || lookup_path == b"/proc/sys/fs/nr_open" || lookup_path == b"/proc/sys/fs/file-max"
@@ -11240,7 +11249,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
                 let mut s = &b[..n];
                 while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
-                if s != b"0" && s != b"1" && s != b"2" && s != b"3" && s != b"4" && s != b"5" { return err_reply(-22); }
+                if s != b"0" && s != b"1" && s != b"2" && s != b"3" && s != b"4" && s != b"5" && s != b"6" { return err_reply(-22); }
                 extern "C" { fn kernel_drm_fence_hold_set(on: u32); }
                 unsafe { kernel_drm_fence_hold_set((s[0] - b'0') as u32) };
                 return val_reply(count as u64);

@@ -417,7 +417,7 @@ def phase_hid(arch, run_id, env):
         print(f"(a) control (no injection) bytes: {ctl}")
         # a cat of event0 reads a fixed initial burst on open (ctl); injected keys add 24 B/event on top
         if n1 <= ctl or n2 <= ctl:
-            print("FAIL: baseline keys not delivered (step a)"); return False
+            print(f"FAIL: baseline keys not delivered (step a) ctl={ctl} n1={n1} n2={n2}"); return False
         print(f"(a) baseline key bytes on event0: kbd1={n1} kbd2={n2}")
         rc, o = drv("qmp", "device_del", json.dumps({"id": "kbd1"}), timeout=60)
         print(f"device_del kbd1 rc={rc}")

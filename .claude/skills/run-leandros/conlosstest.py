@@ -31,6 +31,17 @@ def gaps(buf: bytes, n: int):
     return sorted(set(range(1, n + 1)) - seen)
 
 
+def spliced(seg: bytes):
+    """Lines of the flood with a CONLOSS row or its payload inside something else
+    (a kernel line spliced into a row, or a row into a kernel line)."""
+    bad = []
+    for ln in seg.split(b"\n"):
+        if (b"CONLOSS " in ln or b"x" * 40 in ln) and not re.fullmatch(rb"CONLOSS \d{6} x{40}\r?", ln):
+            if not ln.startswith(b"CONLOSS-DONE"):
+                bad.append(ln[:200])
+    return bad
+
+
 def segment(buf: bytes) -> bytes:
     """The flood in `buf`: first CONLOSS line through the DONE line."""
     i = buf.find(b"CONLOSS 000001 ")
@@ -74,7 +85,10 @@ def main():
         d = driver.serial_run("cat /proc/sysstat", timeout=30, arch=arch, ser=ser).get("output", "")
         md = re.search(r"# uartdrop total (\d+) user (\d+)", d)
         user_drops = int(md.group(2)) if md else -1
-        ok = (r["status"] == "ok" and m is not None and not gs and not gf and not short and seg_s and user_drops == 0)
+        sp = spliced(seg_s)
+        if sp:
+            print(f"  spliced lines {len(sp)}: {sp[:3]!r}")
+        ok = (r["status"] == "ok" and m is not None and not sp and not gs and not gf and not short and seg_s and user_drops == 0)
         print(f"conloss_lossless: {'PASS' if ok else 'FAIL'} (lines {N}, status {r['status']}, "
               f"{m.group(0) if m else 'no DONE line'}; socket gaps {len(gs)} {gs[:10]}; "
               f"qemu-log gaps {len(gf)} {gf[:10]} (bytes socket {len(seg_s)} log {len(seg_f)}); {md.group(0) if md else 'no # uartdrop line'})")

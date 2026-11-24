@@ -52,7 +52,8 @@ stop_vm() {
 }
 r() { $REMOTE run "$1" | tr -d '\r'; }
 
-GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-$ARCH}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/m6out.sh"
+GUI_BIN="${GUI_BIN:-$M6_OUT/leandros-installer-$ARCH}"; [ -e "$GUI_BIN" ] || GUI_BIN="$M6_OUT_SHARED/leandros-installer-$ARCH"
 FAKE="$ROOT/ports/leandros-installer/test/fake-backend.sh"
 echo "== images"
 rm -rf "$WORK"; mkdir -p "$WORK"

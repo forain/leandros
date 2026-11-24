@@ -41,7 +41,8 @@ cleanup() { [ -n "$QPID" ] && kill "$QPID" 2>/dev/null || true; rm -f "$STATE" "
 trap cleanup EXIT
 r() { $REMOTE run "$1" | tr -d '\r'; }
 LI=/tmp/leandros-install
-GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-$ARCH}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/m6out.sh"
+GUI_BIN="${GUI_BIN:-$M6_OUT/leandros-installer-$ARCH}"; [ -e "$GUI_BIN" ] || GUI_BIN="$M6_OUT_SHARED/leandros-installer-$ARCH"
 P2=/dev/nvme0n1p2
 
 dfguard() { local g; g=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}'); [ "$g" -ge 30 ] || fail "only ${g} GiB free on the host; stop"; }
