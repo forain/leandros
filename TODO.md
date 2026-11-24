@@ -123,6 +123,8 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - **Shared m6 cargo target dirs (watch)**: `../leandros-artifacts/m6-session-bins/src/<app>/target` (19 GB cosmic-files, 6 GB applets) is still shared by every worktree (too big to clone per worktree); `build-rust.sh` now serializes builds per target dir, but the build-then-stage window in each port script is not under that lock (a concurrent different-feature build could swap the binary in between). `LEANDROS_M6_TARGET=<dir>` gives a private target. The m5 ship tree is per-worktree since lane buildshare.
 
 
+- ctxdestroyfence (lane/ctxdestroyfence): a destroyed context's fences are orphaned (stay pending until the host answers; no write-off at close); venustest 7h on x86_64 KVM. Open: 7h on aarch64 TCG untested; 7h cannot import the eventfd-backed out-fence into a syncobj (checks poll only); a second ringed fence on one fresh Venus context is never answered by the host (7h uses single-fence tenants); verify render-server proxy contexts deliver a destroyed context's late fence.
+- Venus bare probe context: the host answers only the first fence of a bare probe context (vkEnumerateInstanceVersion without a VkInstance/queue); a second ringed fence stays unanswered. Pre-existing, likely virglrenderer render-server behaviour, unverified.
 - venusisr follow-up: a venustest 7c variant on the syncobj path (per-context/ring timelines done by venustl+venusfollow).
 - venusisr follow-up: per-context fence timelines like Linux (one stalled context's fence currently holds back the global fence floor and everyone's retired-ahead depth; table grows to AHEAD_MAX=65536 then EAGAIN). Also a venustest 7c variant on the syncobj path.
 
