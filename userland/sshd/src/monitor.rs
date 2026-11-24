@@ -404,8 +404,40 @@ impl Mon {
                         line_opts = Some(o);
                         file_principal = true;
                     }
+                    Ok(None) if eff.authorized_principals_command.is_some() => {}
                     Ok(None) => return deny("no principal listed in AuthorizedPrincipalsFile"),
                     Err(why) => return deny(&format!("AuthorizedPrincipalsFile unusable: {why}")),
+                }
+            }
+        }
+        // AuthorizedPrincipalsCommand (after the file, as OpenSSH): same line format.
+        if trusted && !file_principal {
+            if let Some(pc) = eff.authorized_principals_command.as_deref() {
+                let Some(runas) = eff.authorized_principals_command_user.as_deref().and_then(accounts::lookup_user) else {
+                    return deny("AuthorizedPrincipalsCommand needs a valid AuthorizedPrincipalsCommandUser");
+                };
+                let conn_id = {
+                    use sha2::{Digest, Sha256};
+                    let l = self.local.map(|l| l.to_string()).unwrap_or_default();
+                    let h = Sha256::digest(format!("{l} {}", self.peer).as_bytes());
+                    h.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                };
+                let argv = match accounts::expand_command(pc, &accounts::CmdTokens { user: &u, cert, conn_id }) {
+                    Ok(a) => a,
+                    Err(why) => return deny(&format!("AuthorizedPrincipalsCommand: {why}")),
+                };
+                match accounts::run_command_as(&runas, &argv) {
+                    Ok(text) => match accounts::principals_match_text(&u, &text, cert.valid_principals()) {
+                        Some(o) => {
+                            if !self.opts_ok(user, &o) {
+                                return None;
+                            }
+                            line_opts = Some(o);
+                            file_principal = true;
+                        }
+                        None => return deny("no principal listed by AuthorizedPrincipalsCommand"),
+                    },
+                    Err(why) => return deny(&format!("AuthorizedPrincipalsCommand failed: {why}")),
                 }
             }
         }
@@ -648,15 +680,25 @@ impl Mon {
         for &i in ready.iter().rev() {
             let h = self.helpers.remove(i);
             let res = rpc::recv(h.sock.as_raw_fd());
-            unsafe { libc::waitpid(h.pid, std::ptr::null_mut(), 0) };
+            let (hpid, hreq) = (h.pid, h.req);
+            drop(h.sock); // lets the helper (waiting for this hang-up) exit
+            let mut wst = 0i32;
+            unsafe { libc::waitpid(hpid, &mut wst, 0) };
             match res {
                 Ok(Some((Ok(f), fds))) if matches!(f.ty, rpc::FWD_FD | rpc::FWD_LISTEN | rpc::ERR) && fds.len() <= 1 => {
-                    self.send_ctl(f.ty, h.req, &f.body, &fds);
+                    self.send_ctl(f.ty, hreq, &f.body, &fds);
                     for fd in fds {
                         unsafe { libc::close(fd) };
                     }
                 }
-                _ => {
+                other => {
+                    let what = match other {
+                        Ok(None) => "eof".to_string(),
+                        Ok(Some((Ok(f), fds))) => format!("frame type {} with {} fds", f.ty, fds.len()),
+                        Ok(Some((Err(_), _))) => "undecodable frame".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    log(&format!("{}: forward helper {} failed: {what}, wait status {wst:#x}", self.peer, hpid));
                     let mut w = W::default();
                     w.str(b"helper failed");
                     self.send_ctl(rpc::ERR, h.req, &w.0, &[]);
@@ -748,17 +790,19 @@ impl Mon {
                     Err(e) => self.fatal(&e),
                 }
             }
-            SESSION_OPEN | SESSION_SIGNAL | SESSION_HANGUP | DIRECT_TCPIP | TCPIP_FORWARD if !self.authed => {
+            SESSION_OPEN | SESSION_SIGNAL | SESSION_HANGUP | DIRECT_TCPIP | TCPIP_FORWARD | DIRECT_STREAMLOCAL | STREAMLOCAL_FORWARD if !self.authed => {
                 log(&format!("{}: forged auth refused: request {} before authentication", self.peer, f.ty));
                 self.shutdown(1)
             }
-            SESSION_OPEN | SESSION_SIGNAL | SESSION_HANGUP | DIRECT_TCPIP | TCPIP_FORWARD => {
+            SESSION_OPEN | SESSION_SIGNAL | SESSION_HANGUP | DIRECT_TCPIP | TCPIP_FORWARD | DIRECT_STREAMLOCAL | STREAMLOCAL_FORWARD => {
                 let r = match f.ty {
                     SESSION_OPEN => self.session_open(&f),
                     SESSION_SIGNAL => self.session_signal(&f, false),
                     SESSION_HANGUP => self.session_signal(&f, true),
                     DIRECT_TCPIP => self.forward(&f, false),
-                    _ => self.forward(&f, true),
+                    TCPIP_FORWARD => self.forward(&f, true),
+                    DIRECT_STREAMLOCAL => self.forward_unix(&f, false),
+                    _ => self.forward_unix(&f, true),
                 };
                 match r {
                     Ok(()) => {}
@@ -1063,6 +1107,107 @@ impl Mon {
 
     // ---- forwarding ----------------------------------------------------------
 
+    /// Unix-socket forwarding (`direct-streamlocal` / `streamlocal-forward`): AllowStreamLocalForwarding
+    /// and the key's no-port-forwarding decide; the socket is opened as the user.
+    fn forward_unix(&mut self, f: &Frame, listen: bool) -> Result<(), String> {
+        let user = self.user.clone().ok_or("not authenticated")?;
+        let mut r = R(&f.body);
+        let path = String::from_utf8_lossy(r.str().map_err(rerr)?).into_owned();
+        r.done().map_err(rerr)?;
+        let eff = self.eff_for(&user.name);
+        {
+            use crate::TcpFwd::*;
+            let ok = !self.key_opts.no_port_forwarding
+                && match eff.allow_streamlocal_forwarding {
+                    All => true,
+                    No => false,
+                    Local => !listen,
+                    Remote => listen,
+                };
+            if !ok {
+                return Err("streamlocal forwarding disabled (AllowStreamLocalForwarding or the key)".into());
+            }
+        }
+        if path.is_empty() || path.len() >= 108 || path.contains('\0') {
+            return Err("bad socket path".into());
+        }
+        let path = if let Some(rest) = path.strip_prefix("~/") { format!("{}/{rest}", user.home) } else { path };
+        if self.helpers.len() >= MAX_HELPERS {
+            return Err("too many pending forwards".into());
+        }
+        let (mask, unlink) = (eff.streamlocal_bind_mask, eff.streamlocal_bind_unlink);
+        let (a, b) = socketpair().map_err(|e| e.to_string())?;
+        let groups = accounts::groups_of(&user);
+        let (uid, gid) = (user.uid, user.gid);
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            unsafe {
+                libc::close(a);
+                libc::close(b);
+            }
+            return Err("fork failed".into());
+        }
+        if pid == 0 {
+            unsafe {
+                crate::sandbox::close_except(&[b]);
+                let fail = |msg: &str| -> ! {
+                    let mut w = W::default();
+                    w.str(msg.as_bytes());
+                    let _ = rpc::send(b, rpc::ERR, 0, &w.0, &[]);
+                    libc::_exit(1)
+                };
+                if uid != 0 {
+                    if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0
+                        || libc::setresgid(gid, gid, gid) != 0
+                        || libc::setresuid(uid, uid, uid) != 0
+                        || libc::getuid() != uid
+                        || libc::geteuid() != uid
+                        || libc::setuid(0) == 0
+                    {
+                        fail("cannot drop privileges");
+                    }
+                }
+                if listen {
+                    libc::umask(mask as libc::mode_t);
+                    if unlink {
+                        // Like OpenSSH: unlink whatever is there (but never a directory).
+                        if let Ok(md) = std::fs::symlink_metadata(&path) {
+                            if !md.file_type().is_dir() {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                    match std::os::unix::net::UnixListener::bind(&path) {
+                        Ok(l) => {
+                            if let Err(e) = rpc::send(b, rpc::FWD_LISTEN, 0, &0u32.to_be_bytes(), &[l.as_raw_fd()]) {
+                                fail(&format!("send failed: {e}"));
+                            }
+                        }
+                        Err(e) => fail(&format!("bind failed: {e}")),
+                    }
+                } else {
+                    match std::os::unix::net::UnixStream::connect(&path) {
+                        Ok(s) => {
+                            if let Err(e) = rpc::send(b, rpc::FWD_FD, 0, &[], &[s.as_raw_fd()]) {
+                                fail(&format!("send failed: {e}"));
+                            }
+                        }
+                        Err(e) => fail(&format!("connect failed: {e}")),
+                    }
+                }
+                // Stay until the monitor has read the frame and hung up: exiting right after sendmsg
+                // can lose the queued frame (the reader then sees a bare EOF).
+                let mut one = [0u8; 1];
+                let _ = libc::read(b, one.as_mut_ptr() as *mut _, 1);
+                libc::_exit(0)
+            }
+        }
+        unsafe { libc::close(b) };
+        set_nonblock(a);
+        self.helpers.push(Helper { pid, sock: unsafe { OwnedFd::from_raw_fd(a) }, req: f.req, deadline: Instant::now() + HELPER_DEADLINE });
+        Ok(())
+    }
+
     fn forward(&mut self, f: &Frame, listen: bool) -> Result<(), String> {
         let user = self.user.clone().ok_or("not authenticated")?;
         let mut r = R(&f.body);
@@ -1135,11 +1280,15 @@ impl Mon {
                 } else {
                     match std::net::TcpStream::connect((host.as_str(), port as u16)) {
                         Ok(s) => {
-                            let _ = rpc::send(b, rpc::FWD_FD, 0, &[], &[s.as_raw_fd()]);
+                            if let Err(e) = rpc::send(b, rpc::FWD_FD, 0, &[], &[s.as_raw_fd()]) {
+                                fail(&format!("send failed: {e}"));
+                            }
                         }
                         Err(e) => fail(&format!("connect failed: {e}")),
                     }
                 }
+                let mut one = [0u8; 1];
+                let _ = libc::read(b, one.as_mut_ptr() as *mut _, 1); // wait for the monitor's hang-up
                 libc::_exit(0)
             }
         }
