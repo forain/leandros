@@ -230,7 +230,8 @@ def full(ssh, user, pw, tmp):
     step("bad_password_refused", rc == 255, f"rc={rc}")
 
     # public key: install, then BatchMode login
-    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ssh.key], check=True)
+    if not os.path.exists(ssh.key):  # options() already made it
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ssh.key], check=True)
     pub = open(ssh.key + ".pub", "rb").read()
     rc, out, err = ssh.run(user, "umask 077; mkdir -p .ssh && cat > .ssh/authorized_keys && echo ok",
                            password=pw, stdin=pub)
@@ -608,9 +609,11 @@ def write_cmd(path, text):
     return ("printf '%s\\n' " + args + f" > {path}").replace("$", "\\$")
 
 
-def sudo_write(ssh, user, pw, path, text):
-    """Replace `path` with `text` as root."""
-    return sudo_sh(ssh, user, pw, write_cmd(path, text))
+def sudo_write(ssh, user, pw, path, text, then=""):
+    """Replace `path` with `text` as root.
+    `then` is more shell (no '$' or double quotes) run in the SAME sudo: with real PAM (musl crypt) a
+    legacy $sha256$ hash cannot authenticate sudo, so nothing may need a second sudo while one is planted."""
+    return sudo_sh(ssh, user, pw, write_cmd(path, text) + (f"; {then}" if then else ""))
 
 
 def accounts_extra(ssh, user, pw, tmp):
@@ -650,8 +653,7 @@ def accounts_extra(ssh, user, pw, tmp):
         return
     legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
     lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
-    rc, wout, err = sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
-    rc2, mid, _ = sudo_sh(ssh, user, pw, "cat /etc/shadow")
+    rc, mid, err = sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n", then="cat /etc/shadow")
     primed = rc == 0 and f"{user}:$sha256$" in mid
     rc, out, err = ssh.run(user, "id -un", password=pw)
     login_ok = rc == 0 and out.strip() == user
@@ -1114,7 +1116,6 @@ def sshdcfg(ssh, user, pw, tmp):
     else:
         legacy = "$sha256$lnd0$" + hashlib.sha256(b"lnd0" + pw.encode()).hexdigest()
         lines = [(f"{user}:{legacy}:" + l.split(":", 2)[2]) if l.startswith(user + ":") else l for l in orig.splitlines()]
-        sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n")
         conf("")
         # The guest script remounts / read-only for a window, records what it sees, and remounts it read-write.
         sudo_write(ssh, user, pw, "/tmp/sshdcfg-ro.sh", "\n".join([
@@ -1132,7 +1133,9 @@ def sshdcfg(ssh, user, pw, tmp):
             "chmod 644 /tmp/sshdcfg-ro-*",
             "echo done > /tmp/sshdcfg-ro-done",
         ]))
-        sudo_sh(ssh, user, pw, "chmod 755 /tmp/sshdcfg-ro.sh; sh /tmp/sshdcfg-ro.sh > /dev/null 2>&1 < /dev/null &")
+        # One sudo plants the legacy hash and starts the script (sudo cannot authenticate against it afterwards).
+        sudo_write(ssh, user, pw, "/etc/shadow", "\n".join(lines) + "\n",
+                   then="chmod 755 /tmp/sshdcfg-ro.sh; sh /tmp/sshdcfg-ro.sh > /dev/null 2>&1 < /dev/null &")
         time.sleep(7)  # the root is read-only from here on
         rc, out, err = login(password=True)
         step("cfg_rehash_readonly_login_still_works", rc == 0 and out.strip() == user, f"rc={rc} out={out.strip()!r} err={err.strip()[-100:]!r}")
@@ -1482,8 +1485,13 @@ done"""
 
 def sshd_procs(ssh, user, pw):
     """[(pid, ppid, comm)] of every sshd* process in the guest."""
-    sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
-    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
+    # /proc/*/status is world readable: no sudo (with real PAM each sudo costs seconds of
+    # sha512-crypt on TCG, longer than the 4 s LoginGraceTime the probes below race against).
+    ssh.run(user, "cat > /tmp/sshps-u.sh", key=True, stdin=PS_SSHD.encode())
+    rc, out, err = ssh.run(user, "sh /tmp/sshps-u.sh", key=True)
+    if not out.strip():
+        sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
+        rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
     res = []
     if not out.strip():
         print(f"sshd_procs: empty listing rc={rc} out={out[-200:]!r} err={err.strip()[-200:]!r}", flush=True)
@@ -1634,9 +1642,24 @@ def privsep_hooks(ssh, user, pw, tmp):
         set_keys(ssh, user, pw, open(ssh.key + ".pub").read().strip())
 
 
-def wait_preauth(ssh, user, pw, limit=12):
+def grace_for(ssh, user, pw):
+    """LoginGraceTime for the probes: the STOP/KILL sudos run inside the window, so it must outlast
+    the guest's sudo latency (seconds on aarch64 TCG with real PAM). Never below the old 4 s."""
+    t0 = time.time()
+    sudo_sh(ssh, user, pw, "true")
+    lat = time.time() - t0
+    g = min(30, max(4, int(3 * lat) + 4))
+    print(f"grace_for: sudo latency {lat:.1f} s -> LoginGraceTime {g}", flush=True)
+    return g
+
+
+def wait_preauth(ssh, user, pw, grace, limit=12):
     """The sshd-preauth process list once the listener has forked it (it may lag well over 1 s on a loaded TCG
-    host); polled until it appears, then a short settle. LoginGraceTime 4 keeps the window open after the fork."""
+    host); polled until it appears. The listener's LoginGraceTime clock started at connect, and the STOP and
+    KILL sudos (about lat = (grace - 4) / 3 each, see grace_for) must still fit inside it, so the poll is
+    bounded by min(limit, grace - 2 * lat - 3) with a 2 s floor."""
+    lat = max(1.0, (grace - 4) / 3.0)
+    limit = min(limit, max(2.0, grace - 2 * lat - 3))
     t0 = time.time()
     while True:
         pre = [x for x in sshd_procs(ssh, user, pw) if x[2] == "sshd-preauth"]
@@ -1647,7 +1670,8 @@ def wait_preauth(ssh, user, pw, limit=12):
 
 def privsep_grace(ssh, user, pw, tmp):
     """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
-    conf = "LoginGraceTime 4\nPasswordAuthentication yes\n"
+    grace = grace_for(ssh, user, pw)
+    conf = f"LoginGraceTime {grace}\nPasswordAuthentication yes\n"
     if not sshd2_start(ssh, user, pw, conf):
         step("privsep_grace_kill", False, "second sshd did not start")
         return
@@ -1668,17 +1692,17 @@ def privsep_grace(ssh, user, pw, tmp):
         step("privsep_grace_kill", False, "cannot reach the second sshd through the tunnel")
         return
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
-    pre = wait_preauth(ssh, user, pw)
+    pre = wait_preauth(ssh, user, pw, grace)
     pre = [p for p, _, n in pre]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0]}")  # hung: it cannot disconnect itself
-    ok = bool(pre) and probe_eof(s, 25)
+    ok = bool(pre) and probe_eof(s, grace + 21)
     if pre:
         sudo_sh(ssh, user, pw, f"kill -KILL {pre[0]} 2>/dev/null; true")
     s.close()
     stop(tun)
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
-    step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within 25 s")
+    step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within {grace + 21} s")
 
 
 def second_tunnel(ssh, user, pw, conf, env=""):
@@ -1705,23 +1729,24 @@ def second_tunnel(ssh, user, pw, conf, env=""):
 def privsep_stalled_monitor(ssh, user, pw):
     """A monitor that stops (SIGSTOP) pre-auth cannot enforce LoginGraceTime itself: the listener's backstop
     kills the connection process after LoginGraceTime + 10 s and the client sees EOF."""
-    tun, lp = second_tunnel(ssh, user, pw, "LoginGraceTime 4\nPasswordAuthentication yes\n")
+    grace = grace_for(ssh, user, pw)
+    tun, lp = second_tunnel(ssh, user, pw, f"LoginGraceTime {grace}\nPasswordAuthentication yes\n")
     if tun is None:
         step("privsep_stalled_monitor_backstop", False, lp)
         return
     s = socket.create_connection(("127.0.0.1", lp), timeout=10)
     s.recv(256)
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
-    pre = [(p, pp) for p, pp, n in wait_preauth(ssh, user, pw)]
+    pre = [(p, pp) for p, pp, n in wait_preauth(ssh, user, pw, grace)]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]}")  # only the monitor hangs; the child stays live
-    ok = bool(pre) and probe_eof(s, 40)
+    ok = bool(pre) and probe_eof(s, grace + 36)
     if pre:
         sudo_sh(ssh, user, pw, f"kill -KILL {pre[0][1]} {pre[0][0]} 2>/dev/null; true")
     s.close()
     stop(tun)
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
-    step("privsep_stalled_monitor_backstop", ok, "" if ok else f"preauth {'found' if pre else 'missing'}, no EOF within 40 s")
+    step("privsep_stalled_monitor_backstop", ok, "" if ok else f"preauth {'found' if pre else 'missing'}, no EOF within {grace + 36} s")
 
 
 def privsep_highfd(ssh, user, pw):

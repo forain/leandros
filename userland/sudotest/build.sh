@@ -20,9 +20,14 @@ toolchain="+$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT_DIR/rust-toolchain.toml
 target_triple="${arch}-unknown-linux-musl"
 
 echo "Building sudotest for $arch ($target_triple)..."
+# Dynamic musl PIE linked against Alpine's real libpam.so.0 (scripts/lib/realpam.sh).
+source "$ROOT_DIR/scripts/lib/realpam.sh"
+WORK="$HERE/target/linkstub-$arch"
+realpam_stub "$arch" "$WORK"
+DYN_TC="$ROOT_DIR/scripts/toolchain/dyn" sh "$ROOT_DIR/scripts/toolchain/dyn/gen-cargo-config.sh" "$HERE" >/dev/null
+sed -i "s|^rustflags = \[|rustflags = [\n  \"-L\", \"native=$WORK\",|" "$HERE/.cargo/config.toml"
 (
     cd "$HERE"
-    RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no -C relocation-model=static" \
-        cargo "$toolchain" build --target "$target_triple" --release
+    cargo "$toolchain" build --target "$target_triple" --release
 )
 echo "built: $HERE/target/$target_triple/release/sudotest"

@@ -558,7 +558,16 @@ def cmd_deploy_files(t, a):
         pairs.append((l, r, bits[2] if len(bits) > 2 else None))
     if not pairs:
         die("nothing to deploy")
-    upload(t, pairs, force=a.force)
+    import pi_sync
+    held = [x for x in pairs if pi_sync.guarded(x[1])]
+    pairs = [x for x in pairs if x not in held]
+    if pairs:
+        upload(t, pairs, force=a.force)
+    if held:
+        ok, msg = pi_sync.shadow_gate(t, sys.modules[__name__])
+        if not ok:
+            die("refusing to swap PAM-dependent files (" + ", ".join(x[1] for x in held) + "): " + msg)
+        upload(t, held, force=a.force)
 
 
 # ── Kernel slots ────────────────────────────────────────────────────────────

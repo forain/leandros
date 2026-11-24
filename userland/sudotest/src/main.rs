@@ -18,7 +18,6 @@
 //! (gid 10) = {leandro}, and /etc/sudoers with `root ALL` and `%wheel ALL`.
 
 use std::ffi::CString;
-use pam_leandros as _;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -319,6 +318,49 @@ fn main() {
     let o = run(LEANDRO, &[SUDO, "-K"], &[], "");
     t.check("leandro: sudo -K (drop cached credentials)", o.code == 0, &o);
 
+    // AT_SECURE: a setuid dynamic binary must ignore LD_PRELOAD (musl would
+    // otherwise abort the exec with "Error loading shared library").
+    let o = run(LEANDRO, &[SUDO, "-S", "id"], &[("LD_PRELOAD", "/nonexistent/evil.so")], "leandro\n");
+    t.check(
+        "leandro: setuid sudo ignores LD_PRELOAD (AT_SECURE)",
+        o.code == 0 && o.stdout.contains("uid=0(root)") && !o.all().contains("Error loading"),
+        &o,
+    );
+    let o = run(LEANDRO, &[SU, "-c", "id", "root"], &[("LD_PRELOAD", "/nonexistent/evil.so")], "root\n");
+    t.check(
+        "leandro: setuid su ignores LD_PRELOAD (AT_SECURE)",
+        o.code == 0 && o.stdout.contains("uid=0(root)") && !o.all().contains("Error loading"),
+        &o,
+    );
+    // A locked account (`passwd -l`: "!" prefix on the hash) is refused even
+    // with the right password; unlocking restores it.
+    if let Ok(orig) = std::fs::read_to_string("/etc/shadow") {
+        let locked: String = orig
+            .lines()
+            .map(|l| if l.starts_with("leandro:") { format!("leandro:!{}", &l["leandro:".len()..]) } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if std::fs::write("/etc/shadow", &locked).is_ok() {
+            let _ = run(LEANDRO, &[SUDO, "-K"], &[], "");
+            let o = run(LEANDRO, &[SUDO, "-S", "id"], &[], "leandro\n");
+            t.check("leandro: locked (passwd -l) account rejected by sudo", o.code != 0 && !o.stdout.contains("uid=0"), &o);
+            let o = run(GREETER, &[SU, "-c", "id", "leandro"], &[], "leandro\n");
+            t.check("locked account rejected by su", o.code != 0 && !o.stdout.contains("uid=1000"), &o);
+            let _ = std::fs::write("/etc/shadow", &orig);
+            let o = run(LEANDRO, &[SUDO, "-S", "id"], &[], "leandro\n");
+            t.check("leandro: unlocked account works again", o.code == 0 && o.stdout.contains("uid=0(root)"), &o);
+        }
+    }
+
+    // The unlocked-account check above authenticated and cached a timestamp: start the
+    // "no cached credentials" checks from a clean slate.
+    // Linux sudo keys the timestamp on tty (or parent pid + session without one), so the
+    // same-parent success above IS cached: prove it, then prove `sudo -K` clears it.
+    let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
+    t.check("leandro: sudo -n id works from the timestamp the previous success cached", o.code == 0 && o.stdout.contains("uid=0(root)"), &o);
+    let o = run(LEANDRO, &[SUDO, "-K"], &[], "");
+    t.check("leandro: sudo -K succeeds", o.code == 0, &o);
     let o = run(LEANDRO, &[SUDO, "-n", "id"], &[], "");
     t.check(
         "leandro: sudo -n id without cached credentials fails",
@@ -375,6 +417,9 @@ fn main() {
     }
 
     pam_checks(&mut t);
+    shadow_migration_checks(&mut t);
+    shadow_repair_checks(&mut t);
+    chkpwd_checks(&mut t);
     login_checks(&mut t);
     devtty_checks(&mut t);
     su_background(&mut t);
@@ -613,7 +658,7 @@ fn su_background_pty(t: &mut T) {
     }
 }
 
-// ── libpam ABI (pam-leandros), driven directly ──────────────────────────────
+// ── libpam ABI (Alpine's real Linux-PAM, /etc/pam.d), driven directly ──────────────────────────────
 //
 // The same functions greetd (login screen), su and sudo-rs call. A wrong
 // password must be rejected on every service name, accepted when right, and a
@@ -637,6 +682,7 @@ struct PamConvT {
     data: *mut c_void,
 }
 
+#[link(name = "pam")]
 extern "C" {
     fn pam_start(svc: *const c_char, user: *const c_char, conv: *const PamConvT, h: *mut *mut c_void) -> c_int;
     fn pam_authenticate(h: *mut c_void, flags: c_int) -> c_int;
@@ -693,6 +739,12 @@ fn pam_checks(t: &mut T) {
         let (rc, _) = pam_try(svc, "leandro", "leandro ");
         t.check(&format!("pam {svc}: password with trailing byte rejected"), rc != 0, &none);
     }
+    // pam_rootok (Alpine's su stack): root switches user with no password at all,
+    // for su and su-l, while a non-root caller is covered by sudotest's su cases.
+    for svc in ["su", "su-l"] {
+        let (rc, _) = pam_try(svc, "leandro", "");
+        t.check(&format!("pam {svc}: root needs no password (pam_rootok)"), rc == 0, &none);
+    }
     // Locked accounts (`!`/`*` hash) never authenticate.
     let sh = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
     let locked = sh.lines().find_map(|l| {
@@ -706,6 +758,198 @@ fn pam_checks(t: &mut T) {
         let (rc2, _) = pam_try("greetd", &u, "x");
         t.check(&format!("pam greetd: locked account {u} rejected"), rc != 0 && rc2 != 0, &none);
     }
+    // The real case: leandro with the RIGHT password but `!` in front of the
+    // hash (passwd -l) must be refused; unlocked again it must work (control).
+    if sh.lines().any(|l| l.starts_with("leandro:")) {
+        let lk: String = sh
+            .lines()
+            .map(|l| if l.starts_with("leandro:") { format!("leandro:!{}", &l["leandro:".len()..]) } else { l.to_string() })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        if std::fs::write("/etc/shadow", &lk).is_ok() {
+            let (rc, _) = pam_try("greetd", "leandro", "leandro");
+            let _ = std::fs::write("/etc/shadow", &sh);
+            t.check("pam greetd: locked leandro refused despite the right password", rc != 0, &none);
+            t.check("pam greetd: leandro accepted again once unlocked (control)", pam_try("greetd", "leandro", "leandro").0 == 0, &none);
+        }
+    }
+}
+
+/// /usr/sbin/unix_chkpwd is setuid root (4755): as uid 1000 it verifies only
+/// the caller's own account. Password goes in on stdin, NUL terminated.
+fn chkpwd_checks(t: &mut T) {
+    use std::os::unix::fs::MetadataExt;
+    const C: &str = "/usr/sbin/unix_chkpwd";
+    let Ok(m) = std::fs::metadata(C) else { return };
+    let none = Out { code: 0, stdout: String::new(), stderr: String::new() };
+    t.check("unix_chkpwd is 4755 root:root", m.mode() & 0o7777 == 0o4755 && m.uid() == 0 && m.gid() == 0, &none);
+    let o = run(LEANDRO, &[C, "leandro", "nullok"], &[], "leandro\0");
+    t.check("unix_chkpwd as uid 1000: own account, right password, accepted", o.code == 0, &o);
+    let o = run(LEANDRO, &[C, "leandro", "nullok"], &[], "wrong\0");
+    t.check("unix_chkpwd as uid 1000: own account, wrong password, refused", o.code != 0, &o);
+    let o = run(LEANDRO, &[C, "cosmic-greeter", "nullok"], &[], "x\0");
+    t.check("unix_chkpwd as uid 1000: another account refused", o.code != 0, &o);
+    let o = run(LEANDRO, &[C, "root", "nullok"], &[], "root\0");
+    t.check("unix_chkpwd as uid 1000: root refused even with root's password", o.code != 0, &o);
+}
+
+/// Old images wrote two-field shadow lines (`user:HASH:`), which musl getspnam()
+/// (so unix_chkpwd, so PAM) rejects: a lockout. `/usr/sbin/shadowfix` (run by
+/// init each boot) pads them to nine fields. Short line without it: refused (the
+/// red case); with it: right password accepted, wrong one rejected, hash/owner/mode
+/// unchanged, second run a no-op; the image's own nine-field line works too.
+fn shadow_migration_checks(t: &mut T) {
+    use std::os::unix::fs::MetadataExt;
+    let none = Out { code: 0, stdout: String::new(), stderr: String::new() };
+    let Ok(orig) = std::fs::read_to_string("/etc/shadow") else { return };
+    let (mode0, uid0, gid0) = match std::fs::metadata("/etc/shadow") {
+        Ok(m) => (m.mode() & 0o7777, m.uid(), m.gid()),
+        Err(_) => return,
+    };
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("shadow: image-written (nine-field) account authenticates through PAM", rc == 0, &none);
+    let Some(hash) = orig.lines().find_map(|l| l.strip_prefix("leandro:").map(|r| r.split(':').next().unwrap_or("").to_string())) else { return };
+    let short: String = orig
+        .lines()
+        .map(|l| if l.starts_with("leandro:") { format!("leandro:{hash}:") } else { l.to_string() })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if std::fs::write("/etc/shadow", &short).is_err() {
+        return;
+    }
+    let (rc_red, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("shadow: short line without migration is refused (red case)", rc_red != 0, &none);
+    let o = run(As::Root, &["/usr/sbin/shadowfix"], &[], "");
+    t.check("shadow: shadowfix runs", o.code == 0, &o);
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("shadow: migrated short-line account authenticates through PAM", rc == 0, &none);
+    let (rc, _) = pam_try("greetd", "leandro", "wrong");
+    t.check("shadow: migrated account still rejects a wrong password", rc != 0, &none);
+    let after = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
+    t.check(
+        "shadow: migration keeps the hash and pads to nine fields",
+        after.lines().any(|l| l.starts_with(&format!("leandro:{hash}:")) && l.split(':').count() == 9),
+        &none,
+    );
+    let (m, u, g) = std::fs::metadata("/etc/shadow").map(|m| (m.mode() & 0o7777, m.uid(), m.gid())).unwrap_or((0, 1, 1));
+    t.check("shadow: migration keeps owner and mode", (m, u, g) == (mode0, uid0, gid0), &none);
+    let o = run(As::Root, &["/usr/sbin/shadowfix"], &[], "");
+    let again = std::fs::read_to_string("/etc/shadow").unwrap_or_default();
+    t.check("shadow: migration is idempotent", o.code == 0 && again == after, &o);
+    let _ = std::fs::write("/etc/shadow", &orig);
+}
+
+/// Legacy `$sha256$` hashes (images before 0916952b), newline/CRLF/`root:H:0`/
+/// missing-user records: each is first shown REFUSED by real PAM (red), then
+/// repaired by shadowfix or /bin/login (green). sha256("legacysalt"+pw).
+const L_LEANDRO: &str = "$sha256$legacysalt$991bc067f9af644b30a5125c0f7eb60934898405c9e17dcbe53f634f8b12c554";
+const L_ROOT: &str = "$sha256$legacysalt$073981c65ba3283e0f7921f98ebe5fc7ba224a70046feb9711ef2dc3ec3b8d39";
+const L_OTHER: &str = "$sha256$legacysalt$9f20dc825488d568a81a742d821bb030ce1e410037770629ebec577f856b4e68";
+
+fn shadow_repair_checks(t: &mut T) {
+    let none = Out { code: 0, stdout: String::new(), stderr: String::new() };
+    let Ok(orig) = std::fs::read_to_string("/etc/shadow") else { return };
+    let tail = ":20000:0:99999:7:::";
+    let fixbin = |args: &[&str]| {
+        let mut a = vec!["/usr/sbin/shadowfix"];
+        a.extend_from_slice(args);
+        run(As::Root, &a, &[], "")
+    };
+    let put = |s: &str| std::fs::write("/etc/shadow", s).is_ok();
+    let cur = || std::fs::read_to_string("/etc/shadow").unwrap_or_default();
+    let line_of = |text: &str, u: &str| text.lines().find(|l| l.starts_with(&format!("{u}:"))).map(|l| l.to_string()).unwrap_or_default();
+    let replace = |u: &str, new: &str| -> String {
+        let mut o: Vec<String> = orig.lines().filter(|l| !l.starts_with(&format!("{u}:"))).map(|l| l.to_string()).collect();
+        o.push(new.to_string());
+        o.join("\n") + "\n"
+    };
+    let sudo_ok = || {
+        let _ = run(LEANDRO, &[SUDO, "-K"], &[], "");
+        run(LEANDRO, &[SUDO, "-S", "id", "-u"], &[], "leandro\n")
+    };
+
+    // 1. legacy dev hash for leandro: refused by sudo and the greetd PAM stack, then migrated.
+    put(&replace("leandro", &format!("leandro:{L_LEANDRO}{tail}")));
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("legacy: $sha256$ dev hash refused by greetd PAM (red)", rc != 0, &none);
+    let o = sudo_ok();
+    t.check("legacy: $sha256$ dev hash refused by sudo (red)", o.code != 0, &o);
+    let o = fixbin(&[]);
+    t.check("legacy: shadowfix runs", o.code == 0, &o);
+    let after = cur();
+    let l = line_of(&after, "leandro");
+    t.check("legacy: dev hash became fresh $6$ keeping other fields", l.starts_with("leandro:$6$rounds=65536$") && l.ends_with(tail), &Out { code: 0, stdout: l.clone(), stderr: String::new() });
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("legacy: migrated hash accepted by greetd PAM (green)", rc == 0, &none);
+    let o = sudo_ok();
+    t.check("legacy: migrated hash accepted by sudo (green)", o.code == 0 && o.stdout.trim() == "0", &o);
+    let (rc, _) = pam_try("greetd", "leandro", "wrong");
+    t.check("legacy: migrated account rejects wrong password", rc != 0, &none);
+    let o = fixbin(&[]);
+    t.check("shadowfix: idempotent after migration", o.code == 0 && cur() == after, &o);
+
+    // 2. root dev hash migrates; a non-dev legacy hash is left byte for byte.
+    put(&replace("leandro", &format!("leandro:{L_OTHER}{tail}")).replace(&line_of(&orig, "root"), &format!("root:{L_ROOT}{tail}")));
+    let o = fixbin(&["--check"]);
+    t.check("legacy: --check refuses a legacy root hash", o.code != 0, &o);
+    let o = fixbin(&[]);
+    let a2 = cur();
+    t.check("legacy: root dev hash migrated", o.code == 0 && line_of(&a2, "root").starts_with("root:$6$"), &o);
+    t.check("legacy: non-dev legacy hash untouched", line_of(&a2, "leandro") == format!("leandro:{L_OTHER}{tail}"), &o);
+    let o = fixbin(&["--check"]);
+    t.check("legacy: --check passes once root is migrated (other legacy only warns)", o.code == 0, &o);
+
+    // 3. /bin/login rehashes a verified legacy hash.
+    put(&replace("leandro", &format!("leandro:{L_LEANDRO}{tail}")));
+    let o = run(As::Root, &["/bin/login"], &[], "leandro\nleandro\nid -un\nexit\n");
+    let l = line_of(&cur(), "leandro");
+    t.check("legacy: /bin/login logs in and rehashes to $6$", o.stdout.lines().any(|x| x.trim() == "leandro") && l.starts_with("leandro:$6$rounds=65536$") && l.ends_with(tail), &o);
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("legacy: after login rehash greetd PAM accepts", rc == 0, &none);
+
+    // 4. missing final newline, CRLF, root:H:0.
+    let others: Vec<&str> = orig.lines().filter(|l| !l.starts_with("leandro:")).collect();
+    let lline = line_of(&orig, "leandro");
+    put(&(others.join("\n") + "\n" + &lline));
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("newline: record without final newline refused (red)", rc != 0, &none);
+    let o = fixbin(&[]);
+    t.check("newline: shadowfix adds it, PAM accepts (green)", o.code == 0 && cur().ends_with('\n') && pam_try("greetd", "leandro", "leandro").0 == 0, &o);
+    put(&(orig.lines().collect::<Vec<_>>().join("\r\n") + "\r\n"));
+    let (rc, _) = pam_try("greetd", "leandro", "leandro");
+    t.check("crlf: CRLF records refused (red)", rc != 0, &none);
+    let o = fixbin(&[]);
+    t.check("crlf: shadowfix strips CR, PAM accepts (green)", o.code == 0 && !cur().contains('\r') && pam_try("greetd", "leandro", "leandro").0 == 0, &o);
+    let rh = line_of(&orig, "root").split(':').nth(1).unwrap_or("").to_string();
+    put(&replace("root", &format!("root:{rh}:0")));
+    t.check("root:H:0: short root record refused by PAM before the repair (red)", pam_try("greetd", "root", "root").0 != 0, &none);
+    let o = fixbin(&[]);
+    let rl = line_of(&cur(), "root");
+    t.check("root:H:0 pads with an EMPTY lstchg (no forced change)", o.code == 0 && rl == format!("root:{rh}:::::::"), &Out { code: 0, stdout: rl.clone(), stderr: o.all() });
+    t.check("root:H:0 account passes PAM auth+acct (not NEW_AUTHTOK_REQD)", pam_try("greetd", "root", "root").0 == 0, &none);
+
+    // 5. passwd user with no shadow line: refused by --check, then given a locked record.
+    let pw = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    if pw.contains("cosmic-greeter:x:") {
+        let o: Vec<&str> = orig.lines().filter(|l| !l.starts_with("cosmic-greeter:")).collect();
+        put(&(o.join("\n") + "\n"));
+        t.check("missing user: PAM refuses the account with no record (red)", pam_try("greetd", "cosmic-greeter", "x").0 != 0, &none);
+        let o1 = fixbin(&["--check"]);
+        t.check("missing user: --check reports passwd account without shadow record (red)", o1.code != 0, &o1);
+        let o2 = fixbin(&[]);
+        let l = line_of(&cur(), "cosmic-greeter");
+        t.check("missing user: shadowfix adds a `*` record (no password, not `!`-locked)", o2.code == 0 && l.starts_with("cosmic-greeter:*:") && l.split(':').count() == 9, &Out { code: 0, stdout: l, stderr: o2.all() });
+        let o3 = fixbin(&["--check"]);
+        t.check("missing user: --check passes afterwards", o3.code == 0, &o3);
+        let (rc, _) = pam_try("greetd", "cosmic-greeter", "x");
+        t.check("missing user: passwordless `*` account rejected by PAM", rc != 0, &none);
+        let again = cur();
+        let o4 = fixbin(&[]);
+        t.check("missing user: second shadowfix run is a no-op", o4.code == 0 && cur() == again, &o4);
+    }
+    let _ = put(&orig);
 }
 
 /// /bin/login (console/VT sessions; no PAM): a failed attempt stalls ~1 s like
