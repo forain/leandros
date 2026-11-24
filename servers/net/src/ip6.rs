@@ -428,6 +428,8 @@ pub(crate) fn dns_publish() {
 }
 
 static RA_SEEN: Mutex<[bool; MAX_NETIF]> = Mutex::new([false; MAX_NETIF]);
+/// Whether a router solicitation was ever sent on netif `id` (IF_RS_SENT).
+pub(crate) fn rs_was_sent(id: usize) -> bool { id < MAX_NETIF && (SLAAC.lock()[id].rs_sent > 0 || RA_SEEN.lock()[id]) }
 pub(crate) fn ra_rcvd(id: usize) -> bool { id < MAX_NETIF && RA_SEEN.lock()[id] }
 static SLAAC: Mutex<[Slaac; MAX_NETIF]> = Mutex::new([Slaac::NONE; MAX_NETIF]);
 /// The internal raw ICMPv6 socket of each NIC stack.
@@ -683,6 +685,18 @@ pub(crate) fn proc_ipv6_route(out: &mut impl Write) {
 use crate::rtnetlink::{A6, R6, RtOp};
 
 fn scope_of(a: &[u8; 16]) -> u8 { if is_link_local(a) { 253 } else { 0 } }
+
+/// The interface index a link-local address `a` belongs to or was heard on: the NIC that owns
+/// it, else the vif that does, else the first NIC with a link-local address (0 when none).
+pub(crate) fn ll_scope_of(a: &[u8; 16]) -> u32 {
+    let mut first = 0;
+    for nif in netdev::iter() {
+        let Some(l) = ll_cfg(nif.id) else { continue };
+        if &l == a { return nif.id as u32 + 2; }
+        if first == 0 { first = nif.id as u32 + 2; }
+    }
+    first
+}
 
 /// Is `a` a static address on `lo`? Such an address is local: it is delivered through the loopback.
 pub(crate) fn lo_static(a: &Ipv6Address) -> bool {
