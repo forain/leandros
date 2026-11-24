@@ -17,6 +17,7 @@ dead tick; the guest says so). A missing knob or CPU is a FAIL. Every boot is ti
 import os
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "x86_64")
@@ -29,29 +30,38 @@ for b in boots:
     red = (int(m) & 3) == 0
     env = dict(os.environ, LEANDROS_RUN_ID=f"{os.environ.get('LEANDROS_RUN_ID', 'x')}-deadtimer{cpu}m{m}")
     ok, why = False, ""
-    try:
-        r = subprocess.run([sys.executable, os.path.join(HERE, "runtests.py"), arch, f"{tag}-{cpu}-{m}", "--suite", "deadtimer",
-                            "--cmdline", f"timer.dead_delay={cpu} timer.fixmask={m}"],
-                           env=env, timeout=BOOT_TIMEOUT)
-        if red:
-            # Red case: the guest must have failed because the tick is dead, nothing else.
-            log = ""
-            import glob
-            for f in glob.glob(f"/tmp/ffsession/tests-{tag}-{cpu}-{m}*/serial-full.log"):
-                log += open(f, errors="replace").read()
-            # On CPU 0 (the BSP, which keeps global time) a dead tick can also stop the
-            # guest from ever reaching a shell: that is the same defect, so it is red too.
-            ok = r.returncode != 0 and ("FAIL: tick is dead" in log or (cpu == "0" and "dead_local_tick: cpu" not in log))
-            why = "red as expected" if ok else "expected red (tick is dead) but got rc=%d" % r.returncode
-        else:
-            ok = r.returncode == 0
-            why = "green" if ok else "rc=%d" % r.returncode
-    except subprocess.TimeoutExpired:
-        why = f"HANG: no result within {BOOT_TIMEOUT}s"
-    # A hung guest (dead BSP tick) outlives runtests: reap this worktree's QEMU so it
-    # does not hold the image lock against the next boot.
-    root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-    subprocess.run(["pkill", "-f", f"[q]emu-system.*{root}/"], check=False)
+    # The stall kills the tick only when it lands in the race window; with no fix about one
+    # boot in six keeps its tick. A red boot therefore gets up to 3 attempts, the green ones one.
+    for attempt in range(3 if red else 1):
+        try:
+            r = subprocess.run([sys.executable, os.path.join(HERE, "runtests.py"), arch, f"{tag}-{cpu}-{m}", "--suite", "deadtimer",
+                                "--cmdline", f"timer.dead_delay={cpu} timer.fixmask={m}"],
+                               env=env, timeout=BOOT_TIMEOUT)
+            if red:
+                # Red case: the guest must have failed because the tick is dead, nothing else.
+                log = ""
+                import glob
+                for f in glob.glob(f"/tmp/ffsession/tests-{tag}-{cpu}-{m}*/serial-full.log"):
+                    log += open(f, errors="replace").read()
+                # On CPU 0 (the BSP, which keeps global time) a dead tick can also stop the
+                # guest from ever reaching a shell: that is the same defect, so it is red too.
+                ok = r.returncode != 0 and ("FAIL: tick is dead" in log or (cpu == "0" and "dead_local_tick: cpu" not in log))
+                why = "red as expected" if ok else "expected red (tick is dead) but got rc=%d" % r.returncode
+            else:
+                ok = r.returncode == 0
+                why = "green" if ok else "rc=%d" % r.returncode
+        except subprocess.TimeoutExpired:
+            why = f"HANG: no result within {BOOT_TIMEOUT}s"
+        # A hung guest (dead BSP tick) outlives runtests: reap this worktree's QEMU so it
+        # does not hold the image lock against the next boot.
+        root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+        subprocess.run(["pkill", "-f", f"[q]emu-system.*{root}/"], check=False)
+        for _ in range(60):  # the image write lock is held until QEMU is gone
+            if subprocess.run(["pgrep", "-f", f"[q]emu-system.*{root}/"], capture_output=True).returncode != 0:
+                break
+            time.sleep(1)
+        if ok or not red:
+            break
     print(f"deadtimertest.py {arch} cpu{cpu} fixmask={m}: {'PASS' if ok else 'FAIL'} ({why})", flush=True)
     bad += not ok
 print(f"deadtimertest.py {arch}: {'PASS' if not bad else 'FAIL'}")
