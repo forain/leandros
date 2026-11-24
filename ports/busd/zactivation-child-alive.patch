@@ -1,0 +1,111 @@
+Activation: wait for a spawned service for as long as its process is alive.
+
+MUST apply after unique-activation.patch (the "z" name sorts it last).
+
+A fixed 25 s wait turned host load into a ServiceUnknown. xdg-desktop-portal
+activates its backend before it claims org.freedesktop.portal.Desktop; the
+portalshot probe's call (which includes that activation) takes 8.6 s on an
+idle host and 18.8 s on a busy one, and on a busier one the 25 s ran out
+while the frontend was still starting: "ServiceUnknown: The name
+org.freedesktop.portal.Desktop was not provided by any .service files" after
+~25 s, with the .service file present and the same 41 portal files as a
+passing run (portalshottest.py x86_64: 2 of 10 runs failed on a host at load
+average 46, 0 of 8 more on a quiet one). The message is the generic one
+because send_msg turns every failed activation into reply_service_unknown.
+
+A service that is running is slow, not failed. The wait now polls the spawned
+child: while it lives the cap is ACTIVATION_ALIVE_CAP (120 s); once it has
+exited without claiming the name only ACTIVATION_TIMEOUT (25 s) more is
+given, so a service that really dies costs what it always did. A second
+caller waiting on the same activation follows the spawner's in-flight marker.
+
+--- a/src/peers.rs
++++ b/src/peers.rs
+@@ -43,6 +43,15 @@
+ /// timeout.
+ const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(25);
+ 
++/// Upper bound on the wait for a spawned service that is still running. A
++/// service that is alive is slow, not failed: xdg-desktop-portal activates
++/// its backend before it claims its name and measured 8.6 s on an idle host,
++/// 18.8 s on a busy one and more than 25 s on a busier one, where every
++/// caller got ServiceUnknown for a service that came up moments later. A
++/// child that has exited without claiming the name still gets only
++/// `ACTIVATION_TIMEOUT` more.
++const ACTIVATION_ALIVE_CAP: Duration = Duration::from_secs(120);
++
+ /// Poll interval while waiting for an activated service to claim its name.
+ /// There's no notification hook into `NameRegistry` to await instead, so
+ /// this is a plain poll loop; see `Peers::await_name_owner`.
+@@ -207,7 +216,7 @@
+             .map(|mut set| set.insert(name.to_string()))
+             .unwrap_or(true);
+         if !first {
+-            return self.await_name_owner(name, ACTIVATION_TIMEOUT).await;
++            return self.await_name_owner(name, None).await;
+         }
+         let result = self.spawn_service(name, &service).await;
+         if let Ok(mut set) = self.activating.lock() {
+@@ -234,13 +243,16 @@
+             command.env(key, value);
+         }
+ 
+-        if let Err(e) = command.spawn() {
+-            return Err(zbus::fdo::Error::SpawnExecFailed(format!(
+-                "Failed to execute `{program}` for name `{name}`: {e}"
+-            )));
+-        }
++        let mut child = match command.spawn() {
++            Ok(child) => child,
++            Err(e) => {
++                return Err(zbus::fdo::Error::SpawnExecFailed(format!(
++                    "Failed to execute `{program}` for name `{name}`: {e}"
++                )));
++            }
++        };
+ 
+-        self.await_name_owner(name, ACTIVATION_TIMEOUT).await
++        self.await_name_owner(name, Some(&mut child)).await
+     }
+ 
+     /// Poll the name registry until `name` has an owner or `timeout`
+@@ -251,16 +263,35 @@
+     async fn await_name_owner(
+         &self,
+         name: &WellKnownName<'_>,
+-        timeout: Duration,
++        mut child: Option<&mut std::process::Child>,
+     ) -> std::result::Result<(), zbus::fdo::Error> {
+-        let deadline = tokio::time::Instant::now() + timeout;
++        let started = tokio::time::Instant::now();
++        let mut deadline = started + ACTIVATION_ALIVE_CAP;
++        let mut exited = false;
+         loop {
+             if self.name_registry.read().await.lookup(name.clone()).is_some() {
+                 return Ok(());
+             }
+-            if tokio::time::Instant::now() >= deadline {
++            let now = tokio::time::Instant::now();
++            // The spawner polls its own child; a second caller waiting on
++            // the same activation follows the spawner's in-flight marker.
++            let gone = match child.as_mut() {
++                Some(c) => matches!(c.try_wait(), Ok(Some(_))),
++                None => !self
++                    .activating
++                    .lock()
++                    .map(|set| set.contains(name.as_str()))
++                    .unwrap_or(false),
++            };
++            if gone && !exited {
++                exited = true;
++                deadline = deadline.min(now + ACTIVATION_TIMEOUT);
++            }
++            if now >= deadline {
+                 return Err(zbus::fdo::Error::SpawnChildExited(format!(
+-                    "Activated service for `{name}` did not claim the name within {timeout:?}"
++                    "Activated service for `{name}` did not claim the name within {:?} ({})",
++                    now - started,
++                    if exited { "its process exited" } else { "its process is still running" }
+                 )));
+             }
+             tokio::time::sleep(ACTIVATION_POLL_INTERVAL).await;
