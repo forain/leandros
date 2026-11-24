@@ -1944,6 +1944,9 @@ static void nn_case(const char *name, int mode) {
         system("nft delete table inet midflow");
         /* the dropped established flow keeps the server netns (and with it the veth peer) alive until its sockets time out,
          * so the host end would still own the name vethN for the next case: delete it, which removes the peer as well */
+        int ms = 0;
+        for (; ms < 10000 && link_get(s, "vethN", NULL, NULL) > 0; ms += 100) usleep(100000);
+        printf("# %s: vethN went away %d ms after the server exited%s\n", name, ms, ms >= 10000 ? " (still there)" : "");
         int vi = link_get(s, "vethN", NULL, NULL);
         if (vi > 0) link_del(s, vi);
     }
