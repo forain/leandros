@@ -1378,7 +1378,7 @@ def sshdcfg2(ssh, user, pw, tmp):
         conf(f"AllowStreamLocalForwarding {mode}\n")
         got = both()
         lg = sudo_sh(ssh, user, pw, "grep -c . /dev/null; tail -n 12 /tmp/sshdcfg.log")[1].replace("\n", "|") if got != want else ""
-        rt = sudo_sh(ssh, user, pw, "grep -c fdpass-retry /tmp/sshdcfg.log; grep -c 'Bad file descriptor' /tmp/sshdcfg.log")[1].replace("\n", "/")
+        rt = sudo_sh(ssh, user, pw, "echo retry=\\$(grep -c fdpass-retry /tmp/sshdcfg.log) ebadf=\\$(grep -c Bad.file.descriptor /tmp/sshdcfg.log)")[1].strip()
         step(f"cfg2_streamlocal_{mode}", got == want, f"got={got} want={want} fdpass-retry/EBADF={rt} {lg}")
     conf("AllowTcpForwarding no\nAllowStreamLocalForwarding yes\n")
     got = both()
