@@ -2029,6 +2029,24 @@ unsafe fn test_pagecache_memory_returns() -> bool {
     report(name, status == 0 && lost < 64)
 }
 
+/// kB value of a /proc/meminfo field (`key` includes the colon).
+unsafe fn meminfo_kb(key: &[u8]) -> usize {
+    let mut buf = [0u8; 512];
+    let n = slurp(b"/proc/meminfo\0", &mut buf);
+    let mut i = 0;
+    while i + key.len() <= n {
+        if &buf[i..i + key.len()] == key && (i == 0 || buf[i - 1] == b'\n') {
+            let mut j = i + key.len();
+            while j < n && buf[j] == b' ' { j += 1; }
+            let mut v = 0usize;
+            while j < n && buf[j].is_ascii_digit() { v = v * 10 + (buf[j] - b'0') as usize; j += 1; }
+            return v;
+        }
+        i += 1;
+    }
+    0
+}
+
 /// wait() is exact: the moment it returns, the child's address space is
 /// already released. Measured with no polling and no slack beyond a few pages
 /// of unrelated churn (the child maps and touches 1024 pages).
@@ -2060,6 +2078,8 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
                 slurp(&path, &mut buf);
             }
         }
+        let c_before = meminfo_kb(b"Cached:");
+        let s_before = meminfo_kb(b"Shmem:");
         let before = free_ram();
         let pid = fork();
         if pid == 0 {
@@ -2079,9 +2099,16 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
         core::ptr::write_volatile(shared, pid as u64);
         let status = wait_status(pid);
         let after = free_ram();
+        let c_after = meminfo_kb(b"Cached:");
+        let s_after = meminfo_kb(b"Shmem:");
         syscall2(nr::KILL, hammer as usize, 9);
         wait_status(hammer);
         let lost = before.saturating_sub(after) / PAGE;
+        write(STDOUT_FILENO, b"  round lost=".as_ptr(), 13); print_dec(lost);
+        write(STDOUT_FILENO, b" free_before=".as_ptr(), 13); print_dec(before / PAGE);
+        write(STDOUT_FILENO, b" cached_kb_delta=".as_ptr(), 17); print_dec(c_after.wrapping_sub(c_before) as usize);
+        write(STDOUT_FILENO, b" shmem_kb_delta=".as_ptr(), 16); print_dec(s_after.wrapping_sub(s_before) as usize);
+        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
         if lost > worst { worst = lost; }
         ok &= status == 0 && lost < 64;
     }
