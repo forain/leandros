@@ -109,8 +109,22 @@ esac
   # -- patched libext2fs: durable undo records (ports/e2fsprogs/patches) --------
   # Alpine's undo_io never fsyncs the undo file before the protected write, and
   # keeps records in unix_io's write-back cache. Rebuild libext2fs.so.2 from the
-  # same 1.47.1 source with patches/undo-durable.patch and use it instead.
-  E2V=1.47.1
+  # same-version source with patches/undo-durable.patch and use it instead.
+  # E2V is DERIVED from the packaged tools, never typed: the patched libs sit
+  # underneath stock e2fsck/resize2fs, so source and package versions must be
+  # identical. E2PIN/E2SHA below are the tested pair; a lock bump that moves
+  # the package version fails here until the pin, hash and patches are redone.
+  E2PIN=1.47.4
+  E2V=$($APK info -e -v e2fsprogs | sed -n 's/^e2fsprogs-\([0-9][0-9.]*\)-r[0-9]*$/\1/p')
+  [ -n "$E2V" ] || { echo "cannot derive e2fsprogs version from apk" >&2; exit 4; }
+  for q in e2fsprogs-extra e2fsprogs-libs libcom_err; do
+    QV=$($APK info -e -v "$q" 2>/dev/null | sed -n "s/^$q-\([0-9][0-9.]*\)-r[0-9]*\$/\1/p")
+    [ -z "$QV" ] || [ "$QV" = "$E2V" ] || { echo "version skew: $q $QV vs e2fsprogs $E2V" >&2; exit 4; }
+  done
+  if [ "$E2V" != "$E2PIN" ]; then
+    echo "Alpine packages e2fsprogs $E2V but the patched source is pinned to $E2PIN; rebase ports/e2fsprogs/patches, pin the new tarball sha256 and E2PIN" >&2
+    exit 4
+  fi
   TARB=/out/e2fsprogs-$E2V.tar.xz
   if [ ! -s "$TARB" ]; then
     apk add --no-cache wget xz ca-certificates >/dev/null
@@ -119,7 +133,7 @@ esac
   fi
   # Pinned from kernel.org's signed sha256sums.asc (v$E2V, fetched over https);
   # a cached or downloaded tarball that does not match is refused and removed.
-  E2SHA=5a33dc047fd47284bca4bb10c13cfe7896377ae3d01cb81a05d406025d99e0d1
+  E2SHA=fd5bf388cbdbe006a3d3b318d983b2948382440acc85a87f1e7d108653e8db0b
   if [ "$(sha256sum "$TARB" | cut -d' ' -f1)" != "$E2SHA" ]; then
     echo "e2fsprogs-$E2V.tar.xz sha256 mismatch (want $E2SHA); refusing" >&2
     rm -f "$TARB" "$TARB.part"; exit 4
