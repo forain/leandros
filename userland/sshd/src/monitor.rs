@@ -1044,8 +1044,19 @@ impl Mon {
         }
         cmd.envs(env);
         let with_tty = pty.is_some();
+        // The USER_PROCESS record is written by the child itself (as root, before the
+        // uid drop, pid = its own) so it exists before the session command runs, like
+        // OpenSSH's do_login. Written by the parent after spawn it raced `w`/`who`.
+        let utmp_rec: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = tty_name.as_deref().map(|t| (
+            t.strip_prefix("/dev/").unwrap_or(t).as_bytes().to_vec(),
+            user.name.as_bytes().to_vec(),
+            self.peer.ip().to_string().into_bytes()));
+        let utmp_rec_parent = utmp_rec.clone();
         unsafe {
             cmd.pre_exec(move || {
+                if let Some((line, name, host)) = &utmp_rec {
+                    crate::utmpx::login(crate::utmpx::getpid(), line, name, host, uid as u32);
+                }
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 if let Some(p) = &scope_procs {
                     crate::cgsession::join(p);
@@ -1074,17 +1085,22 @@ impl Mon {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().map_err(|e| format!("{prog}: {e}"))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // The child may have written its record before exec/setup failed.
+                if let Some((line, ..)) = &utmp_rec_parent {
+                    crate::utmpx::logout_line(line);
+                }
+                return Err(format!("{prog}: {e}"));
+            }
+        };
         let pid = child.id() as i32;
         log(&format!(
             "{}: {} for {} (uid {}) pid {}{}",
             self.peer, what, user.name, uid, pid,
             tty_name.as_deref().map(|t| format!(" on {t}")).unwrap_or_default()
         ));
-        if let Some(t) = tty_name.as_deref() {
-            let line = t.strip_prefix("/dev/").unwrap_or(t);
-            crate::utmpx::login(pid, line.as_bytes(), user.name.as_bytes(), self.peer.ip().to_string().as_bytes(), uid as u32);
-        }
         let mut fds: Vec<OwnedFd> = Vec::new();
         if let Some(m) = master {
             fds.push(m);
