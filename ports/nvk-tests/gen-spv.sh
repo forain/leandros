@@ -2,7 +2,7 @@
 # gen-spv.sh — regenerate ports/nvk-tests/nvktest_spv.h from shaders/*.
 #
 # The header is committed so build.sh needs no shader compiler; run this only
-# after editing a shader. glslc (Alpine `shaderc`) runs in an alpine:3.21
+# after editing a shader. glslc (Alpine `shaderc`) runs in an $ALPINE_IMAGE
 # container of the HOST architecture (inside LeandrOS: a chroot'ed Alpine root,
 # scripts/container-lib.sh) (SPIR-V is arch-independent), emits
 # Vulkan 1.0 SPIR-V as C initialisers (-mfmt=c), and each blob is checked for
@@ -16,7 +16,7 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/nvk-spv.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 cp "$HERE"/shaders/add.comp "$HERE"/shaders/triangle.vert "$HERE"/shaders/triangle.frag "$TMP/"
 
-leandros_alpine_run --image "${GPU_BUILD_IMAGE:-alpine:3.21}" -v "$TMP:/w" -- sh -c '
+leandros_alpine_run --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" -v "$TMP:/w" -- sh -c '
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   apk add --no-cache shaderc >/dev/null

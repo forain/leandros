@@ -6,7 +6,7 @@
 # compiled here.
 #
 # Runs INSIDE an Alpine 3.24 container of the TARGET architecture (same release
-# as ports/firefox and the GPU Mesa stack, so musl 1.2.5 and the GLib ABI match
+# as ports/firefox and the GPU Mesa stack, so musl and the GLib ABI match
 # what the image already runs). Driven by ports/portal/build.sh, which mounts:
 #   /src           ports/portal (read-only snapshot)
 #   /out           ports/portal/out; this writes /out/<arch>/ and /out/sdk-<arch>/
@@ -43,7 +43,7 @@ esac
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   [ "$(uname -m)" = "$ARCH" ] || { echo "container is $(uname -m), wanted $ARCH"; exit 3; }
-  grep -q '^3\.24\.' /etc/alpine-release || { echo "want Alpine 3.24, got $(cat /etc/alpine-release)"; exit 3; }
+  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
   apk add --no-cache xdg-desktop-portal glib-dev binutils file patchelf build-base
   XDPVER=$(apk info -e -v xdg-desktop-portal)
   echo "package: $XDPVER $(apk info -e -v glib) (alpine $(cat /etc/alpine-release))"

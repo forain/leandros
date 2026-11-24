@@ -220,7 +220,7 @@ TESTS = [
     ("nl", "nl c1", contains_all("1", "a"), False),
     ("nohup", "nohup --help", lambda t: True, True),
     ("nproc", "nproc", lambda t: t.strip().isdigit() and int(t.strip()) >= 1, False),
-    ("numfmt", "numfmt --to=si 1000", contains_all("1.0"), False),
+    ("numfmt", "numfmt --to=si 1000", contains_all("1.0K"), False),
     ("od", "od -c hashin", nonempty(), False),
     ("paste", "paste pa1 pa2", contains_all("a", "1"), False),
     ("pathchk", "pathchk /tmp/valid_name && echo GOOD || echo BAD", equals("GOOD"), False),

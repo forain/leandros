@@ -14,7 +14,7 @@
 # virgl/zink lanes used; override with MESA_SRC=. With NVK the x86_64 build
 # also works as a qemu-user container on the aarch64 Mac (~25 min; the alpine
 # script works around rustc's scudo abort there). GPU_BUILD_IMAGE=<image>
-# replaces alpine:3.24 with a pre-baked image of the same packages.
+# replaces $ALPINE_IMAGE with a pre-baked image of the same packages.
 #
 # INTEL=1 also builds iris (GL) and ANV (libvulkan_intel.so); off by default
 # until a build has been verified (lane i915). OUT_SUFFIX names a side output
@@ -83,7 +83,7 @@ if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_
 OUTMNT="$OUT:/out"
 if [ "$ALPINE_BACKEND" = local ]; then mkdir -p "$OUT/gpu-stage-$ARCH$OUT_SUFFIX"; OUTMNT="$OUT/gpu-stage-$ARCH$OUT_SUFFIX:/out/gpu-stage-$ARCH$OUT_SUFFIX"; fi
 # shellcheck disable=SC2086
-leandros_alpine_run --arch "$ARCH" --image "${GPU_BUILD_IMAGE:-alpine:3.24}" $TMPMNT \
+leandros_alpine_run --arch "$ARCH" --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" $TMPMNT \
     -e NVK="$NVK" -e INTEL="$INTEL" -e OUT_SUFFIX="$OUT_SUFFIX" -e NINJA_JOBS="${NINJA_JOBS:-}" -v "$CACHE:/cache" \
     -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUTMNT" \
     -- sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true

@@ -6,7 +6,7 @@
 #
 # Same dynamic-musl-PIE recipe as every other COSMIC client
 # (m6-session-bins: ld.lld against the m3 GL sysroot), plus:
-#   * GLib/GIO from ports/portal/out/sdk-<arch> (Alpine 3.21's, made by
+#   * GLib/GIO from ports/portal/out/sdk-<arch> (Alpine 3.24's, made by
 #     build-in-alpine.sh): the backend links cosmic-files with its "gvfs"
 #     feature, which the portal's Cargo.toml hardcodes. system-deps env
 #     overrides, so the m3 sysroot keeps serving pkg-config for the rest.

@@ -13,7 +13,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q '^3\.24\.' /etc/alpine-release || { echo "want Alpine 3.24, got $(cat /etc/alpine-release)"; exit 3; }
+  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
   PKGS="e2fsprogs e2fsprogs-extra"
   if [ "$(uname -m)" = "$ARCH" ]; then
     R=""

@@ -922,6 +922,55 @@ static void test_ping6_own_global(void) {
     CHECK("ping6_own_global", good == 4);
 }
 
+/* The router answers a ping to its link-local address: the recvfrom() source of the reply is
+ * fe80::2%eth0, so sin6_scope_id must be eth0's index (Linux fills it for link-local peers). */
+static void test_ll_recv_scope(void) {
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ll_recv_scope", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a = router_ll(), from; socklen_t fl = sizeof from;
+    unsigned want = if_nametoindex("eth0");
+    int ok = 0;
+    for (int seq = 1; seq <= 4 && !ok; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4324, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        for (int i = 0; i < 8; i++) {
+            fl = sizeof from; memset(&from, 0, sizeof from);
+            ssize_t m = recvfrom(s, r, sizeof r, 0, (struct sockaddr *)&from, &fl);
+            if (m < 8) break;
+            if (r[0] == ICMP6_ECHO_REPLY && ((r[6] << 8) | r[7]) == seq) { ok = 1; break; }
+        }
+    }
+    close(s);
+    if (ok) printf("  recvfrom scope_id %u want %u\n", from.sin6_scope_id, want);
+    CHECK("ll_recv_scope", ok && from.sin6_scope_id == want);
+}
+
+/* Ping our own link-local address through eth0: delivered locally, no wire. */
+static void test_ping6_own_ll(void) {
+    char line[128];
+    if (!if_inet6_find("eth0", "fe80", line, sizeof line)) { CHECK("ping6_own_ll", 0); return; }
+    int s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (s < 0) { CHECK("ping6_own_ll", 0); return; }
+    tmo(s, 3);
+    struct sockaddr_in6 a; memset(&a, 0, sizeof a);
+    a.sin6_family = AF_INET6;
+    for (int i = 0; i < 16; i++) sscanf(line + 2 * i, "%2hhx", &a.sin6_addr.s6_addr[i]);
+    a.sin6_scope_id = if_nametoindex("eth0");
+    int good = 0;
+    for (int seq = 1; seq <= 4; seq++) {
+        uint8_t q[64], r[256];
+        size_t n = echo_req(q, 0x4325, seq);
+        if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
+        int got = await_reply(s, seq, r, sizeof r);
+        if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+    }
+    close(s);
+    if (good != 4) printf("  ping own fe80: %d/4\n", good);
+    CHECK("ping6_own_ll", good == 4);
+}
+
 static void test_ll_noscope(void) {
     struct sockaddr_in6 a = router_ll();
     a.sin6_port = htons(53);
@@ -1034,7 +1083,7 @@ static void test_dad_off(void) {
 }
 
 /* RTM_NEWADDR / RTM_DELADDR of a v6 address on eth0. */
-static int nl_addr6(int add, const unsigned char *a, int plen, unsigned flags) {
+static int nl_addr6_if(const char *ifn, int add, const unsigned char *a, int plen, unsigned flags) {
     int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     if (s < 0) return -1;
     tmo(s, 3);
@@ -1042,7 +1091,7 @@ static int nl_addr6(int add, const unsigned char *a, int plen, unsigned flags) {
     memset(&q, 0, sizeof q);
     q.h.nlmsg_len = sizeof q; q.h.nlmsg_type = add ? RTM_NEWADDR : RTM_DELADDR;
     q.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
-    q.m.ifa_family = AF_INET6; q.m.ifa_prefixlen = plen; q.m.ifa_index = if_nametoindex("eth0");
+    q.m.ifa_family = AF_INET6; q.m.ifa_prefixlen = plen; q.m.ifa_index = if_nametoindex(ifn);
     q.la.rta_len = RTA_LENGTH(16); q.la.rta_type = IFA_LOCAL; memcpy(q.a, a, 16);
     q.fa.rta_len = RTA_LENGTH(4); q.fa.rta_type = IFA_FLAGS; q.f = flags;
     int r = -1;
@@ -1054,6 +1103,7 @@ static int nl_addr6(int add, const unsigned char *a, int plen, unsigned flags) {
     close(s);
     return r;
 }
+static int nl_addr6(int add, const unsigned char *a, int plen, unsigned flags) { return nl_addr6_if("eth0", add, a, plen, flags); }
 
 /* The flags of eth0's 2001:db8:dad::<n> style line: `hex` is the 32 hex digits. */
 static void test_dad_static_and_dup(void) {
@@ -1074,6 +1124,277 @@ static void test_dad_static_and_dup(void) {
     CHECK("dad_nodad", r == 0 && fl == 0x80);
     nl_addr6(0, fresh, 64, 0);
     conf_rw("dad_transmits", 1, 1);
+}
+
+
+// ---- Peers on the NIC's link (lane dhcpv6): the SIOCDEVPRIVATE test knob hands a frame to eth0's
+// receive side, so the test plays the router, the DHCPv6 server and the node that owns a
+// duplicate address. ----
+static void put16(unsigned char *p, unsigned v) { p[0] = v >> 8; p[1] = v; }
+static unsigned csum_v6(const unsigned char *src, const unsigned char *dst, int proto, const unsigned char *p, int n) {
+    unsigned long sum = 0;
+    for (int i = 0; i < 16; i += 2) sum += (src[i] << 8) | src[i + 1];
+    for (int i = 0; i < 16; i += 2) sum += (dst[i] << 8) | dst[i + 1];
+    sum += n + proto;
+    for (int i = 0; i < n; i += 2) sum += (p[i] << 8) | (i + 1 < n ? p[i + 1] : 0);
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    return ~sum & 0xffff;
+}
+/* One Ethernet+IPv6 frame (`proto` 58 = ICMPv6 with its checksum filled, 17 = UDP likewise) to eth0. */
+static int nic_send6(const unsigned char *src, const unsigned char *dst, int proto, int hl, unsigned char *l4, int n, int mcast) {
+    unsigned char mac[6], f[1600];
+    if (!eth0_mac(mac)) return -1;
+    memset(f, 0, 14);
+    if (mcast) { f[0] = f[1] = 0x33; memcpy(f + 2, dst + 12, 4); } else memcpy(f, mac, 6);
+    f[6] = 0x02; f[7] = 0xaa; f[8] = f[9] = f[10] = 0; f[11] = 0x77;
+    f[12] = 0x86; f[13] = 0xdd;
+    f[14] = 0x60; put16(f + 18, n); f[20] = proto; f[21] = hl;
+    memcpy(f + 22, src, 16); memcpy(f + 38, dst, 16);
+    int ck = proto == 58 ? 2 : 6;
+    l4[ck] = l4[ck + 1] = 0;
+    unsigned c = csum_v6(src, dst, proto, l4, n);
+    if (proto == 17 && c == 0) c = 0xffff;
+    put16(l4 + ck, c);
+    memcpy(f + 54, l4, n);
+    struct { unsigned idx, len; unsigned char f[1600]; } b;
+    b.idx = if_nametoindex("eth0"); b.len = 54 + n; memcpy(b.f, f, 54 + n);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int r = s < 0 ? -1 : ioctl(s, 0x89f0, &b);
+    if (s >= 0) close(s);
+    return r;
+}
+static const unsigned char ALLNODES[16] = { 0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+static const unsigned char FAKE_MAC[6] = { 0x02, 0xaa, 0, 0, 0, 0x77 };
+
+/* An RA from the real router's link-local address (so its default route stays) with `flags`
+ * (M 0x80, O 0x40) and, when `dns` is set, an RDNSS option of lifetime `life`. */
+static int inject_ra(unsigned char flags, const unsigned char *dns, unsigned life) {
+    struct sockaddr_in6 r = router_ll();
+    unsigned char ra[64] = { 134, 0, 0, 0, 64, flags, 0x07, 0x08, 0, 0, 0, 0, 0, 0, 0, 0 };
+    int n = 16;
+    if (dns) {
+        ra[n] = 25; ra[n + 1] = 3; ra[n + 2] = ra[n + 3] = 0;
+        ra[n + 4] = life >> 24; ra[n + 5] = life >> 16; ra[n + 6] = life >> 8; ra[n + 7] = life;
+        memcpy(ra + n + 8, dns, 16);
+        n += 24;
+    }
+    return nic_send6(r.sin6_addr.s6_addr, ALLNODES, 58, 255, ra, n, 1);
+}
+
+static int resolv_has(const char *needle) {
+    FILE *f = fopen("/etc/resolv.conf", "r");
+    if (!f) return 0;
+    char b[256]; int found = 0;
+    while (!found && fgets(b, sizeof b, f)) found = strstr(b, needle) != NULL;
+    fclose(f);
+    return found;
+}
+static int resolv_wait(const char *needle, int want) {
+    for (int i = 0; i < 50; i++) { if (resolv_has(needle) == want) return 1; usleep(100000); }
+    return 0;
+}
+
+static void test_rdnss_linklocal_scope(void) {
+    unsigned char d[16] = { 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53 };
+    int r = inject_ra(0, d, 600);
+    CHECK("rdnss_ll_scoped", r == 0 && resolv_wait("nameserver fe80::53%eth0", 1));
+    r = inject_ra(0, d, 0);
+    CHECK("rdnss_ll_withdrawn", r == 0 && resolv_wait("fe80::53", 0));
+}
+
+/* The state line of eth0 in /proc/net/dhcp6: mode, state, xid. */
+static int d6_state(char *mode, char *st, char *xid, int *replies) {
+    FILE *f = fopen("/proc/net/dhcp6", "r");
+    if (!f) return 0;
+    char b[512], ifn[32]; int tries, ok = 0;
+    while (fgets(b, sizeof b, f)) {
+        if (sscanf(b, "%31s %15s %15s %6s %d %d", ifn, mode, st, xid, &tries, replies) == 6 && !strcmp(ifn, "eth0")) { ok = 1; break; }
+    }
+    fclose(f);
+    return ok;
+}
+static int d6_wait(const char *want_st) {
+    char m[16], s[16], x[8]; int rep;
+    for (int i = 0; i < 100; i++) {
+        if (d6_state(m, s, x, &rep) && !strcmp(s, want_st)) return 1;
+        usleep(100000);
+    }
+    return 0;
+}
+static int eth0_ll(unsigned char *a) {
+    char l[256];
+    if (!if_inet6_find("eth0", "fe80", l, sizeof l)) return 0;
+    for (int i = 0; i < 16; i++) { unsigned v; sscanf(l + 2 * i, "%2x", &v); a[i] = v; }
+    return 1;
+}
+/* A DHCPv6 message from the router to eth0: header, ClientID, ServerID, `extra` options. */
+static int d6_send(int type, const char *xid, const unsigned char *extra, int en) {
+    unsigned char mac[6], ll[16], msg[600], p[700];
+    if (!eth0_mac(mac) || !eth0_ll(ll)) return -1;
+    struct sockaddr_in6 r = router_ll();
+    int n = 4;
+    msg[0] = type;
+    for (int i = 0; i < 3; i++) { unsigned v; sscanf(xid + 2 * i, "%2x", &v); msg[1 + i] = v; }
+    unsigned char cid[14] = { 0, 1, 0, 10, 0, 3, 0, 1 }; memcpy(cid + 8, mac, 6);
+    unsigned char sid[14] = { 0, 2, 0, 10, 0, 3, 0, 1 }; memcpy(sid + 8, FAKE_MAC, 6);
+    memcpy(msg + n, cid, 14); n += 14;
+    memcpy(msg + n, sid, 14); n += 14;
+    memcpy(msg + n, extra, en); n += en;
+    put16(p, 547); put16(p + 2, 546); put16(p + 4, 8 + n); p[6] = p[7] = 0;
+    memcpy(p + 8, msg, n);
+    return nic_send6(r.sin6_addr.s6_addr, ll, 17, 255, p, 8 + n, 0);
+}
+static const unsigned char DNS_OPTS[] = {
+    0, 23, 0, 16, 0x20, 0x01, 0x0d, 0xb8, 0, 0xd6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53,
+    0, 24, 0, 10, 3, 'd', 'h', '6', 4, 't', 'e', 's', 't', 0 };
+
+/* Back to a clean slate: accept_ra off drops the manager's state (DHCPv6, RDNSS, SLAAC); on
+ * again re-solicits, and the slirp router's SLAAC address comes back. */
+static void d6_reset(void) {
+    char m[16], st[16], x[8]; int rep;
+    conf_rw("accept_ra", 1, 0);
+    for (int i = 0; i < 100; i++) { if (d6_state(m, st, x, &rep) && !strcmp(m, "none")) break; usleep(100000); }
+    conf_rw("accept_ra", 1, 2);
+    for (int i = 0; i < 200; i++) { if (inet6_flags("fec0") >= 0) break; usleep(100000); }
+}
+
+static void test_dhcp6_info(void) {
+    char m[16] = "", s[16] = "", x[8] = ""; int rep = 0;
+    int r = inject_ra(0x40, NULL, 0);
+    int got = d6_wait("info-sent") || d6_wait("done");
+    d6_state(m, s, x, &rep);
+    if (!strcmp(s, "done")) printf("  note: a server on the wire (slirp) already answered the Information-Request\n");
+    CHECK("dhcp6_info_request_sent", r == 0 && got && !strcmp(m, "info"));
+    if (strcmp(s, "done")) {
+        r = d6_send(7, x, DNS_OPTS, sizeof DNS_OPTS);
+        CHECK("dhcp6_info_reply_dns", r == 0 && resolv_wait("nameserver 2001:db8:d6::53", 1) && resolv_has("dh6.test"));
+        d6_state(m, s, x, &rep);
+        CHECK("dhcp6_info_done", !strcmp(s, "done"));
+    }
+    d6_reset();
+    CHECK("dhcp6_info_cleared", resolv_wait("2001:db8:d6::53", 0));
+}
+
+static void test_dhcp6_stateful(void) {
+    char m[16] = "", s[16] = "", x[8] = ""; int rep = 0;
+    unsigned char ia[] = { 0, 3, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 5, 0, 24, 0x20, 0x01, 0x0d, 0xb8, 0, 0xd6, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34,
+        0, 0, 0x0e, 0x10, 0, 0, 0x1c, 0x20 };
+    int r = inject_ra(0x80, NULL, 0);
+    CHECK("dhcp6_solicit_sent", r == 0 && d6_wait("solicit") && d6_state(m, s, x, &rep) && !strcmp(m, "stateful"));
+    r = d6_send(2, x, ia, sizeof ia);                 /* Advertise */
+    CHECK("dhcp6_request_sent", r == 0 && d6_wait("request"));
+    char x2[8] = "";
+    d6_state(m, s, x2, &rep);
+    CHECK("dhcp6_request_new_xid", strcmp(x, x2) != 0);
+    unsigned char rp[sizeof ia + sizeof DNS_OPTS]; memcpy(rp, ia, sizeof ia); memcpy(rp + sizeof ia, DNS_OPTS, sizeof DNS_OPTS);
+    r = d6_send(7, x2, rp, sizeof rp);                /* Reply */
+    int ok = 0;
+    for (int i = 0; i < 50 && !ok; i++) { ok = inet6_flags("20010db800d600000000000000001234") == 0x80; if (!ok) usleep(100000); }
+    CHECK("dhcp6_address_bound", r == 0 && ok);
+    char l[256] = "";
+    if_inet6_find("eth0", "20010db800d600000000000000001234", l, sizeof l);
+    unsigned ix = 0, pl = 0; sscanf(l + 33, "%x %x", &ix, &pl);
+    CHECK("dhcp6_address_prefix128", pl == 0x80);
+    CHECK("dhcp6_stateful_dns", resolv_wait("nameserver 2001:db8:d6::53", 1));
+    d6_reset();
+    CHECK("dhcp6_address_released", inet6_flags("20010db800d600000000000000001234") < 0 && resolv_wait("2001:db8:d6::53", 0));
+}
+
+/* Addresses of eth0 through RTM_GETADDR: the flags (IFA_FLAGS) of `a`, -1 when absent. */
+static long nl_get_flags(const unsigned char *a) {
+    int s = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (s < 0) return -1;
+    tmo(s, 3);
+    struct { struct nlmsghdr h; struct ifaddrmsg m; } q;
+    memset(&q, 0, sizeof q);
+    q.h.nlmsg_len = sizeof q; q.h.nlmsg_type = RTM_GETADDR; q.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    q.m.ifa_family = AF_INET6;
+    long res = -1;
+    if (send(s, &q, sizeof q, 0) == (ssize_t)sizeof q) {
+        char b[8192];
+        for (int done = 0; !done;) {
+            ssize_t n = recv(s, b, sizeof b, 0);
+            if (n <= 0) break;
+            for (struct nlmsghdr *h = (struct nlmsghdr *)b; NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+                if (h->nlmsg_type == NLMSG_DONE) { done = 1; break; }
+                if (h->nlmsg_type != RTM_NEWADDR) continue;
+                struct ifaddrmsg *m = NLMSG_DATA(h);
+                int len = IFA_PAYLOAD(h); unsigned fl = m->ifa_flags; int match = 0;
+                for (struct rtattr *ra = IFA_RTA(m); RTA_OK(ra, len); ra = RTA_NEXT(ra, len)) {
+                    if (ra->rta_type == IFA_ADDRESS && !memcmp(RTA_DATA(ra), a, 16)) match = 1;
+                    if (ra->rta_type == IFA_FLAGS) fl = *(unsigned *)RTA_DATA(ra);
+                }
+                if (match) res = fl;
+            }
+        }
+    }
+    close(s);
+    return res;
+}
+
+/* A peer claims a tentative NIC address: a NA for it, or a NS from `::` probing for it too,
+ * makes it DADFAILED (flags 0x40|0x800), in /proc/net/if_inet6 and in rtnetlink. */
+static void test_dad_failed_peer(void) {
+    unsigned char a1[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x0d, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11 };
+    unsigned char a2[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x0d, 0xad, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x22 };
+    const char *h1 = "20010db80dad00000000000000000011", *h2 = "20010db80dad00000000000000000022";
+    conf_rw("dad_transmits", 1, 3);
+    int r1 = nl_addr6(1, a1, 64, 0), r2 = nl_addr6(1, a2, 64, 0);
+    CHECK("dad_peer_tentative", r1 == 0 && r2 == 0 && (inet6_flags(h1) & 0x40) && !(inet6_flags(h1) & 0x800));
+    unsigned char na[32] = { 136, 0, 0, 0, 0x20, 0, 0, 0 };           /* NA: override */
+    memcpy(na + 8, a1, 16); na[24] = 2; na[25] = 1; memcpy(na + 26, FAKE_MAC, 6);
+    unsigned char sn1[16] = { 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77 };
+    int r = nic_send6(sn1, ALLNODES, 58, 255, na, 32, 1);
+    unsigned char ns[24] = { 135, 0, 0, 0, 0, 0, 0, 0 };              /* NS from :: (another node's DAD probe) */
+    memcpy(ns + 8, a2, 16);
+    unsigned char unspec[16] = { 0 }, snm[16] = { 0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0, 0x22 };
+    r |= nic_send6(unspec, snm, 58, 255, ns, 24, 1);
+    int ok1 = 0, ok2 = 0;
+    for (int i = 0; i < 30 && !(ok1 && ok2); i++) {
+        ok1 = (inet6_flags(h1) & 0x840) == 0x840; ok2 = (inet6_flags(h2) & 0x840) == 0x840;
+        if (!(ok1 && ok2)) usleep(100000);
+    }
+    CHECK("dad_peer_na_failed", r == 0 && ok1);
+    CHECK("dad_peer_ns_failed", ok2);
+    long n1 = nl_get_flags(a1), n2 = nl_get_flags(a2);
+    CHECK("dad_peer_rtnetlink", n1 >= 0 && (n1 & 0x800) && n2 >= 0 && (n2 & 0x800));
+    sleep(4);                                          /* a failed address stays failed, never permanent */
+    CHECK("dad_peer_stays_failed", (inet6_flags(h1) & 0x800) && (inet6_flags(h2) & 0x800));
+    nl_addr6(0, a1, 64, 0); nl_addr6(0, a2, 64, 0);
+    CHECK("dad_peer_removed", inet6_flags(h1) < 0 && inet6_flags(h2) < 0);
+    conf_rw("dad_transmits", 1, 1);
+}
+
+
+/* A vif of a non-initial netns: its address is listed in THAT netns's /proc/net/if_inet6 (not the
+ * NICs of the initial one), and not in the initial netns's. */
+#include <linux/if_tun.h>
+static int vif_ns_body(void) {
+    unsigned char a[16] = { 0x20, 0x01, 0x0d, 0xb8, 0x0d, 0x66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 };
+    if (unshare(CLONE_NEWNET) != 0) return 2;
+    int t = open("/dev/net/tun", O_RDWR);
+    if (t < 0) return 3;
+    struct ifreq q; memset(&q, 0, sizeof q); strcpy(q.ifr_name, "dh6t0"); q.ifr_flags = IFF_TAP | IFF_NO_PI;
+    if (ioctl(t, TUNSETIFF, &q) != 0) return 4;
+    if (nl_addr6_if("dh6t0", 1, a, 64, 0x02) != 0) return 5;
+    char l[256];
+    int found = 0;
+    for (int i = 0; i < 30 && !found; i++) { found = if_inet6_find("dh6t0", "20010db80d660000", l, sizeof l); if (!found) usleep(100000); }
+    if (!found) return 6;
+    FILE *f = fopen("/proc/net/if_inet6", "r");
+    char b[256]; int nic = 0;
+    while (f && fgets(b, sizeof b, f)) if (strstr(b, " eth0")) nic = 1;
+    if (f) fclose(f);
+    return nic ? 7 : 0;
+}
+static void test_vif_ns_if_inet6(void) {
+    pid_t k = fork();
+    if (k == 0) _exit(vif_ns_body());
+    int st = 0; waitpid(k, &st, 0);
+    errno = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    CHECK("vif_ns_if_inet6", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    CHECK("vif_ns_not_in_initial", !if_inet6_find("dh6t0", "2001", NULL, 0));
 }
 
 int main(int argc, char **argv) {
@@ -1115,12 +1436,19 @@ int main(int argc, char **argv) {
     test_ping6_global();
     test_ping6_own_global();
     test_ll_noscope();
+    test_ping6_own_ll();
+    test_ll_recv_scope();
     test_ll_bind_scope();
     test_disable_ipv6();
     test_dad_sysctl();
     test_dad_tentative_then_permanent();
     test_dad_off();
     test_dad_static_and_dup();
+    test_dad_failed_peer();
+    test_rdnss_linklocal_scope();
+    test_dhcp6_info();
+    test_dhcp6_stateful();
+    test_vif_ns_if_inet6();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
 }

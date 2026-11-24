@@ -142,20 +142,20 @@ leandros_port_reuse() {
   return 1
 }
 
-# ── Alpine 3.24, with or without a container ────────────────────────────────
+# ── Alpine (the image's release), with or without a container ────────────────────────────────
 #
 # One abstraction, two backends:
 #
 #   container  the host build (macOS / Linux): podman or docker runs
-#              alpine:3.24 of the requested architecture, a foreign arch under
+#              $ALPINE_IMAGE of the requested architecture, a foreign arch under
 #              binfmt emulation. Exactly what the ports always did; the tool is
 #              picked by leandros_pick_container above.
 #   local      the build runs INSIDE LeandrOS, where there are no containers:
-#              an Alpine 3.24 root is staged with the image's static apk-tools
+#              an Alpine $ALPINE_REL root is staged with the image's static apk-tools
 #              (/usr/sbin/apk.static via /usr/sbin/alpine-sysroot, both from
 #              ports/apk) under $LEANDROS_ALPINE_DIR, and the command runs
 #              chroot'ed into a throw-away copy of it -- the same "fresh
-#              alpine:3.24, --rm" contract as the container. Native arch only:
+#              $ALPINE_IMAGE, --rm" contract as the container. Native arch only:
 #              there is no qemu-user in the guest, so asking for the other
 #              architecture is a clear error, not an attempt.
 #
@@ -169,9 +169,9 @@ leandros_port_reuse() {
 #                            overrides the detection; the container side keeps
 #                            honouring LEANDROS_CONTAINER.
 #   leandros_alpine_run [--arch A] [--image I] [-e K=V]... [-v HOST:DIR[:ro]]... -- CMD...
-#                            run CMD in Alpine 3.24 and return its status.
+#                            run CMD in Alpine $ALPINE_REL and return its status.
 #                            --arch omitted = this machine's arch. --image
-#                            (container only) replaces alpine:3.24. Mounts: the
+#                            (container only) replaces $ALPINE_IMAGE. Mounts: the
 #                            container bind-mounts. LeandrOS has no bind mounts,
 #                            so the local backend COPIES each HOST dir into the
 #                            root first and, for the writable ones, copies DIR
@@ -213,12 +213,18 @@ _leandros_sysroot_merge_locked() {
   done
 }
 
+# The release comes from the image's lock (scripts/lib/alpine-release.sh).
+for _cl_d in "${ROOT:-/nonexistent}/scripts/lib" "${ROOT_DIR:-/nonexistent}/scripts/lib" "${HERE:-/nonexistent}/../../scripts/lib" "${HERE:-/nonexistent}/../scripts/lib" "${HERE:-/nonexistent}/lib" "${LEANDROS_NETRETRY_DIR:-/nonexistent}"; do
+  [ -f "$_cl_d/alpine-release.sh" ] && { . "$_cl_d/alpine-release.sh"; break; }
+done
+: "${ALPINE_REL:?container-lib.sh: alpine-release.sh not found (set ROOT or ALPINE_REL)}"
+
 leandros_in_guest() {
   [ "$(uname -s 2>/dev/null)" = Leandros ] && return 0
   grep -qsE '^ID="?leandros"?$' /etc/os-release
 }
 
-# What the alpine:3.24 image is made of; the local base root gets the same set
+# What the $ALPINE_IMAGE image is made of; the local base root gets the same set
 # so a script written for the container sees the same userland.
 LEANDROS_ALPINE_BASE_PKGS="alpine-baselayout alpine-baselayout-data alpine-keys
   alpine-release apk-tools busybox busybox-binsh ca-certificates-bundle
@@ -273,8 +279,8 @@ _leandros_q() {
 }
 
 # leandros_alpine_image [aarch64|x86_64|linux/arm64|linux/amd64]: print an
-# arch-specific local tag (alpine:3.24-arm64 / -amd64) for alpine:3.24. A
-# --platform pull or run of alpine:3.24 REPLACES that tag with the pulled
+# arch-specific local tag ($ALPINE_IMAGE-arm64 / -amd64) for $ALPINE_IMAGE. A
+# --platform pull or run of $ALPINE_IMAGE REPLACES that tag with the pulled
 # architecture (docker and podman), so nothing runs the bare tag any more:
 # each arch gets its own tag, (re)pulled only when missing or wrong-arch.
 # Needs $CT (leandros_pick_container). No arch = the host's architecture.
@@ -284,17 +290,17 @@ leandros_alpine_image() {
     x86_64|amd64|linux/amd64)  _ai_a=amd64 ;;
     *) echo "leandros_alpine_image: unknown arch $1" >&2; return 2 ;;
   esac
-  _ai_t="alpine:3.24-$_ai_a"
+  _ai_t="$ALPINE_IMAGE-$_ai_a"
   if [ "$("$CT" image inspect --format '{{.Architecture}}' "$_ai_t" 2>/dev/null)" != "$_ai_a" ]; then
-    "$CT" pull -q --platform "linux/$_ai_a" alpine:3.24 >/dev/null 2>&1 \
-      && "$CT" tag alpine:3.24 "$_ai_t" \
+    "$CT" pull -q --platform "linux/$_ai_a" "$ALPINE_IMAGE" >/dev/null 2>&1 \
+      && "$CT" tag "$ALPINE_IMAGE" "$_ai_t" \
       || { echo "leandros_alpine_image: cannot pull $_ai_t" >&2; return 1; }
   fi
   printf '%s\n' "$_ai_t"
 }
 
 leandros_alpine_run() {
-  _ar_arch="" _ar_image="alpine:3.24" _ar_env="" _ar_cenv="" _ar_cmnt="" _ar_mlist=""
+  _ar_arch="" _ar_image="$ALPINE_IMAGE" _ar_env="" _ar_cenv="" _ar_cmnt="" _ar_mlist=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --arch)  _ar_arch=$2; shift 2 ;;
@@ -309,6 +315,9 @@ leandros_alpine_run() {
     esac
   done
   [ $# -gt 0 ] || { echo "leandros_alpine_run: no command" >&2; return 2; }
+  # the in-container scripts check /etc/alpine-release against this
+  _ar_env="$_ar_env $(_leandros_q "ALPINE_REL=$ALPINE_REL")"
+  _ar_cenv="$_ar_cenv -e $(_leandros_q "ALPINE_REL=$ALPINE_REL")"
   # retry helpers for apk/pip/wget inside the container (see scripts/lib/netretry.sh)
   for _ar_nd in "${LEANDROS_NETRETRY_DIR:-}" "${ROOT:-/nonexistent}/scripts/lib" "${HERE:-/nonexistent}/../../scripts/lib"; do
     if [ -f "$_ar_nd/netretry.sh" ]; then
@@ -330,7 +339,7 @@ leandros_alpine_run() {
       "")      _ar_plat="" ;;
       *) echo "leandros_alpine_run: unknown arch $_ar_arch" >&2; return 2 ;;
     esac
-    if [ "$_ar_image" = alpine:3.24 ]; then
+    if [ "$_ar_image" = "$ALPINE_IMAGE" ]; then
       _ar_image=$(leandros_alpine_image "${_ar_arch:-}") || return 1
     fi
     eval "\"\$CT\" run --rm $_ar_plat $_ar_cenv $_ar_cmnt $(_leandros_q "$_ar_image") \"\$@\""
@@ -352,11 +361,11 @@ _leandros_alpine_run_local() {
     echo "   (there is no qemu-user inside LeandrOS: build $_ar_arch on a $_ar_arch guest or on the host)" >&2
     return 3
   fi
-  [ "$_ar_image" = alpine:3.24 ] || echo "note: the local Alpine backend ignores --image $_ar_image" >&2
+  [ "$_ar_image" = "$ALPINE_IMAGE" ] || echo "note: the local Alpine backend ignores --image $_ar_image" >&2
   _rl_dir=${LEANDROS_ALPINE_DIR:-/var/lib/leandros-alpine}
   _rl_base="$_rl_dir/$_rl_native-base"
   if [ ! -f "$_rl_base/lib/apk/db/installed" ]; then
-    echo "staging the Alpine 3.24 base root $_rl_base" >&2
+    echo "staging the Alpine $ALPINE_REL base root $_rl_base" >&2
     # shellcheck disable=SC2086
     APK="$ALPINE_TOOL" "$LEANDROS_ALPINE_SYSROOT" "$_rl_base" $LEANDROS_ALPINE_BASE_PKGS >&2 \
       || { echo "❌ could not stage $_rl_base" >&2; return 1; }

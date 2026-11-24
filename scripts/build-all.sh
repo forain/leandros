@@ -625,7 +625,7 @@ build_portal() {
     stage_container_port "$port" "$arch" portal "the portal" PORTAL
 }
 
-# Function to stage GStreamer (ports/gstreamer): Alpine 3.24 gstreamer 1.24 +
+# Function to stage GStreamer (ports/gstreamer): Alpine 3.24 gstreamer (Alpine release of the image lock) +
 # plugins + gst-libav + PipeWire plugin for cosmic-player. Same rules as PipeWire;
 # LEANDROS_GSTREAMER_REBUILD=1 forces it, LEANDROS_SKIP_GSTREAMER=1 skips it.
 build_gstreamer() {
@@ -679,7 +679,7 @@ build_libflatpak() {
 
 # Function to stage PipeWire + WirePlumber (ports/pipewire)
 #
-# Alpine 3.24's prebuilt pipewire 1.2.7 + wireplumber 0.5 (container, like the
+# Alpine 3.24's prebuilt pipewire + wireplumber (container, like the
 # portal), plus leandros-snd-sink (the virtio-sound Audio/Sink) compiled in the
 # same container. mkfs overlays ports/pipewire/out/<arch>/ when it exists, and
 # its real libpipewire then replaces the inert stub. A failure falls back to a
