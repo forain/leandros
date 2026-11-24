@@ -15,7 +15,7 @@ apk add -q e2fsprogs e2fsprogs-extra dosfstools mtools sgdisk util-linux openssl
 export MTOOLS_SKIP_CHECK=1
 
 echo "== fetch Alpine kernel/busybox ($ARCH)"
-REPO=https://dl-cdn.alpinelinux.org/alpine/v3.21
+REPO=https://dl-cdn.alpinelinux.org/alpine/v$(cut -d. -f1,2 /etc/alpine-release)
 apk --root $W/k --arch $ARCH --initdb --no-scripts --allow-untrusted --no-cache \
   -X $REPO/main -X $REPO/community add -q linux-virt busybox-static >/dev/null
 KVER=$(ls $W/k/lib/modules | head -1)

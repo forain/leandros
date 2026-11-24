@@ -70,6 +70,11 @@ pub fn parse_for(domain: usize, ptr: usize, len: usize) -> Result<SockAddr, i32>
 /// Build the sockaddr for `ep` as seen by a socket of `domain`.
 pub fn encode(domain: usize, ip: IpAddress, port: u16, scope: u32) -> ([u8; SIN6_LEN], usize) {
     let mut sa = [0u8; SIN6_LEN];
+    // Linux fills sin6_scope_id for a link-local peer (fe80::/10): the interface it was heard on.
+    let scope = match ip {
+        IpAddress::Ipv6(a) if scope == 0 && domain == AF_INET6 && a.0[0] == 0xfe && a.0[1] & 0xc0 == 0x80 => crate::ip6::ll_scope_of(&a.0),
+        _ => scope,
+    };
     if domain == AF_INET6 {
         sa[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
         sa[2..4].copy_from_slice(&port.to_be_bytes());

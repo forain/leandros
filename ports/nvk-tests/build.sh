@@ -1,7 +1,7 @@
 #!/bin/sh
 # build.sh <x86_64|aarch64|all> — build /usr/bin/nvktest, nvkmstest (the
 # KMS test) and nvgltest (GLES on GBM/EGL, when the GPU Mesa stage exists)
-# in an Alpine 3.21
+# in an Alpine 3.24
 # container of the target architecture (venus-lane vkrender idiom: native cc,
 # -fno-stack-protector, a local __stack_chk_guard, -ldl, then patchelf the musl
 # soname to LeandrOS's libc.so). Output:
@@ -15,7 +15,7 @@
 # container's own libc headers. The x86_64 build runs as an emulated amd64
 # container on an arm64 host — fine for a single C file.
 #
-# GPU_BUILD_IMAGE=<image> replaces alpine:3.21 (same as ports/mesa).
+# GPU_BUILD_IMAGE=<image> replaces $ALPINE_IMAGE (same as ports/mesa).
 # Each arch ends with '=== rc=N arch=A nvktest ===' — trust that line.
 #
 # Internal: `build.sh --in-container <arch>` is what runs inside the container.
@@ -109,7 +109,7 @@ build_one() {
   if [ -d "$_stage/usr/lib" ]; then _stagemnt="-v $_stage:/stage:ro"; else echo "no GPU stage at $_stage: nvgltest will not be built"; fi
   echo "building nvktest + nvgltest for $_arch with $ALPINE_TOOL (log: $_log)"
   # shellcheck disable=SC2086
-  leandros_alpine_run --arch "$_arch" --image "${GPU_BUILD_IMAGE:-alpine:3.21}" $_stagemnt \
+  leandros_alpine_run --arch "$_arch" --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" $_stagemnt \
       -v "$SNAP:/src:ro" \
       -v "$MESA_SRC/include/vulkan:/vkheaders/vulkan:ro" \
       -v "$MESA_SRC/include/vk_video:/vkheaders/vk_video:ro" \

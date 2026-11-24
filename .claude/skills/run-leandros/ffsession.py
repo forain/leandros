@@ -3,7 +3,7 @@
                 [--prefs "k=v;..."] [--gpu virgl|venus] [--scale X]
                 [--greeter-timeout S] [--desktop-timeout S] [--term-timeout S]
                 [--ff-timeout S] [--snap] [--post "CMD"] [--wheel]
-                [--fresh-profile] [--shot-every S] [--freeze-detect N [--freeze-frac F] [--freeze-cmd CMD]]
+                [--fresh-profile] [--ffbin PATH] [--pre "CMD"] [--shot-every S] [--freeze-detect N [--freeze-frac F] [--freeze-cmd CMD]]
 
 Boot --virgl (--gpu venus: the linux desktop's Venus/zink path) with the
 driver's guest RAM (2G; LEANDROS_QEMU_MEM overrides), serial root login,
@@ -625,8 +625,12 @@ def main():
         put_file(src, "/tmp/fflong.html")
     if url.startswith("file:///tmp/fftest.html"):
         sh("printf '%s' \"" + page + "\" > /tmp/fftest.html; chmod 644 /tmp/fftest.html; wc -c /tmp/fftest.html")
+    if "--pre" in A:
+        # --pre CMD: run from the serial root shell just before the launcher
+        # script is written (e.g. stage a distribution policy, remove a pref file).
+        log(sh(opt("--pre", ""), 60))
     script = ("unset WAYLAND_DEBUG; export RUST_LOG=info; echo START >/tmp/ff.log; env | sort >/tmp/ff.env; " + extra +
-              "/bin/firefox --no-remote " + url + " >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
+              opt("--ffbin", "/bin/firefox") + " --no-remote " + url + " >>/tmp/ff.log 2>&1; echo EXIT=$? >>/tmp/ff.log")
     sh(f"printf '%s\\n' '{script}' > /tmp/ffrun.sh; chmod 755 /tmp/ffrun.sh; cat /tmp/ffrun.sh")
     if "--fresh-profile" in A:
         # A new Firefox profile, as on the first run after an image build:

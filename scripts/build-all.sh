@@ -599,7 +599,7 @@ stage_container_port() {
 
 # Function to stage the desktop portal (org.freedesktop.portal.Desktop)
 #
-# ports/portal/build.sh: Alpine 3.21's prebuilt xdg-desktop-portal frontend and
+# ports/portal/build.sh: Alpine 3.24's prebuilt xdg-desktop-portal frontend and
 # permission store (container, like Firefox) plus xdg-desktop-portal-cosmic
 # cross-built on the host from the pinned ../cosmic-epoch checkout (needs the
 # m6-session-bins toolchain; LEANDROS_PORTAL_BACKEND=<file> supplies a prebuilt
@@ -625,7 +625,7 @@ build_portal() {
     stage_container_port "$port" "$arch" portal "the portal" PORTAL
 }
 
-# Function to stage GStreamer (ports/gstreamer): Alpine 3.21 gstreamer 1.24 +
+# Function to stage GStreamer (ports/gstreamer): Alpine 3.24 gstreamer (Alpine release of the image lock) +
 # plugins + gst-libav + PipeWire plugin for cosmic-player. Same rules as PipeWire;
 # LEANDROS_GSTREAMER_REBUILD=1 forces it, LEANDROS_SKIP_GSTREAMER=1 skips it.
 build_gstreamer() {
@@ -652,7 +652,7 @@ build_gstreamer() {
     stage_container_port "$port" "$arch" gstreamer GStreamer GSTREAMER
 }
 
-# Function to stage libflatpak (ports/libflatpak): Alpine 3.21 flatpak's libflatpak.so.0
+# Function to stage libflatpak (ports/libflatpak): Alpine 3.24 flatpak's libflatpak.so.0
 # + closure for cosmic-store's `flatpak` feature, plus its -dev tree merged into the
 # cross sysroot. Same rules as GStreamer; LEANDROS_LIBFLATPAK_REBUILD=1 forces it,
 # LEANDROS_SKIP_LIBFLATPAK=1 skips it (cosmic-store then needs the feature removed).
@@ -679,7 +679,7 @@ build_libflatpak() {
 
 # Function to stage PipeWire + WirePlumber (ports/pipewire)
 #
-# Alpine 3.21's prebuilt pipewire 1.2.7 + wireplumber 0.5 (container, like the
+# Alpine 3.24's prebuilt pipewire + wireplumber (container, like the
 # portal), plus leandros-snd-sink (the virtio-sound Audio/Sink) compiled in the
 # same container. mkfs overlays ports/pipewire/out/<arch>/ when it exists, and
 # its real libpipewire then replaces the inert stub. A failure falls back to a
@@ -715,7 +715,7 @@ build_alpine_pkgs() {
 
 # Function to stage apk-tools (ports/apk)
 #
-# Alpine 3.21's statically linked apk.static, the alpine-sysroot wrapper, the
+# Alpine 3.24's statically linked apk.static, the alpine-sysroot wrapper, the
 # Alpine keys/repositories and a CA bundle, fetched once into
 # ~/.cache/leandros/apk (LEANDROS_APK_CACHE) and unpacked with tar -- no
 # container. They let a build running INSIDE LeandrOS stage an Alpine root
@@ -1039,7 +1039,7 @@ build_leandros_install() {
     "$ROOT_DIR/userland/leandros-install/build.sh" "$arch"
 }
 
-# Function to stage e2fsprogs (ports/e2fsprogs): Alpine 3.21's e2fsck,
+# Function to stage e2fsprogs (ports/e2fsprogs): Alpine 3.24's e2fsck,
 # resize2fs, dumpe2fs, e2undo and mke2fs (dual-boot installer, ext4 shrink).
 # LEANDROS_E2FSPROGS_REBUILD=1 forces it, LEANDROS_SKIP_E2FSPROGS=1 skips it.
 build_e2fsprogs() {

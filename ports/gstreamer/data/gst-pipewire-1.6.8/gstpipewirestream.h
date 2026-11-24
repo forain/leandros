@@ -11,6 +11,7 @@
 #include "gstpipewirecore.h"
 
 #include <gst/gst.h>
+#include <spa/utils/dll.h>
 #include <pipewire/pipewire.h>
 
 G_BEGIN_DECLS
@@ -29,9 +30,19 @@ struct _GstPipeWireStream {
   GstPipeWirePool *pool;
   GstClock *clock;
 
+  guint64 position;
+  guint64 buf_duration;
+  struct spa_dll dll;
+  double err_avg, err_var, err_wdw;
+  guint64 last_ts;
+  guint64 base_buffer_ts;
+  guint64 base_ts;
+
   /* the actual pw stream */
   struct pw_stream *pwstream;
   struct spa_hook pwstream_listener;
+
+  struct spa_io_position *io_position;
 
   /* common properties */
   int fd;

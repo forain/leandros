@@ -188,6 +188,7 @@ static int has_addr(int s, int idx, const char *ip) {
 #define IF_READY 0x80000000u
 #endif
 #define IF_RA_RCVD_ 0x20u
+#define IF_RS_SENT_ 0x10u
 #define IFA_F_TENTATIVE_ 0x40u
 struct nm { int type; int idx; int fam; const void *addr; int alen; int plen; unsigned flagmask, flagval; unsigned *seen_fl; };
 /* Wait up to ~4 s for a non-dump message matching `w`. */
@@ -641,6 +642,7 @@ static void v6_tests(void) {
             close(st);
             unsigned f6 = 0;
             CHECK("IFLA_INET6_FLAGS eth0 has IF_READY (non-tentative link-local)", link_inet6_flags(s, eth, &f6) && (f6 & IF_READY));
+            CHECK("IFLA_INET6_FLAGS eth0 has IF_RS_SENT (router solicitation went out)", (f6 & IF_RS_SENT_) != 0);
             if (proc_router6(nh, sizeof nh)) CHECK("IFLA_INET6_FLAGS eth0 has IF_RA_RCVD after an RA", (f6 & IF_RA_RCVD_) != 0);
         }
         if (eth && proc_router6(nh, sizeof nh)) {
