@@ -3588,6 +3588,47 @@ static int drm_getdev_rd(const char *p, char *b, size_t n) {
     int f = open(p, O_RDONLY); if (f < 0) return -1;
     ssize_t k = read(f, b, n - 1); close(f); if (k < 0) return -2; b[k] = 0; return (int)k;
 }
+/* The DRM device's PCI identity reads the same under every sysfs spelling Linux
+ * serves (udev/libdrm/Mesa walk /sys/class/drm/<node>/device/*): vendor, device,
+ * subsystem_*, class and uevent through class/drm/card0 and renderD128 must equal
+ * /sys/dev/char/226:N/device/*, and the ids must be real (non-zero, 0x-prefixed). */
+static int drm_pci_ids_spellings_case(int m) {
+    static const char *F[] = { "vendor", "device", "subsystem_vendor", "subsystem_device", "class", "uevent" };
+    static const char *N[] = { "card0", "renderD128" };
+    static const char *M[] = { "0", "128" };
+    char p[160], q[160], a[512], b[512]; struct stat st; int i, k; (void)m;
+    if (stat("/sys/dev/char/226:128/device/uevent", &st) != 0) return 0; /* no DRM device on this board */
+    for (k = 0; k < 2; k++) for (i = 0; i < 6; i++) {
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/%s", M[k], F[i]);
+        snprintf(q, sizeof q, "/sys/class/drm/%s/device/%s", N[k], F[i]);
+        int na = drm_getdev_rd(p, a, sizeof a), nb = drm_getdev_rd(q, b, sizeof b);
+        if (na <= 0 || nb <= 0) { printf("  pcisp: %s=%d %s=%d errno=%d\n", p, na, q, nb, errno); return 10 + i; }
+        if (na != nb || memcmp(a, b, na) != 0) { printf("  pcisp: %s differs from %s\n", q, p); return 20 + i; }
+        if (i < 2 && (strncmp(a, "0x", 2) != 0 || strtoul(a, NULL, 16) == 0)) { printf("  pcisp: %s=%s\n", p, a); return 30 + i; }
+    }
+    return 0;
+}
+/* Firefox's RDD/GPU broker policy is built from the files present in the DRM
+ * device directory, and everything else is denied; Intel's iHD VA-API driver
+ * readlink()s `device/driver` and opens `device/irq` and `device/resource`, so
+ * they must exist (a sparse sysfs made the sandboxed RDD die, errno 13). */
+static int drm_device_extras_case(int m) {
+    static const char *M[] = { "0", "128" };
+    char p[160], b[160]; struct stat st; int k, f; (void)m;
+    if (stat("/sys/dev/char/226:128/device/uevent", &st) != 0) return 0; /* no DRM device on this board */
+    for (k = 0; k < 2; k++) {
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/driver", M[k]);
+        ssize_t n = readlink(p, b, sizeof b - 1);
+        if (n <= 0) { printf("  drvx: readlink %s=%zd errno=%d\n", p, n, errno); return 10 + k; }
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/irq", M[k]);
+        if ((f = open(p, O_RDONLY)) < 0) { printf("  drvx: open %s errno=%d\n", p, errno); return 20 + k; }
+        close(f);
+        snprintf(p, sizeof p, "/sys/dev/char/226:%s/device/resource", M[k]);
+        if ((f = open(p, O_RDONLY)) < 0) { printf("  drvx: open %s errno=%d\n", p, errno); return 30 + k; }
+        close(f);
+    }
+    return 0;
+}
 static int drm_getdevice_ns_case(int m) {
     const char *R = "/sys/dev/char/226:128";
     char p[160], b[512], base[32]; struct stat st; int i, r;
@@ -3650,6 +3691,8 @@ static void filebind_suite(void) {
     report("sysfs_drm_links_in_mntns", nn_in_child(sysfs_drm_links_ns_case, 0) & nn_in_child(sysfs_drm_links_ns_case, 2) & nn_in_child(sysfs_drm_links_ns_case, 4) & nn_in_child(sysfs_drm_links_ns_case, 6));
     report("devdri_realpath_in_userns", nn_in_child(devdri_realpath_ns_case, 0) & nn_in_child(devdri_realpath_ns_case, 2) & nn_in_child(devdri_realpath_ns_case, 6));
     report("drm_getdevice_in_flatpak_ns", nn_in_child(drm_getdevice_ns_case, 0) & nn_in_child(drm_getdevice_ns_case, 2));
+    report("sysfs_drm_pci_ids_all_spellings", nn_in_child(drm_pci_ids_spellings_case, 0));
+    report("sysfs_drm_device_driver_irq_resource", nn_in_child(drm_device_extras_case, 0));
     report("devtty_opath_bind_rdev", nn_in_child(devtty_opath_bind_rdev_case, 0) & nn_in_child(devtty_opath_bind_rdev_case, 2));
     report("filebind_remount_via_procfd", nn_in_child(fb_fdremount, 0) & nn_in_child(fb_fdremount, 1));
     report("bindpin_unlink_source_tmpfs", nn_in_child(bpin_case, 0) & nn_in_child(bpin_case, 8));

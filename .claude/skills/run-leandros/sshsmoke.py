@@ -1267,6 +1267,21 @@ def grace_for(ssh, user, pw):
     return g
 
 
+def wait_preauth(ssh, user, pw, grace, limit=12):
+    """The sshd-preauth process list once the listener has forked it (it may lag well over 1 s on a loaded TCG
+    host); polled until it appears. The listener's LoginGraceTime clock started at connect, and the STOP and
+    KILL sudos (about lat = (grace - 4) / 3 each, see grace_for) must still fit inside it, so the poll is
+    bounded by min(limit, grace - 2 * lat - 3) with a 2 s floor."""
+    lat = max(1.0, (grace - 4) / 3.0)
+    limit = min(limit, max(2.0, grace - 2 * lat - 3))
+    t0 = time.time()
+    while True:
+        pre = [x for x in sshd_procs(ssh, user, pw) if x[2] == "sshd-preauth"]
+        if pre or time.time() - t0 > limit:
+            return pre
+        time.sleep(0.5)
+
+
 def privsep_grace(ssh, user, pw, tmp):
     """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
     grace = grace_for(ssh, user, pw)
@@ -1291,9 +1306,8 @@ def privsep_grace(ssh, user, pw, tmp):
         step("privsep_grace_kill", False, "cannot reach the second sshd through the tunnel")
         return
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
-    time.sleep(1)
-    procs = sshd_procs(ssh, user, pw)
-    pre = [p for p, _, n in procs if n == "sshd-preauth"]
+    pre = wait_preauth(ssh, user, pw, grace)
+    pre = [p for p, _, n in pre]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0]}")  # hung: it cannot disconnect itself
     ok = bool(pre) and probe_eof(s, grace + 21)
@@ -1337,9 +1351,7 @@ def privsep_stalled_monitor(ssh, user, pw):
     s = socket.create_connection(("127.0.0.1", lp), timeout=10)
     s.recv(256)
     s.sendall(b"SSH-2.0-sshsmoke-probe\r\n")
-    time.sleep(1)
-    procs = sshd_procs(ssh, user, pw)
-    pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
+    pre = [(p, pp) for p, pp, n in wait_preauth(ssh, user, pw, grace)]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]}")  # only the monitor hangs; the child stays live
     ok = bool(pre) and probe_eof(s, grace + 36)

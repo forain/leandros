@@ -43,6 +43,7 @@ static const struct media_type media_type_map[] = {
   { "image/jpeg", SPA_MEDIA_TYPE_video, SPA_MEDIA_SUBTYPE_mjpg },
   { "video/x-jpeg", SPA_MEDIA_TYPE_video, SPA_MEDIA_SUBTYPE_mjpg },
   { "video/x-h264", SPA_MEDIA_TYPE_video, SPA_MEDIA_SUBTYPE_h264 },
+  { "video/x-h265", SPA_MEDIA_TYPE_video, SPA_MEDIA_SUBTYPE_h265 },
   { "audio/x-mulaw", SPA_MEDIA_TYPE_audio, SPA_MEDIA_SUBTYPE_raw },
   { "audio/x-alaw", SPA_MEDIA_TYPE_audio, SPA_MEDIA_SUBTYPE_raw },
   { "audio/mpeg", SPA_MEDIA_TYPE_audio, SPA_MEDIA_SUBTYPE_mp3 },
@@ -129,6 +130,65 @@ static const uint32_t video_format_map[] = {
   SPA_VIDEO_FORMAT_I422_12LE,
   SPA_VIDEO_FORMAT_Y444_12BE,
   SPA_VIDEO_FORMAT_Y444_12LE,
+};
+
+static const uint32_t color_range_map[] = {
+  SPA_VIDEO_COLOR_RANGE_UNKNOWN,
+  SPA_VIDEO_COLOR_RANGE_0_255,
+  SPA_VIDEO_COLOR_RANGE_16_235,
+};
+
+static const uint32_t color_matrix_map[] = {
+  SPA_VIDEO_COLOR_MATRIX_UNKNOWN,
+  SPA_VIDEO_COLOR_MATRIX_RGB,
+  SPA_VIDEO_COLOR_MATRIX_FCC,
+  SPA_VIDEO_COLOR_MATRIX_BT709,
+  SPA_VIDEO_COLOR_MATRIX_BT601,
+  SPA_VIDEO_COLOR_MATRIX_SMPTE240M,
+  SPA_VIDEO_COLOR_MATRIX_BT2020,
+};
+
+static const uint32_t transfer_function_map[] = {
+  SPA_VIDEO_TRANSFER_UNKNOWN,
+  SPA_VIDEO_TRANSFER_GAMMA10,
+  SPA_VIDEO_TRANSFER_GAMMA18,
+  SPA_VIDEO_TRANSFER_GAMMA20,
+  SPA_VIDEO_TRANSFER_GAMMA22,
+  SPA_VIDEO_TRANSFER_BT709,
+  SPA_VIDEO_TRANSFER_SMPTE240M,
+  SPA_VIDEO_TRANSFER_SRGB,
+  SPA_VIDEO_TRANSFER_GAMMA28,
+  SPA_VIDEO_TRANSFER_LOG100,
+  SPA_VIDEO_TRANSFER_LOG316,
+  SPA_VIDEO_TRANSFER_BT2020_12,
+  SPA_VIDEO_TRANSFER_ADOBERGB,
+  SPA_VIDEO_TRANSFER_BT2020_10,
+  SPA_VIDEO_TRANSFER_SMPTE2084,
+  SPA_VIDEO_TRANSFER_ARIB_STD_B67,
+  SPA_VIDEO_TRANSFER_BT601,
+};
+
+static const uint32_t color_primaries_map[] = {
+  SPA_VIDEO_COLOR_PRIMARIES_UNKNOWN,
+  SPA_VIDEO_COLOR_PRIMARIES_BT709,
+  SPA_VIDEO_COLOR_PRIMARIES_BT470M,
+  SPA_VIDEO_COLOR_PRIMARIES_BT470BG,
+  SPA_VIDEO_COLOR_PRIMARIES_SMPTE170M,
+  SPA_VIDEO_COLOR_PRIMARIES_SMPTE240M,
+  SPA_VIDEO_COLOR_PRIMARIES_FILM,
+  SPA_VIDEO_COLOR_PRIMARIES_BT2020,
+  SPA_VIDEO_COLOR_PRIMARIES_ADOBERGB,
+  SPA_VIDEO_COLOR_PRIMARIES_SMPTEST428,
+  SPA_VIDEO_COLOR_PRIMARIES_SMPTERP431,
+  SPA_VIDEO_COLOR_PRIMARIES_SMPTEEG432,
+  SPA_VIDEO_COLOR_PRIMARIES_EBU3213,
+};
+
+static const uint32_t interlace_mode_map[] = {
+  SPA_VIDEO_INTERLACE_MODE_PROGRESSIVE,
+  SPA_VIDEO_INTERLACE_MODE_INTERLEAVED,
+  SPA_VIDEO_INTERLACE_MODE_MIXED,
+  SPA_VIDEO_INTERLACE_MODE_FIELDS,
 };
 
 #if __BYTE_ORDER == __BIG_ENDIAN
@@ -589,7 +649,7 @@ handle_video_fields (ConvertData *d)
 static void
 set_default_channels (struct spa_pod_builder *b, uint32_t channels)
 {
-  uint32_t position[SPA_AUDIO_MAX_CHANNELS] = {0};
+  uint32_t position[8] = {0};
   gboolean ok = TRUE;
 
   switch (channels) {
@@ -821,9 +881,19 @@ static char *video_id_to_dma_drm_fourcc(uint32_t id, uint64_t mod)
   if ((idx = find_index(video_format_map, SPA_N_ELEMENTS(video_format_map), id)) == -1)
     return NULL;
   fourcc = gst_video_dma_drm_fourcc_from_format(idx);
+  if (fourcc == DRM_FORMAT_INVALID)
+    return NULL;
   return gst_video_dma_drm_fourcc_to_string(fourcc, mod);
 }
 #endif
+
+static const char *interlace_mode_id_to_string(uint32_t id)
+{
+  int idx;
+  if ((idx = find_index(interlace_mode_map, SPA_N_ELEMENTS(interlace_mode_map), id)) == -1)
+    return NULL;
+  return gst_video_interlace_mode_to_string(idx);
+}
 
 static const char *audio_id_to_string(uint32_t id)
 {
@@ -831,6 +901,46 @@ static const char *audio_id_to_string(uint32_t id)
   if ((idx = find_index(audio_format_map, SPA_N_ELEMENTS(audio_format_map), id)) == -1)
     return NULL;
   return gst_audio_format_to_string(idx);
+}
+
+static GstVideoColorRange color_range_to_gst(uint32_t id)
+{
+  int idx;
+  if ((idx = find_index(color_range_map, SPA_N_ELEMENTS(color_range_map), id)) == -1)
+    return GST_VIDEO_COLOR_RANGE_UNKNOWN;
+  return idx;
+}
+
+static GstVideoColorMatrix color_matrix_to_gst(uint32_t id)
+{
+  int idx;
+  if ((idx = find_index(color_matrix_map, SPA_N_ELEMENTS(color_matrix_map), id)) == -1)
+    return GST_VIDEO_COLOR_MATRIX_UNKNOWN;
+  return idx;
+}
+
+static GstVideoTransferFunction transfer_function_to_gst(uint32_t id)
+{
+  int idx;
+  if ((idx = find_index(transfer_function_map, SPA_N_ELEMENTS(transfer_function_map), id)) == -1)
+    return GST_VIDEO_TRANSFER_UNKNOWN;
+  return idx;
+}
+
+static GstVideoColorPrimaries color_primaries_to_gst(uint32_t id)
+{
+  int idx;
+  if ((idx = find_index(color_primaries_map, SPA_N_ELEMENTS(color_primaries_map), id)) == -1)
+    return GST_VIDEO_COLOR_PRIMARIES_UNKNOWN;
+  return idx;
+}
+
+static void colorimetry_to_gst_colorimetry(struct spa_video_colorimetry *colorimetry, GstVideoColorimetry *gst_colorimetry)
+{
+  gst_colorimetry->range = color_range_to_gst(colorimetry->range);
+  gst_colorimetry->matrix = color_matrix_to_gst(colorimetry->matrix);
+  gst_colorimetry->transfer = transfer_function_to_gst(colorimetry->transfer);
+  gst_colorimetry->primaries = color_primaries_to_gst(colorimetry->primaries);
 }
 
 static void
@@ -915,21 +1025,25 @@ handle_dmabuf_prop (const struct spa_pod_prop *prop,
 
   for (i = 0; i < n_fmts; i++) {
     for (j = 0; j < n_mods; j++) {
+      gboolean as_drm = FALSE;
       const char *fmt_str;
-
-      if ((mods[j] == DRM_FORMAT_MOD_LINEAR ||
-           mods[j] == DRM_FORMAT_MOD_INVALID) &&
-          (fmt_str = video_id_to_string(id[i])))
-        g_ptr_array_add(fmt_array, g_strdup_printf ("%s", fmt_str));
 
 #ifdef HAVE_GSTREAMER_DMA_DRM
       if (mods[j] != DRM_FORMAT_MOD_INVALID) {
         char *drm_str;
 
-        if ((drm_str = video_id_to_dma_drm_fourcc(id[i], mods[j])))
+        if ((drm_str = video_id_to_dma_drm_fourcc(id[i], mods[j]))) {
           g_ptr_array_add(drm_fmt_array, drm_str);
+          as_drm = TRUE;
+        }
       }
 #endif
+
+      if (!as_drm &&
+          (mods[j] == DRM_FORMAT_MOD_LINEAR ||
+           mods[j] == DRM_FORMAT_MOD_INVALID) &&
+          (fmt_str = video_id_to_string(id[i])))
+        g_ptr_array_add(fmt_array, g_strdup_printf ("%s", fmt_str));
     }
   }
 
@@ -1050,8 +1164,19 @@ handle_rect_prop (const struct spa_pod_prop *prop, const char *width, const char
     {
       if (n_items < 3)
         return;
-      gst_caps_set_simple (res, width, GST_TYPE_INT_RANGE, rect[1].width, rect[2].width,
-                                height, GST_TYPE_INT_RANGE, rect[1].height, rect[2].height, NULL);
+
+      if (rect[1].width == rect[2].width &&
+          rect[1].height == rect[2].height) {
+        gst_caps_set_simple (res,
+            width, G_TYPE_INT, rect[1].width,
+            height, G_TYPE_INT, rect[1].height,
+            NULL);
+      } else {
+        gst_caps_set_simple (res,
+            width, GST_TYPE_INT_RANGE, rect[1].width, rect[2].width,
+            height, GST_TYPE_INT_RANGE, rect[1].height, rect[2].height,
+            NULL);
+      }
       break;
     }
     case SPA_CHOICE_Enum:
@@ -1102,8 +1227,17 @@ handle_fraction_prop (const struct spa_pod_prop *prop, const char *key, GstCaps 
     {
       if (n_items < 3)
         return;
-      gst_caps_set_simple (res, key, GST_TYPE_FRACTION_RANGE, fract[1].num, fract[1].denom,
-                                                              fract[2].num, fract[2].denom, NULL);
+
+      if (fract[1].num == fract[2].num &&
+          fract[1].denom == fract[2].denom) {
+        gst_caps_set_simple (res, key, GST_TYPE_FRACTION,
+            fract[1].num, fract[1].denom, NULL);
+      } else {
+        gst_caps_set_simple (res, key, GST_TYPE_FRACTION_RANGE,
+            fract[1].num, fract[1].denom,
+            fract[2].num, fract[2].denom,
+            NULL);
+      }
       break;
     }
     case SPA_CHOICE_Enum:
@@ -1129,6 +1263,7 @@ gst_caps_from_format (const struct spa_pod *format)
 {
   GstCaps *res = NULL;
   uint32_t media_type, media_subtype;
+  struct spa_video_colorimetry colorimetry = { 0 };
   const struct spa_pod_prop *prop = NULL;
   const struct spa_pod_object *obj = (const struct spa_pod_object *) format;
 
@@ -1149,6 +1284,11 @@ gst_caps_from_format (const struct spa_pod *format)
           handle_id_prop (prop, "format", video_id_to_string, res);
         }
       }
+      if ((prop = spa_pod_object_find_prop (obj, prop, SPA_FORMAT_VIDEO_interlaceMode))) {
+        handle_id_prop (prop, "interlace-mode", interlace_mode_id_to_string, res);
+      } else {
+        gst_caps_set_simple(res, "interlace-mode", G_TYPE_STRING, "progressive", NULL);
+      }
     }
     else if (media_subtype == SPA_MEDIA_SUBTYPE_mjpg) {
       res = gst_caps_new_empty_simple ("image/jpeg");
@@ -1158,8 +1298,14 @@ gst_caps_from_format (const struct spa_pod *format)
           "stream-format", G_TYPE_STRING, "byte-stream",
           "alignment", G_TYPE_STRING, "au",
           NULL);
+    }
+    else if (media_subtype == SPA_MEDIA_SUBTYPE_h265) {
+      res = gst_caps_new_simple ("video/x-h265",
+          "stream-format", G_TYPE_STRING, "byte-stream",
+          "alignment", G_TYPE_STRING, "au",
+          NULL);
     } else {
-	    return NULL;
+      return NULL;
     }
     if ((prop = spa_pod_object_find_prop (obj, prop, SPA_FORMAT_VIDEO_size))) {
       handle_rect_prop (prop, "width", "height", res);
@@ -1169,6 +1315,20 @@ gst_caps_from_format (const struct spa_pod *format)
     }
     if ((prop = spa_pod_object_find_prop (obj, prop, SPA_FORMAT_VIDEO_maxFramerate))) {
       handle_fraction_prop (prop, "max-framerate", res);
+    }
+    if (spa_pod_parse_object(format,
+      SPA_TYPE_OBJECT_Format, NULL,
+      SPA_FORMAT_VIDEO_colorRange, SPA_POD_OPT_Id(&colorimetry.range),
+      SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_OPT_Id(&colorimetry.matrix),
+      SPA_FORMAT_VIDEO_transferFunction, SPA_POD_OPT_Id(&colorimetry.transfer),
+      SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_OPT_Id(&colorimetry.primaries)) > 0) {
+        GstVideoColorimetry gst_colorimetry;
+        char *color;
+        colorimetry_to_gst_colorimetry(&colorimetry, &gst_colorimetry);
+        color = gst_video_colorimetry_to_string(&gst_colorimetry);
+        gst_caps_set_simple(res, "colorimetry", G_TYPE_STRING, color, NULL);
+        g_free(color);
+
     }
   } else if (media_type == SPA_MEDIA_TYPE_audio) {
     if (media_subtype == SPA_MEDIA_SUBTYPE_raw) {

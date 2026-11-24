@@ -2,36 +2,18 @@
 # /bin/firefox — launch Alpine's Firefox (ports/firefox) inside a LeandrOS
 # COSMIC session, e.g. from cosmic-term. POSIX sh: /bin/sh is brush.
 #
-# RULE: GPU rendering only. /bin/gpu-env (already sourced by the session, so
-# this is normally a no-op) decides zink, iris or virgl; without one of them this
-# refuses to start instead of letting WebRender fall back to its software
-# rasteriser. LEANDROS_FIREFOX_ALLOW_SOFTWARE=1 overrides, for debugging only.
-
-if [ -r /bin/gpu-env ]; then
-    . /bin/gpu-env
-fi
-case "${LEANDROS_RENDERER_PATH:-}" in
-zink|iris|virgl|v3d) ;;
-*)
+# Thin launcher: Firefox's own defaults decide WebRender, Wayland, VA-API and the
+# process model (distro prefs: /usr/lib/firefox/defaults/pref/leandros-*.js).
+# RULE: GPU rendering only. Without a DRM render node WebRender would fall back
+# to its software rasteriser, so this refuses to start instead.
+# LEANDROS_FIREFOX_ALLOW_SOFTWARE=1 overrides, for debugging only.
+if [ ! -e /dev/dri/renderD128 ]; then
     if [ "${LEANDROS_FIREFOX_ALLOW_SOFTWARE:-0}" != 1 ]; then
-        echo "firefox: no GPU renderer (LEANDROS_RENDERER_PATH=${LEANDROS_RENDERER_PATH:-unset}); refusing to start" >&2
+        echo "firefox: no GPU render node (/dev/dri/renderD128); refusing to start" >&2
         exit 78
     fi
-    echo "firefox: WARNING running without a GPU renderer (LEANDROS_FIREFOX_ALLOW_SOFTWARE=1)" >&2
-    ;;
-esac
-
-# Native Wayland, through GTK3's Wayland backend.
-MOZ_ENABLE_WAYLAND=1
-GDK_BACKEND=wayland
-export MOZ_ENABLE_WAYLAND GDK_BACKEND
-
-# Hardware compositing: WebRender on EGL (our Mesa: zink, iris or virgl). The prefs
-# in /usr/lib/firefox/defaults/pref/leandros-prefs.js force it past the GPU
-# blocklist and forbid the software-WebRender fallback.
-MOZ_ACCELERATED=1
-MOZ_WEBRENDER=1
-export MOZ_ACCELERATED MOZ_WEBRENDER
+    echo "firefox: WARNING running without a GPU render node (LEANDROS_FIREFOX_ALLOW_SOFTWARE=1)" >&2
+fi
 
 # Sandboxes are ON by default (seccomp-bpf, user/pid/net/ipc namespaces, chroot).
 # LEANDROS_FIREFOX_SANDBOX=0 disables every process type's sandbox (debug only).
@@ -52,19 +34,6 @@ if [ "${LEANDROS_FIREFOX_SANDBOX_LOG:-0}" = 1 ]; then
     MOZ_SANDBOX_LOGGING=1
     export MOZ_SANDBOX_LOGGING
 fi
-
-# VA-API video decode. iHD only exists on x86_64 Intel images; elsewhere the
-# variable stays unset and VA-API init fails, so decode stays in software.
-if [ -z "${LIBVA_DRIVER_NAME:-}" ] && [ -e /usr/lib/dri/iHD_drv_video.so ]; then
-    LIBVA_DRIVER_NAME=iHD
-    export LIBVA_DRIVER_NAME
-fi
-# Belt-and-braces: without these, RDD's first setenv runs through libc's getenv
-# PLT, which reaches mozglue's getenv under gEnvLock and self-deadlocks. Lane
-# libcsym fixes the root cause.
-LIBVA_MESSAGING_LEVEL=${LIBVA_MESSAGING_LEVEL:-0}
-MOZ_AV_LOG_LEVEL=${MOZ_AV_LOG_LEVEL:-0}
-export LIBVA_MESSAGING_LEVEL MOZ_AV_LOG_LEVEL
 
 # No crash reporter, no accessibility bus, no dconf, no portals: none of those
 # services exist here, and each one is a D-Bus round trip that can only fail.
