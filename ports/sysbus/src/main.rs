@@ -37,6 +37,7 @@
 //! anything that needs root (powering off, writing /etc as uid 1000) is
 //! reported as an error instead of pretending to succeed. See each module.
 
+mod act_test;
 mod a11y;
 mod bluez;
 mod locale1;
@@ -75,10 +76,10 @@ pub(crate) fn log(service: &str, msg: std::fmt::Arguments<'_>) {
 /// shared by every worktree, so a sysbus rebuilt by a lane on an older tree
 /// would otherwise silently drop e.g. `bluez` or `power`. Add every new
 /// subcommand here.
-const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,packagekit,pk-test,pkcon,bluez,bluez-test,probe,power,portal,timedate1,switcheroo,a11y,svc-test;";
+const SERVICES: &str = "leandros-sysbus-services:login1,locale1,upower,power-profiles,polkit,rtkit,networkmanager,packagekit,pk-test,pkcon,bluez,bluez-test,probe,power,portal,timedate1,switcheroo,a11y,svc-test,activation-test,act-claim;";
 
 fn usage() -> ExitCode {
-    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|timedate1|switcheroo|a11y|svc-test|networkmanager|packagekit|pk-test|pkcon ARGS|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
+    eprintln!("usage: leandros-sysbus <login1|locale1|upower|power-profiles|polkit|rtkit|timedate1|switcheroo|a11y|svc-test|activation-test|act-claim NAME MODE|networkmanager|packagekit|pk-test|pkcon ARGS|bluez|bluez-test|probe|power <PowerOff|Reboot|Halt|CanPowerOff|CanReboot|CanHalt>|portal [settings|screenshot|open-file|all] [timeout_s]>");
     eprintln!("{SERVICES}");
     ExitCode::from(2)
 }
@@ -87,6 +88,19 @@ fn main() -> ExitCode {
     let Some(which) = std::env::args().nth(1) else {
         return usage();
     };
+    if which == "activation-test" || which == "act-claim" {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio");
+        let ok = rt.block_on(async {
+            if which == "act-claim" {
+                let a: Vec<String> = std::env::args().skip(2).collect();
+                let addr = bus_address().unwrap_or_default();
+                act_test::claim(&addr, a.first().map(String::as_str).unwrap_or(""), a.get(1).map(String::as_str).unwrap_or("")).await
+            } else {
+                act_test::run().await.1 == 0
+            }
+        });
+        return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     // The portal lives on the session bus proper.
     let address = if which == "portal" {
         std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().filter(|v| !v.is_empty()).or_else(bus_address)

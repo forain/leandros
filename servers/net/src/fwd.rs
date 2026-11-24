@@ -382,6 +382,7 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
                 if reply_in(br, port, &mut f, &p) || hair(br, port, bmac, &mut f, &p) { continue; }
             }
         }
+        if nft && port != crate::vifsel::NO_PEER && port != br && f[23] == PROTO_ICMP && icmp_error_type(&f) && hair_icmp_err(br, &f) { continue; }
         // The bridge's own network (and its broadcast) stays with the stack.
         if addrs.iter().any(|&(a, p)| u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(dst) & mask(p)) {
             keep.push_back(f);
@@ -407,7 +408,7 @@ pub(crate) fn divert(br: Sid, rx: VecDeque<Vec<u8>>, rxsrc: VecDeque<Sid>) -> Ve
 fn route_l3(sbr: Sid, sport: Sid, t: &Tgt, mut f: Vec<u8>) {
     let n = t.name.iter().position(|&c| c == 0).unwrap_or(16);
     if !sched::ns::forwarding(0, &t.name[..n]) { return; }
-    if f[22] <= 1 { stat(S_ING_TTL); return; }
+    if f[22] <= 1 { stat(S_ING_TTL); ttl_exceeded4(sbr, sport, &f); return; }
     let ihl = ((f[14] & 0xf) as usize) * 4;
     if ihl < 20 || f.len() < 14 + ihl { return; }
     if crate::nfnl::has_tables(0) {
@@ -446,13 +447,23 @@ fn route_l3(sbr: Sid, sport: Sid, t: &Tgt, mut f: Vec<u8>) {
 
 fn ingress(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>, p: Pkt) {
     if p.proto == PROTO_UDP { stat(S_ING_UDP); }
-    if f[22] <= 1 { stat(S_ING_TTL); return; } // TTL exhausted
+    if f[22] <= 1 { stat(S_ING_TTL); ttl_exceeded4(br, port, &f); return; } // TTL exhausted
     let Some((nic, nh, nicip)) = crate::iface::nic_route(p.dst) else { stat(S_ING_NOROUTE); return };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { return };
     let now = sched::monotonic_ns();
     // Nftables is loaded but no nat/postrouting chain exists: nothing may masquerade, so the packet is
     // routed to the NIC subnet with its source address kept (Linux ip_forward without a NAT rule).
-    if crate::nfnl::has_tables(0) && !crate::nfnl::has_hook(0, crate::nfnl::H_POST)
+    // A postrouting chain whose verdict for this packet is not masquerade (netavark's internal networks, or a
+    // subnet without a masquerade rule) behaves the same way: Linux forwards it unchanged if FORWARD accepts.
+    let nomasq = crate::nfnl::has_tables(0) && {
+        if !crate::nfnl::has_hook(0, crate::nfnl::H_POST) { true } else {
+            let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+            let rp = if p.proto == PROTO_ICMP { 0 } else { p.dport };
+            let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: p.src, dst: p.dst, sport: p.sport, dport: rp, oif, mark: 0, local: false, v6: None };
+            crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq
+        }
+    };
+    if nomasq
         && !FWD.lock().ct.iter().any(|e| e.kind == 0 && e.proto == p.proto && e.br == br && e.port == port && e.cip == p.src && e.cport == p.sport) {
         let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
         let est = p.proto == PROTO_TCP && p.flags & 0x12 != 0x02;
@@ -710,6 +721,54 @@ fn icmp_error_rx(nic: u8, buf: &[u8]) -> bool {
     true
 }
 
+/// An ICMP error from a hairpin target (or a hop in front of it) quoting the DNATed packet it received: it is
+/// un-NATed like any related error of a tracked flow (outer destination, quoted source and destination),
+/// run through FORWARD as `ct state related` and handed to the client. True = taken (also when dropped).
+fn hair_icmp_err(br: Sid, buf: &[u8]) -> bool {
+    let ihl = (buf[14] & 15) as usize * 4;
+    let tot = u16::from_be_bytes([buf[16], buf[17]]) as usize;
+    if ihl < 20 || tot < ihl + 8 + 20 || 14 + tot > buf.len() { return false; }
+    let i = 14 + ihl + 8;
+    if buf[i] >> 4 != 4 { return false; }
+    let iihl = (buf[i] & 15) as usize * 4;
+    let proto = buf[i + 9];
+    if iihl < 20 || 14 + tot < i + iihl + 8 || (proto != PROTO_UDP && proto != PROTO_TCP) { return false; }
+    let qsrc = [buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]];
+    let qdst = [buf[i + 16], buf[i + 17], buf[i + 18], buf[i + 19]];
+    let l = i + iihl;
+    let (qsp, qdp) = (u16::from_be_bytes([buf[l], buf[l + 1]]), u16::from_be_bytes([buf[l + 2], buf[l + 3]]));
+    let odst = [buf[30], buf[31], buf[32], buf[33]];
+    let osrc = [buf[26], buf[27], buf[28], buf[29]];
+    let mut st = FWD.lock();
+    let Some(e) = st.ct.iter().find(|e| (e.kind == 2 || e.kind == 3) && e.proto == proto && e.tbr == br && e.tip == qdst && e.tport == qdp
+        && if e.kind == 2 { e.nicip == qsrc && e.nat == qsp && odst == e.nicip } else { e.cip == qsrc && e.cport == qsp && odst == e.cip }) else { return false };
+    let (cip, cport, cmac, bmac, cbr, cport_sid, rip, rport, tip) = (e.cip, e.cport, e.cmac, e.bmac, e.br, e.port, e.rip, e.rport, e.tip);
+    if crate::nfnl::has_tables(0) {
+        let mut m = crate::nfnl::Pkt { rel: true, est: true, l4: PROTO_ICMP, src: osrc, dst: cip, sport: 0, dport: 0, oif: br_name(cbr), mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { stat(S_ING_NFT); return true; }
+    }
+    let mut f = buf[..14 + tot].to_vec();
+    if f[22] <= 1 { return true; }
+    f[22] -= 1;
+    f[30..34].copy_from_slice(&cip);
+    if osrc == tip { f[26..30].copy_from_slice(&rip); }
+    f[i + 12..i + 16].copy_from_slice(&cip);
+    f[i + 16..i + 20].copy_from_slice(&rip);
+    f[l..l + 2].copy_from_slice(&cport.to_be_bytes());
+    f[l + 2..l + 4].copy_from_slice(&rport.to_be_bytes());
+    f[i + 10] = 0; f[i + 11] = 0;
+    let c = fold(sum(&f[i..i + iihl], 0));
+    f[i + 10..i + 12].copy_from_slice(&c.to_be_bytes());
+    icmp_csum(&mut f, ihl, tot - ihl);
+    ip_csum(&mut f, ihl);
+    f[0..6].copy_from_slice(&cmac);
+    f[6..12].copy_from_slice(&bmac);
+    if st.inq.len() < 256 { st.inq.push_back((cbr, cport_sid, f)); INQ_N.fetch_add(1, Ordering::Relaxed); }
+    drop(st);
+    drivers::netdev::kick();
+    true
+}
+
 fn arp_learn(nic: u8, b: &[u8]) {
     if b.len() < 42 || b[14..20] != [0, 1, 8, 0, 6, 4] || (b[21] != 1 && b[21] != 2) { return; }
     let mac: [u8; 6] = b[22..28].try_into().unwrap();
@@ -860,7 +919,15 @@ pub(crate) fn requeue(br: Sid, list: Vec<(Sid, Sid, Vec<u8>)>, work: &mut VecDeq
 }
 
 /// A parked packet whose next hop never resolved: Linux answers the sender with ICMP host unreachable.
-fn unreach4(sbr: Sid, port: Sid, f: &[u8]) {
+fn unreach4(sbr: Sid, port: Sid, f: &[u8]) { err4(sbr, port, f, 3, 1) }
+
+/// Hop limit exhausted on `f` (a container's packet): ICMP time exceeded back to it from the bridge address.
+fn ttl_exceeded4(sbr: Sid, port: Sid, f: &[u8]) { err4(sbr, port, f, 11, 0) }
+
+/// A locally generated ICMP error about the forwarded packet `f`. It leaves through the OUTPUT hook as
+/// `ct state related` (the error quotes a tracked packet), exactly like Linux's icmp_send.
+fn err4(sbr: Sid, port: Sid, f: &[u8], ty: u8, code: u8) {
+    if f.len() < 34 { return; }
     let info = {
         let v = crate::vif::VIFS.lock();
         v[sbr as usize].as_ref().filter(|b| b.kind == VifKind::Bridge && b.netns == 0).map(|b| (b.mac, b.addrs.clone()))
@@ -869,7 +936,11 @@ fn unreach4(sbr: Sid, port: Sid, f: &[u8]) {
     let src = [f[26], f[27], f[28], f[29]];
     let a = addrs.iter().find(|&&(a, p)| a != src && u32::from_be_bytes(a) & mask(p) == u32::from_be_bytes(src) & mask(p)).map(|x| x.0);
     let Some(a) = a else { return };
-    if let Some(r) = host_unreach(bmac, a, f) {
+    if crate::nfnl::has_tables(0) {
+        let mut m = crate::nfnl::Pkt { rel: true, est: true, l4: PROTO_ICMP, src: a, dst: src, sport: 0, dport: 0, oif: br_name(sbr), mark: 0, local: false, v6: None };
+        if !crate::nfnl::eval(0, crate::nfnl::H_OUT, &mut m).0 { stat(S_ING_NFT); return; }
+    }
+    if let Some(r) = host_icmp_err(bmac, a, f, ty, code) {
         let mut st = FWD.lock();
         st.inq.push_back((sbr, port, r)); INQ_N.fetch_add(1, Ordering::Relaxed);
         drop(st);
@@ -877,10 +948,10 @@ fn unreach4(sbr: Sid, port: Sid, f: &[u8]) {
     }
 }
 
-/// ICMP destination unreachable / host unreachable for `f` (an Ethernet+IPv4 frame), from the bridge address `baddr`.
-fn host_unreach(bmac: [u8; 6], baddr: [u8; 4], f: &[u8]) -> Option<Vec<u8>> {
+/// ICMP error (`ty`/`code`) for `f` (an Ethernet+IPv4 frame), from the bridge address `baddr`.
+fn host_icmp_err(bmac: [u8; 6], baddr: [u8; 4], f: &[u8], ty: u8, code: u8) -> Option<Vec<u8>> {
     let ihl = ((f[14] & 0xf) as usize) * 4;
-    if ihl < 20 || f.len() < 14 + ihl + 8 || f[23] == PROTO_ICMP { return None; }
+    if ihl < 20 || f.len() < 14 + ihl + 8 || (f[23] == PROTO_ICMP && icmp_error_type(f)) { return None; }
     let q = &f[14..14 + ihl + 8];
     let mut r = alloc::vec![0u8; 14 + 20 + 8 + q.len()];
     r[0..6].copy_from_slice(&f[6..12]);
@@ -893,7 +964,7 @@ fn host_unreach(bmac: [u8; 6], baddr: [u8; 4], f: &[u8]) -> Option<Vec<u8>> {
     r[26..30].copy_from_slice(&baddr);
     r[30..34].copy_from_slice(&f[26..30]);
     ip_csum(&mut r, 20);
-    r[34] = 3; r[35] = 1;
+    r[34] = ty; r[35] = code;
     r[42..].copy_from_slice(q);
     let c = fold(sum(&r[34..], 0));
     r[36..38].copy_from_slice(&c.to_be_bytes());
