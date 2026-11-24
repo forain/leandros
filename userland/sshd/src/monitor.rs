@@ -1194,7 +1194,7 @@ impl Mon {
                             Ok(s) => match rpc::send(b, rpc::FWD_FD, 0, &[], &[s.as_raw_fd()]) {
                                 Ok(()) => break,
                                 Err(e) if tries >= 20 => fail(&format!("send failed: {e}")),
-                                Err(_) => {}
+                                Err(e) => eprintln!("sshd: fdpass-retry try={tries} {e}"),
                             },
                             Err(e) => fail(&format!("connect failed: {e}")),
                         }
