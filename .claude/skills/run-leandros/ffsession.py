@@ -446,6 +446,29 @@ def install_wraps():
         log(sh(f"chmod 755 /bin/{name}; ls -l /usr/libexec/lrf/{name} /bin/{name} | cut -c1-120"))
 
 
+PORTALSAMP = "--portalsamp" in A
+# --portalsamp (lane portalstart): root sampler started before login; every 0.1 s it
+# writes the uptime and the /proc/sysstat 'w' line (state, syscall, port) of every
+# thread of the xdg-*/busd/dbus processes into /tmp/pls.log, plus a 'P' line per new
+# process (tgid, comm, argv) so the host can rebuild a per-step timeline.
+PORTAL_SAMP = r"""S=/tmp/pls.log; : >$S; SEEN=" "
+while :; do read u x </proc/uptime; W=""
+for d in /proc/[0-9]*; do p=${d#/proc/}; read c <$d/comm 2>/dev/null || continue
+case $c in xdg*|busd*|dbus*|cosmic-sess*|cosmic-set*|pop-*|leandros*)
+ W="$W|$p"; case "$SEEN" in *" $p "*) ;; *) SEEN="$SEEN$p "; echo "P $u $p $c $(head -c 150 $d/cmdline | tr '\\0' ' ')" >>$S;; esac;; esac; done
+echo "@ $u" >>$S
+[ -n "$W" ] && grep -E "^w [0-9]+ (${W#|}) " /proc/sysstat | cut -c1-80 >>$S
+sleep 0.1; done
+"""
+
+
+def install_portal_samp():
+    src = f"{OUT}/plsamp.sh"
+    open(src, "w").write(PORTAL_SAMP)
+    put_file(src, "/tmp/plsamp.sh")
+    log(sh("(/bin/sh /tmp/plsamp.sh </dev/null >/dev/null 2>&1 &); sleep 1; ls -l /tmp/pls.log"))
+
+
 PANELTRACE = "--paneltrace" in A or os.environ.get("FFS_PANELTRACE") == "1"
 # --paneltrace (lane panellate): when does cosmic-panel create and map its layer
 # surfaces?  A /bin/cosmic-panel wrapper logs its start (uptime + realtime),
@@ -640,6 +663,8 @@ def main():
         install_wraps()
     if PANELTRACE:
         install_panel_wrap()
+    if PORTALSAMP:
+        install_portal_samp()
     if not wait_for("greeter", have("cosmic-greeter"), T_GREETER):
         # No greeter: keep what shows why (the compositor's log, every process's
         # scheduler state, where the CPUs are) before the run goes on and is torn down.
