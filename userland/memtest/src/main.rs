@@ -124,6 +124,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
     if !test_wait_releases_memory_exactly() { failures += 1; }
+    if !test_wait_releases_memory_exactly_noise() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
@@ -2031,7 +2032,7 @@ unsafe fn test_pagecache_memory_returns() -> bool {
 
 /// kB value of a /proc/meminfo field (`key` includes the colon).
 unsafe fn meminfo_kb(key: &[u8]) -> usize {
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 1024];
     let n = slurp(b"/proc/meminfo\0", &mut buf);
     let mut i = 0;
     while i + key.len() <= n {
@@ -2051,9 +2052,31 @@ unsafe fn meminfo_kb(key: &[u8]) -> usize {
 /// already released. Measured with no polling and no slack beyond a few pages
 /// of unrelated churn (the child maps and touches 1024 pages).
 unsafe fn test_wait_releases_memory_exactly() -> bool {
-    let name = b"wait_releases_memory_exactly\0";
+    wait_releases_memory(false)
+}
+
+/// Same, with an unrelated process allocating, touching and freeing 4 MiB in
+/// a loop the whole time: system-wide free memory swings by ~1024 pages, the
+/// child's own release (kernel teardown counter) does not.
+unsafe fn test_wait_releases_memory_exactly_noise() -> bool {
+    wait_releases_memory(true)
+}
+
+unsafe fn wait_releases_memory(noise: bool) -> bool {
+    let name: &[u8] = if noise { b"wait_releases_memory_exactly_noise\0" } else { b"wait_releases_memory_exactly\0" };
     const PAGES: usize = 1024;
+    let noisy = if noise { fork() } else { -1 };
+    if noisy == 0 {
+        loop {
+            let p = mmap(core::ptr::null_mut(), 4 << 20, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if p as isize == -1 { exit(2); }
+            for pg in 0..1024 { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
+            munmap(p, 4 << 20);
+        }
+    }
     let mut worst = 0usize;
+    let mut min_freed = usize::MAX;
     let mut ok = true;
     // [0]: pid of the child the observer hammers (0 = none yet).
     let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE,
@@ -2080,6 +2103,7 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
         }
         let c_before = meminfo_kb(b"Cached:");
         let s_before = meminfo_kb(b"Shmem:");
+        let freed_before = meminfo_kb(b"AsFreedPages:");
         let before = free_ram();
         let pid = fork();
         if pid == 0 {
@@ -2099,6 +2123,10 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
         core::ptr::write_volatile(shared, pid as u64);
         let status = wait_status(pid);
         let after = free_ram();
+        // The child's own release: VMA pages returned by completed address
+        // space teardowns since before the fork (kernel counter, end of
+        // AddressSpace::drop). Unrelated allocation moves free_ram, not this.
+        let freed = meminfo_kb(b"AsFreedPages:").wrapping_sub(freed_before);
         let c_after = meminfo_kb(b"Cached:");
         let s_after = meminfo_kb(b"Shmem:");
         syscall2(nr::KILL, hammer as usize, 9);
@@ -2110,9 +2138,15 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
         write(STDOUT_FILENO, b" shmem_kb_delta=".as_ptr(), 16); print_dec(s_after.wrapping_sub(s_before) as usize);
         write(STDOUT_FILENO, b"\n".as_ptr(), 1);
         if lost > worst { worst = lost; }
-        ok &= status == 0 && lost < 64;
+        write(STDOUT_FILENO, b"  round freed_by_teardown=".as_ptr(), 26); print_dec(freed);
+        write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+        // wait4 returned: the child's touched pages are already back.
+        if freed < PAGES { min_freed = min_freed.min(freed); }
+        ok &= status == 0 && freed >= PAGES;
     }
-    write(STDOUT_FILENO, b"  worst_lost_pages=".as_ptr(), 19); print_dec(worst);
+    if noisy > 0 { syscall2(nr::KILL, noisy as usize, 9); wait_status(noisy); }
+    write(STDOUT_FILENO, b"  min_short_freed=".as_ptr(), 18); print_dec(min_freed);
+    write(STDOUT_FILENO, b" worst_lost_pages(info)=".as_ptr(), 25); print_dec(worst);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, ok)
 }

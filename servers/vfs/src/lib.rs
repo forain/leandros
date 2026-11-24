@@ -8379,7 +8379,11 @@ fn gen_proc_system_content(path: &[u8], root: bool, buf: &mut [u8; TMP_BUF_SIZE]
         // frames held by live `mm::shmem` objects.
         p = write_lit(buf, p, b" kB\nShmem:          ");
         p = write_u32(buf, p, (mm::shmem::pages() * 4) as u32);
-        p = write_lit(buf, p, b" kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\n");
+        p = write_lit(buf, p, b" kB\nSwapTotal:      0 kB\nSwapFree:       0 kB\nAsDrops:        ");
+        p = write_u64(buf, p, mm::vmm::ASPACE_DROPS.load(core::sync::atomic::Ordering::Acquire));
+        p = write_lit(buf, p, b"\nAsFreedPages:   ");
+        p = write_u64(buf, p, mm::vmm::ASPACE_FREED_PAGES.load(core::sync::atomic::Ordering::Acquire));
+        p = write_lit(buf, p, b"\n");
         return Some(p);
     }
 
