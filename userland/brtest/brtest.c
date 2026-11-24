@@ -1714,6 +1714,17 @@ static const char NN_RULES_RANGE[] =
  "  ip saddr 127.0.0.1 tcp dport 8000-8002 jump NETAVARK-HOSTPORT-SETMARK\n"
  "  tcp dport 8000 dnat ip to 10.97.0.2:8000\n  tcp dport 8001 dnat ip to 10.97.0.2:8001\n  tcp dport 8002 dnat ip to 10.97.0.2:8002\n }\n"
  "}\n";
+
+#define NN_HPI_COMMON \
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  meta mark & 0x00002000 == 0x00002000 masquerade\n }\n" \
+ " chain PREROUTING { type nat hook prerouting priority dstnat; policy accept;\n  fib daddr type local jump NETAVARK-HOSTPORT-DNAT\n }\n" \
+ " chain NETAVARK-HOSTPORT-DNAT { udp dport 8080 jump nv_x_dnat\n }\n" \
+ " chain NETAVARK-HOSTPORT-SETMARK { meta mark set meta mark | 0x00002000\n }\n" \
+ " chain nv_x_dnat {\n  ip saddr 10.97.0.0/24 udp dport 8080 jump NETAVARK-HOSTPORT-SETMARK\n  udp dport 8080 dnat ip to 10.97.0.2:90\n }\n}\n"
+static const char NN_RULES_HPI_ON[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n" NN_HPI_COMMON;
+static const char NN_RULES_HPI_OFF[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n" NN_HPI_COMMON;
 static int nn_poll(int fd, short ev, int ms) { struct pollfd p = { fd, ev, 0 }; return poll(&p, 1, ms) > 0 && (p.revents & ev); }
 static int nn_connect(const char *ip, int port) {
     int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -1745,6 +1756,7 @@ static int nn_udp_serve(void) {
     return 0;
 }
 static int nn_serve(const char *want_peer) {
+    if (g_nn_mode == 6 || g_nn_mode == 7) { char r = 'r'; write(done_[1], &r, 1); sleep(5); return 0; } /* no UDP listener: the target answers port-unreachable */
     if (g_nn_mode == 3) return nn_udp_serve();
     int l = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1; setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -1783,6 +1795,24 @@ static int nn_body(void) {
     char ch = 'c'; write(done_[1], &ch, 1);
     if (rd_to(ctl[0], &ch) != 1) return 3;
     if (!g_nn_role) return nn_serve(g_nn_mode == 0 ? NULL : "10.97.0.1");
+    if (g_nn_mode == 6 || g_nn_mode == 7) {
+        /* hairpin UDP to the bridge address; the DNAT target has no listener, so its ICMP port-unreachable must come back un-NATed */
+        int u = socket(AF_INET, SOCK_DGRAM, 0), on = 1;
+        setsockopt(u, IPPROTO_IP, IP_RECVERR, &on, sizeof on);
+        struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(8080) };
+        inet_pton(AF_INET, "10.97.0.1", &to.sin_addr);
+        if (connect(u, (struct sockaddr *)&to, sizeof to)) return 30;
+        struct timeval tv = { 2, 0 };
+        setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        int err = 0;
+        for (int k = 0; k < 4 && !err; k++) {
+            char b[16];
+            send(u, "hi", 2, 0);
+            if (recv(u, b, sizeof b, 0) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) err = errno;
+        }
+        printf("DETAIL hairpin icmp errno=%d\n", err); fflush(stdout);
+        return (err == ECONNREFUSED) == (g_nn_mode == 6) ? 0 : 31;
+    }
     int c = nn_connect("10.97.0.1", 8080);
     if (c < 0) return 20;
     /* The parked SYN is replayed on the ARP reply; the ARP request must be kicked out at once (was a ~450 ms tick wait). */
@@ -1800,7 +1830,7 @@ static void nn_case(const char *name, int mode) {
     ok = ok && bidx > 0 && addr_add(s, bidx, "10.97.0.1", 24) == 0 && link_set_up(s, bidx) == 0 && ip_forward_set(1) == 0;
     snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up, ip_forward=1", name); CHECK(msg, ok);
     FILE *fp = fopen("/tmp/nn.nft", "w");
-    if (fp) { fputs(mode == 3 ? NN_RULES_UDP : mode == 4 ? NN_RULES_RANGE : NN_RULES, fp); fclose(fp); }
+    if (fp) { fputs(mode == 6 ? NN_RULES_HPI_ON : mode == 7 ? NN_RULES_HPI_OFF : mode == 3 ? NN_RULES_UDP : mode == 4 ? NN_RULES_RANGE : NN_RULES, fp); fclose(fp); }
     snprintf(msg, sizeof msg, "%s: nft -f loads the netavark-shaped ruleset", name);
     int nr = system("nft -f /tmp/nn.nft >/tmp/nn.err 2>&1");
     if (nr) { char eb[200] = ""; FILE *ef = fopen("/tmp/nn.err", "r"); if (ef) { size_t n = fread(eb, 1, 190, ef); eb[n] = 0; fclose(ef); }
@@ -1812,6 +1842,8 @@ static void nn_case(const char *name, int mode) {
     int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
     pid_t c2 = -1; int cc2[2] = { -1, -1 }, dd2[2] = { -1, -1 };
     char ch = 'g';
+    /* the previous case's netns (and with it vethN) is torn down asynchronously: wait for the name to be free */
+    for (int w = 0; w < 50 && link_get(s, "vethN", NULL, NULL) > 0; w++) usleep(100000);
     int fc = c > 0 ? netns_fd_of(c) : -1;
     ok = c > 0 && veth_new_m(s, "vethN", "eth0", fc, bidx) == 0;
     if (fc >= 0) close(fc);
@@ -1825,7 +1857,7 @@ static void nn_case(const char *name, int mode) {
         if (ok) write(cc[1], &ch, 1);
         ok = ok && rd_to(dd[0], &ch) == 1; /* listening */
     }
-    if (ok && mode == 2) {
+    if (ok && (mode == 2 || mode == 6 || mode == 7)) {
         g_nn_role = 1;
         c2 = spawn_ns(nn_body);
         cc2[0] = ctl[0]; cc2[1] = ctl[1]; dd2[0] = done_[0]; dd2[1] = done_[1];
@@ -1897,6 +1929,7 @@ static void nn_case(const char *name, int mode) {
         write(cc[1], &ch, 1);
     }
     if (c > 0) {
+        if (!ok) kill(c, SIGKILL);
         int r = wait_child(c);
         if (mode == 5) { snprintf(msg, sizeof msg, "%s: established hairpin flow is dropped by a rule added mid-flow (exit %d)", name, r); CHECK(msg, r == 0); }
         else {
@@ -1907,9 +1940,26 @@ static void nn_case(const char *name, int mode) {
         snprintf(msg, sizeof msg, "%s: client got the reply through the published port (exit %d)", name, r); CHECK(msg, r == 0);
     }
     system("nft delete table inet netavark");
-    if (mode == 5) system("nft delete table inet midflow");
+    if (mode == 5) {
+        system("nft delete table inet midflow");
+        /* The dropped established flow leaves the server's sockets retransmitting FINs that nothing ACKs (the flow's
+         * conntrack entry is gone). Once the bridge is deleted the daemon must still free the dead stack ~2 s after its last
+         * TCP progress: queued retransmits are not progress (servers/net/src/vif.rs finish_dying). Before that fix
+         * every retransmit restarted the grace and vethN outlived the server by ~12.8 s (x86_64 KVM, 3 runs); with it ~1.1-2 s.
+         * (Linux differs: the orphaned socket holds its netns ~104 s, so a Linux port of this check needs no bound.) */
+        link_del(s, bidx);
+        int ms = 0;
+        for (; ms < 35000 && link_get(s, "vethN", NULL, NULL) > 0; ms += 100) usleep(100000);
+        snprintf(msg, sizeof msg, "%s: vethN is freed within 4 s of the bridge going away (%d ms)", name, ms);
+        CHECK(msg, ms < 4000);
+        int vi = link_get(s, "vethN", NULL, NULL);
+        if (vi > 0) link_del(s, vi);
+        close(s); return;
+    }
     link_del(s, bidx); close(s);
 }
+static void nftnat_hairpin_icmp_on(void) { nn_case("nftnat_hairpin_icmp_related", 6); }
+static void nftnat_hairpin_icmp_off(void) { nn_case("nftnat_hairpin_icmp_dropped", 7); }
 static void nftnat_hairpin_midflow(void) { nn_case("nftnat_hairpin_midflow", 5); }
 static void nftnat_local(void) { nn_case("nftnat_local_redirect", 0); }
 static void nftnat_hairpin(void) { nn_case("nftnat_hairpin", 1); }
@@ -1992,6 +2042,11 @@ static const char FN_RULES_FMT_B[] =
 static const char FN_RULES_NONAT[] =
  "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n }\n}\n";
 static void nftnat_nonat_route(void) { g_fwd_nft = FN_RULES_NONAT; g_fwd_expect_ovr = 0; g_fwd_nonat = 1; fwd_case("nftnat_nonat_route", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; g_fwd_nonat = 0; }
+/* a nat/postrouting chain exists but its masquerade rule does not match this subnet: Linux forwards the packet unchanged (FORWARD accepts) */
+static const char FN_RULES_POSTNOMASQ[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.250.0.0/24 masquerade\n }\n}\n";
+static void nftnat_postnomasq(void) { g_fwd_nft = FN_RULES_POSTNOMASQ; g_fwd_expect_ovr = 0; g_fwd_nonat = 1; fwd_case("nftnat_postnomasq", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; g_fwd_nonat = 0; }
 static void nftnat_internal(void) { g_fwd_nft = FN_RULES_FMT_A; g_fwd_expect_ovr = 0; fwd_case("nftnat_internal", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; }
 static void nftnat_masq_ok(void) { g_fwd_nft = FN_RULES_FMT_B; fwd_case("nftnat_masq_ok", 0, 1); g_fwd_nft = NULL; }
 static void fwd_udp(void) { fwd_case("fwd_udp", 0, 1); }
@@ -2145,6 +2200,7 @@ static const char FR6_RULES_OFF[] =
 static const char FR6_RULES_ON[] =
  "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
 static int g_r6_expect;
+static int g_r6_hl = 2;
 static int rel6_body(void) {
     g_ip6 = "fd00:97::2";
     int e = v6_conf_eth0(); if (e) return e;
@@ -2157,7 +2213,7 @@ static int rel6_body(void) {
     if (rd_to(ctl[0], &ch) != 1) return 4;
     int u = socket(AF_INET6, SOCK_DGRAM, 0);
     if (u < 0) return 5;
-    int hl = 2, on = 1;
+    int hl = g_r6_hl, on = 1;
     setsockopt(u, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hl, sizeof hl);
     setsockopt(u, IPPROTO_IPV6, IPV6_RECVERR, &on, sizeof on);
     struct sockaddr_in6 to; memset(&to, 0, sizeof to); to.sin6_family = AF_INET6; to.sin6_port = htons(7001);
@@ -2209,6 +2265,74 @@ static void rel6_case(const char *name, const char *rules, int expect, const cha
     link_del(s, bidx);
     close(s);
 }
+/* hop limit 1: the forwarder itself answers with time exceeded; that locally generated error leaves through OUTPUT as `ct state related` */
+static const char FR6_RULES_OUT_OFF[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n }\n"
+ " chain OUTPUT { type filter hook output priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n}\n";
+static const char FR6_RULES_OUT_ON[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n }\n"
+ " chain OUTPUT { type filter hook output priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+static void nftfwd6_local_te_off(void) { g_r6_hl = 1; rel6_case("nftfwd6_local_te_drop", FR6_RULES_OUT_OFF, 0, "the local ICMPv6 time-exceeded is dropped by a default-drop OUTPUT policy without `ct state related`"); g_r6_hl = 2; }
+static void nftfwd6_local_te_on(void) { g_r6_hl = 1; rel6_case("nftfwd6_local_te_accept", FR6_RULES_OUT_ON, 1, "the local ICMPv6 time-exceeded passes OUTPUT with `ct state related accept`"); g_r6_hl = 2; }
+/* ---- IPv4: TTL 1 is answered by the forwarder with time exceeded, which leaves through OUTPUT as `ct state related` --- */
+static int g_te4_expect;
+static int te4_body(void) {
+    int s = nl_sock();
+    int idx = link_get(s, "eth0", NULL, NULL);
+    if (!idx || addr_add(s, idx, "10.97.0.2", 24) || link_set_up(s, idx)) return 1;
+    int lo = link_get(s, "lo", NULL, NULL); link_set_up(s, lo);
+    if (route_default(s, idx, "10.97.0.1")) return 2;
+    close(s);
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 4;
+    int u = socket(AF_INET, SOCK_DGRAM, 0), ttl = 1, on = 1;
+    setsockopt(u, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl);
+    setsockopt(u, IPPROTO_IP, IP_RECVERR, &on, sizeof on);
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(7001) };
+    inet_pton(AF_INET, "203.0.113.9", &to.sin_addr);
+    if (connect(u, (struct sockaddr *)&to, sizeof to)) return 6;
+    struct timeval tv = { 2, 0 };
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int err = 0;
+    for (int k = 0; k < 4 && !err; k++) {
+        char b[16];
+        send(u, "hi", 2, 0);
+        if (recv(u, b, sizeof b, 0) < 0 && errno != EAGAIN && errno != EWOULDBLOCK) err = errno;
+    }
+    printf("DETAIL te4 errno=%d\n", err); fflush(stdout);
+    return (err != 0) == g_te4_expect ? 0 : 10 + (err != 0);
+}
+static void te4_case(const char *name, const char *rules, int expect, const char *what) {
+    char msg[200];
+    int s = nl_sock();
+    unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x0b };
+    int ok = br_new(s, "br0", brmac) == 0;
+    int bidx = link_get(s, "br0", NULL, NULL);
+    ok = ok && bidx > 0 && addr_add(s, bidx, "10.97.0.1", 24) == 0 && link_set_up(s, bidx) == 0 && ip_forward_set(1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 10.97.0.1/24 up, ip_forward=1", name); CHECK(msg, ok);
+    FILE *fp = fopen("/tmp/te4.nft", "w");
+    if (fp) { fputs(rules, fp); fclose(fp); }
+    snprintf(msg, sizeof msg, "%s: nft -f loads a default-drop OUTPUT policy", name);
+    CHECK(msg, system("nft -f /tmp/te4.nft >/tmp/te4.err 2>&1") == 0);
+    g_te4_expect = expect;
+    pid_t cl = spawn_ns(te4_body);
+    int fc = netns_fd_of(cl);
+    int vc = veth_new_m(s, "vethC", "eth0", fc, bidx) == 0 && link_set_up(s, link_get(s, "vethC", NULL, NULL)) == 0;
+    close(fc);
+    char ch = 'g';
+    write(ctl[1], &ch, 1);
+    snprintf(msg, sizeof msg, "%s: container on br0 configured", name); CHECK(msg, cl > 0 && vc && rd_to(done_[0], &ch) == 1);
+    write(ctl[1], &ch, 1);
+    int rc = wait_child(cl);
+    snprintf(msg, sizeof msg, "%s: %s (exit %d)", name, what, rc); CHECK(msg, rc == 0);
+    system("nft delete table inet netavark");
+    ip_forward_set(0);
+    link_del(s, link_get(s, "vethC", NULL, NULL));
+    link_del(s, bidx);
+    close(s);
+}
+static void nftfwd_local_te_on(void) { te4_case("nftfwd_local_te_accept", FR6_RULES_OUT_ON, 1, "the forwarder answers TTL 1 with time exceeded, accepted by `ct state related` in OUTPUT"); }
+static void nftfwd_local_te_off(void) { te4_case("nftfwd_local_te_drop", FR6_RULES_OUT_OFF, 0, "the local time exceeded is dropped by a default-drop OUTPUT policy without `ct state related`"); }
 static void nftfwd6_related_off(void) { rel6_case("nftfwd6_related_drop", FR6_RULES_OFF, 0, "ICMPv6 time-exceeded of a tracked flow (ct state related) is dropped by the default-drop policy"); }
 static void nftfwd6_related_on(void) { rel6_case("nftfwd6_related_accept", FR6_RULES_ON, 1, "ICMPv6 time-exceeded is delivered by `ct state related accept` under a default-drop policy"); }
 
@@ -2495,16 +2619,23 @@ int main(int argc, char **argv) {
     if (want("nftnat_port_range")) nftnat_range();
     if (want("nftnat_internal")) nftnat_internal();
     if (want("nftnat_nonat_route")) nftnat_nonat_route();
+    if (want("nftnat_postnomasq")) nftnat_postnomasq();
     if (want("nftnat_xbridge")) nftnat_xbridge();
     if (want("nftnat_masq_ok")) nftnat_masq_ok();
     if (want("fwd_udp")) fwd_udp();
     if (want("nftfwd_midflow_established")) nftfwd_midflow();
     if (want("nftfwd6_midflow_established")) nftfwd6_midflow();
     if (want("nftfwd6_related_drop")) nftfwd6_related_off();
+    if (want("nftfwd_local_te_drop")) nftfwd_local_te_off();
+    if (want("nftfwd_local_te_accept")) nftfwd_local_te_on();
+    if (want("nftfwd6_local_te_drop")) nftfwd6_local_te_off();
+    if (want("nftfwd6_local_te_accept")) nftfwd6_local_te_on();
     if (want("nftfwd6_related_accept")) nftfwd6_related_on();
     if (want("nftfwd_related_drop")) nftfwd_related_off();
     if (want("nftfwd_related_accept")) nftfwd_related_on();
     if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
+    if (want("nftnat_hairpin_icmp_related")) nftnat_hairpin_icmp_on();
+    if (want("nftnat_hairpin_icmp_dropped")) nftnat_hairpin_icmp_off();
     if (want("routed6_l3")) routed6_on();
     if (want("routed6_l3_off")) routed6_off();
     if (want("routed6_l3_hoplimit")) routed6_ttl();
