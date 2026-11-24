@@ -51,7 +51,8 @@ for b in boots:
                 ok = r.returncode == 0
                 why = "green" if ok else "rc=%d" % r.returncode
         except subprocess.TimeoutExpired:
-            why = f"HANG: no result within {BOOT_TIMEOUT}s"
+            ok = red and cpu == "0"  # a dead BSP tick hangs the whole guest: the expected red
+            why = f"HANG: no result within {BOOT_TIMEOUT}s" + (" (BSP tick dead, red as expected)" if ok else "")
         # A hung guest (dead BSP tick) outlives runtests: reap this worktree's QEMU so it
         # does not hold the image lock against the next boot.
         root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
