@@ -95,7 +95,17 @@ def analyze():
             continue
         first, last = on[0], on[-1]
         body = rms[first + 2:last - 1]
-        holes = [i for i in range(first, last + 1) if rms[i] < 0.5 * (sum(body) / max(1, len(body)))]
+        # edge windows are partial (tone onset/stop falls inside them), so only
+        # the interior counts as a hole; the old test counted the partial tail
+        # window of the 0.30-volume tone as a "50 ms hole".
+        holes = [i for i in range(first + 1, last) if rms[i] < 0.5 * (sum(body) / max(1, len(body)))]
+        # 10 ms resolution dips in the tone body (after a 200 ms start-up
+        # allowance, before the last 100 ms): a real dropout of >= 10 ms.
+        w10 = rate // 100
+        r10 = [math.sqrt(sum(v * v for v in seg[i:i + w10]) / w10) for i in range(first * w, (last + 1) * w - w10, w10)]
+        ref = sorted(r10[20:-10])[len(r10[20:-10]) // 2] if len(r10) > 40 else 0
+        dips = [round(i / 100, 2) for i in range(20, len(r10) - 10) if r10[i] < 0.5 * ref]
+        startup_dips = [round(i / 100, 2) for i in range(1, min(20, len(r10))) if r10[i] < 0.5 * ref and r10[i - 1] > 0.5 * ref and r10[i] > 20]
         # sine model: x[n+1] + x[n-1] = 2cos(w) x[n]; a dropout/repeat breaks it
         c2 = 2 * math.cos(2 * math.pi * 440 / rate)
         x = seg[(first + 2) * w:(last - 1) * w]
@@ -113,7 +123,7 @@ def analyze():
                           rms=round(sum(body) / max(1, len(body)), 1),
                           rms_min=round(min(body), 1) if body else None,
                           rms_max=round(max(body), 1) if body else None,
-                          holes_50ms=len(holes), discontinuities=spikes, at_s=at[:20],
+                          holes_50ms=len(holes), dips_10ms=len(dips), dips_at=dips[:10], startup_dips=startup_dips[:5], discontinuities=spikes, at_s=at[:20],
                           max_resid=round(max(resid), 4) if resid else None)
     return out
 
