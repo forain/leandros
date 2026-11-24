@@ -1099,8 +1099,13 @@ done"""
 
 def sshd_procs(ssh, user, pw):
     """[(pid, ppid, comm)] of every sshd* process in the guest."""
-    sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
-    rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
+    # /proc/*/status is world readable: no sudo (with real PAM each sudo costs seconds of
+    # sha512-crypt on TCG, longer than the 4 s LoginGraceTime the probes below race against).
+    ssh.run(user, "cat > /tmp/sshps-u.sh", key=True, stdin=PS_SSHD.encode())
+    rc, out, err = ssh.run(user, "sh /tmp/sshps-u.sh", key=True)
+    if not out.strip():
+        sudo_write(ssh, user, pw, "/tmp/sshps.sh", PS_SSHD)
+        rc, out, err = sudo_sh(ssh, user, pw, "sh /tmp/sshps.sh")
     res = []
     if not out.strip():
         print(f"sshd_procs: empty listing rc={rc} out={out[-200:]!r} err={err.strip()[-200:]!r}", flush=True)
@@ -1251,9 +1256,18 @@ def privsep_hooks(ssh, user, pw, tmp):
         set_keys(ssh, user, pw, open(ssh.key + ".pub").read().strip())
 
 
+def grace_for(ssh, user, pw):
+    """LoginGraceTime for the probes: the STOP/KILL sudos run inside the window, so it must outlast
+    the guest's sudo latency (seconds on aarch64 TCG with real PAM). Never below the old 4 s."""
+    t0 = time.time()
+    sudo_sh(ssh, user, pw, "true")
+    return max(4, int(3 * (time.time() - t0)) + 4)
+
+
 def privsep_grace(ssh, user, pw, tmp):
     """A connection process that hangs pre-auth is killed by the listener after LoginGraceTime."""
-    conf = "LoginGraceTime 4\nPasswordAuthentication yes\n"
+    grace = grace_for(ssh, user, pw)
+    conf = f"LoginGraceTime {grace}\nPasswordAuthentication yes\n"
     if not sshd2_start(ssh, user, pw, conf):
         step("privsep_grace_kill", False, "second sshd did not start")
         return
@@ -1279,13 +1293,13 @@ def privsep_grace(ssh, user, pw, tmp):
     pre = [p for p, _, n in procs if n == "sshd-preauth"]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0]}")  # hung: it cannot disconnect itself
-    ok = bool(pre) and probe_eof(s, 25)
+    ok = bool(pre) and probe_eof(s, grace + 21)
     if pre:
         sudo_sh(ssh, user, pw, f"kill -KILL {pre[0]} 2>/dev/null; true")
     s.close()
     stop(tun)
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
-    step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within 25 s")
+    step("privsep_grace_kill", ok, "" if ok else f"preauth child {'found' if pre else 'missing'}, no EOF within {grace + 21} s")
 
 
 def second_tunnel(ssh, user, pw, conf, env=""):
@@ -1312,7 +1326,8 @@ def second_tunnel(ssh, user, pw, conf, env=""):
 def privsep_stalled_monitor(ssh, user, pw):
     """A monitor that stops (SIGSTOP) pre-auth cannot enforce LoginGraceTime itself: the listener's backstop
     kills the connection process after LoginGraceTime + 10 s and the client sees EOF."""
-    tun, lp = second_tunnel(ssh, user, pw, "LoginGraceTime 4\nPasswordAuthentication yes\n")
+    grace = grace_for(ssh, user, pw)
+    tun, lp = second_tunnel(ssh, user, pw, f"LoginGraceTime {grace}\nPasswordAuthentication yes\n")
     if tun is None:
         step("privsep_stalled_monitor_backstop", False, lp)
         return
@@ -1324,13 +1339,13 @@ def privsep_stalled_monitor(ssh, user, pw):
     pre = [(p, pp) for p, pp, n in procs if n == "sshd-preauth"]
     if pre:
         sudo_sh(ssh, user, pw, f"kill -STOP {pre[0][1]}")  # only the monitor hangs; the child stays live
-    ok = bool(pre) and probe_eof(s, 40)
+    ok = bool(pre) and probe_eof(s, grace + 36)
     if pre:
         sudo_sh(ssh, user, pw, f"kill -KILL {pre[0][1]} {pre[0][0]} 2>/dev/null; true")
     s.close()
     stop(tun)
     sudo_sh(ssh, user, pw, "kill $(cat /tmp/sshdcfg.pid) 2>/dev/null; true")
-    step("privsep_stalled_monitor_backstop", ok, "" if ok else f"preauth {'found' if pre else 'missing'}, no EOF within 40 s")
+    step("privsep_stalled_monitor_backstop", ok, "" if ok else f"preauth {'found' if pre else 'missing'}, no EOF within {grace + 36} s")
 
 
 def privsep_highfd(ssh, user, pw):
