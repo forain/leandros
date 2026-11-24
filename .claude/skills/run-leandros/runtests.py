@@ -85,6 +85,7 @@ Exit status 0 iff every command returned 0 with a known status.
 LEANDROS_RUN_ID defaults to "runtests" (scopes driver.py's sockets/logs).
 """
 import json
+import platform
 import os
 import re
 import shutil
@@ -608,6 +609,15 @@ HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
                   "a64acpitest.py": "aarch64"}
 
 
+# Host scripts that drive a GPU session and refuse software rendering: they cannot run on a QEMU
+# without virgl + egl-headless (the Pi 5 KVM host's /opt/qemu).
+# Skips exist only for the Pi 5 KVM runner (an aarch64 host), and only for HOST_NEEDS_GL. On any other
+# host (the x86_64 desktop) a suite that cannot run is a failure, never a skip.
+SKIP_ALLOWED = platform.machine() == "aarch64"
+EXCLUSIVE_HOST = {"listentagtest.py"}
+HOST_NEEDS_GL = {"blanktest.py", "portalshottest.py", "powerctltest.py"}
+
+
 def host_run(c, timeout, arch=None, scale=1.0):
     """`host:<script> [args]`: run a script of this directory ON THE HOST
     (same LEANDROS_RUN_ID, so it finds this VM), in serial_run's result shape.
@@ -619,6 +629,10 @@ def host_run(c, timeout, arch=None, scale=1.0):
     if want and arch and arch != want:
         return {"rc": 0, "status": "ok", "secs": 0.0,
                 "output": f"SKIP {script}: {want} only (this run is {arch})\n"}
+    if script in HOST_NEEDS_GL and SKIP_ALLOWED and not driver._gl_capable_qemu(f"qemu-system-{arch or 'aarch64'}"):
+        # Not a pass and not a failure: reported as status "skip", counted apart in every summary.
+        return {"rc": 0, "status": "skip", "secs": 0.0,
+                "output": f"SKIP {script}: needs a QEMU with virtio-gpu-gl-pci and egl-headless (this host's has none)\n"}
     timeout = max(timeout, HOST_TIMEOUTS.get(script, 0) * scale)
     env = dict(os.environ)
     if arch:
@@ -627,7 +641,9 @@ def host_run(c, timeout, arch=None, scale=1.0):
     t0 = time.time()
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
-        return {"rc": r.returncode, "status": "ok", "output": r.stdout + r.stderr,
+        out = r.stdout + r.stderr
+        st = "skip" if SKIP_ALLOWED and script in HOST_NEEDS_GL and r.returncode == 0 and re.search(r"^\S+: SKIP \(", out, re.M) else "ok"
+        return {"rc": r.returncode, "status": st, "output": out,
                 "secs": round(time.time() - t0, 1)}
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -799,14 +815,23 @@ def run_sharded(arch, tag, cmds, k, gpu, mode, base_timeout, cmdline, keep, repe
     import shutil
     import threading
     dur = load_durations(arch)
+    # Latency-limited suites (EXCLUSIVE_HOST) run alone, after every other shard has finished: their
+    # limits are on wakeup latency, which a host with every core busy with sibling guests blows through.
+    excl = [c for c in cmds if c.startswith("host:") and c.split()[0][len("host:"):] in EXCLUSIVE_HOST]
+    cmds = [c for c in cmds if c not in excl]
     k = max(1, min(k, len(cmds)))
     bins, load = partition(cmds, k, dur)
+    if excl:
+        bins = bins + [excl]
+        print(f"runtests: exclusive (run alone, other shards idle): {' '.join(excl)}", flush=True)
+    cmds = cmds + excl
     rid = os.environ.get("LEANDROS_RUN_ID", "runtests")
     print(f"runtests: sharding {len(cmds)} commands over {k} runs, est. wall "
           f"{max(load):.0f}s (sequential est. {sum(dur.get(c, DUR_DEFAULT) for c in cmds):.0f}s)", flush=True)
     lock = threading.Lock()
     procs = []
-    for j, b in enumerate(bins):
+
+    def launch(j, b):
         sd = os.path.join(out, f"s{j}")
         tree = os.path.join(sd, "tree")
         shutil.rmtree(sd, ignore_errors=True)
@@ -824,6 +849,7 @@ def run_sharded(arch, tag, cmds, k, gpu, mode, base_timeout, cmdline, keep, repe
         argv += b
         procs.append((j, b, sd, subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                  text=True, bufsize=1, env=env, cwd=tree)))
+        return procs[-1]
 
     def pump(j, p):
         for line in p.stdout:
@@ -831,11 +857,16 @@ def run_sharded(arch, tag, cmds, k, gpu, mode, base_timeout, cmdline, keep, repe
             with lock:
                 print(line if line.startswith("=== ") else f"[s{j}] {line}", flush=True)
 
-    ths = [threading.Thread(target=pump, args=(j, p), daemon=True) for j, _, _, p in procs]
-    for t in ths:
-        t.start()
-    for t in ths:
-        t.join()
+    def phase(batch):
+        ths = [threading.Thread(target=pump, args=(j, p), daemon=True) for j, _, _, p in batch]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+
+    phase([launch(j, b) for j, b in enumerate(bins[:len(bins) - (1 if excl else 0)])])
+    if excl:
+        phase([launch(len(bins) - 1, bins[-1])])
     all_ok, bad_boots, rows_by_cmd, allrows = True, 0, {}, []
     for j, b, sd, p in procs:
         rc = p.wait()
@@ -864,12 +895,20 @@ def run_sharded(arch, tag, cmds, k, gpu, mode, base_timeout, cmdline, keep, repe
         rows = rows_by_cmd.get(c, [])
         good = sum(1 for x in rows if x["rc"] == 0 and x["status"] in ("ok", "rc-file"))
         unknown = sum(1 for x in rows if x["rc"] is None)
-        print(f"{c}: {good}/{len(rows)} RC=0, {unknown} unknown")
+        nskip = sum(1 for x in rows if x["status"] == "skip")
+        print(f"{c}: {good}/{len(rows)} RC=0, {unknown} unknown" + (f", {nskip} SKIPPED (not runnable here)" if nskip else ""))
     if not keep:
         for j, _, sd, _ in procs:
             shutil.rmtree(os.path.join(sd, "tree"), ignore_errors=True)
+    print_skips(rows_by_cmd)
     print(f"boots failed: {bad_boots}/{k * repeat}; overall: {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1
+
+
+def print_skips(rows_by_cmd):
+    """One explicit line listing every suite that was not runnable on this host (never counted as a pass)."""
+    sk = [c for c, rows in rows_by_cmd.items() if any(x["status"] == "skip" for x in rows)]
+    print(f"skipped (not runnable here, not passes): {len(sk)}" + (": " + ", ".join(sk) if sk else ""))
 
 
 def main(argv):
@@ -1009,7 +1048,7 @@ def main(argv):
                     r = {"rc": None, "status": str(e) if str(e) == "reboot failed" else f"error {e}", "output": "", "secs": 0}
                 fails = find_fails(r["output"])
                 rc = r["rc"] if r["rc"] is not None else "?"
-                ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file")
+                ok = r["rc"] == 0 and r["status"] in ("ok", "rc-file", "skip")
                 # Belt and braces for session/gate scripts: a RESULT line that
                 # reports a failed gate is a failure whatever the exit status.
                 if ok and c.startswith("host:") and re.search(
@@ -1088,8 +1127,10 @@ def main(argv):
         rows = [x for e in summary["runs"] for x in e["results"] if x["cmd"] == c]
         good = sum(1 for x in rows if x["rc"] == 0 and x["status"] in ("ok", "rc-file"))
         unknown = sum(1 for x in rows if x["rc"] is None)
-        print(f"{c}: {good}/{len(rows)} RC=0, {unknown} unknown")
+        nskip = sum(1 for x in rows if x["status"] == "skip")
+        print(f"{c}: {good}/{len(rows)} RC=0, {unknown} unknown" + (f", {nskip} SKIPPED (not runnable here)" if nskip else ""))
     bad_boots = sum(1 for e in summary["runs"] if e["boot"] != "ok")
+    print_skips({c: [x for e in summary["runs"] for x in e["results"] if x["cmd"] == c] for c in cmds})
     print(f"boots failed: {bad_boots}/{repeat}; overall: {'PASS' if all_ok else 'FAIL'}")
     return 0 if all_ok else 1
 
