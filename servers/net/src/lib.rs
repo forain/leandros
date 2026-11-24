@@ -2273,6 +2273,13 @@ fn unix_listener_gone(sock_id: u64) {
                 c.seq = c.seq.wrapping_add(1);
             }
         }
+        // A connector end passed by SCM_RIGHTS is a plain `UnixConnected` entry
+        // (`xfer_export`), invisible to the table scan above: its connection is
+        // still marked pending on this listener with end A open. Reset those
+        // too, or the holder of the copy waits forever.
+        for (ci, c) in conns.iter().enumerate() {
+            if c.in_use && c.pending_sid == sock_id && !c.closed_a && !hit.contains(&ci) { hit.push(ci); }
+        }
         for &ci in hit.iter() {
             if ci >= conns.len() || !conns[ci].in_use { continue; }
             let c = &mut conns[ci];
