@@ -769,6 +769,62 @@ unsafe fn test_blockdev_full_read() -> bool {
     report(name, n as usize == want)
 }
 
+/// /proc/partitions (Linux format) and the EBUSY rules for an open partition:
+/// BLKRRPART on the disk and BLKPG_DEL_PARTITION both fail while a partition
+/// of it is open, and the rescan succeeds once it is closed.
+static mut PP_BUF: [u8; 2048] = [0; 2048];
+unsafe fn test_proc_partitions() -> bool {
+    let name = b"proc_partitions\0";
+    let fd = open(b"/proc/partitions\0".as_ptr(), O_RDONLY, 0);
+    if fd < 0 { return report(name, false); }
+    let buf = core::ptr::addr_of_mut!(PP_BUF) as *mut u8;
+    let n = read(fd, buf, 2048);
+    close(fd);
+    if n <= 0 { return report(name, false); }
+    let txt = core::slice::from_raw_parts(buf, n as usize);
+    let hdr = b"major minor  #blocks  name\n\n";
+    if txt.len() < hdr.len() || &txt[..hdr.len()] != &hdr[..] { return report(name, false); }
+    // The first entry is a whole disk; its partitions follow it.
+    let mut disk = [0u8; 32];
+    let mut dl = 0usize;
+    let mut part = [0u8; 32];
+    let mut pl = 0usize;
+    for line in txt[hdr.len()..].split(|&c| c == b'\n') {
+        let mut f = line.split(|&c| c == b' ').filter(|x| !x.is_empty());
+        let (_, _, blocks, nm) = match (f.next(), f.next(), f.next(), f.next()) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d), _ => continue };
+        if !blocks.iter().all(|c| c.is_ascii_digit()) || nm.len() >= 30 { return report(name, false); }
+        if dl == 0 { disk[..nm.len()].copy_from_slice(nm); dl = nm.len(); }
+        else if pl == 0 && nm.len() > dl && nm.starts_with(&disk[..dl]) { part[..nm.len()].copy_from_slice(nm); pl = nm.len(); }
+    }
+    if dl == 0 { return report(name, false); }
+    if pl == 0 { return report(name, true); } // no partitioned disk in this boot
+    let mut dp = [0u8; 48];
+    dp[..5].copy_from_slice(b"/dev/");
+    dp[5..5 + dl].copy_from_slice(&disk[..dl]);
+    let mut pp = [0u8; 48];
+    pp[..5].copy_from_slice(b"/dev/");
+    pp[5..5 + pl].copy_from_slice(&part[..pl]);
+    let dfd = open(dp.as_ptr(), O_RDONLY, 0);
+    let pfd = open(pp.as_ptr(), O_RDONLY, 0);
+    if dfd < 0 || pfd < 0 { return report(name, false); }
+    let mut ok = true;
+    if ioctl(dfd, 0x125F, 0) != -1 || get_errno() != 16 { ok = false; } // BLKRRPART: EBUSY
+    let mut pno = 0u32;
+    let mut m = 1u32;
+    for &c in part[..pl].iter().rev() { if !c.is_ascii_digit() { break; } pno += (c - b'0') as u32 * m; m *= 10; }
+    let mut pt = [0u8; 152];
+    pt[16..20].copy_from_slice(&(pno as i32).to_le_bytes());
+    let mut arg = [0u8; 24];
+    arg[0..4].copy_from_slice(&2i32.to_le_bytes()); // BLKPG_DEL_PARTITION
+    arg[16..24].copy_from_slice(&(pt.as_ptr() as u64).to_le_bytes());
+    if ioctl(dfd, 0x1269, arg.as_ptr() as usize) != -1 || get_errno() != 16 { ok = false; }
+    close(pfd);
+    if ioctl(dfd, 0x125F, 0) != 0 { ok = false; }
+    close(dfd);
+    report(name, ok)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const *const u8) -> i32 {
     let mut failures = 0;
@@ -779,6 +835,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     mkdir(F2FS_DIR.as_ptr(), 0o755);
 
     if !test_blockdev_full_read() { failures += 1; }
+    if !test_proc_partitions() { failures += 1; }
     if !test_rmdir() { failures += 1; }
     if !test_rename() { failures += 1; }
     if !test_rename_replace(b"/tmp", b"rename_replace_tmpfs\0") { failures += 1; }

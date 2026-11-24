@@ -1634,6 +1634,9 @@ fn rrpart(dev: u16) -> isize {
         (b[dev as usize].lbs.max(512), matches!(b[dev as usize].backing, Backing::Part { .. }))
     };
     if part { return -22; }
+    // Linux blk_drop_partitions: a rescan fails with EBUSY while any
+    // partition of the disk is open.
+    if any_partition_open(dev) { return -16; }
     let res = partscan::scan(lbs, size / lbs as u64, |lba, buf| {
         root_read(root, base + lba * lbs as u64, buf)
     });
@@ -1758,6 +1761,8 @@ fn del_partition(dev: u16, pno: u32) -> isize {
                              if parent as u16 == dev && p == pno)
     });
     match found {
+        // Linux bdev_del_partition: EBUSY while the partition is open.
+        Some(i) if crate::blk_open_count(i as u16) != 0 => -16,
         Some(i) => { b[i] = BDev::empty(); 0 }
         None => -6, // ENXIO, as Linux reports for a partition that is not there
     }
@@ -1771,4 +1776,45 @@ fn drop_partitions_of(dev: u16) {
             *e = BDev::empty();
         }
     }
+}
+
+/// True when any partition node of whole device `dev` has an open fd.
+fn any_partition_open(dev: u16) -> bool {
+    let b = BDEVS.lock();
+    b.iter().enumerate().any(|(i, e)| e.in_use
+        && matches!(e.backing, Backing::Part { parent, .. } if parent as u16 == dev)
+        && crate::blk_open_count(i as u16) != 0)
+}
+
+/// `/proc/partitions`, Linux format: header, blank line, then each whole disk
+/// followed by its partitions as `%4d %7d %10llu name` in 1 KiB blocks.
+/// Output stops at a line boundary when `buf` is full. Returns the length.
+pub fn proc_partitions(buf: &mut [u8]) -> usize {
+    use core::fmt::Write;
+    struct W<'a> { b: &'a mut [u8], n: usize }
+    impl Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            if self.n + s.len() > self.b.len() { return Err(core::fmt::Error); }
+            self.b[self.n..self.n + s.len()].copy_from_slice(s.as_bytes());
+            self.n += s.len();
+            Ok(())
+        }
+    }
+    let mut w = W { b: buf, n: 0 };
+    let _ = w.write_str("major minor  #blocks  name\n\n");
+    let b = synced();
+    for (i, e) in b.iter().enumerate() {
+        if !e.in_use || e.special || e.size == 0 || matches!(e.backing, Backing::Part { .. }) { continue; }
+        let mark = w.n;
+        if write!(w, "{:4} {:7} {:10} {}\n", e.major, e.minor, e.size / 1024,
+                  core::str::from_utf8(e.name()).unwrap_or("?")).is_err() { w.n = mark; break; }
+        for p in b.iter() {
+            if !p.in_use || p.size == 0 { continue; }
+            if !matches!(p.backing, Backing::Part { parent, .. } if parent as usize == i) { continue; }
+            let mark = w.n;
+            if write!(w, "{:4} {:7} {:10} {}\n", p.major, p.minor, p.size / 1024,
+                      core::str::from_utf8(p.name()).unwrap_or("?")).is_err() { w.n = mark; return w.n; }
+        }
+    }
+    w.n
 }
