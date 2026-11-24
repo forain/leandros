@@ -8108,6 +8108,10 @@ fn scheduler_run_loop() -> ! {
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
             }
+            // Woken from idle (any interrupt): cheap dead-local-tick check (one
+            // rdtsc on the live path, see timer::check_alive).
+            #[cfg(target_arch = "x86_64")]
+            unsafe { arch_timer_check_alive(); }
             let idle_ns = unsafe { arch_monotonic_ns() }.saturating_sub(t_idle);
             CPU_IDLE_NS[id.min(MAX_CPUS - 1)].fetch_add(idle_ns, Ordering::Relaxed);
             if idlestat::ENABLED {
