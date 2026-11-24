@@ -1940,7 +1940,13 @@ static void nn_case(const char *name, int mode) {
         snprintf(msg, sizeof msg, "%s: client got the reply through the published port (exit %d)", name, r); CHECK(msg, r == 0);
     }
     system("nft delete table inet netavark");
-    if (mode == 5) system("nft delete table inet midflow");
+    if (mode == 5) {
+        system("nft delete table inet midflow");
+        /* the dropped established flow keeps the server netns (and with it the veth peer) alive until its sockets time out,
+         * so the host end would still own the name vethN for the next case: delete it, which removes the peer as well */
+        int vi = link_get(s, "vethN", NULL, NULL);
+        if (vi > 0) link_del(s, vi);
+    }
     link_del(s, bidx); close(s);
 }
 static void nftnat_hairpin_icmp_on(void) { nn_case("nftnat_hairpin_icmp_related", 6); }
