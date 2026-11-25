@@ -7717,7 +7717,8 @@ fn gen_leandros_timer() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
 }
 
-/// Fake path of the writable `/proc/leandros_asfree` snapshot (root only).
+/// Fake path of the writable `/proc/leandros_asfree` snapshot (open and write
+/// need CAP_SYS_ADMIN in the initial user namespace).
 const PROC_ASFREE_W: &[u8] = b"/tmp/.proc_asfree";
 fn gen_asfree() -> Option<VnodeKind> {
     let mut s = alloc::string::String::new();
@@ -10153,7 +10154,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 None    => return err_reply(-2),
             }
         } else if lookup_path == b"/proc/leandros_asfree" {
-            if sched::euid_of(pid) != 0 { return err_reply(-13); }
+            // CAP_SYS_ADMIN in the initial user namespace (not euid 0: a
+            // container's user-namespace root or a root with the capability
+            // dropped is refused); an unknown pid is refused too.
+            if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
             match gen_asfree() {
                 Some(v) => v,
                 None    => return err_reply(-23),
@@ -11300,7 +11304,8 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 e.in_use() && e.ephemeral() && e.path() == PROC_ASFREE_W
             };
             if is_asfree {
-                if sched::euid_of(pid) != 0 { return err_reply(-13); }
+                // Same gate as the open: an fd handed to someone else gains nothing.
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
                 let n = count.min(63);
                 let mut b = [0u8; 63];
                 if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
