@@ -210,4 +210,182 @@ mod tests {
         b.x(0).s(" ").x(0x1f_ab00);
         assert_eq!(&b.b[..b.n], b"0x0 0x1fab00");
     }
+
+    // ── GET_THROTTLED / undervoltage monitor ─────────────────────────────────
+
+    const S: u64 = 1_000_000_000;
+
+    fn text(m: uvolt::Msg, v: u32) -> String {
+        let mut b = [0u8; 160];
+        let mut w = Buf::new(&mut b);
+        uvolt::render(m, v, &mut w);
+        let n = w.n;
+        String::from_utf8(b[..n].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn uvolt_bit_decoding() {
+        assert!(uvolt::undervolt_now(0x1));
+        assert!(!uvolt::undervolt_now(0x50000));
+        assert!(uvolt::undervolt_occurred(0x10000));
+        assert!(!uvolt::undervolt_occurred(0x1));
+        assert_eq!(uvolt::live(0x5_000d), 0xd);
+        assert_eq!(uvolt::sticky(0x5_000d), 0x5);
+        assert!(uvolt::freq_capped(0x2) && uvolt::throttled(0x4) && uvolt::soft_temp(0x8));
+    }
+
+    #[test]
+    fn uvolt_request_does_not_clear_sticky() {
+        let mut msg = [0u32; fw::MSG_WORDS];
+        fw::build(uvolt::GET_THROTTLED, &uvolt::REQUEST, &mut msg);
+        assert_eq!(msg[2], 0x0003_0046);
+        assert_eq!(msg[5], 0, "a nonzero value would clear sticky bits");
+    }
+
+    #[test]
+    fn uvolt_first_read_logs_once_even_when_ok() {
+        let mut m = uvolt::Monitor::new(false);
+        let (k, v) = m.feed(Some(0), 0).expect("first read logs");
+        assert_eq!(k, uvolt::Msg::BootOk);
+        assert!(text(k, v).starts_with("[power] voltage ok"));
+        assert!(m.feed(Some(0), 2 * S).is_none());
+        assert_eq!(m.events(), 0);
+    }
+
+    #[test]
+    fn uvolt_boot_with_sticky_occurred_has_clear_line() {
+        let mut m = uvolt::Monitor::new(false);
+        let (k, v) = m.feed(Some(0x50000), 0).unwrap();
+        assert_eq!(k, uvolt::Msg::BootOccurred);
+        let t = text(k, v);
+        assert!(t.contains("undervoltage occurred") && t.contains("throttled=0x50000"), "{t}");
+        assert_eq!(m.events(), 0, "an old sticky bit is not an event since boot");
+    }
+
+    #[test]
+    fn uvolt_boot_live_undervoltage_is_an_event() {
+        let mut m = uvolt::Monitor::new(false);
+        let (k, v) = m.feed(Some(0x50005), 0).unwrap();
+        assert_eq!(k, uvolt::Msg::Under);
+        assert_eq!(text(k, v), "[power] undervoltage detected (throttled=0x50005)");
+        assert_eq!(m.events(), 1);
+    }
+
+    #[test]
+    fn uvolt_change_detection_and_events() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0), 0);
+        let (k, v) = m.feed(Some(0x50005), 20 * S).unwrap();
+        assert_eq!(k, uvolt::Msg::Under);
+        assert_eq!(m.events(), 1);
+        assert_eq!(m.last_event_ns(), Some(20 * S));
+        assert!(m.feed(Some(0x50005), 40 * S).is_none(), "unchanged: silent");
+        assert_eq!(m.events(), 1, "staying low is one event");
+        let (k, v2) = m.feed(Some(0x50000), 60 * S).unwrap();
+        assert_eq!(k, uvolt::Msg::Normal);
+        assert_eq!(text(k, v2), "[power] voltage normal (throttled=0x50000)");
+        assert_eq!(v, 0x50005);
+        m.feed(Some(0x50001), 80 * S);
+        assert_eq!(m.events(), 2);
+        assert_eq!(m.last_event_ns(), Some(80 * S));
+    }
+
+    #[test]
+    fn uvolt_sticky_only_growth_counts_an_event() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0), 0);
+        // a dip entirely between two polls: live clear, sticky newly set
+        m.feed(Some(0x10000), 2 * S);
+        assert_eq!(m.events(), 1);
+        m.feed(Some(0x10000), 4 * S);
+        assert_eq!(m.events(), 1, "sticky staying set is not a new event");
+    }
+
+    #[test]
+    fn uvolt_sticky_alone_does_not_log_change() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0), 0);
+        // only sticky bits move: live word unchanged, no log line (the event is counted)
+        assert!(m.feed(Some(0x10000), 30 * S).is_none());
+        assert_eq!(m.live(), Some(0));
+        assert_eq!(m.sticky(), Some(1));
+    }
+
+    #[test]
+    fn uvolt_rate_limit_defers_not_drops() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0), 0);
+        assert!(m.feed(Some(0x1), 2 * S).is_none(), "inside the rate limit window");
+        assert_eq!(m.events(), 1, "still counted");
+        assert!(m.feed(Some(0x1), 4 * S).is_none());
+        let (k, _) = m.feed(Some(0x1), uvolt::LOG_MIN_NS + 1).expect("deferred line is emitted later");
+        assert_eq!(k, uvolt::Msg::Under);
+        assert_eq!(m.events(), 1);
+        assert!(m.feed(Some(0x1), uvolt::LOG_MIN_NS + 3 * S).is_none());
+    }
+
+    #[test]
+    fn uvolt_other_live_bits_log_throttle_change() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0), 0);
+        let (k, v) = m.feed(Some(0xc), 30 * S).unwrap();
+        assert_eq!(k, uvolt::Msg::Changed);
+        assert_eq!(text(k, v), "[power] throttle state changed (throttled=0xc)");
+        assert_eq!(m.events(), 0);
+    }
+
+    #[test]
+    fn uvolt_mailbox_failure_disables_after_three_with_one_line() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0), 0);
+        assert!(m.feed(None, 2 * S).is_none());
+        assert!(m.feed(Some(0), 4 * S).is_none(), "a success resets the failure count");
+        assert!(m.feed(None, 6 * S).is_none());
+        assert!(m.feed(None, 8 * S).is_none());
+        let (k, v) = m.feed(None, 10 * S).expect("one disable line");
+        assert_eq!(k, uvolt::Msg::Disabled);
+        assert!(text(k, v).starts_with("[power] undervoltage monitor disabled"));
+        assert!(m.disabled());
+        assert!(m.feed(None, 12 * S).is_none());
+        assert!(m.feed(Some(0x1), 100 * S).is_none(), "stays off");
+        assert_eq!(m.events(), 0);
+    }
+
+    #[test]
+    fn uvolt_first_read_failure_path() {
+        let mut m = uvolt::Monitor::new(false);
+        for i in 0..2 { assert!(m.feed(None, i * S).is_none()); }
+        assert_eq!(m.feed(None, 3 * S).unwrap().0, uvolt::Msg::Disabled);
+    }
+
+    #[test]
+    fn uvolt_knob_off_is_inert() {
+        let mut m = uvolt::Monitor::new(true);
+        assert!(m.disabled());
+        assert!(m.feed(Some(0x50005), 0).is_none());
+        assert_eq!(m.events(), 0);
+        assert_eq!(m.live(), None);
+        assert!(uvolt::knob_off(Some("off")));
+        assert!(uvolt::knob_off(Some("0")));
+        assert!(!uvolt::knob_off(Some("on")));
+        assert!(!uvolt::knob_off(None));
+    }
+
+    #[test]
+    fn uvolt_proc_report_lines() {
+        let mut m = uvolt::Monitor::new(false);
+        m.feed(Some(0x50005), 7 * S);
+        let mut b = [0u8; 256];
+        let mut w = Buf::new(&mut b);
+        m.report(&mut w);
+        let n = w.n;
+        let t = String::from_utf8(b[..n].to_vec()).unwrap();
+        assert!(t.contains("power: throttled=0x50005 live=0x5 sticky=0x5 undervolt_events=1 last_event_s=7"), "{t}");
+        let mut off = uvolt::Monitor::new(true);
+        let mut b2 = [0u8; 64];
+        let mut w2 = Buf::new(&mut b2);
+        off.report(&mut w2);
+        let n2 = w2.n;
+        assert!(String::from_utf8(b2[..n2].to_vec()).unwrap().contains("power: disabled"));
+    }
 }
