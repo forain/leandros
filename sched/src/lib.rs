@@ -9323,7 +9323,7 @@ pub fn replace_address_space(
     user_sp: usize
 ) -> ! {
     let pid = current_pid();
-    let old_as = {
+    let (old_as, old_sole) = {
         let mut rq = RUN_QUEUE.lock();
         // A space another process also holds (a vfork / CLONE_VM child execing
         // out of its parent's memory): its counters are the parent's, not ours.
@@ -9345,7 +9345,7 @@ pub fn replace_address_space(
             },
             None => false,
         };
-        if let Some(t) = rq.find_pid_mut(pid) {
+        let displaced = if let Some(t) = rq.find_pid_mut(pid) {
             // Page-fault counts belong to the process, not the image: carry
             // them across exec (Linux keeps them in the task) -- but a borrowed
             // space's counts are the lender's, so the vfork child starts at 0.
@@ -9391,7 +9391,20 @@ pub fn replace_address_space(
             displaced
         } else {
             None
-        }
+        };
+        // The displaced image is torn down by this exec when no slot holds it
+        // (a vfork/CLONE_VM lender's, or a not-yet-reaped sibling's, is
+        // someone else's to free). Decided by a scan, not the Arc count: an
+        // observer's transient clone must not postpone the free.
+        let sole = match displaced.as_ref() {
+            Some(d) => {
+                let mine = alloc::sync::Arc::as_ptr(d);
+                !rq.live_slots().any(|i| rq.get(i).map_or(false, |o| o.address_space.as_ref()
+                    .map_or(false, |x| core::ptr::eq(alloc::sync::Arc::as_ptr(x), mine))))
+            }
+            None => false,
+        };
+        (displaced, sole)
     };
 
     extern "C" {
@@ -9410,20 +9423,21 @@ pub fn replace_address_space(
         // in-flight holder of its busy flag (a fault on another CPU by a
         // thread of the pre-exec image) to finish first.
         if let Some(old) = old_as {
-            if old.busy.load(Ordering::Acquire) {
+            if old_sole {
+                // ru_maxrss spans execve (Linux `setmax_mm_hiwater_rss`): keep
+                // the old image's peak. The close waits out any in-flight
+                // `busy` holder (a fault on another CPU by a thread of the
+                // pre-exec image, or an observer) and tears the contents
+                // down whatever the Arc count.
+                let hwm = close_address_space(&old) as u64;
+                if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm); }
+            } else if old.busy.load(Ordering::Acquire) {
                 lockwatch::note_wait(lockwatch::L_AS_BUSY);
                 while old.busy.load(Ordering::Acquire) {
                     mm::paging::tlb_service_pending();
                     core::hint::spin_loop();
                 }
                 lockwatch::note_wait(0);
-            }
-            // ru_maxrss spans execve (Linux `setmax_mm_hiwater_rss`): keep
-            // the old image's peak — unless the space was borrowed (a vfork
-            // child execs out of its parent's memory).
-            if alloc::sync::Arc::strong_count(&old) == 1 {
-                let hwm = old.mem_counters().hwm as u64;
-                if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm); }
             }
             drop(old);
         }
