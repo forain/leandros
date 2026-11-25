@@ -633,6 +633,7 @@ fn removed_space_unshared(rq: &RunQueue, t: &Task) -> bool {
 /// a space no slot refers to.
 fn reap_close_space(t: &Task, sole: bool) {
     if !sole { return; }
+    if asfree::any_armed() && asfree::legacy_is(t.tgid) { return; } // negative control
     if let Some(a) = t.address_space.as_ref() { close_address_space(a); }
 }
 
@@ -8961,6 +8962,9 @@ pub fn exit(code: i32) -> ! {
 /// waits out any in-flight `busy` holder exactly as `replace_address_space`
 /// does.
 fn release_exiting_address_space(pid: Pid) {
+    // Lane memexact negative control (`legacy <pid>` in /proc/leandros_asfree):
+    // the old Arc-count rule for this pid. One relaxed load when unarmed.
+    let legacy = asfree::any_armed() && asfree::legacy_is(pid);
     let taken = 'retry: loop {
         let mut rq = RUN_QUEUE.lock();
         let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
@@ -9019,10 +9023,15 @@ fn release_exiting_address_space(pid: Pid) {
             Some(a) => alloc::sync::Arc::as_ptr(a),
             None => return,
         };
-        for i in rq.live_slots() {
-            if let Some(o) = rq.get(i) {
-                if o.pid != pid && o.address_space.as_ref()
-                    .map_or(false, |a| core::ptr::eq(alloc::sync::Arc::as_ptr(a), mine)) { return; }
+        if legacy {
+            if rq.find_pid(pid).and_then(|t| t.address_space.as_ref())
+                .map_or(true, |a| alloc::sync::Arc::strong_count(a) != 1) { return; }
+        } else {
+            for i in rq.live_slots() {
+                if let Some(o) = rq.get(i) {
+                    if o.pid != pid && o.address_space.as_ref()
+                        .map_or(false, |a| core::ptr::eq(alloc::sync::Arc::as_ptr(a), mine)) { return; }
+                }
             }
         }
         let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
@@ -9052,7 +9061,20 @@ fn release_exiting_address_space(pid: Pid) {
         break taken;
     };
     if let Some(old) = taken {
+        if legacy {
+            if old.busy.load(Ordering::Acquire) {
+                lockwatch::note_wait(lockwatch::L_AS_BUSY);
+                while old.busy.load(Ordering::Acquire) { mm::paging::tlb_service_pending(); core::hint::spin_loop(); }
+                lockwatch::note_wait(0);
+            }
+            let hwm = old.mem_counters().hwm as u64;
+            if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm); }
+            drop(old);
+            return;
+        }
+        let probe = if asfree::any_armed() { asfree::exit_before_close(pid, &old) } else { None };
         let hwm = close_address_space(&old);
+        if asfree::any_armed() { asfree::exit_after_close(pid, probe); }
         if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm as u64); }
         drop(old);
     }
@@ -9073,6 +9095,7 @@ fn release_exiting_address_space(pid: Pid) {
 /// `Drop` a no-op. Never call with RUN_QUEUE held (this spins on `busy`).
 fn close_address_space(old: &alloc::sync::Arc<mm::vmm::AddressSpace>) -> usize {
     if old.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        asfree::BUSY_WAITS.fetch_add(1, Ordering::Release);
         lockwatch::note_wait(lockwatch::L_AS_BUSY);
         // The holder may be waiting for this CPU's TLB flush acknowledgement.
         while old.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {

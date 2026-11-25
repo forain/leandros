@@ -127,6 +127,8 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_wait_teardown_exact_per_child() { failures += 1; }
     if !test_wait_teardown_hold() { failures += 1; }
     if !test_wait_teardown_busyhold() { failures += 1; }
+    if !test_wait_teardown_legacy() { failures += 1; }
+    if !test_wait_teardown_pause() { failures += 1; }
     if !test_wait_memory_drift() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
@@ -2103,7 +2105,7 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 struct AsFreeEnt { seq: u64, tgid: usize, pages: usize, pt: usize }
-struct AsFree { total: u64, n: usize, e: [AsFreeEnt; 256] }
+struct AsFree { total: u64, cpus: usize, overlaps: usize, pause_result: usize, n: usize, e: [AsFreeEnt; 256] }
 
 const ASFREE_PATH: &[u8] = b"/proc/leandros_asfree\0";
 
@@ -2121,6 +2123,10 @@ unsafe fn asfree_read(out: &mut AsFree) -> bool {
             got_total = true;
             continue;
         }
+        if let Some(r) = line.strip_prefix(b"cpus ") { out.cpus = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"overlaps ") { out.overlaps = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"pause_result ") { out.pause_result = parse_num(r).unwrap_or(0); continue; }
+        if line.starts_with(b"busy_waits ") { continue; }
         let mut f = [0usize; 4];
         let mut k = 0;
         for w in line.split(|&c| c == b' ') {
@@ -2171,7 +2177,7 @@ fn asfree_of(a: &AsFree, tgid: usize) -> (usize, AsFreeEnt) {
 }
 
 unsafe fn asfree_new() -> AsFree {
-    AsFree { total: 0, n: 0, e: [AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }; 256] }
+    AsFree { total: 0, cpus: 0, overlaps: 0, pause_result: 0, n: 0, e: [AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }; 256] }
 }
 
 unsafe fn kill_and_reap(pid: i32) {
@@ -2319,20 +2325,30 @@ unsafe fn test_wait_teardown_hold() -> bool {
     report(name, armed && status == 0 && at_wait && after_release == 1)
 }
 
-/// `busyhold`: a kernel observer holds the child's `busy` flag (and so its
-/// address space) for up to 5 ms around the child's exit. The teardown must
-/// still happen, exactly once, within a second of wait4; whether it was
-/// already done at wait4 is printed.
+/// `busyhold`: a kernel observer takes the child's `busy` flag (IRQs masked,
+/// as real holders have it) at the moment the child's exit decides to close
+/// its space, and keeps it until the closing exit is seen waiting on it. The
+/// teardown must be done by wait4's return (entry present, exactly once), and
+/// every round must have overlapped (`overlaps` rose by one): a run in which
+/// the holder and the closer never met proves nothing. One CPU cannot
+/// overlap them: FAIL.
 unsafe fn test_wait_teardown_busyhold() -> bool {
     let name = b"wait_teardown_busyhold\0";
+    const ROUNDS: usize = 10;
     let mut ok = true;
     let mut late = 0usize;
-    for round in 0..10usize {
+    let mut a = asfree_new();
+    if !asfree_read(&mut a) { return report(name, false); }
+    if a.cpus < 2 {
+        puts(b"  busyhold: needs 2 CPUs, have fewer\0".as_ptr());
+        return report(name, false);
+    }
+    let overlaps0 = a.overlaps;
+    for round in 0..ROUNDS {
         let mut go = [0i32; 2];
         let pid = spawn_gated_child(&mut go);
         if pid <= 0 { return report(name, false); }
-        let armed = asfree_do(b"busyhold", pid, 1_000 + 400 * round);
-        if armed { usleep(500); }
+        let armed = asfree_do(b"busyhold", pid, 2_000 + 600 * round);
         write(go[1], b"x".as_ptr(), 1);
         close(go[1]);
         let status = wait_status(pid);
@@ -2344,9 +2360,61 @@ unsafe fn test_wait_teardown_busyhold() -> bool {
         // Let the observer thread finish before the next round re-arms the slot.
         usleep(8_000);
     }
+    let mut a = asfree_new();
+    let overlapped = if asfree_read(&mut a) { a.overlaps.saturating_sub(overlaps0) } else { 0 };
     write(STDOUT_FILENO, b"  not_yet_at_wait=".as_ptr(), 18); print_dec(late);
+    write(STDOUT_FILENO, b" overlapped=".as_ptr(), 12); print_dec(overlapped);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
-    report(name, ok)
+    report(name, ok && late == 0 && overlapped == ROUNDS)
+}
+
+/// Permanent negative control: `legacy` puts that pid's exit back on the old
+/// Arc-count rule. With the kernel's `hold` the teardown then does NOT happen
+/// by wait4 (no entry), and does when the hold is released. If this ever
+/// shows an entry at wait4, the hold or the control stopped working and the
+/// green of `wait_teardown_hold` means nothing.
+unsafe fn test_wait_teardown_legacy() -> bool {
+    let name = b"wait_teardown_legacy\0";
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"legacy", pid, 0) && asfree_do(b"hold", pid, 0);
+    if armed { usleep(2_000); }
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    let mut a = asfree_new();
+    let at_wait = if asfree_read(&mut a) { asfree_of(&a, pid as usize).0 } else { 99 };
+    asfree_do(b"release", pid, 0);
+    let after_release = asfree_wait_entry(pid as usize, 2_000);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b" after_release=".as_ptr(), 15); print_dec(after_release);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && status == 0 && at_wait == 0 && after_release == 1)
+}
+
+/// `pause`: between exit's sole-owner decision and the close an extra strong
+/// reference appears (a racing observer's upgrade). The close must not care:
+/// the entry is present at wait4, and the observer, trying the space after the
+/// close, gets nothing (`pause_result` 1; 2 would be a space handed out).
+unsafe fn test_wait_teardown_pause() -> bool {
+    let name = b"wait_teardown_pause\0";
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"pause", pid, 0);
+    if armed { usleep(2_000); }
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    let mut a = asfree_new();
+    let (read_ok, at_wait) = if asfree_read(&mut a) { (true, asfree_of(&a, pid as usize).0) } else { (false, 99) };
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b" observer=".as_ptr(), 10); print_dec(a.pause_result);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && read_ok && status == 0 && at_wait == 1 && a.pause_result == 1)
 }
 
 /// Whole-test drift: after a batch of children has come and gone, free RAM +
