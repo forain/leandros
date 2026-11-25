@@ -6285,6 +6285,10 @@ fn wdog_selftest_stall() {
 /// system-down check (shutdown with a live cpu0 keeps feeding). It decides
 /// from [`wdog_tick_age_secs`] / [`cpu_idle`] whether to feed; it must take no
 /// blocking lock. 0 = none registered (every other board).
+/// Per-tick hook of the power-off/restart path (kernel/src/power.rs): lets a
+/// CPU that is not stuck force the machine off when the shutdown CPU is.
+static SHUTDOWN_HOOK: AtomicUsize = AtomicUsize::new(0);
+pub fn set_shutdown_hook(f: fn(usize)) { SHUTDOWN_HOOK.store(f as usize, Ordering::Release); }
 static HW_WDOG_HOOK: AtomicUsize = AtomicUsize::new(0);
 pub fn set_hw_watchdog_hook(f: fn()) { HW_WDOG_HOOK.store(f as usize, Ordering::Release); }
 /// Seconds since `cpu` last took a timer tick, as cpu0's watchdog scans saw
@@ -6442,6 +6446,8 @@ fn tlbstat_tick(now: u64) {
 /// hooks run once per interrupt: a catch-up is a jump, never a storm.
 pub fn timer_tick_irq(elapsed: u64) {
     let id = unsafe { cpu_id() };
+    let sh = SHUTDOWN_HOOK.load(Ordering::Relaxed);
+    if sh != 0 { let f: fn(usize) = unsafe { core::mem::transmute(sh) }; f(id); }
     // A tick late by whole intervals on a CPU that was not idle means it ran
     // that long with IRQs masked (an idle CPU's timer may legitimately sleep).
     if elapsed > 1 && id < MAX_CPUS && IDLE_SINCE[id].load(Ordering::Relaxed) == 0 {

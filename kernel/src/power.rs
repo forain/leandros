@@ -18,7 +18,7 @@
 //! `reboot -f` leaves a consistent volume. Init's orderly path (userland/init)
 //! has already remounted / read-only by then, which makes this a no-op.
 
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use crate::serial_print_str;
 
 // include/uapi/linux/reboot.h
@@ -223,6 +223,7 @@ fn shutdown_prepare(state: u8) {
     if SYSTEM_STATE.compare_exchange(SYSTEM_RUNNING, state, Ordering::AcqRel, Ordering::Acquire).is_err() {
         loop { core::hint::spin_loop(); }
     }
+    phase(PH_PREPARE);
     // Shutdown notifiers: none are registered in this kernel.
     // Device shutdown: the block layer (see the module comment).
     crate::syscall::sync_all();
@@ -232,6 +233,142 @@ fn shutdown_prepare(state: u8) {
     serial_print_str(" f2fs volume(s) committed with a clean-unmount checkpoint (the rest were already read-only)\n");
     // NVMe: delete the I/O queues and send CC.SHN (Linux `nvme_shutdown`).
     for l in crate::pm2::block_shutdown() { plog(&l); }
+}
+
+
+// ── Bounded shutdown (lane a64poweroff) ──────────────────────────────────────
+//
+// Linux never lets kernel_power_off wait forever on a peer: it stops the other
+// CPUs (`smp_send_stop`) and `hw_failure`/`orderly_poweroff` carry an
+// emergency timeout. Here every phase of kernel_power_off/restart is
+// announced with a `[POWER] phase N <name>` line, and a per-tick hook on every
+// OTHER CPU forces the final action (PSCI/ACPI off, reset, halt) when one phase
+// has made no progress for `reboot.phase_ms` (default 20000; 0 = no watchdog).
+// Test knob `reboot.test_hang=<phase>`: the shutdown CPU masks IRQs and spins
+// forever when it enters that phase (red proof: also pass `reboot.phase_ms=0`).
+
+const PH_PREPARE: u8 = 1;
+const PH_QUIESCE1: u8 = 2;
+const PH_MACHINE: u8 = 3;
+const PH_QUIESCE2: u8 = 4;
+const PH_STOPCPUS: u8 = 5;
+const PH_FINAL: u8 = 6;
+const PHASE_NAMES: [&str; 7] = ["-", "prepare(sync+f2fs+nvme)", "quiesce1(devices)", "machine_prepare(console+klog+disks)", "quiesce2(xhci+busmaster)", "stop-other-cpus", "final(psci/acpi)"];
+
+static PH_NOW: AtomicU8 = AtomicU8::new(0);
+static PH_T0: AtomicU64 = AtomicU64::new(0);
+static PH_START: AtomicU64 = AtomicU64::new(0);
+static PH_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PH_LIMIT_NS: AtomicU64 = AtomicU64::new(0);
+static PH_FORCED: AtomicBool = AtomicBool::new(false);
+
+fn phase(n: u8) {
+    let now = sched::monotonic_ns();
+    if n == PH_PREPARE {
+        PH_START.store(now, Ordering::Relaxed);
+        PH_CPU.store(unsafe { sched::cpu_id() }, Ordering::Relaxed);
+        let ms = opt("reboot.phase_ms").and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
+        PH_LIMIT_NS.store(ms.saturating_mul(1_000_000), Ordering::Relaxed);
+        sched::set_shutdown_hook(shutdown_watch);
+    }
+    PH_T0.store(now, Ordering::Release);
+    PH_NOW.store(n, Ordering::Release);
+    serial_print_str(&alloc::format!("[POWER] phase {} {} at +{} ms\n", n, PHASE_NAMES[n as usize],
+        now.saturating_sub(PH_START.load(Ordering::Relaxed)) / 1_000_000));
+    if opt("reboot.test_hang").and_then(|v| v.parse::<u8>().ok()) == Some(n) {
+        serial_print_str("[POWER] test: shutdown CPU hangs here with IRQs masked\n");
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("cli", options(nomem, nostack));
+            #[cfg(target_arch = "aarch64")]
+            core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
+        }
+        loop { core::hint::spin_loop(); }
+    }
+}
+
+/// Tick hook, every CPU. On a CPU other than the shutdown CPU: a phase older
+/// than the limit forces the final action.
+fn shutdown_watch(cpu: usize) {
+    let n = PH_NOW.load(Ordering::Acquire);
+    let lim = PH_LIMIT_NS.load(Ordering::Relaxed);
+    if n == 0 || lim == 0 || cpu == PH_CPU.load(Ordering::Relaxed) { return; }
+    let st = SYSTEM_STATE.load(Ordering::Acquire);
+    if st == SYSTEM_RUNNING || st == SYSTEM_KEXEC { return; }
+    let age = sched::monotonic_ns().saturating_sub(PH_T0.load(Ordering::Acquire));
+    if age < lim || PH_FORCED.swap(true, Ordering::AcqRel) { return; }
+    serial_print_str(&alloc::format!("[POWER] phase {} {} made no progress for {} ms on cpu{}: cpu{} forces the {}\n",
+        n, PHASE_NAMES[(n as usize).min(6)], age / 1_000_000, PH_CPU.load(Ordering::Relaxed), cpu,
+        match st { SYSTEM_POWER_OFF => "power-off", SYSTEM_RESTART => "restart", _ => "halt" }));
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("cli", options(nomem, nostack));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
+    }
+    sched::mark_system_down();
+    crate::console_staging_disable_and_drain();
+    final_action(st)
+}
+
+/// The arch's last step for `st`; never returns.
+fn final_action(st: u8) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        match st {
+            SYSTEM_POWER_OFF => {
+                if let Some(p) = (*core::ptr::addr_of!(ACPI_POWER)).as_ref() { arch_x86_64::power::acpi_power_off(p); }
+            }
+            SYSTEM_RESTART => arch_x86_64::power::restart((*core::ptr::addr_of!(ACPI_POWER)).as_ref(), arch_x86_64::power::Method::Auto),
+            _ => {}
+        }
+        arch_x86_64::power::halt_forever()
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        match st {
+            SYSTEM_POWER_OFF => arch_aarch64::power::system_off(),
+            SYSTEM_RESTART => arch_aarch64::power::system_reset(),
+            _ => {}
+        }
+        arch_aarch64::power::halt_forever()
+    }
+}
+
+/// aarch64: park every other CPU (Linux `smp_send_stop`) so none of them keeps
+/// hammering MMIO (BQL contention in QEMU TCG) while PSCI SYSTEM_OFF/RESET is
+/// processed. Bounded: gives up after 500 ms and says who did not arrive.
+#[cfg(target_arch = "aarch64")]
+static PARKED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "aarch64")]
+fn stop_park() -> ! {
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
+    PARKED.fetch_or(1 << unsafe { arch_aarch64::smp::arch_cpu_id() }, Ordering::AcqRel);
+    arch_aarch64::power::halt_forever()
+}
+#[cfg(target_arch = "aarch64")]
+fn stop_park_hook() { stop_park() }
+
+fn stop_other_cpus() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
+        let n = arch_aarch64::smp::assigned();
+        arch_aarch64::exception::IRQ_DIVERT.store(stop_park as fn() -> ! as usize, Ordering::Release);
+        sched::wedge::PARK_HOOK.store(stop_park_hook as fn() as usize, Ordering::Release);
+        spin::held::set_park_hook(stop_park_hook);
+        unsafe { core::arch::asm!("dsb ish", options(nostack)); }
+        for i in 0..n { if i != me { arch_aarch64::gic::send_sgi(i, arch_aarch64::gic::SGI_RESCHED); } }
+        let want = ((1usize << n) - 1) & !(1 << me);
+        let t0 = sched::monotonic_ns();
+        while PARKED.load(Ordering::Acquire) & want != want && sched::monotonic_ns().saturating_sub(t0) < 500_000_000 {
+            core::hint::spin_loop();
+        }
+        let got = PARKED.load(Ordering::Acquire) & want;
+        serial_print_str(&alloc::format!("[POWER] other CPUs parked: {} of {} in {} us{}\n",
+            got.count_ones(), want.count_ones(), sched::monotonic_ns().saturating_sub(t0) / 1000,
+            if got == want { alloc::string::String::new() } else { alloc::format!(" (missing mask {:#x})", want & !got) }));
+    }
 }
 
 // ── Reboot / power-off knobs (kernel command line) ───────────────────────────
@@ -330,6 +467,7 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
         what, cfg.quiesce as u8, cfg.hda_crst as u8, cfg.xhci_hcrst as u8,
         if cfg.usb_vbus_off { "off" } else { "on" }, cfg.busmaster_off as u8);
     plog(&plan);
+    phase(PH_QUIESCE1);
     if !cfg.quiesce { return bm; }
     let t = sched::monotonic_ns();
     let (lines, fns) = crate::pm2::shutdown_phase1(cfg.hda_crst);
@@ -354,6 +492,7 @@ fn quiesce_phase1(cfg: &RebootCfg, what: &str) -> alloc::vec::Vec<drivers::pci::
 /// (+ reset, + port power off), then bus mastering off. Serial only — the
 /// stick is gone.
 fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) -> usize {
+    phase(PH_QUIESCE2);
     if !cfg.quiesce { return 0; }
     let mut halted = 0;
     for line in drivers::usb_hcd::quiesce_all(cfg.xhci_hcrst, cfg.usb_vbus_off) {
@@ -375,6 +514,7 @@ fn quiesce_phase2(cfg: &RebootCfg, bm: &[drivers::pci::PciFunction]) -> usize {
 /// console line written out, the kernel log's final flush and the disks'
 /// write caches committed after it.
 fn machine_prepare() {
+    phase(PH_MACHINE);
     sched::mark_system_down();
     crate::console_drain_outbox();
     crate::console_staging_disable_and_drain();
@@ -401,6 +541,9 @@ fn kernel_power_off() -> ! {
     serial_print_str("reboot: Power down\n");
     machine_prepare();
     quiesce_phase2(&cfg, &bm);
+    phase(PH_STOPCPUS);
+    stop_other_cpus();
+    phase(PH_FINAL);
     #[cfg(target_arch = "x86_64")]
     unsafe {
         if let Some(p) = (*core::ptr::addr_of!(ACPI_POWER)).as_ref() {
@@ -448,6 +591,9 @@ fn kernel_restart() -> ! {
     })));
     machine_prepare();
     quiesce_phase2(&cfg, &bm);
+    phase(PH_STOPCPUS);
+    stop_other_cpus();
+    phase(PH_FINAL);
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let m = match cfg.method {
