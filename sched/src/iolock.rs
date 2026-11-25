@@ -126,7 +126,13 @@ impl<T> IoMutex<T> {
         let mut waited = 0u64;
         if !self.raw.try_lock() {
             let t0 = crate::monotonic_ns();
-            self.raw.lock();
+            // Queued even when the caller cannot sleep (a polling `lock()` is starved by the
+            // hand-off to queued sleepers). A spinner is a RUNNING CPU: let it overtake sleeping
+            // waiters a bounded number of times, so the grant does not sit on a Ready-but-
+            // CPU-less task while a CPU spins on a spinlock the spinner's holder needs.
+            let class = if crate::irqctx::might_sleep() { crate::ksync::LockClass::Fifo }
+                        else { crate::ksync::LockClass::Prio { max_bypass: 16 } };
+            self.raw.lock_class(class, u64::MAX);
             waited = crate::monotonic_ns().saturating_sub(t0).max(1);
             self.waits.fetch_add(1, Ordering::Relaxed);
             self.wait_ns.fetch_add(waited, Ordering::Relaxed);

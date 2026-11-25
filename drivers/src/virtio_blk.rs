@@ -904,12 +904,18 @@ pub struct VirtioDisk {
 
 impl VirtioDisk {
     fn rw(&self, type_: u32, lba: u64, buf: *mut u8, len: usize) -> Result<(), crate::blockdev::BlkErr> {
+        self.rw_impl(type_, lba, buf, len, false)
+    }
+    /// `try`: fail with `Io` instead of waiting for the device lock (panic path).
+    fn rw_impl(&self, type_: u32, lba: u64, buf: *mut u8, len: usize, try_only: bool) -> Result<(), crate::blockdev::BlkErr> {
         use crate::blockdev::BlkErr;
         if len == 0 || len % SECTOR != 0 { return Err(BlkErr::BadBuffer); }
         if self.capacity_sectors != 0 && lba + (len / SECTOR) as u64 > self.capacity_sectors {
             return Err(BlkErr::OutOfRange);
         }
-        let mut dev = self.dev.lock();
+        let mut dev = if try_only {
+            match self.dev.try_lock() { Some(g) => g, None => return Err(BlkErr::Io) }
+        } else { self.dev.lock() };
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(MAX_IO_BYTES);
@@ -931,6 +937,10 @@ impl crate::blockdev::BlockDevice for VirtioDisk {
     fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), crate::blockdev::BlkErr> {
         // do_io only reads from `buf` for T_OUT (copies it into the DMA page).
         self.rw(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len())
+    }
+    /// Panic-path write: never parks and never waits for the device lock.
+    fn try_write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), crate::blockdev::BlkErr> {
+        self.rw_impl(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len(), true)
     }
     /// Commit the device's volatile write cache to stable storage.
     ///

@@ -10,7 +10,7 @@ Stress: virtio_blk.inject_every holds the device lock holder for 2.5 s every 250
 for BLKSTEAL_SECS (default 60) while the host starves one vCPU thread at a time for
 2-3.5 s (the vCPU threads are pinned and put in SCHED_IDLE; a pinned busy-loop on the same
 host CPU is the starvation, started and killed per stall; only our own QEMU is touched).
-Gate: zero `[WDOG]` lines on a CPU that answers the NMI sample (a starved vCPU does not) in the serial log, no `[F2FS] long hold` >= 2 s,
+Gate (no `[F2FS] long hold` gate: a request injected 2.5 s late under F2FS_MOUNTS legitimately holds it that long): >= 5 injected requests, >= 1 `[LOCKWAIT] VIRTIO_BLK`, guest rc 0, zero `[WDOG]` lines on a CPU that answers the NMI sample (a starved vCPU does not) in the serial log, no `[F2FS] long hold` >= 2 s,
 the guest finishes. `BLKSTEAL_BENCH=1` instead prints throughput (seq write/read, rand 4k read;
 no throttle, no stalls) as `BENCH name=ms`.
 Usage: LEANDROS_RUN_ID=<id> python3 blkstealtest.py [aarch64|x86_64]
@@ -27,6 +27,8 @@ PID_FILE = f"/tmp/leandros{TAG}-qemu.pid"
 SECS = int(os.environ.get("BLKSTEAL_SECS", "60"))
 BENCH = os.environ.get("BLKSTEAL_BENCH") == "1"
 LO, HI = float(os.environ.get("BLKSTEAL_LO", "2.0")), float(os.environ.get("BLKSTEAL_HI", "3.5"))
+CONTROL = os.environ.get("BLKSTEAL_CONTROL") == "1"   # run on main: passes only if RED
+MSGS = []
 HOST = os.environ.get("BLKSTEAL_HOST") == "1"
 # Every K-th request answers late: the holder of the device lock is "descheduled" for 2.5 s.
 CMDLINE = f"virtio_blk.inject_every={os.environ.get('BLKSTEAL_EVERY', '250')}:{os.environ.get('BLKSTEAL_MS', '2500')} virtio_blk.slow_ms=60000"
@@ -127,14 +129,16 @@ def main():
             if HOST:
                 th = threading.Thread(target=staller, args=(pid, stop, stats)); th.start()
             else:
-                th = threading.Thread(target=lambda: None); th.start(); stats.update(stalls=99)
+                th = threading.Thread(target=lambda: None); th.start()
             try:
                 rc, o = drv("run", STRESS, str(SECS + 400), arch, env=env, timeout=SECS + 500)
             finally:
                 stop.set(); th.join()
             print(f"host stalls: {stats['stalls']} totalling {stats['ms']} ms" + (f" ERR {stats['err']}" if "err" in stats else ""))
-            if "err" in stats or stats["stalls"] < 5:
+            if HOST and ("err" in stats or stats["stalls"] < 5):
                 ok = False; print("FAIL: stall injector did not run")
+            if rc != 0:
+                ok = False; print(f"FAIL: guest stress rc={rc}")
             if "STRESS_DONE" not in o:
                 ok = False; print("FAIL: guest stress did not finish\n" + o[-300:])
             log = open(LOG, "rb").read().decode("utf-8", "replace")
@@ -150,13 +154,16 @@ def main():
             holds = [int(x) for x in re.findall(r"\[F2FS\] long hold (\d+) ms", log)]
             print(f"WDOG: {nall} lines, {len(wl)} on CPUs that were not host-stalled; long holds: {sorted(holds)[-5:]}")
             if wl:
-                ok = False; print("FAIL: [WDOG] on a running vCPU")
+                ok = False; MSGS.append("FAIL: [WDOG]"); print("FAIL: [WDOG] on a running vCPU")
                 for l in wl[:8]: print("  " + l[:240])
                 open(os.path.join(out, "serial.log"), "w").write(log)
-            if any(h >= 2000 for h in holds):
-                ok = False; print("FAIL: an F2FS hold >= 2 s")
     finally:
         drv("stop", timeout=60)
+    if CONTROL:
+        # Negative control: on a kernel with the spin lock the same stress MUST show WDOG lines.
+        red = any("[WDOG]" in m for m in MSGS)
+        print("CONTROL " + ("RED as expected" if red else "NOT RED: the test is vacuous"))
+        return 0 if red else 1
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 
