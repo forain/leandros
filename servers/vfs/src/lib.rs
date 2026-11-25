@@ -17926,7 +17926,9 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     }
     // LeandrOS's diagnostic /proc files exist only in handle_open's chain;
     // without this, stat and access(2) said ENOENT while open worked.
-    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path)) {
+    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path))
+        // /proc/leandros_sd exists only where the SD driver registered its source.
+        && (strip_trailing_slash(path) != b"/proc/leandros_sd" || PROC_SD.load(core::sync::atomic::Ordering::Acquire) != 0) {
         write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
         return ok_reply();
     }

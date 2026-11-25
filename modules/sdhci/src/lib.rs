@@ -51,6 +51,7 @@ impl blockdev::BlockDevice for Card {
         if sdhci::write_blocks(self.idx, lba, buf) { Ok(()) } else { Err(blockdev::BlkErr::Io) }
     }
     fn flush(&self) -> Result<(), blockdev::BlkErr> { if sdhci::flush(self.idx) { Ok(()) } else { Err(blockdev::BlkErr::Io) } }
+    fn read_only(&self) -> bool { sdhci::read_only(self.idx) }
     fn removable(&self) -> bool { false }
     fn name_class(&self) -> &'static str { "vd" }
 }
