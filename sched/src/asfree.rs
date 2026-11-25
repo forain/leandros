@@ -80,8 +80,12 @@ pub fn exit_before_close(pid: Pid, old: &Arc<AddressSpace>) -> Option<Arc<Addres
         BUSY_GO.store(true, Ordering::Release);
         let t0 = crate::monotonic_ns();
         while !BUSY_HELD.load(Ordering::Acquire) && crate::monotonic_ns().saturating_sub(t0) < 200_000_000 {
-            // Park when allowed: the holder may be queued on this very CPU.
-            if crate::irqctx::can_sleep() { crate::kthread::msleep(1); } else { crate::irq_window(); core::hint::spin_loop(); }
+            // Spin briefly (the holder is normally on another CPU and a park
+            // costs a tick or more), then park when allowed: the holder may
+            // be queued on this very CPU.
+            if crate::irqctx::can_sleep() && crate::monotonic_ns().saturating_sub(t0) > 1_000_000 {
+                crate::kthread::msleep(1);
+            } else { crate::irq_window(); core::hint::spin_loop(); }
         }
     }
     refresh_any();
@@ -205,7 +209,8 @@ fn worker(gen: u64, arc: Arc<AddressSpace>, busy_us: u64, deadline: u64) {
                 BUSY_HELD.store(true, Ordering::Release);
                 let t0 = crate::monotonic_ns();
                 let mut overlapped = false;
-                while crate::monotonic_ns().saturating_sub(t0) < busy_us * 1000 {
+                // `busy_us` plus a margin for the exit to arrive after its wake-up.
+                while crate::monotonic_ns().saturating_sub(t0) < busy_us * 1000 + 20_000_000 {
                     if BUSY_WAITS.load(Ordering::Acquire) != waits0 { overlapped = true; break; }
                     mm::paging::tlb_service_pending();
                     core::hint::spin_loop();
