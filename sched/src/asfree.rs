@@ -80,8 +80,8 @@ pub fn exit_before_close(pid: Pid, old: &Arc<AddressSpace>) -> Option<Arc<Addres
         BUSY_GO.store(true, Ordering::Release);
         let t0 = crate::monotonic_ns();
         while !BUSY_HELD.load(Ordering::Acquire) && crate::monotonic_ns().saturating_sub(t0) < 200_000_000 {
-            crate::irq_window();
-            core::hint::spin_loop();
+            // Park when allowed: the holder may be queued on this very CPU.
+            if crate::irqctx::can_sleep() { crate::kthread::msleep(1); } else { crate::irq_window(); core::hint::spin_loop(); }
         }
     }
     refresh_any();

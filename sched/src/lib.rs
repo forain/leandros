@@ -9074,7 +9074,7 @@ fn release_exiting_address_space(pid: Pid) {
         }
         let probe = if asfree::any_armed() { asfree::exit_before_close(pid, &old) } else { None };
         let hwm = close_address_space(&old);
-        if asfree::any_armed() { asfree::exit_after_close(pid, probe); }
+        if probe.is_some() { asfree::exit_after_close(pid, probe); }
         if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm as u64); }
         drop(old);
     }
