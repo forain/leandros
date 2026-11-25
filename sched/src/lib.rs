@@ -8144,6 +8144,7 @@ fn scheduler_run_loop() -> ! {
 
             if let Some(l) = late_leader.take() { finish_reaped_leader(l, leader_sole); }
             if let Some(t) = zombie {
+                if asfree::any_armed() { asfree::drop_delay(t.tgid); }
                 // This CPU ran the task to its death and holds the only
                 // reference now — safe to run the exit hook and free its
                 // kernel stack.  Dropping the Box releases the address space.
@@ -8866,6 +8867,7 @@ pub fn exit(code: i32) -> ! {
     // the task turns Zombie and becomes waitable (Linux: `exit_mm` precedes
     // `exit_notify`).
     release_exiting_address_space(pid);
+    if asfree::any_armed() { asfree::exit_race(pid, tgid); }
 
     let (notice, reaped_leader) = {
         let mut rq = RUN_QUEUE.lock();
@@ -8950,6 +8952,7 @@ pub fn exit(code: i32) -> ! {
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         if t.state != TaskState::Zombie { t.set_state(TaskState::Zombie); }
     }
+    if asfree::any_armed() { asfree::leader_delay(pid, tgid); }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
 }
