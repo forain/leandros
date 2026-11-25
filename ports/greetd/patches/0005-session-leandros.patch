@@ -1,0 +1,18 @@
+--- a/greetd/src/session/worker.rs
++++ b/greetd/src/session/worker.rs
+@@ -230,6 +230,7 @@
+ 
+     // Session time!
+     pam.open_session(PamFlag::NONE)?;
++    session_leandros::session_open(&user.name);
+ 
+     // We are done with PAM, clear variables that the child will not need.
+     _ = pam.putenv("XDG_SESSION_CLASS");
+@@ -326,6 +327,7 @@
+     // why we cannot drop privileges in this process, but must do it in the
+     // inner-most child.
+     pam.close_session(PamFlag::NONE)?;
++    session_leandros::session_close();
+     pam.setcred(PamFlag::DELETE_CRED)?;
+     pam.end()?;
+ 

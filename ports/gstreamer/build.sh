@@ -68,7 +68,7 @@ for ARCH in $ARCHS; do
     rm -rf "$T"; mv "$T.new" "$T"; touch "$T/.stamp"
     # merge the dev tree into the cross sysroot (no clobber of Mesa/libc/etc.)
     SYS="$ART/m3-gl-stack/sysroot-$ARCH"
-    if [ -d "$SYS" ]; then cp -a -n "$OUT/$ARCH.sysroot/." "$SYS/"; echo "sysroot merged into $SYS"; fi
+    if [ -d "$SYS" ]; then leandros_sysroot_merge "$OUT/$ARCH.sysroot" "$SYS"; echo "sysroot merged into $SYS"; fi
     echo "staged $T ($(du -sh "$T" | cut -f1))"
   ) > "$LOG" 2>&1 || true
   tail -4 "$LOG"

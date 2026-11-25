@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "shadowfix"
+version = "0.1.0"
+edition = "2021"
+description = "Pads short /etc/shadow records to the nine shadow(5) fields musl getspnam() requires"
+
+# Standalone std/musl crate like userland/espctl, no dependencies. Installed as
+# /usr/sbin/shadowfix; init runs it once per boot before any login can happen.
+[[bin]]
+name = "shadowfix"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = 2

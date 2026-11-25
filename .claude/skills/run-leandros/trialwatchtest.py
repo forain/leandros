@@ -74,8 +74,11 @@ def main(argv):
     subprocess.run([*imgclone.CPC, src, img], check=False)
     if not os.path.exists(img):
         imgclone.clone_file(src, img)
-        imgclone.ensure_remote_key(img)
-    env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}")
+    # always trust a key generated for this run (the cp-clone of a build made on another host
+    # embeds that host's key, which a clean host such as the Pi does not have)
+    rkey = os.path.join(tmp, "remote_key")
+    imgclone.ensure_remote_key(img, rkey)
+    env = dict(os.environ, LEANDROS_DISK_IMAGE=img, LEANDROS_REMOTE=f"qemu:{run_id}", LEANDROS_REMOTE_KEY=rkey)
     os.environ["LEANDROS_DISK_IMAGE"] = img
 
     def stop():

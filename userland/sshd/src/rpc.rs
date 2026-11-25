@@ -28,6 +28,8 @@ pub const SESSION_SIGNAL: u8 = 20;
 pub const SESSION_HANGUP: u8 = 21;
 pub const DIRECT_TCPIP: u8 = 22;
 pub const TCPIP_FORWARD: u8 = 23;
+pub const DIRECT_STREAMLOCAL: u8 = 24;
+pub const STREAMLOCAL_FORWARD: u8 = 25;
 // ctl channel, monitor -> child
 pub const AUTH_OK: u8 = 32;
 pub const AUTH_FAIL: u8 = 33;

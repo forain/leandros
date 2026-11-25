@@ -50,6 +50,32 @@ KEEP_PREFIXES = ("/etc/leandros/", "/home/", "/root/", "/var/")
 MERGE = {"/etc/passwd", "/etc/group"}
 
 
+def guarded(path):
+    """Binaries and config real PAM needs a usable /etc/shadow for: swapping them
+    on a root whose shadow records musl getspnam() rejects (short lines,
+    `$sha256$` root hash, passwd account without a record) locks everyone out,
+    root and the greeter included."""
+    base = os.path.basename(path)
+    return (base in ("sudo", "su", "greetd", "unix_chkpwd") or "libpam" in base
+            or base.startswith("pam_") or "/pam.d/" in path or path.startswith("/usr/lib/security/")
+            or path.startswith("/lib/security/"))
+
+
+def shadow_gate(t, R):
+    """Run shadowfix on the target, then `shadowfix --check`; (ok, message).
+    An old shadowfix without --check ignores the flag and prints nothing, so the
+    success line is required, not just exit status 0."""
+    cmd = ("if [ -x /usr/sbin/shadowfix ]; then /usr/sbin/shadowfix; echo SHADOWFIX-RC=$?; "
+           "/usr/sbin/shadowfix --check; echo SHADOWFIX-CHECK=$?; else echo SHADOWFIX-MISSING; fi 2>&1")
+    p = R.rrun(t, f"sh -c {q(cmd)}", timeout=300, what="shadowfix")
+    out = p.stdout.decode(errors="replace") + p.stderr.decode(errors="replace")
+    if "SHADOWFIX-MISSING" in out:
+        return False, "no /usr/sbin/shadowfix on the target"
+    if "SHADOWFIX-RC=0" in out and "SHADOWFIX-CHECK=0" in out and "usable by PAM" in out:
+        return True, "shadowfix ok"
+    return False, "shadowfix did not leave /etc/shadow usable by PAM:\n" + out.strip()[-600:]
+
+
 def classify(path):
     """skip | keep | merge | sync"""
     if path in SKIP_EXACT or path.startswith(SKIP_PREFIXES):
@@ -457,7 +483,20 @@ def main(t, R, a):
             if not lines:
                 print("up to date: 0 bytes uploaded")
             return 0
-        fails = apply(t, R, acts)
+        held = {k: [x for x in v if guarded(x[0])] for k, v in acts.items() if k != "mkdir"}
+        held["mkdir"] = []
+        rest = {k: ([x for x in v if not guarded(x[0])] if k != "mkdir" else v) for k, v in acts.items()}
+        fails = apply(t, R, rest)
+        if any(held.values()):
+            n = sum(len(v) for v in held.values())
+            ok, msg = shadow_gate(t, R)
+            if ok and not fails:
+                print(f"shadow gate: {msg}; swapping {n} PAM-dependent path(s)")
+                R.rrun(t, f"mkdir -p {RTMP}", what="mkdir")
+                fails += apply(t, R, held)
+            else:
+                fails.append(f"REFUSED: {n} PAM-dependent path(s) (sudo/su/greetd/libpam/pam.d/...) NOT swapped: "
+                             + (msg if not ok else "earlier changes failed") )
         for f in fails[:20]:
             print("  " + f)
         print(f"pi-sync: {len(lines) - len(fails)}/{len(lines)} change(s) applied, {nbytes} bytes, "

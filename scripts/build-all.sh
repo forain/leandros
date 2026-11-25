@@ -645,7 +645,7 @@ build_gstreamer() {
         # cosmic-player without glib-2.0.pc. Same no-clobber merge, here on the fresh path.
         local sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch"
         if [[ -d "$port/out/$arch.sysroot" && -d "$sys" && ! -f "$sys/usr/lib/pkgconfig/gstreamer-1.0.pc" ]]; then
-            cp -a -n "$port/out/$arch.sysroot/." "$sys/" && echo "  sysroot merged into $sys"
+            leandros_sysroot_merge "$port/out/$arch.sysroot" "$sys" && echo "  sysroot merged into $sys"
         fi
         return 0
     fi
@@ -670,7 +670,7 @@ build_libflatpak() {
         echo "  up to date ($port/out/$arch)"
         local sys="${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch"
         if [[ -d "$port/out/$arch.sysroot" && -d "$sys" && ! -f "$sys/usr/lib/pkgconfig/flatpak.pc" ]]; then
-            cp -a -n "$port/out/$arch.sysroot/." "$sys/" && echo "  sysroot merged into $sys"
+            leandros_sysroot_merge "$port/out/$arch.sysroot" "$sys" && echo "  sysroot merged into $sys"
         fi
         return 0
     fi
@@ -988,6 +988,8 @@ build_sudo_rs() {
         return 0
     fi
     "$ROOT_DIR/ports/sudo-rs/build.sh" "$arch"
+    # pam_rundir.so: the XDG_RUNTIME_DIR session module su/sudo's pam.d names.
+    ARCHES="$arch" "$ROOT_DIR/ports/pam-rundir/build.sh"
 }
 
 # Function to build sudotest -- the su/sudo regression test (userland/sudotest).
@@ -1025,6 +1027,18 @@ build_espctl() {
         return 0
     fi
     "$ROOT_DIR/userland/espctl/build.sh" "$arch"
+}
+
+# shadowfix -- pads short /etc/shadow records to nine fields (userland/shadowfix),
+# installed as /usr/sbin/shadowfix; init runs it once per boot. Same shape as espctl.
+build_shadowfix() {
+    local arch="$1"
+    echo "🛡️  Building $arch shadowfix..."
+    if [[ ! -x "$ROOT_DIR/userland/shadowfix/build.sh" ]]; then
+        echo "⚠️  userland/shadowfix not found, skipping"
+        return 0
+    fi
+    "$ROOT_DIR/userland/shadowfix/build.sh" "$arch"
 }
 
 # leandros-install -- the installer backend (userland/leandros-install),
@@ -1245,6 +1259,7 @@ for arch in "${ARCHS[@]}"; do
     phase build_sudotest build_sudotest "$arch"
     phase build_sshd build_sshd "$arch"
     phase build_espctl build_espctl "$arch"
+    phase build_shadowfix build_shadowfix "$arch"
     phase build_leandros_install build_leandros_install "$arch"
     phase build_e2fsprogs build_e2fsprogs "$arch"
     phase build_disktester build_disktester "$arch"

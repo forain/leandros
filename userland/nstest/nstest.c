@@ -3987,6 +3987,7 @@ static void nsforge_freed_slot_cycles(void)
     int vp[2]; pipe(vp);
     if (v == 0) {
         char x;
+        setpgid(0, 0);   /* own group: the 16 holders below must die with it (they leaked past nstest and held userns slots) */
         if (drop_to(1001)) _exit(2);
         for (int i = 0; i < 16; i++) { pid_t g = fork(); if (g == 0) { unshare(CLONE_NEWUSER); pause(); _exit(0); } }
         if (read(vp[0], &x, 1) < 0) _exit(0);
@@ -3998,7 +3999,8 @@ static void nsforge_freed_slot_cycles(void)
     if (write(go[1], "r", 1) != 1) ok = 0;
     int st = 0; waitpid(a, &st, 0);
     ok = ok && r == 'g' && WIFEXITED(st) && WEXITSTATUS(st) == 0;
-    kill(0 - 0 + v, SIGKILL); close(vp[1]); waitpid(v, &st, 0);
+    setpgid(v, v);
+    kill(-v, SIGKILL); kill(v, SIGKILL); close(vp[1]); waitpid(v, &st, 0);
     unlink("/tmp/nsforge_victim");
     check("nsforge_freed_slot_cycles", ok);
 }

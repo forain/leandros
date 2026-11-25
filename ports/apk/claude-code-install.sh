@@ -12,7 +12,7 @@
 #   1. stages (or extends) the Alpine root with alpine-sysroot: bash (Claude Code's
 #      shell), curl, CA certificates, ripgrep (its search tool), git;
 #   2. downloads the linux-<arch>-musl package straight from registry.npmjs.org and
-#      checks it against the sha512 npm publishes for that version;
+#      checks it against the sha512 npm publishes for that version (latest by default);
 #   3. unpacks the executable to ROOT/opt/claude-code/<version>/claude and links
 #      ROOT/usr/local/bin/claude to it.
 # Any user then runs it with /bin/claude (userland/claude-run, set-user-ID root),
@@ -20,27 +20,50 @@
 # back to the caller's ids before starting the CLI.
 #
 # Environment: CLAUDE_CODE_ROOT (default /opt/alpine; /bin/claude honours it for
-# root only), CLAUDE_CODE_VERSION plus CLAUDE_CODE_SHA512 (hex) to pin another
-# release.
+# root only), CLAUDE_CODE_VERSION to pin a release instead of the latest (its
+# sha512 comes from the registry, or CLAUDE_CODE_SHA512 (hex) when given).
 set -eu
 ROOT="${CLAUDE_CODE_ROOT:-/opt/alpine}"
-VER="${CLAUDE_CODE_VERSION:-2.1.296}"
 ARCH=$(uname -m)
 case "$ARCH" in
-  aarch64) PKG=linux-arm64-musl
-           SUM=73a95945592fb87207828e12cc5db2429f915b03c32cb2e35ee33a48db49911f0419c391e4584b2bb726b2b8c3702fede4008fe0de290917d10f38c2df571840 ;;
-  x86_64)  PKG=linux-x64-musl
-           SUM=99b159d1010db325b3983a3679673c331182016157736c35bf6acb6afbb4258776a58efed12f2925207a455f66cc9d741555d3d3d6d75add2c1cce9f81e033e7 ;;
+  aarch64) PKG=linux-arm64-musl ;;
+  x86_64)  PKG=linux-x64-musl ;;
   *) echo "claude-code-install: no Claude Code build for $ARCH" >&2; exit 1 ;;
 esac
-if [ -n "${CLAUDE_CODE_VERSION:-}" ]; then
-  SUM="${CLAUDE_CODE_SHA512:?CLAUDE_CODE_VERSION needs CLAUDE_CODE_SHA512 (hex sha512 of the npm tarball)}"
-fi
-URL="https://registry.npmjs.org/@anthropic-ai/claude-code-$PKG/-/claude-code-$PKG-$VER.tgz"
 say() { echo "[claude-code-install] $*"; }
+REG="https://registry.npmjs.org/@anthropic-ai/claude-code-$PKG"
 
+# Latest release by default; CLAUDE_CODE_VERSION pins one (then the registry
+# is asked for that version's integrity unless CLAUDE_CODE_SHA512 is given).
+# The sha512 is the integrity npm publishes for the tarball, hex-encoded here.
+# Alpine's curl runs inside the root: the LeandrOS image has no curl of its own.
 say "Alpine root $ROOT"
 /usr/sbin/alpine-sysroot "$ROOT" busybox bash curl ca-certificates ripgrep git
+VER="${CLAUDE_CODE_VERSION:-latest}"
+SUM="${CLAUDE_CODE_SHA512:-}"
+if [ "$VER" = latest ] || [ -z "$SUM" ]; then
+  META="$ROOT/tmp/claude-code-meta.json"
+  say "registry lookup: $REG/$VER"
+  chroot "$ROOT" /usr/bin/curl -fsSL --retry 3 -o /tmp/claude-code-meta.json "$REG/$VER"
+  # the metadata is one JSON object; pick "version" and dist.integrity
+  # (the LeandrOS root has no sed/tr/head: busybox of the Alpine root does the parsing)
+  BB="chroot $ROOT /bin/busybox"
+  RVER=$($BB tr ',' '\n' < "$META" | $BB sed -n 's/^.*"version":"\([0-9][^"]*\)".*$/\1/p' | $BB head -n 1)
+  INTEG=$($BB tr ',' '\n' < "$META" | $BB sed -n 's/^.*"integrity":"sha512-\([^"]*\)".*$/\1/p' | $BB head -n 1)
+  [ -n "$RVER" ] && [ -n "$INTEG" ] || { echo "claude-code-install: no version/sha512 integrity in the registry answer" >&2; exit 1; }
+  [ "$VER" = latest ] || [ "$VER" = "$RVER" ] || { echo "claude-code-install: asked $VER, registry says $RVER" >&2; exit 1; }
+  rm -f "$META"
+  VER="$RVER"
+  if [ -z "$SUM" ]; then
+    SUM=$(echo "$INTEG" | $BB base64 -d | $BB od -An -tx1 -v | $BB tr -d ' \n')
+  fi
+fi
+case "$SUM" in
+  *[!0-9a-f]*|"") echo "claude-code-install: bad sha512" >&2; exit 1 ;;
+esac
+[ ${#SUM} -eq 128 ] || { echo "claude-code-install: sha512 must be 128 hex digits" >&2; exit 1; }
+URL="$REG/-/claude-code-$PKG-$VER.tgz"
+
 
 DEST="/opt/claude-code/$VER"
 if [ -x "$ROOT$DEST/claude" ]; then

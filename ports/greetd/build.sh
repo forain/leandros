@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 . "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/netretry.sh"
-# Build the LeandrOS greetd (login manager / greeter IPC daemon) — static musl,
+# Build the LeandrOS greetd (login manager / greeter IPC daemon) — dynamic musl,
 # both arches.
 #
 # Upstream: https://github.com/kennylevinsen/greetd, GPL-3.0-only, pinned to the
@@ -13,27 +13,18 @@
 #   - /proc/self/exe is resolved with std::env::current_exe() before the fork
 #     rather than handed to execv, because LeandrOS synthesises that path inside
 #     readlink(2) only and execv on it returns ENOENT.
-#   - greetd depends on pam-leandros, which supplies the libpam application ABI
-#     pam-sys binds to. LeandrOS has no PAM stack.
+#   - greetd links Alpine's REAL Linux-PAM (libpam.so.0, dynamic musl PIE, see
+#     scripts/lib/realpam.sh); /etc/pam.d/greetd + pam_unix do the work. The
+#     session-leandros rlib only adds utmpx/cgroup bookkeeping (patch 0005).
 #
-# pam-sys's build script unconditionally emits `-lpam -lpam_misc`. The real
-# symbols come from the pam-leandros rlib, so the two names are satisfied with
-# empty archives in $WORK/linkstub — the linker finds them and pulls nothing.
-#
-# pam-leandros is copied OUTSIDE the greetd source tree on purpose: it declares
-# its own [workspace], and a second workspace root inside greetd's workspace
-# directory is a hard cargo error. From $SRC/greetd/, "../../pam-leandros"
-# resolves to $WORK/pam-leandros.
-#
-# Toolchain: cargo +nightly + rust-lld self-contained musl CRT on macOS, exactly
-# as ports/busd/build.sh does. `-C relocation-model=static` is MANDATORY (musl
-# x86_64 otherwise defaults to static-PIE / ET_DYN at vaddr 0, which the
-# LeandrOS loader maps onto the null page). Produces ET_EXEC, statically linked,
-# no PT_INTERP, first PT_LOAD @ 0x200000.
+# session-leandros is copied OUTSIDE the greetd source tree on purpose: it
+# declares its own [workspace], and a second workspace root inside greetd's
+# workspace directory is a hard cargo error. From $SRC/greetd/,
+# "../../session-leandros" resolves to $WORK/session-leandros.
 #
 # Output binaries are staged to:
 #   ~/code/leandros-artifacts/greetd-lane/<arch>/<srchash>/{greetd,fakegreet,greetd.srchash}
-# keyed by the sha256 of the pam-leandros sources, so lanes building different
+# keyed by the sha256 of the session-leandros sources, so lanes building different
 # sources never overwrite each other. scripts/mkfs-f2fs-populated.py picks the
 # directory matching its own checkout (and runs this script when it is missing).
 # <arch>/greetd (+ fakegreet, greetd.srchash) is still refreshed as a
@@ -58,26 +49,15 @@ if [ ! -d "$SRC" ]; then
   git -C "$SRC" apply "$HERE/patches/0001-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0002-fakegreet-leandros.patch"
   git -C "$SRC" apply "$HERE/patches/0004-trace-leandros.patch"
+  git -C "$SRC" apply "$HERE/patches/0005-session-leandros.patch"
 fi
 
 # The PAM provider is ours and lives in-repo; refresh it every run so an edit
 # there does not need the source tree blown away.
-rm -rf "$WORK/pam-leandros"
-cp -R "$HERE/pam-leandros" "$WORK/pam-leandros"
+rm -rf "$WORK/session-leandros"
+cp -R "$HERE/session-leandros" "$WORK/session-leandros"
 
-mkdir -p "$WORK/linkstub"
-printf '!<arch>\n' > "$WORK/linkstub/libpam.a"
-printf '!<arch>\n' > "$WORK/linkstub/libpam_misc.a"
-
-mkdir -p "$SRC/.cargo"
-cat > "$SRC/.cargo/config.toml" <<'CFG'
-[target.aarch64-unknown-linux-musl]
-linker = "rust-lld"
-[target.x86_64-unknown-linux-musl]
-linker = "rust-lld"
-CFG
-
-SRCHASH=$(cd "$HERE/pam-leandros/src" && LC_ALL=C cat $(LC_ALL=C ls) | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1)
+SRCHASH=$(cd "$HERE" && LC_ALL=C cat $(LC_ALL=C ls session-leandros/src/*) $(LC_ALL=C ls patches/*) session-leandros/Cargo.toml session-leandros/Cargo.lock | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d" " -f1)
 
 for arch in ${ARCHES:-aarch64 x86_64}; do
   KEYED="$SHIP/$arch/$SRCHASH"
@@ -86,10 +66,15 @@ for arch in ${ARCHES:-aarch64 x86_64}; do
     continue
   fi
   target="${arch}-unknown-linux-musl"
+  # Dynamic musl PIE linked against Alpine's REAL libpam.so.0 (linux-pam from
+  # ports/alpine/<arch>.lock), loaded at run time next to pam_unix & friends.
+  source "$HERE/../../scripts/lib/realpam.sh"
+  realpam_stub "$arch" "$WORK/linkstub-$arch"
+  DYN_TC="$HERE/../../scripts/toolchain/dyn" sh "$HERE/../../scripts/toolchain/dyn/gen-cargo-config.sh" "$SRC" >/dev/null
+  sed -i "s|^rustflags = \[|rustflags = [\n  \"-L\", \"native=$WORK/linkstub-$arch\",|" "$SRC/.cargo/config.toml"
   (
     cd "$SRC"
-    RUSTFLAGS="-C relocation-model=static -L native=$WORK/linkstub" \
-      cargo +nightly build --release -p greetd -p fakegreet --target "$target"
+    cargo +nightly build --release -p greetd -p fakegreet --target "$target"
   )
   mkdir -p "$KEYED"
   install -m 0755 "$SRC/target/$target/release/greetd" "$KEYED/greetd"

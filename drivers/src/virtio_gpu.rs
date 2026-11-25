@@ -127,6 +127,8 @@ pub struct VirtioGpuDevice {
     /// began; only these are parked.
     hold_win: [u64; 16],
     hold_win_n: usize,
+    /// Mode 6: the swallowed chain head (`usize::MAX` = none).
+    hold_stash: usize,
     /// Retired fence ids above `fence_floor`; 0 marks a free slot. Sized to the
     /// control queue, which bounds how many fences can be outstanding at all.
     fences_ahead: Vec<u64>,
@@ -568,9 +570,12 @@ struct Inflight {
     sync: bool,
     done: bool,
     resp_type: u32,
-    /// Its fence was written off by `ctx_abandon_fences` (context destroyed
-    /// with the command unanswered). The chain is still the host's.
+    /// Its fence was written off by the whole-host-silent watchdog. The chain is still the host's.
     abandoned: bool,
+    /// Its context was destroyed with the command unanswered. The fence is
+    /// NOT written off: it stays pending (fence_id kept) until the host
+    /// answers it, like a Linux `virtio_gpu_fence` outliving its context.
+    orphaned: bool,
 }
 
 /// Bound on any control-queue wait, in spin iterations (each ≤ one
@@ -743,7 +748,7 @@ static FENCE_ALIVE_US: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 static CTX_LOST: [core::sync::atomic::AtomicBool; CTX_ID_POOL as usize] =
     [const { core::sync::atomic::AtomicBool::new(false) }; CTX_ID_POOL as usize];
 /// Contexts marked LOST by the watchdog (stat).
-static CTXS_LOST_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTXS_LOST_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Mark the context of fence `id` LOST (ringed timelines only); true if newly marked.
 /// The WHOLE-HOST-SILENT write-off never calls this: a host-wide stall that
 /// recovers (the host Metal/HVF watchdog) must not kill COSMIC/Firefox.
@@ -784,13 +789,18 @@ fn host_fence_answered(id: u64) {
 }
 
 /// Fences of destroyed contexts retired in the accounting because the host
-/// never will (`VirtioGpuDevice::ctx_abandon_fences`). Each one also leaves a
+/// never will (the whole-host-silent write-off in `fence_watchdog`). Each one also leaves a
 /// control-queue chain parked host-side.
 pub static CTX_FENCES_ABANDONED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Abandoned chains the host answered after all (see `ctx_alloc_id`), and
 /// how many are parked host-side right now.
 pub static CTX_CHAINS_RECLAIMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static CTX_CHAINS_PARKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Fences of destroyed contexts left pending (orphaned) until the host
+/// answers: total ever, and how many are orphaned right now.
+pub static CTX_FENCES_ORPHANED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CTX_ORPHANS_NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Context ids `1..CTX_ID_POOL` are recycled (lowest free first, like Linux's
 /// ida); above that they are handed out monotonically.
@@ -829,6 +839,8 @@ static FENCE_HOLD_ONE: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// Mode 4: the hold window is the first PER-CONTEXT-timeline fence only.
 /// Test knob mode 5: the host "never answers" the first ringed fence (its reply is dropped before the reap retires it; the chain stays in flight).
 static FENCE_HOLD_DROP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Mode 6: like 5, but the swallowed head is stashed; mode 0 replays it through the normal answered path.
+static FENCE_HOLD_STASH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static FENCE_HOLD_RING_ONLY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static FENCE_HOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static FENCE_HELD_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -887,11 +899,12 @@ fn task_reap_event() {
 pub fn fence_hold_set(mode: u32) {
     use core::sync::atomic::Ordering::{Relaxed, Release};
     match mode {
-        1 | 3 | 4 | 5 => {
+        1 | 3 | 4 | 5 | 6 => {
             FENCE_HOLDS.fetch_add(1, Relaxed);
             if let Some(g) = VIRTIO_GPU.lock().as_mut() { g.hold_win_n = 0; }
             FENCE_HOLD_ONE.store(mode >= 3, Relaxed);
-            FENCE_HOLD_DROP.store(mode == 5, Relaxed);
+            FENCE_HOLD_DROP.store(mode == 5 || mode == 6, Relaxed);
+            FENCE_HOLD_STASH.store(mode == 6, Relaxed);
             FENCE_ALIVE_US.store(if mode >= 4 { 10_000_000 } else { FENCE_ALIVE_US_DEFAULT }, Relaxed);
             FENCE_HOLD_RING_ONLY.store(mode >= 4, Relaxed);
             // Modes 4/5 (phase 7f) get a long auto-release so slow TCG cannot expire the hold mid-test.
@@ -904,6 +917,7 @@ pub fn fence_hold_set(mode: u32) {
         }
         _ => {
             FENCE_HOLD_DROP.store(false, Relaxed);
+            FENCE_HOLD_STASH.store(false, Relaxed);
             FENCE_HOLD_UNTIL_US.store(0, Release);
             if let Some(gpu) = VIRTIO_GPU.lock().as_mut() { gpu.hold_release(); }
             FENCE_EVENT_PENDING.store(true, Release);
@@ -928,6 +942,8 @@ pub fn fence_stats_text(s: &mut alloc::string::String) {
         CTRLQ_UNLOCK_DRAINS.load(Relaxed), AHEAD_COUNT.load(Relaxed), AHEAD_PEAK.load(Relaxed), AHEAD_GROWTHS.load(Relaxed),
         AHEAD_CAP.load(Relaxed), AHEAD_QSIZE.load(Relaxed), FENCE_SUBMIT_REFUSED.load(Relaxed), FENCE_AHEAD_DROPPED.load(Relaxed));
     let _ = writeln!(s, "tl_fences={}", TL_FENCES.load(Relaxed));
+    let _ = writeln!(s, "ctx_orphans={} ctx_orphaned_total={} chains_reclaimed={}",
+        CTX_ORPHANS_NOW.load(Relaxed), CTX_FENCES_ORPHANED.load(Relaxed), CTX_CHAINS_RECLAIMED.load(Relaxed));
     let _ = writeln!(s, "watchdog written_off={} ctx_lost={} hangs={} hung_now={}",
         FENCES_WRITTEN_OFF.load(Relaxed), CTXS_LOST_TOTAL.load(Relaxed), HOST_HANGS.load(Relaxed), host_gpu_hung() as u8);
     let _ = writeln!(s, "hook_lat_us n={} p50<={} p99<={} max={}",
@@ -1647,6 +1663,7 @@ impl VirtioGpuDevice {
             fence_floor: 0,
             hold_win: [0; 16],
             hold_win_n: 0,
+            hold_stash: usize::MAX,
             fences_ahead: Vec::new(),
             fences_ahead_t: Vec::new(),
             held: [0; FENCE_HELD_MAX],
@@ -2169,6 +2186,45 @@ impl VirtioGpuDevice {
         let n = self.held_n;
         self.held_n = 0;
         for i in 0..n { let id = self.held[i]; self.fence_complete(id); }
+        self.hold_replay_stash();
+    }
+
+    /// Mode 6 replay: the stashed head's reply is processed now, through the
+    /// normal answered path (fence retire, reclaim stats, free the chain).
+    fn hold_replay_stash(&mut self) {
+        let head = self.hold_stash;
+        if head == usize::MAX { return; }
+        self.hold_stash = usize::MAX;
+        let e = match self.inflight.get(head).copied().flatten() { Some(e) => e, None => return };
+        if e.fence_id != 0 {
+            self.fence_retire_host(e.fence_id);
+            host_fence_answered(e.fence_id);
+            FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release);
+        }
+        self.note_reclaimed(&e);
+        if let Some(q) = self.queues[0].as_mut() { unsafe { q.free_chain(head as u16); } }
+        self.inflight[head] = None;
+        // Tick or task context unknown here: defer the buffers to the safe list.
+        self.release_buffers(&e, false);
+    }
+
+    /// An abandoned or orphaned chain the host answered: reclaim statistics.
+    fn note_reclaimed(&mut self, e: &Inflight) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if e.orphaned {
+            let _ = CTX_ORPHANS_NOW.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+        } else if e.abandoned {
+            let _ = CTX_CHAINS_PARKED.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+        } else { return; }
+        let n = CTX_CHAINS_RECLAIMED.fetch_add(1, Relaxed);
+        if n < 8 {
+            crate::pci::serial_debug(if e.orphaned { "[GPU] orphaned chain answered, reclaimed: ctx " }
+                else { "[GPU] abandoned chain answered, reclaimed: ctx " });
+            crate::pci::serial_debug_hex(Self::inflight_ctx(e));
+            crate::pci::serial_debug(" parked now ");
+            crate::pci::serial_debug_hex(CTX_CHAINS_PARKED.load(Relaxed) as u32);
+            crate::pci::serial_debug("\n");
+        }
     }
 
     /// Tick/IRQ: end an expired hold. True if it released parked fences.
@@ -2242,6 +2298,9 @@ impl VirtioGpuDevice {
                 && self.hold_win[..self.hold_win_n].contains(&e.fence_id)
             {
                 // Test knob: the reply is swallowed; chain and fence stay in flight.
+                if FENCE_HOLD_STASH.load(core::sync::atomic::Ordering::Relaxed) && self.hold_stash == usize::MAX {
+                    self.hold_stash = head;
+                }
                 continue;
             }
             if e.fence_id != 0 {
@@ -2295,18 +2354,7 @@ impl VirtioGpuDevice {
                 CTRLQ_ASYNC_LAT_US.fetch_add(lat, Relaxed);
                 CTRLQ_ASYNC_LAT_MAX_US.fetch_max(lat, Relaxed);
             }
-            if e.abandoned {
-                use core::sync::atomic::Ordering::Relaxed;
-                let _ = CTX_CHAINS_PARKED.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
-                let n = CTX_CHAINS_RECLAIMED.fetch_add(1, Relaxed);
-                if n < 8 {
-                    crate::pci::serial_debug("[GPU] abandoned chain answered, reclaimed: ctx ");
-                    crate::pci::serial_debug_hex(Self::inflight_ctx(&e));
-                    crate::pci::serial_debug(" parked now ");
-                    crate::pci::serial_debug_hex(CTX_CHAINS_PARKED.load(Relaxed) as u32);
-                    crate::pci::serial_debug("\n");
-                }
-            }
+            self.note_reclaimed(&e);
             if let Some(q) = self.queues[0].as_mut() { unsafe { q.free_chain(head as u16); } }
             self.inflight[head] = None;
             self.release_buffers(&e, task_ctx);
@@ -2347,7 +2395,7 @@ impl VirtioGpuDevice {
             self.ctx_ids_used[(id / 64) as usize] &= !(1u64 << (id % 64));
             // Still parked? Keep preferring it until its chains come back.
             let parked = self.inflight.iter().flatten()
-                .any(|e| e.abandoned && Self::inflight_ctx(e) == id);
+                .any(|e| (e.abandoned || e.orphaned) && Self::inflight_ctx(e) == id);
             let bit = 1u64 << (id % 64);
             if parked { self.ctx_ids_parked[(id / 64) as usize] |= bit; }
             else { self.ctx_ids_parked[(id / 64) as usize] &= !bit; }
@@ -2514,6 +2562,7 @@ impl VirtioGpuDevice {
                 req_phys, req_order, pay_phys, pay_order, resp_phys, resp_order, resp_capacity,
                 fence_id, hdr_type, submitted_us, sync, done: false, resp_type: 0,
                 abandoned: false,
+                orphaned: false,
             });
 
             let q = self.queues[0].as_mut().ok_or(EnqErr::Other)?;
@@ -3357,7 +3406,7 @@ impl VirtioGpuDevice {
     /// `(in flight, of which abandoned)` control-queue entries (gpuqtest).
     pub fn inflight_census(&self) -> (u32, u32) {
         let mut n = 0; let mut a = 0;
-        for e in self.inflight.iter().flatten() { n += 1; if e.abandoned { a += 1; } }
+        for e in self.inflight.iter().flatten() { n += 1; if e.abandoned || e.orphaned { a += 1; } }
         (n, a)
     }
 
@@ -3403,8 +3452,7 @@ impl VirtioGpuDevice {
     ///
     /// Here: when fenced work is pending and no fence has retired for
     /// `FENCE_HANG_US`, the host is declared hung. Every pending fence is
-    /// written off (as `ctx_abandon_fences` does for a destroyed context:
-    /// retired in the accounting, the chain left to the device), waits return,
+    /// written off (retired in the accounting, the chain left to the device), waits return,
     /// and submissions fail fast instead of waiting for ring room. While hung,
     /// newer fences are written off after `FENCE_HUNG_US`. The first real
     /// fence the host answers clears the state. Returns how many fences were
@@ -3446,6 +3494,7 @@ impl VirtioGpuDevice {
         let mut total = 0usize;
         let mut chains = 0usize;
         let mut lost_n = 0usize;
+        let mut real_n = 0usize; // written off, orphans excluded
         let mut first_id = 0u64;
         // Parked by the fence-hold test knob: the simulated "host never
         // retires it" case (answered, but not applied); same rule.
@@ -3462,6 +3511,7 @@ impl VirtioGpuDevice {
                 self.held[hi] = self.held[self.held_n];
                 self.held_t[hi] = self.held_t[self.held_n];
                 if first_id == 0 { first_id = id; }
+                real_n += 1;
                 // Ending the hold-one mode: nothing else is parked behind it.
                 FENCE_HOLD_ONE.store(false, Relaxed);
                 self.fence_complete(id);
@@ -3476,12 +3526,22 @@ impl VirtioGpuDevice {
                 if let Some(e) = slot.as_mut() {
                     if e.fence_id == 0 || e.sync || !stuck(e.fence_id, e.submitted_us) { continue; }
                     if !silent { // host alive: context LOST, the fence stays pending
-                        if ctx_mark_lost(e.fence_id) { lost_n += 1; }
+                        // An orphan's context is gone; its id may belong to an
+                        // innocent new tenant, never blame it.
+                        if !e.orphaned && ctx_mark_lost(e.fence_id) { lost_n += 1; }
                         continue;
                     }
                     ids[n] = e.fence_id;
                     n += 1;
                     e.fence_id = 0;
+                    if e.orphaned {
+                        // Whole host silent: orphans are written off like any pending fence,
+                        // but an orphan alone is no evidence of a hung host.
+                        e.orphaned = false;
+                        let _ = CTX_ORPHANS_NOW.fetch_update(Relaxed, Relaxed, |v| v.checked_sub(1));
+                    } else {
+                        real_n += 1;
+                    }
                     e.abandoned = true;
                 }
             }
@@ -3502,6 +3562,8 @@ impl VirtioGpuDevice {
         CTX_CHAINS_PARKED.fetch_add(chains as u64, Relaxed);
         FENCES_WRITTEN_OFF.fetch_add(total as u64, Relaxed);
         let tl = ((first_id >> FENCE_TL_SHIFT) as usize).min(FENCE_TLS - 1);
+        // Orphan-only write-offs stay quiet: no hang state, no count, no log.
+        if real_n == 0 { return total; }
         let whole_host = silent;
         // One count and one log line per hang episode (the first pass only).
         let first_pass = !host_gpu_hung();
@@ -3528,55 +3590,37 @@ impl VirtioGpuDevice {
         total
     }
 
-    /// `ctx_id` has been destroyed: every fenced command of it still in flight
-    /// will never be answered. The host (QEMU's virgl backend) retires a
-    /// context-ring fence only through that context, and a destroyed context
-    /// retires nothing, so the command stays parked host-side for good.
-    ///
-    /// Left alone, that one fence is a hole under `fence_floor`: the floor is
-    /// exact and stops below it, so every later fence — every present, every
-    /// other client's — reads "not retired" until `fences_ahead` overflows and
-    /// the floor jumps (about two drmsmoke runs' worth). That was drmsmoke's
-    /// `FLIP_EVENT_DELIVERED_ON_FENCE` 0/32 right after a Venus compositor was
-    /// killed: every flip fell to the tick fallback, then it healed by itself.
-    ///
-    /// So retire those ids in the accounting now. The chains themselves stay
-    /// in `inflight`: the device still owns their buffers, and if it ever does
-    /// answer, the reap frees them (with the fence already cleared here, so it
-    /// is not retired twice). Returns how many were abandoned.
-    pub fn ctx_abandon_fences(&mut self, ctx_id: u32) -> usize {
+    /// `ctx_id` is being destroyed: every fenced command of it still in flight
+    /// becomes an orphan. Like a Linux `virtio_gpu_fence`, the fence outlives
+    /// its context and signals only when the host answers it (QEMU answers a
+    /// queued fence of the same (ctx id, ring) when that fence or a later one
+    /// is signalled, so reuse of the id under a continuing timeline heals it).
+    /// Nothing is retired here: the chain and `fence_id` stay in `inflight`,
+    /// the reap retires the fence when the answer arrives, and only the
+    /// whole-host-silent write-off or a device reset ends one early.
+    /// Must run before `ctx_free_id`. Returns how many were orphaned.
+    pub fn ctx_orphan_fences(&mut self, ctx_id: u32) -> usize {
         let mut total = 0usize;
-        loop {
-            // In batches, because `fence_complete` needs `self` back.
-            let mut ids = [0u64; 16];
-            let mut n = 0usize;
-            for slot in self.inflight.iter_mut() {
-                if n == ids.len() { break; }
-                if let Some(e) = slot.as_mut() {
-                    if e.fence_id == 0 || e.sync || Self::inflight_ctx(e) != ctx_id { continue; }
-                    ids[n] = e.fence_id;
-                    n += 1;
-                    e.fence_id = 0;
-                    e.abandoned = true;
-                }
+        for slot in self.inflight.iter_mut() {
+            if let Some(e) = slot.as_mut() {
+                if e.fence_id == 0 || e.sync || e.orphaned || Self::inflight_ctx(e) != ctx_id { continue; }
+                e.orphaned = true;
+                total += 1;
             }
-            if n == 0 { break; }
-            for &id in &ids[..n] { self.fence_complete(id); }
-            total += n;
         }
         if total != 0 {
-            CTX_CHAINS_PARKED.fetch_add(total as u64, core::sync::atomic::Ordering::Relaxed);
+            use core::sync::atomic::Ordering::Relaxed;
+            CTX_ORPHANS_NOW.fetch_add(total as u64, Relaxed);
             if ctx_id != 0 && ctx_id < CTX_ID_POOL {
                 self.ctx_ids_parked[(ctx_id / 64) as usize] |= 1u64 << (ctx_id % 64);
             }
-            FENCE_EVENT_PENDING.store(true, core::sync::atomic::Ordering::Release);
-            let k = CTX_FENCES_ABANDONED.fetch_add(total as u64, core::sync::atomic::Ordering::Relaxed);
+            let k = CTX_FENCES_ORPHANED.fetch_add(total as u64, Relaxed);
             if k < 8 {
                 crate::pci::serial_debug("[GPU] ctx ");
                 crate::pci::serial_debug_hex(ctx_id);
-                crate::pci::serial_debug(" destroyed with unanswered fences: abandoned ");
+                crate::pci::serial_debug(" destroyed with unanswered fences: orphaned ");
                 crate::pci::serial_debug_hex(total as u32);
-                crate::pci::serial_debug("\n");
+                crate::pci::serial_debug(" (pending until the host answers)\n");
             }
         }
         total
@@ -4056,6 +4100,10 @@ pub trait GpuSync {
     }
 
     fn ctx_destroy(&mut self, ctx_id: u32) -> bool {
+        // Fences the context still has in flight stay pending (orphaned) until
+        // the host answers them; mark them before the id is freed so it counts
+        // as parked.
+        self.dev().ctx_orphan_fences(ctx_id);
         let hdr = self.dev().hdr_for(VirtioGpuCmd::CtxDestroy, ctx_id);
         let bytes = unsafe {
             core::slice::from_raw_parts(

@@ -17,6 +17,7 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src"
 
@@ -78,7 +79,7 @@ leader_of() {
 # (a different flag set in one app would thrash the shared dir again).
 extra_for() {
   [[ "$(leader_of "$1")" == cosmic-edit ]] || return 0
-  local o="$M6/out/ssp_guard-$2.o"
+  local o="$M6_OUT/ssp_guard-$2.o"
   "$M6/toolchain/$2-linux-musl-cc" -fno-stack-protector -c "$(dirname "$0")/../mesa/ssp_guard.c" -o "$o" || return 1
   echo "--config=target.$2-unknown-linux-musl.rustflags=[\"-C\",\"link-arg=$o\"]"
 }
@@ -103,8 +104,8 @@ build_one() {
       echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
       return 1
     fi
-    stage_file 0755 "$SRC/$app/target/$arch-unknown-linux-musl/release/$app" "$M6/out/$app-$arch"
-    echo "staged $arch: $M6/out/$app-$arch"
+    stage_file 0755 "$SRC/$app/target/$arch-unknown-linux-musl/release/$app" "$M6_OUT/$app-$arch"
+    echo "staged $arch: $M6_OUT/$app-$arch"
   done
 }
 
