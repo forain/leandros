@@ -41,3 +41,12 @@ pub fn sink_info() -> (u32, u32, u32, u32) { (0, 0, 0, 0) }
 pub fn is_d0() -> bool { crate::bcm2712_id::stepping().stepping != crate::bcm2712_id::Stepping::C0 }
 #[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
 pub fn is_d0() -> bool { false }
+
+/// Stepping as the sink record carries it: 0 = C0, 1 = D0, 2 = unknown (`is_d0` counts it as D0).
+#[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
+pub fn stepping_code() -> u32 {
+    use crate::bcm2712_id::Stepping;
+    match crate::bcm2712_id::stepping().stepping { Stepping::C0 => 0, Stepping::D0 => 1, Stepping::Unknown => 2 }
+}
+#[cfg(not(all(target_arch = "aarch64", feature = "rpi5")))]
+pub fn stepping_code() -> u32 { 0 }

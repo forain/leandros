@@ -44,4 +44,12 @@ if rustc --edition 2021 --test "$ROOT_DIR/drivers/src/rpi_misc_logic.rs" -o "$kd
 else
     tail -n 20 "$kdir/hosttest.log"; echo "check-rpi5: rpi_misc_logic host tests FAILED"; rc=1
 fi
+# The hdmi-audio module compiles the built-in driver source against the kmod-kapi shim: a
+# private-module re-export or a kapi drift there is invisible to `cargo check -p kernel`.
+if RUSTFLAGS= cargo build -p kmod-hdmi-audio --target "$spec" --target-dir "$ROOT_DIR/target/kmod-build" --release \
+    -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec >"$kdir/kmod-hdmi-audio.log" 2>&1; then
+    echo "check-rpi5: kmod-hdmi-audio builds"
+else
+    grep -E '^error' -A6 "$kdir/kmod-hdmi-audio.log" | head -n 30; echo "check-rpi5: kmod-hdmi-audio build FAILED"; rc=1
+fi
 exit "$rc"
