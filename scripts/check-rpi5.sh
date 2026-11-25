@@ -11,14 +11,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 board="${CHECK_FEATURE:-rpi5}"
+# CHECK_PROFILE=usbroot: Pi 5 with no SD driver (configs/rpi5_usbroot_defconfig).
+profile="$board"
+if [[ "${CHECK_PROFILE:-}" == "usbroot" ]]; then board=rpi5; profile=rpi5_usbroot; fi
 arch=aarch64
-kdir="$ROOT_DIR/target/kconfig-check-$board"
+kdir="$ROOT_DIR/target/kconfig-check-$profile"
 mkdir -p "$kdir"
 if [[ -f "$ROOT_DIR/.config" ]]; then
-    cat "$ROOT_DIR/configs/${board}_defconfig" "$ROOT_DIR/.config" > "$kdir/.config.in"
+    cat "$ROOT_DIR/configs/${profile}_defconfig" "$ROOT_DIR/.config" > "$kdir/.config.in"
     python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" olddefconfig --arch "$arch" --config "$kdir/.config.in" --out "$kdir/.config" >&2
 else
-    python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" defconfig --arch "$arch" --defconfig "$ROOT_DIR/configs/${board}_defconfig" --out "$kdir/.config" >&2
+    python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" defconfig --arch "$arch" --defconfig "$ROOT_DIR/configs/${profile}_defconfig" --out "$kdir/.config" >&2
 fi
 kc="$(python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" features --arch "$arch" --config "$kdir/.config" --kmod-list "$kdir/kmod-list")"
 feats="$board"
@@ -29,7 +32,7 @@ spec="$ROOT_DIR/targets/aarch64-unknown-kernel.json"
 rc=0
 RUSTFLAGS="-C link-arg=-T$ROOT_DIR/linkers/aarch64.ld" \
 cargo check -p kernel --features "$feats" --target "$spec" \
-    --target-dir "target/check-aarch64-$board" --release \
+    --target-dir "target/check-aarch64-$profile" --release \
     -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec \
     >"$kdir/check.log" 2>&1 || rc=$?
 tail -n "${CHECK_TAIL:-20}" "$kdir/check.log"
