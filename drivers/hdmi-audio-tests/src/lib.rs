@@ -13,6 +13,18 @@ pub mod cb;
 mod tests {
     use super::pure::*;
 
+    /// The driver may hand the DMA engine exactly one address: MAI_DATA at its CPU physical
+    /// address. A 32-bit "bus" alias (0x7c72_xxxx) is ordinary DRAM on >= 2 GiB boards.
+    #[test]
+    fn no_bus_alias_fifo_address_in_driver() {
+        let src = include_str!("../../src/hdmi_audio/mod.rs");
+        let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        assert!(!code.contains("FIFO_BUS"));
+        let norm = code.to_lowercase().replace('_', "");
+        // The CPU physical form is 0x10_7c72_xxxx (normalised 0x107c72..); a bare 0x7c72 is the alias.
+        assert!(!norm.contains("0x7c72"), "bare 0x7c72.. address (bus alias) found");
+    }
+
     /// alsa-lib pcm_iec958.c `iec958_subframe` for an S32 (left-justified) sample, transcribed.
     fn alsa_subframe(s32: u32, channel: usize, counter: usize, status: &[u8; 24]) -> u32 {
         let byte = counter >> 3;

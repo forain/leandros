@@ -58,10 +58,10 @@ mod hw {
     const HD_PHYS: u64 = 0x10_7c72_0000;
     const HDMI0_PHYS: u64 = 0x10_7c70_1400;
     const PACKET0_PHYS: u64 = 0x10_7c70_3800;
-    /// MAI_DATA for hdmi0: CPU physical (dma-ranges are the identity) and the legacy 32-bit
-    /// `hd` reg cell Linux vc4 hands the DMA engine.
+    /// MAI_DATA for hdmi0 as a CPU physical address (dma-ranges are the identity). This is the
+    /// only FIFO address ever given to the DMA engine: a 32-bit "bus" alias would be ordinary
+    /// DRAM on boards with 2 GiB or more.
     const FIFO_CPU: u64 = HD_PHYS + HD_MAI_DATA as u64;
-    const FIFO_BUS: u64 = 0x7c72_0000 + HD_MAI_DATA as u64;
     /// `dmas = <&dma40 0x41fa000a>` on the hdmi0 node (PER_MAP 10).
     const DREQ_CELL_HDMI0: u32 = 0x41fa_000a;
     const DMA_CHANNEL: u8 = 10;
@@ -202,20 +202,15 @@ mod hw {
             self.in_rate = 48_000;
             self.in_channels = 2;
             self.program(48_000)?;
-            // Try the CPU-physical FIFO first, then the 32-bit bus address.
-            let mut how = "";
-            for (fifo, name) in [(FIFO_CPU, "cpu"), (FIFO_BUS, "bus")] {
-                self.fifo = fifo;
-                match self.start_dma(true) {
-                    Ok(()) => { how = name; break; }
-                    Err(why) => serial_debug(&format!("[hdmiaud] fifo {} 0x{:x}: {}\n", name, fifo, why)),
-                }
+            self.fifo = FIFO_CPU;
+            if let Err(why) = self.start_dma(true) {
+                serial_debug(&format!("[hdmiaud] fifo 0x{:x}: {}\n", FIFO_CPU, why));
+                return Err("dma never moved (no progress at the MAI FIFO)");
             }
-            if how.is_empty() { return Err("dma never moved (DREQ 10 silent with both FIFO addresses)"); }
             let ch_id = self.chan.as_ref().map_or(0, |c| c.id());
             self.summary = format!(
-                "hdmi0 pix={} kHz N={} CTS={} gate={} thr={} dma ch{} fifo={}(0x{:x}) {} edid={}\n",
-                self.pix_khz, self.n, self.cts, gate_was, if self.d0 { "d0" } else { "c" }, ch_id, how, self.fifo,
+                "hdmi0 pix={} kHz N={} CTS={} gate={} thr={} dma ch{} fifo=0x{:x} {} edid={}\n",
+                self.pix_khz, self.n, self.cts, gate_was, if self.d0 { "d0" } else { "c" }, ch_id, self.fifo,
                 if dma::polled() { "poll" } else { "irq" },
                 match sink { env::SINK_HDMI => "hdmi", env::SINK_DVI => "dvi(forced hdmi mode)", _ => "unknown" }
             );
