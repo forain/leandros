@@ -124,6 +124,10 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
     if !test_wait_releases_memory_exactly() { failures += 1; }
+    if !test_wait_teardown_exact_per_child() { failures += 1; }
+    if !test_wait_teardown_hold() { failures += 1; }
+    if !test_wait_teardown_busyhold() { failures += 1; }
+    if !test_wait_memory_drift() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
@@ -2088,6 +2092,285 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
     write(STDOUT_FILENO, b"  worst_lost_pages=".as_ptr(), 19); print_dec(worst);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, ok)
+}
+
+// ── Exact teardown accounting through /proc/leandros_asfree (lane memexact) ──
+// The kernel records every address-space teardown in a 256-entry ring: owner
+// tgid, sequence number, pages whose refcount reached zero, page-table pages
+// freed. A test sees *which* teardown happened, not a system-wide free-memory
+// difference that unrelated churn can move.
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct AsFreeEnt { seq: u64, tgid: usize, pages: usize, pt: usize }
+struct AsFree { total: u64, n: usize, e: [AsFreeEnt; 256] }
+
+const ASFREE_PATH: &[u8] = b"/proc/leandros_asfree\0";
+
+/// Parse the ring; false when the file cannot be read (not root, old kernel).
+unsafe fn asfree_read(out: &mut AsFree) -> bool {
+    let mut buf = [0u8; 16384];
+    let n = slurp(ASFREE_PATH, &mut buf);
+    if n == 0 { return false; }
+    out.total = 0; out.n = 0;
+    let mut got_total = false;
+    for line in buf[..n].split(|&c| c == b'\n') {
+        if line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix(b"total ") {
+            out.total = parse_num(rest).unwrap_or(0) as u64;
+            got_total = true;
+            continue;
+        }
+        let mut f = [0usize; 4];
+        let mut k = 0;
+        for w in line.split(|&c| c == b' ') {
+            if k < 4 { if let Some(v) = parse_num(w) { f[k] = v; k += 1; } }
+        }
+        if k == 4 && out.n < 256 {
+            out.e[out.n] = AsFreeEnt { seq: f[0] as u64, tgid: f[1], pages: f[2], pt: f[3] };
+            out.n += 1;
+        }
+    }
+    got_total
+}
+
+/// Write one command (`hold <pid>`, `busyhold <pid> <us>`, `release <pid>`).
+unsafe fn asfree_cmd(cmd: &[u8]) -> bool {
+    let fd = open(ASFREE_PATH.as_ptr(), 2, 0);
+    if fd < 0 { return false; }
+    let r = write(fd, cmd.as_ptr(), cmd.len());
+    close(fd);
+    r == cmd.len() as isize
+}
+
+/// `"<verb> <pid>[ <us>]"` into `out`; returns the length.
+fn asfree_fmt(verb: &[u8], pid: i32, us: usize, out: &mut [u8; 48]) -> usize {
+    let mut p = 0;
+    for &b in verb { out[p] = b; p += 1; }
+    for (i, v) in [pid as usize, us].iter().enumerate() {
+        if i == 1 && *v == 0 { break; }
+        out[p] = b' '; p += 1;
+        let mut d = [0u8; 20]; let mut k = 0; let mut x = *v;
+        loop { d[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+        while k > 0 { k -= 1; out[p] = d[k]; p += 1; }
+    }
+    p
+}
+
+unsafe fn asfree_do(verb: &[u8], pid: i32, us: usize) -> bool {
+    let mut b = [0u8; 48];
+    let n = asfree_fmt(verb, pid, us, &mut b);
+    asfree_cmd(&b[..n])
+}
+
+/// Entries of `a` whose owner is `tgid`: (count, last).
+fn asfree_of(a: &AsFree, tgid: usize) -> (usize, AsFreeEnt) {
+    let mut c = 0; let mut last = AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 };
+    for i in 0..a.n { if a.e[i].tgid == tgid { c += 1; last = a.e[i]; } }
+    (c, last)
+}
+
+unsafe fn asfree_new() -> AsFree {
+    AsFree { total: 0, n: 0, e: [AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }; 256] }
+}
+
+unsafe fn kill_and_reap(pid: i32) {
+    syscall2(nr::KILL, pid as usize, 9);
+    wait_status(pid);
+}
+
+/// `kB` value of a `/proc/meminfo` line (0 when absent).
+unsafe fn meminfo_kb(key: &[u8]) -> usize {
+    let mut buf = [0u8; 2048];
+    let n = slurp(b"/proc/meminfo\0", &mut buf);
+    for line in buf[..n].split(|&c| c == b'\n') {
+        if let Some(rest) = line.strip_prefix(key) { return parse_num(rest).unwrap_or(0); }
+    }
+    0
+}
+
+/// free RAM + Cached + Shmem, in pages.
+unsafe fn ram_plus_cache_pages() -> usize {
+    free_ram() / PAGE + (meminfo_kb(b"Cached:") + meminfo_kb(b"Shmem:")) / (PAGE / 1024)
+}
+
+/// The child of the old exactness test: 1024 touched anonymous pages and a
+/// burst of long mm syscalls, then exit(0).
+unsafe fn teardown_child_body() -> ! {
+    const PAGES: usize = 1024;
+    let p = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { exit(2); }
+    for pg in 0..PAGES { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
+    for i in 0..1024usize {
+        let prot = if i % 2 == 0 { PROT_READ } else { PROT_READ | PROT_WRITE };
+        leandros_libc::syscall::syscall3(SYS_MPROTECT_NR, p as usize, PAGES * PAGE, prot as usize);
+    }
+    exit(0)
+}
+
+/// Per child, exact: right after wait4 returns, the ring holds exactly one
+/// entry for the child's pid, with the pages and page tables it had. No
+/// polling, no slack; the /proc hammer of the old test runs here too. A
+/// wrapped ring (more than 256 teardowns during a round) is a failure of the
+/// measurement, so it fails.
+unsafe fn test_wait_teardown_exact_per_child() -> bool {
+    let name = b"wait_teardown_exact_per_child\0";
+    let mut ok = true;
+    let mut before = asfree_new();
+    if !asfree_read(&mut before) { return report(name, false); }
+    let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
+    if shared as isize == -1 { return report(name, false); }
+    let mut missing = 0usize; let mut dup = 0usize; let mut few = 0usize; let mut wrapped = 0usize;
+    let mut a = asfree_new();
+    for _ in 0..20 {
+        core::ptr::write_volatile(shared, 0);
+        let hammer = fork();
+        if hammer == 0 {
+            let mut buf = [0u8; 1024];
+            let mut path = [0u8; 64];
+            loop {
+                let c = core::ptr::read_volatile(shared) as i32;
+                if c == 0 { continue; }
+                proc_path(c, b"status", &mut path);
+                slurp(&path, &mut buf);
+                proc_path(c, b"statm", &mut path);
+                slurp(&path, &mut buf);
+            }
+        }
+        if !asfree_read(&mut before) { kill_and_reap(hammer); ok = false; break; }
+        let pid = fork();
+        if pid == 0 { teardown_child_body(); }
+        core::ptr::write_volatile(shared, pid as u64);
+        let status = wait_status(pid);
+        let read_ok = asfree_read(&mut a);
+        kill_and_reap(hammer);
+        if status != 0 || !read_ok { ok = false; continue; }
+        if a.total.saturating_sub(before.total) > 256 { wrapped += 1; continue; }
+        let (c, e) = asfree_of(&a, pid as usize);
+        if c == 0 { missing += 1; continue; }
+        if c > 1 { dup += 1; }
+        if e.pages < 1024 || e.pt < 4 { few += 1; }
+    }
+    write(STDOUT_FILENO, b"  missing=".as_ptr(), 10); print_dec(missing);
+    write(STDOUT_FILENO, b" dup=".as_ptr(), 5); print_dec(dup);
+    write(STDOUT_FILENO, b" few=".as_ptr(), 5); print_dec(few);
+    write(STDOUT_FILENO, b" wrapped=".as_ptr(), 9); print_dec(wrapped);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok && missing == 0 && dup == 0 && few == 0 && wrapped == 0)
+}
+
+/// Child that blocks on `go` until the parent has armed a knob, then touches
+/// some pages and exits.
+unsafe fn spawn_gated_child(go: &mut [i32; 2]) -> i32 {
+    if pipe(go.as_mut_ptr()) != 0 { return -1; }
+    let pid = fork();
+    if pid == 0 {
+        close(go[1]);
+        let mut b = [0u8; 1];
+        read(go[0], b.as_mut_ptr(), 1);
+        let p = mmap(core::ptr::null_mut(), 64 * PAGE, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize != -1 { for pg in 0..64 { core::ptr::write_volatile(p.add(pg * PAGE), 1); } }
+        exit(0);
+    }
+    close(go[0]);
+    pid
+}
+
+/// Poll the ring up to `ms` for an entry of `tgid`; returns its count.
+unsafe fn asfree_wait_entry(tgid: usize, ms: u32) -> usize {
+    let mut a = asfree_new();
+    let mut waited = 0;
+    loop {
+        if asfree_read(&mut a) {
+            let (c, _) = asfree_of(&a, tgid);
+            if c > 0 || waited >= ms { return c; }
+        } else { return 0; }
+        usleep(5_000);
+        waited += 5;
+    }
+}
+
+/// Deterministic `hold`: the kernel keeps a strong reference to the child's
+/// address space (no `busy`) while it exits; wait4 must still report only
+/// after the teardown ran, so the ring entry must be present right after
+/// wait4. A kernel whose wait4 does not wait for the last reference fails
+/// here. The hold is released and the child reaped on every path.
+unsafe fn test_wait_teardown_hold() -> bool {
+    let name = b"wait_teardown_hold\0";
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"hold", pid, 0);
+    if armed { usleep(2_000); }
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    let mut a = asfree_new();
+    let at_wait = asfree_read(&mut a) && asfree_of(&a, pid as usize).0 == 1;
+    asfree_do(b"release", pid, 0);
+    let after_release = asfree_wait_entry(pid as usize, 2_000);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait as usize);
+    write(STDOUT_FILENO, b" after_release=".as_ptr(), 15); print_dec(after_release);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && status == 0 && at_wait && after_release == 1)
+}
+
+/// `busyhold`: a kernel observer holds the child's `busy` flag (and so its
+/// address space) for up to 5 ms around the child's exit. The teardown must
+/// still happen, exactly once, within a second of wait4; whether it was
+/// already done at wait4 is printed.
+unsafe fn test_wait_teardown_busyhold() -> bool {
+    let name = b"wait_teardown_busyhold\0";
+    let mut ok = true;
+    let mut late = 0usize;
+    for round in 0..10usize {
+        let mut go = [0i32; 2];
+        let pid = spawn_gated_child(&mut go);
+        if pid <= 0 { return report(name, false); }
+        let armed = asfree_do(b"busyhold", pid, 1_000 + 400 * round);
+        if armed { usleep(500); }
+        write(go[1], b"x".as_ptr(), 1);
+        close(go[1]);
+        let status = wait_status(pid);
+        let mut a = asfree_new();
+        if !(asfree_read(&mut a) && asfree_of(&a, pid as usize).0 == 1) { late += 1; }
+        asfree_do(b"release", pid, 0);
+        let c = asfree_wait_entry(pid as usize, 1_000);
+        ok &= armed && status == 0 && c == 1;
+        // Let the observer thread finish before the next round re-arms the slot.
+        usleep(8_000);
+    }
+    write(STDOUT_FILENO, b"  not_yet_at_wait=".as_ptr(), 18); print_dec(late);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok)
+}
+
+/// Whole-test drift: after a batch of children has come and gone, free RAM +
+/// Cached + Shmem is back within 64 pages, polled up to 5 s (a late free is
+/// allowed to be late, a missing one is not).
+unsafe fn test_wait_memory_drift() -> bool {
+    let name = b"wait_memory_drift\0";
+    let before = ram_plus_cache_pages();
+    let mut ok = true;
+    for _ in 0..30 {
+        let pid = fork();
+        if pid == 0 { teardown_child_body(); }
+        ok &= wait_status(pid) == 0;
+    }
+    let mut drift = before.saturating_sub(ram_plus_cache_pages());
+    let mut tries = 0;
+    while drift >= 64 && tries < 100 {
+        usleep(50_000);
+        drift = before.saturating_sub(ram_plus_cache_pages());
+        tries += 1;
+    }
+    write(STDOUT_FILENO, b"  drift_pages=".as_ptr(), 14); print_dec(drift);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok && drift < 64)
 }
 
 
