@@ -100,8 +100,181 @@ pub fn pick_slots(base: usize, step: usize, tries: usize, mut read: impl FnMut(u
     None
 }
 
+/// One frame at 60.000 Hz, the period `next_check_at` assumes.
+pub const FRAME_NS: u64 = 16_666_667;
+
+/// When to look at the HVS next: just before the next frame boundary predicted from the last
+/// observed latch, then in 250 us steps; 1 ms steps until a boundary has been observed.
+pub fn next_check_at(phase_ns: u64, now: u64) -> u64 {
+    if phase_ns == 0 { return now + 1_000_000; }
+    let k = now.saturating_sub(phase_ns) / FRAME_NS + 1;
+    let t = (phase_ns + k * FRAME_NS).saturating_sub(300_000);
+    if t <= now + 50_000 { now + 250_000 } else { t }
+}
+
+/// The phase to remember when a latch is seen at `now` (the observation time, not the latch).
+pub fn latched_phase(_prev_ns: u64, now: u64) -> u64 { now }
+
+/// Upper edges (us) of the event-lateness histogram buckets; the last bucket is open.
+pub const LATE_EDGES_US: [u64; 6] = [250, 500, 1000, 2000, 4000, 8000];
+
+/// Histogram bucket of a lateness in ns: <250, <500, <1000, <2000, <4000, <8000, >=8000 us.
+pub fn late_bucket(ns: u64) -> usize {
+    let us = ns / 1000;
+    LATE_EDGES_US.iter().position(|&e| us < e).unwrap_or(LATE_EDGES_US.len())
+}
+
+/// CH0 STATUS fields (UNVERIFIED on hardware; candidate layout, firmware sample 0x00ba4124):
+/// scan line [12:0], mode [14:13] (2 = run), FRCNT [21:16].
+pub fn status_line(status: u32) -> u32 { status & 0x1fff }
+pub fn status_mode(status: u32) -> u32 { (status >> 13) & 3 }
+pub fn status_frcnt(status: u32) -> u32 { (status >> 16) & 0x3f }
+
+/// Bins of the scan-line histogram: 8 equal bins of 0..vtotal, then bin 8 for line >= vtotal
+/// (blanking beyond the frame / implausible reading).
+pub const LINE_BINS: usize = 9;
+pub fn line_bin(line: u32, vtotal: u32) -> usize {
+    if vtotal == 0 || line >= vtotal { return LINE_BINS - 1; }
+    (line as u64 * 8 / vtotal as u64) as usize
+}
+
+/// Assumed total lines of a frame with `h` active lines (CEA timing: 1080 -> 1125). An
+/// assumption, reported as such.
+pub fn vtotal_guess(h: u32) -> u32 { (h as u64 * 1125 / 1080) as u32 }
+
+/// Time since the frame start implied by `line` (0 for lines outside the active range `h`
+/// give `None`): line * period / vtotal.
+pub fn line_late_ns(line: u32, h: u32, vtotal: u32, period_ns: u64) -> Option<u64> {
+    if vtotal == 0 || line >= h { return None; }
+    Some(line as u64 * period_ns / vtotal as u64)
+}
+
+/// Counters behind `/proc/leandros_hvs`. Plain atomics, no locks; every field is a diagnostic.
+pub mod stats {
+    use core::fmt::Write;
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    use super::late_bucket;
+
+    pub static LIVE: AtomicU32 = AtomicU32::new(0);
+    pub static FLIPS: AtomicU64 = AtomicU64::new(0);
+    pub static WAITS: AtomicU64 = AtomicU64::new(0);
+    pub static TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static BUSY_REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub static EVENTS: AtomicU64 = AtomicU64::new(0);
+    pub static MISSED: AtomicU64 = AtomicU64::new(0);
+    /// Upper-bound lateness histogram (only events with a pending observation before them).
+    pub static LATE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// Events with no pending observation before them (no bound exists).
+    pub static LATE_UNBOUNDED: AtomicU64 = AtomicU64::new(0);
+    /// Scan-line histogram at latch observation (UNVERIFIED field), and implied lateness.
+    pub static LINE: [AtomicU64; super::LINE_BINS] = [const { AtomicU64::new(0) }; super::LINE_BINS];
+    pub static LINE_LATE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    pub static LINE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    /// Last 8 raw STATUS values at latch with their ktime (ns), newest at RING_N-1 mod 8.
+    pub static RING_N: AtomicU64 = AtomicU64::new(0);
+    pub static RING_ST: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+    pub static RING_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    /// FRCNT frames and the time they took, summed over unambiguous poll pairs.
+    pub static PERIOD_FRAMES: AtomicU64 = AtomicU64::new(0);
+    pub static PERIOD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LATCH_STATUS: AtomicU32 = AtomicU32::new(0);
+    pub static FENCE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FENCE_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FENCE_N: AtomicU64 = AtomicU64::new(0);
+    pub static TAKEOVER_NS: AtomicU64 = AtomicU64::new(0);
+    pub static KSYNC: AtomicU64 = AtomicU64::new(0);
+
+    /// Account one flip event. `bound_ns` is `Some(now - last observation that saw it pending)`,
+    /// an upper bound of its lateness, or `None` when no pending observation preceded it.
+    pub fn record_event(bound_ns: Option<u64>) {
+        EVENTS.fetch_add(1, Relaxed);
+        match bound_ns {
+            Some(b) => {
+                LATE[late_bucket(b)].fetch_add(1, Relaxed);
+                if b > super::FRAME_NS { MISSED.fetch_add(1, Relaxed); }
+            }
+            None => { LATE_UNBOUNDED.fetch_add(1, Relaxed); }
+        }
+    }
+
+    /// Record the raw STATUS seen at a latch at ktime `now`, decode its scan line against an
+    /// active height `h` and `vtotal`, and bin it. `period_ns` converts the line to time.
+    pub fn record_status(status: u32, now: u64, h: u32, vtotal: u32, period_ns: u64) {
+        LATCH_STATUS.store(status, Relaxed);
+        let i = RING_N.fetch_add(1, Relaxed) as usize & 7;
+        RING_ST[i].store(status, Relaxed);
+        RING_NS[i].store(now, Relaxed);
+        let line = super::status_line(status);
+        LINE[super::line_bin(line, vtotal)].fetch_add(1, Relaxed);
+        match super::line_late_ns(line, h, vtotal, period_ns) {
+            Some(ns) => { LINE_LATE[late_bucket(ns)].fetch_add(1, Relaxed); }
+            None => { LINE_SKIPPED.fetch_add(1, Relaxed); }
+        }
+    }
+
+    pub fn record_fence_wait(ns: u64) {
+        FENCE_N.fetch_add(1, Relaxed);
+        FENCE_NS.fetch_add(ns, Relaxed);
+        FENCE_MAX_NS.fetch_max(ns, Relaxed);
+    }
+
+    pub fn record_period(frames: u64, ns: u64) {
+        PERIOD_FRAMES.fetch_add(frames, Relaxed);
+        PERIOD_NS.fetch_add(ns, Relaxed);
+    }
+
+    /// Measured frame period in ns (0 until a sample exists). Reported only; nothing uses it.
+    pub fn period_ns() -> u64 {
+        let f = PERIOD_FRAMES.load(Relaxed);
+        if f == 0 { 0 } else { PERIOD_NS.load(Relaxed) / f }
+    }
+
+    /// Zero every counter (`LIVE` and `TAKEOVER_NS` describe state, not a count, and stay).
+    pub fn reset() {
+        for c in [&FLIPS, &WAITS, &TICKS, &BUSY_REFUSED, &EVENTS, &MISSED, &PERIOD_FRAMES, &PERIOD_NS,
+                  &FENCE_NS, &FENCE_MAX_NS, &FENCE_N, &KSYNC] { c.store(0, Relaxed); }
+        for c in LATE.iter().chain(LINE_LATE.iter()) { c.store(0, Relaxed); }
+        for c in &LINE { c.store(0, Relaxed); }
+        for c in [&LATE_UNBOUNDED, &LINE_SKIPPED, &RING_N] { c.store(0, Relaxed); }
+        LATCH_STATUS.store(0, Relaxed);
+    }
+
+    pub fn text(o: &mut dyn Write) {
+        let g = |c: &AtomicU64| c.load(Relaxed);
+        let _ = writeln!(o, "live {}", LIVE.load(Relaxed));
+        let _ = writeln!(o, "flips {}", g(&FLIPS));
+        let _ = writeln!(o, "waits {}", g(&WAITS));
+        let _ = writeln!(o, "ticks {}", g(&TICKS));
+        let _ = writeln!(o, "busy_refused {}", g(&BUSY_REFUSED));
+        let _ = writeln!(o, "events {}", g(&EVENTS));
+        let _ = writeln!(o, "missed {}", g(&MISSED));
+        let _ = writeln!(o, "late_bound_us (UPPER BOUND, only events with a pending observation before them) <250 <500 <1000 <2000 <4000 <8000 >=8000");
+        let _ = writeln!(o, "late_bound {} {} {} {} {} {} {}", g(&LATE[0]), g(&LATE[1]), g(&LATE[2]), g(&LATE[3]),
+                         g(&LATE[4]), g(&LATE[5]), g(&LATE[6]));
+        let _ = writeln!(o, "late_unbounded {}", g(&LATE_UNBOUNDED));
+        let _ = writeln!(o, "scan_line UNVERIFIED (STATUS[12:0]; bins of 0..vtotal/8, last = line>=vtotal or unknown vtotal)");
+        let _ = writeln!(o, "line_bins {} {} {} {} {} {} {} {} {}", g(&LINE[0]), g(&LINE[1]), g(&LINE[2]), g(&LINE[3]),
+                         g(&LINE[4]), g(&LINE[5]), g(&LINE[6]), g(&LINE[7]), g(&LINE[8]));
+        let _ = writeln!(o, "late_line_us UNVERIFIED (line*period/vtotal) <250 <500 <1000 <2000 <4000 <8000 >=8000");
+        let _ = writeln!(o, "late_line {} {} {} {} {} {} {}", g(&LINE_LATE[0]), g(&LINE_LATE[1]), g(&LINE_LATE[2]),
+                         g(&LINE_LATE[3]), g(&LINE_LATE[4]), g(&LINE_LATE[5]), g(&LINE_LATE[6]));
+        let _ = writeln!(o, "line_outside_active {}", g(&LINE_SKIPPED));
+        let n = RING_N.load(Relaxed);
+        for k in 0..n.min(8) {
+            let i = ((n - 1 - k) & 7) as usize;
+            let _ = writeln!(o, "status_ring ktime_ns {} raw {:#010x}", RING_NS[i].load(Relaxed), RING_ST[i].load(Relaxed));
+        }
+        let _ = writeln!(o, "frame_period_ns {} frames {}", period_ns(), g(&PERIOD_FRAMES));
+        let st = LATCH_STATUS.load(Relaxed);
+        let _ = writeln!(o, "latch_status {:#010x} frcnt {} mode {}", st, (st >> 16) & 0x3f, (st >> 13) & 3);
+        let _ = writeln!(o, "fence_wait_ns {} max {} count {}", g(&FENCE_NS), g(&FENCE_MAX_NS), g(&FENCE_N));
+        let _ = writeln!(o, "takeover_ms {}.{:03}", g(&TAKEOVER_NS) / 1_000_000, g(&TAKEOVER_NS) / 1000 % 1000);
+        let _ = writeln!(o, "ksync_violations {}", g(&KSYNC));
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
-pub use hw::{busy, console_restore as restore, event, flip, init, is_live, queue, wait_idle};
+pub use hw::{busy, console_restore as restore, event, flip, init, is_live, ksync_now, queue, wait_idle};
 
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 mod hw {
@@ -132,10 +305,8 @@ mod hw {
     const SLOT_STEP: usize = 32;
     const LATCH_TIMEOUT_NS: u64 = 100_000_000;
 
-    const FRAME_NS: u64 = 16_666_667;
     static PENDING: AtomicBool = AtomicBool::new(false);
     static TIMER: AtomicPtr<sched::hrtimer::HrTimer> = AtomicPtr::new(core::ptr::null_mut());
-    static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     static VA: AtomicUsize = AtomicUsize::new(0);
     static FW_LPTRS: AtomicU32 = AtomicU32::new(0);
     /// Our list is (or may be) on screen; false after `restore`.
@@ -165,6 +336,12 @@ mod hw {
         extra: Vec<u32>,
         /// When the last latch was seen (0: never).
         phase_ns: u64,
+        /// Last time the flip in flight was known to be pending (issue or a check that saw it so).
+        last_pending_ns: u64,
+        /// A tick has seen the flip in flight still pending (a bound for its lateness exists).
+        seen_pending: bool,
+        /// Time of the previous `poll` (0: none).
+        last_poll_ns: u64,
     }
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -212,9 +389,11 @@ mod hw {
         *STATE.lock() = Some(State {
             fw, slots, cur: 1, pending: false, cur_obj: 0, issued_ns: 0, frames: 0,
             last_frcnt: (st >> 16) & 0x3f, retire: Vec::new(), flips: 0, waits: 0, ev: 0, extra: Vec::new(), phase_ns: 0,
+            last_pending_ns: 0, seen_pending: false, last_poll_ns: 0,
         });
         let tm = alloc::boxed::Box::into_raw(sched::hrtimer::HrTimer::new(tick, 0, sched::hrtimer::TimerMode::Worker));
         TIMER.store(tm, Ordering::Release);
+        stats::LIVE.store(1, Ordering::Relaxed);
         crate::kenv::dma_quiesce_register("hvs-plane", quiesce);
         serial_debug(&format!(
             "[hvs] plane ready {}x{} pitch={} fw ptr={:#x} lptrs={:#x} lact={:#x} slots={},{}\n",
@@ -252,7 +431,14 @@ mod hw {
 
     fn poll(s: &mut State) {
         let f = (rd(CH_STATUS) >> 16) & 0x3f;
-        s.frames += frcnt_delta(s.last_frcnt, f) as u64;
+        let d = frcnt_delta(s.last_frcnt, f) as u64;
+        s.frames += d;
+        let t = sched::monotonic_ns();
+        // Only pairs shorter than the 6-bit wrap are unambiguous.
+        if s.last_poll_ns != 0 && d != 0 && t.wrapping_sub(s.last_poll_ns) < 32 * FRAME_NS {
+            stats::record_period(d, t.wrapping_sub(s.last_poll_ns));
+        }
+        s.last_poll_ns = t;
         s.last_frcnt = f;
         let keep = core::mem::take(&mut s.retire);
         for (obj, at) in keep {
@@ -268,12 +454,20 @@ mod hw {
             let now = sched::monotonic_ns();
             if now.wrapping_sub(t0) > LATCH_TIMEOUT_NS { return false; }
             s.waits += 1;
+            stats::WAITS.fetch_add(1, Ordering::Relaxed);
             // A list written mid-frame latches at the next frame start, up to one period away:
             // sleep most of 6 ms in one go, then poll every 2 ms (few wakeups beat tight polling).
             let since = now.wrapping_sub(s.issued_ns);
+            let v0 = ksync_now();
             sched::kthread::sleep_ns(if since < 6_000_000 { 6_000_000 - since } else { 2_000_000 });
+            stats::KSYNC.fetch_add(ksync_now().wrapping_sub(v0), Ordering::Relaxed);
         }
     }
+
+    /// Global count of voluntary switches/sleeps made with a spin lock held (`/proc/lockstat`'s
+    /// `spin_held` line). A delta across a sleep on this path is attributed to it (other CPUs'
+    /// violations can leak in, so it is an upper bound).
+    pub fn ksync_now() -> u64 { sched::spinheld::switch_violations() as u64 + sched::irqctx::sleep_violations() as u64 }
 
     fn give_up(why: &str) {
         DEAD.store(true, Ordering::Relaxed);
@@ -289,7 +483,15 @@ mod hw {
     /// events waiting for a vblank).
     fn latched(s: &mut State, now: u64) {
         s.pending = false;
-        s.phase_ns = now;
+        s.phase_ns = latched_phase(s.phase_ns, now);
+        let st = rd(CH_STATUS);
+        let vtotal = vtotal_guess(s.fw.h);
+        let period = match stats::period_ns() { 0 => FRAME_NS, p => p };
+        stats::record_status(st, now, s.fw.h, vtotal, period);
+        if s.ev != 0 {
+            stats::record_event(if s.seen_pending { Some(now.wrapping_sub(s.last_pending_ns)) } else { None });
+        }
+        s.seen_pending = false;
         poll(s);
         let ev = core::mem::take(&mut s.ev);
         complete(ev, s.frames, now);
@@ -297,14 +499,7 @@ mod hw {
         PENDING.store(false, Ordering::Release);
     }
 
-    /// When to look at the HVS next: just before the next frame boundary predicted from the last
-    /// observed latch, then in 250 us steps; 1 ms steps until a boundary has been observed.
-    fn next_check(s: &State, now: u64) -> u64 {
-        if s.phase_ns == 0 { return now + 1_000_000; }
-        let k = now.saturating_sub(s.phase_ns) / FRAME_NS + 1;
-        let t = (s.phase_ns + k * FRAME_NS).saturating_sub(300_000);
-        if t <= now + 50_000 { now + 250_000 } else { t }
-    }
+    fn next_check(s: &State, now: u64) -> u64 { next_check_at(s.phase_ns, now) }
 
     fn arm(at: u64) {
         let p = TIMER.load(Ordering::Acquire);
@@ -315,7 +510,7 @@ mod hw {
     }
 
     extern "C" fn tick(_ctx: usize) {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        stats::TICKS.fetch_add(1, Ordering::Relaxed);
         if DEAD.load(Ordering::Relaxed) { return; }
         let Some(mut g) = STATE.try_lock() else { arm(sched::monotonic_ns() + 500_000); return };
         let Some(s) = g.as_mut() else { return };
@@ -335,6 +530,8 @@ mod hw {
                 latched(s, now);
                 return;
             } else {
+                s.last_pending_ns = now;
+                s.seen_pending = true;
                 arm(next_check(s, now));
                 return;
             }
@@ -352,7 +549,9 @@ mod hw {
         let t0 = sched::monotonic_ns();
         while busy() {
             if sched::monotonic_ns().wrapping_sub(t0) > timeout_ns { return false; }
+            let v0 = ksync_now();
             sched::kthread::sleep_ns(500_000);
+            stats::KSYNC.fetch_add(ksync_now().wrapping_sub(v0), Ordering::Relaxed);
         }
         true
     }
@@ -409,7 +608,10 @@ mod hw {
         s.ev = ev;
         PENDING.store(true, Ordering::Release);
         s.issued_ns = sched::monotonic_ns();
+        s.last_pending_ns = s.issued_ns;
+        s.seen_pending = false;
         s.flips += 1;
+        stats::FLIPS.fetch_add(1, Ordering::Relaxed);
         if s.flips == 1 {
             // Prove the takeover took before trusting it for good.
             if !wait_latch(s, off) {
@@ -419,6 +621,7 @@ mod hw {
                 return Err(DriverError::Io);
             }
             let n = sched::monotonic_ns();
+            stats::TAKEOVER_NS.store(n.wrapping_sub(s.issued_ns), Ordering::Relaxed);
             latched(s, n);
         } else {
             let n = s.issued_ns;
@@ -428,7 +631,7 @@ mod hw {
             serial_debug(&format!(
                 "[hvs] flip {} slot={} ptr={:#x} pitch={} lptrs={:#x} lact={:#x} frcnt={} frames={} waits={} ticks={}\n",
                 s.flips, off, phys, pitch, rd(CH_LPTRS) & 0xfff, rd(CH_DL) & 0xfff, s.last_frcnt, s.frames, s.waits,
-                TICKS.load(Ordering::Relaxed)));
+                stats::TICKS.load(Ordering::Relaxed)));
         }
         Ok(())
     }
@@ -437,6 +640,8 @@ mod hw {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
+    use std::{string::String, vec::Vec};
 
     const FW: [u32; PLANE_WORDS] = [0x6000_c007, 0, 0x4000_fff0, 0x0437_077f, 0x8000_01f1, 0, 0x3f40_0000, 0x1e00];
 
@@ -500,5 +705,178 @@ mod tests {
         let got = pick_slots(2048, 32, 8, |o| if o == 2048 { used } else { free });
         assert_eq!(got, Some([2080, 2112]));
         assert_eq!(pick_slots(2048, 32, 8, |_| used), None);
+    }
+
+    // ---- flip event timing model ------------------------------------------------------------
+    // The HVS latches a pending list at frame boundaries `B0 + k*P` (true period `P`). The driver
+    // looks at it at the times `next_check_at` names; an observation can be delayed by `delay(n)`
+    // (a busy worker). Lateness = observation time - the true latch time.
+
+    const B0: u64 = 1_000_000_000;
+
+    struct Sim { p: u64, phase: u64, late: Vec<u64> }
+
+    impl Sim {
+        fn new(p: u64) -> Sim { Sim { p, phase: 0, late: Vec::new() } }
+        /// First boundary strictly after `t`.
+        fn boundary_after(&self, t: u64) -> u64 { B0 + ((t - B0) / self.p + 1) * self.p }
+        /// A flip issued at `issued`; `delay(n)` delays the n-th look (0-based). Returns the
+        /// time the driver saw it latched; records its lateness and the new phase.
+        fn flip(&mut self, issued: u64, delay: &dyn Fn(u32) -> u64) -> u64 {
+            let latch = self.boundary_after(issued);
+            let mut at = next_check_at(self.phase, issued);
+            let mut n = 0u32;
+            loop {
+                let seen = at + delay(n);
+                if seen >= latch {
+                    self.late.push(seen - latch);
+                    self.phase = latched_phase(self.phase, seen);
+                    return seen;
+                }
+                at = next_check_at(self.phase, seen);
+                n += 1;
+                assert!(n < 100_000, "never saw the latch");
+            }
+        }
+    }
+
+    fn no_delay(_: u32) -> u64 { 0 }
+
+    /// Steady state: a flip every frame, 60.000 Hz, prompt worker. Lateness stays small.
+    #[test]
+    fn steady_60hz_is_prompt() {
+        let mut s = Sim::new(FRAME_NS);
+        s.phase = B0; // a boundary was observed exactly
+        let mut t = B0 + 2_000_000;
+        for _ in 0..200 {
+            let seen = s.flip(t, &no_delay);
+            t = seen + 1_000_000;
+        }
+        let worst = *s.late.iter().max().unwrap();
+        assert!(worst < 500_000, "worst lateness {} ns", worst);
+    }
+
+    #[test]
+    fn frcnt_wrap_full_cycle() {
+        // 0x3f -> 0 is one frame; a full 64-frame cycle is indistinguishable from none.
+        assert_eq!(frcnt_delta(0x3f, 0), 1);
+        assert_eq!(frcnt_delta(0x20, 0x1f), 0x3f);
+        assert_eq!(frcnt_delta(7, 7 + 64 & 0x3f), 0);
+    }
+
+    #[test]
+    fn frame_constant_is_60hz() {
+        let hz = 1e9 / FRAME_NS as f64;
+        assert!((hz - 60.0).abs() < 1e-5, "{}", hz);
+    }
+
+    #[test]
+    fn lateness_buckets() {
+        assert_eq!(late_bucket(0), 0);
+        assert_eq!(late_bucket(249_999), 0);
+        assert_eq!(late_bucket(250_000), 1);
+        assert_eq!(late_bucket(7_999_999), 5);
+        assert_eq!(late_bucket(8_000_000), 6);
+        assert_eq!(late_bucket(u64::MAX), 6);
+    }
+
+    #[test]
+    fn status_decode_firmware_sample() {
+        let st = 0x00ba_4124;
+        assert_eq!(status_line(st), 0x124);
+        assert_eq!(status_mode(st), 2);
+        assert_eq!(status_frcnt(st), 0x3a);
+        assert_eq!(vtotal_guess(1080), 1125);
+    }
+
+    #[test]
+    fn line_binning() {
+        assert_eq!(line_bin(0, 1125), 0);
+        assert_eq!(line_bin(140, 1125), 0);
+        assert_eq!(line_bin(141, 1125), 1);
+        assert_eq!(line_bin(1124, 1125), 7);
+        assert_eq!(line_bin(1125, 1125), 8);
+        assert_eq!(line_bin(5000, 1125), 8);
+        assert_eq!(line_bin(3, 0), 8);
+        assert_eq!(line_late_ns(540, 1080, 1125, 16_666_667), Some(8_000_000));
+        assert_eq!(line_late_ns(1080, 1080, 1125, 16_666_667), None); // blanking
+        assert_eq!(line_late_ns(0, 1080, 1125, 16_666_667), Some(0));
+    }
+
+    /// The stats are process-wide atomics: the tests that use them take this lock.
+    static STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn status_recording_bins_and_ring() {
+        let _g = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        stats::reset();
+        for i in 0..10u32 { stats::record_status(0x00ba_4000 | (i * 100), 1000 + i as u64, 1080, 1125, 16_666_667); }
+        let mut t = String::new();
+        stats::text(&mut t);
+        assert!(t.contains("line_outside_active 0\n"), "{}", t); // lines 0..900 all active
+        assert_eq!(t.matches("status_ring").count(), 8);
+        assert!(t.contains("status_ring ktime_ns 1009 raw 0x00ba4384"), "{}", t);
+        stats::record_status(0x00ba_4000 | 1100, 5, 1080, 1125, 16_666_667); // blanking
+        let mut t = String::new();
+        stats::text(&mut t);
+        assert!(t.contains("line_outside_active 1\n"), "{}", t);
+        stats::reset();
+    }
+
+    #[test]
+    fn stats_text_and_reset() {
+        let _g = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        stats::reset();
+        stats::record_event(Some(300_000));
+        stats::record_event(Some(20_000_000));
+        stats::record_event(None);
+        stats::record_fence_wait(5_000);
+        stats::record_fence_wait(9_000);
+        let mut t = String::new();
+        stats::text(&mut t);
+        assert!(t.contains("events 3\n") && t.contains("missed 1\n"), "{}", t);
+        assert!(t.contains("late_bound 0 1 0 0 0 0 1\n") && t.contains("late_unbounded 1\n"), "{}", t);
+        assert!(t.contains("UPPER BOUND") && t.contains("UNVERIFIED"), "{}", t);
+        assert!(t.contains("fence_wait_ns 14000 max 9000 count 2\n"), "{}", t);
+        stats::reset();
+        let mut t = String::new();
+        stats::text(&mut t);
+        assert!(t.contains("events 0\n") && t.contains("fence_wait_ns 0 max 0 count 0\n"), "{}", t);
+    }
+
+    /// (a) The first event is observed 8 ms late (worker delayed). The phase must not inherit that
+    /// error: the next event must be less than 0.5 ms late. EXPECTED RED on the current logic
+    /// (phase := observation time makes every later prediction 8 ms late).
+    #[test]
+    #[ignore = "red until hvsphase"]
+    fn late_observation_does_not_poison_next_event() {
+        let mut s = Sim::new(FRAME_NS);
+        s.phase = B0;
+        let seen = s.flip(B0 + 2_000_000, &no_delay);
+        let _ = seen;
+        // The observation of this flip is delayed by 8 ms ...
+        let first = s.flip(B0 + 4 * FRAME_NS + 2_000_000, &|_| 8_000_000);
+        assert!(*s.late.last().unwrap() >= 7_000_000);
+        // ... and the next flip, with a prompt worker, must still be seen on time.
+        s.flip(first + 1_000_000, &no_delay);
+        let l = *s.late.last().unwrap();
+        assert!(l < 500_000, "next event {} ns late", l);
+    }
+
+    /// (b) The panel's true period is 16.683 ms, not 16.666667: after an idle gap the predicted
+    /// boundary drifts. 20, 60 and 300 idle frames: the next event must be <0.5 ms late.
+    /// EXPECTED RED on the current logic.
+    #[test]
+    #[ignore = "red until hvsphase"]
+    fn real_period_after_idle_is_prompt() {
+        for idle in [20u64, 60, 300] {
+            let p = 16_683_000;
+            let mut s = Sim::new(p);
+            s.phase = B0; // phase exactly right when the last event was seen
+            let t = B0 + idle * p + 2_000_000;
+            s.flip(t, &no_delay);
+            let l = *s.late.last().unwrap();
+            assert!(l < 500_000, "idle {} frames: {} ns late", idle, l);
+        }
     }
 }

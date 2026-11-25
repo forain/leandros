@@ -7717,6 +7717,20 @@ fn gen_leandros_timer() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
 }
 
+/// Fake path of the writable `/proc/leandros_asfree` snapshot (open and write
+/// need CAP_SYS_ADMIN in the initial user namespace).
+const PROC_ASFREE_W: &[u8] = b"/tmp/.proc_asfree";
+fn gen_asfree() -> Option<VnodeKind> {
+    let mut s = alloc::string::String::new();
+    sched::asfree::render(&mut s);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_ASFREE_W);
+    if !tmp_fill_kernel(&mut tmp, idx, s.as_bytes()) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 /// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
 /// one makes Ready (`sched::wakestat`, always on, cumulative since boot —
 /// diff two reads), then, with `sched.wakestat=1` on the command line, which
@@ -9159,10 +9173,10 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// and what a `/proc/<pid>` directory lists. `/proc/<pid>/fd` is served too
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
-const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer",
+const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer", b"/proc/leandros_asfree",
                                      b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/leandros_hvs", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
 /// The regular files `handle_open` generates through `gen_proc_system` (and
 /// the `/proc/sys/fs` ones), none of which is a RAMFS entry: stat must answer
 /// for them or they cannot be a bind-mount target.
@@ -10139,6 +10153,15 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/leandros_asfree" {
+            // CAP_SYS_ADMIN in the initial user namespace (not euid 0: a
+            // container's user-namespace root or a root with the capability
+            // dropped is refused); an unknown pid is refused too.
+            if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_asfree() {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if lookup_path == b"/proc/wakestat" {
             match gen_wakestat() {
                 Some(v) => v,
@@ -10219,6 +10242,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let mut g = alloc::vec![0u8; 2048];
             let n = unsafe { kernel_drm_fence_stats(g.as_mut_ptr(), g.len()) };
             match proc_snapshot(b"/tmp/.drm_fence_stats", &g[..n], false) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
+        } else if lookup_path == b"/proc/leandros_hvs" {
+            // Counters read by anyone; `reset` written by root (CAP_SYS_ADMIN in the initial userns).
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_leandros_hvs(write) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -11240,6 +11271,23 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let r = sched::ns::limit_set_in(sched::ns::userns_of(pid), c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
+            let hvs_w = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_HVS_W
+            };
+            if hvs_w {
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                if s != b"reset" { return err_reply(-22); }
+                extern "C" { fn kernel_hvs_stats_reset(); }
+                unsafe { kernel_hvs_stats_reset() };
+                return val_reply(count as u64);
+            }
             let drm_hold = {
                 let tmp = TMP_FILES.lock();
                 let e = &tmp[idx];
@@ -11274,6 +11322,20 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let mut v = 0usize;
                 for &c in s { v = v.saturating_mul(10).saturating_add((c - b'0') as usize); }
                 return match inotify::limit_set(k, v) { Ok(()) => val_reply(count as u64), Err(e) => err_reply(e) };
+            }
+            let is_asfree = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_ASFREE_W
+            };
+            if is_asfree {
+                // Same gate as the open: an fd handed to someone else gains nothing.
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(63);
+                let mut b = [0u8; 63];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = match core::str::from_utf8(&b[..n]) { Ok(t) => sched::asfree::control(t), Err(_) => -22 };
+                return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
             }
             let oom_tid = {
                 let tmp = TMP_FILES.lock();
@@ -13805,6 +13867,22 @@ fn gen_proc_nslimit(pid: u32, c: usize, write: bool) -> Option<VnodeKind> {
 }
 
 const PROC_DRMH_W: &[u8] = b"/tmp/.proc_drmhold";
+
+const PROC_HVS_W: &[u8] = b"/tmp/.proc_hvs";
+
+/// `/proc/leandros_hvs`: Pi 5 HVS flip-path counters; a write of `reset` zeroes them (root only).
+fn gen_leandros_hvs(write: bool) -> Option<VnodeKind> {
+    extern "C" { fn kernel_hvs_stats(buf: *mut u8, cap: usize) -> usize; }
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    let n = unsafe { kernel_hvs_stats(buf.as_mut_ptr(), buf.len()) };
+    if !write { return gen_proc_system_file(&buf, n); }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_HVS_W);
+    if !tmp_fill_kernel(&mut tmp, idx, &buf[..n]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
 
 /// `/proc/drm/fence_hold`: "1\n" while the fence-retirement hold is active.
 /// A write of 0 or 1 routes through `handle_write` (test knob, root only).
