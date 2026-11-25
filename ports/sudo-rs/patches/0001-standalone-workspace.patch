@@ -1,0 +1,12 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 90d1e40..3a06601 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -54,3 +54,7 @@ unsafe_op_in_unsafe_fn = { level = "deny" }
+ [lints.clippy]
+ undocumented_unsafe_blocks = "warn"
+ uninlined_format_args = "warn"
++
++# LeandrOS: built from ports/sudo-rs/.work inside the LeandrOS tree; keep it out
++# of the repo-root workspace.
++[workspace]

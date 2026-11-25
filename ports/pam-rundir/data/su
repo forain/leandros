@@ -1,0 +1,9 @@
+# su: root switches user without a password (pam_rootok), everyone else
+# authenticates; Alpine's defaults plus the XDG_RUNTIME_DIR export that keeps
+# `su leandro -c firefox` on leandro's Wayland/PipeWire sockets.
+auth        sufficient     pam_rootok.so
+auth        include        base-auth
+account     include        base-account
+password    include        base-password
+session     include        base-session-noninteractive
+-session    optional       pam_rundir.so

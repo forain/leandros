@@ -584,9 +584,19 @@ pub unsafe fn has_data() -> bool {
         || rd(FR) & FR_RXFE == 0
 }
 
+extern "C" {
+    /// Kernel console byte: before line staging is on it goes straight to
+    /// the UART (and klog); afterwards it is appended to this CPU's stage and
+    /// leaves with its whole line, so pieces from different CPUs never splice.
+    fn arch_serial_putc(c: u8);
+}
+
+/// Post-boot safe console print: every byte goes through the kernel's
+/// line-atomic staging (`arch_serial_putc`); early boot output (staging off)
+/// still reaches the UART byte by byte.
 pub fn serial_print_str(s: &str) {
     for &b in s.as_bytes() {
-        unsafe { putc(b); }
+        unsafe { arch_serial_putc(b); }
     }
 }
 
@@ -608,6 +618,6 @@ pub fn print_hex(mut n: usize) {
         buf[i] = b'0';
     }
     for &c in &buf {
-        unsafe { putc(c); }
+        unsafe { arch_serial_putc(c); }
     }
 }

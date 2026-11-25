@@ -587,6 +587,10 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     // can need one.
     seed_runtime_dirs();
 
+    // 4c''. Pad short /etc/shadow records (older images) to nine fields so PAM's
+    // unix_chkpwd (musl getspnam) can read them: no lockout after an upgrade.
+    shadow_fix();
+
     // 4c'. The boot ESP's per-boot hook (userland/espctl): a one-shot trial
     // kernel that got this far makes the fallback entry the default again,
     // and ESP /leandros/authorized_keys is merged into root's keys. Before
@@ -916,6 +920,61 @@ unsafe fn esp_boot_hook() {
             return;
         }
         usleep(20_000);
+    }
+}
+
+/// Run `/usr/sbin/shadowfix` (rewrites only short shadow lines, atomically,
+/// idempotent) and wait for it, killing it after 10 s (non-blocking waits only). Missing = nothing to do.
+unsafe fn shadow_fix() {
+    // An `apk upgrade linux-pam` on the live root reinstalls unix_chkpwd as
+    // Alpine ships it (2755 root:shadow); our shadow is 0600 root:root, so a
+    // non-root caller could no longer verify its own password. Restore the
+    // image arrangement (setuid root, 4755) every boot; chown first, it
+    // clears the setuid bit.
+    const CHK: &[u8] = b"/usr/sbin/unix_chkpwd\0";
+    if exists(CHK) {
+        chown(CHK.as_ptr(), 0, 0);
+        chmod(CHK.as_ptr(), 0o4755);
+    }
+    const PATH: &[u8] = b"/usr/sbin/shadowfix\0";
+    if !exists(PATH) {
+        return;
+    }
+    let pid = fork();
+    if pid == 0 {
+        let argv: [*const u8; 2] = [PATH.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        execve(PATH.as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    if pid < 0 {
+        return;
+    }
+    let start = monotonic_ms();
+    loop {
+        let mut status = 0i32;
+        let r = wait4(pid, &mut status, 1, core::ptr::null_mut());
+        if r == pid || r < 0 {
+            if r == pid && status != 0 {
+                write_str("shadowfix exited nonzero\n");
+            }
+            return;
+        }
+        if monotonic_ms().saturating_sub(start) > 10_000 {
+            // SIGKILL, then reap without ever blocking: a child stuck in an
+            // uninterruptible wait must not hold boot. Give it 1 s, then
+            // leave the zombie to the supervisor's reaper.
+            syscall2(nr::KILL, pid as usize, 9);
+            for _ in 0..100 {
+                if wait4(pid, &mut status, 1, core::ptr::null_mut()) != 0 {
+                    break;
+                }
+                usleep(10_000);
+            }
+            write_str("shadowfix timed out; killed\n");
+            return;
+        }
+        usleep(10_000);
     }
 }
 

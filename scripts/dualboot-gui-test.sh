@@ -11,6 +11,8 @@
 . "$(cd "$(dirname "$0")" && pwd)/lib/clonecp.sh"
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+# QEMU-only test: the stick needs no Intel iris/ANV ship-set (write-usb.sh refuses otherwise)
+export LEANDROS_USB_ALLOW_GENERIC_GPU="${LEANDROS_USB_ALLOW_GENERIC_GPU:-1}"
 ARCH="${1:-aarch64}"
 case "$ARCH" in aarch64|x86_64) ;; *) echo "usage: $0 [aarch64|x86_64]"; exit 2 ;; esac
 FXDIR="${FX_DIR:-$HOME/code/leandros-artifacts/dualboot}"
@@ -50,13 +52,14 @@ stop_vm() {
 }
 r() { $REMOTE run "$1" | tr -d '\r'; }
 
-GUI_BIN="${GUI_BIN:-$HOME/code/leandros-artifacts/m6-session-bins/out/leandros-installer-$ARCH}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/m6out.sh"
+GUI_BIN="${GUI_BIN:-$M6_OUT/leandros-installer-$ARCH}"; [ -e "$GUI_BIN" ] || GUI_BIN="$M6_OUT_SHARED/leandros-installer-$ARCH"
 FAKE="$ROOT/ports/leandros-installer/test/fake-backend.sh"
 echo "== images"
 rm -rf "$WORK"; mkdir -p "$WORK"
 SRC="$FXDIR/fxgap-$ARCH.img"
 [ -f "$SRC" ] || fail "missing $SRC"
-df -g "$HOME" | awk 'NR==2 && $4 < 30 { exit 1 }' || fail "less than 30 GiB free"
+df -Pk "$HOME" | awk 'NR==2 && $4 < 30*1048576 { exit 1 }' || fail "less than 30 GiB free"
 for f in "$SRC"*; do clone_cp "$f" "$WORK/$(basename "$f" | sed "s/fxgap-$ARCH/disk/")"; done
 STICK="$WORK/stick.img"
 "$ROOT/scripts/write-usb.sh" "$ARCH" --image "$STICK" --gpt >"$WORK/write-usb.log" 2>&1 || { tail -5 "$WORK/write-usb.log"; fail "write-usb.sh"; }

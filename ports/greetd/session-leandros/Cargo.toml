@@ -5,18 +5,15 @@
 [workspace]
 
 [package]
-name = "pam-leandros"
+name = "session-leandros"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "libpam application ABI for LeandrOS, backed by /etc/shadow"
+description = "utmpx and cgroup session bookkeeping for greetd"
 
-# An rlib on purpose, not a staticlib: a Rust staticlib carries its own copy of
-# std, and linking one into greetd (also std) duplicates every std symbol.
-# greetd depends on this crate directly and the linker resolves pam-sys's
-# undefined pam_* references from it. See src/lib.rs.
+# An rlib on purpose, not a staticlib (a staticlib carries its own std copy).
 [lib]
-name = "pam_leandros"
+name = "session_leandros"
 path = "src/lib.rs"
 
 [dependencies]

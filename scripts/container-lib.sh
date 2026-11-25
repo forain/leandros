@@ -183,6 +183,36 @@ leandros_port_reuse() {
 # LEANDROS_ALPINE_KEEP=1 keeps the per-run root for inspection, and
 # alpine-sysroot's own ALPINE_REPO.
 
+# leandros_sysroot_merge SRC DEST: additive, no-clobber merge of SRC/. into the
+# SHARED sysroot DEST that concurrent builds from different trees also merge into.
+# Serialised by flock on DEST.lock; every new file is copied to a hidden temp name
+# in its final directory and renamed into place (mv -n), so a reader never sees a
+# half-written file and an existing file is never replaced. Without flock (macOS)
+# the per-file rename still keeps it atomic.
+leandros_sysroot_merge() {
+  _sm_src=$1 _sm_dst=$2
+  [ -d "$_sm_src" ] && [ -d "$_sm_dst" ] || return 1
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock 8 || exit 1
+      _leandros_sysroot_merge_locked "$_sm_src" "$_sm_dst"
+    ) 8>>"$_sm_dst.lock"
+  else
+    _leandros_sysroot_merge_locked "$_sm_src" "$_sm_dst"
+  fi
+}
+
+_leandros_sysroot_merge_locked() {
+  ( cd "$1" && find . -mindepth 1 \( -type d -o -type f -o -type l \) -print ) | while IFS= read -r _sm_p; do
+    _sm_t="$2/$_sm_p"
+    if [ -d "$1/$_sm_p" ] && [ ! -L "$1/$_sm_p" ]; then mkdir -p "$_sm_t"; continue; fi
+    if [ -e "$_sm_t" ] || [ -L "$_sm_t" ]; then continue; fi
+    _sm_tmp="$(dirname "$_sm_t")/.merge.$$.$(basename "$_sm_t")"
+    cp -a "$1/$_sm_p" "$_sm_tmp" && mv -n "$_sm_tmp" "$_sm_t"
+    rm -f "$_sm_tmp"
+  done
+}
+
 # The release comes from the image's lock (scripts/lib/alpine-release.sh).
 for _cl_d in "${ROOT:-/nonexistent}/scripts/lib" "${ROOT_DIR:-/nonexistent}/scripts/lib" "${HERE:-/nonexistent}/../../scripts/lib" "${HERE:-/nonexistent}/../scripts/lib" "${HERE:-/nonexistent}/lib" "${LEANDROS_NETRETRY_DIR:-/nonexistent}"; do
   [ -f "$_cl_d/alpine-release.sh" ] && { . "$_cl_d/alpine-release.sh"; break; }

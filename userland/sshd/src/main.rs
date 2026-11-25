@@ -89,6 +89,16 @@ pub struct Config {
     /// `AuthorizedPrincipalsFile file` (`none` = unset; tokens %u %h %U %%): principal names accepted
     /// for certificates signed by a `TrustedUserCAKeys` CA, instead of the user name.
     pub authorized_principals_file: Option<String>,
+    /// `AuthorizedPrincipalsCommand cmd args` (`none` = unset; absolute path, tokens %% %C %D %F %f %h %i %K %k %s %T %t %U %u):
+    /// run as `AuthorizedPrincipalsCommandUser`, prints one principal (with optional key options) per line.
+    pub authorized_principals_command: Option<String>,
+    pub authorized_principals_command_user: Option<String>,
+    /// `AllowStreamLocalForwarding yes|all|no|local|remote`: unix-socket forwarding (also needs the key to allow forwarding).
+    pub allow_streamlocal_forwarding: TcpFwd,
+    /// `StreamLocalBindMask` (umask while binding a remote-forward socket, default 0177).
+    pub streamlocal_bind_mask: u32,
+    /// `StreamLocalBindUnlink yes`: remove a stale socket file before binding a remote forward.
+    pub streamlocal_bind_unlink: bool,
     /// `RevokedKeys file`: plain public-key list or OpenSSH KRL; a listed key (or CA) is refused.
     pub revoked_keys: Option<String>,
     /// `Match` blocks, in file order; applied per connection once the user is known.
@@ -111,7 +121,8 @@ pub struct MatchBlock {
 const MATCH_KEYWORDS: &[&str] = &[
     "passwordauthentication", "pubkeyauthentication", "permitrootlogin", "allowtcpforwarding",
     "forcecommand", "permituserenvironment", "authorizedkeysfile", "devpasswordauthentication",
-    "authorizedprincipalsfile",
+    "authorizedprincipalsfile", "authorizedprincipalscommand", "authorizedprincipalscommanduser",
+    "allowstreamlocalforwarding", "streamlocalbindmask", "streamlocalbindunlink",
 ];
 
 /// OpenSSH pattern list: comma-separated `*`/`?` globs; a matching `!pattern`
@@ -198,6 +209,11 @@ impl Default for Config {
             force_command: None,
             trusted_user_ca_keys: None,
             authorized_principals_file: None,
+            authorized_principals_command: None,
+            authorized_principals_command_user: None,
+            allow_streamlocal_forwarding: TcpFwd::All,
+            streamlocal_bind_mask: 0o177,
+            streamlocal_bind_unlink: false,
             revoked_keys: None,
             matches: Vec::new(),
         }
@@ -267,15 +283,33 @@ fn apply_kw(cfg: &mut Config, key: &str, val: &str) -> Result<bool, String> {
                 return Err(err("PermitEmptyPasswords yes is not supported".into()));
             }
         }
-        "allowtcpforwarding" => {
-            cfg.allow_tcp_forwarding = match val.to_ascii_lowercase().as_str() {
+        "allowtcpforwarding" | "allowstreamlocalforwarding" => {
+            let v = match val.to_ascii_lowercase().as_str() {
                 "yes" | "all" => TcpFwd::All,
                 "no" => TcpFwd::No,
                 "local" => TcpFwd::Local,
                 "remote" => TcpFwd::Remote,
-                _ => return Err(err(format!("bad AllowTcpForwarding {val}"))),
-            }
+                _ => return Err(err(format!("bad {key} {val}"))),
+            };
+            if key == "allowtcpforwarding" { cfg.allow_tcp_forwarding = v } else { cfg.allow_streamlocal_forwarding = v }
         }
+        "authorizedprincipalscommand" => {
+            cfg.authorized_principals_command =
+                if val.is_empty() { return Err(err("AuthorizedPrincipalsCommand needs a command".into())) }
+                else if val.eq_ignore_ascii_case("none") { None }
+                else if !val.starts_with('/') { return Err(err("AuthorizedPrincipalsCommand must be an absolute path".into())) }
+                else { Some(val.to_string()) }
+        }
+        "authorizedprincipalscommanduser" => {
+            cfg.authorized_principals_command_user =
+                if val.is_empty() { return Err(err("AuthorizedPrincipalsCommandUser needs a user".into())) }
+                else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
+        }
+        "streamlocalbindmask" => {
+            cfg.streamlocal_bind_mask = u32::from_str_radix(val, 8).ok().filter(|m| *m <= 0o777)
+                .ok_or_else(|| err(format!("bad StreamLocalBindMask {val}")))?
+        }
+        "streamlocalbindunlink" => cfg.streamlocal_bind_unlink = yes_no(val, &key).map_err(err)?,
         "forcecommand" => {
             cfg.force_command = if val.is_empty() { return Err(err("ForceCommand needs a command".into())) }
                 else if val.eq_ignore_ascii_case("none") { None } else { Some(val.to_string()) }
@@ -480,7 +514,7 @@ fn load_or_create_host_key(path: &str) -> Result<PrivateKey, String> {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: sshd [-f config] [-e] [-t] [-p port]");
+    eprintln!("usage: sshd [-D] [-f config] [-e] [-t] [-p port]");
     std::process::exit(2);
 }
 
@@ -513,6 +547,8 @@ fn main() {
         match a.as_str() {
             "-f" => config_path = args.next().unwrap_or_else(|| usage()),
             "-e" => to_stderr = true,
+            // sshd never detaches (the init system supervises it), so -D is already the behaviour.
+            "-D" => {}
             "-t" => test_only = true,
             "-R" => child_mode = true,
             "-p" => port_override = Some(args.next().and_then(|p| p.parse().ok()).unwrap_or_else(|| usage())),

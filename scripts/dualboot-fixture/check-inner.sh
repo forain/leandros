@@ -50,7 +50,7 @@ if [ "$MODE" = installed ]; then
     # Session B: only p2's end moved; start, GUID, name and attributes are unchanged.
     [ "$P2E" -lt "$FX_P2_END" ] && ok "p2 end $P2E < original $FX_P2_END" || bad "p2 end $P2E not below $FX_P2_END"
     [ $(((P2E + 1) % 2048)) = 0 ] && ok "p2 end + 1 is 1 MiB aligned" || bad "p2 end not aligned"
-    BLK2=$(dumpe2fs -h "$IMG?offset=$((FX_P2_START * 512))" 2>/dev/null | sed -n 's/^Block count: *//p')
+    BLK2=$(tune2fs -l "$IMG?offset=$((FX_P2_START * 512))" 2>/dev/null | sed -n 's/^Block count: *//p')
     [ "$P2E" -ge $((FX_P2_START + BLK2 * 4096 / 512 - 1)) ] && ok "p2 still holds the whole filesystem ($BLK2 blocks)" || bad "p2 cut below the filesystem"
     [ -z "$P2ATTRS" ] || { field 2 "Attribute flags" | grep -qi "^$P2ATTRS\$" && ok "p2 attributes unchanged ($P2ATTRS)" || bad "p2 attributes changed"; }
     P4S=$(field 4 "First sector" | cut -d' ' -f1)
@@ -63,12 +63,12 @@ fi
 echo "== ext4 p2"
 P2S=$(field 2 "First sector" | cut -d' ' -f1); P2OFF=$((P2S * 512)); E="$IMG?offset=$P2OFF"
 e2fsck -fn "$E" >$W/e2fsck.log 2>&1 && ok "e2fsck -fn clean" || { bad "e2fsck -fn"; tail -3 $W/e2fsck.log; }
-BLK=$(dumpe2fs -h "$E" 2>/dev/null | sed -n 's/^Block count: *//p')
+BLK=$(tune2fs -l "$E" 2>/dev/null | sed -n 's/^Block count: *//p')
 if [ "$MODE" = pristine ] && [ "${SHRUNK:-0}" = 0 ]; then [ "$BLK" = "$FX_P2_BLOCKS" ] && ok "block count $BLK" || bad "block count $BLK"
 else echo "  block count $BLK ($((BLK * 4 / 1024 / 1024)) GiB)"; fi
 sb() { dd if=$IMG bs=1 skip=$((P2OFF + 1024 + $1)) count=4 2>/dev/null | od -An -tx4 | tr -d ' '; }
 [ "$(sb 92)-$(sb 96)-$(sb 100)" = "0000103c-000022c2-0000046b" ] && ok "feature bits = laptop" || bad "feature bits $(sb 92)-$(sb 96)-$(sb 100)"
-[ "$(dumpe2fs -h "$E" 2>/dev/null | sed -n 's/^Filesystem UUID: *//p')" = "$FX_P2_UUID" ] && ok "fs UUID" || bad "fs UUID"
+[ "$(tune2fs -l "$E" 2>/dev/null | sed -n 's/^Filesystem UUID: *//p')" = "$FX_P2_UUID" ] && ok "fs UUID" || bad "fs UUID"
 [ -f $IMG.manifest ] && MAN=$IMG.manifest || MAN=""
 debugfs -R "rdump /testdata $W" "$E" >/dev/null 2>&1
 if [ -n "$MAN" ]; then cp $MAN $W/MANIFEST.sha256; else debugfs -R "cat /MANIFEST.sha256" "$E" > $W/MANIFEST.sha256 2>/dev/null; fi
