@@ -212,6 +212,23 @@ pub extern "C" fn kernel_drm_fence_stats(buf: *mut u8, cap: usize) -> usize {
     n
 }
 
+/// `/proc/leandros_hvs`: Pi 5 HVS flip-path counters (`drivers::hvs_plane::stats`). Returns the
+/// bytes written. Called by servers/vfs.
+#[no_mangle]
+pub extern "C" fn kernel_hvs_stats(buf: *mut u8, cap: usize) -> usize {
+    let mut s = alloc::string::String::new();
+    drivers::hvs_stats_text(&mut s);
+    let n = s.len().min(cap);
+    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), buf, n); }
+    n
+}
+
+/// `/proc/leandros_hvs` write `reset`: zero the counters.
+#[no_mangle]
+pub extern "C" fn kernel_hvs_stats_reset() {
+    drivers::hvs_stats_reset();
+}
+
 /// `/proc/drm/fence_hold`: state of the fence-retirement hold (test knob).
 #[no_mangle]
 pub extern "C" fn kernel_drm_fence_hold_get() -> u32 {

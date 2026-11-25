@@ -362,3 +362,17 @@ pub mod iwlwifi;
 #[cfg(not(feature = "wifi-stack"))]
 #[path = "stubs/wifi_mgr.rs"]
 pub mod wifi_mgr;
+
+/// `/proc/leandros_hvs` text (Pi 5 HVS flip path counters).
+pub fn hvs_stats_text(out: &mut alloc::string::String) {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
+    hvs_plane::stats::text(out);
+    #[cfg(not(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core")))]
+    out.push_str("hvs: not built (needs aarch64 rpi5 v3d-core)\n");
+}
+
+/// `/proc/leandros_hvs` write `reset`.
+pub fn hvs_stats_reset() {
+    #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "v3d-core"))]
+    hvs_plane::stats::reset();
+}
