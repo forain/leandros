@@ -244,6 +244,7 @@ extern "C" {
     // (`sim_syncobj_poll`, `os_dupfd_cloexec`) — the subtests assert the fd is
     // usable the way its only consumer uses it, not merely that it is a number.
     pub fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
+    pub fn clock_gettime(clk: c_int, ts: *mut [i64; 2]) -> c_int;
     pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 
     // Used only by phase 2 (multi-fd context isolation); same relibc-linked
@@ -801,6 +802,19 @@ unsafe fn syncobj_wait_now(fd: c_int, handle: u32) -> c_int {
     if ioctl(fd, 0xC020_64C3 as c_ulong, raw.as_mut_ptr()) == 0 { 0 } else { *__errno_location() }
 }
 
+/// Timed syncobj wait (DRM timeouts are absolute CLOCK_MONOTONIC ns): 0 signalled, else the errno (62 = ETIME).
+unsafe fn syncobj_wait_ms(fd: c_int, handle: u32, ms: u64) -> c_int {
+    let hs = [handle];
+    let mut ts = [0i64; 2];
+    clock_gettime(1, &mut ts as *mut _);
+    let abs = (ts[0] as u64) * 1_000_000_000 + ts[1] as u64 + ms * 1_000_000;
+    let mut raw = [0u8; 32];
+    raw[0..8].copy_from_slice(&(hs.as_ptr() as u64).to_ne_bytes());
+    raw[8..16].copy_from_slice(&abs.to_ne_bytes());
+    raw[16..20].copy_from_slice(&1u32.to_ne_bytes());
+    if ioctl(fd, 0xC020_64C3 as c_ulong, raw.as_mut_ptr()) == 0 { 0 } else { *__errno_location() }
+}
+
 /// SYNC_IOC_FILE_INFO status of a sync file fd (0 active, 1 signalled,
 /// negative errno = the fence errored); i32::MIN if the ioctl fails.
 unsafe fn sync_file_status(fd: c_int) -> i32 {
@@ -1325,10 +1339,16 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             if lost_ret == 0 && e2.fence_fd >= 3 { close(e2.fence_fd); }
         }
         let a_still_pending = oka && !poll_in_ready(ea.fence_fd);
+        // Linux: a syncobj wait on the stuck (written-off context's) fence stays ETIME, NOWAIT and timed.
+        let a_sh = if oka { syncobj_from_sync_file(fa, ea.fence_fd) } else { 0 };
+        let a_wait_now = if a_sh != 0 { syncobj_wait_now(fa, a_sh) } else { -1 };
+        let a_wait_50ms = if a_sh != 0 { syncobj_wait_ms(fa, a_sh, 50) } else { -1 };
         let a_ctx = if inited { ctx_id(fa) } else { 0 };
         let rel = fence_hold_mode(0);
         // Releasing the hold lets the host answer: the fence signals normally.
         let a_signals_on_release = oka && poll_in_within(ea.fence_fd, 4000);
+        // Positive control: the same syncobj reports 0 once the fence signalled.
+        let a_wait_ctl = if a_sh != 0 { syncobj_wait_ms(fa, a_sh, 1000) } else { -1 };
         if fa >= 0 { close(fa); }
         // The app is gone and its context id is free: recycle it (the next
         // contexts reuse the lowest free ids) while A's out-fence fd is still
@@ -1355,6 +1375,11 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
             failures += 1;
         }
         if !report(b"phase7f_stuck_fence_signals_on_release", a_signals_on_release) { failures += 1; }
+        out(b"  7f: syncobj="); out_u64(a_sh as u64); out(b" now="); out_u64(a_wait_now as i64 as u64);
+        out(b" t50="); out_u64(a_wait_50ms as i64 as u64); out(b" ctl="); out_u64(a_wait_ctl as i64 as u64); out(b"\n");
+        if !report(b"phase7f_syncobj_wait_stuck_fence_nowait_etime", a_sh != 0 && a_wait_now == 62) { failures += 1; }
+        if !report(b"phase7f_syncobj_wait_stuck_fence_timed_etime", a_sh != 0 && a_wait_50ms == 62) { failures += 1; }
+        if !report(b"phase7f_syncobj_wait_signalled_fence_ok", a_sh != 0 && a_wait_ctl == 0) { failures += 1; }
         if !report(b"phase7f_lost_context_submit_is_ecanceled", inited && lost_ret != 0 && lost_errno == 125) {
             failures += 1;
         }
@@ -1527,8 +1552,8 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         poll(core::ptr::null_mut(), 0, 300);
         // b)
         let b_poll = oka && !poll_in_ready(ea.fence_fd);
-        // An out-fence that is not a sync_file cannot be imported into a syncobj: then only the poll side is checked.
-        let b_wait = sh == 0 || syncobj_wait_now(fb, sh) == 62;
+        // The out-fence eventfd is a sync file: it must import into a syncobj (sh != 0), no skip.
+        let b_wait = sh != 0 && syncobj_wait_now(fb, sh) == 62;
         let orph1 = ctrlq_stat(ctl, 7);
         let b_cnt = orph1 == orph0.wrapping_add(1);
         let b_unch = ctrlq_stat(ctl, 2) == aband0 && ctrlq_stat(ctl, 8) == wo0;
@@ -1584,7 +1609,7 @@ unsafe fn phase7_simulate_syncobj(fd: c_int) -> i32 {
         let infl_pre = ctrlq_stat(ctl, 3);
         let rel = fence_hold_mode(0);
         let d_poll = oka && poll_in_within(ea.fence_fd, 1000);
-        let d_wait = sh == 0 || syncobj_wait_now(fb, sh) == 0;
+        let d_wait = sh != 0 && syncobj_wait_now(fb, sh) == 0;
         poll(core::ptr::null_mut(), 0, 100);
         let d_orph = ctrlq_stat(ctl, 7) == orph0;
         let d_recl = ctrlq_stat(ctl, 1) == recl0.wrapping_add(1);
