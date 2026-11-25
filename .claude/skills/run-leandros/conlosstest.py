@@ -62,6 +62,11 @@ def main():
     fails = []
     try:
         start = len(ser.buf)
+        # serial-full.log holds every earlier flood of this VM too: only this run's bytes count.
+        try:
+            log_off = os.path.getsize(driver.SERIAL_FULL_LOG)
+        except OSError:
+            log_off = 0
         r = driver.serial_run(f"/bin/conloss {N} 40 {SLEEP_MS}", timeout=600, arch=arch, ser=ser)
         ser.pump(2.0)
         sock = ser.buf[start:]
@@ -73,6 +78,9 @@ def main():
                 full = f.read()
         except OSError:
             pass
+        if len(full) < log_off:  # the log shrank: the VM rebooted in between, start from 0
+            log_off = 0
+        full = full[log_off:]
         gs = gaps(sock, N)
         # QEMU's own logfile can DUPLICATE a byte when the chardev socket takes a
         # partial write (seen on x86_64: +75 bytes in 1.1 MB, socket stream exact),
