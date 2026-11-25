@@ -2807,7 +2807,17 @@ unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize,
     }
     let waited_ms = (ll_now_ms() - t1) as usize;
     let mut a = asfree_new();
-    let (cnt, last) = if asfree_read(&mut a) { asfree_of(&a, pid as usize) } else { (99, AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }) };
+    let (mut cnt, mut last) = if asfree_read(&mut a) { asfree_of(&a, pid as usize) } else { (99, AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }) };
+    if ign {
+        // An auto-reaped group is gone for the parent when its leader is
+        // logged; the leader's space is closed right after, so the ring
+        // entry is awaited (bounded) instead of read once.
+        let t2 = ll_now_ms();
+        while cnt != before + 1 && ll_now_ms() - t2 < 1000 {
+            usleep(1000);
+            if asfree_read(&mut a) { let (c, l) = asfree_of(&a, pid as usize); cnt = c; last = l; }
+        }
+    }
     if ign {
         ok &= gone && r == -10 && waited_ms < 500;
     } else {
