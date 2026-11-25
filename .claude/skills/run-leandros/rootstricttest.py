@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rootstricttest.py [aarch64|x86_64] [a|b|c|d ...]: a named root= is never replaced by another disk
+"""rootstricttest.py [aarch64|x86_64] [a|b|c|d|e|f|g|h ...]: a named root= is never replaced by another disk
 (lane strictroot).
 
 Boots the QEMU boot image (ESP on virtio, a VALID f2fs root on virtio vdb, the historical fallback)
@@ -8,13 +8,19 @@ with `root=PARTUUID=<guid>` naming a GPT partition on a USB stick (qemu-xhci + u
   b  the stick is absent, `rootwait=6 root.fail=reboot`: vdb is NOT mounted, the console says what
      was wanted, and init restarts the machine (a second "Init (PID 1) starting" in one QEMU)
   c  the stick is hot-added (QMP) ~10 s after init started waiting: root mounts from it
-  d  two sticks, the decoy first (bigger partition, other PARTUUID): only the named one is root
+  d  two sticks (decoy first, then named first: both enumeration orders), the decoy has a bigger
+     partition and another PARTUUID: only the named one is root
+  e  unknown root= form (UUID=) with a valid removable f2fs stick present: nothing is mounted, init restarts
+  f  root=LABEL=<the root image's label>: root mounts and logs in
+  g  root=LABEL=<no such label> with a stick present: nothing is mounted, init restarts
+  h  the same PARTUUID on two sticks: refused (nothing mounted, init restarts), no stick is guessed
+Every boot gets a private clone of the root image (LEANDROS_ROOT_IMAGE), never the build's.
 First it runs the cmdline parser unit tests (userland/init/src/rootspec.rs) with rustc --test.
-Red on a build without the strict root policy: b (vdb is mounted), c and d usually pass anyway.
+Red on a build without the strict root policy: b, e, g, h (vdb or a stick is mounted); a, c, d, f pass anyway.
 Usage: LEANDROS_RUN_ID=<lane> python3 rootstricttest.py [aarch64|x86_64] [a b c d]
 """
 import imgclone
-import json, os, re, shutil, subprocess, sys, time, uuid
+import hashlib, json, os, re, shutil, subprocess, sys, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
@@ -99,7 +105,10 @@ class T:
         imgclone.clone_file(os.path.join(REPO, f"leandros-limine-{self.arch}.img"), img)
         subprocess.run(["bash", os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, cmdline],
                        check=True, capture_output=True, cwd=REPO)
-        env = dict(os.environ, LEANDROS_RUN_ID=rid, LEANDROS_DISK_IMAGE=img)
+        rootimg = os.path.join(self.tmp, f"root-{case}.img")
+        imgclone.clone_file(os.path.join(REPO, f"f2fs-data0-{self.arch}.img"), rootimg)
+        self.rootimg = rootimg
+        env = dict(os.environ, LEANDROS_RUN_ID=rid, LEANDROS_DISK_IMAGE=img, LEANDROS_ROOT_IMAGE=rootimg)
         extra = "-device qemu-xhci,id=xhs"
         for i, (st, sid) in enumerate(sticks):
             extra += (f" -drive if=none,id=d{sid},format=raw,file={st}"
@@ -138,6 +147,37 @@ class T:
         return False, serial(rid)
 
 
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(8 * MIB)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def strict_fail(t, case, cmdline, sticks, expect_log):
+    """Boot with a root= that must not resolve: init restarts, nothing is mounted as root."""
+    rid, env = t.boot_env(case, cmdline, sticks)
+    before = sha256_file(t.rootimg)
+    proc = None
+    try:
+        proc = t.up_async(t.arch, env)
+        ok, log = t.wait_log(rid, lambda l: l.count(INIT_LINE) >= 2, 200)
+        t.check(f"{case}: machine restarted (init ran twice)", ok, f"init lines: {log.count(INIT_LINE)}")
+        t.check(f"{case}: nothing mounted as root",
+                "F2FS mounted successfully" not in log and "falling back to /dev/vdb" not in log)
+        t.check(f"{case}: console says why", expect_log in log,
+                "\n".join(l for l in log.splitlines() if "root" in l.lower())[-600:])
+    finally:
+        if proc:
+            proc.kill()
+        drv("stop", timeout=60, env=env)
+    t.check(f"{case}: vdb image untouched", sha256_file(t.rootimg) == before)
+
+
 def case_a(t, g):
     st = os.path.join(t.tmp, "a.img"); make_stick(t.arch, st, g)
     rid, env = t.boot_env("a", f"root=PARTUUID={g} rootwait=60", [(st, "usba")])
@@ -156,6 +196,7 @@ def case_a(t, g):
 
 def case_b(t, g):
     rid, env = t.boot_env("b", f"root=PARTUUID={g} rootwait=6 root.fail=reboot", [])
+    before = sha256_file(t.rootimg)
     try:
         proc = t.up_async(t.arch, env)   # `start` waits for a login prompt that never comes
         ok, log = t.wait_log(rid, lambda l: l.count(INIT_LINE) >= 2, 200)
@@ -166,6 +207,7 @@ def case_b(t, g):
     finally:
         proc.kill()
         drv("stop", timeout=60, env=env)
+    t.check("b: vdb image byte-identical after the failed boot", sha256_file(t.rootimg) == before)
 
 
 def case_c(t, g):
@@ -196,26 +238,63 @@ def case_c(t, g):
         drv("stop", timeout=60, env=env)
 
 
-def case_d(t, g):
-    decoy = os.path.join(t.tmp, "d-decoy.img"); make_stick(t.arch, decoy, str(uuid.uuid4()), extra_mib=64)
-    st = os.path.join(t.tmp, "d-named.img"); make_stick(t.arch, st, g)
-    rid, env = t.boot_env("d", f"root=PARTUUID={g} rootwait=60", [(decoy, "usbdecoy"), (st, "usbnamed")])
+def case_d_order(t, g, tag, decoy_first):
+    decoy = os.path.join(t.tmp, f"{tag}-decoy.img"); make_stick(t.arch, decoy, str(uuid.uuid4()), extra_mib=64)
+    st = os.path.join(t.tmp, f"{tag}-named.img"); make_stick(t.arch, st, g)
+    order = [(decoy, "usbdecoy"), (st, "usbnamed")]
+    if not decoy_first:
+        order.reverse()
+    rid, env = t.boot_env(tag, f"root=PARTUUID={g} rootwait=60", order)
     try:
-        ok, why = t.up(t.arch, env); t.check("d: boot", ok, why)
+        ok, why = t.up(t.arch, env); t.check(f"{tag}: boot", ok, why)
         ok, why = t.login(env) if ok else (False, "")
-        t.check("d: login", ok, why)
+        t.check(f"{tag}: login", ok, why)
         if ok:
             dev = t.root_dev(env)
-            t.check("d: / is on a USB stick", bool(dev and dev.startswith("sd")), f"root on {dev}")
+            t.check(f"{tag}: / is on a USB stick", bool(dev and dev.startswith("sd")), f"root on {dev}")
             # the decoy's partition is 64 MiB bigger than the named one: root must be the smaller sd?1
             _, out = drv("run", "cat /proc/partitions", "30", timeout=90, env=env)
             parts = {m.group(2): int(m.group(1)) for m in re.finditer(r"^\s*\d+\s+\d+\s+(\d+)\s+(sd\w*1)$", out, re.M)}
             rootsize = parts.get(dev) if dev else None
-            t.check("d: root partition is the named (smaller) one",
+            t.check(f"{tag}: root partition is the named (smaller) one",
                     len(parts) == 2 and rootsize == min(parts.values()) and len(set(parts.values())) == 2,
                     f"root {dev}, partitions {parts}")
     finally:
         drv("stop", timeout=60, env=env)
+
+
+def case_d(t, g):
+    case_d_order(t, g, "d1", True)    # decoy enumerates first
+    case_d_order(t, g, "d2", False)   # named stick enumerates first
+
+
+def case_e(t, g):
+    st = os.path.join(t.tmp, "e.img"); make_stick(t.arch, st, str(uuid.uuid4()))
+    strict_fail(t, "e", f"root=UUID={g} rootwait=6 root.fail=reboot", [(st, "usbe")], f"root=UUID={g}")
+
+
+def case_f(t, g):
+    rid, env = t.boot_env("f", "root=LABEL=leandros-root rootwait=60", [])
+    try:
+        ok, why = t.up(t.arch, env); t.check("f: boot", ok, why)
+        ok, why = t.login(env) if ok else (False, "")
+        t.check("f: login", ok, why)
+        t.check("f: root mounted", bool(ok and t.root_dev(env)))
+    finally:
+        drv("stop", timeout=60, env=env)
+
+
+def case_g(t, g):
+    st = os.path.join(t.tmp, "g.img"); make_stick(t.arch, st, str(uuid.uuid4()))
+    strict_fail(t, "g", "root=LABEL=nosuchlabel-" + g[:8] + " rootwait=6 root.fail=reboot", [(st, "usbg")],
+                "root=LABEL=nosuchlabel-")
+
+
+def case_h(t, g):
+    s1 = os.path.join(t.tmp, "h1.img"); make_stick(t.arch, s1, g)
+    s2 = os.path.join(t.tmp, "h2.img"); make_stick(t.arch, s2, g)
+    strict_fail(t, "h", f"root=PARTUUID={g} rootwait=6 root.fail=reboot", [(s1, "usbh1"), (s2, "usbh2")],
+                f"root=PARTUUID={g}")
 
 
 def main():
@@ -226,7 +305,7 @@ def main():
             arch = a
         else:
             cases.append(a)
-    cases = cases or ["a", "b", "c", "d"]
+    cases = cases or ["a", "b", "c", "d", "e", "f", "g", "h"]
     tmp = os.path.join(REPO, f"rootstrict-{os.environ.get('LEANDROS_RUN_ID', 'x')}")
     os.makedirs(tmp, exist_ok=True)
     t = T(arch, tmp)
@@ -234,7 +313,7 @@ def main():
         ok, out = unit_tests(tmp)
         t.check("parser unit tests", ok, out)
         for c in cases:
-            {"a": case_a, "b": case_b, "c": case_c, "d": case_d}[c](t, str(uuid.uuid4()))
+            {"a": case_a, "b": case_b, "c": case_c, "d": case_d, "e": case_e, "f": case_f, "g": case_g, "h": case_h}[c](t, str(uuid.uuid4()))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"rootstricttest {arch}: {'PASS' if not t.fails else 'FAIL ' + ', '.join(t.fails)}")

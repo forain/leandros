@@ -18,9 +18,17 @@ pub fn token_value<'a>(cmdline: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     found
 }
 
-/// The `root=` value; None when absent or empty.
+/// The `root=` value; None when absent or empty. Like the kernel, empty
+/// `root=` tokens are dropped before the last one wins, so a trailing
+/// `root=` does not hide an earlier value.
 pub fn root_spec(cmdline: &[u8]) -> Option<&[u8]> {
-    token_value(cmdline, b"root").filter(|v| !v.is_empty())
+    let mut found = None;
+    for t in cmdline.split(|&c| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0) {
+        if t.len() > 5 && &t[..5] == b"root=" {
+            found = Some(&t[5..]);
+        }
+    }
+    found
 }
 
 /// `rootwait=<seconds>`; the default when absent, empty or not a plain decimal number.
@@ -65,6 +73,12 @@ mod tests {
         assert_eq!(root_spec(b"root=/dev/a root=/dev/b"), Some(&b"/dev/b"[..]));
         assert_eq!(root_spec(b"a\troot=/dev/a\n"), Some(&b"/dev/a"[..]));
         assert_eq!(root_spec(b"x root=/dev/a\0junk"), Some(&b"/dev/a"[..]));
+    }
+    #[test]
+    fn trailing_empty_root_does_not_hide_earlier() {
+        assert_eq!(root_spec(b"root=/dev/a root="), Some(&b"/dev/a"[..]));
+        assert_eq!(root_spec(b"root= root=/dev/a root=/dev/b root="), Some(&b"/dev/b"[..]));
+        assert_eq!(root_spec(b"root=PARTUUID=x\nroot=\0"), Some(&b"PARTUUID=x"[..]));
     }
     #[test]
     fn rootwait() {

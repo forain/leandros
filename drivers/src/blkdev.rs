@@ -520,6 +520,13 @@ fn disk_of(idx: usize) -> Option<usize> {
     get(idx).map(|e| e.parent.map_or(idx, |p| p as usize))
 }
 
+/// The registry entry whose PARTUUID is `id`; two matches are `Ambiguous`.
+fn resolve_partuuid(id: &str) -> Result<usize, RootErr> {
+    let t = REG.lock();
+    crate::blockdev::pick_unique((0..t.n)
+        .filter(|&i| t.e[i].and_then(|e| e.partuuid).map_or(false, |u| u.matches(id))))
+}
+
 /// Resolve a mount source given by identity rather than name:
 /// `LABEL=<f2fs label>` or `PARTUUID=<id>`. Several volumes with one label
 /// are told apart by the disk: one on the root's disk wins, then one on the
@@ -528,10 +535,7 @@ pub fn resolve_source(spec: &str, cmdline: Option<&str>, boot: Option<BootDisk>)
     -> Option<Result<usize, RootErr>>
 {
     if let Some(id) = spec.strip_prefix("PARTUUID=") {
-        let t = REG.lock();
-        return Some(t.e[..t.n].iter()
-            .position(|e| e.and_then(|e| e.partuuid).map_or(false, |u| u.matches(id)))
-            .ok_or(RootErr::NotFound));
+        return Some(resolve_partuuid(id));
     }
     let label = spec.strip_prefix("LABEL=")?;
     let mut cands: alloc::vec::Vec<usize> =
@@ -811,7 +815,9 @@ fn resolve_root_label(label: &str) -> Result<usize, RootErr> {
 /// 1. `root=` on the kernel command line: `/dev/<name>`, `PARTUUID=<id>` or
 ///    `LABEL=<f2fs label>` (what QEMU boot images pass).
 ///    An explicit `root=` that matches nothing is `NotFound` (the disk may
-///    still be enumerating), never a silent fall-through to a guess.
+///    still be enumerating), never a silent fall-through to a guess; so is a
+///    form we do not understand (`UUID=`, a typo). A `PARTUUID=` carried by
+///    two partitions is `Ambiguous`.
 /// 2. No hint (old images; logged once as a warning). Legacy: index 1 when it is a whole virtio disk with f2fs magic — QEMU's
 ///    vdb, so the default boot is unchanged.
 /// 3. The unique removable or `sd*` disk/partition with f2fs magic that is not
@@ -860,21 +866,27 @@ pub fn busy_range(idx: usize) -> Option<(u64, u64)> {
 
 fn resolve_root_inner(cmdline: Option<&str>, boot: Option<BootDisk>) -> Result<usize, RootErr> {
     if let Some(spec) = cmdline.and_then(parse_root_arg) {
-        if let Some(name) = spec.strip_prefix("/dev/") {
-            return lookup_name(name).ok_or(RootErr::NotFound);
+        match crate::blockdev::root_form(spec) {
+            crate::blockdev::RootForm::Dev(name) => return lookup_name(name).ok_or(RootErr::NotFound),
+            crate::blockdev::RootForm::PartUuid(id) => {
+                let r = resolve_partuuid(id);
+                if r == Err(RootErr::Ambiguous) {
+                    log("[BLK] root=PARTUUID=");
+                    log(id);
+                    log(" matches more than one partition\n");
+                }
+                return r;
+            }
+            crate::blockdev::RootForm::Label(label) => return resolve_root_label(label),
+            crate::blockdev::RootForm::Unknown(_) => {
+                // A root= that names nothing we understand must never fall
+                // through to a guess (vdb, the lone removable f2fs).
+                log("[BLK] root=");
+                log(spec);
+                log(" is not understood (want /dev/<name>, PARTUUID= or LABEL=); refusing to guess\n");
+                return Err(RootErr::NotFound);
+            }
         }
-        if let Some(id) = spec.strip_prefix("PARTUUID=") {
-            let t = REG.lock();
-            return t.e[..t.n].iter()
-                .position(|e| e.and_then(|e| e.partuuid).map_or(false, |u| u.matches(id)))
-                .ok_or(RootErr::NotFound);
-        }
-        if let Some(label) = spec.strip_prefix("LABEL=") {
-            return resolve_root_label(label);
-        }
-        log("[BLK] root=");
-        log(spec);
-        log(" not understood (want /dev/<name>, PARTUUID= or LABEL=), auto-detecting\n");
     } else if !NO_HINT_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         log("[BLK] warning: no root= on the kernel command line; guessing /dev/root \
              from probe order (pass root=LABEL=, PARTUUID= or /dev/<name>)\n");
