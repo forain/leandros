@@ -653,15 +653,26 @@ pub fn raw_flush(idx: usize) -> bool { flush(idx) }
 /// Reboot / power-off: commit the write cache of every writable whole disk
 /// (a USB stick gets SYNCHRONIZE CACHE after the kernel log's final write;
 /// Linux `sd_shutdown`). Read-only disks are skipped. Returns (flushed,
-/// failed).
+/// failed); a device answering `Unsupported` is counted apart in
+/// `flush_all_disks_tally`, not as a failure.
 pub fn flush_all_disks() -> (usize, usize) {
-    let (mut ok, mut bad) = (0, 0);
+    let t = flush_all_disks_tally();
+    (t.ok + t.unsupported, t.failed)
+}
+
+pub fn flush_all_disks_tally() -> crate::flush_logic::FlushTally {
+    use crate::flush_logic::{FlushResult, FlushTally};
+    let mut t = FlushTally::default();
     for i in 0..device_count() {
         let e = match get(i) { Some(e) => e, None => continue };
         if e.parent.is_some() || e.dev.read_only() { continue; }
-        if e.dev.flush().is_ok() { ok += 1; } else { bad += 1; }
+        t.add(match e.dev.flush() {
+            Ok(()) => FlushResult::Ok,
+            Err(BlkErr::Unsupported) => FlushResult::Unsupported,
+            Err(_) => FlushResult::Failed,
+        });
     }
-    (ok, bad)
+    t
 }
 
 // ── System sleep gate (kernel pm) ───────────────────────────────────────────

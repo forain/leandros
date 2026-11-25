@@ -460,9 +460,9 @@ fn machine_prepare() {
     crate::console_drain_outbox();
     crate::console_staging_disable_and_drain();
     crate::klog::flush_final();
-    let (ok, bad) = drivers::blkdev::flush_all_disks();
-    if ok + bad > 0 {
-        serial_print_str(&alloc::format!("[REBOOT] disk write caches flushed: {} ok, {} failed\n", ok, bad));
+    let t = drivers::blkdev::flush_all_disks_tally();
+    if t.ok + t.unsupported + t.failed > 0 {
+        serial_print_str(&alloc::format!("[REBOOT] disk write caches flushed: {} ok, {} unsupported, {} failed\n", t.ok, t.unsupported, t.failed));
     }
     unsafe {
         #[cfg(target_arch = "x86_64")]

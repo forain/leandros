@@ -236,6 +236,7 @@ pub mod sdhci;
 pub mod rpi_mailbox;
 /// Pi 5 SoC housekeeping: RNG, firmware RTC, PM watchdog, thermal, ARM clock (lane pimisc).
 pub mod rpi_misc_logic;
+pub mod flush_logic;
 #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
 pub mod rpi_misc;
 /// Shared BCM2712 PM block accessor (V3D power + watchdog/reset).
