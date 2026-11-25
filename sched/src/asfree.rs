@@ -32,6 +32,20 @@
 //!                           1 when it got nothing, 2 when it got the space.
 //!                           Cleared when armed; disarmed by `release` or 10 s
 //!                           (ESRCH for an unknown pid).
+//!   `exitrace <tgid> <n> <w|l>`
+//!                           lane lateleader: in `exit`, after the thread's
+//!                           space was released and before it turns Zombie, a
+//!                           thread of `tgid` waits (no lock held, IRQ window
+//!                           and yield) until `n` threads have arrived or 2 s
+//!                           passed, so that they become Zombies together.
+//!                           `w` = only non-leader threads count and wait, `l`
+//!                           = the leader too;
+//!   `dropdelay <tgid> <us>` (us <= 2000) the dispatch loop holds the drop of a
+//!                           removed member of `tgid` open for `us` after it
+//!                           released RUN_QUEUE (the window in which
+//!                           `AS_DROP_TGID` is set), and the leader of `tgid`
+//!                           waits `us` once before its final yield. Both
+//!                           disarm with `release <tgid>` or after 10 s.
 //! `busyhold` is gated on the exit itself: the kernel observer takes `busy`
 //! (IRQs masked, like real holders) when the pid's exit has decided to close
 //! and keeps it until the closer of the SAME space is seen waiting
@@ -72,6 +86,16 @@ static BUSY_HELD: AtomicBool = AtomicBool::new(false);
 static ARMED_SPACE: AtomicUsize = AtomicUsize::new(0);
 static BUSY_WAITS: AtomicU64 = AtomicU64::new(0);
 static OVERLAPS: AtomicU64 = AtomicU64::new(0);
+// Lane lateleader knobs.
+static RACE_PID: AtomicU32 = AtomicU32::new(0);
+static RACE_N: AtomicU32 = AtomicU32::new(0);
+static RACE_LEADER: AtomicBool = AtomicBool::new(false);
+static RACE_ARRIVED: AtomicU32 = AtomicU32::new(0);
+static RACE_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static DELAY_PID: AtomicU32 = AtomicU32::new(0);
+static DELAY_US: AtomicU64 = AtomicU64::new(0);
+static DELAY_DEADLINE: AtomicU64 = AtomicU64::new(0);
+static DELAY_LEADER_ONCE: AtomicBool = AtomicBool::new(false);
 
 #[inline(always)]
 pub fn any_armed() -> bool { ANY.load(Ordering::Relaxed) }
@@ -87,7 +111,14 @@ fn refresh_any() {
     if PAUSE_PID.load(Ordering::Relaxed) != 0 && now >= PAUSE_DEADLINE.load(Ordering::Relaxed) {
         PAUSE_PID.store(0, Ordering::Relaxed);
     }
-    ANY.store(LEGACY_PID.load(Ordering::Relaxed) != 0 || PAUSE_PID.load(Ordering::Relaxed) != 0
+    if RACE_PID.load(Ordering::Relaxed) != 0 && now >= RACE_DEADLINE.load(Ordering::Relaxed) {
+        RACE_PID.store(0, Ordering::Relaxed);
+    }
+    if DELAY_PID.load(Ordering::Relaxed) != 0 && now >= DELAY_DEADLINE.load(Ordering::Relaxed) {
+        DELAY_PID.store(0, Ordering::Relaxed);
+    }
+    ANY.store(RACE_PID.load(Ordering::Relaxed) != 0 || DELAY_PID.load(Ordering::Relaxed) != 0
+        || LEGACY_PID.load(Ordering::Relaxed) != 0 || PAUSE_PID.load(Ordering::Relaxed) != 0
         || GATE_PID.load(Ordering::Relaxed) != 0 || ARMED_SPACE.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
 }
 
@@ -131,6 +162,47 @@ pub fn exit_before_close(pid: Pid, old: &Arc<AddressSpace>) -> Option<Arc<Addres
     }
     refresh_any();
     extra
+}
+
+/// `exitrace`: called by `exit` of `pid` (thread group `tgid`) after its space
+/// was released, before it becomes a Zombie. No lock held. Call only after
+/// `any_armed()`.
+pub fn exit_race(pid: Pid, tgid: Pid) {
+    if RACE_PID.load(Ordering::Relaxed) != tgid { return; }
+    let now = crate::monotonic_ns();
+    if now >= RACE_DEADLINE.load(Ordering::Relaxed) { return; }
+    if pid == tgid && !RACE_LEADER.load(Ordering::Relaxed) { return; }
+    RACE_ARRIVED.fetch_add(1, Ordering::AcqRel);
+    let n = RACE_N.load(Ordering::Relaxed);
+    while RACE_ARRIVED.load(Ordering::Acquire) < n && crate::monotonic_ns().saturating_sub(now) < 2_000_000_000 {
+        crate::irq_window();
+        crate::yield_now("asfree_exitrace");
+    }
+}
+
+/// `dropdelay`: the dispatch loop, with a removed member of `tgid` whose drop
+/// is pending (`AS_DROP_TGID` set, RUN_QUEUE released). Call only after
+/// `any_armed()`.
+pub fn drop_delay(tgid: Pid) {
+    if DELAY_PID.load(Ordering::Relaxed) != tgid { return; }
+    let t0 = crate::monotonic_ns();
+    if t0 >= DELAY_DEADLINE.load(Ordering::Relaxed) { return; }
+    let us = DELAY_US.load(Ordering::Relaxed);
+    while crate::monotonic_ns().saturating_sub(t0) < us * 1000 {
+        mm::paging::tlb_service_pending();
+        core::hint::spin_loop();
+    }
+}
+
+/// `dropdelay`, leader side: once, before the leader's final yield. Task
+/// context, no lock held. Call only after `any_armed()`.
+pub fn leader_delay(pid: Pid, tgid: Pid) {
+    if pid != tgid || DELAY_PID.load(Ordering::Relaxed) != tgid { return; }
+    if !DELAY_LEADER_ONCE.swap(false, Ordering::AcqRel) { return; }
+    let t0 = crate::monotonic_ns();
+    // Half the drop delay: the leader's switch-out lands inside the window.
+    let us = DELAY_US.load(Ordering::Relaxed) / 2;
+    while crate::monotonic_ns().saturating_sub(t0) < us * 1000 { crate::irq_window(); core::hint::spin_loop(); }
 }
 
 /// After the close: the paused observer tries the space and must get nothing.
@@ -202,6 +274,28 @@ pub fn control(cmd: &str) -> i32 {
             ANY.store(true, Ordering::Relaxed);
             0
         }
+        Some("exitrace") => {
+            if crate::task_as(pid).is_none() { return -3; }
+            let n = match num(it.next()) { Some(n) if n >= 1 && n <= 64 => n as u32, _ => return -22 };
+            let leader = match it.next() { Some("w") => false, Some("l") => true, _ => return -22 };
+            RACE_N.store(n, Ordering::Relaxed);
+            RACE_LEADER.store(leader, Ordering::Relaxed);
+            RACE_ARRIVED.store(0, Ordering::Relaxed);
+            RACE_DEADLINE.store(crate::monotonic_ns().saturating_add(AUTO_RELEASE_NS), Ordering::Relaxed);
+            RACE_PID.store(pid, Ordering::Release);
+            ANY.store(true, Ordering::Relaxed);
+            0
+        }
+        Some("dropdelay") => {
+            if crate::task_as(pid).is_none() { return -3; }
+            let us = match num(it.next()) { Some(u) if u >= 1 && u <= 2000 => u, _ => return -22 };
+            DELAY_US.store(us, Ordering::Relaxed);
+            DELAY_LEADER_ONCE.store(true, Ordering::Relaxed);
+            DELAY_DEADLINE.store(crate::monotonic_ns().saturating_add(AUTO_RELEASE_NS), Ordering::Relaxed);
+            DELAY_PID.store(pid, Ordering::Release);
+            ANY.store(true, Ordering::Relaxed);
+            0
+        }
         Some("busyhold") => match num(it.next()) {
             Some(us) if us >= 1 && us <= BUSYHOLD_MAX_US => arm(pid, us),
             _ => -22,
@@ -228,6 +322,8 @@ fn release(pid: Pid) -> i32 {
         PAUSE_RESULT.store(0, Ordering::Relaxed);
         refresh_any();
     }
+    if RACE_PID.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { refresh_any(); }
+    if DELAY_PID.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { refresh_any(); }
     drop(h); // the teardown, if this was the last reference, runs here
     if let Some(g) = wait_gen {
         let t0 = crate::monotonic_ns();

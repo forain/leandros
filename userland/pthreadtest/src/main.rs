@@ -155,6 +155,35 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         pthread_exit(core::ptr::null_mut());
     }
 
+    // Lane lateleader: `pthreadtest late_leader <readyfd> <gofd> <nworkers> [x]`
+    //   touches 8 MiB, starts `nworkers` threads that each block on one byte of
+    //   `gofd` and return, writes a byte to `readyfd`, then pthread_exit()s the
+    //   leader: at once, or with an extra `x` argument after taking one byte of
+    //   `gofd` itself (so the leader leaves together with the workers).
+    //   `pthreadtest late_leader_churn <rounds>`: knob-less barrier-exit churn.
+    if argc >= 5 && arg_eq(argv, 1, b"late_leader") {
+        let rfd = arg_num(argv, 2);
+        ASFREE_GOFD = arg_num(argv, 3);
+        let nw = arg_num(argv, 4);
+        let lead_waits = argc >= 6;
+        let big = core::ptr::addr_of_mut!(LL_BIG) as *mut u8;
+        let mut pg = 0usize;
+        while pg < LL_BIG_LEN { core::ptr::write_volatile(big.add(pg), 1); pg += 4096; }
+        let mut t: pthread_t = core::ptr::null_mut();
+        for _ in 0..nw {
+            if pthread_create(&mut t, core::ptr::null(), asfree_waiter, core::ptr::null_mut()) != 0 { return 1; }
+        }
+        write(rfd, b"r".as_ptr(), 1);
+        if lead_waits {
+            let mut b = [0u8; 1];
+            read(ASFREE_GOFD, b.as_mut_ptr(), 1);
+        }
+        pthread_exit(core::ptr::null_mut());
+    }
+    if argc >= 3 && arg_eq(argv, 1, b"late_leader_churn") {
+        return churn_barrier_exit(arg_num(argv, 2));
+    }
+
     // Mode `pthreadtest churn [N]`: only the thread-churn leak check.
     if argc >= 2 && arg_eq(argv, 1, b"churn") {
         let mut n = 5000u64;
@@ -779,6 +808,93 @@ extern "C" fn asfree_parker(_a: *mut c_void) -> *mut c_void {
 }
 
 static mut ASFREE_GOFD: i32 = -1;
+const LL_BIG_LEN: usize = 8 << 20;
+static mut LL_BIG: [u8; LL_BIG_LEN] = [0; LL_BIG_LEN];
+static LL_ARRIVED: AtomicU32 = AtomicU32::new(0);
+static LL_NEED: AtomicU32 = AtomicU32::new(0);
+
+/// Every thread spins until all arrived, then leaves at once.
+extern "C" fn ll_barrier_worker(_arg: *mut c_void) -> *mut c_void {
+    LL_ARRIVED.fetch_add(1, SeqCst);
+    while LL_ARRIVED.load(SeqCst) < LL_NEED.load(SeqCst) { core::hint::spin_loop(); }
+    core::ptr::null_mut()
+}
+
+unsafe fn ll_now_ms() -> i64 {
+    let mut ts = [0i64; 2];
+    syscall(fx::CLOCK_GETTIME, 1i64, ts.as_mut_ptr() as i64);
+    ts[0] * 1000 + ts[1] / 1_000_000
+}
+
+#[cfg(target_arch = "x86_64")]
+mod llnr { pub const SIGPROCMASK: i64 = 14; pub const SIGTIMEDWAIT: i64 = 128; }
+#[cfg(target_arch = "aarch64")]
+mod llnr { pub const SIGPROCMASK: i64 = 135; pub const SIGTIMEDWAIT: i64 = 137; }
+
+/// rt_sigtimedwait for SIGCHLD only: true when one was consumed within `ms`.
+unsafe fn ll_take_sigchld(ms: i64) -> bool {
+    let set: u64 = 1 << 16;
+    let mut info = [0u8; 128];
+    let ts = [ms / 1000, (ms % 1000) * 1_000_000];
+    let r = syscall(llnr::SIGTIMEDWAIT, &set as *const u64 as i64, info.as_mut_ptr() as i64,
+        ts.as_ptr() as i64, 8i64);
+    r == 17
+}
+
+unsafe fn ll_print(tag: &[u8], v: i64) {
+    let mut b = [0u8; 48];
+    let mut n = 0;
+    for &c in tag { b[n] = c; n += 1; }
+    let mut d = [0u8; 20]; let mut k = 0; let mut x = v.max(0) as u64;
+    loop { d[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+    while k > 0 { k -= 1; b[n] = d[k]; n += 1; }
+    b[n] = b'\n'; n += 1;
+    write(1, b.as_ptr(), n);
+}
+
+/// `rounds` forked children, each with 1-3 workers leaving together with the
+/// leader (which calls pthread_exit). The parent blocks SIGCHLD and per round
+/// reaps the child within 3 s (WNOHANG polls), checks its status and takes
+/// exactly one SIGCHLD; at the end no further SIGCHLD may be pending. Returns
+/// 0 when clean, else 1 fork, 2 bad status, 3 not reapable in 3 s (leaked
+/// leader), 4 SIGCHLD missing, 5 stray SIGCHLD. Counts are printed.
+unsafe fn churn_barrier_exit(rounds: i32) -> i32 {
+    let set: u64 = 1 << 16;
+    syscall(llnr::SIGPROCMASK, 0i64, &set as *const u64 as i64, 0i64, 8i64);
+    while ll_take_sigchld(0) {}
+    let mut done = 0i32;
+    let mut rc = 0;
+    for r in 0..rounds {
+        let nw = 1 + (r % 3) as u32;
+        let pid = fork();
+        if pid == 0 {
+            LL_ARRIVED.store(0, SeqCst);
+            LL_NEED.store(nw + 1, SeqCst);
+            let mut t: pthread_t = core::ptr::null_mut();
+            for _ in 0..nw {
+                if pthread_create(&mut t, core::ptr::null(), ll_barrier_worker, core::ptr::null_mut()) != 0 { exit(3); }
+            }
+            ll_barrier_worker(core::ptr::null_mut());
+            pthread_exit(core::ptr::null_mut());
+        }
+        if pid < 0 { rc = 1; break; }
+        let t0 = ll_now_ms();
+        loop {
+            let mut st = -1i32;
+            let w = waitpid(pid, &mut st, 1);
+            if w == pid { if st != 0 { rc = 2; } break; }
+            if w < 0 || ll_now_ms() - t0 > 3000 { rc = 3; break; }
+            usleep(200);
+        }
+        if rc != 0 { break; }
+        if !ll_take_sigchld(3000) { rc = 4; break; }
+        done += 1;
+    }
+    if rc == 0 && ll_take_sigchld(200) { rc = 5; }
+    ll_print(b"late_leader_churn rounds_done=", done as i64);
+    ll_print(b"late_leader_churn rc=", rc as i64);
+    rc
+}
 
 /// Blocks until one byte arrives on `ASFREE_GOFD`, then ends the last thread.
 extern "C" fn asfree_waiter(_arg: *mut c_void) -> *mut c_void {
