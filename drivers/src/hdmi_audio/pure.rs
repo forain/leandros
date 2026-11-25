@@ -366,6 +366,15 @@ impl Ring {
         (self.written % RING_BYTES as u64) as usize
     }
 
+    /// Position update where the position may be unavailable (the engine is not yet inside the
+    /// ring): returns the advance and the bytes played by it. `None` counts as nothing moved.
+    pub fn update(&mut self, pos: Option<usize>) -> (Advance, u64) {
+        let Some(pos) = pos else { return (Advance { refill: [(0, 0); 2], starved: false }, 0) };
+        let before = self.played;
+        let adv = self.advance(pos);
+        (adv, self.played - before)
+    }
+
     /// New engine position `pos` (byte offset; rounded down to a frame).
     pub fn advance(&mut self, pos: usize) -> Advance {
         let mut out = Advance { refill: [(0, 0); 2], starved: false };
@@ -475,26 +484,130 @@ pub fn dreq_knob(cmdline: &str) -> Option<u32> {
         .and_then(|v| v.parse::<u32>().ok()).filter(|&n| n < 32)
 }
 
-/// Probe verification windows (ms): skip the start-up transient, then measure.
+/// Probe verification: skip the start-up transient, then measure over a fixed window.
 pub const VERIFY_SKIP_MS: u64 = 5;
-pub const VERIFY_MIN_MS: u64 = 20;
-pub const VERIFY_MAX_MS: u64 = 40;
+pub const VERIFY_MEASURE_MS: u64 = 30;
+/// Position sampling period (us).
+pub const VERIFY_SAMPLE_US: u64 = 500;
 /// At or below this many bytes the engine is considered silent (not paced by the FIFO).
 pub const VERIFY_SILENT_BYTES: u64 = 2048;
+/// More than this many periods completing inside the window means the engine is not paced.
+pub const VERIFY_MAX_PERIODS: u64 = 1;
 
-/// True when the ring position moved at the hardware rate: both positions valid, more than
-/// 2 KiB in total, and 50..=150 % of `hw_rate * 8 / 1000` bytes per ms (384 B/ms at 48 kHz)
-/// over `elapsed_us`. A free-running engine (no DREQ pacing) races far above 150 %.
-pub fn verify_rate(pos0: Option<usize>, pos1: Option<usize>, elapsed_us: u64, hw_rate: u32) -> bool {
-    let (Some(a), Some(b)) = (pos0, pos1) else { return false };
-    if a >= RING_BYTES || b >= RING_BYTES || elapsed_us == 0 { return false; }
-    let moved = ((b + RING_BYTES - a) % RING_BYTES) as u64;
-    if moved <= VERIFY_SILENT_BYTES { return false; }
-    // bytes per second * 1e6 comparisons without division: moved/elapsed vs expected.
-    let expected_bps = hw_rate as u64 * FRAME_BYTES as u64;
-    let got = moved * 1_000_000; // bytes * us / us -> compare moved*1e6 with expected_bps*elapsed_us
-    let want = expected_bps * elapsed_us;
-    got * 2 >= want && got * 2 <= want * 3
+/// Accumulates the engine's position samples into an unwrapped byte count and decides once.
+///
+/// Every sample adds the forward distance from the previous one (mod the ring) to a `u64`, so a
+/// racing engine cannot hide behind the ring size: its total grows without bound while a paced
+/// one stays at the hardware rate. A single step of half a ring or more is ambiguous (the
+/// engine may have lapped) and fails at once, as does a lost position inside the window and a
+/// window with more than [`VERIFY_MAX_PERIODS`] completed periods.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RateMeter {
+    last: Option<usize>,
+    total: u64,
+    mark_total: u64,
+    mark_periods: u64,
+    periods: u64,
+    marked: bool,
+    bad: bool,
+}
+
+impl RateMeter {
+    pub const fn new() -> Self {
+        RateMeter { last: None, total: 0, mark_total: 0, mark_periods: 0, periods: 0, marked: false, bad: false }
+    }
+
+    /// One sample (every [`VERIFY_SAMPLE_US`], the start-up skip included). `periods` is the
+    /// channel's completed-period counter.
+    pub fn sample(&mut self, pos: Option<usize>, periods: u64) {
+        self.periods = periods;
+        match pos {
+            Some(p) if p < RING_BYTES => {
+                if let Some(l) = self.last {
+                    let d = (p + RING_BYTES - l) % RING_BYTES;
+                    if d >= RING_BYTES / 2 { self.bad = true; }
+                    self.total += d as u64;
+                }
+                self.last = Some(p);
+            }
+            _ => if self.marked { self.bad = true; },
+        }
+    }
+
+    /// End of the start-up transient: everything counted so far is excluded from the verdict.
+    pub fn mark(&mut self) {
+        self.marked = true;
+        self.mark_total = self.total;
+        self.mark_periods = self.periods;
+    }
+
+    /// Bytes moved since the mark (unwrapped).
+    pub fn moved(&self) -> u64 { self.total - self.mark_total }
+    pub fn periods_since_mark(&self) -> u64 { self.periods.saturating_sub(self.mark_periods) }
+
+    /// The verdict, taken once at the end of the window of `elapsed_us` since the mark: more
+    /// than 2 KiB moved, 50..=150 % of `hw_rate * 8` bytes per second, a continuous position and
+    /// at most one completed period.
+    pub fn verdict(&self, elapsed_us: u64, hw_rate: u32) -> bool {
+        if !self.marked || self.bad || elapsed_us == 0 || self.periods_since_mark() > VERIFY_MAX_PERIODS { return false; }
+        let moved = self.moved();
+        if moved <= VERIFY_SILENT_BYTES { return false; }
+        let got = moved * 1_000_000;
+        let want = hw_rate as u64 * FRAME_BYTES as u64 * elapsed_us;
+        got * 2 >= want && got * 2 <= want * 3
+    }
+}
+
+/// Re-train check: does the programmed audio setup still read back? CRP_CFG must keep the
+/// external-CTS enable and N, CTS_0 its value, and the audio packet / MAI config registers all
+/// the bits we set (a firmware re-train that keeps N can still drop the rest).
+pub fn setup_intact(crp: u32, cts0: u32, apc: u32, mai_cfg: u32, n: u32, cts: u32, mask: u32) -> bool {
+    let (want_apc, want_mai) = (audio_packet_config(mask), mai_config(mask));
+    crp & 0x010f_ffff == crp_cfg(n)
+        && cts0 & 0xf_ffff == cts & 0xf_ffff
+        && apc & want_apc == want_apc
+        && mai_cfg & want_mai == want_mai
+}
+
+/// The audio InfoFrame rewrite when the packet slot was busy: retried without waiting, one
+/// tick at a time. `Disable` stops the slot, `Write` rewrites and re-enables it once idle,
+/// `GiveUp` re-enables the old contents after too many busy ticks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoframeStep { Nothing, Disable, Write, GiveUp }
+
+pub const INFOFRAME_RETRY_TICKS: u32 = 100;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InfoframeRetry {
+    pending: bool,
+    disabled: bool,
+    busy_ticks: u32,
+    logged: bool,
+}
+
+impl InfoframeRetry {
+    pub const fn new() -> Self { InfoframeRetry { pending: false, disabled: false, busy_ticks: 0, logged: false } }
+    pub fn is_pending(&self) -> bool { self.pending }
+    /// The blocking write found the slot busy. True the first time only (the caller logs once).
+    pub fn defer(&mut self) -> bool {
+        self.pending = true;
+        self.disabled = false;
+        self.busy_ticks = 0;
+        let first = !self.logged;
+        self.logged = true;
+        first
+    }
+    /// A blocking write succeeded: nothing is owed any more.
+    pub fn done(&mut self) { self.pending = false; self.disabled = false; self.busy_ticks = 0; }
+    /// One tick; `slot_busy` is the packet status bit (read non-blockingly).
+    pub fn tick(&mut self, slot_busy: bool) -> InfoframeStep {
+        if !self.pending { return InfoframeStep::Nothing; }
+        if !self.disabled { self.disabled = true; return InfoframeStep::Disable; }
+        if !slot_busy { self.done(); return InfoframeStep::Write; }
+        self.busy_ticks += 1;
+        if self.busy_ticks >= INFOFRAME_RETRY_TICKS { self.done(); return InfoframeStep::GiveUp; }
+        InfoframeStep::Nothing
+    }
 }
 
 /// Wait before the next action after restart number `k` (1-based): 1, 2, 4, 8 s, then 8 s again.
@@ -502,8 +615,9 @@ pub const fn restart_wait_ns(k: u32) -> u64 {
     const S: u64 = 1_000_000_000;
     match k { 0 | 1 => S, 2 => 2 * S, 3 => 4 * S, _ => 8 * S }
 }
-/// Idle ticks before the first restart of a stall.
-pub const STALL_TICKS: u32 = 30;
+/// Time without any played byte before the first restart of a stall (wall clock, not ticks:
+/// update() runs from the timer IRQ and from every write, at no fixed rate).
+pub const STALL_NS: u64 = 300_000_000;
 /// Restarts without progress before the stream is declared dead.
 pub const STALL_MAX_RESTARTS: u32 = 5;
 /// Bytes played since a restart that count as progress.
@@ -520,48 +634,76 @@ pub enum StallAction {
 
 /// Decides when a stalled stream is restarted and when it is given up on. Pure: the caller
 /// supplies the clock and the bytes played since the previous call.
+///
+/// After a death a client reconfigure puts the policy on probation: the reconfigure itself is
+/// the one restart, a second stall goes straight back to dead, and only real progress
+/// ([`STALL_PROGRESS_BYTES`] played) or a firmware re-train ([`StallPolicy::rearm`]) restores
+/// the full ladder.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StallPolicy {
     restarts: u32,
-    ticks: u32,
+    last_move_ns: u64,
+    seen: bool,
     since: u64,
     deadline_ns: u64,
     dead: bool,
+    probation: bool,
 }
 
 impl StallPolicy {
-    pub const fn new() -> Self { StallPolicy { restarts: 0, ticks: 0, since: 0, deadline_ns: 0, dead: false } }
+    pub const fn new() -> Self {
+        StallPolicy { restarts: 0, last_move_ns: 0, seen: false, since: 0, deadline_ns: 0, dead: false, probation: false }
+    }
     pub fn is_dead(&self) -> bool { self.dead }
     pub fn restarts(&self) -> u32 { self.restarts }
-    /// A client reconfigure or a firmware re-train starts over, including out of dead.
+    pub fn on_probation(&self) -> bool { self.probation }
     /// Marks the stream dead without a stall (a restart that could not even start).
     pub fn kill(&mut self) { self.dead = true; }
+    /// A firmware re-train starts over completely, including out of dead and probation.
     pub fn rearm(&mut self) { *self = StallPolicy::new(); }
+    /// A client reconfigure: starts over, but out of dead (or still on probation) it only
+    /// earns the one restart the reconfigure itself performs.
+    pub fn rearm_client(&mut self) {
+        let was = self.dead || self.probation;
+        *self = StallPolicy::new();
+        self.probation = was;
+    }
 
     fn restart(&mut self, now_ns: u64) -> StallAction {
         self.restarts += 1;
-        self.ticks = 0;
         self.since = 0;
         self.deadline_ns = now_ns + restart_wait_ns(self.restarts);
         StallAction::Restart(self.restarts)
     }
 
+    fn die(&mut self) -> StallAction {
+        self.dead = true;
+        StallAction::Dead
+    }
+
     fn after_wait(&mut self, now_ns: u64) -> StallAction {
         if now_ns < self.deadline_ns { return StallAction::None; }
-        if self.restarts >= STALL_MAX_RESTARTS {
-            self.dead = true;
-            return StallAction::Dead;
-        }
+        if self.restarts >= STALL_MAX_RESTARTS { return self.die(); }
         self.restart(now_ns)
     }
 
-    /// One update tick: `moved` bytes played since the previous call.
+    /// One update tick: `moved` bytes played since the previous call (0 when the position is
+    /// unavailable).
     pub fn observe(&mut self, now_ns: u64, moved: u64) -> StallAction {
         if self.dead { return StallAction::None; }
         if self.restarts == 0 {
-            if moved > 0 { self.ticks = 0; return StallAction::None; }
-            self.ticks += 1;
-            return if self.ticks >= STALL_TICKS { self.restart(now_ns) } else { StallAction::None };
+            if self.probation {
+                self.since += moved;
+                if self.since >= STALL_PROGRESS_BYTES { *self = StallPolicy::new(); }
+            }
+            if !self.seen || moved > 0 {
+                self.seen = true;
+                self.last_move_ns = now_ns;
+                return StallAction::None;
+            }
+            if now_ns.saturating_sub(self.last_move_ns) < STALL_NS { return StallAction::None; }
+            if self.probation { return self.die(); }
+            return self.restart(now_ns);
         }
         self.since += moved;
         if self.since >= STALL_PROGRESS_BYTES {
@@ -575,6 +717,7 @@ impl StallPolicy {
     /// restarts at once; later ones only once the backoff since the last restart has passed.
     pub fn request(&mut self, now_ns: u64) -> StallAction {
         if self.dead { return StallAction::None; }
+        if self.probation && self.restarts == 0 { return self.die(); }
         if self.restarts == 0 { return self.restart(now_ns); }
         self.after_wait(now_ns)
     }
