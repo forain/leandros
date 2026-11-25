@@ -881,8 +881,9 @@ pub fn clone_thread(
         // on) could reap the leader while it, and other siblings, were still
         // running on those tables — a freed root under a live CPU. The
         // space is now freed when the *last* thread's Task drops, which the
-        // scheduler only does once that thread is off its CPU and the CPU
-        // has switched back to the kernel page table.
+        // scheduler only does once that thread is off its CPU (x86_64: and
+        // the CPU has reloaded the kernel CR3; aarch64: TTBR0 may stay stale,
+        // which is harmless, see `reap_close_space`).
         child.address_space = leader_as;
         child.pgid       = pgid;
         child.sid        = sid;
