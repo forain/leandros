@@ -45,7 +45,7 @@ def spliced(seg: bytes):
 def segment(buf: bytes) -> bytes:
     """The flood in `buf`: first CONLOSS line through the DONE line."""
     i = buf.find(b"CONLOSS 000001 ")
-    j = buf.find(b"CONLOSS-DONE")
+    j = buf.find(b"CONLOSS-DONE", i) if i >= 0 else -1  # the DONE after the flood's start
     return buf[i:j] if 0 <= i < j else b""
 
 
@@ -62,6 +62,11 @@ def main():
     fails = []
     try:
         start = len(ser.buf)
+        # serial-full.log holds every earlier flood of this VM too: only this run's bytes count.
+        try:
+            log_off = os.path.getsize(driver.SERIAL_FULL_LOG)
+        except OSError:
+            log_off = 0
         r = driver.serial_run(f"/bin/conloss {N} 40 {SLEEP_MS}", timeout=600, arch=arch, ser=ser)
         ser.pump(2.0)
         sock = ser.buf[start:]
@@ -73,6 +78,9 @@ def main():
                 full = f.read()
         except OSError:
             pass
+        if len(full) < log_off:  # the log shrank: the VM rebooted in between, start from 0
+            log_off = 0
+        full = full[log_off:]
         gs = gaps(sock, N)
         # QEMU's own logfile can DUPLICATE a byte when the chardev socket takes a
         # partial write (seen on x86_64: +75 bytes in 1.1 MB, socket stream exact),
@@ -88,7 +96,19 @@ def main():
         sp = spliced(seg_s)
         if sp:
             print(f"  spliced lines {len(sp)}: {sp[:3]!r}")
-        ok = (r["status"] == "ok" and m is not None and not sp and not gs and not gf and not short and seg_s and user_drops == 0)
+        conds = {"status": r["status"] == "ok", "done_line": m is not None, "no_splice": not sp, "socket_no_gaps": not gs,
+                 "log_no_gaps": not gf, "log_not_shorter": not short, "socket_seg_nonempty": bool(seg_s),
+                 "user_drops_0": user_drops == 0}
+        ok = all(conds.values())
+        if not ok:
+            print(f"  failed conditions: {[k for k, v in conds.items() if not v]}; log size {len(full)} "
+                  f"DONE at {[x.start() for x in re.finditer(rb'CONLOSS-DONE', full)]} "
+                  f"start at {full.find(b'CONLOSS 000001 ')}; sock size {len(sock)}")
+            try:
+                with open(f"conloss-fail-{os.getpid()}-serial-full.log", "wb") as f:
+                    f.write(full)
+            except OSError:
+                pass
         print(f"conloss_lossless: {'PASS' if ok else 'FAIL'} (lines {N}, status {r['status']}, "
               f"{m.group(0) if m else 'no DONE line'}; socket gaps {len(gs)} {gs[:10]}; "
               f"qemu-log gaps {len(gf)} {gf[:10]} (bytes socket {len(seg_s)} log {len(seg_f)}); {md.group(0) if md else 'no # uartdrop line'})")

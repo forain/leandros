@@ -337,7 +337,7 @@ SUITES = {
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
-                "host:uartgaptest.py", "host:conlosstest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
+                "host:uartgaptest.py", "host:conlosstest.py", "host:conlossnoisetest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
                 # Out-of-tree host suites that were solo-green 3x x86_64 KVM + aarch64 TCG (lane hostcov 2026-11-22): USB unplug, F2FS checkpoint, power control (~2-5 min each).
                 "host:usbunplugtest.py", "host:f2fscptest.py", "host:powerctltest.py",
                 # Input event paths in the running VM (lane regresscov2; ~20 s total).
@@ -368,6 +368,8 @@ SUITES = {
                 "host:portalshottest.py",
                 # pid-ns zap timeout log + recovery via the pidns.zaptest=1 hook (own boot).
                 "host:pidnszaptest.py",
+                # Dead local LAPIC tick, 4 boots (fixmask 7/1/2/0), ~4-5 min on x86_64/KVM (lane deadtimer2).
+                "host:deadtimertest.py",
                 # Must stay last: it stops this VM and boots its own (wifi_sim
                 # self-test on a second NIC, see wifisimtest.py).
                 "host:wifisimtest.py"],
@@ -495,6 +497,7 @@ SUITES = {
     "reboot": ["host:reboottest.py"],
     "trialwatch": ["host:trialwatchtest.py"],
     "conloss": ["host:conlosstest.py"],
+    "conlossnoise": ["host:conlossnoisetest.py"],
     "uartgap": ["host:uartgaptest.py"],
     "usbstall": ["host:usbstalltest.py"],
     "usbunplug": ["host:usbunplugtest.py"],
@@ -509,6 +512,7 @@ SUITES = {
     # Dead local LAPIC tick (lane deadtimer): the kernel stalls 15 ms inside the one-shot -> periodic
     # switch on cpu1 (x86_64; own boot via cmdline timer.dead_delay=1); the CPU's tick must survive.
     "deadtimer": ["/bin/timertest deadtick"],
+    "deadtimerhost": ["host:deadtimertest.py"],
     # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
@@ -597,7 +601,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
+HOST_TIMEOUTS = {"deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
@@ -618,7 +622,7 @@ def find_fails(out):
 # arch). A run of the other arch reports them as a skip, not a failure.
 HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
                   "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64", "vkwlload.py": "x86_64",
-                  "a64acpitest.py": "aarch64"}
+                  "a64acpitest.py": "aarch64", "deadtimertest.py": "x86_64"}
 
 
 # Host scripts that drive a GPU session and refuse software rendering: they cannot run on a QEMU
@@ -1131,7 +1135,7 @@ def main(argv):
     if "nitrox86" in suites:
         os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
     if "deadtimer" in suites and cmdline is None:
-        cmdline = "timer.dead_delay=1"
+        cmdline = "timer.dead_delay=1 timer.fixmask=7"
     if "pidnszap" in suites and cmdline is None:
         cmdline = "pidns.zaptest=1"
     if "i915fake" in suites and cmdline is None:

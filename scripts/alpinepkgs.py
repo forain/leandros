@@ -48,6 +48,15 @@ def stage(arch):
             elif m.uid or m.gid:
                 sys.exit("alpinepkgs: %s: %s owned by %d:%d (only root expected)" % (name, path, m.uid, m.gid))
             e = {"path": path, "mode": m.mode & 0o7777, "uid": 0, "gid": 0, "pkg": name, "size": 0}
+            if path == "/usr/sbin/unix_chkpwd":
+                # Alpine ships 2755 root:shadow and a 0640 root:shadow /etc/shadow, so the
+                # helper reads the file through its group. Our /etc/shadow is 0600 root:root
+                # and the image has no `shadow` group, so setgid would be setgid gid 0 and
+                # read nothing: a non-root caller (lock screen, su -l from a user) could never
+                # verify its own password. Use the RHEL/Fedora arrangement that fits root-only
+                # shadow: setuid root (4755), no group dependence. unix_chkpwd itself only lets
+                # a non-root caller check its own account.
+                e["mode"] = 0o4755
             if m.isdir():
                 e["kind"] = "dir"
             else:

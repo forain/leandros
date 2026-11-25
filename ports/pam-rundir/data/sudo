@@ -1,0 +1,6 @@
+# sudo-rs: password via pam_unix; XDG_RUNTIME_DIR of the target user exported.
+auth        include        base-auth
+account     include        base-account
+password    include        base-password
+session     include        base-session-noninteractive
+-session    optional       pam_rundir.so

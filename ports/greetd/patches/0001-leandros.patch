@@ -6,9 +6,9 @@ index 7d471ae..608256b 100644
  [dependencies]
  nix = { version = "0.28", features = ["ioctl", "signal", "user", "fs", "mman"] }
  pam-sys = "0.5.6"
-+# LeandrOS has no PAM stack. This crate supplies the libpam application ABI
-+# pam-sys binds to, backed by /etc/shadow. See ports/greetd/pam-leandros.
-+pam-leandros = { path = "../../pam-leandros" }
++# utmpx/wtmp/lastlog + session cgroup bookkeeping around the real libpam
++# session (PAM is Alpine's Linux-PAM). See ports/greetd/session-leandros.
++session-leandros = { path = "../../session-leandros" }
  serde = { version = "1.0", features = ["derive"] }
  serde_json = "1.0"
  greetd_ipc = { path = "../greetd_ipc", features = ["tokio-codec"] }
@@ -20,10 +20,10 @@ index e66fdf1..78bd5bf 100644
  
  use crate::{error::Error, session::worker};
  
-+// Linked for its symbols, not its API: pam-leandros defines the pam_* C ABI
-+// that pam-sys declares as extern. Without a reference the crate is never
-+// linked and every pam_* call becomes an undefined symbol.
-+use pam_leandros as _;
++// Session bookkeeping (utmpx, cgroup) is called from session/worker.rs
++// (patch 0005); this reference keeps the crate linked even without it.
++//
++use session_leandros as _;
 +
  async fn session_worker_main(config: config::Config) -> Result<(), Error> {
      let raw_fd = config.internal.session_worker as RawFd;

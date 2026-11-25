@@ -7703,14 +7703,17 @@ fn gen_leandros_timer() -> Option<VnodeKind> {
     #[cfg(target_arch = "x86_64")]
     {
         extern "C" { fn arch_timer_cpu_stats(out: *mut u64, n: usize); }
-        let mut st = [0u64; 1 + 16];
+        let mut st = [0u64; 6 + 16];
         let n = (sched::active_cpu_count()).min(16);
         unsafe { arch_timer_cpu_stats(st.as_mut_ptr(), n); }
         let _ = writeln!(s, "dead_recovered {}", st[0]);
-        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[1 + i]); }
+        let _ = writeln!(s, "stall_consumed {}", st[1]);
+        let _ = writeln!(s, "recovered_by_state {} {} {}", st[2], st[3], st[4]);
+        let _ = writeln!(s, "stale_ignored {}", st[5]);
+        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[6 + i]); }
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = writeln!(s, "dead_recovered 0");
+    { let _ = writeln!(s, "dead_recovered 0"); let _ = writeln!(s, "stall_consumed 0"); }
     proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
 }
 

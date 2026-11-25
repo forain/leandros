@@ -116,14 +116,18 @@ def elf_has_gnu_build_id(path):
 
 
 def _greetd_src_hash():
-    """sha256 over the pam-leandros sources (sorted by name, concatenated).
+    """sha256 over the session-leandros sources (sorted by path), the patches
+    applied to upstream greetd (sorted), and session-leandros Cargo.toml/lock,
+    concatenated. A patch edit therefore re-keys the staged build.
     ports/greetd/build.sh writes the same value to greetd.srchash."""
     import hashlib
-    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "ports", "greetd", "pam-leandros", "src")
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "greetd")
     h = hashlib.sha256()
-    for n in sorted(os.listdir(src_dir)):
-        with open(os.path.join(src_dir, n), "rb") as f:
+    names = ["session-leandros/src/" + n for n in sorted(os.listdir(os.path.join(base, "session-leandros", "src")))]
+    names += ["patches/" + n for n in sorted(os.listdir(os.path.join(base, "patches")))]
+    names += ["session-leandros/Cargo.toml", "session-leandros/Cargo.lock"]
+    for n in names:
+        with open(os.path.join(base, n), "rb") as f:
             h.update(f.read())
     return h.hexdigest()
 
@@ -154,25 +158,24 @@ def _greetd_stage_dir(arch):
 
 
 def _check_greetd_fresh(path):
-    """Refuse a greetd whose embedded PAM shim predates sha512-crypt shadow.
+    """Refuse a greetd that predates the real-PAM link (no libpam.so.0 NEEDED).
 
-    /etc/shadow holds `$6$rounds=` hashes; an old greetd only verifies
-    `$sha256$` and every greeter login fails with pam_authenticate AUTH_ERR
-    (L11.15). The shim's `rounds=` parser string is the marker. If the
+    Auth is Alpine's Linux-PAM + pam_unix; an old shim-linked greetd would
+    fail every greeter login. If the
     greetd.srchash sidecar (written by build.sh) exists it must match the
-    current pam-leandros sources. File mtimes are NOT compared: a fresh git
+    current session-leandros sources. File mtimes are NOT compared: a fresh git
     worktree gives every source a new mtime."""
     with open(path, "rb") as f:
         data = f.read()
     problems = []
-    if b"rounds=" not in data:
-        problems.append("lacks the sha512-crypt 'rounds=' marker")
+    if b"libpam.so.0" not in data:
+        problems.append("is not linked against the real libpam.so.0")
     sidecar = path + ".srchash"
     if os.path.exists(sidecar):
         with open(sidecar) as f:
             want = f.read().strip()
         if want != _greetd_src_hash():
-            problems.append("was built from different pam-leandros sources")
+            problems.append("was built from different session-leandros sources")
     else:
         print(f"warning: {sidecar} missing; checked the rounds= marker only",
               file=sys.stderr)
@@ -723,10 +726,16 @@ def main():
     # /etc/shadow — /bin/login's only source of password hashes. Salts are
     # fixed per user so this Python hasher and the Rust verifier in
     # userland/login/src/main.rs (verify_password) agree byte-for-byte.
+    # Full nine-field shadow(5) records: musl's getspnam() (unix_chkpwd under real
+    # Linux-PAM) rejects a line with fewer fields as "no such user".
     shadow_lines = (
-        f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:\n"
-        f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:\n"
-        "sshd:!:\n"
+        f"root:{shadow_hash('lnd0rootsalt0000', 'root')}:20000:0:99999:7:::\n"
+        f"leandro:{shadow_hash('lnd0leandrosalt1', 'leandro')}:20000:0:99999:7:::\n"
+        "sshd:!:20000:0:99999:7:::\n"
+        # Every passwd account has a shadow record, like Alpine's baselayout and every
+        # useradd/pwconv: PAM's unix_chkpwd says "no such user" for an account without one.
+        "cosmic-greeter:!:20000:0:99999:7:::\n"
+        "nobody:!:20000:0:99999:7:::\n"
     )
     etc_files.append(("shadow", shadow_lines.encode('ascii'), 0o100600))
 
@@ -876,17 +885,7 @@ def main():
                # is the first client to use client-side Wayland-EGL; without it
                # the panel panics ("Library libwayland-egl.so could not be
                # loaded.") right after "Waiting for configure event".
-               "libwayland-egl.so.1", "libffi.so.8",
-               # libpam.so.0 is the LeandrOS shadow-auth shim (source:
-               # m6-session-bins/src/libpam-shim); verifies $sha256$ /etc/shadow
-               # like /bin/login. It is DT_NEEDED by the cosmic-greeter ELF
-               # itself — pam-sys is an unconditional dependency of that build —
-               # so the dynamic loader resolves it on EVERY launch regardless of
-               # which role the binary takes. The login role makes no PAM call at
-               # all (greeter.rs has none; authentication crosses greetd IPC),
-               # but the library still has to be present or the greeter fails to
-               # load. Do not unstage it on the grounds that nothing calls it.
-               "libpam.so.0"):
+               "libwayland-egl.so.1", "libffi.so.8"):
         p = gl_lib(so)
         if os.path.exists(p):
             usr_lib_files.append((so, p, 0o100755))
@@ -1918,7 +1917,14 @@ def main():
     # /etc/vconsole.conf KEYMAP=<name> selects one at boot (loadkmap aliases
     # kbd's names such as de-latin1 onto them).
     for _dirpath, _name, _srcname in (("/etc/greetd", "greetd.conf", "greetd.conf"),
+                                      # Real Linux-PAM (Alpine's linux-pam) reads these; the
+                                      # defaults it ships live in /usr/lib/pam.d (base-auth,
+                                      # login, other ...), these override/extend them.
                                       ("/etc/pam.d",  "greetd",      "pam.d-greetd"),
+                                      ("/etc/pam.d",  "sudo",        "../../pam-rundir/data/sudo"),
+                                      ("/etc/pam.d",  "sudo-i",      "../../pam-rundir/data/sudo-i"),
+                                      ("/etc/pam.d",  "su",          "../../pam-rundir/data/su"),
+                                      ("/etc/pam.d",  "su-l",        "../../pam-rundir/data/su-l"),
                                       ("/etc",        "profile",     "profile"),
                                       ("/usr/share/wayland-sessions",
                                        "cosmic.desktop", "cosmic.desktop")):
@@ -2147,6 +2153,17 @@ def main():
         m4_share_dirs.add("/usr/sbin")
         m5_exec_files.append(("/usr/sbin", "espctl", p))
         m5_exec_files.append(("/usr/sbin", "mbrtool", p))
+
+    # shadowfix: pads short /etc/shadow records to nine fields (userland/
+    # shadowfix); init runs it once per boot so older roots still log in
+    # through PAM (musl getspnam() rejects short lines).
+    # FATAL when missing: without it an older root stays locked out of real PAM.
+    p = f"userland/shadowfix/target/{_musl_triple}/release/shadowfix"
+    if not os.path.exists(p):
+        sys.exit(f"mkfs: {p} missing; build it (userland/shadowfix/build.sh {arch}); "
+                 "an image without shadowfix locks older roots out of PAM")
+    m4_share_dirs.add("/usr/sbin")
+    m5_exec_files.append(("/usr/sbin", "shadowfix", p))
 
     # leandros-install: the installer backend (userland/leandros-install),
     # run as root (the GUI goes through sudo): list disks, install to one.
@@ -2918,6 +2935,12 @@ def main():
     if not os.path.isfile(os.path.join(_apk_root, "usr", "sbin", "apk")):
         sys.exit(f"{_apk_root} missing (ports/apk/build.sh {arch})")
     _overlay_port_tree(_apk_root)
+    # pam_rundir.so: the XDG_RUNTIME_DIR provider Alpine's base-session names
+    # (ports/pam-rundir). Overlaid after the apk root so linux-pam's own files win.
+    _prd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ports", "pam-rundir", "out", arch)
+    if not os.path.isdir(_prd):
+        sys.exit(f"{_prd} missing (ports/pam-rundir/build.sh)")
+    _overlay_port_tree(os.path.normpath(_prd))
     bin_files.append(("apk", os.path.join(_apk_root, "usr", "sbin", "apk"), 0o100755))
     _ap_world = ["leandros-base", "musl=" + alpinepkgs.lk.read_lock(arch)[0]["musl"]["ver"]]
 
@@ -2981,6 +3004,14 @@ def main():
     # shadow-subids ships empty /etc/subuid|subgid; ours (etc_files) carry the rootless ranges
     _ap_entries = [e for e in _ap_entries if e["path"] not in ("/etc/subuid", "/etc/subgid")]
     _ap_owned = {e["path"]: e for e in _ap_entries if e["kind"] != "dir"}
+    # Real PAM needs the helper and the module in the image; a missing or non-setuid
+    # unix_chkpwd would only show up later as "cannot retrieve authentication info".
+    _chk = _ap_owned.get("/usr/sbin/unix_chkpwd")
+    if _chk is None or (_chk["mode"] & 0o7777) != 0o4755:
+        sys.exit("mkfs: /usr/sbin/unix_chkpwd missing or not 4755 in the Alpine set (linux-pam); "
+                 "real PAM cannot verify a non-root caller without it")
+    if not any(p.endswith("/pam_unix.so") for p in _ap_owned):
+        sys.exit("mkfs: pam_unix.so missing from the Alpine set (linux-pam)")
     _deny = re.compile(r"libEGL|libGLES|libgbm|libgallium|libvulkan|libdrm|libpipewire|libgst|libext2fs")
     _sh = {"n": 0, "diff": 0}
     def _shadow(d, n, h):
