@@ -30,7 +30,7 @@ mod kenv {
         pub const SINK_DVI: u32 = 2;
 
         pub use crate::decode::acr_n_cts;
-        pub use crate::cb;
+        pub(crate) use crate::cb;
 
         pub struct Sink { pub state: u32, pub flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: bool, pub d0_unknown: bool }
         pub fn sink() -> Sink {
