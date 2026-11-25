@@ -128,6 +128,33 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         return 1;
     }
 
+    // Modes for memtest's address-space teardown checks (lane memexact):
+    //   `pthreadtest asfree_mt <readyfd>`: three sibling threads park, the
+    //     leader writes one byte to `readyfd` and parks (memtest kills it);
+    //   `pthreadtest asfree_leader <readyfd> <gofd>`: one worker blocks on
+    //     `gofd`; the leader writes a byte to `readyfd` and pthread_exit()s
+    //     FIRST; the worker, the last thread, exits once `gofd` delivers.
+    if argc >= 3 && arg_eq(argv, 1, b"asfree_mt") {
+        let rfd = arg_num(argv, 2);
+        let mut t: pthread_t = core::ptr::null_mut();
+        for _ in 0..3 {
+            pthread_create(&mut t, core::ptr::null(), asfree_parker, core::ptr::null_mut());
+        }
+        usleep(50_000);
+        write(rfd, b"r".as_ptr(), 1);
+        loop { usleep(1_000_000); }
+    }
+    if argc >= 4 && arg_eq(argv, 1, b"asfree_leader") {
+        let rfd = arg_num(argv, 2);
+        let mut t: pthread_t = core::ptr::null_mut();
+        ASFREE_GOFD = arg_num(argv, 3);
+        if pthread_create(&mut t, core::ptr::null(), asfree_waiter, core::ptr::null_mut()) != 0 {
+            return 1;
+        }
+        write(rfd, b"r".as_ptr(), 1);
+        pthread_exit(core::ptr::null_mut());
+    }
+
     // Mode `pthreadtest churn [N]`: only the thread-churn leak check.
     if argc >= 2 && arg_eq(argv, 1, b"churn") {
         let mut n = 5000u64;
@@ -738,6 +765,29 @@ unsafe fn report(name: &[u8], passed: bool) -> bool {
 }
 
 // ── exit()-kills-siblings regression (mode: `pthreadtest exitkill`) ──────────
+
+unsafe fn arg_num(argv: *mut *mut u8, idx: isize) -> i32 {
+    let p = *argv.offset(idx);
+    let mut v = 0i32;
+    let mut i = 0usize;
+    while *p.add(i) >= b'0' && *p.add(i) <= b'9' { v = v * 10 + (*p.add(i) - b'0') as i32; i += 1; }
+    v
+}
+
+extern "C" fn asfree_parker(_a: *mut c_void) -> *mut c_void {
+    unsafe { loop { usleep(1_000_000); } }
+}
+
+static mut ASFREE_GOFD: i32 = -1;
+
+/// Blocks until one byte arrives on `ASFREE_GOFD`, then ends the last thread.
+extern "C" fn asfree_waiter(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let mut b = [0u8; 1];
+        read(ASFREE_GOFD, b.as_mut_ptr(), 1);
+    }
+    core::ptr::null_mut()
+}
 
 /// True if `argv[idx]` is exactly the NUL-terminated string `want` (no NUL).
 unsafe fn arg_eq(argv: *mut *mut u8, idx: isize, want: &[u8]) -> bool {
