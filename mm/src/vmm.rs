@@ -477,6 +477,15 @@ pub struct AddressSpace {
     /// scheduler lock stalls every other CPU (see
     /// `sched::lock_leader_address_space`).
     pub busy: core::sync::atomic::AtomicBool,
+    /// Set (under `busy`, before it is released) once the exiting owner has
+    /// decided this space's contents are being torn down although other
+    /// `Arc`s may still exist (an observer's transient clone, a debug hold).
+    /// A taker that wins `busy` and sees it must release `busy` and use
+    /// nothing: the regions and the page tables are gone or going.
+    pub closed: core::sync::atomic::AtomicBool,
+    /// `release_contents` has run (it is idempotent; the ring entry is
+    /// written once, by the run that did the work).
+    contents_released: bool,
     /// Bumped on every release of `busy`; a chunked operation compares it
     /// across its own unlock/relock to detect a foreign holder in between.
     pub lock_epoch: core::sync::atomic::AtomicU64,
@@ -600,7 +609,19 @@ impl Drop for AddressSpace {
     /// any page boundary: every [`TEARDOWN_BATCH`] pages it passes a
     /// reschedule point. A multi-GiB teardown used to run start to end with
     /// IRQs masked.
-    fn drop(&mut self) {
+    fn drop(&mut self) { self.release_contents(); }
+}
+
+impl AddressSpace {
+    /// Tear down the CONTENTS (VMAs, backing pages, page-table tree), leaving
+    /// the empty shell. Idempotent: the regions are taken, the root is zeroed
+    /// after it is freed, and the teardown ring entry is written once, at the
+    /// end of the run that did the work. Exit calls it explicitly (after
+    /// `closed` is set under `busy`) whatever the `Arc` count; `Drop` calls it
+    /// for every other last reference.
+    pub fn release_contents(&mut self) {
+        if self.contents_released { return; }
+        self.contents_released = true;
         let mut batch = 0usize;
         let mut freed = 0usize;
         let mut pt_freed = 0usize;
@@ -647,6 +668,7 @@ impl Drop for AddressSpace {
             tlb_flush_as(self.page_table_root);
             pt_freed = unsafe { crate::paging::free_user_page_tables(self.page_table_root) };
             buddy_free(self.page_table_root, 0);
+            self.page_table_root = 0;
         }
         asfree_record(self.owner_tgid.load(Ordering::Relaxed), freed, pt_freed);
     }
@@ -661,6 +683,8 @@ impl AddressSpace {
             heap_start: 0,
             heap_end: 0,
             busy: core::sync::atomic::AtomicBool::new(false),
+            closed: core::sync::atomic::AtomicBool::new(false),
+            contents_released: false,
             lock_epoch: core::sync::atomic::AtomicU64::new(0),
             stack_top: 0,
             hiwater_rss: 0,

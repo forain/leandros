@@ -593,7 +593,7 @@ fn reap_delayed_leader(rq: &mut RunQueue, tgid: Pid) -> Option<alloc::boxed::Box
 /// No locks held: what the dispatch loop does for a reaped Task (exit hook =
 /// releases the reply port owned by `tgid`, free the kernel stack, drop the
 /// Box and with it the leader's Arc on the address space).
-fn finish_reaped_leader(t: alloc::boxed::Box<Task>) {
+fn finish_reaped_leader(t: alloc::boxed::Box<Task>, sole: bool) {
     let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
     if !hook_ptr.is_null() {
         let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
@@ -601,8 +601,39 @@ fn finish_reaped_leader(t: alloc::boxed::Box<Task>) {
     }
     clear_comm(t.pid);
     mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
+    // Like the dispatch loop's drop: the group is not done until the Box is
+    // gone. Save/restore, the caller may have its own pending drop marked.
+    let cpu = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let has_as = t.address_space.is_some();
+    let prev = if has_as { AS_DROP_TGID[cpu].swap(t.tgid, Ordering::AcqRel) } else { 0 };
+    reap_close_space(&t, sole);
     drop(t);
+    if has_as { AS_DROP_TGID[cpu].store(prev, Ordering::Release); }
     percpu::pexit_bump();
+}
+
+/// No slot of `rq` holds the very address space of `t` (a removed Task).
+fn removed_space_unshared(rq: &RunQueue, t: &Task) -> bool {
+    let mine = match t.address_space.as_ref() { Some(a) => alloc::sync::Arc::as_ptr(a), None => return false };
+    for i in rq.live_slots() {
+        if let Some(o) = rq.get(i) {
+            if o.address_space.as_ref()
+                .map_or(false, |a| core::ptr::eq(alloc::sync::Arc::as_ptr(a), mine)) { return false; }
+        }
+    }
+    true
+}
+
+/// A Task removed from the run queue whose space no slot holds any more
+/// (`sole`, decided in the removing RUN_QUEUE hold): close and tear down the
+/// contents before the Box is dropped, so a stray `Arc` (an observer's clone)
+/// does not postpone the free past the group's report. The CPU already
+/// switched back to the kernel page table before the slot was removed (the
+/// dispatch loop's "detach" after `cpu_switch_to`), and no other CPU can load
+/// a space no slot refers to.
+fn reap_close_space(t: &Task, sole: bool) {
+    if !sole { return; }
+    if let Some(a) = t.address_space.as_ref() { close_address_space(a); }
 }
 
 /// Lane proclife: per CPU, the thread group whose just-removed member's `Task`
@@ -1726,12 +1757,24 @@ pub static FOREIGN_AS_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 /// may not sleep (a spin lock held, scheduler context) it keeps the old spin.
 fn acquire_foreign_as(w: &alloc::sync::Weak<mm::vmm::AddressSpace>, pid: Pid) -> Option<alloc::sync::Arc<mm::vmm::AddressSpace>> {
     // One attempt: upgrade, take `busy`; the strong ref is dropped on failure.
+    // A space whose owner exited is `closed` (its contents are gone or going,
+    // see `close_address_space`): that is final, not a retry.
+    let dead = core::cell::Cell::new(false);
     let try_take = || {
         let a = w.upgrade()?;
-        if a.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() { Some(a) } else { None }
+        if a.closed.load(Ordering::Acquire) { dead.set(true); return None; }
+        if a.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            // `closed` is set under `busy`: re-check now that we hold it.
+            if a.closed.load(Ordering::Acquire) {
+                a.busy.store(false, Ordering::Release);
+                dead.set(true);
+                return None;
+            }
+            Some(a)
+        } else { None }
     };
     if let Some(a) = try_take() { return Some(a); }
-    if w.strong_count() == 0 { return None; }
+    if dead.get() || w.strong_count() == 0 { return None; }
     let t0 = monotonic_ns();
     let mut parked = false;
     loop {
@@ -1739,7 +1782,7 @@ fn acquire_foreign_as(w: &alloc::sync::Weak<mm::vmm::AddressSpace>, pid: Pid) ->
         mm::paging::tlb_service_pending();
         core::hint::spin_loop();
         if let Some(a) = try_take() { return Some(a); }
-        if w.strong_count() == 0 { return None; }
+        if dead.get() || w.strong_count() == 0 { return None; }
         let waited = monotonic_ns().saturating_sub(t0);
         if waited < FOREIGN_AS_SPIN_NS || !irqctx::can_sleep() { continue; }
         if waited >= FOREIGN_AS_GIVE_UP_NS || signal::fatal_signal_pending() {
@@ -7963,6 +8006,8 @@ fn scheduler_run_loop() -> ! {
             // still held: nothing can touch an off-CPU Zombie meanwhile).
             let mut late_notice: Option<(Pid, (Pid, ExitStatus, u32, u8))> = None;
             let mut late_leader: Option<alloc::boxed::Box<Task>> = None;
+            let mut zombie_sole = false;
+            let mut leader_sole = false;
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
                 let mut runnable = false;
@@ -8060,13 +8105,22 @@ fn scheduler_run_loop() -> ! {
                         if zpid != ztgid { late_leader = reap_delayed_leader(&mut rq, ztgid); }
                         late_notice = group_exit_notice(&rq, ztgid, zuid).map(|n| (ztgid, n));
                     }
+                    // Last holder of its space? Decided here, with every
+                    // removal of this pass done (see `reap_close_space`).
+                    // The leader's Box, if it shares it, does the closing.
+                    if let Some(r) = removed.as_ref() { zombie_sole = removed_space_unshared(&rq, r); }
+                    if let Some(l) = late_leader.as_ref() {
+                        leader_sole = removed_space_unshared(&rq, l);
+                        if leader_sole && removed.as_ref().map_or(false, |r| match (r.address_space.as_ref(), l.address_space.as_ref()) {
+                            (Some(x), Some(y)) => alloc::sync::Arc::ptr_eq(x, y), _ => false }) { zombie_sole = false; }
+                    }
                     removed
                 } else {
                     None
                 }
             };
 
-            if let Some(l) = late_leader.take() { finish_reaped_leader(l); }
+            if let Some(l) = late_leader.take() { finish_reaped_leader(l, leader_sole); }
             if let Some(t) = zombie {
                 // This CPU ran the task to its death and holds the only
                 // reference now — safe to run the exit hook and free its
@@ -8082,6 +8136,7 @@ fn scheduler_run_loop() -> ! {
                 if t.pid == t.tgid { clear_exe_path(t.pid); sysacct::free_tgid(t.pid); }
         clear_comm(t.pid);
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
+                reap_close_space(&t, zombie_sole);
                 drop(t);
                 if AS_DROP_TGID[id].swap(0, Ordering::AcqRel) != 0 {
                     // `group_settled` (a pidfd's "exited") may have changed.
@@ -8818,7 +8873,7 @@ pub fn exit(code: i32) -> ! {
             (group_exit_notice(&rq, tgid, uid), l)
         } else { (None, None) }
     };
-    if let Some(l) = reaped_leader { finish_reaped_leader(l); }
+    if let Some(l) = reaped_leader { finish_reaped_leader(l, false); }
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if last { clear_exe_path(tgid); sysacct::free_tgid(tgid); }
     clear_comm(pid);
@@ -8906,7 +8961,7 @@ pub fn exit(code: i32) -> ! {
 /// waits out any in-flight `busy` holder exactly as `replace_address_space`
 /// does.
 fn release_exiting_address_space(pid: Pid) {
-    let taken = {
+    let taken = 'retry: loop {
         let mut rq = RUN_QUEUE.lock();
         let tgid = match rq.find_pid(pid) { Some(t) => t.tgid, None => return };
         for i in rq.live_slots() {
@@ -8916,18 +8971,26 @@ fn release_exiting_address_space(pid: Pid) {
                     && !(t.state == TaskState::Zombie && t.delayed_leader) { return; }
             }
         }
-        // L5.12: drop the delayed leader's Arc, so ours can be the last and the
-        // space is freed before the group is reported. Only while it is
-        // off-CPU: on its CPU, TTBR0/CR3 may still point at this space.
+        // L5.12: drop the delayed leader's Arc, so ours is the group's last
+        // and the space is freed before the group is reported. Only while it
+        // is off-CPU: on its CPU, TTBR0/CR3 may still point at this space,
+        // which must not be freed under it. Then wait it out (IRQs open, no
+        // lock held) and look again: its switch-back is all that is left.
         if pid != tgid {
             if let Some(li) = rq.find_pid_idx(tgid) {
-                if slot::on_cpu(li).is_none() {
+                let lead_has_as = rq.get(li).map_or(false, |l|
+                    l.state == TaskState::Zombie && l.delayed_leader && l.address_space.is_some());
+                if lead_has_as {
+                    if slot::on_cpu(li).is_some() {
+                        drop(rq);
+                        irq_window();
+                        core::hint::spin_loop();
+                        continue 'retry;
+                    }
                     if let Some(l) = rq.get_mut(li) {
-                        if l.state == TaskState::Zombie && l.delayed_leader {
-                            l.page_table = 0;
-                            drop(l.address_space.take()); // not the last ref: we hold one
-                            slot::publish(l);
-                        }
+                        l.page_table = 0;
+                        drop(l.address_space.take()); // not the last ref: we hold one
+                        slot::publish(l);
                     }
                 }
             }
@@ -8936,27 +8999,33 @@ fn release_exiting_address_space(pid: Pid) {
         // The group's last thread: once it is a Zombie, the group may be
         // reported (`group_settled`). Set before the drop below, which runs
         // before `exit` marks the Zombie, so a waiter never sees it early.
-        // An Arc held elsewhere is a `CLONE_VM` sharer's (or a transient
-        // kernel reader's), not this group's.
         t.mm_released = true;
         percpu::pexit_bump();
         // A sibling's Task can be out of the run queue with its Arc not yet
         // dropped (its CPU drops the Box after releasing RUN_QUEUE): wait it
-        // out, or the space outlives the wait4 that reports the group — the
-        // window lane execleak measured. Never long: the drop is all that is
-        // left of that dispatch-loop pass.
-        if t.address_space.as_ref().map_or(false, |a| alloc::sync::Arc::strong_count(a) > 1)
-            && as_drop_pending(tgid)
-        {
+        // out, so its drop is not racing the close. Never long: the drop is
+        // all that is left of that dispatch-loop pass.
+        if as_drop_pending(tgid) {
             drop(rq);
             while as_drop_pending(tgid) { irq_window(); core::hint::spin_loop(); }
             rq = RUN_QUEUE.lock();
         }
-        let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
-        match t.address_space.as_ref() {
-            Some(a) if alloc::sync::Arc::strong_count(a) == 1 => {}
-            _ => return,
+        // Sole user = no OTHER slot holds this very space (a CLONE_VM/vfork
+        // sharer in another group does). The Arc COUNT is not the test: an
+        // observer's transient clone (`task_as`, `with_process_as`, a debug
+        // hold) raises it without using the space, and a count-based exit
+        // then left the teardown to whoever dropped last, after wait4.
+        let mine = match rq.find_pid(pid).and_then(|t| t.address_space.as_ref()) {
+            Some(a) => alloc::sync::Arc::as_ptr(a),
+            None => return,
+        };
+        for i in rq.live_slots() {
+            if let Some(o) = rq.get(i) {
+                if o.pid != pid && o.address_space.as_ref()
+                    .map_or(false, |a| core::ptr::eq(alloc::sync::Arc::as_ptr(a), mine)) { return; }
+            }
         }
+        let t = match rq.find_pid_mut(pid) { Some(t) => t, None => return };
         t.page_table = 0;
         let taken = t.address_space.take();
         // Its fault counts outlive it, for the parent's wait (`group_acct`).
@@ -8970,21 +9039,58 @@ fn release_exiting_address_space(pid: Pid) {
             // TLB flush (the kernel runs from TTBR1 either way).
             arch_load_kernel_page_table();
             arch_set_page_table(0);
+            // This CPU's fast-path pointer must not keep naming the space
+            // about to be closed (`lock_leader_address_space` would hand it
+            // out). Users of it: the fast path above (own task only),
+            // `current_is_user_task` (a scheduling hint), and
+            // `with_foreign_task_as` (compares addresses only).
+            let cpu = cpu_id();
+            if core::ptr::eq(CURRENT_AS[cpu].load(Ordering::Relaxed), mine) {
+                CURRENT_AS[cpu].store(core::ptr::null_mut(), Ordering::Release);
+            }
         }
-        taken
+        break taken;
     };
     if let Some(old) = taken {
-        if old.busy.load(Ordering::Acquire) {
-            lockwatch::note_wait(lockwatch::L_AS_BUSY);
-            while old.busy.load(Ordering::Acquire) { mm::paging::tlb_service_pending(); core::hint::spin_loop(); }
-            lockwatch::note_wait(0);
-        }
-        // Its peak RSS outlives it too (wait4's ru_maxrss): the space is
-        // ours alone now, so the walk needs no `busy`.
-        let hwm = old.mem_counters().hwm as u64;
-        if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm); }
+        let hwm = close_address_space(&old);
+        if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) { t.hwm_pages = t.hwm_pages.max(hwm as u64); }
         drop(old);
     }
+}
+
+/// Close and tear down the CONTENTS of an address space whose owner is
+/// gone: no slot holds it and no CPU has it loaded (the caller took it out of
+/// its slot under RUN_QUEUE). Returns its peak RSS in pages. The caller holds
+/// an `Arc` but need not hold the only one.
+///
+/// Soundness: every taker of the space other than its owner goes through
+/// `busy` (`acquire_foreign_as`, `lock_leader_address_space`), and a taker
+/// that wins `busy` after this function has set `closed` releases it and
+/// uses nothing. `closed` is set under `busy` and released with it, so a
+/// taker either held `busy` before (and this waits for it) or sees `closed`
+/// after. From then on any other `Arc` is a dead reference: it is dropped,
+/// never dereferenced for contents, and `release_contents` makes the final
+/// `Drop` a no-op. Never call with RUN_QUEUE held (this spins on `busy`).
+fn close_address_space(old: &alloc::sync::Arc<mm::vmm::AddressSpace>) -> usize {
+    if old.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        lockwatch::note_wait(lockwatch::L_AS_BUSY);
+        // The holder may be waiting for this CPU's TLB flush acknowledgement.
+        while old.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            mm::paging::tlb_service_pending();
+            core::hint::spin_loop();
+        }
+        lockwatch::note_wait(0);
+    }
+    // Its peak RSS outlives it (wait4's ru_maxrss).
+    let hwm = old.mem_counters().hwm;
+    old.closed.store(true, Ordering::Release);
+    old.lock_epoch.fetch_add(1, Ordering::Relaxed);
+    old.busy.store(false, Ordering::Release);
+    // Nobody may touch the contents now: the teardown is ours alone, whatever
+    // the strong count. (Same "exclusive because of `busy`/`closed`, not
+    // because of the reference type" contract as `lock_leader_address_space`.)
+    unsafe { (*(alloc::sync::Arc::as_ptr(old) as *mut mm::vmm::AddressSpace)).release_contents(); }
+    hwm
 }
 
 /// Outcome of one `kill_next_group_member` step.
