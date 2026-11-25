@@ -536,14 +536,6 @@ fn teardown_resched() {
 pub static TEARDOWN_RESCHED_POINTS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Completed address-space teardowns and the VMA pages they released, since
-/// boot (/proc/meminfo `AsDrops`, `AsFreedPages`). Counted at the END of
-/// `drop`, so a teardown still in progress contributes nothing yet: memtest
-/// `wait_releases_memory_exactly` measures the child's own release with it
-/// instead of system-wide free memory, which other activity moves.
-pub static ASPACE_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-pub static ASPACE_FREED_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 impl Drop for AddressSpace {
     /// Unmap and free all VMAs, then release the page-table root page.
     ///
@@ -559,7 +551,6 @@ impl Drop for AddressSpace {
     /// IRQs masked.
     fn drop(&mut self) {
         let mut batch = 0usize;
-        let mut freed_pages = 0u64;
         // Free all VMA backing pages.
         for slot in self.regions.iter_mut() {
             if let Some(region) = slot.take() {
@@ -567,7 +558,6 @@ impl Drop for AddressSpace {
                     for (_, phys) in region.lazy_pages.present() {
                         crate::pageref::unref_or_free(phys, 0);
                         batch += 1;
-                        freed_pages += 1;
                         if batch >= TEARDOWN_BATCH {
                             batch = 0;
                             TEARDOWN_RESCHED_POINTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -604,8 +594,6 @@ impl Drop for AddressSpace {
             unsafe { crate::paging::free_user_page_tables(self.page_table_root); }
             buddy_free(self.page_table_root, 0);
         }
-        ASPACE_FREED_PAGES.fetch_add(freed_pages, core::sync::atomic::Ordering::Release);
-        ASPACE_DROPS.fetch_add(1, core::sync::atomic::Ordering::Release);
     }
 }
 
