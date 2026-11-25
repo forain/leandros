@@ -503,6 +503,57 @@ pub struct AddressSpace {
     /// Atomic because `find` takes `&self`; Relaxed is enough because the
     /// hint is never trusted.
     pub find_hint: AtomicUsize,
+    /// Thread-group id of the process this space belongs to (0 = not yet
+    /// attached to a Task). Set where the space gets its Task (fork, exec,
+    /// clone); read only by the teardown ring (`/proc/leandros_asfree`).
+    pub owner_tgid: AtomicUsize,
+}
+
+/// Entries of the address-space teardown ring.
+pub const ASFREE_RING: usize = 256;
+struct AsFreeSlot {
+    /// Entry sequence number + 1 (0 = never written); stored last.
+    seq: core::sync::atomic::AtomicU64,
+    tgid: AtomicUsize,
+    pages: AtomicUsize,
+    pt_pages: AtomicUsize,
+}
+#[allow(clippy::declare_interior_mutable_const)]
+const ASFREE_SLOT0: AsFreeSlot = AsFreeSlot {
+    seq: core::sync::atomic::AtomicU64::new(0),
+    tgid: AtomicUsize::new(0), pages: AtomicUsize::new(0), pt_pages: AtomicUsize::new(0),
+};
+static ASFREE_SLOTS: [AsFreeSlot; ASFREE_RING] = [ASFREE_SLOT0; ASFREE_RING];
+/// Teardowns recorded so far (the next entry's sequence number).
+static ASFREE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// One teardown ring entry: `(seq, owner tgid, pages whose refcount reached
+/// zero, page-table pages freed)`.
+pub type AsFreeEntry = (u64, usize, usize, usize);
+
+fn asfree_record(tgid: usize, pages: usize, pt_pages: usize) {
+    let n = ASFREE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let s = &ASFREE_SLOTS[(n as usize) % ASFREE_RING];
+    s.seq.store(0, Ordering::Release);
+    s.tgid.store(tgid, Ordering::Relaxed);
+    s.pages.store(pages, Ordering::Relaxed);
+    s.pt_pages.store(pt_pages, Ordering::Relaxed);
+    s.seq.store(n + 1, Ordering::Release);
+}
+
+/// Snapshot the teardown ring, oldest first. Returns the total number of
+/// teardowns recorded since boot (more than [`ASFREE_RING`] means older
+/// entries were overwritten).
+pub fn asfree_snapshot(out: &mut Vec<AsFreeEntry>) -> u64 {
+    let total = ASFREE_SEQ.load(Ordering::Acquire);
+    let first = total.saturating_sub(ASFREE_RING as u64);
+    for n in first..total {
+        let s = &ASFREE_SLOTS[(n as usize) % ASFREE_RING];
+        let a = s.seq.load(Ordering::Acquire);
+        let (t, p, q) = (s.tgid.load(Ordering::Relaxed), s.pages.load(Ordering::Relaxed), s.pt_pages.load(Ordering::Relaxed));
+        if a == n + 1 && s.seq.load(Ordering::Acquire) == a { out.push((n, t, p, q)); }
+    }
+    total
 }
 
 /// Called every [`TEARDOWN_BATCH`] pages of an address-space teardown:
@@ -551,12 +602,14 @@ impl Drop for AddressSpace {
     /// IRQs masked.
     fn drop(&mut self) {
         let mut batch = 0usize;
+        let mut freed = 0usize;
+        let mut pt_freed = 0usize;
         // Free all VMA backing pages.
         for slot in self.regions.iter_mut() {
             if let Some(region) = slot.take() {
                 if region.lazy {
                     for (_, phys) in region.lazy_pages.present() {
-                        crate::pageref::unref_or_free(phys, 0);
+                        if crate::pageref::unref_or_free(phys, 0) { freed += 1; }
                         batch += 1;
                         if batch >= TEARDOWN_BATCH {
                             batch = 0;
@@ -569,6 +622,7 @@ impl Drop for AddressSpace {
                 } else if region.phys != 0 {
                     let pages = (region.end - region.start) / PAGE_SIZE;
                     buddy_free(region.phys, pages_to_order(pages));
+                    freed += pages;
                 }
                 if is_file_backed(region.file_cap) {
                     file_release(region.file_cap);
@@ -591,9 +645,10 @@ impl Drop for AddressSpace {
             // root before its table pages are returned (normally none: a
             // dying address space is loaded nowhere).
             tlb_flush_as(self.page_table_root);
-            unsafe { crate::paging::free_user_page_tables(self.page_table_root); }
+            pt_freed = unsafe { crate::paging::free_user_page_tables(self.page_table_root) };
             buddy_free(self.page_table_root, 0);
         }
+        asfree_record(self.owner_tgid.load(Ordering::Relaxed), freed, pt_freed);
     }
 }
 
@@ -613,6 +668,7 @@ impl AddressSpace {
             min_flt: core::sync::atomic::AtomicU64::new(0),
             maj_flt: core::sync::atomic::AtomicU64::new(0),
             find_hint: AtomicUsize::new(0),
+            owner_tgid: AtomicUsize::new(0),
         }
     }
 

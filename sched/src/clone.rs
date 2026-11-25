@@ -484,6 +484,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.tls_base      = tls_base;
         // fork copies the user GS base along with everything else (Linux).
         child.user_gs_base  = super::get_user_gs_base();
+        child_as.owner_tgid.store(child_pid as usize, core::sync::atomic::Ordering::Relaxed);
         child.address_space = Some(alloc::sync::Arc::new(child_as));
         child.ppid          = pid;
         child.tgid          = child_pid;

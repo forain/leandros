@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod clone;
+pub mod asfree;
 pub mod wedge;
 pub mod fdkey;
 pub mod playstat;
@@ -7694,6 +7695,7 @@ pub fn spawn_user_with_address_space(entry_point: usize, sp: usize, as_: mm::vmm
 
     let mut task = Task::new_userspace(pid, entry_point, sp, stack_phys, stack_size, page_table);
     task.kernel_stack = stack_phys;
+    as_.owner_tgid.store(pid as usize, Ordering::Relaxed);
     task.address_space = Some(alloc::sync::Arc::new(as_));
 
     let ok = RUN_QUEUE.lock().enqueue(task);
@@ -9251,6 +9253,7 @@ pub fn replace_address_space(
                 new_as.maj_flt.store(mj, Ordering::Relaxed);
             }
             t.mm_borrowed = false;
+            new_as.owner_tgid.store(t.tgid as usize, Ordering::Relaxed);
             let displaced = t.address_space.replace(alloc::sync::Arc::new(new_as));
             // Re-publish before the displaced one can be dropped (below).
             let cur = t.address_space.as_ref()

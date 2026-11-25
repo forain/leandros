@@ -7717,6 +7717,19 @@ fn gen_leandros_timer() -> Option<VnodeKind> {
     proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
 }
 
+/// Fake path of the writable `/proc/leandros_asfree` snapshot (root only).
+const PROC_ASFREE_W: &[u8] = b"/tmp/.proc_asfree";
+fn gen_asfree() -> Option<VnodeKind> {
+    let mut s = alloc::string::String::new();
+    sched::asfree::render(&mut s);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_ASFREE_W);
+    if !tmp_fill_kernel(&mut tmp, idx, s.as_bytes()) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
 /// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
 /// one makes Ready (`sched::wakestat`, always on, cumulative since boot —
 /// diff two reads), then, with `sched.wakestat=1` on the command line, which
@@ -9159,7 +9172,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// and what a `/proc/<pid>` directory lists. `/proc/<pid>/fd` is served too
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
-const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer",
+const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer", b"/proc/leandros_asfree",
                                      b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
@@ -10138,6 +10151,12 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             match gen_leandros_timer() {
                 Some(v) => v,
                 None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/leandros_asfree" {
+            if sched::euid_of(pid) != 0 { return err_reply(-13); }
+            match gen_asfree() {
+                Some(v) => v,
+                None    => return err_reply(-23),
             }
         } else if lookup_path == b"/proc/wakestat" {
             match gen_wakestat() {
@@ -11274,6 +11293,19 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let mut v = 0usize;
                 for &c in s { v = v.saturating_mul(10).saturating_add((c - b'0') as usize); }
                 return match inotify::limit_set(k, v) { Ok(()) => val_reply(count as u64), Err(e) => err_reply(e) };
+            }
+            let is_asfree = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_ASFREE_W
+            };
+            if is_asfree {
+                if sched::euid_of(pid) != 0 { return err_reply(-13); }
+                let n = count.min(63);
+                let mut b = [0u8; 63];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = match core::str::from_utf8(&b[..n]) { Ok(t) => sched::asfree::control(t), Err(_) => -22 };
+                return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
             }
             let oom_tid = {
                 let tmp = TMP_FILES.lock();
