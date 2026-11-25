@@ -124,6 +124,31 @@ pub fn late_bucket(ns: u64) -> usize {
     LATE_EDGES_US.iter().position(|&e| us < e).unwrap_or(LATE_EDGES_US.len())
 }
 
+/// CH0 STATUS fields (UNVERIFIED on hardware; candidate layout, firmware sample 0x00ba4124):
+/// scan line [12:0], mode [14:13] (2 = run), FRCNT [21:16].
+pub fn status_line(status: u32) -> u32 { status & 0x1fff }
+pub fn status_mode(status: u32) -> u32 { (status >> 13) & 3 }
+pub fn status_frcnt(status: u32) -> u32 { (status >> 16) & 0x3f }
+
+/// Bins of the scan-line histogram: 8 equal bins of 0..vtotal, then bin 8 for line >= vtotal
+/// (blanking beyond the frame / implausible reading).
+pub const LINE_BINS: usize = 9;
+pub fn line_bin(line: u32, vtotal: u32) -> usize {
+    if vtotal == 0 || line >= vtotal { return LINE_BINS - 1; }
+    (line as u64 * 8 / vtotal as u64) as usize
+}
+
+/// Assumed total lines of a frame with `h` active lines (CEA timing: 1080 -> 1125). An
+/// assumption, reported as such.
+pub fn vtotal_guess(h: u32) -> u32 { (h as u64 * 1125 / 1080) as u32 }
+
+/// Time since the frame start implied by `line` (0 for lines outside the active range `h`
+/// give `None`): line * period / vtotal.
+pub fn line_late_ns(line: u32, h: u32, vtotal: u32, period_ns: u64) -> Option<u64> {
+    if vtotal == 0 || line >= h { return None; }
+    Some(line as u64 * period_ns / vtotal as u64)
+}
+
 /// Counters behind `/proc/leandros_hvs`. Plain atomics, no locks; every field is a diagnostic.
 pub mod stats {
     use core::fmt::Write;
@@ -137,7 +162,18 @@ pub mod stats {
     pub static BUSY_REFUSED: AtomicU64 = AtomicU64::new(0);
     pub static EVENTS: AtomicU64 = AtomicU64::new(0);
     pub static MISSED: AtomicU64 = AtomicU64::new(0);
+    /// Upper-bound lateness histogram (only events with a pending observation before them).
     pub static LATE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// Events with no pending observation before them (no bound exists).
+    pub static LATE_UNBOUNDED: AtomicU64 = AtomicU64::new(0);
+    /// Scan-line histogram at latch observation (UNVERIFIED field), and implied lateness.
+    pub static LINE: [AtomicU64; super::LINE_BINS] = [const { AtomicU64::new(0) }; super::LINE_BINS];
+    pub static LINE_LATE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    pub static LINE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    /// Last 8 raw STATUS values at latch with their ktime (ns), newest at RING_N-1 mod 8.
+    pub static RING_N: AtomicU64 = AtomicU64::new(0);
+    pub static RING_ST: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+    pub static RING_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     /// FRCNT frames and the time they took, summed over unambiguous poll pairs.
     pub static PERIOD_FRAMES: AtomicU64 = AtomicU64::new(0);
     pub static PERIOD_NS: AtomicU64 = AtomicU64::new(0);
@@ -148,12 +184,32 @@ pub mod stats {
     pub static TAKEOVER_NS: AtomicU64 = AtomicU64::new(0);
     pub static KSYNC: AtomicU64 = AtomicU64::new(0);
 
-    /// Account one event observed `bound_ns` after the last time it was known to be pending (an
-    /// upper bound of how late its timestamp is) and whether a whole frame went unchecked.
-    pub fn record_event(bound_ns: u64) {
+    /// Account one flip event. `bound_ns` is `Some(now - last observation that saw it pending)`,
+    /// an upper bound of its lateness, or `None` when no pending observation preceded it.
+    pub fn record_event(bound_ns: Option<u64>) {
         EVENTS.fetch_add(1, Relaxed);
-        LATE[late_bucket(bound_ns)].fetch_add(1, Relaxed);
-        if bound_ns > super::FRAME_NS { MISSED.fetch_add(1, Relaxed); }
+        match bound_ns {
+            Some(b) => {
+                LATE[late_bucket(b)].fetch_add(1, Relaxed);
+                if b > super::FRAME_NS { MISSED.fetch_add(1, Relaxed); }
+            }
+            None => { LATE_UNBOUNDED.fetch_add(1, Relaxed); }
+        }
+    }
+
+    /// Record the raw STATUS seen at a latch at ktime `now`, decode its scan line against an
+    /// active height `h` and `vtotal`, and bin it. `period_ns` converts the line to time.
+    pub fn record_status(status: u32, now: u64, h: u32, vtotal: u32, period_ns: u64) {
+        LATCH_STATUS.store(status, Relaxed);
+        let i = RING_N.fetch_add(1, Relaxed) as usize & 7;
+        RING_ST[i].store(status, Relaxed);
+        RING_NS[i].store(now, Relaxed);
+        let line = super::status_line(status);
+        LINE[super::line_bin(line, vtotal)].fetch_add(1, Relaxed);
+        match super::line_late_ns(line, h, vtotal, period_ns) {
+            Some(ns) => { LINE_LATE[late_bucket(ns)].fetch_add(1, Relaxed); }
+            None => { LINE_SKIPPED.fetch_add(1, Relaxed); }
+        }
     }
 
     pub fn record_fence_wait(ns: u64) {
@@ -177,7 +233,9 @@ pub mod stats {
     pub fn reset() {
         for c in [&FLIPS, &WAITS, &TICKS, &BUSY_REFUSED, &EVENTS, &MISSED, &PERIOD_FRAMES, &PERIOD_NS,
                   &FENCE_NS, &FENCE_MAX_NS, &FENCE_N, &KSYNC] { c.store(0, Relaxed); }
-        for c in &LATE { c.store(0, Relaxed); }
+        for c in LATE.iter().chain(LINE_LATE.iter()) { c.store(0, Relaxed); }
+        for c in &LINE { c.store(0, Relaxed); }
+        for c in [&LATE_UNBOUNDED, &LINE_SKIPPED, &RING_N] { c.store(0, Relaxed); }
         LATCH_STATUS.store(0, Relaxed);
     }
 
@@ -190,9 +248,22 @@ pub mod stats {
         let _ = writeln!(o, "busy_refused {}", g(&BUSY_REFUSED));
         let _ = writeln!(o, "events {}", g(&EVENTS));
         let _ = writeln!(o, "missed {}", g(&MISSED));
-        let _ = writeln!(o, "late_us <250 <500 <1000 <2000 <4000 <8000 >=8000");
-        let _ = writeln!(o, "late {} {} {} {} {} {} {}", g(&LATE[0]), g(&LATE[1]), g(&LATE[2]), g(&LATE[3]),
+        let _ = writeln!(o, "late_bound_us (UPPER BOUND, only events with a pending observation before them) <250 <500 <1000 <2000 <4000 <8000 >=8000");
+        let _ = writeln!(o, "late_bound {} {} {} {} {} {} {}", g(&LATE[0]), g(&LATE[1]), g(&LATE[2]), g(&LATE[3]),
                          g(&LATE[4]), g(&LATE[5]), g(&LATE[6]));
+        let _ = writeln!(o, "late_unbounded {}", g(&LATE_UNBOUNDED));
+        let _ = writeln!(o, "scan_line UNVERIFIED (STATUS[12:0]; bins of 0..vtotal/8, last = line>=vtotal or unknown vtotal)");
+        let _ = writeln!(o, "line_bins {} {} {} {} {} {} {} {} {}", g(&LINE[0]), g(&LINE[1]), g(&LINE[2]), g(&LINE[3]),
+                         g(&LINE[4]), g(&LINE[5]), g(&LINE[6]), g(&LINE[7]), g(&LINE[8]));
+        let _ = writeln!(o, "late_line_us UNVERIFIED (line*period/vtotal) <250 <500 <1000 <2000 <4000 <8000 >=8000");
+        let _ = writeln!(o, "late_line {} {} {} {} {} {} {}", g(&LINE_LATE[0]), g(&LINE_LATE[1]), g(&LINE_LATE[2]),
+                         g(&LINE_LATE[3]), g(&LINE_LATE[4]), g(&LINE_LATE[5]), g(&LINE_LATE[6]));
+        let _ = writeln!(o, "line_outside_active {}", g(&LINE_SKIPPED));
+        let n = RING_N.load(Relaxed);
+        for k in 0..n.min(8) {
+            let i = ((n - 1 - k) & 7) as usize;
+            let _ = writeln!(o, "status_ring ktime_ns {} raw {:#010x}", RING_NS[i].load(Relaxed), RING_ST[i].load(Relaxed));
+        }
         let _ = writeln!(o, "frame_period_ns {} frames {}", period_ns(), g(&PERIOD_FRAMES));
         let st = LATCH_STATUS.load(Relaxed);
         let _ = writeln!(o, "latch_status {:#010x} frcnt {} mode {}", st, (st >> 16) & 0x3f, (st >> 13) & 3);
@@ -267,6 +338,8 @@ mod hw {
         phase_ns: u64,
         /// Last time the flip in flight was known to be pending (issue or a check that saw it so).
         last_pending_ns: u64,
+        /// A tick has seen the flip in flight still pending (a bound for its lateness exists).
+        seen_pending: bool,
         /// Time of the previous `poll` (0: none).
         last_poll_ns: u64,
     }
@@ -316,7 +389,7 @@ mod hw {
         *STATE.lock() = Some(State {
             fw, slots, cur: 1, pending: false, cur_obj: 0, issued_ns: 0, frames: 0,
             last_frcnt: (st >> 16) & 0x3f, retire: Vec::new(), flips: 0, waits: 0, ev: 0, extra: Vec::new(), phase_ns: 0,
-            last_pending_ns: 0, last_poll_ns: 0,
+            last_pending_ns: 0, seen_pending: false, last_poll_ns: 0,
         });
         let tm = alloc::boxed::Box::into_raw(sched::hrtimer::HrTimer::new(tick, 0, sched::hrtimer::TimerMode::Worker));
         TIMER.store(tm, Ordering::Release);
@@ -411,8 +484,14 @@ mod hw {
     fn latched(s: &mut State, now: u64) {
         s.pending = false;
         s.phase_ns = latched_phase(s.phase_ns, now);
-        stats::LATCH_STATUS.store(rd(CH_STATUS), Ordering::Relaxed);
-        if s.ev != 0 { stats::record_event(now.wrapping_sub(s.last_pending_ns)); }
+        let st = rd(CH_STATUS);
+        let vtotal = vtotal_guess(s.fw.h);
+        let period = match stats::period_ns() { 0 => FRAME_NS, p => p };
+        stats::record_status(st, now, s.fw.h, vtotal, period);
+        if s.ev != 0 {
+            stats::record_event(if s.seen_pending { Some(now.wrapping_sub(s.last_pending_ns)) } else { None });
+        }
+        s.seen_pending = false;
         poll(s);
         let ev = core::mem::take(&mut s.ev);
         complete(ev, s.frames, now);
@@ -452,6 +531,7 @@ mod hw {
                 return;
             } else {
                 s.last_pending_ns = now;
+                s.seen_pending = true;
                 arm(next_check(s, now));
                 return;
             }
@@ -529,6 +609,7 @@ mod hw {
         PENDING.store(true, Ordering::Release);
         s.issued_ns = sched::monotonic_ns();
         s.last_pending_ns = s.issued_ns;
+        s.seen_pending = false;
         s.flips += 1;
         stats::FLIPS.fetch_add(1, Ordering::Relaxed);
         if s.flips == 1 {
@@ -700,16 +781,62 @@ mod tests {
     }
 
     #[test]
-    fn stats_text_and_reset() {
+    fn status_decode_firmware_sample() {
+        let st = 0x00ba_4124;
+        assert_eq!(status_line(st), 0x124);
+        assert_eq!(status_mode(st), 2);
+        assert_eq!(status_frcnt(st), 0x3a);
+        assert_eq!(vtotal_guess(1080), 1125);
+    }
+
+    #[test]
+    fn line_binning() {
+        assert_eq!(line_bin(0, 1125), 0);
+        assert_eq!(line_bin(140, 1125), 0);
+        assert_eq!(line_bin(141, 1125), 1);
+        assert_eq!(line_bin(1124, 1125), 7);
+        assert_eq!(line_bin(1125, 1125), 8);
+        assert_eq!(line_bin(5000, 1125), 8);
+        assert_eq!(line_bin(3, 0), 8);
+        assert_eq!(line_late_ns(540, 1080, 1125, 16_666_667), Some(8_000_000));
+        assert_eq!(line_late_ns(1080, 1080, 1125, 16_666_667), None); // blanking
+        assert_eq!(line_late_ns(0, 1080, 1125, 16_666_667), Some(0));
+    }
+
+    /// The stats are process-wide atomics: the tests that use them take this lock.
+    static STATS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn status_recording_bins_and_ring() {
+        let _g = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         stats::reset();
-        stats::record_event(300_000);
-        stats::record_event(20_000_000);
+        for i in 0..10u32 { stats::record_status(0x00ba_4000 | (i * 100), 1000 + i as u64, 1080, 1125, 16_666_667); }
+        let mut t = String::new();
+        stats::text(&mut t);
+        assert!(t.contains("line_outside_active 0\n"), "{}", t); // lines 0..900 all active
+        assert_eq!(t.matches("status_ring").count(), 8);
+        assert!(t.contains("status_ring ktime_ns 1009 raw 0x00ba4384"), "{}", t);
+        stats::record_status(0x00ba_4000 | 1100, 5, 1080, 1125, 16_666_667); // blanking
+        let mut t = String::new();
+        stats::text(&mut t);
+        assert!(t.contains("line_outside_active 1\n"), "{}", t);
+        stats::reset();
+    }
+
+    #[test]
+    fn stats_text_and_reset() {
+        let _g = STATS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        stats::reset();
+        stats::record_event(Some(300_000));
+        stats::record_event(Some(20_000_000));
+        stats::record_event(None);
         stats::record_fence_wait(5_000);
         stats::record_fence_wait(9_000);
         let mut t = String::new();
         stats::text(&mut t);
-        assert!(t.contains("events 2\n") && t.contains("missed 1\n"), "{}", t);
-        assert!(t.contains("late 0 1 0 0 0 0 1\n"), "{}", t);
+        assert!(t.contains("events 3\n") && t.contains("missed 1\n"), "{}", t);
+        assert!(t.contains("late_bound 0 1 0 0 0 0 1\n") && t.contains("late_unbounded 1\n"), "{}", t);
+        assert!(t.contains("UPPER BOUND") && t.contains("UNVERIFIED"), "{}", t);
         assert!(t.contains("fence_wait_ns 14000 max 9000 count 2\n"), "{}", t);
         stats::reset();
         let mut t = String::new();
