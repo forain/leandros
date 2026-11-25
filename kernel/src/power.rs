@@ -236,16 +236,13 @@ fn shutdown_prepare(state: u8) {
 }
 
 
-// ── Bounded shutdown (lane a64poweroff) ──────────────────────────────────────
+// ── Shutdown phases and stopping the other CPUs (lane a64poweroff) ───────────
 //
-// Linux never lets kernel_power_off wait forever on a peer: it stops the other
-// CPUs (`smp_send_stop`) and `hw_failure`/`orderly_poweroff` carry an
-// emergency timeout. Here every phase of kernel_power_off/restart is
-// announced with a `[POWER] phase N <name>` line, and a per-tick hook on every
-// OTHER CPU forces the final action (PSCI/ACPI off, reset, halt) when one phase
-// has made no progress for `reboot.phase_ms` (default 20000; 0 = no watchdog).
-// Test knob `reboot.test_hang=<phase>`: the shutdown CPU masks IRQs and spins
-// forever when it enters that phase (red proof: also pass `reboot.phase_ms=0`).
+// Every phase of kernel_power_off/restart/halt is announced with a
+// `[POWER] phase N <name> at +X ms` line, so a hang names its phase. After
+// the last sync/flush, and before the arch's final PSCI/ACPI/reset step, the
+// other CPUs are stopped (Linux `machine_shutdown` -> `smp_send_stop`), with
+// a bounded wait and a line saying how many arrived. Not done for kexec.
 
 const PH_PREPARE: u8 = 1;
 const PH_QUIESCE1: u8 = 2;
@@ -254,92 +251,17 @@ const PH_QUIESCE2: u8 = 4;
 const PH_STOPCPUS: u8 = 5;
 const PH_FINAL: u8 = 6;
 const PHASE_NAMES: [&str; 7] = ["-", "prepare(sync+f2fs+nvme)", "quiesce1(devices)", "machine_prepare(console+klog+disks)", "quiesce2(xhci+busmaster)", "stop-other-cpus", "final(psci/acpi)"];
-
-static PH_NOW: AtomicU8 = AtomicU8::new(0);
-static PH_T0: AtomicU64 = AtomicU64::new(0);
 static PH_START: AtomicU64 = AtomicU64::new(0);
-static PH_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
-static PH_LIMIT_NS: AtomicU64 = AtomicU64::new(0);
-static PH_FORCED: AtomicBool = AtomicBool::new(false);
 
 fn phase(n: u8) {
     let now = sched::monotonic_ns();
-    if n == PH_PREPARE {
-        PH_START.store(now, Ordering::Relaxed);
-        PH_CPU.store(unsafe { sched::cpu_id() }, Ordering::Relaxed);
-        let ms = opt("reboot.phase_ms").and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
-        PH_LIMIT_NS.store(ms.saturating_mul(1_000_000), Ordering::Relaxed);
-        sched::set_shutdown_hook(shutdown_watch);
-    }
-    PH_T0.store(now, Ordering::Release);
-    PH_NOW.store(n, Ordering::Release);
+    if n == PH_PREPARE { PH_START.store(now, Ordering::Relaxed); }
     serial_print_str(&alloc::format!("[POWER] phase {} {} at +{} ms\n", n, PHASE_NAMES[n as usize],
         now.saturating_sub(PH_START.load(Ordering::Relaxed)) / 1_000_000));
-    if opt("reboot.test_hang").and_then(|v| v.parse::<u8>().ok()) == Some(n) {
-        serial_print_str("[POWER] test: shutdown CPU hangs here with IRQs masked\n");
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            core::arch::asm!("cli", options(nomem, nostack));
-            #[cfg(target_arch = "aarch64")]
-            core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
-        }
-        loop { core::hint::spin_loop(); }
-    }
 }
 
-/// Tick hook, every CPU. On a CPU other than the shutdown CPU: a phase older
-/// than the limit forces the final action.
-fn shutdown_watch(cpu: usize) {
-    let n = PH_NOW.load(Ordering::Acquire);
-    let lim = PH_LIMIT_NS.load(Ordering::Relaxed);
-    if n == 0 || lim == 0 || cpu == PH_CPU.load(Ordering::Relaxed) { return; }
-    let st = SYSTEM_STATE.load(Ordering::Acquire);
-    if st == SYSTEM_RUNNING || st == SYSTEM_KEXEC { return; }
-    let age = sched::monotonic_ns().saturating_sub(PH_T0.load(Ordering::Acquire));
-    if age < lim || PH_FORCED.swap(true, Ordering::AcqRel) { return; }
-    serial_print_str(&alloc::format!("[POWER] phase {} {} made no progress for {} ms on cpu{}: cpu{} forces the {}\n",
-        n, PHASE_NAMES[(n as usize).min(6)], age / 1_000_000, PH_CPU.load(Ordering::Relaxed), cpu,
-        match st { SYSTEM_POWER_OFF => "power-off", SYSTEM_RESTART => "restart", _ => "halt" }));
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!("cli", options(nomem, nostack));
-        #[cfg(target_arch = "aarch64")]
-        core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
-    }
-    sched::mark_system_down();
-    crate::console_staging_disable_and_drain();
-    final_action(st)
-}
-
-/// The arch's last step for `st`; never returns.
-fn final_action(st: u8) -> ! {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        match st {
-            SYSTEM_POWER_OFF => {
-                if let Some(p) = (*core::ptr::addr_of!(ACPI_POWER)).as_ref() { arch_x86_64::power::acpi_power_off(p); }
-            }
-            SYSTEM_RESTART => arch_x86_64::power::restart((*core::ptr::addr_of!(ACPI_POWER)).as_ref(), arch_x86_64::power::Method::Auto),
-            _ => {}
-        }
-        arch_x86_64::power::halt_forever()
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        match st {
-            SYSTEM_POWER_OFF => arch_aarch64::power::system_off(),
-            SYSTEM_RESTART => arch_aarch64::power::system_reset(),
-            _ => {}
-        }
-        arch_aarch64::power::halt_forever()
-    }
-}
-
-/// aarch64: park every other CPU (Linux `smp_send_stop`) so none of them keeps
-/// hammering MMIO (BQL contention in QEMU TCG) while PSCI SYSTEM_OFF/RESET is
-/// processed. Bounded: gives up after 500 ms and says who did not arrive.
-#[cfg(target_arch = "aarch64")]
 static PARKED: AtomicUsize = AtomicUsize::new(0);
+
 #[cfg(target_arch = "aarch64")]
 fn stop_park() -> ! {
     unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack)); }
@@ -348,27 +270,46 @@ fn stop_park() -> ! {
 }
 #[cfg(target_arch = "aarch64")]
 fn stop_park_hook() { stop_park() }
+#[cfg(target_arch = "x86_64")]
+fn stop_park() -> ! {
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    PARKED.fetch_or(1 << unsafe { arch_x86_64::smp::arch_cpu_id() }, Ordering::AcqRel);
+    arch_x86_64::power::halt_forever()
+}
 
+/// Stop every other CPU (no mask change in the caller). Bounded: gives up
+/// after 500 ms and names the CPUs that did not arrive. Call after all
+/// sync/flush work; never for kexec (it stops them itself).
 fn stop_other_cpus() {
     #[cfg(target_arch = "aarch64")]
+    let (me, n) = (unsafe { arch_aarch64::smp::arch_cpu_id() }, arch_aarch64::smp::assigned());
+    #[cfg(target_arch = "x86_64")]
+    let (me, n) = (unsafe { arch_x86_64::smp::arch_cpu_id() }, arch_x86_64::cpus::assigned());
+    if n <= 1 || n >= 64 { return; }
+    #[cfg(target_arch = "aarch64")]
     {
-        let me = unsafe { arch_aarch64::smp::arch_cpu_id() };
-        let n = arch_aarch64::smp::assigned();
         arch_aarch64::exception::IRQ_DIVERT.store(stop_park as fn() -> ! as usize, Ordering::Release);
         sched::wedge::PARK_HOOK.store(stop_park_hook as fn() as usize, Ordering::Release);
         spin::held::set_park_hook(stop_park_hook);
         unsafe { core::arch::asm!("dsb ish", options(nostack)); }
         for i in 0..n { if i != me { arch_aarch64::gic::send_sgi(i, arch_aarch64::gic::SGI_RESCHED); } }
-        let want = ((1usize << n) - 1) & !(1 << me);
-        let t0 = sched::monotonic_ns();
-        while PARKED.load(Ordering::Acquire) & want != want && sched::monotonic_ns().saturating_sub(t0) < 500_000_000 {
-            core::hint::spin_loop();
-        }
-        let got = PARKED.load(Ordering::Acquire) & want;
-        serial_print_str(&alloc::format!("[POWER] other CPUs parked: {} of {} in {} us{}\n",
-            got.count_ones(), want.count_ones(), sched::monotonic_ns().saturating_sub(t0) / 1000,
-            if got == want { alloc::string::String::new() } else { alloc::format!(" (missing mask {:#x})", want & !got) }));
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch_x86_64::idt::NMI_DIVERT.store(stop_park as fn() -> ! as usize, Ordering::Release);
+        for i in 0..n { if i != me { unsafe { arch_x86_64::smp::arch_send_nmi(i); } } }
+    }
+    let want = ((1usize << n) - 1) & !(1 << me);
+    let t0 = sched::monotonic_ns();
+    while PARKED.load(Ordering::Acquire) & want != want && sched::monotonic_ns().saturating_sub(t0) < 500_000_000 {
+        core::hint::spin_loop();
+    }
+    let got = PARKED.load(Ordering::Acquire) & want;
+    #[cfg(target_arch = "x86_64")]
+    arch_x86_64::idt::NMI_DIVERT.store(0, Ordering::Release);
+    serial_print_str(&alloc::format!("[POWER] other CPUs stopped: {} of {} in {} us{}\n",
+        got.count_ones(), want.count_ones(), sched::monotonic_ns().saturating_sub(t0) / 1000,
+        if got == want { alloc::string::String::new() } else { alloc::format!(" (missing mask {:#x})", want & !got) }));
 }
 
 // ── Reboot / power-off knobs (kernel command line) ───────────────────────────
@@ -789,6 +730,8 @@ fn kernel_halt() -> ! {
     }
     serial_print_str("reboot: System halted\n");
     machine_prepare();
+    phase(PH_STOPCPUS);
+    stop_other_cpus();
     #[cfg(target_arch = "x86_64")]
     arch_x86_64::power::halt_forever();
     #[cfg(target_arch = "aarch64")]
