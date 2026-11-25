@@ -302,6 +302,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     arch_x86_64::psmouse::init();
     vfs_server::set_kernel_cmdline(crate::boot_cmdline().unwrap_or("")); // /proc/cmdline
     vfs_server::set_proc_pcipm(drivers::pci::pm_report); // /proc/pcipm
+    #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"), feature = "drv-sdhci"))]
+    vfs_server::set_proc_sd(drivers::sdhci::proc_text); // /proc/leandros_sd
     vfs_server::set_proc_klog(|| crate::klog::tail(256 << 10)); // /proc/klog (dmesg; boards with no ESP)
     {
         // Wedge diagnostics: on by default on the Pi 5 (wedge=0 turns them

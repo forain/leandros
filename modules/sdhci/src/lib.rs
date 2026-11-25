@@ -18,6 +18,8 @@ mod blockdev;
 mod partscan;
 #[path = "../../../drivers/src/blkmod.rs"]
 mod blkdev;
+#[path = "../../../drivers/src/rpi_misc_logic.rs"]
+mod rpi_misc_logic;
 #[path = "../../../drivers/src/sdhci.rs"]
 mod sdhci;
 

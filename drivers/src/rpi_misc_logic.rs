@@ -404,19 +404,18 @@ pub mod sdmbr {
     /// 0x83 partitions: the first whose superblock magic (read through
     /// `magic_at(lba)`) is F2FS. A dual-boot card also carries an ext4 0x83
     /// partition (Raspberry Pi OS root, p4), so the type alone is not enough.
-    /// No 0x83 with the magic (unreadable / unformatted): the first 0x83, as
-    /// before. `None` without a 55AA signature or any 0x83 entry.
+    /// No 0x83 with the magic (another OS's card, unreadable, unformatted):
+    /// `None`, so the caller never treats a foreign ext4 as ours. `None` as
+    /// well without a 55AA signature or any 0x83 entry.
     pub fn pick_f2fs(mbr: &[u8], mut magic_at: impl FnMut(u64) -> Option<u32>) -> Option<u64> {
         if mbr.len() < 512 || mbr[510] != 0x55 || mbr[511] != 0xAA { return None; }
-        let mut first = None;
         for i in 0..4usize {
             let e = &mbr[446 + i * 16..446 + i * 16 + 16];
             if e[4] != 0x83 { continue; }
             let lba = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
-            if first.is_none() { first = Some(lba); }
             if magic_at(lba) == Some(F2FS_MAGIC) { return Some(lba); }
         }
-        first
+        None
     }
 
     /// The bytes of the card the mounted root F2FS owns: raw writes that
@@ -477,6 +476,78 @@ pub mod sdmbr {
             .find(|e| e[4] == 0x83 && u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64 == start)
             .map_or(0, |e| u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64 * 512);
         Some(RootGuard { start_lba: start, bytes: if len == 0 { u64::MAX / 2 } else { len }, from_sb: false })
+    }
+}
+
+// ── SD write grant: LeandrOS writes only a card that is its own ──────────────
+pub mod sdgrant {
+    use super::Regs32;
+
+    pub const R_OK: u8 = 0;
+    pub const R_NO_F2FS: u8 = 1;
+    pub const R_RW_OFF: u8 = 2;
+    pub const R_OTHER_ROOT: u8 = 3;
+
+    pub fn reason_str(r: u8) -> &'static str {
+        match r {
+            R_OK => "ok",
+            R_NO_F2FS => "no-f2fs-magic",
+            R_RW_OFF => "sdhci.rw=0",
+            R_OTHER_ROOT => "root=-names-another-device",
+            _ => "unknown",
+        }
+    }
+
+    /// Whether the kernel `root=` value (`/dev/vdb`, `/dev/mmcblk0pN`,
+    /// `LABEL=<this card's label>`) names this card. PARTUUID=, /dev/sd*,
+    /// another label: no.
+    pub fn root_names_this_card(root: &str, label: &str) -> bool {
+        if let Some(l) = root.strip_prefix("LABEL=") { return !label.is_empty() && l == label; }
+        if root == "/dev/vdb" { return true; }
+        match root.strip_prefix("/dev/mmcblk0p") {
+            Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+            None => false,
+        }
+    }
+
+    /// The write-grant decision, evaluated once at the end of SD init:
+    /// `(granted, reason)`. Grant iff the F2FS magic was found AND `rw` AND
+    /// (no `root=` | it names this card).
+    pub fn evaluate(f2fs_found: bool, rw: bool, cmdline: &str, label: &str) -> (bool, u8) {
+        if !f2fs_found { return (false, R_NO_F2FS); }
+        if !rw { return (false, R_RW_OFF); }
+        let root = cmdline.split_ascii_whitespace().filter_map(|t| t.strip_prefix("root=")).last();
+        match root {
+            Some(r) if !r.is_empty() && !root_names_this_card(r, label) => (false, R_OTHER_ROOT),
+            _ => (true, R_OK),
+        }
+    }
+
+    /// Commands that change card contents or state: CMD24/25 (write), 27 (CSD
+    /// program), 28/29 (write protect), 32/33/38 (erase), 42 (lock/unlock),
+    /// 56 (general command, write direction), and ACMD23 (pre-erase count).
+    /// `app` = the command follows an accepted CMD55 (so index 23 is an ACMD
+    /// and, equally, CMD24 is never mistaken for an ACMD).
+    pub fn is_write_cmd(index: u8, app: bool) -> bool {
+        if app { index == 23 } else { matches!(index, 24 | 25 | 27 | 28 | 29 | 32 | 33 | 38 | 42 | 56) }
+    }
+
+    /// May this command go out? Everything else (reads, CMD6/ACMD6/CMD11,
+    /// identification) is always allowed.
+    pub fn allows(granted: bool, index: u8, app: bool) -> bool { granted || !is_write_cmd(index, app) }
+
+    /// SDHCI Argument 1 / Command register offsets (the 16-bit Command
+    /// register is written through its 32-bit-aligned window in the mock).
+    pub const REG_ARGUMENT1: usize = 0x08;
+    pub const REG_COMMAND: usize = 0x0E;
+
+    /// The command-issue step of the driver in seam form: refuse (no register
+    /// access at all) or program Argument 1 then the Command register.
+    pub fn issue(regs: &mut impl Regs32, granted: bool, index: u8, app: bool, arg: u32, word: u16) -> bool {
+        if !allows(granted, index, app) { return false; }
+        regs.w(REG_ARGUMENT1, arg);
+        regs.w(REG_COMMAND, word as u32);
+        true
     }
 }
 
@@ -545,9 +616,9 @@ mod tests {
         // ext4 ahead of the F2FS partition in the table: still the F2FS one.
         let m = mbr(&[(0x0c, 8192), (0x83, 41_000_000), (0x0c, 40_000_000), (0x83, 1_056_768)]);
         assert_eq!(sdmbr::pick_f2fs(&m, magic), Some(1_056_768));
-        // Single-boot card, magic unreadable: first 0x83 as before.
+        // Magic unreadable / foreign ext4 only (another OS card): no root, never the first 0x83.
         let m = mbr(&[(0x0c, 8192), (0x83, 1_056_768)]);
-        assert_eq!(sdmbr::pick_f2fs(&m, |_| None), Some(1_056_768));
+        assert_eq!(sdmbr::pick_f2fs(&m, |_| None), None);
         // No signature / no Linux partition.
         let mut bad = m; bad[511] = 0;
         assert_eq!(sdmbr::pick_f2fs(&bad, |_| None), None);
@@ -604,13 +675,23 @@ mod tests {
         // already adds the partition offset (block 2 x 125440) finds no
         // magic. The guard must then fall back to p2's MBR length, not
         // "everything from p2 to the end of the card".
-        let (m, mut rd) = real_card();
-        let g = sdmbr::root_guard(&m, |b, buf| rd(if b == 0 { 0 } else { b + 125_440 }, buf)).unwrap();
+        // (A card with no readable magic is no longer a root at all: pick_f2fs
+        // returns None. The fallback is for a magic whose size fields are bogus.)
+        let (m, _) = real_card();
+        let bogus_sb = |b: u64, buf: &mut [u8; 4096]| {
+            *buf = [0u8; 4096];
+            if b == 125_440 { buf[1024..1028].copy_from_slice(&sdmbr::F2FS_MAGIC.to_le_bytes()); }
+            true
+        };
+        let g = sdmbr::root_guard(&m, bogus_sb).unwrap();
         assert_eq!(g, sdmbr::RootGuard { start_lba: 1_003_520, bytes: 7_495_680 * 512, from_sb: false });
         assert!(!g.overlaps(8_503_296 * 512, 4 << 20));
-        // Zero-length MBR entry and no superblock: rest of the card.
+        // The old premise: the reader that adds the partition offset finds no magic.
+        let (m2, mut rd) = real_card();
+        assert_eq!(sdmbr::root_guard(&m2, |b, buf| rd(if b == 0 { 0 } else { b + 125_440 }, buf)), None);
+        // Zero-length MBR entry and a bogus superblock: rest of the card.
         let mut z = m; z[446 + 16 + 12..446 + 16 + 16].fill(0);
-        let g = sdmbr::root_guard(&z, |_, buf| { *buf = [0u8; 4096]; true }).unwrap();
+        let g = sdmbr::root_guard(&z, bogus_sb).unwrap();
         assert_eq!((g.start_lba, g.bytes, g.from_sb), (1_003_520, u64::MAX / 2, false));
     }
 }

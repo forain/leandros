@@ -210,4 +210,100 @@ mod tests {
         b.x(0).s(" ").x(0x1f_ab00);
         assert_eq!(&b.b[..b.n], b"0x0 0x1fab00");
     }
+
+    // ── SD write grant ──────────────────────────────────────────────────────
+
+    fn mbr_of(entries: &[(u8, u32)]) -> [u8; 512] {
+        let mut m = [0u8; 512];
+        for (i, &(ty, lba)) in entries.iter().enumerate() {
+            let e = &mut m[446 + i * 16..446 + i * 16 + 16];
+            e[4] = ty;
+            e[8..12].copy_from_slice(&lba.to_le_bytes());
+        }
+        m[510] = 0x55; m[511] = 0xAA;
+        m
+    }
+
+    #[test]
+    fn batocera_style_card_has_no_f2fs_root() {
+        // p1 vfat 0x0c, p2 ext4 0x83 (magic 0xEF53 at the superblock), no f2fs.
+        let m = mbr_of(&[(0x0c, 8192), (0x83, 1_056_768)]);
+        assert_eq!(sdmbr::pick_f2fs(&m, |_| Some(0xEF53)), None);
+        assert_eq!(sdmbr::pick_f2fs(&m, |_| None), None);
+        // root_guard (reads through the same picker) finds nothing either.
+        assert_eq!(sdmbr::root_guard(&m, |_, b| { b.fill(0); true }), None);
+    }
+
+    #[test]
+    fn grant_table() {
+        use sdgrant::*;
+        let ev = |f, rw, cl, lb| evaluate(f, rw, cl, lb).0;
+        let l = "leandros-root";
+        // no root=, or a root naming this card: granted
+        assert!(ev(true, true, "", l));
+        assert!(ev(true, true, "console=ttyAMA10,115200", l));
+        assert!(ev(true, true, "root=LABEL=leandros-root", l));
+        assert!(ev(true, true, "root=/dev/vdb", l));
+        assert!(ev(true, true, "root=/dev/mmcblk0p2 rootfstype=ext4 rootwait", l));
+        assert!(ev(true, true, "a root=/dev/mmcblk0p17 b", l));
+        // another OS's root / not provably ours: locked
+        assert!(!ev(true, true, "root=PARTUUID=1234-02", l));
+        assert!(!ev(true, true, "root=/dev/sda2", l));
+        assert!(!ev(true, true, "root=LABEL=other", l));
+        assert!(!ev(true, true, "root=LABEL=leandros-root", "other"));
+        assert!(!ev(true, true, "root=LABEL=leandros-root", ""));
+        assert!(!ev(true, true, "root=/dev/mmcblk0p", l));
+        assert!(!ev(true, true, "root=/dev/mmcblk0", l));
+        assert!(!ev(true, true, "root=/dev/nvme0n1p2", l));
+        // the last root= wins
+        assert!(!ev(true, true, "root=/dev/vdb root=/dev/sda1", l));
+        // no magic or rw off: locked whatever root says
+        assert_eq!(evaluate(false, true, "", l), (false, R_NO_F2FS));
+        assert_eq!(evaluate(false, true, "root=/dev/vdb", l), (false, R_NO_F2FS));
+        assert_eq!(evaluate(true, false, "", l), (false, R_RW_OFF));
+        assert_eq!(evaluate(true, true, "root=/dev/sda1", l), (false, R_OTHER_ROOT));
+        assert_eq!(evaluate(true, true, "", l), (true, R_OK));
+        // raspi4b/QEMU: no cmdline, magic at offset 0, no label needed
+        assert!(ev(true, true, "", ""));
+    }
+
+    #[test]
+    fn command_filter() {
+        use sdgrant::*;
+        for c in [24u8, 25, 27, 28, 29, 32, 33, 38, 42, 56] {
+            assert!(is_write_cmd(c, false), "CMD{c}");
+            assert!(!allows(false, c, false), "CMD{c} locked");
+            assert!(allows(true, c, false), "CMD{c} granted");
+        }
+        // ACMD23 is a write-class command, but CMD23 (SET_BLOCK_COUNT) is not
+        assert!(is_write_cmd(23, true));
+        assert!(!is_write_cmd(23, false));
+        // an ACMD sharing an index with a write CMD is not blocked
+        for c in [24u8, 25, 27, 28, 29, 32, 33, 38, 42, 56] { assert!(!is_write_cmd(c, true), "ACMD{c}"); }
+        // CMD6 / ACMD6 / CMD11 / reads / identification / ACMD41 stay open when locked
+        for (c, app) in [(6u8, false), (6, true), (11, false), (17, false), (18, false), (12, false),
+                         (0, false), (2, false), (3, false), (7, false), (8, false), (9, false),
+                         (16, false), (19, false), (55, false), (41, true), (51, true)] {
+            assert!(allows(false, c, app), "CMD{c} app={app}");
+        }
+    }
+
+    #[test]
+    fn locked_means_no_write_command_reaches_the_controller() {
+        use sdgrant::*;
+        let mut m = Mock::default();
+        // locked: every write-class command is refused with ZERO register access
+        for c in [24u8, 25, 27, 28, 29, 32, 33, 38, 42, 56] {
+            assert!(!issue(&mut m, false, c, false, 0x1234, (c as u16) << 8));
+        }
+        assert!(!issue(&mut m, false, 23, true, 8, 23 << 8));
+        assert!(m.writes.is_empty(), "locked writes touched MMIO: {:?}", m.writes);
+        // locked: a read still programs the controller
+        assert!(issue(&mut m, false, 17, false, 5, 17 << 8));
+        assert_eq!(m.writes, vec![(REG_ARGUMENT1, 5), (REG_COMMAND, 17 << 8)]);
+        // granted: CMD24 goes out
+        m.writes.clear();
+        assert!(issue(&mut m, true, 24, false, 7, 24 << 8));
+        assert_eq!(m.writes, vec![(REG_ARGUMENT1, 7), (REG_COMMAND, 24 << 8)]);
+    }
 }
