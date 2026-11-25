@@ -88,7 +88,7 @@ fn refresh_any() {
         PAUSE_PID.store(0, Ordering::Relaxed);
     }
     ANY.store(LEGACY_PID.load(Ordering::Relaxed) != 0 || PAUSE_PID.load(Ordering::Relaxed) != 0
-        || GATE_PID.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
+        || GATE_PID.load(Ordering::Relaxed) != 0 || ARMED_SPACE.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
 }
 
 /// Is `pid` on the old Arc-count rule (armed by `legacy`, not expired)?
