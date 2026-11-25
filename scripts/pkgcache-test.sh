@@ -66,6 +66,10 @@ FAKECALLS=0 OKAT=99; leandros_alpine_stage "$L" -- x 2>"$T/e"; rc=$?
 [ "$rc" = 1 ] && [ "$FAKECALLS" = 3 ] && grep -q "staging step failed after 3" "$T/e" && grep -q "rc=52" "$T/e" && ok "stage: bounded, final error shows the log" || bad "stage bound rc=$rc calls=$FAKECALLS"
 leandros_alpine_run() { FAKECALLS=$((FAKECALLS+1)); echo "ERROR: unable to select packages: nosuch"; echo "=== rc=99 arch=x ==="; return 0; }
 FAKECALLS=0; leandros_alpine_stage "$L" -- x 2>/dev/null; [ "$FAKECALLS" = 1 ] && ok "stage: deterministic apk error not retried" || bad "stage det calls=$FAKECALLS"
+# the GPU-stack ports stage through the helper too (no bare leandros_alpine_run with a swallowed rc)
+for f in ports/mesa/build-gpu-stack.sh ports/nvk-tests/build.sh; do
+  grep -q '^ *leandros_alpine_stage ' "$HERE/../$f" && ! grep -qE '^ *leandros_alpine_run ' "$HERE/../$f" && ok "$f uses leandros_alpine_stage" || bad "$f bypasses leandros_alpine_stage"
+done
 # srchash: lock sensitivity (Alpine-staged ports only)
 mkdir -p "$ROOT/ports/p2"; echo a > "$ROOT/ports/p1/f"; echo a > "$ROOT/ports/p2/f"; touch "$ROOT/ports/p1/build-in-alpine.sh"
 h1=$(leandros_port_srchash "$ROOT/ports/p1"); h2=$(leandros_port_srchash "$ROOT/ports/p2")

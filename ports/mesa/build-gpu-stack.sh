@@ -83,10 +83,10 @@ if [ -n "${GPU_BUILD_TMP:-}" ]; then mkdir -p "$GPU_BUILD_TMP"; TMPMNT="-v $GPU_
 OUTMNT="$OUT:/out"
 if [ "$ALPINE_BACKEND" = local ]; then mkdir -p "$OUT/gpu-stage-$ARCH$OUT_SUFFIX"; OUTMNT="$OUT/gpu-stage-$ARCH$OUT_SUFFIX:/out/gpu-stage-$ARCH$OUT_SUFFIX"; fi
 # shellcheck disable=SC2086
-leandros_alpine_run --arch "$ARCH" --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" $TMPMNT \
+leandros_alpine_stage "$LOG" --arch "$ARCH" --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" $TMPMNT \
     -e NVK="$NVK" -e INTEL="$INTEL" -e OUT_SUFFIX="$OUT_SUFFIX" -e NINJA_JOBS="${NINJA_JOBS:-}" -v "$CACHE:/cache" \
     -v "$MESA_SRC:/work/mesa" -v "$SNAP:/src:ro" -v "$OUTMNT" \
-    -- sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" >"$LOG" 2>&1 || true
+    -- sh /src/build-gpu-stack-alpine.sh "$ARCH" "${2:-all}" \
+    || { echo "❌ build failed (see $LOG)"; exit 1; }
 tail -30 "$LOG"
-tail -1 "$LOG" | grep -q '=== rc=0 ' || { echo "❌ build failed (see $LOG)"; exit 1; }
 echo "✅ $OUT/gpu-stage-$ARCH$OUT_SUFFIX"

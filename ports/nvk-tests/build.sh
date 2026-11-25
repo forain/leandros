@@ -109,14 +109,14 @@ build_one() {
   if [ -d "$_stage/usr/lib" ]; then _stagemnt="-v $_stage:/stage:ro"; else echo "no GPU stage at $_stage: nvgltest will not be built"; fi
   echo "building nvktest + nvgltest for $_arch with $ALPINE_TOOL (log: $_log)"
   # shellcheck disable=SC2086
-  leandros_alpine_run --arch "$_arch" --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" $_stagemnt \
+  leandros_alpine_stage "$_log" --arch "$_arch" --image "${GPU_BUILD_IMAGE:-$ALPINE_IMAGE}" $_stagemnt \
       -v "$SNAP:/src:ro" \
       -v "$MESA_SRC/include/vulkan:/vkheaders/vulkan:ro" \
       -v "$MESA_SRC/include/vk_video:/vkheaders/vk_video:ro" \
       -v "$OUT:/out" \
-      -- sh /src/build.sh --in-container "$_arch" >"$_log" 2>&1 || true
+      -- sh /src/build.sh --in-container "$_arch" \
+      || { echo "=== rc=1 arch=$_arch nvktest === (see $_log)"; return 1; }
   tail -12 "$_log"
-  tail -1 "$_log" | grep -q '=== rc=0 ' || { echo "=== rc=1 arch=$_arch nvktest === (see $_log)"; return 1; }
   [ -x "$OUT/stage-$_arch/usr/bin/nvktest" ] || { echo "missing $OUT/stage-$_arch/usr/bin/nvktest"; return 1; }
   [ -x "$OUT/stage-$_arch/usr/bin/nvkmstest" ] || { echo "missing $OUT/stage-$_arch/usr/bin/nvkmstest"; return 1; }
   return 0
