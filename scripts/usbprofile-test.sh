@@ -38,17 +38,28 @@ done
 echo "write-usb-rpi5: ok"
 
 # staging
-mkdir "$T/boot"; echo cfg > "$T/boot/config.txt"; echo k > "$T/boot/batocera.img"
+mkdir "$T/boot"; echo cfg > "$T/boot/config.txt"; echo k > "$T/boot/batocera.img"; echo d > "$T/boot/bcm2712-rpi-5-b.dtb"
+echo d0 > "$T/boot/bcm2712d0-rpi-5-b.dtb"; mkdir "$T/boot/overlays"; echo o > "$T/boot/overlays/x.dtbo"
 echo kern > "$T/k"; echo ird > "$T/i"
 S="$ROOT/scripts/stage-batocera-rpi5.sh"
+tree() { (cd "$T/boot" && find . -type f -print0 | sort -z | xargs -0 sha256sum); }
+orig="$(tree)"
 a=(--boot-dir "$T/boot" --partuuid 1234abcd-01 --kernel "$T/k" --initrd "$T/i")
 "$S" "${a[@]}" >/dev/null
-[[ "$(ls "$T/boot" | wc -l)" == 2 ]] || fail "dry run wrote files"
+[[ "$(tree)" == "$orig" ]] || fail "dry run wrote files"
 "$S" "${a[@]}" --apply >/dev/null
-grep -qx "root=PARTUUID=1234abcd-01 root.fail=reboot espctl=0 leandros.tryboot=1 tryboot.deadline=300 sdhci.rw=0 panic.reset=5 rootwait=60" "$T/boot/leandros-cmdline.txt" || fail "cmdline"
-grep -q "tryboot_a_b\|autoboot" "$T/boot/tryboot.txt" "$T/boot/leandros-cmdline.txt" && fail "forbidden key"
-[[ "$(cat "$T/boot/config.txt")" == cfg ]] || fail "config.txt changed"
+grep -qx "root=PARTUUID=1234abcd-01 root.fail=reboot espctl=0 leandros.tryboot=1 tryboot.deadline=300 sdhci.rw=0 panic.reset=5 rootwait=60" "$T/boot/leandros/cmdline.txt" || fail "cmdline"
+grep -q "tryboot_a_b\|autoboot" "$T/boot/tryboot.txt" "$T/boot/leandros/cmdline.txt" && fail "forbidden key"
+grep -q "^kernel=leandros/kernel.img" "$T/boot/tryboot.txt" || fail "tryboot kernel path"
+[[ "$(ls "$T/boot/leandros" | tr '\n' ' ')" == "cmdline.txt initrd.cpio kernel.img " ]] || fail "folder contents"
+added="$(tree | grep -c 'leandros/\|tryboot.txt')"; [[ $added == 4 ]] || fail "unexpected additions ($added)"
+[[ "$(tree | grep -v 'leandros/\|tryboot.txt')" == "$orig" ]] || fail "existing files changed"
 "$S" "${a[@]}" --apply >/dev/null 2>&1 && fail "second apply allowed"
-rm "$T/boot"/leandros-* "$T/boot/tryboot.txt"; touch "$T/boot/autoboot.txt"
+"$S" --boot-dir "$T/boot" --rollback >/dev/null
+[[ "$(tree)" == "$orig" ]] || fail "rollback not exact"
+[[ ! -e "$T/boot/leandros" && ! -e "$T/boot/tryboot.txt" ]] || fail "rollback leftovers"
+touch "$T/boot/autoboot.txt"
 "$S" "${a[@]}" >/dev/null 2>&1 && fail "autoboot.txt accepted"
+rm "$T/boot/autoboot.txt" "$T/boot/bcm2712-rpi-5-b.dtb"
+"$S" "${a[@]}" >/dev/null 2>&1 && fail "missing dtb accepted"
 echo "stage-batocera-rpi5: ok"
