@@ -45,8 +45,10 @@ for b in boots:
     red = (int(m) & 3) == 0
     ok, why = False, ""
     # The stall kills the tick only when it lands in the race window; with no fix about one
-    # boot in six keeps its tick. A red boot therefore gets up to 3 attempts, the green ones one.
-    for attempt in range(3 if red else 1):
+    # boot in six keeps its tick. Boots without fix 1 (red, and fix-2-only which needs a death to recover from) therefore get up to 3
+    # attempts; a green one passes only when an attempt really recovers exactly once.
+    racy = (int(m) & 1) == 0  # without fix 1 the death only happens when the stall lands in the window
+    for attempt in range(3 if racy else 1):
         # Unique run id and out dir per attempt: a leftover wedged VM or log never aliases the next.
         rid = f"{BASE_RID}-deadtimer{cpu}m{m}a{attempt}-{os.getpid()}"
         out_base = os.path.join(BASE_OUT, f"deadtimer-{os.getpid()}-{cpu}-{m}-a{attempt}")
@@ -81,7 +83,7 @@ for b in boots:
         # A hung guest (dead BSP tick) outlives runtests: reap exactly this attempt's VM by its
         # own run id so the image lock is released, and nothing else.
         reap(rid)
-        if ok or not red:
+        if ok or not racy:
             break
     print(f"deadtimertest.py {arch} cpu{cpu} fixmask={m}: {'PASS' if ok else 'FAIL'} ({why})", flush=True)
     bad += not ok
