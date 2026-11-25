@@ -4,7 +4,7 @@
 //! clock, format, D0 threshold layout), the audio packet / channel map, ACR N/CTS from the pixel
 //! clock the boot probe measured, and the audio InfoFrame (packet RAM slot 4, read-modify-write so
 //! the firmware's AVI InfoFrame survives). PCM is packed into IEC958 subframes by the CPU and a
-//! dma40 cyclic ring (channel 10, DREQ 10) feeds MAI_DATA.
+//! dma40 cyclic ring (channel 10; DREQ 12 on D0, 10 on C0) feeds MAI_DATA.
 //!
 //! Inert unless `hdmi_probe` saw a sink on hdmi0 in HDMI (not DVI) mode with a known pixel clock.
 //! `hdmi.audio=0` disables it. Log tag `[hdmiaud]`.
@@ -62,11 +62,12 @@ mod hw {
     /// only FIFO address ever given to the DMA engine: a 32-bit "bus" alias would be ordinary
     /// DRAM on boards with 2 GiB or more.
     const FIFO_CPU: u64 = HD_PHYS + HD_MAI_DATA as u64;
-    /// `dmas = <&dma40 0x41fa000a>` on the hdmi0 node (PER_MAP 10).
-    const DREQ_CELL_HDMI0: u32 = 0x41fa_000a;
     const DMA_CHANNEL: u8 = 10;
     const RING_ORDER: usize = 5; // 32 pages >= RING_BYTES
-    const STALL_TICKS: u32 = 30;
+    /// Longest the audio InfoFrame rewrite may wait for the packet slot to go idle when a
+    /// recovery runs inside the timer IRQ (STATE held); probe and client reconfigure wait 100 ms.
+    const IRQ_INFOFRAME_SPIN_NS: u64 = 1_000_000;
+    const TASK_INFOFRAME_SPIN_NS: u64 = 100_000_000;
 
     static SERROR: AtomicUsize = AtomicUsize::new(0);
 
@@ -111,6 +112,10 @@ mod hw {
         chan: Option<dma::Channel>,
         fifo: u64,
         d0: bool,
+        d0_unknown: bool,
+        dreq_cell: u32,
+        policy: StallPolicy,
+        null: NullSink,
         pix_khz: u32,
         n: u32,
         cts: u32,
@@ -121,7 +126,6 @@ mod hw {
         cs: [u8; 24],
         silence: [u32; FRAMES_PER_BLOCK * 2],
         r: Ring,
-        stall: u32,
         mai_errs: u64,
         retrains: u64,
         restarts: u64,
@@ -133,9 +137,9 @@ mod hw {
         pub fn new() -> Self {
             HdmiAudio {
                 initialized: false, stream_active: false, dvp: 0, hd: 0, hdmi: 0, pkt: 0, ring: 0, ring_phys: 0,
-                chan: None, fifo: 0, d0: true, pix_khz: 0, n: 0, cts: 0, in_rate: 48_000, in_channels: 2,
+                chan: None, fifo: 0, d0: true, d0_unknown: false, dreq_cell: 0, policy: StallPolicy::new(), null: NullSink::new(), pix_khz: 0, n: 0, cts: 0, in_rate: 48_000, in_channels: 2,
                 hw_rate: 48_000, resamp: Resampler::new(48_000, 48_000), cs: [0; 24],
-                silence: [0; FRAMES_PER_BLOCK * 2], r: Ring::default(), stall: 0, mai_errs: 0, retrains: 0,
+                silence: [0; FRAMES_PER_BLOCK * 2], r: Ring::default(), mai_errs: 0, retrains: 0,
                 restarts: 0, stalls: 0, summary: String::new(),
             }
         }
@@ -173,12 +177,16 @@ mod hw {
             self.pix_khz = sk.pix_khz;
             if self.pix_khz == 0 { return Err("hdmi0 pixel clock unknown"); }
             self.d0 = sk.d0;
+            self.d0_unknown = sk.d0_unknown;
             let map = |phys: u64, len: usize| env::ioremap_uc(phys, len);
             self.dvp = map(DVP_PHYS, DVP_LEN);
             self.hd = map(HD_PHYS, HD_LEN);
             self.hdmi = map(HDMI0_PHYS, HDMI_LEN);
             self.pkt = map(PACKET0_PHYS, PKT_LEN);
             if self.dvp == 0 || self.hd == 0 || self.hdmi == 0 || self.pkt == 0 { return Err("ioremap failed"); }
+            // Raw vertical timing registers for the pixel-clock follow-up (read-only, before any write).
+            serial_debug(&format!("[hdmiaud] timing regs VERTA0=0x{:08x} VERTB0=0x{:08x} VERTA1=0x{:08x} VERTB1=0x{:08x}\n",
+                rd(self.hdmi, HDMI_VERTA0), rd(self.hdmi, HDMI_VERTB0), rd(self.hdmi, HDMI_VERTA1), rd(self.hdmi, HDMI_VERTB1)));
             if let Some(syn) = serror() {
                 serial_debug(&format!("[hdmiaud] serror pending before setup syn=0x{:016x}\n", syn));
             }
@@ -201,16 +209,25 @@ mod hw {
             self.initialized = true;
             self.in_rate = 48_000;
             self.in_channels = 2;
-            self.program(48_000)?;
+            self.program(48_000, TASK_INFOFRAME_SPIN_NS)?;
             self.fifo = FIFO_CPU;
+            // DREQ: hdmi.dreq=N wins; otherwise the cell of this stepping. Only when the stepping is
+            // unknown and the pacing check fails is the other stepping's cell tried, once (never
+            // another FIFO address).
+            let forced = dreq_knob(cmdline);
+            let first = env::cb::hdmi_dreq_cell(self.d0, 0);
+            self.dreq_cell = match forced { Some(n) => env::cb::cell_with_per_map(first, n), None => first };
             if let Err(why) = self.start_dma(true) {
-                serial_debug(&format!("[hdmiaud] fifo 0x{:x}: {}\n", FIFO_CPU, why));
-                return Err("dma never moved (no progress at the MAI FIFO)");
+                if forced.is_some() || !self.d0_unknown { return Err(why); }
+                self.dreq_cell = env::cb::hdmi_dreq_cell(!self.d0, 0);
+                serial_debug(&format!("[hdmiaud] stepping unknown: retrying with DREQ cell 0x{:08x}\n", self.dreq_cell));
+                self.start_dma(true)?;
             }
             let ch_id = self.chan.as_ref().map_or(0, |c| c.id());
             self.summary = format!(
-                "hdmi0 pix={} kHz N={} CTS={} gate={} thr={} dma ch{} fifo=0x{:x} {} edid={}\n",
+                "hdmi0 pix={} kHz N={} CTS={} gate={} thr={} dma ch{} fifo=0x{:x} dreq=0x{:08x}({}) {} edid={}\n",
                 self.pix_khz, self.n, self.cts, gate_was, if self.d0 { "d0" } else { "c" }, ch_id, self.fifo,
+                self.dreq_cell, self.dreq_cell & 31,
                 if dma::polled() { "poll" } else { "irq" },
                 match sink { env::SINK_HDMI => "hdmi", env::SINK_DVI => "dvi(forced hdmi mode)", _ => "unknown" }
             );
@@ -218,7 +235,7 @@ mod hw {
         }
 
         /// Programs MAI, packetizer, ACR and the InfoFrame for `fs` (Linux startup + prepare).
-        fn program(&mut self, fs: u32) -> Result<(), &'static str> {
+        fn program(&mut self, fs: u32, infoframe_spin_ns: u64) -> Result<(), &'static str> {
             let fmt = mai_fmt(fs).ok_or("unsupported rate")?;
             let (mut n, mut cts) = env::acr_n_cts(self.pix_khz, fs);
             if n == 0 || cts == 0 { (n, cts) = n_cts_fallback(self.pix_khz, fs); }
@@ -240,7 +257,7 @@ mod hw {
             wr(h, HDMI_CRP_CFG, crp_cfg(n));
             wr(h, HDMI_CTS_0, cts);
             wr(h, HDMI_CTS_1, cts);
-            self.write_infoframe();
+            self.write_infoframe(infoframe_spin_ns);
             if let Some(syn) = serror() {
                 serial_debug(&format!("[hdmiaud] serror programming MAI/CRP syn=0x{:016x}\n", syn));
                 return Err("serror while programming MAI/CRP");
@@ -248,15 +265,22 @@ mod hw {
             Ok(())
         }
 
-        /// `vc4_hdmi_write_infoframe` for the audio InfoFrame: stop slot 4, wait idle, write the
-        /// slot, re-enable it; the other slot bits (AVI = 2) are preserved.
-        fn write_infoframe(&mut self) {
+        /// `vc4_hdmi_write_infoframe` for the audio InfoFrame: stop slot 4, wait idle (at most
+        /// `spin_ns`), write the slot, re-enable it; the other slot bits (AVI = 2) are preserved.
+        /// If the slot is still busy after `spin_ns` (the IRQ-context recovery allows ~1 ms) the
+        /// slot is re-enabled with its previous contents: the InfoFrame does not change on a
+        /// restart, so nothing is lost and no long spin happens with STATE held.
+        fn write_infoframe(&mut self, spin_ns: u64) {
             let h = self.hdmi;
             let bit = 1u32 << AUDIO_PACKET_ID;
             let cfg = rd(h, HDMI_RAM_PACKET_CONFIG);
             wr(h, HDMI_RAM_PACKET_CONFIG, cfg & !bit);
-            let end = env::monotonic_ns() + 100_000_000;
+            let end = env::monotonic_ns() + spin_ns;
             while rd(h, HDMI_RAM_PACKET_STATUS) & bit != 0 && env::monotonic_ns() < end { core::hint::spin_loop(); }
+            if rd(h, HDMI_RAM_PACKET_STATUS) & bit != 0 {
+                wr(h, HDMI_RAM_PACKET_CONFIG, cfg | bit | RAM_PACKET_ENABLE);
+                return;
+            }
             let words = infoframe_words(&audio_infoframe(2));
             let base = self.pkt + AUDIO_PACKET_ID as usize * PACKET_STRIDE;
             for (i, w) in words.iter().enumerate() { wr(base, i * 4, *w); }
@@ -274,14 +298,17 @@ mod hw {
             env::dcache_clean_inval(self.ring + a, b - a);
         }
 
-        /// Fills the ring with silence and starts the cyclic DMA into MAI_DATA. With `verify`,
-        /// waits up to 40 ms for the position to move (DREQ pacing proven).
+        /// Fills the ring with silence and starts the cyclic DMA into MAI_DATA. With `verify`
+        /// (probe only, task context), proves the FIFO paces the engine: the position must be
+        /// valid at both ends and, measured from 5 ms after the start over 20..40 ms, advance at
+        /// 50..150 % of the hardware rate (more than 2 KiB in total).
         fn start_dma(&mut self, verify: bool) -> Result<(), &'static str> {
             self.fill_silence(0, RING_BYTES);
             self.r.reset();
-            self.stall = 0;
+            let cell = self.dreq_cell;
+            let hw = self.hw_rate;
             let Some(ch) = self.chan.as_mut() else { return Err("no channel") };
-            ch.start_cyclic(self.ring_phys as u64, RING_BYTES, PERIOD_BYTES, self.fifo, DREQ_CELL_HDMI0, true)
+            ch.start_cyclic(self.ring_phys as u64, RING_BYTES, PERIOD_BYTES, self.fifo, cell, true)
                 .map_err(|_| "start_cyclic refused")?;
             if let Some(syn) = serror() {
                 serial_debug(&format!("[hdmiaud] serror starting dma syn=0x{:016x}\n", syn));
@@ -292,22 +319,28 @@ mod hw {
             wr(self.hd, HD_MAI_CTL, mai_ctl_run(2) | MAI_CTL_ERRS);
             self.stream_active = true;
             if !verify { return Ok(()); }
+            let t0 = env::monotonic_ns();
+            while env::monotonic_ns() < t0 + VERIFY_SKIP_MS * 1_000_000 { ch.poll(); spin_us(250); }
+            let ts = env::monotonic_ns();
             let first = ch.position();
-            let end = env::monotonic_ns() + 40_000_000;
-            while env::monotonic_ns() < end {
-                ch.poll();
-                let p = ch.position();
-                if p.is_some() && p != first {
-                    return Ok(());
-                }
+            let mut last = first;
+            let mut el_us = 0;
+            while el_us < VERIFY_MAX_MS * 1000 {
                 spin_us(500);
+                ch.poll();
+                last = ch.position();
+                el_us = (env::monotonic_ns() - ts) / 1000;
+                if el_us >= VERIFY_MIN_MS * 1000 && verify_rate(first, last, el_us, hw) { return Ok(()); }
             }
             let (cs, dbg) = ch.status();
-            serial_debug(&format!("[hdmiaud] no progress pos={:?} cs=0x{:08x} debug=0x{:08x} mai_ctl=0x{:08x}\n",
-                first, cs, dbg, rd(self.hd, HD_MAI_CTL)));
+            let ti = env::cb::DreqCfg::from_cell(cell).ti;
+            let src = last.map_or(0, |p| self.ring_phys as u64 + p as u64);
+            serial_debug(&format!(
+                "[hdmiaud] dma not paced by the FIFO: pos {:?}->{:?} in {} us, src=0x{:x} cs=0x{:08x} debug=0x{:08x} ti=0x{:08x} (programmed) mai_ctl=0x{:08x} dreq=0x{:08x}\n",
+                first, last, el_us, src, cs, dbg, ti, rd(self.hd, HD_MAI_CTL), cell));
             ch.stop();
             self.stream_active = false;
-            Err("no progress")
+            Err("dma not paced by the FIFO (wrong DREQ?)")
         }
 
         fn teardown(&mut self) {
@@ -326,38 +359,85 @@ mod hw {
             self.initialized = false;
         }
 
+        /// Client SET_PARAMS: new input format, the stall policy starts over (also out of dead).
         pub fn reconfigure_stream(&mut self, _id: u32, freq: u32, channels: u8) {
             if !self.initialized { return; }
-            self.stream_active = false;
-            if let Some(c) = self.chan.as_mut() { c.stop(); }
+            self.policy.rearm();
             self.in_rate = if freq == 0 { 48_000 } else { freq };
             self.in_channels = channels.max(1);
-            let hw = hw_rate_for(self.in_rate);
-            self.resamp = Resampler::new(self.in_rate, hw);
-            if let Err(why) = self.program(hw) {
-                serial_debug(&format!("[hdmiaud] reprogram failed: {}\n", why));
-                return;
-            }
-            serial_debug(&format!("[hdmiaud] SET_PARAMS {} Hz x{} -> hw {} Hz N={} CTS={}\n",
-                self.in_rate, self.in_channels, hw, self.n, self.cts));
-            if let Err(why) = self.start_dma(false) {
-                serial_debug(&format!("[hdmiaud] restart failed: {}\n", why));
+            match self.restart_hw(TASK_INFOFRAME_SPIN_NS) {
+                Ok(()) => serial_debug(&format!("[hdmiaud] SET_PARAMS {} Hz x{} -> hw {} Hz N={} CTS={}\n",
+                    self.in_rate, self.in_channels, self.hw_rate, self.n, self.cts)),
+                Err(why) => {
+                    serial_debug(&format!("[hdmiaud] reprogram failed: {}\n", why));
+                    self.go_dead(why);
+                }
             }
         }
 
-        pub fn recover_stream(&mut self) {
-            self.restarts += 1;
-            if self.restarts <= 8 {
-                serial_debug(&format!("[hdmiaud] stream stalled - restarting (mai_ctl=0x{:08x} crp=0x{:08x})\n",
-                    if self.hd != 0 { rd(self.hd, HD_MAI_CTL) } else { 0 },
-                    if self.hdmi != 0 { rd(self.hdmi, HDMI_CRP_CFG) } else { 0 }));
+        /// Stops the engine, reprograms MAI/ACR for the current input format and restarts the ring.
+        fn restart_hw(&mut self, infoframe_spin_ns: u64) -> Result<(), &'static str> {
+            self.stream_active = false;
+            if let Some(c) = self.chan.as_mut() { c.stop(); }
+            let hw = hw_rate_for(self.in_rate);
+            self.resamp = Resampler::new(self.in_rate, hw);
+            self.program(hw, infoframe_spin_ns)?;
+            self.null = NullSink::new();
+            self.start_dma(false)
+        }
+
+        /// Gives up on the hardware: DMA and MAI stopped, input drained through the null sink at
+        /// the stream's own rate so the writer never blocks. One line.
+        fn go_dead(&mut self, why: &str) {
+            self.policy.kill();
+            let (cs, dbg) = self.chan.as_ref().map_or((0, 0), |c| c.status());
+            let pos = self.chan.as_ref().and_then(|c| c.position());
+            serial_debug(&format!("[hdmiaud] dead: {} (pos={:?} cs=0x{:08x} debug=0x{:08x} mai_ctl=0x{:08x}); audio is dropped until the next SET_PARAMS or re-train\n",
+                why, pos, cs, dbg, if self.hd != 0 { rd(self.hd, HD_MAI_CTL) } else { 0 }));
+            self.stream_active = false;
+            if let Some(c) = self.chan.as_mut() { c.stop(); }
+            if self.hd != 0 { wr(self.hd, HD_MAI_CTL, mai_ctl_run(2) & !MAI_CTL_ENABLE); }
+            self.null = NullSink::new();
+            self.null.start(env::monotonic_ns());
+        }
+
+        fn act(&mut self, a: StallAction) {
+            match a {
+                StallAction::None => {}
+                StallAction::Restart(n) => {
+                    self.stalls += 1;
+                    self.restarts += 1;
+                    if self.restarts <= 8 {
+                        serial_debug(&format!("[hdmiaud] stream stalled - restart #{} (mai_ctl=0x{:08x} crp=0x{:08x})\n",
+                            n, rd(self.hd, HD_MAI_CTL), rd(self.hdmi, HDMI_CRP_CFG)));
+                    }
+                    // Runs in the timer IRQ with STATE held: no long spin.
+                    if let Err(why) = self.restart_hw(IRQ_INFOFRAME_SPIN_NS) { self.go_dead(why); }
+                }
+                StallAction::Dead => self.go_dead("no progress after 5 restarts"),
             }
-            let (f, c) = (self.in_rate, self.in_channels);
-            self.reconfigure_stream(0, f, c);
+        }
+
+        /// A stall reported from outside (PipeWire's 250 ms no-TX-progress detector). It goes
+        /// through the same policy as the internal detector.
+        pub fn recover_stream(&mut self) {
+            if !self.initialized { return; }
+            let a = self.policy.request(env::monotonic_ns());
+            self.act(a);
         }
 
         /// Position update, MAI error / firmware re-train check, silence refill, underrun resync.
         fn update(&mut self) {
+            if self.policy.is_dead() {
+                // Dead: only a firmware re-train (N changed behind our back) re-arms.
+                if self.retrains < 20 && self.hdmi != 0 && rd(self.hdmi, HDMI_CRP_CFG) & 0x010f_ffff != crp_cfg(self.n) {
+                    self.retrains += 1;
+                    serial_debug("[hdmiaud] re-train while dead - re-arming\n");
+                    self.policy.rearm();
+                    if let Err(why) = self.restart_hw(IRQ_INFOFRAME_SPIN_NS) { self.go_dead(why); }
+                }
+                return;
+            }
             if !self.stream_active { return; }
             let Some(ch) = self.chan.as_ref() else { return };
             ch.poll();
@@ -368,13 +448,15 @@ mod hw {
                 wr(self.hd, HD_MAI_CTL, mai_ctl_run(2) | (ctl & MAI_CTL_ERRS));
             }
             // A hotplug re-train by the firmware drops our setup: MAI disabled or N changed.
+            // That is not a stall: reprogram directly and start the policy over.
             let crp = rd(self.hdmi, HDMI_CRP_CFG);
             if self.retrains < 20 && (ctl & MAI_CTL_ENABLE == 0 || crp & 0x010f_ffff != crp_cfg(self.n)) {
                 self.retrains += 1;
                 if self.retrains <= 4 {
                     serial_debug(&format!("[hdmiaud] setup lost (mai_ctl=0x{:08x} crp=0x{:08x}) - reprogramming\n", ctl, crp));
                 }
-                self.recover_stream();
+                self.policy.rearm();
+                if let Err(why) = self.restart_hw(IRQ_INFOFRAME_SPIN_NS) { self.go_dead(why); }
                 return;
             }
             let Some(pos) = pos else { return };
@@ -384,20 +466,22 @@ mod hw {
             if adv.starved && (self.r.underruns <= 8 || self.r.underruns % 100 == 0) {
                 serial_debug(&format!("[hdmiaud] writer starved #{} (end of every playback counts once)\n", self.r.underruns));
             }
-            if self.r.played == before {
-                self.stall += 1;
-                if self.stall == STALL_TICKS {
-                    self.stalls += 1;
-                    self.stall = 0;
-                    self.recover_stream();
-                }
-            } else {
-                self.stall = 0;
-            }
+            let a = self.policy.observe(env::monotonic_ns(), self.r.played - before);
+            self.act(a);
         }
 
         pub fn send_pcm_data(&mut self, data: &[u8]) -> usize {
-            if !self.initialized || !self.stream_active { return 0; }
+            if !self.initialized { return 0; }
+            if self.policy.is_dead() {
+                self.update();
+                if self.policy.is_dead() {
+                    // Null sink: whole input frames at the stream's own rate.
+                    let fb = self.in_channels as usize * 2;
+                    let frames = self.null.drain(env::monotonic_ns(), data.len() / fb, self.in_rate as u64);
+                    return frames * fb;
+                }
+            }
+            if !self.stream_active { return 0; }
             self.update();
             if !self.stream_active { return 0; }
             let out_frames = (self.r.space() as usize) / FRAME_BYTES;
@@ -425,9 +509,14 @@ mod hw {
         }
 
         /// Queued audio in S16-stereo-equivalent bytes (the ring holds 8-byte IEC958 frames).
-        pub fn queued_bytes(&self) -> u64 { self.r.queued() / 2 }
+        pub fn queued_bytes(&self) -> u64 { if self.policy.is_dead() { 0 } else { self.r.queued() / 2 } }
 
-        pub fn tx_used_idx(&self) -> u16 { (self.r.played / 2 / env::TX_BUF_BYTES as u64) as u16 }
+        pub fn tx_used_idx(&self) -> u16 {
+            if self.policy.is_dead() {
+                return (self.null.consumed * (self.in_channels as u64 * 2) / env::TX_BUF_BYTES as u64) as u16;
+            }
+            (self.r.played / 2 / env::TX_BUF_BYTES as u64) as u16
+        }
 
         pub fn top_up_silence(&mut self) { self.update(); }
 
@@ -437,9 +526,9 @@ mod hw {
             s.push_str(&self.summary);
             s.push_str(&format!(
                 "stream: {} Hz x{} -> {} Hz IEC958 S16, queued {} B, played {} B\n\
-                 underruns {} mai_errors {} retrains {} restarts {} stalls {}\n",
+                 underruns {} mai_errors {} retrains {} restarts {} stalls {} dead {}\n",
                 self.in_rate, self.in_channels, self.hw_rate, self.r.queued(), self.r.played,
-                self.r.underruns, self.mai_errs, self.retrains, self.restarts, self.stalls));
+                self.r.underruns, self.mai_errs, self.retrains, self.restarts, self.stalls, self.policy.is_dead()));
             s
         }
     }

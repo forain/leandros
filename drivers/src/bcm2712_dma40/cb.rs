@@ -19,10 +19,27 @@ pub const LAST_CHAN: u8 = 11;
 pub const DT_CHANNEL_MASK: u32 = 0x7c0;
 /// Channel the HDMI audio path uses (the pisound-design note).
 pub const AUDIO_CHAN: u8 = 10;
-/// HDMI0/HDMI1 MAI DREQ cells from the Pi 5 DTB (`dmas = <&dma40 0x41fa000a>` / `0x41fa0011`):
-/// DREQ 10 and 17. The pisound design note's 12/13 (from the vc4 sources) is wrong for this DTB.
+/// HDMI0/HDMI1 MAI DREQ cells, C0 stepping (`bcm2712-rpi-5-b.dtb`: `dmas = <&dma40 0x41fa000a>` /
+/// `0x41fa0011`): DREQ 10 and 17.
 pub const DREQ_CELL_HDMI0: u32 = 0x41fa_000a;
 pub const DREQ_CELL_HDMI1: u32 = 0x41fa_0011;
+/// The same cells on the D0 stepping (`bcm2712d0-rpi-5-b.dtb`: `0x41fa000c` / `0x41fa000d`):
+/// DREQ 12 and 13. Using the C0 numbers on a D0 board leaves the engine unpaced.
+pub const DREQ_CELL_HDMI0_D0: u32 = 0x41fa_000c;
+pub const DREQ_CELL_HDMI1_D0: u32 = 0x41fa_000d;
+
+/// The MAI DREQ cell for `port` (0 = hdmi0, 1 = hdmi1) on a D0 or C0 SoC.
+pub const fn hdmi_dreq_cell(d0: bool, port: usize) -> u32 {
+    match (d0, port) {
+        (true, 0) => DREQ_CELL_HDMI0_D0,
+        (true, _) => DREQ_CELL_HDMI1_D0,
+        (false, 0) => DREQ_CELL_HDMI0,
+        (false, _) => DREQ_CELL_HDMI1,
+    }
+}
+
+/// `cell` with its PER_MAP (low 5 bits) replaced by `per_map` (the `hdmi.dreq=N` knob).
+pub const fn cell_with_per_map(cell: u32, per_map: u32) -> u32 { (cell & !31) | (per_map & 31) }
 
 // Channel registers.
 pub const CS: u32 = 0x00;

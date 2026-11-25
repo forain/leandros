@@ -39,6 +39,7 @@ pub mod dma_dir { pub const CLEAN: u32 = 3; pub const INVALIDATE: u32 = 4; }
 /// HDMI sink facts from the boot probe (`kapi_hdmi_sink_info`). `size` is `size_of::<KHdmiSink>()`.
 /// `state`: hdmi_probe PROBE_* (2 = done). `port_flags`: bit0 valid, 1 hpd, 2 hdmi mode, 3 active, 4 gate open (hdmi0).
 /// `pix_khz`: measured pixel clock (0 unknown). `sink`: EDID verdict, 0 unknown, 1 HDMI, 2 DVI.
+/// `d0`: 0 = C0, 1 = D0, 2 = stepping unknown (counts as D0, the DMA pacing is then verified).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KHdmiSink { pub size: u32, pub state: u32, pub port_flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: u32 }

@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn hdmi_dreq_cells_decode_like_linux() {
-        // 0x41fa000a (DTB): BURST(30) | WIDE_SOURCE(24) | QOS 0xa | PANIC_QOS 0xf | DREQ 10.
+        // 0x41fa000a (C0 DTB): BURST(30) | WIDE_SOURCE(24) | QOS 0xa | PANIC_QOS 0xf | DREQ 10.
         let d = DreqCfg::from_cell(DREQ_CELL_HDMI0);
         assert_eq!(d.per_map, 10);
         assert_eq!(d.cs_flags, cs_qos(0xa) | cs_panic_qos(0xf));
@@ -52,6 +52,13 @@ mod tests {
         assert_eq!(d.src_xi, XI_SIZE_128 | (3 << 8));
         assert_eq!(d.dst_xi, 3 << 8);
         assert_eq!(DreqCfg::from_cell(DREQ_CELL_HDMI1).per_map, 17);
+        // C0 stepping cells (bcm2712-rpi-5-b.dtb); the D0 DTB (bcm2712d0-rpi-5-b.dtb) says 12 / 13.
+        assert_eq!((DREQ_CELL_HDMI0, DREQ_CELL_HDMI1), (hdmi_dreq_cell(false, 0), hdmi_dreq_cell(false, 1)));
+        assert_eq!((DREQ_CELL_HDMI0_D0, DREQ_CELL_HDMI1_D0), (0x41fa_000c, 0x41fa_000d));
+        let d0 = DreqCfg::from_cell(hdmi_dreq_cell(true, 0));
+        assert_eq!((d0.per_map, d0.ti), (12, TI_WAIT_RESP | (12 << 9)));
+        assert_eq!(d0.cs_flags, DreqCfg::from_cell(DREQ_CELL_HDMI0).cs_flags, "only PER_MAP differs between steppings");
+        assert_eq!(DreqCfg::from_cell(hdmi_dreq_cell(true, 1)).per_map, 13);
         // NO_WAIT_RESP drops WAIT_RESP; a plain cell has no burst/width.
         let p = DreqCfg::from_cell((1 << 27) | 5);
         assert_eq!((p.ti, p.src_xi, p.dst_xi, p.cs_flags), (5 << 9, 0, 0, 0));

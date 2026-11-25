@@ -200,4 +200,174 @@ mod tests {
         assert_eq!(out[1].0, 5 << 8);
         assert!(out.windows(2).all(|w| w[1].0 >= w[0].0));
     }
+
+    // ----- DREQ cell selection against the real Pi 5 device trees (dtc output, data/) -----
+
+    fn dts_cells(text: &str) -> [u32; 2] {
+        let mut out = [0u32; 2];
+        let mut port = 0;
+        for l in text.lines().filter(|l| l.contains("dmas")) {
+            let v = l.split("0x16 0x").nth(1).unwrap().trim_end_matches(">;").trim();
+            out[port] = u32::from_str_radix(v, 16).unwrap();
+            port += 1;
+        }
+        assert_eq!(port, 2);
+        out
+    }
+
+    #[test]
+    fn dreq_cells_match_both_device_trees() {
+        use super::cb::*;
+        let c0 = dts_cells(include_str!("../data/dts-hdmi-c0.txt"));
+        let d0 = dts_cells(include_str!("../data/dts-hdmi-d0.txt"));
+        assert_eq!(c0, [hdmi_dreq_cell(false, 0), hdmi_dreq_cell(false, 1)]);
+        assert_eq!(d0, [hdmi_dreq_cell(true, 0), hdmi_dreq_cell(true, 1)]);
+        assert_eq!(DreqCfg::from_cell(hdmi_dreq_cell(true, 0)).per_map, 12);
+        assert_eq!(DreqCfg::from_cell(hdmi_dreq_cell(true, 1)).per_map, 13);
+        assert_eq!(DreqCfg::from_cell(hdmi_dreq_cell(false, 0)).per_map, 10);
+        assert_eq!(DreqCfg::from_cell(hdmi_dreq_cell(false, 1)).per_map, 17);
+        assert_eq!(cell_with_per_map(hdmi_dreq_cell(true, 0), 10), DREQ_CELL_HDMI0);
+    }
+
+    #[test]
+    fn dreq_knob_parses() {
+        assert_eq!(dreq_knob("quiet hdmi.dreq=12 x"), Some(12));
+        assert_eq!(dreq_knob("hdmi.dreq=32"), None);
+        assert_eq!(dreq_knob("hdmi.dreq=x"), None);
+        assert_eq!(dreq_knob("hdmi.audio=0"), None);
+    }
+
+    // ----- verify_rate -----
+
+    #[test]
+    fn verify_rate_window() {
+        // 48 kHz: 384 B/ms. 30 ms -> 11520 B nominal.
+        let r = |moved: usize, us: u64| verify_rate(Some(1000), Some((1000 + moved) % RING_BYTES), us, 48_000);
+        assert!(r(11_520, 30_000));
+        assert!(r(5_760, 30_000) && r(17_280, 30_000), "50 % and 150 % edges pass");
+        assert!(!r(5_700, 30_000) && !r(17_400, 30_000));
+        assert!(!r(80_000, 30_000), "an unpaced engine races");
+        assert!(!r(2_048, 30_000) && !r(0, 30_000), "<= 2 KiB is silent");
+        assert!(!verify_rate(None, Some(10), 30_000, 48_000) && !verify_rate(Some(10), None, 30_000, 48_000));
+        assert!(!verify_rate(Some(RING_BYTES), Some(0), 30_000, 48_000));
+        assert!(!verify_rate(Some(0), Some(11_520), 0, 48_000));
+        // The position wraps through the ring end.
+        assert!(verify_rate(Some(RING_BYTES - 4_000), Some(7_520), 30_000, 48_000));
+        // 44.1 kHz expects 352.8 B/ms.
+        assert!(verify_rate(Some(0), Some(10_584), 30_000, 44_100));
+    }
+
+    // ----- StallPolicy -----
+
+    const MS: u64 = 1_000_000;
+    const S: u64 = 1_000 * MS;
+
+    #[test]
+    fn single_glitch_recovers_at_30_ticks() {
+        let mut p = StallPolicy::new();
+        for i in 0..29 { assert_eq!(p.observe(i * 10 * MS, 0), StallAction::None); }
+        assert_eq!(p.observe(300 * MS, 0), StallAction::Restart(1));
+        // Audio flows again: 4 KiB since the restart re-arms the whole ladder.
+        assert_eq!(p.observe(400 * MS, 4096), StallAction::None);
+        assert_eq!(p.restarts(), 0);
+        for i in 0..29 { assert_eq!(p.observe(S + i * 10 * MS, 0), StallAction::None); }
+        assert_eq!(p.observe(2 * S, 0), StallAction::Restart(1));
+    }
+
+    #[test]
+    fn movement_between_idle_ticks_resets_the_tick_count() {
+        let mut p = StallPolicy::new();
+        for _ in 0..20 { p.observe(0, 0); }
+        p.observe(0, 8);
+        for _ in 0..29 { assert_eq!(p.observe(0, 0), StallAction::None); }
+        assert_eq!(p.observe(0, 0), StallAction::Restart(1));
+    }
+
+    #[test]
+    fn dead_after_five_restarts_with_512_bytes_each_and_one_dead_action() {
+        let mut p = StallPolicy::new();
+        let mut now = 0u64;
+        for _ in 0..29 { p.observe(now, 0); }
+        assert_eq!(p.observe(now, 0), StallAction::Restart(1));
+        let waits = [1, 2, 4, 8, 8];
+        let mut restarts = 1;
+        let mut dead = 0;
+        for (k, w) in waits.iter().enumerate() {
+            // 512 B per restart is not progress (< 4 KiB), and nothing happens before the wait.
+            assert_eq!(p.observe(now + w * S - 1, 512), StallAction::None, "wait {}", k);
+            now += w * S;
+            match p.observe(now, 0) {
+                StallAction::Restart(n) => { restarts += 1; assert_eq!(n, restarts); }
+                StallAction::Dead => dead += 1,
+                StallAction::None => panic!("expected an action at wait {}", k),
+            }
+        }
+        assert_eq!((restarts, dead), (5, 1));
+        assert!(p.is_dead());
+        for i in 0..100 { assert_eq!(p.observe(now + i * S, 0), StallAction::None, "dead is reported once"); }
+        assert_eq!(p.request(now + 1000 * S), StallAction::None);
+    }
+
+    #[test]
+    fn progress_resets_the_ladder() {
+        let mut p = StallPolicy::new();
+        for _ in 0..30 { p.observe(0, 0); }
+        assert_eq!(p.restarts(), 1);
+        assert_eq!(p.observe(S / 2, 3000), StallAction::None); // 3000 B: not yet
+        assert_eq!(p.observe(S * 9 / 10, 1096), StallAction::None); // 4096 B total: progress
+        assert_eq!((p.restarts(), p.is_dead()), (0, false));
+    }
+
+    #[test]
+    fn rearm_after_dead() {
+        let mut p = StallPolicy::new();
+        let mut now = 0;
+        for _ in 0..30 { p.observe(now, 0); }
+        for w in [1, 2, 4, 8, 8] { now += w * S; p.observe(now, 0); }
+        assert!(p.is_dead());
+        p.rearm();
+        assert!(!p.is_dead() && p.restarts() == 0);
+        for _ in 0..29 { assert_eq!(p.observe(now, 0), StallAction::None); }
+        assert_eq!(p.observe(now, 0), StallAction::Restart(1));
+    }
+
+    #[test]
+    fn external_detector_goes_through_the_same_ladder() {
+        let mut p = StallPolicy::new();
+        assert_eq!(p.request(0), StallAction::Restart(1));
+        // Another 250 ms detector hit inside the 1 s backoff is ignored.
+        assert_eq!(p.request(250 * MS), StallAction::None);
+        assert_eq!(p.request(500 * MS), StallAction::None);
+        assert_eq!(p.request(S), StallAction::Restart(2));
+        let mut now = S;
+        for (w, want) in [(2, StallAction::Restart(3)), (4, StallAction::Restart(4)), (8, StallAction::Restart(5)), (8, StallAction::Dead)] {
+            now += w * S;
+            assert_eq!(p.request(now), want);
+        }
+        assert_eq!(p.request(now + 100 * S), StallAction::None);
+    }
+
+    // ----- NullSink -----
+
+    #[test]
+    fn null_sink_drains_at_exactly_the_wall_clock_rate() {
+        let bps = 48_000 * 2 * 2; // S16 stereo 48 kHz
+        let mut n = NullSink::new();
+        n.start(5 * S);
+        let mut total = 0usize;
+        // 1 s in 7 ms steps with a writer always offering more than it can drain.
+        let mut now = 5 * S;
+        while now < 6 * S { now = (now + 7 * MS).min(6 * S); total += n.drain(now, 1 << 20, bps); }
+        assert_eq!(total, bps as usize);
+        assert_eq!(n.consumed, bps);
+        // Nothing offered, nothing consumed; the backlog is capped at 100 ms.
+        assert_eq!(n.drain(6 * S, 0, bps), 0);
+        assert_eq!(n.drain(60 * S, 1 << 30, bps), bps as usize / 10);
+        // An odd rate keeps its remainder instead of rounding each call.
+        let mut m = NullSink::new();
+        m.start(0);
+        let mut got = 0;
+        for i in 1..=1000u64 { got += m.drain(i * MS, 1 << 20, 44_100 * 3); }
+        assert_eq!(got, 44_100 * 3);
+    }
 }

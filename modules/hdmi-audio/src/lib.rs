@@ -30,12 +30,13 @@ mod kenv {
         pub const SINK_DVI: u32 = 2;
 
         pub use crate::decode::acr_n_cts;
+        pub use crate::cb;
 
-        pub struct Sink { pub state: u32, pub flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: bool }
+        pub struct Sink { pub state: u32, pub flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: bool, pub d0_unknown: bool }
         pub fn sink() -> Sink {
             match sys::hdmi_sink_info() {
-                Some(k) => Sink { state: k.state, flags: k.port_flags, pix_khz: k.pix_khz, sink: k.sink, d0: k.d0 != 0 },
-                None => Sink { state: PROBE_NOT_RUN, flags: 0, pix_khz: 0, sink: 0, d0: false },
+                Some(k) => Sink { state: k.state, flags: k.port_flags, pix_khz: k.pix_khz, sink: k.sink, d0: k.d0 != 0, d0_unknown: k.d0 == 2 },
+                None => Sink { state: PROBE_NOT_RUN, flags: 0, pix_khz: 0, sink: 0, d0: false, d0_unknown: false },
             }
         }
         pub fn monotonic_ns() -> u64 { kmod_kapi::sched::monotonic_ns() }
@@ -75,6 +76,10 @@ mod kenv {
 #[path = "../../../drivers/src/hdmi_probe/decode.rs"]
 #[allow(dead_code)]
 mod decode;
+
+#[path = "../../../drivers/src/bcm2712_dma40/cb.rs"]
+#[allow(dead_code)]
+mod cb;
 
 #[path = "../../../drivers/src/hdmi_audio/mod.rs"]
 #[allow(dead_code)]

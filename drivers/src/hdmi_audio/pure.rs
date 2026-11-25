@@ -149,6 +149,11 @@ pub const HDMI_RAM_PACKET_STATUS: usize = 0x0cc;
 pub const HDMI_CRP_CFG: usize = 0x0d0;
 pub const HDMI_CTS_0: usize = 0x0d4;
 pub const HDMI_CTS_1: usize = 0x0d8;
+/// Vertical timing registers (read-only here, logged raw for the pixel-clock follow-up).
+pub const HDMI_VERTA0: usize = 0x0f4;
+pub const HDMI_VERTB0: usize = 0x0f8;
+pub const HDMI_VERTA1: usize = 0x0fc;
+pub const HDMI_VERTB1: usize = 0x100;
 /// DVP clock block: MISC_CONFIG bit 3 + port gates the port's audio clock (set = closed).
 pub const DVP_MISC_CONFIG: usize = 0x08;
 pub fn dvp_gate_bit(port: usize) -> u32 {
@@ -458,4 +463,147 @@ pub fn convert_s16(data: &[u8], ch: usize, same_rate: bool, rs: &mut Resampler, 
         consumed += 1;
     }
     (consumed * in_frame, produced)
+}
+
+// ---------------------------------------------------------------------------------------------
+// DMA pacing verification (probe) and the stall policy (runtime)
+// ---------------------------------------------------------------------------------------------
+
+/// `hdmi.dreq=N` (0..=31): forces the HDMI audio PER_MAP; the cell flags still come from the table.
+pub fn dreq_knob(cmdline: &str) -> Option<u32> {
+    cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("hdmi.dreq="))
+        .and_then(|v| v.parse::<u32>().ok()).filter(|&n| n < 32)
+}
+
+/// Probe verification windows (ms): skip the start-up transient, then measure.
+pub const VERIFY_SKIP_MS: u64 = 5;
+pub const VERIFY_MIN_MS: u64 = 20;
+pub const VERIFY_MAX_MS: u64 = 40;
+/// At or below this many bytes the engine is considered silent (not paced by the FIFO).
+pub const VERIFY_SILENT_BYTES: u64 = 2048;
+
+/// True when the ring position moved at the hardware rate: both positions valid, more than
+/// 2 KiB in total, and 50..=150 % of `hw_rate * 8 / 1000` bytes per ms (384 B/ms at 48 kHz)
+/// over `elapsed_us`. A free-running engine (no DREQ pacing) races far above 150 %.
+pub fn verify_rate(pos0: Option<usize>, pos1: Option<usize>, elapsed_us: u64, hw_rate: u32) -> bool {
+    let (Some(a), Some(b)) = (pos0, pos1) else { return false };
+    if a >= RING_BYTES || b >= RING_BYTES || elapsed_us == 0 { return false; }
+    let moved = ((b + RING_BYTES - a) % RING_BYTES) as u64;
+    if moved <= VERIFY_SILENT_BYTES { return false; }
+    // bytes per second * 1e6 comparisons without division: moved/elapsed vs expected.
+    let expected_bps = hw_rate as u64 * FRAME_BYTES as u64;
+    let got = moved * 1_000_000; // bytes * us / us -> compare moved*1e6 with expected_bps*elapsed_us
+    let want = expected_bps * elapsed_us;
+    got * 2 >= want && got * 2 <= want * 3
+}
+
+/// Wait before the next action after restart number `k` (1-based): 1, 2, 4, 8 s, then 8 s again.
+pub const fn restart_wait_ns(k: u32) -> u64 {
+    const S: u64 = 1_000_000_000;
+    match k { 0 | 1 => S, 2 => 2 * S, 3 => 4 * S, _ => 8 * S }
+}
+/// Idle ticks before the first restart of a stall.
+pub const STALL_TICKS: u32 = 30;
+/// Restarts without progress before the stream is declared dead.
+pub const STALL_MAX_RESTARTS: u32 = 5;
+/// Bytes played since a restart that count as progress.
+pub const STALL_PROGRESS_BYTES: u64 = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StallAction {
+    None,
+    /// Restart the stream; the number is the restart count so far (1-based).
+    Restart(u32),
+    /// Give up: stop DMA and MAI, drain through the null sink. Returned once.
+    Dead,
+}
+
+/// Decides when a stalled stream is restarted and when it is given up on. Pure: the caller
+/// supplies the clock and the bytes played since the previous call.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StallPolicy {
+    restarts: u32,
+    ticks: u32,
+    since: u64,
+    deadline_ns: u64,
+    dead: bool,
+}
+
+impl StallPolicy {
+    pub const fn new() -> Self { StallPolicy { restarts: 0, ticks: 0, since: 0, deadline_ns: 0, dead: false } }
+    pub fn is_dead(&self) -> bool { self.dead }
+    pub fn restarts(&self) -> u32 { self.restarts }
+    /// A client reconfigure or a firmware re-train starts over, including out of dead.
+    /// Marks the stream dead without a stall (a restart that could not even start).
+    pub fn kill(&mut self) { self.dead = true; }
+    pub fn rearm(&mut self) { *self = StallPolicy::new(); }
+
+    fn restart(&mut self, now_ns: u64) -> StallAction {
+        self.restarts += 1;
+        self.ticks = 0;
+        self.since = 0;
+        self.deadline_ns = now_ns + restart_wait_ns(self.restarts);
+        StallAction::Restart(self.restarts)
+    }
+
+    fn after_wait(&mut self, now_ns: u64) -> StallAction {
+        if now_ns < self.deadline_ns { return StallAction::None; }
+        if self.restarts >= STALL_MAX_RESTARTS {
+            self.dead = true;
+            return StallAction::Dead;
+        }
+        self.restart(now_ns)
+    }
+
+    /// One update tick: `moved` bytes played since the previous call.
+    pub fn observe(&mut self, now_ns: u64, moved: u64) -> StallAction {
+        if self.dead { return StallAction::None; }
+        if self.restarts == 0 {
+            if moved > 0 { self.ticks = 0; return StallAction::None; }
+            self.ticks += 1;
+            return if self.ticks >= STALL_TICKS { self.restart(now_ns) } else { StallAction::None };
+        }
+        self.since += moved;
+        if self.since >= STALL_PROGRESS_BYTES {
+            *self = StallPolicy::new();
+            return StallAction::None;
+        }
+        self.after_wait(now_ns)
+    }
+
+    /// An external detector (PipeWire: no TX progress for 250 ms) reports a stall. The first one
+    /// restarts at once; later ones only once the backoff since the last restart has passed.
+    pub fn request(&mut self, now_ns: u64) -> StallAction {
+        if self.dead { return StallAction::None; }
+        if self.restarts == 0 { return self.restart(now_ns); }
+        self.after_wait(now_ns)
+    }
+}
+
+/// Wall-clock sink used while dead: it accepts input at the stream's own rate so a blocked
+/// writer keeps moving. Exact: the sub-byte remainder is carried.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NullSink {
+    last_ns: u64,
+    credit: u128, // byte * ns
+    pub consumed: u64,
+}
+
+impl NullSink {
+    pub const fn new() -> Self { NullSink { last_ns: 0, credit: 0, consumed: 0 } }
+    /// Starts the clock at `now_ns`.
+    pub fn start(&mut self, now_ns: u64) { self.last_ns = now_ns; self.credit = 0; }
+    /// Consumes up to `offered` bytes at `bytes_per_sec`; never more than 100 ms of backlog.
+    pub fn drain(&mut self, now_ns: u64, offered: usize, bytes_per_sec: u64) -> usize {
+        let dt = now_ns.saturating_sub(self.last_ns);
+        self.last_ns = self.last_ns.max(now_ns);
+        self.credit += dt as u128 * bytes_per_sec as u128;
+        let cap = bytes_per_sec as u128 * 100_000_000;
+        if self.credit > cap { self.credit = cap; }
+        let avail = (self.credit / 1_000_000_000) as usize;
+        let n = avail.min(offered);
+        self.credit -= n as u128 * 1_000_000_000;
+        self.consumed += n as u64;
+        n
+    }
 }
