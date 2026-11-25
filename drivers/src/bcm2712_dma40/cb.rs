@@ -235,6 +235,14 @@ pub fn build_memcpy(out: &mut [Scb], scb_phys: u64, dst: u64, src: u64, len: usi
     Ok(n)
 }
 
+/// A cyclic ring may only target a peripheral FIFO inside the BCM2712 peripheral window (CPU
+/// physical, `0x10_7c00_0000..0x10_8000_0000`). Anything else - a 32-bit bus alias, which is
+/// ordinary DRAM on a board with 2 GiB or more - would have the engine write over memory. The
+/// check lives here so the built-in driver and the module exports (`kapi_dma40_start_cyclic`)
+/// share it.
+pub const CYCLIC_FIFO_MIN: u64 = 0x10_7c00_0000;
+pub const CYCLIC_FIFO_MAX: u64 = 0x10_8000_0000;
+
 /// Builds a cyclic mem-to-device ring: one SCB per period, the last pointing back at the first.
 /// `fifo` is the peripheral FIFO's DMA (= CPU physical) address, written with a fixed address
 /// and paced by the cell's DREQ. Every period's SCB interrupts when `irq_per_period`.
@@ -248,6 +256,7 @@ pub fn build_cyclic_tx(out: &mut [Scb], scb_phys: u64, ring: u64, ring_len: usiz
     let n = ring_len / period;
     if n > out.len() { return Err(Dma40Error::TooManyCbs); }
     if fifo & 3 != 0 { return Err(Dma40Error::Misaligned); }
+    if !(CYCLIC_FIFO_MIN..CYCLIC_FIFO_MAX).contains(&fifo) { return Err(Dma40Error::AddrRange); }
     let first = cb_addr(scb_phys)?;
     let ti = dreq.ti | TI_D_DREQ | if irq_per_period { TI_INTEN } else { 0 };
     for i in 0..n {

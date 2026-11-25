@@ -112,12 +112,20 @@ mod tests {
         let mut hops = 1;
         while cur != (0x10_0000u64 >> 5) as u32 { cur = t[(cur as usize * 32 - 0x10_0000) / 32].next_cb; hops += 1; }
         assert_eq!(hops, n);
-        let n = build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 65536, 0x7c72_001c, &d, false).unwrap();
+        let n = build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 65536, 0x10_7c72_001c, &d, false).unwrap();
         assert_eq!((n, t[0].next_cb, t[0].ti & TI_INTEN), (1, 0x10_0000 >> 5, 0));
         assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 3000, 0, &d, false), Err(Dma40Error::BadLength));
         assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 6, 0, &d, false), Err(Dma40Error::BadLength));
         assert_eq!(build_cyclic_tx(&mut t[..4], 0x10_0000, ring, 65536, 4096, 0, &d, false), Err(Dma40Error::TooManyCbs));
         assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 4096, 0x7c72_001e, &d, false), Err(Dma40Error::Misaligned));
+        // The FIFO must sit in the peripheral window 0x10_7c00_0000..0x10_8000_0000: a bus alias or
+        // a RAM address would have the engine write over memory (also guards the module export).
+        for bad in [0u64, 0x7c72_001c, 0x4000_0000, 0x10_7bff_fffc, 0x10_8000_0000, 0xff_ffff_fffc] {
+            assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 4096, bad, &d, false), Err(Dma40Error::AddrRange), "{:#x}", bad);
+        }
+        for ok in [0x10_7c00_0000u64, 0x10_7c72_001c, 0x10_7fff_fffc] {
+            assert!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 4096, ok, &d, false).is_ok(), "{:#x}", ok);
+        }
     }
 
     #[test]
