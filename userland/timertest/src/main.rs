@@ -1413,37 +1413,86 @@ unsafe fn local_irqs(cpu: usize) -> Option<u64> {
     field_of(&b[..n], &key, 0)
 }
 
-unsafe fn dead_delay_cpu() -> Option<usize> {
+/// Value of the `key=` kernel command line knob (decimal), or None.
+unsafe fn cmdline_num(key: &[u8]) -> Option<usize> {
     let mut b = [0u8; 4096];
     let n = slurp(b"/proc/cmdline\0", &mut b);
-    let key = b"timer.dead_delay=";
     let mut i = 0;
     while i + key.len() < n {
-        if &b[i..i + key.len()] == key {
+        if &b[i..i + key.len()] == key && (i == 0 || b[i - 1] == b' ') {
             let mut v = 0usize;
             let mut j = i + key.len();
+            let st = j;
             while j < n && b[j].is_ascii_digit() { v = v * 10 + (b[j] - b'0') as usize; j += 1; }
-            return Some(v);
+            return if j == st { None } else { Some(v) };
         }
         i += 1;
     }
     None
 }
 
-unsafe fn pin(cpu: usize) {
+unsafe fn pin(cpu: usize) -> bool {
     let m: u64 = 1u64 << cpu;
-    sched_setaffinity(0, 8, &m as *const u64 as *const c_void);
+    sched_setaffinity(0, 8, &m as *const u64 as *const c_void) == 0
+}
+
+/// Guest runs under KVM (CPUID hypervisor leaf), as opposed to TCG, which
+/// cannot reproduce the dead tick (its timer model re-arms differently).
+#[cfg(target_arch = "x86_64")]
+fn under_kvm() -> bool {
+    let r = unsafe { core::arch::x86_64::__cpuid(0x4000_0000) };
+    let mut sig = [0u8; 12];
+    sig[0..4].copy_from_slice(&r.ebx.to_le_bytes());
+    sig[4..8].copy_from_slice(&r.ecx.to_le_bytes());
+    sig[8..12].copy_from_slice(&r.edx.to_le_bytes());
+    &sig == b"KVMKVMKVM\0\0\0"
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn under_kvm() -> bool { false }
+
+unsafe fn statn(key: &[u8], idx: usize) -> Option<u64> {
+    let mut b = [0u8; 4096];
+    let n = slurp(b"/proc/leandros_timer\0", &mut b);
+    field_of(&b[..n], key, idx)
+}
+unsafe fn stat(key: &[u8]) -> Option<u64> { statn(key, 0) }
+
+unsafe fn fail(msg: &[u8]) -> bool {
+    write(1, b"dead_local_tick: FAIL: ".as_ptr(), 23);
+    write(1, msg.as_ptr(), msg.len());
+    write(1, b"\n".as_ptr(), 1);
+    report(b"dead_local_tick\0", false)
 }
 
 unsafe fn test_dead_local_tick() -> bool {
     let name = b"dead_local_tick\0";
-    let c = match dead_delay_cpu() { Some(c) => c, None => return report(name, true) };
-    if local_irqs(c).is_none() { return report(name, true); } // aarch64 / no such CPU
+    // x86_64 only: aarch64 has no LAPIC. runtests only runs this suite on
+    // x86_64 (HOST_ARCH_ONLY); this SKIP would count as a failure there.
+    if !cfg!(target_arch = "x86_64") {
+        write(1, b"dead_local_tick: SKIP: x86_64 only (no LAPIC); the desktop regress gate counts a skip as FAILURE\n".as_ptr(), 98);
+        return report(name, true);
+    }
+    let c = match cmdline_num(b"timer.dead_delay=") {
+        Some(c) => c,
+        None => return fail(b"kernel cmdline has no timer.dead_delay=<cpu>"),
+    };
+    let fixmask = cmdline_num(b"timer.fixmask=").unwrap_or(3);
+    let kvm = under_kvm();
+    print_kv(b"dead_local_tick: cpu = \0", c as u64);
+    print_kv(b"dead_local_tick: fixmask = \0", fixmask as u64);
+    print_kv(b"dead_local_tick: kvm = \0", kvm as u64);
+    if !kvm {
+        let m = b"NOTE: not KVM (TCG): it cannot reproduce the dead tick, strict recovery checks are NOT applied\n";
+        write(1, m.as_ptr(), m.len());
+    }
+    if local_irqs(c).is_none() { return fail(b"CPU absent from /proc/leandros_timer"); }
+    if stat(b"dead_recovered").is_none() { return fail(b"no dead_recovered line"); }
     let other = if c == 0 { 1 } else { 0 };
-    pin(other);
+    if local_irqs(other).is_none() { return fail(b"helper CPU absent from /proc/leandros_timer"); }
+    if !pin(other) { return fail(b"sched_setaffinity(helper) failed"); }
     let child = fork();
     if child == 0 {
-        pin(c);
+        if !pin(c) { exit(3); }
         // Short poll deadlines: each takes the CPU through a one-shot and back
         // to periodic mode, where the stalled switch happens.
         for _ in 0..300 { sleep_ms(2); }
@@ -1454,10 +1503,41 @@ unsafe fn test_dead_local_tick() -> bool {
     let a = local_irqs(c).unwrap_or(0);
     sleep_ms(1000);
     let b = local_irqs(c).unwrap_or(0);
+    let mut st: c_int = 0;
+    let dead_child = waitpid(child, &mut st, 1) == child; // WNOHANG: child exited early (pin failed)
     kill(child, 9);
     waitpid(child, core::ptr::null_mut(), 0);
-    print_kv(b"dead_local_tick: irqs in 1s = \0", b.wrapping_sub(a));
-    report(name, b.wrapping_sub(a) >= 50)
+    if dead_child { return fail(b"worker could not pin to the CPU (sched_setaffinity failed)"); }
+    let rate = b.wrapping_sub(a);
+    let consumed = stat(b"stall_consumed").unwrap_or(0);
+    // Absolute: the stall hits during early boot tests, before this one starts.
+    let rec = stat(b"dead_recovered").unwrap_or(0);
+    let rec_per = statn(b"recovered_by_state", 0).unwrap_or(99);
+    print_kv(b"dead_local_tick: irqs in 1s = \0", rate);
+    print_kv(b"dead_local_tick: stall_consumed = \0", consumed);
+    print_kv(b"dead_local_tick: dead_recovered = \0", rec);
+    for (i, nm) in [&b"dead_local_tick: recovered_by_state periodic = \0"[..], &b"dead_local_tick: recovered_by_state deadline = \0"[..], &b"dead_local_tick: recovered_by_state realign = \0"[..]].iter().enumerate() {
+        print_kv(nm, statn(b"recovered_by_state", i).unwrap_or(99));
+    }
+    print_kv(b"dead_local_tick: stale_ignored = \0", stat(b"stale_ignored").unwrap_or(99));
+    if consumed != 1 { return fail(b"the stall did not run exactly once (stall_consumed != 1)"); }
+    if !kvm { return report(name, rate >= 50); }
+    // KVM, strict. fix 1 (count reload after the flip) keeps the tick alive,
+    // so no recovery is needed; without it the stall kills the tick and fix 2
+    // (check_alive on a periodic CPU) must bring it back exactly once; with
+    // neither the tick stays dead (the red case, which deadtimertest.py expects).
+    if fixmask & 1 != 0 {
+        if rec != 0 { return fail(b"fix 1 active but dead_recovered != 0 (stall did not hit, or fix 1 ineffective)"); }
+        if rate < 50 { return fail(b"tick below 50 Hz with fix 1"); }
+    } else if fixmask & 2 != 0 {
+        if rec != 1 || rec_per != 1 { return fail(b"fix 2 only: expected exactly one periodic-state recovery"); }
+        if rate < 50 { return fail(b"tick below 50 Hz after recovery"); }
+    } else if rate < 50 {
+        return fail(b"tick is dead (no fix active)");
+    } else if rec != 0 {
+        return fail(b"dead_recovered != 0 without recovery");
+    }
+    report(name, true)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
