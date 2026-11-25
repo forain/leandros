@@ -22,6 +22,7 @@ Options:
                              pcibridge host:pcibridgetest.py alone (root port -> PCI bridge -> virtio-rng, own boot)
                              usbisoch host:usbisochtest.py alone (xHCI isoch OUT: 2 s 1 kHz sine to usb-audio, WAV checked)
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
+                             blksteal host:blkstealtest.py alone (late device-lock holder: no [WDOG] on running CPUs)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
                              failevid  host:failevidtest.py (failing suites leave <out>/fail/<NN>-<name>/ evidence)
@@ -359,6 +360,9 @@ SUITES = {
                 # A spin-locked caller reading a file (the wifi-brcmf ctl poll) must not stall f2fs
                 # under bulk writes on a throttled disk (lane f2fsatomic; own boot, ~4 min).
                 "host:f2fsatomictest.py",
+                # A late-answering virtio-blk lock holder must not leave other CPUs without timer ticks
+                # (lane f2fswatchdog; own boot, ~2.5 min).
+                "host:blkstealtest.py",
                 "host:f2fsgctest.py",  # default factor 8: the 2026-11-15 statfs/ENOSPC bug only showed at churn round 27
                 # Vulkan swapchain on a Wayland surface presented to cosmic-comp (--venus, x86_64 only; own boot, ~3 min).
                 "host:vkwltest.py",
@@ -452,6 +456,7 @@ SUITES = {
     "nitrox86": ["/bin/timertest", "host:nitrotest.py"],
     "usbisoch": ["host:usbisochtest.py"],
     "blkslow": ["host:blkslowtest.py"],
+    "blksteal": ["host:blkstealtest.py"],
     # 12 extra virtio-blk data disks all appear in /dev and mount (own boot, openbugs #83).
     "blkmany": ["host:blkmanytest.py"],
     # --features rpi5 kernel compile-check (cargo check, no boot; integ lanes run it).
