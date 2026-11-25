@@ -2055,8 +2055,8 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
     wait_releases_memory(false)
 }
 
-/// Same, with an unrelated process allocating, touching and freeing 4 MiB in
-/// a loop the whole time: system-wide free memory swings by ~1024 pages, the
+/// Same without the /proc observer, with an unrelated process allocating,
+/// touching and freeing 4 MiB in a loop the whole time: system-wide free memory swings by ~1024 pages, the
 /// child's own release (kernel teardown counter) does not.
 unsafe fn test_wait_releases_memory_exactly_noise() -> bool {
     wait_releases_memory(true)
@@ -2088,7 +2088,11 @@ unsafe fn wait_releases_memory(noise: bool) -> bool {
         // pages in and exits: a reader still holding the child's address
         // space (parked on `busy`) at exit delays the free past wait4.
         // Forked first so its own footprint is in `before`.
-        let hammer = fork();
+        // The noise variant runs without the observer: this variant isolates
+        // allocator noise; a /proc reader that holds the mm at exit (on TCG
+        // under CPU starvation) legitimately delays the free, as on Linux,
+        // and is covered by the hammer variant.
+        let hammer = if noise { -1 } else { fork() };
         if hammer == 0 {
             let mut buf = [0u8; 1024];
             let mut path = [0u8; 64];
@@ -2129,8 +2133,10 @@ unsafe fn wait_releases_memory(noise: bool) -> bool {
         let freed = meminfo_kb(b"AsFreedPages:").wrapping_sub(freed_before);
         let c_after = meminfo_kb(b"Cached:");
         let s_after = meminfo_kb(b"Shmem:");
-        syscall2(nr::KILL, hammer as usize, 9);
-        wait_status(hammer);
+        if hammer > 0 {
+            syscall2(nr::KILL, hammer as usize, 9);
+            wait_status(hammer);
+        }
         let lost = before.saturating_sub(after) / PAGE;
         write(STDOUT_FILENO, b"  round lost=".as_ptr(), 13); print_dec(lost);
         write(STDOUT_FILENO, b" free_before=".as_ptr(), 13); print_dec(before / PAGE);
