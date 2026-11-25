@@ -55,3 +55,5 @@ ports/gstreamer/out/
 # Alpine appstream snapshot (ports/appstream-alpine/build.sh).
 ports/appstream-alpine/out/
 ports/libflatpak/out/
+ports/pam-rundir/out/
+userland/sudotest/.cargo/

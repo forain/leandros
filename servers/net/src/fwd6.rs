@@ -583,6 +583,12 @@ pub(crate) fn unreach6(sbr: Sid, port: Sid, f: &[u8]) {
 }
 
 fn icmp6_err(br: Sid, port: Sid, bmac: [u8; 6], ba: [u8; 16], f: &[u8], ty: u8, code: u8) {
+    // A locally generated error leaves through the OUTPUT hook as `ct state related` (Linux icmp6_send).
+    if crate::nfnl::has_tables(0) {
+        let dst: [u8; 16] = f[22..38].try_into().unwrap();
+        let mut m = crate::nfnl::Pkt { rel: true, est: true, l4: PROTO_ICMP6, src: [0; 4], dst: [0; 4], sport: 0, dport: 0, oif: fwd::br_name(br), mark: 0, local: false, v6: Some((ba, dst)) };
+        if !crate::nfnl::eval(0, crate::nfnl::H_OUT, &mut m).0 { return; }
+    }
     let inv = &f[14..f.len().min(14 + 1232)];
     let mut r = alloc::vec![0u8; 14 + 40 + 8 + inv.len()];
     r[0..6].copy_from_slice(&f[6..12]);

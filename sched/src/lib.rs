@@ -1668,7 +1668,7 @@ pub fn proc_stat_of(pid: Pid) -> Option<(Pid, Pid, Pid, u8)> {
 /// owner does; `busy` then orders the read against that owner's faults and
 /// mm syscalls. `f` must not block (the usual `busy` rule).
 fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> Option<(R, u32)> {
-    let (as_arc, threads) = {
+    let (as_weak, threads) = {
         let rq = RUN_QUEUE.lock();
         let t = rq.find_pid(pid)?;
         let tgid = t.tgid;
@@ -1682,9 +1682,11 @@ fn with_process_as<R>(pid: Pid, f: impl FnOnce(&mm::vmm::AddressSpace) -> R) -> 
                 if x.tgid == tgid && x.state != TaskState::Zombie { n += 1; }
             }
         }
-        (a, n)
+        (alloc::sync::Arc::downgrade(&a), n)
     };
-    if !acquire_foreign_as(&as_arc, pid) { return None; }
+    // Only a Weak is kept across the waits: a strong ref held while parked
+    // would delay the owner's address-space free past its wait4.
+    let as_arc = acquire_foreign_as(&as_weak, pid)?;
     // Marked held like `lock_leader_address_space` does, so `can_sleep()` is
     // false inside `f` and nothing under it parks with the flag set.
     lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
@@ -1721,16 +1723,22 @@ pub static FOREIGN_AS_GAVE_UP: AtomicU64 = AtomicU64::new(0);
 /// briefly, then parks a millisecond at a time, gives up when it is being
 /// killed, and gives up for good after [`FOREIGN_AS_GIVE_UP_NS`]. Where it
 /// may not sleep (a spin lock held, scheduler context) it keeps the old spin.
-fn acquire_foreign_as(a: &mm::vmm::AddressSpace, pid: Pid) -> bool {
-    let try_take = || a.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok();
-    if try_take() { return true; }
+fn acquire_foreign_as(w: &alloc::sync::Weak<mm::vmm::AddressSpace>, pid: Pid) -> Option<alloc::sync::Arc<mm::vmm::AddressSpace>> {
+    // One attempt: upgrade, take `busy`; the strong ref is dropped on failure.
+    let try_take = || {
+        let a = w.upgrade()?;
+        if a.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() { Some(a) } else { None }
+    };
+    if let Some(a) = try_take() { return Some(a); }
+    if w.strong_count() == 0 { return None; }
     let t0 = monotonic_ns();
     let mut parked = false;
     loop {
         // The holder may be waiting for this CPU's TLB flush acknowledgement.
         mm::paging::tlb_service_pending();
         core::hint::spin_loop();
-        if try_take() { return true; }
+        if let Some(a) = try_take() { return Some(a); }
+        if w.strong_count() == 0 { return None; }
         let waited = monotonic_ns().saturating_sub(t0);
         if waited < FOREIGN_AS_SPIN_NS || !irqctx::can_sleep() { continue; }
         if waited >= FOREIGN_AS_GIVE_UP_NS || signal::fatal_signal_pending() {
@@ -1738,7 +1746,7 @@ fn acquire_foreign_as(a: &mm::vmm::AddressSpace, pid: Pid) -> bool {
             irqctx::raw_log("[AS] observer gave up on the address space of pid ");
             irqctx::raw_dec(pid as u64);
             irqctx::raw_log(" (busy flag held too long)\n");
-            return false;
+            return None;
         }
         if !parked { parked = true; FOREIGN_AS_PARKED.fetch_add(1, Ordering::Relaxed); }
         kthread::msleep(1);
@@ -8100,6 +8108,10 @@ fn scheduler_run_loop() -> ! {
                 #[cfg(target_arch = "aarch64")]
                 core::arch::asm!("msr daifclr, #2; wfi; msr daifset, #2");
             }
+            // Woken from idle (any interrupt): cheap dead-local-tick check (one
+            // rdtsc on the live path, see timer::check_alive).
+            #[cfg(target_arch = "x86_64")]
+            unsafe { arch_timer_check_alive(); }
             let idle_ns = unsafe { arch_monotonic_ns() }.saturating_sub(t_idle);
             CPU_IDLE_NS[id.min(MAX_CPUS - 1)].fetch_add(idle_ns, Ordering::Relaxed);
             if idlestat::ENABLED {
@@ -9380,7 +9392,9 @@ fn with_foreign_task_as<R>(pid: Pid, f: impl FnOnce(&mut mm::vmm::AddressSpace) 
     let cur = CURRENT_AS[unsafe { cpu_id() }].load(Ordering::Acquire);
     if core::ptr::eq(cur, alloc::sync::Arc::as_ptr(&a)) { return Some(Err(())); }
     FOREIGN_TASK_COPIES.fetch_add(1, Ordering::Relaxed);
-    if !acquire_foreign_as(&a, pid) { return None; }
+    let w = alloc::sync::Arc::downgrade(&a);
+    drop(a);
+    let a = acquire_foreign_as(&w, pid)?;
     lockwatch::note_hold(lockwatch::L_AS_BUSY, true);
     // Exclusive under `busy`, as `lock_leader_address_space` hands it out.
     let p = alloc::sync::Arc::as_ptr(&a) as *mut mm::vmm::AddressSpace;

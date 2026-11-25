@@ -5,7 +5,7 @@
 //! `shrink --recover [--part DEV] [--dir D] --yes`   (e2undo after a crash)
 //! `shrink-status [--dir D] [--mark-verified]`
 //!
-//! All ext4 writes go through e2fsck and resize2fs (e2fsprogs 1.47.1); this
+//! All ext4 writes go through e2fsck and resize2fs (e2fsprogs 1.47.4); this
 //! module reads the superblock itself and gates on it. Every write to the
 //! disk runs under a BLKWRWIN window covering only the ext4 partition.
 //!
@@ -119,7 +119,7 @@ pub fn sb_gates(s: &Sb) -> Vec<(&'static str, String)> {
     }
     let unk = (s.compat & !KNOWN_COMPAT, s.incompat & !KNOWN_INCOMPAT & !sbguard::GUARD, s.ro_compat & !KNOWN_RO);
     if unk != (0, 0, 0) {
-        v.push(("S6", format!("feature bits unknown to e2fsprogs 1.47.1 (compat {:#x} incompat {:#x} ro {:#x})", unk.0, unk.1, unk.2)));
+        v.push(("S6", format!("feature bits unknown to e2fsprogs 1.47.4 (compat {:#x} incompat {:#x} ro {:#x})", unk.0, unk.1, unk.2)));
     }
     v
 }

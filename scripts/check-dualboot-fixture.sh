@@ -38,10 +38,16 @@ if [ -n "$BOOT" ]; then
     *) echo "bad arch" >&2; exit 2 ;;
   esac
   [ "$BOOT" = aarch64 ] && [ "$(uname -m)" != arm64 ] && MACH="-machine virt -cpu max -accel tcg"
+  # Linux hosts: edk2 lives under /usr/share/edk2 (4 MiB split images), not Homebrew.
+  if [ ! -f "$FW" ]; then
+    for c in /usr/share/edk2/x64/OVMF_CODE.4m.fd /usr/share/edk2/aarch64/QEMU_EFI.fd; do
+      case "$BOOT:$c" in x86_64:*x64*|aarch64:*aarch64*) [ -f "$c" ] && FW=$c ;; esac
+    done
+  fi
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   if [ "${FX_BOOT_INPLACE:-0}" = 1 ]; then ln -s "$IMG" "$T/disk.img"; else clone_cp "$IMG" "$T/disk.img"; fi
   VARS=$T/vars.fd
-  if [ "$BOOT" = x86_64 ]; then cp /opt/homebrew/share/qemu/edk2-i386-vars.fd "$VARS"; else dd if=/dev/zero of="$VARS" bs=1m count=64 2>/dev/null; fi
+  if [ "$BOOT" = x86_64 ]; then cp "$([ -f /opt/homebrew/share/qemu/edk2-i386-vars.fd ] && echo /opt/homebrew/share/qemu/edk2-i386-vars.fd || echo /usr/share/edk2/x64/OVMF_VARS.4m.fd)" "$VARS"; else dd if=/dev/zero of="$VARS" bs=1M count=64 2>/dev/null; fi
   DISKDEV="${FX_DISKDEV:-virtio-blk-pci}"
   echo "== QEMU boot ($BOOT, $DISKDEV, timeout ${FX_BOOT_TIMEOUT:-240}s)"
   $Q $MACH -m 2048 -nographic -serial stdio -monitor none -no-reboot \

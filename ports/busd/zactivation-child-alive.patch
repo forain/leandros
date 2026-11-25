@@ -1,0 +1,257 @@
+Activation: wait for a spawned service for as long as its process is alive, and report a failed activation with dbus-daemon's own error.
+
+MUST apply after unique-activation.patch (the "z" name sorts it last).
+
+A fixed 25 s wait turned host load into a ServiceUnknown. xdg-desktop-portal
+activates its backend before it claims org.freedesktop.portal.Desktop; the
+portalshot probe's call (which includes that activation) takes 8.6 s on an
+idle host and 18.8 s on a busy one, and on a busier one the 25 s ran out
+while the frontend was still starting: "ServiceUnknown: The name
+org.freedesktop.portal.Desktop was not provided by any .service files" after
+~25 s, with the .service file present (portalshottest.py x86_64: 2 of 10 runs
+failed on a host at load average 46, 0 of 8 more on a quiet one). The message
+is the generic one because send_msg turned every failed activation into
+reply_service_unknown.
+
+Now, as dbus-daemon does:
+  * a service whose process is alive is waited for up to 120 s (the session
+    bus service_start_timeout); at the cap the caller gets
+    org.freedesktop.DBus.Error.TimedOut "Failed to activate service 'N':
+    timed out (service_start_timeout=120000ms)";
+  * a service that exits non-zero without claiming the name fails at once
+    with org.freedesktop.DBus.Error.Spawn.ChildExited "Process NAME exited
+    with status N", or Spawn.ChildSignaled "Process NAME received signal S"
+    (dbus-spawn-unix.c _dbus_babysitter_set_child_exit_error); exit status
+    0 is ignored and the wait goes on, as in bus/activation.c
+    pending_activation_finished_cb ("a program may (misguidedly) daemonize");
+  * a failed exec replies Spawn.ExecFailed; a second caller waiting on the
+    same activation follows the spawner's in-flight marker and fails with it;
+  * ServiceUnknown is kept for a name no .service file provides.
+Covered by `leandros-sysbus activation-test` (regress: busdact).
+
+--- a/src/peers.rs
++++ b/src/peers.rs
+@@ -1,4 +1,5 @@
+ use anyhow::{bail, Context, Result};
++use std::os::unix::process::ExitStatusExt;
+ use event_listener::EventListener;
+ use futures_util::{
+     future::{select, Either},
+@@ -29,19 +30,16 @@
+     peer::{Monitor, Peer, Stream},
+ };
+ 
+-/// How long implicit/explicit activation waits for a spawned service to
+-/// actually appear in the name registry before giving up.
+-///
+-/// The D-Bus spec leaves this to the implementation; the reference
+-/// `dbus-daemon` defaults to 25s, and so does this. It used to be 5s, on the
+-/// theory that LeandrOS services are small static binaries, but activation
+-/// targets now include dynamically linked GLib/iced programs started during
+-/// the login storm: xdg-desktop-portal (which itself activates its backend
+-/// before claiming its name) measured >5s, and every libcosmic app's
+-/// color-scheme query then got ServiceUnknown. The wait ends as soon as the
+-/// name is claimed, so only a service that really fails costs the full
+-/// timeout.
+-const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(25);
++/// Upper bound on the wait for a spawned service that is still running; the
++/// reference `dbus-daemon` session bus default `service_start_timeout` is
++/// 120 s. A service that is alive is slow, not failed: xdg-desktop-portal
++/// activates its backend before it claims its name and measured 8.6 s on an
++/// idle host, 18.8 s on a busy one and more than 25 s on a busier one, where
++/// every caller got ServiceUnknown for a service that came up moments later.
++/// A child that exits without claiming the name fails the activation at
++/// once, with Spawn.ChildExited, and a child that is still running at the cap
++/// fails it with TimedOut, both as dbus-daemon reports them.
++const ACTIVATION_ALIVE_CAP: Duration = Duration::from_secs(120);
+ 
+ /// Poll interval while waiting for an activated service to claim its name.
+ /// There's no notification hook into `NameRegistry` to await instead, so
+@@ -207,7 +205,7 @@
+             .map(|mut set| set.insert(name.to_string()))
+             .unwrap_or(true);
+         if !first {
+-            return self.await_name_owner(name, ACTIVATION_TIMEOUT).await;
++            return self.await_name_owner(name, None).await;
+         }
+         let result = self.spawn_service(name, &service).await;
+         if let Ok(mut set) = self.activating.lock() {
+@@ -234,13 +232,16 @@
+             command.env(key, value);
+         }
+ 
+-        if let Err(e) = command.spawn() {
+-            return Err(zbus::fdo::Error::SpawnExecFailed(format!(
+-                "Failed to execute `{program}` for name `{name}`: {e}"
+-            )));
+-        }
++        let mut child = match command.spawn() {
++            Ok(child) => child,
++            Err(e) => {
++                return Err(zbus::fdo::Error::SpawnExecFailed(format!(
++                    "Failed to execute `{program}` for name `{name}`: {e}"
++                )));
++            }
++        };
+ 
+-        self.await_name_owner(name, ACTIVATION_TIMEOUT).await
++        self.await_name_owner(name, Some(&mut child)).await
+     }
+ 
+     /// Poll the name registry until `name` has an owner or `timeout`
+@@ -251,16 +252,55 @@
+     async fn await_name_owner(
+         &self,
+         name: &WellKnownName<'_>,
+-        timeout: Duration,
++        mut child: Option<&mut std::process::Child>
+     ) -> std::result::Result<(), zbus::fdo::Error> {
+-        let deadline = tokio::time::Instant::now() + timeout;
++        let started = tokio::time::Instant::now();
++        let deadline = started + ACTIVATION_ALIVE_CAP;
+         loop {
+             if self.name_registry.read().await.lookup(name.clone()).is_some() {
+                 return Ok(());
+             }
+-            if tokio::time::Instant::now() >= deadline {
++            let now = tokio::time::Instant::now();
++            // The spawner polls its own child; a second caller waiting on
++            // the same activation follows the spawner's in-flight marker.
++            if let Some(c) = child.as_mut() {
++                // dbus-daemon (bus/activation.c pending_activation_finished_cb):
++                // a child that exits non-zero or on a signal without claiming
++                // the name fails the activation at once; exit status 0 is
++                // ignored (a program may daemonize).
++                if let Ok(Some(status)) = c.try_wait() {
++                    if self.name_registry.read().await.lookup(name.clone()).is_some() {
++                        return Ok(());
++                    }
++                    // Exit status 0 is not a failure (bus/activation.c
++                    // pending_activation_finished_cb: a program may
++                    // misguidedly "daemonize", which looks like an exit, and
++                    // ignoring it closes the race with the child claiming
++                    // the name): keep waiting, up to the cap.
++                    if status.code() != Some(0) {
++                        return Err(match (status.code(), status.signal()) {
++                            (Some(code), _) => zbus::fdo::Error::SpawnChildExited(format!(
++                                "Process {name} exited with status {code}"
++                            )),
++                            (None, Some(sig)) => zbus::fdo::Error::SpawnChildSignaled(format!(
++                                "Process {name} received signal {sig}"
++                            )),
++                            _ => zbus::fdo::Error::Failed(format!("Process {name} exited abnormally")),
++                        });
++                    }
++                }
++            } else if !self.activating.lock().map(|set| set.contains(name.as_str())).unwrap_or(false) {
++                // The spawner finished (and failed, or we would have seen the
++                // owner above): report it to this waiter too.
+                 return Err(zbus::fdo::Error::SpawnChildExited(format!(
+-                    "Activated service for `{name}` did not claim the name within {timeout:?}"
++                    "Activation of `{name}` by another caller failed"
++                )));
++            }
++            if now >= deadline {
++                // dbus-daemon's text for service_start_timeout (session bus: 120 s).
++                return Err(zbus::fdo::Error::TimedOut(format!(
++                    "Failed to activate service '{name}': timed out (service_start_timeout={}ms)",
++                    ACTIVATION_ALIVE_CAP.as_millis()
+                 )));
+             }
+             tokio::time::sleep(ACTIVATION_POLL_INTERVAL).await;
+@@ -281,15 +321,18 @@
+     /// fast as it was before activation existed, so `send_msg` still falls
+     /// through to `reply_service_unknown` promptly instead of ever
+     /// re-introducing the hang that patch fixed.
+-    async fn activate_if_activatable(&self, name: &WellKnownName<'_>) -> Option<OwnedUniqueName> {
++    async fn activate_if_activatable(
++        &self,
++        name: &WellKnownName<'_>,
++    ) -> std::result::Result<Option<OwnedUniqueName>, zbus::fdo::Error> {
+         if !self.is_activatable(name).await {
+-            return None;
++            return Ok(None);
+         }
+         if let Err(e) = self.activate_service(name).await {
+             warn!("Implicit activation of `{name}` failed: {e}");
+-            return None;
++            return Err(e);
+         }
+-        self.name_registry.read().await.lookup(name.clone())
++        Ok(self.name_registry.read().await.lookup(name.clone()))
+     }
+ 
+     pub async fn add(
+@@ -525,11 +568,26 @@
+                 let dest = match owner {
+                     Some(dest) => dest,
+                     None => match self.activate_if_activatable(&name).await {
+-                        Some(dest) => dest,
+-                        None => {
++                        Ok(Some(dest)) => dest,
++                        Ok(None) => {
+                             self.reply_service_unknown(&msg, &name).await;
+                             bail!("unknown destination: {}", name);
+                         }
++                        Err(e) => {
++                            // A failed activation is not "not provided by any
++                            // .service files": answer with the real error
++                            // (Spawn.ChildExited, Spawn.ExecFailed, TimedOut),
++                            // as dbus-daemon does.
++                            let (en, text) = match &e {
++                                zbus::fdo::Error::SpawnChildExited(t) => ("org.freedesktop.DBus.Error.Spawn.ChildExited", t.clone()),
++                                zbus::fdo::Error::SpawnChildSignaled(t) => ("org.freedesktop.DBus.Error.Spawn.ChildSignaled", t.clone()),
++                                zbus::fdo::Error::SpawnExecFailed(t) => ("org.freedesktop.DBus.Error.Spawn.ExecFailed", t.clone()),
++                                zbus::fdo::Error::TimedOut(t) => ("org.freedesktop.DBus.Error.TimedOut", t.clone()),
++                                other => ("org.freedesktop.DBus.Error.ServiceUnknown", other.to_string()),
++                            };
++                            self.reply_error(&msg, en, text).await;
++                            bail!("activation of {} failed: {}", name, e);
++                        }
+                     },
+                 };
+                 self.send_msg_to_unique_name(msg, (&*dest).into()).await
+@@ -559,6 +617,15 @@
+     ///     address the error. `peer::Stream` sets the sender on everything it
+     ///     admits, so this is belt and braces.
+     async fn reply_service_unknown(&self, msg: &Message, name: &WellKnownName<'_>) {
++        self.reply_error(
++            msg,
++            "org.freedesktop.DBus.Error.ServiceUnknown",
++            format!("The name {name} was not provided by any .service files"),
++        )
++        .await
++    }
++
++    async fn reply_error(&self, msg: &Message, error_name: &str, text: String) {
+         let header = msg.header();
+ 
+         if msg.message_type() != message::Type::MethodCall {
+@@ -578,23 +645,21 @@
+         // `Message::error` copies the incoming serial into `reply_serial` and
+         // the incoming sender into `destination` by itself; only the sender
+         // field has to be filled in, and it has to be the bus's own name.
+-        let reply = match Message::error(&header, "org.freedesktop.DBus.Error.ServiceUnknown")
++        let reply = match Message::error(&header, error_name)
+             .and_then(|b| b.sender(fdo::BUS_NAME))
+             .and_then(|b| {
+-                b.build(&(format!(
+-                    "The name {name} was not provided by any .service files"
+-                ),))
++                b.build(&(text,))
+             }) {
+             Ok(reply) => reply,
+             Err(e) => {
+-                warn!("Couldn't build a ServiceUnknown reply for `{name}`: {e}");
++                warn!("Couldn't build a {error_name} reply: {e}");
+ 
+                 return;
+             }
+         };
+ 
+         if let Err(e) = self.send_msg_to_unique_name(reply, sender).await {
+-            warn!("Couldn't deliver the ServiceUnknown reply for `{name}`: {e}");
++            warn!("Couldn't deliver the {error_name} reply: {e}");
+         }
+     }
+ 

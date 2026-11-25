@@ -123,6 +123,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_write_truncate_unlink() { failures += 1; }
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
+    if !test_wait_releases_memory_exactly() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
@@ -2026,6 +2027,67 @@ unsafe fn test_pagecache_memory_returns() -> bool {
     write(STDOUT_FILENO, b" child_status=".as_ptr(), 14); print_dec(status as usize);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, status == 0 && lost < 64)
+}
+
+/// wait() is exact: the moment it returns, the child's address space is
+/// already released. Measured with no polling and no slack beyond a few pages
+/// of unrelated churn (the child maps and touches 1024 pages).
+unsafe fn test_wait_releases_memory_exactly() -> bool {
+    let name = b"wait_releases_memory_exactly\0";
+    const PAGES: usize = 1024;
+    let mut worst = 0usize;
+    let mut ok = true;
+    // [0]: pid of the child the observer hammers (0 = none yet).
+    let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
+    if shared as isize == -1 { return report(name, false); }
+    for _ in 0..20 {
+        core::ptr::write_volatile(shared, 0);
+        // An observer hammers the child's /proc files while it faults its
+        // pages in and exits: a reader still holding the child's address
+        // space (parked on `busy`) at exit delays the free past wait4.
+        // Forked first so its own footprint is in `before`.
+        let hammer = fork();
+        if hammer == 0 {
+            let mut buf = [0u8; 1024];
+            let mut path = [0u8; 64];
+            loop {
+                let c = core::ptr::read_volatile(shared) as i32;
+                if c == 0 { continue; }
+                proc_path(c, b"status", &mut path);
+                slurp(&path, &mut buf);
+                proc_path(c, b"statm", &mut path);
+                slurp(&path, &mut buf);
+            }
+        }
+        let before = free_ram();
+        let pid = fork();
+        if pid == 0 {
+            let p = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if p as isize == -1 { exit(2); }
+            for pg in 0..PAGES { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
+            // Long mm syscalls right before exiting: the observer outlasts
+            // its spin on `busy`, parks, and is parked holding the address
+            // space when this process exits.
+            for i in 0..1024usize {
+                let prot = if i % 2 == 0 { PROT_READ } else { PROT_READ | PROT_WRITE };
+                leandros_libc::syscall::syscall3(SYS_MPROTECT_NR, p as usize, PAGES * PAGE, prot as usize);
+            }
+            exit(0);
+        }
+        core::ptr::write_volatile(shared, pid as u64);
+        let status = wait_status(pid);
+        let after = free_ram();
+        syscall2(nr::KILL, hammer as usize, 9);
+        wait_status(hammer);
+        let lost = before.saturating_sub(after) / PAGE;
+        if lost > worst { worst = lost; }
+        ok &= status == 0 && lost < 64;
+    }
+    write(STDOUT_FILENO, b"  worst_lost_pages=".as_ptr(), 19); print_dec(worst);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok)
 }
 
 

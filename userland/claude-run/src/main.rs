@@ -15,8 +15,9 @@
 //!    (AF_UNIX sockets bind on tmpfs only) and `/home`, plus the caller's
 //!    home when it is not under `/home` (root's `/root`), so `~/.claude`
 //!    lives in the caller's real home;
-//! 3. makes sure the caller's `passwd` entry and groups exist in the root's
-//!    `/etc/passwd` and `/etc/group` (`~`, `whoami`, `id`);
+//! 3. makes sure the caller's `passwd` entry and groups exist and are current
+//!    in the root's `/etc/passwd` and `/etc/group` (`~`, `whoami`, `id`), by
+//!    atomic rewrite (temp file + rename), never duplicating on a re-run;
 //! 4. chroots, then DROPS every privilege before anything of the caller's
 //!    runs: the caller's supplementary groups (`setgroups`), then
 //!    `setresgid(rgid, rgid, rgid)` and `setresuid(ruid, ruid, ruid)`, and
@@ -39,7 +40,7 @@ use std::ffi::{c_char, CString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -140,22 +141,59 @@ fn ensure_mount(src: &str, target: &Path, fstype: Option<&str>, flags: u64) {
     }
 }
 
-/// Append `line` to `file` unless a line's field `key_idx` already equals
-/// `key`, or the name (field 0) is already taken by another id, in which case
-/// Alpine's entry stays and nothing is written.
+/// Make `file` (passwd/group inside the root) carry `line`, idempotently:
+/// - a line whose field `key_idx` equals `key` and whose name is `name` is
+///   replaced when it differs (updated home, shell, gid, members), else kept;
+/// - a line with that key but another name, or the name taken by another id,
+///   is Alpine's own entry and stays untouched;
+/// - otherwise `line` is appended.
+/// The new file is written beside it and renamed over it (like sshd's shadow
+/// rehash), so a reader never sees a half-written file and a re-run never
+/// duplicates a line. When the rename is refused (read-only or bind-mounted
+/// file) the content is written in place; when that fails too the launch goes
+/// on with a warning, since the entry only feeds `~`, `whoami` and `id`.
 fn ensure_entry(file: &Path, key_idx: usize, key: &str, name: &str, line: &str) {
     let text = fs::read_to_string(file).unwrap_or_default();
+    let mut out = String::with_capacity(text.len() + line.len() + 1);
+    let mut found = false;
     for l in text.lines() {
         let f: Vec<&str> = l.split(':').collect();
-        if f.get(key_idx) == Some(&key) { return; }
-        if f.first() == Some(&name) { return; } // name taken by another id: leave Alpine's
+        if f.get(key_idx) == Some(&key) || f.first() == Some(&name) {
+            if found {
+                // a duplicate of an entry already handled (earlier runs): drop it
+                if f.first() == Some(&name) && f.get(key_idx) == Some(&key) { continue; }
+            } else if f.first() == Some(&name) && f.get(key_idx) == Some(&key) {
+                found = true;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            } else {
+                found = true; // another id's / name's entry: leave Alpine's
+            }
+        }
+        out.push_str(l);
+        out.push('\n');
     }
-    let mut out = match OpenOptions::new().append(true).create(true).open(file) {
-        Ok(f) => f,
-        Err(e) => die(&format!("{}: {e}", file.display())),
-    };
-    let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
-    let _ = write!(out, "{sep}{line}\n");
+    if !found {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out == text { return; }
+    let mode = fs::metadata(file).map(|m| m.mode() & 0o7777).unwrap_or(0o644);
+    let mut tmp = file.as_os_str().to_os_string();
+    tmp.push(".claude-run-new");
+    let tmp = PathBuf::from(tmp);
+    let _ = fs::remove_file(&tmp);
+    let staged = OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)
+        .and_then(|mut f| { f.write_all(out.as_bytes())?; f.sync_all() })
+        .and_then(|_| fs::rename(&tmp, file));
+    if staged.is_ok() { return; }
+    let _ = fs::remove_file(&tmp);
+    let inplace = OpenOptions::new().write(true).truncate(true).open(file)
+        .and_then(|mut f| f.write_all(out.as_bytes()));
+    if let Err(e) = inplace {
+        eprintln!("claude: cannot update {}: {e} (continuing)", file.display());
+    }
 }
 
 fn host_group_line(gid: GidT) -> Option<(String, String)> {

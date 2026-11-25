@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# Build sudo-rs (sudo + su) for LeandrOS -- static musl, one arch per
+# Build sudo-rs (sudo + su) for LeandrOS -- dynamic musl, one arch per
 # invocation: ./build.sh aarch64 | ./build.sh x86_64
 #
 # Upstream: https://github.com/trifectatechfoundation/sudo-rs, Apache-2.0 OR MIT,
 # pinned to the commit in PIN below. The LeandrOS deltas are in patches/ (see
-# README.md). PAM is pam-leandros (ports/greetd/pam-leandros), linked in as an
-# rlib exactly as greetd links it; sudo-rs's `#[link(name = "pam")]` is satisfied
-# by an empty libpam.a so the linker finds the name and pulls nothing.
-#
-# Toolchain as ports/mkfs-fat and userland/claude-run: the pinned nightly, the
-# clang/lld linker wrapper, link-self-contained=no, relocation-model=static (ET_EXEC).
+# README.md). PAM is Alpine's REAL Linux-PAM: sudo-rs's `#[link(name = "pam")]`
+# resolves to libpam.so.0 (scripts/lib/realpam.sh); the binaries are dynamic musl
+# PIEs (PT_INTERP /lib/ld-musl-<arch>.so.1) so libpam can dlopen pam_unix & co.
 #
 # Output: ports/sudo-rs/out/<arch>/{sudo,su}; scripts/mkfs-f2fs-populated.py
 # installs both set-user-ID root (04755).
@@ -53,20 +50,16 @@ if [[ ! -f "$stamp" ]]; then
     echo "$patch_sum" > "$stamp"
 fi
 
-# The PAM provider lives in-repo (shared with greetd); refresh it every run.
-# Copied outside the sudo-rs tree because it declares its own [workspace].
-rm -rf "$WORK/pam-leandros"
-cp -R "$ROOT_DIR/ports/greetd/pam-leandros" "$WORK/pam-leandros"
-
-mkdir -p "$WORK/linkstub"
-printf '!<arch>\n' > "$WORK/linkstub/libpam.a"
+source "$ROOT_DIR/scripts/lib/realpam.sh"
+realpam_stub "$arch" "$WORK/linkstub-$arch"
+DYN_TC="$ROOT_DIR/scripts/toolchain/dyn" sh "$ROOT_DIR/scripts/toolchain/dyn/gen-cargo-config.sh" "$SRC" >/dev/null
+sed -i "s|^rustflags = \[|rustflags = [\n  \"-L\", \"native=$WORK/linkstub-$arch\",|" "$SRC/.cargo/config.toml"
 
 target_triple="${arch}-unknown-linux-musl"
 echo "Building sudo-rs for $arch ($target_triple)..."
 (
     cd "$SRC"
-    RUSTFLAGS="-C linker=$ROOT_DIR/scripts/linker-$arch-musl.sh -C link-self-contained=no -C relocation-model=static -L native=$WORK/linkstub" \
-        cargo "$toolchain" build --target "$target_triple" --release --bin sudo --bin su
+    cargo "$toolchain" build --target "$target_triple" --release --bin sudo --bin su
 )
 out="$HERE/out/$arch"
 mkdir -p "$out"

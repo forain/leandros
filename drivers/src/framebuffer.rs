@@ -40,6 +40,52 @@ pub fn get_hardware_fb_info() -> Option<(u64, u32, u32, u32)> {
 
 /// Resolve an xterm-256 colour index: 0-15 palette, 16-231 6×6×6 cube,
 /// 232-255 greyscale ramp.
+pub(crate) const SGR_BASE: [u32; 8] = [
+    0x000000, 0xCD0000, 0x00CD00, 0xCDCD00,
+    0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+];
+pub(crate) const SGR_BRIGHT: [u32; 8] = [
+    0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00,
+    0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
+];
+
+/// Pixel value of palette index `n` (0 = the default black background).
+fn palette(n: u8) -> u32 { xterm256(n as usize, &SGR_BASE, &SGR_BRIGHT) }
+
+/// Nearest xterm-256 palette index to `c` (first on ties, so black is 0).
+fn nearest256(c: u32) -> u8 {
+    let (r, g, b) = ((c >> 16) as i32 & 255, (c >> 8) as i32 & 255, c as i32 & 255);
+    let (mut best, mut bd) = (0u8, i32::MAX);
+    for n in 0..=255u8 {
+        let p = palette(n);
+        let (pr, pg, pb) = ((p >> 16) as i32 & 255, (p >> 8) as i32 & 255, p as i32 & 255);
+        let d = (r - pr) * (r - pr) + (g - pg) * (g - pg) + (b - pb) * (b - pb);
+        if d < bd { bd = d; best = n; if d == 0 { break; } }
+    }
+    best
+}
+
+/// Resolve SGR state to the (foreground colour, background index) drawn:
+/// bold brightens the eight base colours, reverse swaps the two.
+fn sgr_resolve(sfg: u32, sbg: u8, bold: bool, rev: bool) -> (u32, u8) {
+    let mut f = sfg;
+    if bold { for i in 0..8 { if f == SGR_BASE[i] { f = SGR_BRIGHT[i]; break; } } }
+    if rev { (palette(sbg), nearest256(f)) } else { (f, sbg) }
+}
+
+/// DEC Special Graphics (`ESC ( 0`) → Unicode, for 0x5f..=0x7e.
+fn acs_map(c: u8) -> Option<u32> {
+    Some(match c {
+        0x5f => 0x00A0, 0x60 => 0x25C6, 0x61 => 0x2592, 0x66 => 0x00B0, 0x67 => 0x00B1,
+        0x6a => 0x2518, 0x6b => 0x2510, 0x6c => 0x250C, 0x6d => 0x2514, 0x6e => 0x253C,
+        0x6f => 0x23BA, 0x70 => 0x23BB, 0x71 => 0x2500, 0x72 => 0x23BC, 0x73 => 0x23BD,
+        0x74 => 0x251C, 0x75 => 0x2524, 0x76 => 0x2534, 0x77 => 0x252C, 0x78 => 0x2502,
+        0x79 => 0x2264, 0x7a => 0x2265, 0x7b => 0x03C0, 0x7c => 0x2260, 0x7d => 0x00A3,
+        0x7e => 0x00B7,
+        _ => return None,
+    })
+}
+
 fn xterm256(n: usize, base: &[u32; 8], bright: &[u32; 8]) -> u32 {
     match n {
         0..=7   => base[n],
@@ -129,6 +175,25 @@ pub struct Framebuffer {
     params_len: usize,
     /// Current SGR foreground colour; reset to white by `SGR 0`.
     fg: u32,
+    /// Effective background colour and its palette index (0 = default black).
+    bg: u32,
+    bgi: u8,
+    /// SGR state before bold/reverse are resolved into `fg`/`bgi`.
+    sfg: u32,
+    sbg: u8,
+    bold: bool,
+    rev: bool,
+    /// DECSTBM margins in rows: `[reg_top, reg_bot)`; `reg_bot == 0` = whole screen.
+    reg_top: usize,
+    reg_bot: usize,
+    /// G0/G1 are DEC Special Graphics; `shift_out` selects G1 (SO/SI).
+    g0_gfx: bool,
+    g1_gfx: bool,
+    shift_out: bool,
+    /// Which designator (`(` or `)`) the next charset byte belongs to.
+    cs_target: u8,
+    /// DECOM (`CSI ? 6 h`): CUP/VPA are relative to the top margin.
+    origin: bool,
     /// Cursor saved by `ESC 7` / `CSI s`, restored by `ESC 8` / `CSI u`.
     saved_cursor: (usize, usize),
     /// Tab stops (`ESC H`, `CSI g`); every 8 columns until changed.
@@ -181,6 +246,19 @@ impl Framebuffer {
             params: [0; 32],
             params_len: 0,
             fg: 0xFFFFFF,
+            bg: 0,
+            bgi: 0,
+            sfg: 0xFFFFFF,
+            sbg: 0,
+            bold: false,
+            rev: false,
+            reg_top: 0,
+            reg_bot: 0,
+            origin: false,
+            g0_gfx: false,
+            g1_gfx: false,
+            shift_out: false,
+            cs_target: 0,
             saved_cursor: (0, 0),
             tabs: crate::wcwidth::TabStops::default_stops(),
             wide: [[0; 4]; WIDE_ROWS],
@@ -331,11 +409,15 @@ impl Framebuffer {
                     b'[' => { self.params_len = 0; EscState::Csi }
                     b']' => EscState::Osc,
                     // Charset / DEC selectors take one more byte: ESC ( B, ESC # 8, …
-                    b'(' | b')' | b'*' | b'+' | b'#' | b'%' => EscState::Discard1,
+                    b'(' | b')' => { self.cs_target = c; EscState::Discard1 }
+                    b'*' | b'+' | b'#' | b'%' => { self.cs_target = 0; EscState::Discard1 }
+                    b'c' => { self.g0_gfx = false; self.g1_gfx = false; self.shift_out = false; EscState::Ground }
                     b'7' => { self.saved_cursor = (self.cursor_x, self.cursor_y); EscState::Ground }
                     b'8' => { let (x, y) = self.saved_cursor;
                               self.cursor_x = x; self.cursor_y = y; EscState::Ground }
                     b'M' => { self.reverse_index(); EscState::Ground }
+                    b'D' => { self.line_feed(); EscState::Ground }
+                    b'E' => { self.cursor_x = 0; self.line_feed(); EscState::Ground }
                     // ESC H — HTS, set a tab stop at the cursor.
                     b'H' => { let c = self.col(); self.tabs.set(c); EscState::Ground }
                     // ESC =, ESC >, ESC c, … — nothing we need to render.
@@ -390,6 +472,8 @@ impl Framebuffer {
                 return;
             }
             EscState::Discard1 => {
+                if self.cs_target == b'(' { self.g0_gfx = c == b'0'; }
+                else if self.cs_target == b')' { self.g1_gfx = c == b'0'; }
                 self.esc = EscState::Ground;
                 return;
             }
@@ -398,7 +482,7 @@ impl Framebuffer {
         if c < 0x20 { self.wrap_pending = false; }
         if c == b'\n' {
             self.cursor_x = 0;
-            self.cursor_y += self.char_height;
+            self.line_feed();
         } else if c == b'\r' {
             self.cursor_x = 0;
         } else if c == b'\t' {
@@ -407,6 +491,10 @@ impl Framebuffer {
                 let col = self.tabs.next(self.col(), 1, cols);
                 self.cursor_x = col * self.char_width;
             }
+        } else if c == 0x0e {
+            self.shift_out = true;
+        } else if c == 0x0f {
+            self.shift_out = false;
         } else if c == b'\x08' {  // Backspace (ASCII 8)
             self.handle_backspace();
         } else {
@@ -415,12 +503,17 @@ impl Framebuffer {
                 if c < 0x80 {
                     // ASCII character
                     UTF8_STATE = (0, 0);
+                    let gfx = if self.shift_out { self.g1_gfx } else { self.g0_gfx };
+                    if let Some(u) = if gfx { acs_map(c) } else { None } {
+                        self.put_unicode(u);
+                    } else {
                     self.apply_pending_wrap();
                     let (col, row) = (self.col(), self.row());
                     self.split_wide(row, col, col + 1);
                     self.draw_char_vector(self.cursor_x, self.cursor_y, c as char, self.fg);
                     self.last_char = c as u32;
                     self.cursor_x += self.char_width;
+                    }
                 } else if c & 0xE0 == 0xC0 {
                     // Start of 2-byte UTF-8
                     UTF8_STATE = (1, (c & 0x1F) as u32);
@@ -469,7 +562,7 @@ impl Framebuffer {
             // Clear the character at the cursor position by drawing a space (background color)
             for y in 0..self.char_height {
                 for x in 0..self.char_width {
-                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, 0x000000);
+                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, self.bg);
                 }
             }
         } else if self.cursor_y >= self.char_height {
@@ -484,7 +577,7 @@ impl Framebuffer {
             // Clear the character at the cursor position
             for y in 0..self.char_height {
                 for x in 0..self.char_width {
-                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, 0x000000);
+                    self.set_pixel(self.cursor_x + x, self.cursor_y + y, self.bg);
                 }
             }
         }
@@ -525,12 +618,6 @@ impl Framebuffer {
     }
 
     /// `ESC M` — move up one line, scrolling down if already at the top.
-    fn reverse_index(&mut self) {
-        if self.cursor_y >= self.char_height {
-            self.cursor_y -= self.char_height;
-        }
-    }
-
     /// Dispatch a CSI sequence given its raw parameter bytes and final byte.
     ///
     /// This replaces an exact-match on three literal sequences.  Parameterised
@@ -580,23 +667,37 @@ impl Framebuffer {
         match final_byte {
             b'h' | b'l' if private => {                          // DECSET / DECRST
                 if &params[..] == b"?7" { self.autowrap = final_byte == b'h'; }
+                if &params[..] == b"?6" {
+                    self.origin = final_byte == b'h';
+                    row = if self.origin { self.region().0 } else { 0 };
+                    col = 0;
+                }
             }
             _ if private => {}                                   // other DEC private modes
-            b'A' => row = row.saturating_sub(p(0, 1)),            // CUU
-            b'B' => row = (row + p(0, 1)).min(rows - 1),          // CUD
+            b'A' => { let t = self.region().0; row = row.saturating_sub(p(0, 1)); if row < t && self.row() >= t { row = t; } } // CUU
+            b'B' => { let bo = self.region().1; let m = if self.row() < bo { bo - 1 } else { rows - 1 }; row = (row + p(0, 1)).min(m); } // CUD
             b'C' => col = (col + p(0, 1)).min(cols - 1),          // CUF
             b'D' => col = col.saturating_sub(p(0, 1)),            // CUB
-            b'E' => { row = (row + p(0, 1)).min(rows - 1); col = 0; }        // CNL
-            b'F' => { row = row.saturating_sub(p(0, 1)); col = 0; }          // CPL
+            b'E' => { let bo = self.region().1; let m = if self.row() < bo { bo - 1 } else { rows - 1 }; row = (row + p(0, 1)).min(m); col = 0; } // CNL
+            b'F' => { let t = self.region().0; row = row.saturating_sub(p(0, 1)); if row < t && self.row() >= t { row = t; } col = 0; } // CPL
             b'G' | b'`' => col = p(0, 1).saturating_sub(1).min(cols - 1),    // CHA
             b'I' => col = ((col / 8 + p(0, 1)) * 8).min(cols - 1),           // CHT
             b'Z' => {                                                        // CBT
                 let n = p(0, 1);
                 col = if col % 8 == 0 { col.saturating_sub(8 * n) } else { (col / 8).saturating_sub(n - 1) * 8 };
             }
-            b'd' => row = p(0, 1).saturating_sub(1).min(rows - 1),           // VPA
+            b'd' => row = self.abs_row(p(0, 1).saturating_sub(1)),           // VPA
+            b'r' => {                                                        // DECSTBM
+                let (t, b) = (p(0, 1).max(1), p(1, rows).max(1));
+                if t < b && b <= rows {
+                    self.reg_top = t - 1;
+                    self.reg_bot = b;
+                    row = if self.origin { t - 1 } else { 0 };
+                    col = 0;
+                }
+            }
             b'H' | b'f' => {                                                 // CUP
-                row = p(0, 1).saturating_sub(1).min(rows - 1);
+                row = self.abs_row(p(0, 1).saturating_sub(1));
                 col = p(1, 1).saturating_sub(1).min(cols - 1);
             }
             b'J' => self.erase_in_display(p(0, 0)),              // ED
@@ -625,12 +726,18 @@ impl Framebuffer {
         self.set_cell(col, row);
     }
 
+    /// Row for a 0-based CUP/VPA row number: margin-relative under DECOM.
+    fn abs_row(&self, r: usize) -> usize {
+        let (t, b) = self.region();
+        if self.origin { (t + r).min(b - 1) } else { r.min(self.rows() - 1) }
+    }
+
     /// Blank cells `[c0, c1)` of `row` (ECH, and the blanks ICH/DCH expose).
     fn erase_cells(&mut self, row: usize, c0: usize, c1: usize) {
         let (cw, chh) = (self.char_width, self.char_height);
         if c0 >= c1 { return; }
         self.split_wide(row, c0, c1);
-        self.fill_rect(c0 * cw, row * chh, (c1 - c0) * cw, chh, 0x000000);
+        self.fill_rect(c0 * cw, row * chh, (c1 - c0) * cw, chh, self.bg);
     }
 
     /// Move `cells` cells of `row` from column `src` to `dst` (overlap-safe),
@@ -675,24 +782,72 @@ impl Framebuffer {
         self.erase_cells(row, cols - n, cols);
     }
 
-    /// `CSI n L` — insert blank rows at `row`, pushing the rows below down.
+    /// Bottom margin (exclusive) and top margin of the scroll region.
+    fn region(&self) -> (usize, usize) {
+        let rows = self.rows();
+        let b = if self.reg_bot == 0 { rows } else { self.reg_bot.min(rows) };
+        (self.reg_top.min(b.saturating_sub(1)), b)
+    }
+
+    fn region_full(&self) -> bool { let (t, b) = self.region(); t == 0 && b == self.rows() }
+
+    /// `CSI n L` — insert blank rows at `row` inside the region.
     fn insert_lines(&mut self, row: usize, n: usize) {
-        let (rows, chh) = (self.rows(), self.char_height);
-        if row >= rows { return; }
-        let n = n.min(rows - row);
-        self.move_rows(row, row + n, rows - row - n);
-        self.fill_rect(0, row * chh, self.width, n * chh, 0x000000);
+        let (t, bot) = self.region();
+        let chh = self.char_height;
+        if row < t || row >= bot { return; }
+        let n = n.min(bot - row);
+        self.move_rows(row, row + n, bot - row - n);
+        self.fill_rect(0, row * chh, self.width, n * chh, self.bg);
         for r in row..row + n { if r < WIDE_ROWS { self.wide[r] = [0; 4]; } }
     }
 
-    /// `CSI n M` — delete rows at `row`, pulling the rows below up.
+    /// `CSI n M` — delete rows at `row` inside the region.
     fn delete_lines(&mut self, row: usize, n: usize) {
-        let (rows, chh) = (self.rows(), self.char_height);
-        if row >= rows { return; }
-        let n = n.min(rows - row);
-        self.move_rows(row + n, row, rows - row - n);
-        self.fill_rect(0, (rows - n) * chh, self.width, n * chh, 0x000000);
-        for r in rows - n..rows { if r < WIDE_ROWS { self.wide[r] = [0; 4]; } }
+        let (t, bot) = self.region();
+        let chh = self.char_height;
+        if row < t || row >= bot { return; }
+        let n = n.min(bot - row);
+        self.move_rows(row + n, row, bot - row - n);
+        self.fill_rect(0, (bot - n) * chh, self.width, n * chh, self.bg);
+        for r in bot - n..bot { if r < WIDE_ROWS { self.wide[r] = [0; 4]; } }
+    }
+
+    /// Line feed: move down one row, scrolling the region at its bottom margin.
+    /// With no region this is the console's multi-row scroll at the screen end.
+    fn line_feed(&mut self) {
+        let (t, bot) = self.region();
+        let row = self.row();
+        if self.region_full() {
+            self.cursor_y += self.char_height;
+            if self.cursor_y + self.char_height > self.height { self.scroll_vector(); }
+        } else if row + 1 == bot {
+            self.delete_lines_at(t, bot);
+        } else if row + 1 < self.rows() {
+            self.cursor_y += self.char_height;
+        }
+    }
+
+    /// Scroll `[t, bot)` up one row (the cursor stays).
+    fn delete_lines_at(&mut self, t: usize, bot: usize) {
+        let chh = self.char_height;
+        self.move_rows(t + 1, t, bot - t - 1);
+        self.fill_rect(0, (bot - 1) * chh, self.width, chh, self.bg);
+        if bot - 1 < WIDE_ROWS { self.wide[bot - 1] = [0; 4]; }
+    }
+
+    /// Reverse index: move up one row, scrolling the region down at its top margin.
+    fn reverse_index(&mut self) {
+        let (t, bot) = self.region();
+        let row = self.row();
+        if row == t {
+            let chh = self.char_height;
+            self.move_rows(t, t + 1, bot - t - 1);
+            self.fill_rect(0, t * chh, self.width, chh, self.bg);
+            if t < WIDE_ROWS { self.wide[t] = [0; 4]; }
+        } else if row > 0 {
+            self.cursor_y -= self.char_height;
+        }
     }
 
     /// Move `count` character rows from row `src` to row `dst` (overlap-safe).
@@ -721,19 +876,19 @@ impl Framebuffer {
         let (col, row, cols) = (self.col(), self.row(), self.cols());
         match mode {
             0 => {
-                self.fill_rect(x, y, w - x.min(w), ch, 0x000000);
-                self.fill_rect(0, y + ch, w, h.saturating_sub(y + ch), 0x000000);
+                self.fill_rect(x, y, w - x.min(w), ch, self.bg);
+                self.fill_rect(0, y + ch, w, h.saturating_sub(y + ch), self.bg);
                 self.split_wide(row, col, cols);
                 for r in row + 1..WIDE_ROWS { self.wide[r] = [0; 4]; }
             }
             1 => {
-                self.fill_rect(0, 0, w, y, 0x000000);
-                self.fill_rect(0, y, x, ch, 0x000000);
+                self.fill_rect(0, 0, w, y, self.bg);
+                self.fill_rect(0, y, x, ch, self.bg);
                 self.split_wide(row, 0, col);
                 for r in 0..row.min(WIDE_ROWS) { self.wide[r] = [0; 4]; }
             }
             _ => {
-                self.fill_rect(0, 0, w, h, 0x000000);
+                self.fill_rect(0, 0, w, h, self.bg);
                 self.wide = [[0; 4]; WIDE_ROWS];
             }
         }
@@ -746,44 +901,37 @@ impl Framebuffer {
         let (x, y) = (self.cursor_x, self.cursor_y);
         let (col, row, cols) = (self.col(), self.row(), self.cols());
         match mode {
-            0 => { self.fill_rect(x, y, w - x.min(w), ch, 0x000000); self.split_wide(row, col, cols); }
-            1 => { self.fill_rect(0, y, x, ch, 0x000000); self.split_wide(row, 0, col); }
-            _ => { self.fill_rect(0, y, w, ch, 0x000000); self.split_wide(row, 0, cols); }
+            0 => { self.fill_rect(x, y, w - x.min(w), ch, self.bg); self.split_wide(row, col, cols); }
+            1 => { self.fill_rect(0, y, x, ch, self.bg); self.split_wide(row, 0, col); }
+            _ => { self.fill_rect(0, y, w, ch, self.bg); self.split_wide(row, 0, cols); }
         }
     }
 
     /// `CSI ... m` — foreground colour only; the background stays black.
     /// Previously all text rendered hardcoded white, so a highlighting prompt
     /// lost its colours entirely.
-    fn apply_sgr(&mut self, nums: &[usize], present: &[bool]) {
-        const BASE: [u32; 8] = [
-            0x000000, 0xCD0000, 0x00CD00, 0xCDCD00,
-            0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
-        ];
-        const BRIGHT: [u32; 8] = [
-            0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00,
-            0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
-        ];
-
-        // A bare `CSI m` means `CSI 0 m`.
-        if nums.is_empty() || !present.first().copied().unwrap_or(false) {
-            self.fg = 0xFFFFFF;
-            if nums.len() <= 1 { return; }
-        }
-
+    fn apply_sgr(&mut self, nums: &[usize], _present: &[bool]) {
         let mut i = 0;
         while i < nums.len() {
             match nums[i] {
-                0 => self.fg = 0xFFFFFF,
-                30..=37 => self.fg = BASE[nums[i] - 30],
-                90..=97 => self.fg = BRIGHT[nums[i] - 90],
-                39 => self.fg = 0xFFFFFF,
-                38 => {
-                    // 38;5;<n> (256-colour) or 38;2;<r>;<g>;<b> (truecolour)
+                0 => { self.sfg = 0xFFFFFF; self.sbg = 0; self.bold = false; self.rev = false; }
+                1 => self.bold = true,
+                22 => self.bold = false,
+                7 => self.rev = true,
+                27 => self.rev = false,
+                30..=37 => self.sfg = SGR_BASE[nums[i] - 30],
+                90..=97 => self.sfg = SGR_BRIGHT[nums[i] - 90],
+                39 => self.sfg = 0xFFFFFF,
+                40..=47 => self.sbg = (nums[i] - 40) as u8,
+                100..=107 => self.sbg = (nums[i] - 100 + 8) as u8,
+                49 => self.sbg = 0,
+                38 | 48 => {
+                    let is_fg = nums[i] == 38;
                     match nums.get(i + 1) {
                         Some(5) => {
                             if let Some(&n) = nums.get(i + 2) {
-                                self.fg = xterm256(n, &BASE, &BRIGHT);
+                                if is_fg { self.sfg = xterm256(n, &SGR_BASE, &SGR_BRIGHT); }
+                                else { self.sbg = n.min(255) as u8; }
                             }
                             i += 2;
                         }
@@ -791,16 +939,21 @@ impl Framebuffer {
                             let r = nums.get(i + 2).copied().unwrap_or(0) as u32;
                             let g = nums.get(i + 3).copied().unwrap_or(0) as u32;
                             let b = nums.get(i + 4).copied().unwrap_or(0) as u32;
-                            self.fg = (r << 16) | (g << 8) | b;
+                            let c = (r << 16) | (g << 8) | b;
+                            if is_fg { self.sfg = c; } else { self.sbg = nearest256(c); }
                             i += 4;
                         }
                         _ => {}
                     }
                 }
-                _ => {} // bold/underline/background — not rendered
+                _ => {}
             }
             i += 1;
         }
+        let (fg, bgi) = sgr_resolve(self.sfg, self.sbg, self.bold, self.rev);
+        self.fg = fg;
+        self.bgi = bgi;
+        self.bg = palette(bgi);
     }
 
     /// Map Unicode box-drawing characters to ASCII equivalents
@@ -839,12 +992,12 @@ impl Framebuffer {
         if row >= WIDE_ROWS { return; }
         let (cw, chh) = (self.char_width, self.char_height);
         if c0 > 0 && self.wide_bit(row, c0 - 1) {
-            self.fill_rect((c0 - 1) * cw, row * chh, cw, chh, 0x000000);
+            self.fill_rect((c0 - 1) * cw, row * chh, cw, chh, self.bg);
             self.wide_set(row, c0 - 1, false);
         }
         for k in c0..c1.min(256) {
             if self.wide_bit(row, k) {
-                if k + 1 >= c1 { self.fill_rect((k + 1) * cw, row * chh, cw, chh, 0x000000); }
+                if k + 1 >= c1 { self.fill_rect((k + 1) * cw, row * chh, cw, chh, self.bg); }
                 self.wide_set(row, k, false);
             }
         }
@@ -856,7 +1009,7 @@ impl Framebuffer {
     /// gets a placeholder box two cells wide.
     fn draw_wide(&mut self, x: usize, y: usize, u: u32, color: u32) {
         let (cw, ch) = (self.char_width, self.char_height);
-        self.fill_rect(x, y, 2 * cw, ch, 0x000000);
+        self.fill_rect(x, y, 2 * cw, ch, self.bg);
         if (0xFF01..=0xFF5E).contains(&u) {
             self.draw_char_vector(x + cw / 2, y, (u - 0xFEE0) as u8 as char, color);
             return;
@@ -886,8 +1039,7 @@ impl Framebuffer {
         if !self.wrap_pending { return; }
         self.wrap_pending = false;
         self.cursor_x = 0;
-        self.cursor_y += self.char_height;
-        if self.cursor_y + self.char_height > self.height { self.scroll_vector(); }
+        self.line_feed();
     }
 
     fn put_unicode(&mut self, u: u32) {
@@ -903,8 +1055,7 @@ impl Framebuffer {
         if w == 2 && self.col() + 2 > cols {
             // Does not fit before the right margin: wrap whole.
             self.cursor_x = 0;
-            self.cursor_y += self.char_height;
-            if self.cursor_y + self.char_height > self.height { self.scroll_vector(); }
+            self.line_feed();
         }
         let (col, row) = (self.col(), self.row());
         self.split_wide(row, col, col + w);
@@ -952,7 +1103,7 @@ impl Framebuffer {
     fn draw_unicode(&mut self, x: usize, y: usize, u: u32, color: u32) {
         if let Some(g) = crate::glyphs::glyph(u) {
             let (cw, ch) = (self.char_width, self.char_height);
-            self.fill_rect(x, y, cw, ch, 0x000000);
+            self.fill_rect(x, y, cw, ch, self.bg);
             for (gy, &row) in g.iter().enumerate().take(ch) {
                 for gx in 0..8.min(cw) {
                     if row & (0x80 >> gx) != 0 { self.set_pixel(x + gx, y + gy, color); }
@@ -962,7 +1113,7 @@ impl Framebuffer {
         }
         if let Some(rows) = crate::glyphs::narrow_glyph(u) {
             let (cw, ch) = (self.char_width, self.char_height);
-            self.fill_rect(x, y, cw, ch, 0x000000);
+            self.fill_rect(x, y, cw, ch, self.bg);
             for (gy, &row) in rows.iter().enumerate().take(ch) {
                 for gx in 0..8.min(cw) {
                     if row & (0x80 >> gx) != 0 { self.set_pixel(x + gx, y + gy, color); }
@@ -999,7 +1150,7 @@ impl Framebuffer {
                 if (row & (1 << (7 - gx))) != 0 {
                     self.set_pixel(x + gx, y + gy, color);
                 } else {
-                    self.set_pixel(x + gx, y + gy, 0x000000);
+                    self.set_pixel(x + gx, y + gy, self.bg);
                 }
             }
         }
@@ -1012,7 +1163,7 @@ impl Framebuffer {
         // glyph's pixels behind.  Append-only output never hit this, but a
         // line editor repaints the same cells on every keystroke.
         let (cw, ch) = (self.char_width, self.char_height);
-        self.fill_rect(x, y, cw, ch, 0x000000);
+        self.fill_rect(x, y, cw, ch, self.bg);
 
         // Simplified to use bitmap font only during debugging
         if let Some(bitmap) = get_fira_code_char(c) {
@@ -1078,12 +1229,17 @@ impl Framebuffer {
             r += n;
             rx_poll();
         }
-        unsafe {
-            core::ptr::write_bytes(
-                dst.add(rows_to_copy * words_per_row),
-                0,
-                shift_px * words_per_row,
-            );
+        if self.bg == 0 {
+            unsafe {
+                core::ptr::write_bytes(
+                    dst.add(rows_to_copy * words_per_row),
+                    0,
+                    shift_px * words_per_row,
+                );
+            }
+        } else {
+            let bg = self.bg;
+            self.fill_rect(0, rows_to_copy, self.width, shift_px, bg);
         }
         self.cursor_y = self.cursor_y.saturating_sub(shift_px);
         if self.char_height > 0 {
@@ -1307,13 +1463,20 @@ pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
     let (cw, chh, w, h) = (fb.char_width, fb.char_height, fb.width, fb.height);
     let y = row as usize * chh;
     if y + chh > h { return; }
+    let saved_bg = fb.bg;
     for i in 0..len as usize {
         let x = i * cw;
         if x + cw > w { break; }
         let packed = unsafe { cells.add(i).read() };
         let ch = packed as u32;
-        if ch == 0 || ch == 0x20 || ch == 0x8000_0000 { continue; }
-        let fg = ((packed >> 32) as u32) ^ 0x00FF_FFFF;
+        let bgi = (packed >> 56) as u8;
+        fb.bg = palette(bgi);
+        if ch == 0 || ch == 0x20 {
+            if bgi != 0 { let bgc = fb.bg; fb.fill_rect(x, y, cw, chh, bgc); }
+            continue;
+        }
+        if ch == 0x8000_0000 { continue; }
+        let fg = (((packed >> 32) as u32) & 0x00FF_FFFF) ^ 0x00FF_FFFF;
         if ch >= 0x80 && crate::wcwidth::width(ch) == 2 && x + 2 * cw <= w {
             fb.draw_wide(x, y, ch, fg);
             fb.wide_set(row as usize, i, true);
@@ -1323,6 +1486,7 @@ pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
             fb.draw_unicode(x, y, ch, fg);
         }
     }
+    fb.bg = saved_bg;
 }
 
 /// Finish a VT repaint: park the console cursor on the restored VT's cell,
@@ -1332,14 +1496,29 @@ pub extern "C" fn fb_vt_paint_row(row: u32, cells: *const u64, len: u32) {
 /// final byte of a sequence the outgoing VT was mid-way through, and a console
 /// left in `Csi` swallows the incoming VT's next few characters as parameters.
 #[no_mangle]
-pub extern "C" fn fb_vt_repaint_end(col: u32, row: u32, fg: u32) {
+pub extern "C" fn fb_vt_repaint_end(col: u32, row: u32, fg: u32, sgr: u64) {
     {
         let mut fb = KERNEL_FB.lock();
         if fb.char_width == 0 || fb.char_height == 0 { return; }
         let (cols, rows) = (fb.cols(), fb.rows());
         if cols == 0 || rows == 0 { return; }
         fb.set_cell((col as usize).min(cols - 1), (row as usize).min(rows - 1));
-        fb.fg = fg;
+        fb.fg = fg & 0x00FF_FFFF;
+        fb.bgi = (fg >> 24) as u8;
+        fb.bg = palette(fb.bgi);
+        // `sgr` = sfg | sbg << 24 | bold << 32 | rev << 33 | g0 << 34 | g1 << 35 | SO << 36:
+        // the pen as the VT left it, so bold/reverse and the charset survive a switch.
+        fb.sfg = (sgr & 0x00FF_FFFF) as u32;
+        fb.sbg = (sgr >> 24) as u8;
+        fb.bold = sgr >> 32 & 1 != 0;
+        fb.rev = sgr >> 33 & 1 != 0;
+        fb.g0_gfx = sgr >> 34 & 1 != 0;
+        fb.g1_gfx = sgr >> 35 & 1 != 0;
+        fb.shift_out = sgr >> 36 & 1 != 0;
+        let (efg, ebg) = sgr_resolve(fb.sfg, fb.sbg, fb.bold, fb.rev);
+        fb.fg = efg;
+        fb.bgi = ebg;
+        fb.bg = palette(ebg);
         fb.esc = EscState::Ground;
         fb.params_len = 0;
     }

@@ -2273,6 +2273,13 @@ fn unix_listener_gone(sock_id: u64) {
                 c.seq = c.seq.wrapping_add(1);
             }
         }
+        // A connector end passed by SCM_RIGHTS is a plain `UnixConnected` entry
+        // (`xfer_export`), invisible to the table scan above: its connection is
+        // still marked pending on this listener with end A open. Reset those
+        // too, or the holder of the copy waits forever.
+        for (ci, c) in conns.iter().enumerate() {
+            if c.in_use && c.pending_sid == sock_id && !c.closed_a && !hit.contains(&ci) { hit.push(ci); }
+        }
         for &ci in hit.iter() {
             if ci >= conns.len() || !conns[ci].in_use { continue; }
             let c = &mut conns[ci];
@@ -2324,7 +2331,7 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
         // Ordinary VFS descriptor (memfd, pipe, file).
         return vfs::export_fd(pid, fd).map(XferFd::Vfs);
     };
-    let entry = {
+    let mut entry = {
         let tbls = SOCK_TABLES.read();
         let tbl = tbls.iter().find(|t| t.in_use && t.pid == tk(pid))?;
         if slot >= tbl.socks.len() || !tbl.socks[slot].in_use { return None; }
@@ -2356,6 +2363,18 @@ fn xfer_export(pid: u32, fd: usize) -> Option<XferFd> {
             let mut conns = UNIX_CONNS.lock();
             if conn_idx >= conns.len() || !conns[conn_idx].in_use { return None; }
             if is_a { conns[conn_idx].refs_a += 1; } else { conns[conn_idx].refs_b += 1; }
+        }
+        // A connect() the listener has not accept()ed yet: it already returned
+        // 0, so on Linux the socket is established and passable. It is end A
+        // of its connection, refcounted like a connected end. The queued copy
+        // is carried as that end (an accept flips only table entries, never
+        // the queue); closing it releases exactly as the pending close does.
+        SockState::UnixPendingAccept { conn_idx, .. } => {
+            let mut conns = UNIX_CONNS.lock();
+            if conn_idx >= conns.len() || !conns[conn_idx].in_use { return None; }
+            conns[conn_idx].refs_a += 1;
+            drop(conns);
+            entry.state = SockState::UnixConnected { conn_idx, is_a: true };
         }
         // Referenced above.
         ref s if is_inet_state(s) => {}

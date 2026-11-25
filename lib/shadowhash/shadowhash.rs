@@ -383,6 +383,34 @@ fn verify_sha256_legacy(rest: &str, password: &[u8]) -> bool {
     ct_eq(&want, hex.as_bytes())
 }
 
+/// Hex of sha256(salt ++ password): what a legacy `$sha256$` field carries.
+#[cfg(test)]
+pub fn sha256_for_test(salt: &[u8], password: &[u8]) -> alloc_free_string::S {
+    let mut h = Sha256::new();
+    h.write(salt);
+    h.write(password);
+    let d = h.finish();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = alloc_free_string::S::default();
+    for b in d {
+        s.0.push(HEX[(b >> 4) as usize] as char);
+        s.0.push(HEX[(b & 15) as usize] as char);
+    }
+    s
+}
+
+#[cfg(test)]
+pub mod alloc_free_string {
+    extern crate std;
+    #[derive(Default)]
+    pub struct S(pub std::string::String);
+    impl core::fmt::Display for S {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+}
+
 /// Check `password` against a /etc/shadow hash field. An empty field returns
 /// true (passwordless); callers that refuse empty passwords must check first.
 pub fn verify(hash_field: &str, password: &[u8]) -> bool {
@@ -396,6 +424,67 @@ pub fn verify(hash_field: &str, password: &[u8]) -> bool {
         return verify_sha256_legacy(r, password);
     }
     false
+}
+
+/// Rounds of the `$6$` field that replaces a legacy hash (the image's own).
+pub const UPGRADE_ROUNDS: u64 = 65536;
+
+/// Build `$6$rounds=65536$<16 salt chars>$<hash>` for `password` from 16 random
+/// bytes. Returns the length written to `out`. The result is verified.
+pub fn upgrade_field(password: &[u8], rnd: &[u8; 16], out: &mut [u8; 128]) -> Option<usize> {
+    const AL: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut salt = [0u8; 16];
+    for i in 0..16 {
+        salt[i] = AL[(rnd[i] & 63) as usize];
+    }
+    let h = sha512_crypt_raw(password, &salt, UPGRADE_ROUNDS)?;
+    let head = b"$6$rounds=65536$";
+    let n = head.len() + 16 + 1 + CRYPT_LEN;
+    if n > out.len() {
+        return None;
+    }
+    out[..head.len()].copy_from_slice(head);
+    out[head.len()..head.len() + 16].copy_from_slice(&salt);
+    out[head.len() + 16] = b'$';
+    out[head.len() + 17..n].copy_from_slice(&h);
+    let s = core::str::from_utf8(&out[..n]).ok()?;
+    if !verify(s, password) {
+        return None;
+    }
+    Some(n)
+}
+
+/// Copy `src` (an /etc/shadow text) to `out`, replacing the hash field of the
+/// first record named `user` whose hash starts with `$sha256$` by `new_field`.
+/// Every other byte is copied unchanged (other fields, other lines, a missing
+/// final newline). Returns the length, or None when no such record exists or
+/// `out` is too small.
+pub fn replace_legacy_field(src: &[u8], user: &[u8], new_field: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut pos = 0;
+    while pos < src.len() {
+        let end = src[pos..].iter().position(|&b| b == b'\n').map_or(src.len(), |i| pos + i);
+        let line = &src[pos..end];
+        if let Some(c1) = line.iter().position(|&b| b == b':') {
+            if &line[..c1] == user {
+                let rest = &line[c1 + 1..];
+                let c2 = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+                if rest[..c2].starts_with(b"$sha256$") {
+                    let a = pos + c1 + 1;
+                    let b = a + c2;
+                    let total = src.len() - (b - a) + new_field.len();
+                    if total > out.len() {
+                        return None;
+                    }
+                    out[..a].copy_from_slice(&src[..a]);
+                    out[a..a + new_field.len()].copy_from_slice(new_field);
+                    out[a + new_field.len()..total].copy_from_slice(&src[b..]);
+                    return Some(total);
+                }
+            }
+        }
+        pos = end + 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -434,5 +523,22 @@ mod tests {
         assert!(verify("$6$rounds=65536$lnd0rootsalt0000$e/pKi.KtaNXG2AESzxZESa5yppf.wW2fmfF6I0uGSkM9OzFob1CXV0MQvpPb2zsW7fvn9qqB3MEWvo9F5q3.K/", b"root"));
         assert!(!verify("$6$rounds=65536$lnd0rootsalt0000$e/pKi.KtaNXG2AESzxZESa5yppf.wW2fmfF6I0uGSkM9OzFob1CXV0MQvpPb2zsW7fvn9qqB3MEWvo9F5q3.K/", b"roo"));
         assert!(verify("$6$rounds=65536$lnd0leandrosalt1$DQ11AaldqWyE98K3fN.TSIT2.3Ak2LwBci2bWJGtEvVZlCOjLJEdR41JYBW9QFF9kyt3AAGYNu5s64mz9AM/Y1", b"leandro"));
+    }
+
+    #[test]
+    fn upgrade_and_replace() {
+        let legacy = "$sha256$salt$0000";
+        let src = std::format!("root:{legacy}:1:0:99999:7:::\nleandro:{legacy}:2::::::\nx:*:3");
+        let mut f = [0u8; 128];
+        let n = upgrade_field(b"leandro", &[7u8; 16], &mut f).unwrap();
+        let field = core::str::from_utf8(&f[..n]).unwrap();
+        assert!(field.starts_with("$6$rounds=65536$") && verify(field, b"leandro"));
+        let mut out = [0u8; 1024];
+        let m = replace_legacy_field(src.as_bytes(), b"leandro", &f[..n], &mut out).unwrap();
+        let o = std::string::String::from(core::str::from_utf8(&out[..m]).unwrap());
+        assert!(o.starts_with(&std::format!("root:{legacy}:1:0:99999:7:::\nleandro:$6$")));
+        assert!(o.ends_with(":2::::::\nx:*:3"), "{o}");
+        assert!(replace_legacy_field(o.as_bytes(), b"leandro", &f[..n], &mut out).is_none());
+        assert!(replace_legacy_field(src.as_bytes(), b"nobody", &f[..n], &mut out).is_none());
     }
 }
