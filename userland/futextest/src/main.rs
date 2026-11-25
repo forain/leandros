@@ -320,6 +320,11 @@ static PI_WORD: AtomicU32 = AtomicU32::new(0);
 static PI_TID: AtomicU32 = AtomicU32::new(0);
 static PI_RES: AtomicI32 = AtomicI32::new(-1);
 static PI_OWNED: AtomicU32 = AtomicU32::new(0);
+/// The locker may release the lock only once the main thread has finished
+/// observing the word after its UNLOCK_PI; otherwise a locker that runs at
+/// once (idle host) can unlock before the observation and make a correct
+/// hand-off look like a release to 0 / a steal.
+static PI_GO: AtomicU32 = AtomicU32::new(0);
 
 /// The scheduler state letter of thread `tid` (from /proc/self/task/<tid>/stat),
 /// or '?' if it cannot be read.
@@ -344,12 +349,15 @@ fn pi_handoff_round(settle_ms: u64, bit_only: bool) -> (bool, String) {
     PI_TID.store(0, SeqCst);
     PI_RES.store(-1, SeqCst);
     PI_OWNED.store(0, SeqCst);
+    PI_GO.store(0, SeqCst);
     let h = thread::spawn(|| {
         let tid = gettid();
         PI_TID.store(tid, SeqCst);
         let r = futex(&PI_WORD, FUTEX_LOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
         PI_RES.store(r as i32, SeqCst);
         PI_OWNED.store((PI_WORD.load(SeqCst) & TID_MASK == tid) as u32, SeqCst);
+        let g = Instant::now();
+        while PI_GO.load(SeqCst) == 0 && g.elapsed() < Duration::from_secs(10) { thread::sleep(Duration::from_millis(1)); }
         futex(&PI_WORD, FUTEX_UNLOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
     });
     // Wait until the locker set FUTEX_WAITERS and is parked in the kernel.
@@ -372,6 +380,7 @@ fn pi_handoff_round(settle_ms: u64, bit_only: bool) -> (bool, String) {
     // word must already name it, so a user-space cas cannot take the lock.
     let after = PI_WORD.load(SeqCst);
     let stolen = PI_WORD.compare_exchange(0, me, SeqCst, SeqCst).is_ok();
+    PI_GO.store(1, SeqCst);
     // A steal means no hand-off happened: give the lock back, or the locker
     // (now queued behind us) and the join below would hang forever.
     if stolen { futex(&PI_WORD, FUTEX_UNLOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0); }
