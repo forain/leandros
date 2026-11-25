@@ -399,6 +399,20 @@ fn pi_handoff_round(settle_ms: u64, bit_only: bool) -> (bool, String) {
         why, un, after, tid, state, waited_ms, stolen, PI_RES.load(SeqCst), PI_OWNED.load(SeqCst), PI_WORD.load(SeqCst)))
 }
 
+/// LOCK_PI on a word that still names a TID that has exited must be ESRCH
+/// (strictness of the re-check that tolerates a word that moved on).
+fn pi_dead_owner() -> bool {
+    static W: AtomicU32 = AtomicU32::new(0);
+    static DEAD: AtomicU32 = AtomicU32::new(0);
+    thread::spawn(|| DEAD.store(gettid(), SeqCst)).join().unwrap();
+    let dead = DEAD.load(SeqCst);
+    W.store(dead, SeqCst);
+    let r = futex(&W, FUTEX_LOCK_PI | FUTEX_PRIVATE, 0, core::ptr::null(), 0);
+    let after = W.load(SeqCst);
+    let ok = r == -3 && after == dead;
+    report("pi_dead_owner", ok, format!("dead tid {} lock={} (want -3) word_after={:#x}", dead, r, after))
+}
+
 fn pi_handoff() -> bool {
     let (ok, detail) = pi_handoff_round(50, false);
     report("pi_handoff", ok, detail)
@@ -1244,6 +1258,7 @@ fn main() {
         ("robust_thread_exit", robust_thread_exit),
         ("robust_pi_exit", || robust_process("robust_pi_exit", Death::ExitWhileWaited, true)),
         ("pi_handoff", pi_handoff),
+        ("pi_dead_owner", pi_dead_owner),
         ("realtime_restart", realtime_restart),
     ];
     let mut failures = 0;
