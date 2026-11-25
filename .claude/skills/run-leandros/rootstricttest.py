@@ -94,7 +94,7 @@ class T:
 
     def boot_env(self, case, cmdline, sticks):
         """Env for one boot: cloned boot image with `cmdline`; sticks = [(img, id)] on one xhci."""
-        rid = f"{self.base}-rs{case}"
+        rid = f"{self.base}-rs{case}-{os.getpid()}"  # fresh logs per run
         img = os.path.join(self.tmp, f"boot-{case}.img")
         imgclone.clone_file(os.path.join(REPO, f"leandros-limine-{self.arch}.img"), img)
         subprocess.run(["bash", os.path.join(REPO, "scripts", "set-image-cmdline.sh"), img, cmdline],
@@ -118,6 +118,11 @@ class T:
         if rc != 0:
             return False, out[-300:]
         return True, ""
+
+    def up_async(self, arch, env):
+        drv("stop", timeout=60, env=env)
+        return subprocess.Popen(DRV + ["start", arch], env=env, cwd=REPO, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
 
     def login(self, env):
         rc, out = drv("login", "root", "root", "240", timeout=400, env=env)
@@ -152,13 +157,14 @@ def case_a(t, g):
 def case_b(t, g):
     rid, env = t.boot_env("b", f"root=PARTUUID={g} rootwait=6 root.fail=reboot", [])
     try:
-        ok, why = t.up(t.arch, env); t.check("b: start", ok, why)
+        proc = t.up_async(t.arch, env)   # `start` waits for a login prompt that never comes
         ok, log = t.wait_log(rid, lambda l: l.count(INIT_LINE) >= 2, 200)
         t.check("b: machine restarted (init ran twice)", ok, f"init lines: {log.count(INIT_LINE)}")
         t.check("b: vdb never mounted", "F2FS mounted successfully" not in log and "falling back to /dev/vdb" not in log)
-        t.check("b: console names the wanted root", f"root={g}" in log)
+        t.check("b: console names the wanted root", f"root=PARTUUID={g}" in log, "\n".join(l for l in log.splitlines() if "root" in l.lower())[-600:])
         t.check("b: root.fail=reboot message", "root.fail=reboot: restarting" in log)
     finally:
+        proc.kill()
         drv("stop", timeout=60, env=env)
 
 
@@ -166,7 +172,7 @@ def case_c(t, g):
     st = os.path.join(t.tmp, "c.img"); make_stick(t.arch, st, g)
     rid, env = t.boot_env("c", f"root=PARTUUID={g} rootwait=90", [])
     try:
-        ok, why = t.up(t.arch, env); t.check("c: start", ok, why)
+        proc = t.up_async(t.arch, env)
         ok, log = t.wait_log(rid, lambda l: "Waiting for the root device root=" in l, 150)
         t.check("c: init waits for the named root", ok)
         time.sleep(10)
@@ -175,6 +181,11 @@ def case_c(t, g):
         rc2, o2 = drv("qmp", "device_add", json.dumps({"driver": "usb-storage", "bus": "xhs.0",
                       "drive": "hotc", "id": "usbhot"}), timeout=60, env=env)
         t.check("c: hot-add accepted", rc1 == 0 and rc2 == 0 and "error" not in o2.lower(), o2[-200:])
+        try:
+            out = proc.communicate(timeout=300)[0]
+        except subprocess.TimeoutExpired:
+            proc.kill(); out = "start timed out"
+        t.check("c: start returns once the stick is added", proc.returncode == 0, out[-200:])
         ok, why = t.login(env); t.check("c: login after hot-add", ok, why)
         if ok:
             dev = t.root_dev(env)
@@ -196,16 +207,13 @@ def case_d(t, g):
         if ok:
             dev = t.root_dev(env)
             t.check("d: / is on a USB stick", bool(dev and dev.startswith("sd")), f"root on {dev}")
-            # the decoy's partition is 64 MiB (131072 sectors) bigger than the named one
-            want = (os.path.getsize(st) - 2 * MIB) // 512
+            # the decoy's partition is 64 MiB bigger than the named one: root must be the smaller sd?1
             _, out = drv("run", "cat /proc/partitions", "30", timeout=90, env=env)
-            sizes = {m.group(3): int(m.group(2)) for m in re.finditer(r"^\s*(\d+)\s+\d+\s+(\d+)\s+(sd\w+)$", out, re.M)}
-            blocks = {k: v * 2 for k, v in sizes.items()}   # 1 KiB blocks -> 512 B sectors
-            rootsize = blocks.get(dev + "1") if dev else None
-            if rootsize is None and dev:
-                rootsize = blocks.get(dev)
-            t.check("d: root partition is the named (smaller) one", rootsize == want,
-                    f"root {dev} sectors {rootsize}, named {want}, partitions {sizes}")
+            parts = {m.group(2): int(m.group(1)) for m in re.finditer(r"^\s*\d+\s+\d+\s+(\d+)\s+(sd\w*1)$", out, re.M)}
+            rootsize = parts.get(dev) if dev else None
+            t.check("d: root partition is the named (smaller) one",
+                    len(parts) == 2 and rootsize == min(parts.values()) and len(set(parts.values())) == 2,
+                    f"root {dev}, partitions {parts}")
     finally:
         drv("stop", timeout=60, env=env)
 
