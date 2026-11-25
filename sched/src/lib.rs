@@ -627,10 +627,19 @@ fn removed_space_unshared(rq: &RunQueue, t: &Task) -> bool {
 /// A Task removed from the run queue whose space no slot holds any more
 /// (`sole`, decided in the removing RUN_QUEUE hold): close and tear down the
 /// contents before the Box is dropped, so a stray `Arc` (an observer's clone)
-/// does not postpone the free past the group's report. The CPU already
-/// switched back to the kernel page table before the slot was removed (the
-/// dispatch loop's "detach" after `cpu_switch_to`), and no other CPU can load
-/// a space no slot refers to.
+/// does not postpone the free past the group's report.
+///
+/// Why no CPU walks the tables being freed. x86_64: the dispatch loop's
+/// "detach" after `cpu_switch_to` reloads the kernel CR3, so this CPU is off
+/// the space. aarch64: `arch_load_kernel_page_table` is EMPTY there and
+/// dispatch does not write TTBR0 for `page_table == 0`, so this CPU may keep
+/// the dead root in TTBR0 until its next user dispatch (which writes TTBR0 and
+/// runs `tlbi vmalle1`). That is sound because kernel code, running from
+/// TTBR1, never dereferences a user VA on a CPU whose current task is not the
+/// owner (foreign access goes through the HHDM), so the stale root is only
+/// reachable by the hardware's speculative walker, which cannot fault and whose
+/// TLB entries nothing consumes before the next TTBR0 write flushes them. On
+/// both arches no other CPU can load a space no slot refers to.
 fn reap_close_space(t: &Task, sole: bool) {
     if !sole { return; }
     if asfree::any_armed() && asfree::legacy_is(t.tgid) { return; } // negative control
@@ -6699,6 +6708,16 @@ pub fn preempt_check() {
 ///    times are bounded and spinning on `busy` cannot deadlock.
 ///  * `replace_address_space` (execve) waits for `busy` to clear before
 ///    dropping the displaced address space.
+///
+/// This does not re-check `closed`, and need not: `closed` is only set by
+/// `close_address_space`, which runs once no slot holds the space (the
+/// sole-user decision is taken under RUN_QUEUE). Both lookups here reach the
+/// space through a slot of the calling group (the CPU fast path through
+/// `CURRENT_AS`, cleared by the exit before the close; the slow path through
+/// the member's own `address_space` field, read under RUN_QUEUE), so a caller
+/// that finds a space this way is a live member and the space cannot have been
+/// closed. A foreign observer holding only a `Weak` goes through
+/// `acquire_foreign_as`, which does check `closed` under `busy`.
 pub(crate) fn lock_leader_address_space(pid: Pid) -> Option<*mut mm::vmm::AddressSpace> {
     // Fast path: the running task's own address space (page faults, its own
     // mm syscalls — nearly every call), via the per-CPU slot, no RUN_QUEUE.
@@ -7930,6 +7949,8 @@ fn scheduler_run_loop() -> ! {
                 // if this task exits (reaped below) or exits later on another
                 // CPU, its tables are released and reused — a CPU still
                 // holding them in CR3/TTBR0 faults on its next TLB miss.
+                // x86_64 only: on aarch64 this is empty and TTBR0 stays stale
+                // until the next user dispatch (see `reap_close_space`).
                 arch_load_kernel_page_table();
             }
 
@@ -8956,6 +8977,12 @@ pub fn exit(code: i32) -> ! {
 /// keeps it alive). Anything else keeps the old behaviour: the reaper drops
 /// it.
 ///
+/// For `CLONE_VM` sharers in different thread groups (a vfork child and its
+/// parent) the last user of the space does the free, so it can come after one
+/// group's `wait4` (the vfork child's exit leaves it to the parent, whose own
+/// exit or exec frees it): `wait4` of a group that was not the last user of
+/// its space does not promise a teardown.
+///
 /// The `Task` keeps running kernel code after this, so its root is detached
 /// first (in the same RUN_QUEUE hold `page_table` is cleared, so a
 /// re-dispatch after a preemption never loads the freed root), and the drop
@@ -9011,7 +9038,12 @@ fn release_exiting_address_space(pid: Pid) {
         // all that is left of that dispatch-loop pass.
         if as_drop_pending(tgid) {
             drop(rq);
-            while as_drop_pending(tgid) { irq_window(); core::hint::spin_loop(); }
+            while as_drop_pending(tgid) {
+                // The dropper may be waiting for this CPU's TLB flush.
+                mm::paging::tlb_service_pending();
+                irq_window();
+                core::hint::spin_loop();
+            }
             rq = RUN_QUEUE.lock();
         }
         // Sole user = no OTHER slot holds this very space (a CLONE_VM/vfork
@@ -9044,8 +9076,10 @@ fn release_exiting_address_space(pid: Pid) {
         }
         slot::publish(t);
         unsafe {
-            // x86_64: back onto the kernel CR3; aarch64: TTBR0 := 0 + local
-            // TLB flush (the kernel runs from TTBR1 either way).
+            // x86_64: back onto the kernel CR3. aarch64:
+            // `arch_load_kernel_page_table` does nothing there; the next line
+            // sets TTBR0 := 0 + a local TLB flush on THIS CPU only (other
+            // CPUs: see `reap_close_space` for why a stale TTBR0 is harmless).
             arch_load_kernel_page_table();
             arch_set_page_table(0);
             // This CPU's fast-path pointer must not keep naming the space
@@ -9095,12 +9129,21 @@ fn release_exiting_address_space(pid: Pid) {
 /// `Drop` a no-op. Never call with RUN_QUEUE held (this spins on `busy`).
 fn close_address_space(old: &alloc::sync::Arc<mm::vmm::AddressSpace>) -> usize {
     if old.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        asfree::BUSY_WAITS.fetch_add(1, Ordering::Release);
+        if asfree::any_armed() { asfree::note_closer_wait(old); }
         lockwatch::note_wait(lockwatch::L_AS_BUSY);
         // The holder may be waiting for this CPU's TLB flush acknowledgement.
+        // Where sleeping is allowed (never under RUN_QUEUE or a spin lock:
+        // this function is not called there), a starved or slow holder must
+        // not pin this CPU with IRQs masked: after ~50 us of spinning open an
+        // IRQ window and honour a pending tick, as `acquire_foreign_as` does.
+        let t0 = monotonic_ns();
         while old.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             mm::paging::tlb_service_pending();
             core::hint::spin_loop();
+            if irqctx::can_sleep() && monotonic_ns().saturating_sub(t0) >= FOREIGN_AS_SPIN_NS {
+                irq_window();
+                preempt_check();
+            }
         }
         lockwatch::note_wait(0);
     }
