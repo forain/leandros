@@ -543,7 +543,10 @@ pub type AsFreeEntry = (u64, usize, usize, usize);
 fn asfree_record(tgid: usize, pages: usize, pt_pages: usize) {
     let n = ASFREE_SEQ.fetch_add(1, Ordering::Relaxed);
     let s = &ASFREE_SLOTS[(n as usize) % ASFREE_RING];
-    s.seq.store(0, Ordering::Release);
+    s.seq.store(0, Ordering::Relaxed);
+    // Seqlock writer: the 0 must be visible before any field store (a Release
+    // store only orders what precedes it; aarch64 may otherwise reorder).
+    core::sync::atomic::fence(Ordering::Release);
     s.tgid.store(tgid, Ordering::Relaxed);
     s.pages.store(pages, Ordering::Relaxed);
     s.pt_pages.store(pt_pages, Ordering::Relaxed);
@@ -560,7 +563,9 @@ pub fn asfree_snapshot(out: &mut Vec<AsFreeEntry>) -> u64 {
         let s = &ASFREE_SLOTS[(n as usize) % ASFREE_RING];
         let a = s.seq.load(Ordering::Acquire);
         let (t, p, q) = (s.tgid.load(Ordering::Relaxed), s.pages.load(Ordering::Relaxed), s.pt_pages.load(Ordering::Relaxed));
-        if a == n + 1 && s.seq.load(Ordering::Acquire) == a { out.push((n, t, p, q)); }
+        // Seqlock reader: the field loads must complete before the re-check.
+        core::sync::atomic::fence(Ordering::Acquire);
+        if a == n + 1 && s.seq.load(Ordering::Relaxed) == a { out.push((n, t, p, q)); }
     }
     total
 }
