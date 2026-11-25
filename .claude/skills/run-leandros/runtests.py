@@ -45,6 +45,7 @@ Options:
                              ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
                              a64its   host:a64itstest.py alone (aarch64 GICv3 ITS: virtio-net + NVMe on MSI-X LPIs, /proc/interrupts, gic.its=0 fallback)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
+                             v6inject host:v6injecttest.py alone (host-injected RA MTU option + DAD claims on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              straysweep host:straysweeptest.py (greetd exit spares detached ssh jobs, own boot)
@@ -552,7 +553,9 @@ SUITES = {
                 "host:nettxtest.py --shape eth0:20000:20000:64:256:2",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
-                "host:udppeertest.py"],
+                "host:udppeertest.py",
+                # RA MTU option + NIC DADFAILED over a real wire: v6injecttest.py.
+                "host:v6injecttest.py"],
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
@@ -561,6 +564,8 @@ SUITES = {
     "a64its": ["host:a64itstest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
+    # v6injecttest.py alone (host-injected RA MTU option and DAD claims on a 2nd NIC).
+    "v6inject": ["host:v6injecttest.py"],
     # linkmontest.py alone.
     "linkmon": ["host:linkmontest.py"],
     # netidletest.py alone.
@@ -601,7 +606,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
+HOST_TIMEOUTS = {"deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "v6injecttest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
