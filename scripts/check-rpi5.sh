@@ -41,4 +41,8 @@ if rustc --edition 2021 --test "$ROOT_DIR/drivers/src/rpi_misc_logic.rs" -o "$kd
 else
     tail -n 20 "$kdir/hosttest.log"; echo "check-rpi5: rpi_misc_logic host tests FAILED"; rc=1
 fi
+# No code outside the gated seam may write the Command register (every command
+# must pass sdgrant::issue, via send_command or gated_cmd).
+bad="$(grep -n 'REG_COMMAND' "$ROOT_DIR/drivers/src/sdhci.rs" | grep -E '\.w(16|32)\(REG_COMMAND' || true)"
+if [[ -n "$bad" ]]; then echo "$bad"; echo "check-rpi5: ungated REG_COMMAND write in sdhci.rs FAILED"; rc=1; else echo "check-rpi5: REG_COMMAND only written via the grant gate ok"; fi
 exit "$rc"

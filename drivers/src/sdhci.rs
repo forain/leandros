@@ -255,6 +255,9 @@ const NI_XFER_COMPLETE:    u16 = 1 << 1;
 const NI_BUF_WRITE_READY:  u16 = 1 << 4;
 const NI_BUF_READ_READY:   u16 = 1 << 5;
 const NI_ERROR:            u16 = 1 << 15;
+const NI_CARD_INS: u16 = 1 << 6;
+const NI_CARD_REM: u16 = 1 << 7;
+const PSTATE_CARD_INSERTED: u32 = 1 << 16;
 const NI_ALL:              u16 = 0xFFFF;
 
 const EI_ALL: u16 = 0xFFFF;
@@ -355,6 +358,8 @@ static SDTEST_MIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 // ── Write grant: this driver writes only a card that is LeandrOS's own ─────
 /// The one switch every write command passes (see `send_command`). False until
 /// `init` has proven the card ours (`rpi_misc_logic::sdgrant::evaluate`).
+/// Present State bit 16 as recorded when the grant was given.
+static CD_AT_GRANT: AtomicBool = AtomicBool::new(false);
 static WRITE_GRANT: AtomicBool = AtomicBool::new(false);
 static SD_WR_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static SD_WR_ISSUED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -379,6 +384,8 @@ static PICK_PNO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::ne
 /// MBR disk signature (the PARTUUID prefix).
 static DISK_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// A card read still failed after the retries (not "no magic": "could not read").
+static INJECT_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static INJECT_RECOVERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static INJECT_RDERR: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 static READ_ERR: AtomicBool = AtomicBool::new(false);
 /// Volume label of the picked partition, read through its final offset.
@@ -774,6 +781,14 @@ impl SdhciDevice {
         // CMD55 arms `APP_NEXT`, which every following command consumes, so
         // ACMD23 and CMD23 (and CMD24 vs an ACMD24) are told apart.
         let app = APP_NEXT.swap(false, Ordering::Relaxed);
+        // Card removed or (re)inserted since the grant: the grant belonged to
+        // the card that was probed. Lock until the next probe.
+        if WRITE_GRANT.load(Ordering::Acquire) && self.card_changed() {
+            WRITE_GRANT.store(false, Ordering::Release);
+            SD_STATE.store(2, Ordering::Relaxed);
+            SD_REASON.store(crate::rpi_misc_logic::sdgrant::R_CARD_CHANGED, Ordering::Relaxed);
+            crate::kenv::pci::serial_debug("[sdhci] card removed/inserted: write grant revoked\n");
+        }
         let granted = WRITE_GRANT.load(Ordering::Acquire);
         if !crate::rpi_misc_logic::sdgrant::allows(granted, index, app) {
             SD_WR_REFUSED.fetch_add(1, Ordering::Relaxed);
@@ -822,6 +837,14 @@ impl SdhciDevice {
             self.r32(REG_RESPONSE0 + 8),
             self.r32(REG_RESPONSE0 + 12),
         ])
+    }
+
+    /// Card-detect changed since the grant, or a removal/insertion IRQ latched.
+    unsafe fn card_changed(&self) -> bool {
+        crate::rpi_misc_logic::sdgrant::card_revoked(
+            CD_AT_GRANT.load(Ordering::Relaxed),
+            self.r32(REG_PRESENT_STATE) & PSTATE_CARD_INSERTED != 0,
+            self.r16(REG_NORMAL_INT_STATUS) & (NI_CARD_INS | NI_CARD_REM) != 0)
     }
 
     /// Read or write one 512-byte sector via single-block PIO.
@@ -960,6 +983,16 @@ impl SdhciDevice {
         }
     }
 
+    /// A command issued outside `send_command` (manual CMD12, tuning CMD19):
+    /// still through the grant allowlist, and it consumes `APP_NEXT`.
+    unsafe fn gated_cmd(&self, index: u8, arg: u32, word: u16) {
+        let app = APP_NEXT.swap(false, Ordering::Relaxed);
+        let granted = WRITE_GRANT.load(Ordering::Acquire);
+        if !crate::rpi_misc_logic::sdgrant::issue(&mut CmdRegs(self), granted, index, app, arg, word) {
+            SD_WR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// After a failed multi-block transfer: reset CMD/DAT, send a manual
     /// CMD12 so a card left in the data or receive state returns to
     /// transfer state (an error reply from a card already there is fine),
@@ -970,7 +1003,7 @@ impl SdhciDevice {
         self.wait_cmd_inhibit_clear(false);
         self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
         self.w16(REG_ERROR_INT_STATUS, EI_ALL);
-        self.w16(REG_COMMAND, ((CMD_STOP_TRANSMISSION as u16) << 8) | RESP_48B
+        self.gated_cmd(CMD_STOP_TRANSMISSION as u8, 0, ((CMD_STOP_TRANSMISSION as u16) << 8) | RESP_48B
             | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_TYPE_ABORT);
         let _ = self.wait_normal_int(NI_CMD_COMPLETE);
         self.wait_cmd_inhibit_clear(true);
@@ -1827,8 +1860,7 @@ impl SdhciDevice {
             self.w16(REG_BLOCK_SIZE, 64);
             self.w16(REG_BLOCK_COUNT, 1);
             self.w16(REG_TRANSFER_MODE, TM_DIR_READ);
-            self.w32(REG_ARGUMENT1, 0);
-            self.w16(REG_COMMAND, ((CMD_SEND_TUNING as u16) << 8) | RESP_48 | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_DATA_PRESENT);
+            self.gated_cmd(CMD_SEND_TUNING as u8, 0, ((CMD_SEND_TUNING as u16) << 8) | RESP_48 | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_DATA_PRESENT);
             let mut got = false;
             let mut spins: u32 = 0;
             loop {
@@ -2099,9 +2131,18 @@ unsafe fn read_retry(raw: &SdhciDevice, blk: u64, buf: &mut [u8; BLOCK_SIZE]) ->
         // Test knob `sdhci.rderr=N`: the first N attempts fail (transient-error injection).
         if INJECT_RDERR.load(Ordering::Relaxed) > 0 && INJECT_RDERR.fetch_sub(1, Ordering::Relaxed) > 0 {
             raw.reset_cmd_dat();
+            // Rate limited: only the first 8 injections are logged.
+            if INJECT_LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] rderr: injected read error on block {}, retrying\n", blk));
+            }
             continue;
         }
-        if raw.do_io(false, blk, buf.as_mut_ptr()) { return true; }
+        if raw.do_io(false, blk, buf.as_mut_ptr()) {
+            if INJECT_LOGGED.load(Ordering::Relaxed) > 0 && INJECT_RECOVERED.swap(true, Ordering::Relaxed) == false {
+                crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] rderr: read of block {} recovered after {} injected error(s)\n", blk, INJECT_LOGGED.load(Ordering::Relaxed)));
+            }
+            return true;
+        }
         raw.reset_cmd_dat();
         raw.retune();
     }
@@ -2373,6 +2414,9 @@ fn decide_grant(_d: &SdhciDevice) -> bool {
     SD_REASON.store(reason, Ordering::Relaxed);
     if granted {
         SD_STATE.store(1, Ordering::Relaxed);
+        let cd = unsafe { _d.w16(REG_NORMAL_INT_STATUS, NI_CARD_INS | NI_CARD_REM); _d.r32(REG_PRESENT_STATE) & PSTATE_CARD_INSERTED != 0 };
+        CD_AT_GRANT.store(cd, Ordering::Relaxed);
+        crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] card-detect at grant: inserted={}\n", cd as u8));
         WRITE_GRANT.store(true, Ordering::Release);
     }
     if cmdline.split_ascii_whitespace().any(|t| t.starts_with("sdhci.trust=")) && granted && label != crate::rpi_misc_logic::sdgrant::LEANDROS_LABEL {

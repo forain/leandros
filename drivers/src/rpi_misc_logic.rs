@@ -587,6 +587,7 @@ pub mod sdgrant {
     pub const R_NO_LABEL: u8 = 4;
     pub const R_BAD_CMDLINE: u8 = 5;
     pub const R_READ_ERROR: u8 = 6;
+    pub const R_CARD_CHANGED: u8 = 7;
 
     /// The F2FS volume label LeandrOS's installer and image builders write.
     pub const LEANDROS_LABEL: &str = "leandros-root";
@@ -603,6 +604,7 @@ pub mod sdgrant {
             R_NO_LABEL => "label-is-not-leandros-root",
             R_BAD_CMDLINE => "cmdline-unreadable-or-without-root",
             R_READ_ERROR => "read-error",
+            R_CARD_CHANGED => "card-removed-or-inserted",
             _ => "unknown",
         }
     }
@@ -673,7 +675,7 @@ pub mod sdgrant {
             _ => return (false, R_BAD_CMDLINE),
         };
         let trusted = cl.split_ascii_whitespace().filter_map(|t| t.strip_prefix("sdhci.trust=")).last()
-            .map_or(false, |v| partuuid_matches(v, c.disk_id, c.pno));
+            .map_or(false, |v| c.disk_id != 0 && partuuid_matches(v, c.disk_id, c.pno));
         if !trusted && c.label != LEANDROS_LABEL { return (false, R_NO_LABEL); }
         let root = cl.split_ascii_whitespace().filter_map(|t| t.strip_prefix("root=")).last();
         match root {
@@ -683,6 +685,11 @@ pub mod sdgrant {
             None => (true, R_OK),
         }
     }
+
+    /// Revoke the grant? Only on a CHANGE of the card-detect bit from the value
+    /// recorded at grant time, or a latched insertion/removal interrupt: a
+    /// stable 0 (unreliable pin) never revokes.
+    pub fn card_revoked(at_grant: bool, now: bool, irq_latched: bool) -> bool { irq_latched || now != at_grant }
 
     /// Commands that change card contents or state: CMD24/25 (write), 27 (CSD
     /// program), 28/29 (write protect), 32/33/38 (erase), 42 (lock/unlock),
@@ -724,6 +731,25 @@ pub mod sdgrant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn card_detect_revokes_only_on_change() {
+        use sdgrant::card_revoked;
+        assert!(!card_revoked(false, false, false)); // stable 0: no revoke
+        assert!(!card_revoked(true, true, false));
+        assert!(card_revoked(true, false, false));   // 1 -> 0
+        assert!(card_revoked(false, false, true));   // latched IRQ
+    }
+
+    #[test]
+    fn trust_rejected_for_zero_disk_id() {
+        use sdgrant::*;
+        let c = |disk_id| Ctx { found: true, label: "custom", disk_id, pno: 2, rw: true,
+            cmdline: Some("root=/dev/mmcblk0p2 sdhci.trust=00000000-02"), require_root: true };
+        assert_eq!(evaluate(&c(0)), (false, R_NO_LABEL));
+        let ok = Ctx { cmdline: Some("root=/dev/mmcblk0p2 sdhci.trust=1234abcd-02"), ..c(0x1234abcd) };
+        assert_eq!(evaluate(&ok), (true, R_OK));
+    }
+
     use super::*;
 
     struct Fake { rsts: u32, writes: u32 }

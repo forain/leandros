@@ -105,9 +105,9 @@ fn label_is(idx: usize, label: &str) -> bool {
 /// logged once and the card is used.
 pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<usize, RootErr> {
     if let Some(spec) = cmdline.and_then(parse_root_arg) {
-        if let Some(i) = spec.strip_prefix("/dev/").and_then(lookup_name) { return Ok(i); }
+        if let Some(i) = spec.strip_prefix("/dev/").and_then(lookup_name).filter(|&i| !read_only(i)) { return Ok(i); }
         if let Some(label) = spec.strip_prefix("LABEL=") {
-            if label_is(1, label) { return Ok(1); }
+            if label_is(1, label) && !read_only(1) { return Ok(1); }
         }
         if !HINT_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
             crate::pci::serial_debug("[BLK] root=");
@@ -115,7 +115,7 @@ pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<us
             crate::pci::serial_debug(" names no device on this board; using the SD card\n");
         }
     }
-    if 1 < device_count() && has_f2fs(1) { Ok(1) } else { Err(RootErr::NotFound) }
+    if 1 < device_count() && has_f2fs(1) && !read_only(1) { Ok(1) } else { Err(RootErr::NotFound) }
 }
 
 /// The SD path has no runtime registration; always `Unsupported`.
