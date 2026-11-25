@@ -2348,7 +2348,7 @@ unsafe fn test_wait_teardown_busyhold() -> bool {
         let mut go = [0i32; 2];
         let pid = spawn_gated_child(&mut go);
         if pid <= 0 { return report(name, false); }
-        let armed = asfree_do(b"busyhold", pid, 2_000 + 600 * round);
+        let armed = asfree_do(b"busyhold", pid, 2_000 + 300 * round);
         write(go[1], b"x".as_ptr(), 1);
         close(go[1]);
         let status = wait_status(pid);
