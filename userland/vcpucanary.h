@@ -13,6 +13,7 @@
 #ifndef VCPUCANARY_H
 #define VCPUCANARY_H
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -34,6 +35,9 @@ static long long canary_now(void) {
 }
 static void *canary_spin(void *a) {
     (void)a;
+#ifdef SCHED_IDLE
+    { struct sched_param sp = { 0 }; pthread_setschedparam(pthread_self(), SCHED_IDLE, &sp); } /* best effort */
+#endif
     long long prev = canary_now();
     while (!canary_stop_flag) {
         long long t = canary_now();
@@ -88,8 +92,15 @@ static long long canary_max(const struct canary_ev *ev, volatile unsigned *np, l
 static const char *canary_report(long long t0, long long t1, char *buf, size_t sz) {
     long long sg = canary_max(canary_spin_ev, &canary_spin_n, t0, t1);
     long long so = canary_max(canary_slp_ev, &canary_slp_n, t0, t1);
-    const char *v = sg >= SPIN_MIN_US ? "HOST-DELAYED" : (so >= SLEEP_MIN_US ? "NO-SPIN-GAP(kernel-wake?)" : "no-vcpu-delay");
-    snprintf(buf, sz, "[canary spin-gap %lld us, sleep-overshoot %lld us: %s]", sg, so, v);
+    /* The sleeper's overshoot includes any vCPU stall the spinner saw; only the
+     * residue (overshoot - gap) is a guest wake-up delay. */
+    long long res = so > sg ? so - sg : 0;
+    char vb[96];
+    const char *v;
+    if (sg >= SPIN_MIN_US && res < SLEEP_MIN_US) v = "HOST-DELAYED";
+    else if (sg >= SPIN_MIN_US) { snprintf(vb, sizeof vb, "MIXED (host %lld ms + wake %lld ms)", sg / 1000, res / 1000); v = vb; }
+    else v = so >= SLEEP_MIN_US ? "NO-SPIN-GAP(kernel-wake?)" : "no-vcpu-delay";
+    snprintf(buf, sz, "[canary spin-gap %lld us, sleep-overshoot %lld us, residue %lld us: %s]", sg, so, res, v);
     return buf;
 }
 #endif
