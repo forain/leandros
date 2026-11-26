@@ -1,0 +1,1 @@
+root=PARTUUID=@PARTUUID@ root.fail=reboot espctl=0 leandros.tryboot=1 tryboot.deadline=300 sdhci.rw=0 panic.reset=5 rootwait=60

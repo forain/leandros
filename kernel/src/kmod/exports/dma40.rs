@@ -29,7 +29,7 @@ pub extern "C" fn kapi_hdmi_sink_info(out: *mut kmod_abi::KHdmiSink) -> i32 {
     let want = core::mem::size_of::<kmod_abi::KHdmiSink>() as u32;
     unsafe {
         if (*out).size < want { return -22; }
-        *out = kmod_abi::KHdmiSink { size: want, state: st, port_flags: fl, pix_khz: px, sink: sk, d0: drivers::hdmi_plat::is_d0() as u32 };
+        *out = kmod_abi::KHdmiSink { size: want, state: st, port_flags: fl, pix_khz: px, sink: sk, d0: drivers::hdmi_plat::stepping_code() };
     }
     0
 }

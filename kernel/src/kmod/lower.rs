@@ -36,8 +36,12 @@ pub fn hold_irq(owner: KmodId, key: u64, h: drivers::irq::IrqHandle) {
     IRQS.lock().push((super::gate::owner(owner), key, h));
 }
 
-/// Free one held handle. Synchronous: the lower gate was drained before this runs, so a handler
-/// that was in flight has finished and any later delivery finds the gate closed.
+/// Is any MSI-X handle on the table at `table_va` still held?
+pub fn has_msix_handle(table_va: usize) -> bool { IRQS.lock().iter().any(|x| x.2.msix_table() == Some(table_va)) }
+
+/// Free one held handle. Not synchronous on the `kapi_irq_free` path: it does not wait for a handler in flight
+/// (no synchronize-IRQ). Safety comes from the gate: the module's handler runs through the lower gate, so a late
+/// delivery after the free finds the gate closed (on unload the gate was drained first).
 pub fn release_irq(owner: KmodId, key: u64) -> bool {
     let h = {
         let mut v = IRQS.lock();

@@ -43,8 +43,6 @@ pub mod env {
 
     pub fn serial_raw(s: &str) { crate::pci::serial_debug(s) }
     pub fn sleep_until(ns: u64) { crate::sys_common::sleep_until(ns) }
-    /// MSI-X for the storage drivers (same names as the built-in `kenv::irq`).
-    pub mod irq { pub use crate::irq::{IrqHandler, IrqReturn, MsixTable}; }
     /// Interrupt-to-task wake-up: the ISR calls `notify`, the I/O path `wait`s with a timeout.
     pub use crate::netdev::LinkMon as IrqWait;
 
@@ -129,28 +127,6 @@ pub mod env {
         pub mod kthread {
             pub use crate::sched::kthread::*;
             pub fn cond_resched() { crate::sys_common::yield_now() }
-        }
-        pub mod ksync {
-            use core::ops::{Deref, DerefMut};
-            use core::cell::UnsafeCell;
-            /// Sleeping mutex over `kapi_mutex_*`.
-            pub struct KMutex<T> { h: usize, v: UnsafeCell<T> }
-            unsafe impl<T: Send> Send for KMutex<T> {}
-            unsafe impl<T: Send> Sync for KMutex<T> {}
-            pub struct KMutexGuard<'a, T> { m: &'a KMutex<T> }
-            impl<T> KMutex<T> {
-                pub fn new(v: T) -> Self { KMutex { h: crate::sys_common::mutex_new("blk"), v: UnsafeCell::new(v) } }
-                pub fn try_lock(&self) -> Option<KMutexGuard<'_, T>> {
-                    if crate::sys_common::mutex_trylock(self.h) { Some(KMutexGuard { m: self }) } else { None }
-                }
-                pub fn is_locked(&self) -> bool {
-                    match self.try_lock() { Some(_) => false, None => true }
-                }
-                pub fn lock(&self) -> KMutexGuard<'_, T> { crate::sys_common::mutex_lock(self.h); KMutexGuard { m: self } }
-            }
-            impl<T> Deref for KMutexGuard<'_, T> { type Target = T; fn deref(&self) -> &T { unsafe { &*self.m.v.get() } } }
-            impl<T> DerefMut for KMutexGuard<'_, T> { fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.m.v.get() } } }
-            impl<T> Drop for KMutexGuard<'_, T> { fn drop(&mut self) { crate::sys_common::mutex_unlock(self.m.h); } }
         }
     }
 }

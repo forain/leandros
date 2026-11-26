@@ -1464,6 +1464,40 @@ unsafe fn fail(msg: &[u8]) -> bool {
     report(b"dead_local_tick\0", false)
 }
 
+/// One measurement: a child pinned to `c` provokes one-shot -> periodic switches, then the
+/// per-CPU interrupt rate over 1 s. None if the child could not pin.
+unsafe fn run_attempt(c: usize) -> Option<u64> {
+    let child = fork();
+    if child == 0 {
+        if !pin(c) { exit(3); }
+        // Short poll deadlines: each takes the CPU through a one-shot and back
+        // to periodic mode, where the stalled switch happens.
+        for _ in 0..300 { sleep_ms(2); }
+        // Then a nearly idle CPU: only its periodic tick can fire now.
+        loop { sleep_ms(200); }
+    }
+    sleep_ms(1500);
+    let a = local_irqs(c).unwrap_or(0);
+    sleep_ms(1000);
+    let b = local_irqs(c).unwrap_or(0);
+    let mut st: c_int = 0;
+    let dead_child = waitpid(child, &mut st, 1) == child; // WNOHANG: child exited early (pin failed)
+    kill(child, 9);
+    waitpid(child, core::ptr::null_mut(), 0);
+    if dead_child { return None; }
+    Some(b.wrapping_sub(a))
+}
+
+/// Re-arm the kernel's one-shot stall on `c` (`stall <cpu>` to /proc/leandros_timer, root only).
+unsafe fn rearm_stall(c: usize) -> bool {
+    let fd = open(b"/proc/leandros_timer\0".as_ptr(), 1);
+    if fd < 0 { return false; }
+    let msg = [b's', b't', b'a', b'l', b'l', b' ', b'0' + c as u8];
+    let r = write(fd, msg.as_ptr(), msg.len());
+    close(fd);
+    r == msg.len() as isize
+}
+
 unsafe fn test_dead_local_tick() -> bool {
     let name = b"dead_local_tick\0";
     // x86_64 only: aarch64 has no LAPIC. runtests only runs this suite on
@@ -1490,25 +1524,7 @@ unsafe fn test_dead_local_tick() -> bool {
     let other = if c == 0 { 1 } else { 0 };
     if local_irqs(other).is_none() { return fail(b"helper CPU absent from /proc/leandros_timer"); }
     if !pin(other) { return fail(b"sched_setaffinity(helper) failed"); }
-    let child = fork();
-    if child == 0 {
-        if !pin(c) { exit(3); }
-        // Short poll deadlines: each takes the CPU through a one-shot and back
-        // to periodic mode, where the stalled switch happens.
-        for _ in 0..300 { sleep_ms(2); }
-        // Then a nearly idle CPU: only its periodic tick can fire now.
-        loop { sleep_ms(200); }
-    }
-    sleep_ms(1500);
-    let a = local_irqs(c).unwrap_or(0);
-    sleep_ms(1000);
-    let b = local_irqs(c).unwrap_or(0);
-    let mut st: c_int = 0;
-    let dead_child = waitpid(child, &mut st, 1) == child; // WNOHANG: child exited early (pin failed)
-    kill(child, 9);
-    waitpid(child, core::ptr::null_mut(), 0);
-    if dead_child { return fail(b"worker could not pin to the CPU (sched_setaffinity failed)"); }
-    let rate = b.wrapping_sub(a);
+    let rate = match run_attempt(c) { Some(r) => r, None => return fail(b"worker could not pin to the CPU (sched_setaffinity failed)") };
     let consumed = stat(b"stall_consumed").unwrap_or(0);
     // Absolute: the stall hits during early boot tests, before this one starts.
     let rec = stat(b"dead_recovered").unwrap_or(0);
@@ -1530,8 +1546,31 @@ unsafe fn test_dead_local_tick() -> bool {
         if rec != 0 { return fail(b"fix 1 active but dead_recovered != 0 (stall did not hit, or fix 1 ineffective)"); }
         if rate < 50 { return fail(b"tick below 50 Hz with fix 1"); }
     } else if fixmask & 2 != 0 {
-        if rec != 1 || rec_per != 1 { return fail(b"fix 2 only: expected exactly one periodic-state recovery"); }
-        if rate < 50 { return fail(b"tick below 50 Hz after recovery"); }
+        // The stall only sometimes kills the tick (a pending one-shot IRQ can re-enter
+        // program_periodic and revive it), so retry the stall in this boot until one kills the
+        // tick and fix 2 recovers it. Per attempt: killed (countdown 0 at the flip), recovered, alive.
+        let (mut r0, mut p0, mut k0, mut rate) = (0u64, 0u64, 0u64, rate);
+        let mut attempt = 0u64;
+        loop {
+            let rec = stat(b"dead_recovered").unwrap_or(0);
+            let rec_per = statn(b"recovered_by_state", 0).unwrap_or(99);
+            let killed = stat(b"stall_killed").unwrap_or(0);
+            print_kv(b"dead_local_tick: attempt = \0", attempt);
+            print_kv(b"dead_local_tick:   killed = \0", killed - k0);
+            print_kv(b"dead_local_tick:   recovered = \0", rec - r0);
+            print_kv(b"dead_local_tick:   alive_rate = \0", rate);
+            let (dr, dp) = (rec - r0, rec_per.wrapping_sub(p0));
+            if rate < 50 { return fail(b"tick below 50 Hz (fix 2 did not recover a dead tick)"); }
+            if dr > 1 || dr != dp { return fail(b"fix 2 only: recovery count wrong (rec > 1 or not all periodic-state)"); }
+            if dr == 1 { return report(name, true); }
+            // dr == 0 and alive: the stall did not kill the tick: inconclusive, try again.
+            if attempt >= 11 || !rearm_stall(c) { break; }
+            r0 = rec; p0 = rec_per; k0 = killed;
+            attempt += 1;
+            rate = match run_attempt(c) { Some(r) => r, None => return fail(b"worker could not pin to the CPU (sched_setaffinity failed)") };
+        }
+        write(1, b"dead_local_tick: INCONCLUSIVE: the stall never killed the tick\n".as_ptr(), 63);
+        return report(name, false);
     } else if rate < 50 {
         return fail(b"tick is dead (no fix active)");
     } else if rec != 0 {

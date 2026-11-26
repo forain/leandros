@@ -181,8 +181,59 @@ static PROF_COUNT: AtomicI32 = AtomicI32::new(0);
 extern "C" fn vt_handler(_s: c_int) { VT_COUNT.fetch_add(1, Ordering::SeqCst); }
 extern "C" fn prof_handler(_s: c_int) { PROF_COUNT.fetch_add(1, Ordering::SeqCst); }
 
+// ── vCPU-delay canary (diagnostic only; does not change any limit) ──────────
+//
+// A forked child spins on CLOCK_MONOTONIC and writes (end_ns, gap_ns) for each
+// gap > 1 ms into a pipe. A gap while the child was spinning means its vCPU
+// did not run: host scheduling delay, not a guest wake-up bug. It is a child
+// (not a thread) because the tests below use process CPU-time clocks.
+struct Canary { pid: c_int, rd: c_int }
+unsafe fn canary_start() -> Canary {
+    let mut fds = [0 as c_int; 2];
+    if pipe(fds.as_mut_ptr()) != 0 { return Canary { pid: -1, rd: -1 }; }
+    let pid = fork();
+    if pid == 0 {
+        close(fds[0]);
+        let mut prev = now_ns();
+        let mut sent = 0;
+        loop {
+            let t = now_ns();
+            if t - prev > 1_000_000 && sent < 1500 {
+                let mut rec = [0u8; 16];
+                rec[..8].copy_from_slice(&t.to_ne_bytes());
+                rec[8..].copy_from_slice(&(t - prev).to_ne_bytes());
+                write(fds[1], rec.as_ptr(), 16);
+                sent += 1;
+            }
+            prev = t;
+        }
+    }
+    close(fds[1]);
+    Canary { pid, rd: fds[0] }
+}
+/// Stop the canary and print the largest spin gap seen in [t0, t1] (ns).
+unsafe fn canary_finish(c: Canary, t0: i64, t1: i64) {
+    if c.pid <= 0 { print_kv(b"  canary_unavailable=\0", 1); return; }
+    kill(c.pid, 9);
+    let mut st = 0;
+    waitpid(c.pid, &mut st, 0);
+    let mut rec = [0u8; 16];
+    let (mut maxgap, mut n) = (0i64, 0u64);
+    while read(c.rd, rec.as_mut_ptr(), 16) == 16 {
+        let end = i64::from_ne_bytes(rec[..8].try_into().unwrap());
+        let len = i64::from_ne_bytes(rec[8..].try_into().unwrap());
+        if end >= t0 && end - len <= t1 { n += 1; if len > maxgap { maxgap = len; } }
+    }
+    close(c.rd);
+    print_kv(b"  canary_spin_gaps_over_1ms=\0", n);
+    print_kv(b"  canary_max_spin_gap_us=\0", (maxgap / 1000) as u64);
+    print_kv(b"  canary_window_ms=\0", ((t1 - t0) / 1_000_000) as u64);
+}
+
 pub unsafe fn test_cpu_time_timers() -> bool {
     let name = b"cpu_time_timers\0";
+    let canary = canary_start();
+    let win0 = now_ns();
     VT_COUNT.store(0, Ordering::SeqCst);
     PROF_COUNT.store(0, Ordering::SeqCst);
     let mut ok = set_handler(SIGVTALRM, vt_handler, 0) && set_handler(SIGPROF, prof_handler, 0);
@@ -229,10 +280,13 @@ pub unsafe fn test_cpu_time_timers() -> bool {
     }
     sigprocmask(SIG_SETMASK, &old, core::ptr::null_mut());
 
+    canary_finish(canary, win0, now_ns());
     print_kv(b"  vt_after_sleep=\0", vt_after_sleep as u64);
     print_kv(b"  vt_after_burn=\0", vt_after_burn as u64);
     print_kv(b"  prof_getitimer_us=\0", prof_rem_us.max(0) as u64);
     print_kv(b"  prof_after_burn=\0", prof_after_burn as u64);
+    print_kv(b"  prof_after_sleep=\0", prof_after_sleep as u64);
+    print_kv(b"  ok_bad_which_cpu_case=\0", (ok as u64) * 100 + (bad_which as u64) * 10 + cpu_case as u64);
     report(name, ok && vt_after_sleep == 0 && vt_after_burn == 1
         && prof_rem_us > 0 && prof_rem_us <= 60_000 && prof_after_sleep == 0 && prof_after_burn == 1
         && bad_which && cpu_case)

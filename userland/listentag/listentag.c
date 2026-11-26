@@ -40,6 +40,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include "../vcpucanary.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -266,6 +267,7 @@ static void epollet_cases(void) {
         static const int gaps[] = { 25, 40, 60, 150, 30, 110 };
         long long worst = 0;
         int late = 0, lost = 0;
+        char cbuf[160];
         for (int i = 0; i < NCONN; i++) {
             msleep(gaps[i % 6]);
             int base = a.accepted;
@@ -280,7 +282,8 @@ static void epollet_cases(void) {
             if (d > worst) worst = d;
             if (d > LIMIT_US) {
                 late++;
-                printf("%s: connect %d (gap %d ms) accepted after %lld us\n", na, i, gaps[i % 6], d);
+                printf("%s: connect %d (gap %d ms) accepted after %lld us %s\n", na, i, gaps[i % 6], d,
+                       canary_report(t1, a.at[base], cbuf, sizeof cbuf));
             }
             close(c);
         }
@@ -356,7 +359,7 @@ static void level_case(const char *n, int use_select) {
         if (d < 0) d = 0;
         if (!w.returned) { fail(n, "a connect did not return the waiter within 2 s"); bad = 1; }
         else if (w.rv != 1) { fail(n, "returned %d", w.rv); bad = 1; }
-        else if (d > LIMIT_US) { fail(n, "returned %lld us after the connect (limit 20 ms)", d); bad = 1; }
+        else if (d > LIMIT_US) { char cb[160]; fail(n, "returned %lld us after the connect (limit 20 ms) %s", d, canary_report(t1, w.at, cb, sizeof cb)); bad = 1; }
         else printf("%s: returned %lld us after the connect\n", n, d);
     }
     int acc = accept4(l, NULL, NULL, 0);
@@ -427,10 +430,12 @@ int main(int argc, char **argv) {
         skip("select_listener", "(no /proc/sysstat)");
     } else {
         close(sfd);
+        canary_start();
         epollet_cases();
         level_case("poll_listener", 0);
         level_case("select_listener", 1);
         sshd_rows();
+        canary_stop();
     }
     printf("listentag: %d passed, %d failed, %d skipped\n", n_pass, n_fail, n_skip);
     return n_fail > 125 ? 125 : n_fail;

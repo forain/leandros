@@ -5865,7 +5865,18 @@ fn futex_lock_pi(uaddr: usize, private: bool, deadline: Option<u64>, try_only: b
         if owner == tid { return -35; } // EDEADLK
         if try_only { return -11; }     // EWOULDBLOCK
         let owner_k = match sched::pidns::from_cur(owner) { Ok(k) => k, Err(e) => return e };
-        if !sched::futex_task_exists(owner_k) { return -3; } // ESRCH
+        if !sched::futex_task_exists(owner_k) {
+            // The word was loaded before the lookup: the owner may have
+            // unlocked and exited in between. ESRCH only if the word still
+            // names the dead owner (Linux); otherwise re-evaluate. Each
+            // retry needs another thread to have changed the word, so the
+            // loop progresses with them and cannot spin on a stable word.
+            match ua::load_user_u32(uaddr) {
+                Some(w2) if w2 != w => continue,
+                Some(_) => return -3, // ESRCH
+                None => return -14,
+            }
+        }
         // Held: make the owner's unlock come to the kernel, then park
         // expecting exactly that word. FUTEX_WAITERS goes in BEFORE any
         // timeout verdict: a woken locker that lost the free word to a

@@ -44,11 +44,15 @@ for b in boots:
     cpu, m = b.split(":")
     red = (int(m) & 3) == 0
     ok, why = False, ""
-    # The stall kills the tick only when it lands in the race window; with no fix about one
-    # boot in six keeps its tick. Boots without fix 1 (red, and fix-2-only which needs a death to recover from) therefore get up to 3
-    # attempts; a green one passes only when an attempt really recovers exactly once.
+    # The stall kills the tick only when it lands in the race window. Red (fixmask 0): retry the boot
+    # only when the tick came out alive. Fix 2 only: the guest itself re-arms the stall up to 12 times
+    # in one boot; a boot retries only on its INCONCLUSIVE verdict (the stall never killed the tick),
+    # any other failure stops at once.
     racy = (int(m) & 1) == 0  # without fix 1 the death only happens when the stall lands in the window
+    fix2only = (int(m) & 3) == 2
+    retry = False
     for attempt in range(3 if racy else 1):
+        retry = False
         # Unique run id and out dir per attempt: a leftover wedged VM or log never aliases the next.
         rid = f"{BASE_RID}-deadtimer{cpu}m{m}a{attempt}-{os.getpid()}"
         out_base = os.path.join(BASE_OUT, f"deadtimer-{os.getpid()}-{cpu}-{m}-a{attempt}")
@@ -74,17 +78,28 @@ for b in boots:
                 # guest from ever reaching a shell: that is the same defect, so it is red too.
                 ok = rc != 0 and ("FAIL: tick is dead" in log or (cpu == "0" and "dead_local_tick: cpu" not in log))
                 why = "red as expected" if ok else "expected red (tick is dead) but got rc=%d" % rc
+                retry = not ok and rc == 0  # guest passed: the tick came out alive
             else:
                 ok = rc == 0
                 why = "green" if ok else "rc=%d" % rc
+                if fix2only and not ok:
+                    log = captured
+                    for f in glob.glob(os.path.join(out_base, f"tests-{rtag}*", "**", "serial-full.log"), recursive=True):
+                        log += open(f, errors="replace").read()
+                    retry = "dead_local_tick: INCONCLUSIVE" in log
+                    if retry:
+                        why = "INCONCLUSIVE (stall never killed the tick)"
+                    elif "dead_local_tick: FAIL:" in log:
+                        why = "rc=%d: " % rc + log.split("dead_local_tick: FAIL:", 1)[1].split("\n", 1)[0].strip()
         except subprocess.TimeoutExpired:
             ok = red and cpu == "0"  # a dead BSP tick hangs the whole guest: the expected red
             why = f"HANG: no result within {BOOT_TIMEOUT}s" + (" (BSP tick dead, red as expected)" if ok else "")
         # A hung guest (dead BSP tick) outlives runtests: reap exactly this attempt's VM by its
         # own run id so the image lock is released, and nothing else.
         reap(rid)
-        if ok or not racy:
+        if ok or not racy or not retry:
             break
+        print(f"deadtimertest.py: cpu{cpu} fixmask={m} attempt {attempt}: {why}; retrying", flush=True)
     print(f"deadtimertest.py {arch} cpu{cpu} fixmask={m}: {'PASS' if ok else 'FAIL'} ({why})", flush=True)
     bad += not ok
 print(f"deadtimertest.py {arch}: {'PASS' if not bad else 'FAIL'}")
