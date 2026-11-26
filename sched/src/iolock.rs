@@ -96,6 +96,9 @@ static LAST_HOLD_REPORT_NS: AtomicU64 = AtomicU64::new(0);
 static SUPPRESSED_WAIT: AtomicU32 = AtomicU32::new(0);
 static SUPPRESSED_HOLD: AtomicU32 = AtomicU32::new(0);
 
+/// How long a caller that cannot sleep spins for the lock before giving up.
+pub const NOSLEEP_LOCK_TIMEOUT_NS: u64 = 20_000_000_000;
+
 impl<T> IoMutex<T> {
     /// `_id` is kept for source compatibility with the lockwatch-tracked
     /// spinning version; a sleeping lock is deliberately not tracked there.
@@ -123,10 +126,35 @@ impl<T> IoMutex<T> {
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> IoGuard<'_, T> {
+        loop { if let Some(g) = self.lock_inner() { return g; } }
+    }
+
+    /// Like `lock`, but a caller that may not sleep gives up after
+    /// `NOSLEEP_LOCK_TIMEOUT_NS` (logged) instead of spinning forever: `None`.
+    #[track_caller]
+    pub fn lock_bounded(&self) -> Option<IoGuard<'_, T>> { self.lock_inner() }
+
+    #[track_caller]
+    fn lock_inner(&self) -> Option<IoGuard<'_, T>> {
         let mut waited = 0u64;
         if !self.raw.try_lock() {
             let t0 = crate::monotonic_ns();
-            self.raw.lock();
+            // Queued even when the caller cannot sleep (a polling `lock()` is starved by the
+            // hand-off to queued sleepers). A spinner is a RUNNING CPU: let it overtake sleeping
+            // waiters a bounded number of times, so the grant does not sit on a Ready-but-
+            // CPU-less task while a CPU spins on a spinlock the spinner's holder needs.
+            let class = if crate::irqctx::might_sleep() { crate::ksync::LockClass::Fifo }
+                        else { crate::ksync::LockClass::Prio { max_bypass: 16 } };
+            let sleeps = crate::irqctx::might_sleep();
+            let deadline = if sleeps { u64::MAX } else { crate::ksync::deadline_after(NOSLEEP_LOCK_TIMEOUT_NS) };
+            if !self.raw.lock_class(class, deadline) {
+                crate::irqctx::raw_log("[IOLOCK] non-sleeping wait for ");
+                crate::irqctx::raw_log(self.name);
+                crate::irqctx::raw_log(" timed out (owner pid ");
+                crate::irqctx::raw_dec(self.owner_pid() as u64);
+                crate::irqctx::raw_log(")\n");
+                return None;
+            }
             waited = crate::monotonic_ns().saturating_sub(t0).max(1);
             self.waits.fetch_add(1, Ordering::Relaxed);
             self.wait_ns.fetch_add(waited, Ordering::Relaxed);
@@ -139,12 +167,22 @@ impl<T> IoMutex<T> {
         self.win_acquires.fetch_add(1, Ordering::Relaxed);
         self.hold_since.store(crate::monotonic_ns(), Ordering::Relaxed);
         self.holder_pid.store(crate::current_pid(), Ordering::Relaxed);
-        IoGuard { m: self, waited }
+        Some(IoGuard { m: self, waited })
     }
 
     /// Take the lock only if it is free right now (any context).
     pub fn try_lock(&self) -> Option<IoGuard<'_, T>> {
         if !self.raw.try_lock() { return None; }
+        self.note_acquired()
+    }
+
+    /// `try_lock` that also never waits for the mutex's internal spinlock (panic path).
+    pub fn try_lock_nowait(&self) -> Option<IoGuard<'_, T>> {
+        if !self.raw.try_lock_nowait() { return None; }
+        self.note_acquired()
+    }
+
+    fn note_acquired(&self) -> Option<IoGuard<'_, T>> {
         self.acquires.fetch_add(1, Ordering::Relaxed);
         self.win_acquires.fetch_add(1, Ordering::Relaxed);
         self.hold_since.store(crate::monotonic_ns(), Ordering::Relaxed);

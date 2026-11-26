@@ -7,7 +7,6 @@
 
 #[allow(unused_imports)]
 use leandros_lib::mmio::{MmioRd, MmioWr};
-use spin::Mutex;
 use core::sync::atomic::AtomicU64;
 use core::fmt::Write as _;
 use crate::kenv::pci::{PciDevice, find_all_devices, pci_read_config_8, pci_read_config_16, pci_read_config_32, pci_write_config_16};
@@ -43,19 +42,26 @@ const IO_TIMEOUT_NS: u64 = 30_000_000_000;
 /// since boot (all virtio-blk disks, counted from 1) for MS milliseconds,
 /// i.e. a device that answers MS late; `virtio_blk.slow_ms=MS` replaces the
 /// 30 s slow-request threshold.
-struct Knobs { delay_n: u64, delay_ns: u64, slow_ns: u64 }
+struct Knobs { delay_n: u64, delay_ns: u64, slow_ns: u64, every_k: u64, every_ns: u64 }
 static KNOBS_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-static mut KNOBS: Knobs = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS };
+static mut KNOBS: Knobs = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS, every_k: 0, every_ns: 0 };
 static REQ_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn knobs() -> &'static Knobs {
     use core::sync::atomic::Ordering;
     if KNOBS_STATE.load(Ordering::Acquire) == 0 && crate::kenv::cmdline_known() {
-        let mut k = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS };
+        let mut k = Knobs { delay_n: 0, delay_ns: 0, slow_ns: IO_TIMEOUT_NS, every_k: 0, every_ns: 0 };
         if let Some((n, ms)) = crate::kenv::cmdline_word("virtio_blk.inject_delay")
             .and_then(|w| w.split_once(':'))
             .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) {
             k.delay_n = n; k.delay_ns = ms * 1_000_000;
+        }
+        // `inject_every=K:MS`: every K-th request (from #K on) is answered MS late, like a
+        // lock holder the host keeps descheduling (lane f2fswatchdog).
+        if let Some((n, ms)) = crate::kenv::cmdline_word("virtio_blk.inject_every")
+            .and_then(|w| w.split_once(':'))
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) {
+            k.every_k = n; k.every_ns = ms * 1_000_000;
         }
         if let Some(ms) = crate::kenv::cmdline_opt("virtio_blk.slow_ms") {
             if ms > 0 { k.slow_ns = ms * 1_000_000; }
@@ -287,7 +293,6 @@ impl VirtQueue {
         }
         ST_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let parked = armed;
-        let _w = if armed { Some(WaitingCpu::enter()) } else { None };
         let mut warn_at = slow_ns;
         let mut slow = false;
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
@@ -406,18 +411,25 @@ fn spin_window_ns() -> u64 {
     us * 1000
 }
 
-/// Registers this CPU as a parked waiter for the guard's lifetime.
-struct WaitingCpu(u64);
-impl WaitingCpu {
-    fn enter() -> Self {
-        let cpu = crate::kenv::ipi::cpu_id();
-        let bit = if cpu < 64 { 1u64 << cpu } else { 0 };
-        WAITING_CPUS.fetch_or(bit, core::sync::atomic::Ordering::SeqCst);
-        WaitingCpu(bit)
-    }
+/// Preemption off for the lifetime of the value; reschedules on drop.
+struct PreemptOff;
+impl PreemptOff {
+    fn new() -> Self { sched::preempt_disable(); PreemptOff }
 }
-impl Drop for WaitingCpu {
-    fn drop(&mut self) { WAITING_CPUS.fetch_and(!self.0, core::sync::atomic::Ordering::SeqCst); }
+impl Drop for PreemptOff {
+    fn drop(&mut self) { sched::preempt_enable(); }
+}
+
+/// A lock guard plus `PreemptOff`. Fields drop in declaration order: the guard is
+/// released first, then preemption comes back (so a reschedule never happens while
+/// the lock is still held).
+struct HeldNoPreempt<G> { g: G, _p: PreemptOff }
+impl<G: core::ops::Deref> core::ops::Deref for HeldNoPreempt<G> {
+    type Target = G::Target;
+    fn deref(&self) -> &G::Target { &self.g }
+}
+impl<G: core::ops::DerefMut> core::ops::DerefMut for HeldNoPreempt<G> {
+    fn deref_mut(&mut self) -> &mut G::Target { &mut self.g }
 }
 
 /// Park the CPU until an interrupt arrives unless `done()` already holds. The
@@ -428,9 +440,21 @@ impl Drop for WaitingCpu {
 /// lock); an unmasked one has IRQs re-enabled on return.
 fn park_until_irq(done: impl Fn() -> bool) -> bool {
     let mut halted = false;
+    use core::sync::atomic::Ordering::SeqCst;
+    // The completion IRQ kick finds this CPU through its WAITING_CPUS bit, set
+    // for this park only (IRQs off, the holder has preemption off, so it
+    // cannot migrate) and cleared before IRQs come back on. A CPU halted on
+    // the device is not locked up: start a fresh soft-lockup section per park.
+    fn my_bit() -> u64 {
+        let cpu = crate::kenv::ipi::cpu_id();
+        if cpu < 64 { 1u64 << cpu } else { 0 }
+    }
     unsafe {
         if sched::irqs_masked() {
             sched::preempt_disable();
+            let bit = my_bit();
+            WAITING_CPUS.fetch_or(bit, SeqCst);
+            sched::softlockup_touch();
             if !done() {
                 halted = true;
                 #[cfg(target_arch = "aarch64")]
@@ -438,20 +462,32 @@ fn park_until_irq(done: impl Fn() -> bool) -> bool {
                 #[cfg(target_arch = "x86_64")]
                 core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
             }
+            WAITING_CPUS.fetch_and(!bit, SeqCst);
             sched::irq_window();
             sched::preempt_enable_no_resched();
         } else {
             #[cfg(target_arch = "aarch64")]
             {
                 core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+                let bit = my_bit();
+                WAITING_CPUS.fetch_or(bit, SeqCst);
+                sched::softlockup_touch();
                 if !done() { halted = true; core::arch::asm!("wfi", options(nomem, nostack)); }
+                WAITING_CPUS.fetch_and(!bit, SeqCst);
                 core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
             }
             #[cfg(target_arch = "x86_64")]
             {
                 core::arch::asm!("cli", options(nomem, nostack));
-                if !done() { halted = true; core::arch::asm!("sti; hlt", options(nomem, nostack)); }
-                else { core::arch::asm!("sti", options(nomem, nostack)); }
+                let bit = my_bit();
+                WAITING_CPUS.fetch_or(bit, SeqCst);
+                sched::softlockup_touch();
+                if !done() {
+                    halted = true;
+                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
+                WAITING_CPUS.fetch_and(!bit, SeqCst);
+                core::arch::asm!("sti", options(nomem, nostack));
             }
         }
     }
@@ -835,13 +871,15 @@ impl VirtioBlkDevice {
             let t0 = sched::monotonic_ns();
             let k = knobs();
             let seq = REQ_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-            if k.delay_n != 0 && seq == k.delay_n {
+            let every = k.every_k != 0 && seq % k.every_k == 0;
+            if (k.delay_n != 0 && seq == k.delay_n) || every {
+                let delay_ns = if every { k.every_ns } else { k.delay_ns };
                 // Injected slow device: the request sits in the ring, unseen,
                 // for delay_ns. The wait below counts from t0.
                 crate::kenv::pci::serial_debug(&alloc::format!(
                     "[VIRTIO-BLK] inject: request #{} (type {} sector {}) delayed {} ms\n",
-                    seq, type_, sector, k.delay_ns / 1_000_000));
-                while sched::monotonic_ns().saturating_sub(t0) < k.delay_ns {
+                    seq, type_, sector, delay_ns / 1_000_000));
+                while sched::monotonic_ns().saturating_sub(t0) < delay_ns {
                     irq_window_if_masked();
                     for _ in 0..256 { core::hint::spin_loop(); }
                 }
@@ -886,18 +924,36 @@ impl VirtioBlkDevice {
 /// state (virtqueue + DMA bounce pages) sits behind its own lock, so I/O on
 /// vdb never waits for I/O on vdc.
 pub struct VirtioDisk {
-    dev: Mutex<VirtioBlkDevice>,
+    /// A sleeping FIFO mutex (`sched::iolock`): the holder waits for the device, possibly for
+    /// seconds when the host is starved, and a `spin::Mutex` made every waiter spin with IRQs
+    /// masked, so CPUs missed their timer ticks (`[WDOG]`; lane f2fswatchdog). Callers that
+    /// cannot sleep spin with IRQ windows instead.
+    dev: sched::iolock::IoMutex<VirtioBlkDevice>,
     capacity_sectors: u64,
 }
 
 impl VirtioDisk {
     fn rw(&self, type_: u32, lba: u64, buf: *mut u8, len: usize) -> Result<(), crate::blockdev::BlkErr> {
+        self.rw_impl(type_, lba, buf, len, false)
+    }
+    /// `try`: fail with `Io` instead of waiting for the device lock (panic path).
+    fn rw_impl(&self, type_: u32, lba: u64, buf: *mut u8, len: usize, try_only: bool) -> Result<(), crate::blockdev::BlkErr> {
         use crate::blockdev::BlkErr;
         if len == 0 || len % SECTOR != 0 { return Err(BlkErr::BadBuffer); }
         if self.capacity_sectors != 0 && lba + (len / SECTOR) as u64 > self.capacity_sectors {
             return Err(BlkErr::OutOfRange);
         }
-        let mut dev = self.dev.lock();
+        let g = if try_only {
+            match self.dev.try_lock_nowait() { Some(g) => g, None => return Err(BlkErr::Io) }
+        } else {
+            match self.dev.lock_bounded() { Some(g) => g, None => return Err(BlkErr::Io) }
+        };
+        // The holder must not be preempted while it owns the device lock: on -smp 1 a
+        // preempted holder leaves every non-sleeping waiter spinning with no handoff to
+        // steal. The preempt-off lasts the whole hold, including the long completion
+        // park (`park_until_irq` restarts the soft-lockup section per park, so a slow
+        // device is not reported as a lockup). Waiters still sleep and IRQs stay open.
+        let mut dev = HeldNoPreempt { g, _p: PreemptOff::new() };
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(MAX_IO_BYTES);
@@ -919,6 +975,11 @@ impl crate::blockdev::BlockDevice for VirtioDisk {
     fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), crate::blockdev::BlkErr> {
         // do_io only reads from `buf` for T_OUT (copies it into the DMA page).
         self.rw(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len())
+    }
+    /// Panic-path write: never waits for the device lock (nor its internal spinlock). The
+    /// request itself still parks for its completion IRQ like any other.
+    fn try_write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), crate::blockdev::BlkErr> {
+        self.rw_impl(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len(), true)
     }
     /// Commit the device's volatile write cache to stable storage.
     ///
@@ -970,7 +1031,7 @@ pub fn probe_all() -> alloc::vec::Vec<&'static VirtioDisk> {
                 unsafe { d.arm_irq(); }
                 let capacity_sectors = d.capacity_sectors;
                 let disk: &'static VirtioDisk = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-                    VirtioDisk { dev: Mutex::new(d), capacity_sectors },
+                    VirtioDisk { dev: sched::iolock::IoMutex::new(0, "VIRTIO_BLK", d), capacity_sectors },
                 ));
                 out.push(disk);
             }
