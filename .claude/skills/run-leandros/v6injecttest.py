@@ -7,13 +7,13 @@ MAC 02:50:45:45:53:02) on a `-netdev dgram` UDP wire to this script, which hand-
 IPv6/ICMPv6 frames (stdlib only, no root, no host network change). The peer is
 fe80::50:45ff:fe45:5301, MAC 02:50:45:45:53:01. Phases, checked from the guest:
   ra_mtu            an RA (router lifetime 0, prefix 2001:db8:91::/64 L+A, MTU option 1400) answers
-                    the guest's RS: SLAAC address on eth1, IPV6_MTU of a UDP socket connected on
+                    the guest's RS: IPV6_MTU of a UDP socket connected on
                     that prefix = 1400; a later RA with MTU 1300 lowers it, MTU 1000 (< 1280) and
                     1600 (> device MTU) are ignored
-  dad_na            an RA with prefix 2001:db8:92::/64: the guest's DAD NS for the new SLAAC address
-                    is answered with a NA -> flags 0x840 (DADFAILED) in /proc/net/if_inet6, bind()
+  dad_na            (on prefix 1, its address claimed from the start) the guest's DAD NS for the SLAAC
+                    address is answered with a NA -> flags 0x840 (DADFAILED) in /proc/net/if_inet6, bind()
                     to it is EADDRNOTAVAIL, it stays failed
-  dad_ns            the same with prefix 2001:db8:93::/64, the peer instead probing the same target
+  dad_ns            prefix 1 withdrawn (valid 0), then prefix 2001:db8:93::/64, the peer instead probing the same target
                     with its own NS from `::`
 Prints `v6injecttest: <phase> PASS|FAIL` lines and a final `v6injecttest: PASS|FAIL (<arch>)`. Exit
 0 iff all pass. Frame log: $V6INJECT_OUT/peer-frames.log (default /tmp/v6inject-<arch>). Run id
@@ -76,13 +76,13 @@ def mac_for(dst):
     return b"\x33\x33" + dst[12:16] if dst[0] == 0xff else GUEST_MAC
 
 
-def ra_body(prefixes, mtu=None, life=0):
+def ra_body(prefixes, mtu=None, life=0, valid=3600):
     b = struct.pack("!BBHBBHII", 134, 0, 0, 64, 0, life, 0, 0)
     b += b"\x01\x01" + PEER_MAC
     if mtu is not None:
         b += struct.pack("!BBHI", 5, 1, 0, mtu)
     for p in prefixes:
-        b += struct.pack("!BBBBIII", 3, 4, 64, 0xc0, 3600, 1800, 0) + PFX[p] + bytes(10)
+        b += struct.pack("!BBBBIII", 3, 4, 64, 0xc0, valid, min(valid, 1800), 0) + PFX[p] + bytes(10)
     return b
 
 
@@ -102,7 +102,7 @@ class Peer:
         self.stop = False
         self.rs_seen = 0
         self.dad_ns = []  # targets of the guest's DAD probes
-        self.na_claim = set()  # prefix numbers whose DAD probes get a NA
+        self.na_claim = {1}  # prefix numbers whose DAD probes get a NA
         self.ns_claim = set()  # ... get a competing NS from ::
         self.boot_prefixes = [1]
         self.boot_mtu = 1400
@@ -114,9 +114,9 @@ class Peer:
         self.logline("OUT", what)
         self.sock.sendto(f, self.qaddr)
 
-    def send_ra(self, prefixes, mtu=None):
+    def send_ra(self, prefixes, mtu=None, valid=3600):
         dst = ALLNODES
-        self.send(v6_frame(mac_for(dst), PEER_LL, dst, ra_body(prefixes, mtu)), f"RA prefixes {prefixes} mtu {mtu}")
+        self.send(v6_frame(mac_for(dst), PEER_LL, dst, ra_body(prefixes, mtu, valid=valid)), f"RA prefixes {prefixes} mtu {mtu} valid {valid}")
 
     def run(self):
         threading.Thread(target=self.loop, daemon=True).start()
@@ -247,8 +247,20 @@ def main(argv):
             return 1
         print(f"v6injecttest: booted after {time.time() - t0:.0f} s ({arch}, scale {scale}); peer on 127.0.0.1:{pport}", flush=True)
 
-        fl = wait_addr(1, lambda f: not f & 0x40)
-        check("ra_slaac_addr", fl is not None and not fl & 0x840, f"flags {fl} rs_seen {peer.rs_seen}")
+        # The net server keeps ONE SLAAC address per NIC, so the claimed address is replaced by
+        # withdrawing its prefix (valid lifetime 0) before the next prefix is advertised.
+        def dad_phase(n, name):
+            fl = wait_addr(n, lambda f: f & 0x800)
+            bind = sh(f"/bin/ip6test bindchk {socket.inet_ntop(socket.AF_INET6, pfx_addr(n))}")
+            time.sleep(4 * scale)
+            fl2 = inet6(hexs(pfx_addr(n)))
+            check(f"{name}_dadfailed", fl is not None and fl & 0x840 == 0x840, f"flags {fl} probes {len(peer.dad_ns)}")
+            check(f"{name}_not_usable", "ip6bind EADDRNOTAVAIL" in bind, bind.strip()[-60:])
+            check(f"{name}_stays_failed", fl2 is not None and fl2 & 0x800 != 0, f"flags {fl2}")
+
+        # Prefix 1 comes with the MTU option; its address is claimed by a NA (peer.na_claim).
+        fl = wait_addr(1, lambda f: f & 0x800)
+        check("ra_slaac_addr", fl is not None, f"flags {fl} rs_seen {peer.rs_seen}")
         m = mtu()
         check("ra_mtu_1400", m == 1400, f"ipv6 mtu {m}")
         peer.send_ra([1], 1300)
@@ -260,18 +272,15 @@ def main(argv):
         time.sleep(2 * scale)
         m = mtu()
         check("ra_mtu_out_of_range_ignored", m == 1300, f"ipv6 mtu {m}")
-
-        for n, name, claim in ((2, "dad_na", peer.na_claim), (3, "dad_ns", peer.ns_claim)):
-            claim.add(n)
-            peer.send_ra([n])
-            fl = wait_addr(n, lambda f: f & 0x800)
-            bind = sh(f"/bin/ip6test bindchk {socket.inet_ntop(socket.AF_INET6, pfx_addr(n))}")
-            time.sleep(4 * scale)
-            fl2 = inet6(hexs(pfx_addr(n)))
-            check(f"{name}_dadfailed", fl is not None and fl & 0x840 == 0x840, f"flags {fl} probes {len(peer.dad_ns)}")
-            check(f"{name}_not_usable", "ip6bind EADDRNOTAVAIL" in bind, bind.strip()[-60:])
-            check(f"{name}_stays_failed", fl2 is not None and fl2 & 0x800 != 0, f"flags {fl2}")
-        ok = all(results.values()) and len(results) == 9
+        dad_phase(1, "dad_na")
+        peer.send_ra([1], None, valid=0)
+        t1 = time.time()
+        while time.time() - t1 < 30 * scale and inet6(hexs(pfx_addr(1))) is not None:
+            time.sleep(1)
+        peer.ns_claim.add(3)
+        peer.send_ra([3])
+        dad_phase(3, "dad_ns")
+        ok = all(results.values()) and len(results) == 10
     finally:
         peer.stop = True
         time.sleep(0.4)
