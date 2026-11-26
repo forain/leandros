@@ -786,9 +786,15 @@ unsafe fn ctx_drain_override(fd: c_int, us: u64) -> u64 {
 /// Import a sync_file into a fresh syncobj of `fd`; the handle, 0 on failure.
 unsafe fn syncobj_from_sync_file(fd: c_int, sync_fd: c_int) -> u32 {
     let mut c = [0u32; 2];
-    if ioctl(fd, 0xC008_64BF as c_ulong, c.as_mut_ptr()) != 0 { return 0; }
+    if ioctl(fd, 0xC008_64BF as c_ulong, c.as_mut_ptr()) != 0 {
+        out(b"  syncobj create failed errno="); out_u64(*__errno_location() as u64); out(b"\n");
+        return 0;
+    }
     let mut h = [c[0], 1u32 /* IMPORT_SYNC_FILE */, sync_fd as u32, 0u32];
-    if ioctl(fd, 0xC010_64C2 as c_ulong, h.as_mut_ptr()) != 0 { return 0; }
+    if ioctl(fd, 0xC010_64C2 as c_ulong, h.as_mut_ptr()) != 0 {
+        out(b"  syncobj import failed errno="); out_u64(*__errno_location() as u64); out(b"\n");
+        return 0;
+    }
     c[0]
 }
 
