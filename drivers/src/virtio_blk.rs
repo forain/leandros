@@ -915,7 +915,9 @@ impl VirtioDisk {
         }
         let mut dev = if try_only {
             match self.dev.try_lock() { Some(g) => g, None => return Err(BlkErr::Io) }
-        } else { self.dev.lock() };
+        } else {
+            match self.dev.lock_bounded() { Some(g) => g, None => return Err(BlkErr::Io) }
+        };
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(MAX_IO_BYTES);

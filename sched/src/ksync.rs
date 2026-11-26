@@ -304,6 +304,13 @@ impl WaitList {
         (*n).prev = core::ptr::null_mut();
         (*n).linked = false;
     }
+    unsafe fn push_front(&mut self, n: *mut WaitNode) {
+        (*n).prev = core::ptr::null_mut();
+        (*n).next = self.head;
+        if self.head.is_null() { self.tail = n; } else { (*self.head).prev = n; }
+        self.head = n;
+        (*n).linked = true;
+    }
     unsafe fn pop_front(&mut self) -> Option<*mut WaitNode> {
         let n = self.head;
         if n.is_null() { return None; }
@@ -342,12 +349,18 @@ fn relax() {
 /// Park the current task until `node.granted` (read under `lock`) or the
 /// deadline. The node must already be linked (or granted). Returns whether it
 /// was granted. On timeout the node is unlinked. Caller has IRQs masked.
-fn park_until_granted(lock: &RawSpinLock, list: *mut WaitList, node: *mut WaitNode, deadline: u64) -> bool {
+///
+/// `handoff` (a mutex's hand-off slot, else null): cleared once the granted
+/// waiter has actually run and taken the ownership, which ends the window in
+/// which a spinning arrival may steal the grant (see `KRawMutex::lock_class`).
+fn park_until_granted(lock: &RawSpinLock, list: *mut WaitList, node: *mut WaitNode, deadline: u64,
+                      handoff: *mut *mut WaitNode) -> bool {
     loop {
         crate::kwait_prepare(deadline);
         lock.lock_raw();
         let g = unsafe { (*node).granted };
         if g {
+            if !handoff.is_null() && unsafe { *handoff } == node { unsafe { *handoff = core::ptr::null_mut(); } }
             lock.unlock_raw();
             crate::kwait_cancel();
             return true;
@@ -423,7 +436,7 @@ impl KSemaphore {
         // Drop the lock but keep IRQs masked until the park sequence is over.
         self.lock.unlock_raw();
         irqctx::atomic_dec();
-        let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline);
+        let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline, core::ptr::null_mut());
         irq_restore(f);
         ok
     }
@@ -467,6 +480,10 @@ pub struct KRawMutex {
     /// Owner pid + 1 (boot context owns as pid 0 -> 1); 0 = unlocked.
     owner: UnsafeCell<u32>,
     waiters: UnsafeCell<WaitList>,
+    /// The sleeper the last `unlock` handed ownership to and that has not run
+    /// yet (null once it did). A spinning arrival may take the lock back from
+    /// it: the sleeper can be Ready but CPU-less behind the spinner itself.
+    handoff: UnsafeCell<*mut WaitNode>,
 }
 unsafe impl Sync for KRawMutex {}
 unsafe impl Send for KRawMutex {}
@@ -475,7 +492,8 @@ static RELOCK_WARNED: AtomicBool = AtomicBool::new(false);
 
 impl KRawMutex {
     pub const fn new() -> Self {
-        Self { lock: RawSpinLock::new(), owner: UnsafeCell::new(0), waiters: UnsafeCell::new(WaitList::new()) }
+        Self { lock: RawSpinLock::new(), owner: UnsafeCell::new(0), waiters: UnsafeCell::new(WaitList::new()),
+               handoff: UnsafeCell::new(core::ptr::null_mut()) }
     }
 
     #[inline]
@@ -543,7 +561,7 @@ impl KRawMutex {
         unsafe { (*self.waiters.get()).push_back(np); }
         self.lock.unlock_raw();
         irqctx::atomic_dec();
-        let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline);
+        let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline, self.handoff.get());
         if !ok { klock_dec(node.pid); }
         irq_restore(f);
         ok
@@ -567,9 +585,10 @@ impl KRawMutex {
                 // node vanish) as soon as the lock is dropped.
                 let spin = (*n).spin;
                 (*n).granted = true;
+                *self.handoff.get() = if spin { core::ptr::null_mut() } else { n };
                 if spin { 0 } else { (*n).pid }
             },
-            None => { unsafe { *self.owner.get() = 0; } 0 }
+            None => { unsafe { *self.owner.get() = 0; *self.handoff.get() = core::ptr::null_mut(); } 0 }
         };
         self.lock.unlock_irqrestore(f);
         if pid != 0 { crate::kwake(pid); }
@@ -592,6 +611,24 @@ impl KRawMutex {
             self.lock.unlock_irqrestore(f);
             return true;
         }
+        if !sleep {
+            // The owner is a sleeper that was handed the lock but has not run
+            // yet: it may be Ready on this very CPU, behind us (atomic
+            // context, preemption off), and then never runs. Take the lock
+            // back and put it at the head of the queue again.
+            let h = unsafe { *self.handoff.get() };
+            if !h.is_null() {
+                unsafe {
+                    (*h).granted = false;
+                    (*self.waiters.get()).push_front(h);
+                    *self.handoff.get() = core::ptr::null_mut();
+                }
+                *o = Self::me();
+                klock_inc(Self::me() - 1);
+                self.lock.unlock_irqrestore(f);
+                return true;
+            }
+        }
         let mut node = WaitNode::new(KIND_PLAIN);
         let (cls, max_bypass) = match class {
             LockClass::Fifo => (CLS_FIFO, 0),
@@ -606,7 +643,7 @@ impl KRawMutex {
         if sleep {
             self.lock.unlock_raw();
             irqctx::atomic_dec();
-            let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline);
+            let ok = park_until_granted(&self.lock, self.waiters.get(), np, deadline, self.handoff.get());
             if !ok { klock_dec(unsafe { (*np).pid }); }
             irq_restore(f);
             return ok;
@@ -748,7 +785,7 @@ impl KRawRwLock {
         unsafe { (*self.waiters.get()).push_back(np); }
         self.lock.unlock_raw();
         irqctx::atomic_dec();
-        let _ = park_until_granted(&self.lock, self.waiters.get(), np, u64::MAX);
+        let _ = park_until_granted(&self.lock, self.waiters.get(), np, u64::MAX, core::ptr::null_mut());
         irq_restore(f);
     }
 
