@@ -412,6 +412,27 @@ fn spin_window_ns() -> u64 {
     us * 1000
 }
 
+/// Preemption off for the lifetime of the value; reschedules on drop.
+struct PreemptOff;
+impl PreemptOff {
+    fn new() -> Self { sched::preempt_disable(); PreemptOff }
+}
+impl Drop for PreemptOff {
+    fn drop(&mut self) { sched::preempt_enable(); }
+}
+
+/// A lock guard plus `PreemptOff`. Fields drop in declaration order: the guard is
+/// released first, then preemption comes back (so a reschedule never happens while
+/// the lock is still held).
+struct HeldNoPreempt<G> { g: G, _p: PreemptOff }
+impl<G: core::ops::Deref> core::ops::Deref for HeldNoPreempt<G> {
+    type Target = G::Target;
+    fn deref(&self) -> &G::Target { &self.g }
+}
+impl<G: core::ops::DerefMut> core::ops::DerefMut for HeldNoPreempt<G> {
+    fn deref_mut(&mut self) -> &mut G::Target { &mut self.g }
+}
+
 /// Registers this CPU as a parked waiter for the guard's lifetime.
 struct WaitingCpu(u64);
 impl WaitingCpu {
@@ -921,11 +942,15 @@ impl VirtioDisk {
         if self.capacity_sectors != 0 && lba + (len / SECTOR) as u64 > self.capacity_sectors {
             return Err(BlkErr::OutOfRange);
         }
-        let mut dev = if try_only {
+        let g = if try_only {
             match self.dev.try_lock_nowait() { Some(g) => g, None => return Err(BlkErr::Io) }
         } else {
             match self.dev.lock_bounded() { Some(g) => g, None => return Err(BlkErr::Io) }
         };
+        // The holder must not be preempted while it owns the device lock: on -smp 1 a
+        // preempted holder leaves every non-sleeping waiter spinning with no handoff to
+        // steal. Waiters still sleep and IRQs stay open.
+        let mut dev = HeldNoPreempt { g, _p: PreemptOff::new() };
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(MAX_IO_BYTES);
