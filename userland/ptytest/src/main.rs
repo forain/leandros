@@ -178,6 +178,7 @@ extern "C" {
     pub fn isatty(fd: c_int) -> c_int;
     pub fn ttyname(fd: c_int) -> *mut u8;
     pub fn signal(signum: c_int, handler: usize) -> usize;
+    pub fn time(t: *mut i64) -> i64;
     pub fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int;
     pub fn mmap(addr: *mut c_void, len: size_t, prot: c_int, flags: c_int,
                 fd: c_int, offset: i64) -> *mut c_void;
@@ -1199,7 +1200,7 @@ unsafe fn with_pair(name: &[u8], f: unsafe fn(c_int, usize) -> bool) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut u8) -> i32 {
-    const TOTAL: usize = 19;
+    const TOTAL: usize = 20;
     let mut passed = 0usize;
 
     let (m, s) = match open_pair() {
@@ -1255,6 +1256,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *mut *mut u8, _envp: *mut *mut 
     if test_gptpeer() { passed += 1; }
     if test_devpts_instances() { passed += 1; }
     if with_pair(b"brush_on_pty", test_brush) { passed += 1; }
+    if test_tty_times() { passed += 1; }
 
     out(b"ptytest: ");
     out_num(passed);
@@ -1384,4 +1386,42 @@ unsafe fn test_devpts_instances() -> bool {
     rmdir(b"/tmp/dpt2\0".as_ptr());
     let _ = (d1, d2);
     report(b"devpts_instances", ok)
+}
+
+// ── 20. tty node times (Linux tty_update_time, 8 s granularity) ──────────────
+
+/// (atime, mtime, ctime) seconds of `path`; st_atim is at byte 72 on both ABIs.
+unsafe fn stat_times(path: &[u8]) -> Option<(i64, i64, i64)> {
+    let mut b = [0u8; 256];
+    if stat(path.as_ptr(), b.as_mut_ptr()) != 0 { return None; }
+    let rd = |o: usize| i64::from_ne_bytes([b[o], b[o+1], b[o+2], b[o+3], b[o+4], b[o+5], b[o+6], b[o+7]]);
+    Some((rd(72), rd(88), rd(104)))
+}
+
+unsafe fn test_tty_times() -> bool {
+    let name = b"tty_node_times";
+    let Some((m, s, n)) = open_pair() else { return report(name, false) };
+    let mut path = [0u8; 16];
+    pts_path(n, &mut path);
+    let now = time(core::ptr::null_mut());
+    let near = |t: i64| t != 0 && (t - now).abs() < 120;
+    let ok0 = match stat_times(&path) { Some((a, mt, c)) => near(a) && near(mt) && near(c), None => false };
+    let con = match stat_times(b"/dev/console\0") { Some((a, mt, c)) => a != 0 && mt != 0 && c != 0, None => false };
+    let mut t = termios::blank();
+    t.c_oflag = OPOST | ONLCR;
+    let _ = set_termios(m, &t);
+    flush_both(m);
+    msleep(9000);
+    // Slave write -> mtime advances; slave read -> atime advances.
+    let w = write_all(s, b"x");
+    let _ = write_all(m, b"y");
+    let mut buf = [0u8; 8];
+    let r = try_read(s, &mut buf);
+    let ok1 = match stat_times(&path) {
+        Some((a, mt, _)) => w && r == 1 && mt - now >= 8 && a - now >= 8,
+        None => false,
+    };
+    close(m);
+    close(s);
+    report(name, ok0 && con && ok1)
 }
