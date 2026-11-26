@@ -339,6 +339,8 @@ SUITES = {
                 "host:netwatchtest.py",
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
+                # Virtio-blk I/O error completion (blkdebug inject-error): mapped fault = SIGBUS, read() = EIO, system alive (~22 s; lane blkfaultfix).
+                "host:blkfaulttest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
                 "host:uartgaptest.py", "host:conlosstest.py", "host:conlossnoisetest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
                 # Out-of-tree host suites that were solo-green 3x x86_64 KVM + aarch64 TCG (lane hostcov 2026-11-22): USB unplug, F2FS checkpoint, power control (~2-5 min each).
@@ -520,7 +522,7 @@ SUITES = {
     # switch on cpu1 (x86_64; own boot via cmdline timer.dead_delay=1); the CPU's tick must survive.
     "deadtimer": ["/bin/timertest deadtick"],
     "deadtimerhost": ["host:deadtimertest.py"],
-    # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
+    # Virtio-blk I/O error completion: a mapped-page fault must SIGBUS, read() EIO (own boots, ~22 s; in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
     # read finishes with intact data (own boot, ~2 min; not in regress).
