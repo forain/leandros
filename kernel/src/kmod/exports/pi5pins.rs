@@ -1,8 +1,9 @@
 //! kapi export: the Pi 5 Wi-Fi pins (SDIO2 mux, WL_REG_ON), for the module named `brcmf` only, and the SD host's
 //! two gio_aon lines (vqmmc 1.8 V select, card power) as high-level ops, for the module named `sdhci` only.
 //!
-//! NOTE for lane sdlock (unmerged): when merged, SD_POWER / SD_IO_1V8 sets must be routed through its "foreign card:
-//! no state change" grant check before touching the line.
+//! The SD sets follow lane sdlock's rule through `sdgrant::pin_set_allowed`: the module may do whatever the built-in
+//! driver does on a still-locked card (power cycle, 1.8 V after ACMD41) and nothing more. The card-write gate itself
+//! is the shared `drivers/src/sdhci.rs` source (WRITE_GRANT / `sdgrant::issue`), compiled into the module.
 use super::*;
 
 /// See `kmod_abi::plat::sys_plat::kapi_pi5_pins`. -1 for any other module, -22 bad op or missing `out`.
@@ -24,6 +25,17 @@ pub extern "C" fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64)
             P::WL_ON_READY => return if gpio::gpio_is_output(Chip::Gio, WL_ON).is_ok() { 0 } else { -19 },
             P::SD_IO_1V8_GET | P::SD_IO_1V8_SET | P::SD_POWER_GET | P::SD_POWER_SET => {
                 let Some((line, set)) = P::sd_line(op) else { return -22 };
+                if set {
+                    let io = line == P::GIO_AON_SD_IOVDD_SEL;
+                    let pwr = gpio::gpio_get(Chip::GioAon, P::GIO_AON_SD_PWR_ON).unwrap_or(false);
+                    if !drivers::rpi_misc_logic::sdgrant::pin_set_allowed(io, arg != 0, pwr) {
+                        static LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                            drivers::pci::serial_debug("[kmod] sdhci pins: refused 1.8 V I/O on an unpowered card\n");
+                        }
+                        return -1;
+                    }
+                }
                 return if set { if gpio::gpio_set_output(Chip::GioAon, line, arg != 0).is_ok() { 0 } else { -19 } }
                 else { match gpio::gpio_get(Chip::GioAon, line) { Ok(v) => v as i32, Err(_) => -19 } };
             }
