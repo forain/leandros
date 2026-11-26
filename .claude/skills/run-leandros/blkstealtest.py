@@ -10,8 +10,10 @@ Stress: virtio_blk.inject_every holds the device lock holder for 2.5 s every 250
 for BLKSTEAL_SECS (default 60) while the host starves one vCPU thread at a time for
 2-3.5 s (the vCPU threads are pinned and put in SCHED_IDLE; a pinned busy-loop on the same
 host CPU is the starvation, started and killed per stall; only our own QEMU is touched).
-Gate (no `[F2FS] long hold` gate: a request injected 2.5 s late under F2FS_MOUNTS legitimately holds it that long): >= 5 injected requests, >= 1 `[LOCKWAIT] VIRTIO_BLK`, guest rc 0, zero `[WDOG]` lines on a CPU that answers the NMI sample (a starved vCPU does not) in the serial log, no `[F2FS] long hold` >= 2 s,
-the guest finishes. `BLKSTEAL_BENCH=1` instead prints throughput (seq write/read, rand 4k read;
+Gate: >= 5 `[VIRTIO-BLK] inject:` lines, >= 1 `[LOCKWAIT] VIRTIO_BLK`, guest rc 0, zero `[WDOG]`
+lines on a CPU that answers the NMI sample (a starved vCPU does not) in the serial log, no
+`[F2FS] long hold` above 4 s (a request injected 2.5 s late under F2FS_MOUNTS legitimately holds
+it that long, so the threshold sits above the injection), the guest finishes. `BLKSTEAL_BENCH=1` instead prints throughput (seq write/read, rand 4k read;
 no throttle, no stalls) as `BENCH name=ms`.
 Usage: LEANDROS_RUN_ID=<id> python3 blkstealtest.py [aarch64|x86_64]
 """
@@ -153,6 +155,15 @@ def main():
             nall = log.count("took no timer tick")
             holds = [int(x) for x in re.findall(r"\[F2FS\] long hold (\d+) ms", log)]
             print(f"WDOG: {nall} lines, {len(wl)} on CPUs that were not host-stalled; long holds: {sorted(holds)[-5:]}")
+            ninj = len(re.findall(r"\[VIRTIO-BLK\] inject:", log))
+            nlw = len(re.findall(r"\[LOCKWAIT\] VIRTIO_BLK", log))
+            print(f"injected requests: {ninj}; [LOCKWAIT] VIRTIO_BLK lines: {nlw}")
+            if ninj < 5:
+                ok = False; print(f"FAIL: only {ninj} injected requests (< 5): the stress is vacuous")
+            if nlw < 1:
+                ok = False; print("FAIL: no [LOCKWAIT] VIRTIO_BLK line: the device lock was never contended")
+            if any(h > 4000 for h in holds):
+                ok = False; print(f"FAIL: [F2FS] long hold above 4 s (injection is 2.5 s): {sorted(holds)[-3:]}")
             if wl:
                 ok = False; MSGS.append("FAIL: [WDOG]"); print("FAIL: [WDOG] on a running vCPU")
                 for l in wl[:8]: print("  " + l[:240])
