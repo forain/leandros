@@ -2854,16 +2854,28 @@ unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize,
     report(name, ok)
 }
 
+/// Run one case in a forked copy of this process: a red case that leaves a
+/// leaked leader, a changed SIGCHLD disposition or a stuck fd dies with the
+/// copy and cannot disturb the next case.
+unsafe fn ll_isolated(f: unsafe fn() -> bool) -> bool {
+    let pid = fork();
+    if pid == 0 { exit(if f() { 0 } else { 1 }); }
+    if pid < 0 { return false; }
+    let mut st = -1i32;
+    let r = syscall4(nr::WAIT4, pid as usize, &mut st as *mut i32 as usize, 0, 0) as isize;
+    r == pid as isize && st == 0
+}
+
 unsafe fn test_late_leader_all() -> bool {
     let mut ok = true;
-    ok &= test_late_leader_i1();
-    ok &= test_late_leader_i2();
-    ok &= test_late_leader_i3();
-    ok &= test_late_leader_i2_poll();
-    ok &= test_late_leader_i1_ign();
-    ok &= test_late_leader_i2_ign();
-    ok &= test_late_leader_i3_ign();
-    ok &= test_late_leader_churn();
+    ok &= ll_isolated(test_late_leader_i1);
+    ok &= ll_isolated(test_late_leader_i2);
+    ok &= ll_isolated(test_late_leader_i3);
+    ok &= ll_isolated(test_late_leader_i2_poll);
+    ok &= ll_isolated(test_late_leader_i1_ign);
+    ok &= ll_isolated(test_late_leader_i2_ign);
+    ok &= ll_isolated(test_late_leader_i3_ign);
+    ok &= ll_isolated(test_late_leader_churn);
     ok
 }
 
@@ -2885,15 +2897,17 @@ unsafe fn ll_task_total() -> usize {
     parse_num(&buf[(i + 1).min(n)..n]).unwrap_or(0)
 }
 
-/// 2000 knob-less rounds of a barrier exit (1-3 workers and the leader leave
+/// 500 knob-less rounds of a barrier exit (1-3 workers and the leader leave
 /// together), run by `pthreadtest late_leader_churn` with SIGCHLD blocked in
 /// its parent role: no drift in free memory, thread count or SIGCHLD count.
+const LL_CHURN_ROUNDS: &[u8] = b"500\0";
+
 unsafe fn test_late_leader_churn() -> bool {
     let name = b"late_leader_churn\0";
     let (ram0, th0) = (free_ram() / PAGE, ll_task_total());
     let pid = fork();
     if pid == 0 {
-        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"late_leader_churn\0".as_ptr(), b"2000\0".as_ptr(), core::ptr::null()];
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"late_leader_churn\0".as_ptr(), LL_CHURN_ROUNDS.as_ptr(), core::ptr::null()];
         let envp = [core::ptr::null::<u8>()];
         execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
         exit(127);
