@@ -200,7 +200,9 @@ create_initrd() {
 # included once declared by the config; build-all flags still apply too).
 kconfig_features() {
     local arch="$1" def cfg
-    if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then def="rpi5"
+    if [[ "$arch" == "aarch64" && "$RPI5" == "true" ]]; then
+        def="rpi5"
+        [[ "${RPI5_USBROOT:-}" == "1" ]] && def="rpi5_usbroot"
     elif [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]]; then def="raspi4b"
     elif [[ "$arch" == "x86_64" && "${INTEL:-}" == "1" ]]; then def="x86_64_laptop"
     else def="$arch"; fi
@@ -231,6 +233,7 @@ build_kernel() {
         rev="$(git -C "$ROOT_DIR" rev-parse --short=10 HEAD 2>/dev/null || echo nogit)"
         git -C "$ROOT_DIR" diff --quiet HEAD -- 2>/dev/null || dirty="-dirty"
         LEANDROS_KERNEL_TAG="$rev$dirty-$(date -u +%Y%m%dT%H%MZ)"
+        [[ "$arch" == "aarch64" && "$RPI5" == "true" && "${RPI5_USBROOT:-}" == "1" ]] && LEANDROS_KERNEL_TAG="$LEANDROS_KERNEL_TAG-usbroot"
     fi
     export LEANDROS_KERNEL_TAG
     echo "  build tag: $LEANDROS_KERNEL_TAG"

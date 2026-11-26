@@ -19,10 +19,27 @@ pub const LAST_CHAN: u8 = 11;
 pub const DT_CHANNEL_MASK: u32 = 0x7c0;
 /// Channel the HDMI audio path uses (the pisound-design note).
 pub const AUDIO_CHAN: u8 = 10;
-/// HDMI0/HDMI1 MAI DREQ cells from the Pi 5 DTB (`dmas = <&dma40 0x41fa000a>` / `0x41fa0011`):
-/// DREQ 10 and 17. The pisound design note's 12/13 (from the vc4 sources) is wrong for this DTB.
+/// HDMI0/HDMI1 MAI DREQ cells, C0 stepping (`bcm2712-rpi-5-b.dtb`: `dmas = <&dma40 0x41fa000a>` /
+/// `0x41fa0011`): DREQ 10 and 17.
 pub const DREQ_CELL_HDMI0: u32 = 0x41fa_000a;
 pub const DREQ_CELL_HDMI1: u32 = 0x41fa_0011;
+/// The same cells on the D0 stepping (`bcm2712d0-rpi-5-b.dtb`: `0x41fa000c` / `0x41fa000d`):
+/// DREQ 12 and 13. Using the C0 numbers on a D0 board leaves the engine unpaced.
+pub const DREQ_CELL_HDMI0_D0: u32 = 0x41fa_000c;
+pub const DREQ_CELL_HDMI1_D0: u32 = 0x41fa_000d;
+
+/// The MAI DREQ cell for `port` (0 = hdmi0, 1 = hdmi1) on a D0 or C0 SoC.
+pub const fn hdmi_dreq_cell(d0: bool, port: usize) -> u32 {
+    match (d0, port) {
+        (true, 0) => DREQ_CELL_HDMI0_D0,
+        (true, _) => DREQ_CELL_HDMI1_D0,
+        (false, 0) => DREQ_CELL_HDMI0,
+        (false, _) => DREQ_CELL_HDMI1,
+    }
+}
+
+/// `cell` with its PER_MAP (low 5 bits) replaced by `per_map` (the `hdmi.dreq=N` knob).
+pub const fn cell_with_per_map(cell: u32, per_map: u32) -> u32 { (cell & !31) | (per_map & 31) }
 
 // Channel registers.
 pub const CS: u32 = 0x00;
@@ -218,6 +235,14 @@ pub fn build_memcpy(out: &mut [Scb], scb_phys: u64, dst: u64, src: u64, len: usi
     Ok(n)
 }
 
+/// A cyclic ring may only target a peripheral FIFO inside the BCM2712 peripheral window (CPU
+/// physical, `0x10_7c00_0000..0x10_8000_0000`). Anything else - a 32-bit bus alias, which is
+/// ordinary DRAM on a board with 2 GiB or more - would have the engine write over memory. The
+/// check lives here so the built-in driver and the module exports (`kapi_dma40_start_cyclic`)
+/// share it.
+pub const CYCLIC_FIFO_MIN: u64 = 0x10_7c00_0000;
+pub const CYCLIC_FIFO_MAX: u64 = 0x10_8000_0000;
+
 /// Builds a cyclic mem-to-device ring: one SCB per period, the last pointing back at the first.
 /// `fifo` is the peripheral FIFO's DMA (= CPU physical) address, written with a fixed address
 /// and paced by the cell's DREQ. Every period's SCB interrupts when `irq_per_period`.
@@ -231,6 +256,7 @@ pub fn build_cyclic_tx(out: &mut [Scb], scb_phys: u64, ring: u64, ring_len: usiz
     let n = ring_len / period;
     if n > out.len() { return Err(Dma40Error::TooManyCbs); }
     if fifo & 3 != 0 { return Err(Dma40Error::Misaligned); }
+    if !(CYCLIC_FIFO_MIN..CYCLIC_FIFO_MAX).contains(&fifo) { return Err(Dma40Error::AddrRange); }
     let first = cb_addr(scb_phys)?;
     let ti = dreq.ti | TI_D_DREQ | if irq_per_period { TI_INTEN } else { 0 };
     for i in 0..n {

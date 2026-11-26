@@ -139,7 +139,7 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     // ── Block Devices & Filesystems ──────────────────────────────────────────
     // SD-card boards: `sdhci.multi=1` / `sdhci.multitest=1` before the probe.
     #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"), feature = "drv-sdhci"))]
-    drivers::sdhci::configure(crate::boot_cmdline().unwrap_or(""));
+    drivers::sdhci::configure_opt(crate::boot_cmdline());
     drivers::blkdev::set_rw_list(crate::boot_cmdline().unwrap_or(""));
     drivers::blkdev::init();
     // Raspberry Pi 5: ACT LED on SD I/O and the power button (KEY_POWER);
@@ -302,6 +302,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
     arch_x86_64::psmouse::init();
     vfs_server::set_kernel_cmdline(crate::boot_cmdline().unwrap_or("")); // /proc/cmdline
     vfs_server::set_proc_pcipm(drivers::pci::pm_report); // /proc/pcipm
+    #[cfg(all(target_arch = "aarch64", any(feature = "rpi5", feature = "raspi4b"), feature = "drv-sdhci"))]
+    vfs_server::set_proc_sd(drivers::sdhci::proc_text); // /proc/leandros_sd
     vfs_server::set_proc_klog(|| crate::klog::tail(256 << 10)); // /proc/klog (dmesg; boards with no ESP)
     {
         // Wedge diagnostics: on by default on the Pi 5 (wedge=0 turns them

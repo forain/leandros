@@ -197,7 +197,7 @@ fn tick_window() {
 /// `(NORMAL_INT_STATUS << 16) | ERROR_INT_STATUS` as they stood at the moment
 /// the last transfer gave up, latched before they are cleared.
 static LAST_FAIL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // ── Base address ─────────────────────────────────────────────────────────────
 
@@ -255,6 +255,9 @@ const NI_XFER_COMPLETE:    u16 = 1 << 1;
 const NI_BUF_WRITE_READY:  u16 = 1 << 4;
 const NI_BUF_READ_READY:   u16 = 1 << 5;
 const NI_ERROR:            u16 = 1 << 15;
+const NI_CARD_INS: u16 = 1 << 6;
+const NI_CARD_REM: u16 = 1 << 7;
+const PSTATE_CARD_INSERTED: u32 = 1 << 16;
 const NI_ALL:              u16 = 0xFFFF;
 
 const EI_ALL: u16 = 0xFFFF;
@@ -352,6 +355,77 @@ static MULTITEST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 const MULTITEST_BLOCKS: usize = 1024; // 4 MiB
 /// `sdhci.sdtest=<MiB>`: speed table + write/readback proof inside the scratch window.
 static SDTEST_MIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+// ── Write grant: this driver writes only a card that is LeandrOS's own ─────
+/// The one switch every write command passes (see `send_command`). False until
+/// `init` has proven the card ours (`rpi_misc_logic::sdgrant::evaluate`).
+/// Present State bit 16 as recorded when the grant was given.
+static CD_AT_GRANT: AtomicBool = AtomicBool::new(false);
+static WRITE_GRANT: AtomicBool = AtomicBool::new(false);
+static SD_WR_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static SD_WR_ISSUED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `sdhci.rw=0` withholds the grant (default on).
+static RW_ON: AtomicBool = AtomicBool::new(true);
+/// `sdhci.expose=ro`: a locked card is still registered, read-only.
+static EXPOSE_RO: AtomicBool = AtomicBool::new(false);
+/// A locked card was registered read-only (`sdhci.expose=ro`).
+static LOCKED_RO: AtomicBool = AtomicBool::new(false);
+/// The probe found the F2FS magic (rpi5: in an MBR 0x83 partition; else at 0).
+static F2FS_FOUND: AtomicBool = AtomicBool::new(false);
+/// 0 = not probed, 1 = granted, 2 = locked (no device), 3 = locked, exposed ro.
+static SD_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static SD_REASON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The previous command was an accepted CMD55: the next is an ACMD.
+static APP_NEXT: AtomicBool = AtomicBool::new(false);
+static CMDLINE: Mutex<alloc::string::String> = Mutex::new(alloc::string::String::new());
+/// `configure` was handed a command line (false: it was never delivered / unreadable).
+static CMDLINE_SET: AtomicBool = AtomicBool::new(false);
+/// MBR partition number (1-4) of the picked F2FS root; 0 = none (non-MBR probe).
+static PICK_PNO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// MBR disk signature (the PARTUUID prefix).
+static DISK_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// A card read still failed after the retries (not "no magic": "could not read").
+static INJECT_LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static INJECT_RECOVERED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static INJECT_RDERR: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static READ_ERR: AtomicBool = AtomicBool::new(false);
+/// Volume label of the picked partition, read through its final offset.
+static SB_LABEL: Mutex<alloc::string::String> = Mutex::new(alloc::string::String::new());
+
+// The tested command-issue seam must program the registers this driver uses.
+const _: () = assert!(crate::rpi_misc_logic::sdgrant::REG_ARGUMENT1 == REG_ARGUMENT1
+    && crate::rpi_misc_logic::sdgrant::REG_COMMAND == REG_COMMAND);
+
+/// The controller as the `Regs32` the tested `sdgrant::issue` drives: the
+/// 16-bit Command register through `w16`, everything else 32-bit.
+struct CmdRegs<'a>(&'a SdhciDevice);
+impl crate::rpi_misc_logic::Regs32 for CmdRegs<'_> {
+    fn r(&mut self, off: usize) -> u32 { unsafe { self.0.r32(off) } }
+    fn w(&mut self, off: usize, v: u32) {
+        unsafe { if off == REG_COMMAND { self.0.w16(off, v as u16) } else { self.0.w32(off, v) } }
+    }
+}
+
+/// True (and counted) when a write must not be attempted: callers return
+/// before any controller access, so no reset/retry follows a refusal.
+#[inline]
+fn write_refused(is_write: bool) -> bool {
+    if is_write && !WRITE_GRANT.load(Ordering::Acquire) {
+        SD_WR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// `/proc/leandros_sd`.
+pub fn proc_text() -> Option<alloc::string::String> {
+    let st = match SD_STATE.load(Ordering::Relaxed) {
+        1 => "granted", 2 => "locked", 3 => "locked-ro-exposed", _ => "unprobed",
+    };
+    Some(alloc::format!("state={} reason={} writes_issued={} writes_refused={}\n", st,
+        crate::rpi_misc_logic::sdgrant::reason_str(SD_REASON.load(Ordering::Relaxed)),
+        SD_WR_ISSUED.load(Ordering::Relaxed), SD_WR_REFUSED.load(Ordering::Relaxed)))
+}
+
 static SDTEST_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// The raw scratch region (see pi-remote skill): the last 8 GiB of the card,
 /// 512-byte sectors, [FIRST, END). The only place `sdtest` may write.
@@ -363,8 +437,15 @@ const SCRATCH_END: u64 = 249_999_360;
 ///
 /// QEMU `-M raspi4b` boots with no DTB and so no command line: a build with
 /// `LEANDROS_SDHCI_KNOBS="sdhci.multitest=1"` in the environment bakes them in.
-pub fn configure(cmdline: &str) {
+pub fn configure(cmdline: &str) { configure_opt(Some(cmdline)); }
+
+/// `configure` with the "cmdline unreadable" case kept distinct from "empty":
+/// on a real board the former never grants a write.
+pub fn configure_opt(cmdline_in: Option<&str>) {
+    CMDLINE_SET.store(cmdline_in.is_some(), Ordering::Relaxed);
+    let cmdline = cmdline_in.unwrap_or("");
     let baked = option_env!("LEANDROS_SDHCI_KNOBS").unwrap_or("");
+    *CMDLINE.lock() = alloc::string::String::from(cmdline);
     for w in baked.split_ascii_whitespace().chain(cmdline.split_ascii_whitespace()) {
         match w {
             "sdhci.multi=1" => MULTI_ON.store(true, Ordering::Relaxed),
@@ -374,8 +455,13 @@ pub fn configure(cmdline: &str) {
             "sdhci.dma=0" => DMA_ON.store(false, Ordering::Relaxed),
             "sdhci.uhs=1" => UHS_ON.store(true, Ordering::Relaxed),
             "sdhci.uhs=0" => UHS_ON.store(false, Ordering::Relaxed),
+            "sdhci.rw=0" => RW_ON.store(false, Ordering::Relaxed),
+            "sdhci.rw=1" => RW_ON.store(true, Ordering::Relaxed),
+            "sdhci.expose=ro" => EXPOSE_RO.store(true, Ordering::Relaxed),
             _ => {
-                if let Some(v) = w.strip_prefix("sdhci.sdtest=") {
+                if let Some(v) = w.strip_prefix("sdhci.rderr=") {
+                    INJECT_RDERR.store(v.parse().unwrap_or(0), Ordering::Relaxed);
+                } else if let Some(v) = w.strip_prefix("sdhci.sdtest=") {
                     let m: u32 = v.parse().unwrap_or(0);
                     SDTEST_MIB.store(m, Ordering::Relaxed);
                     SDTEST_PENDING.store(m > 0, Ordering::Relaxed);
@@ -690,6 +776,27 @@ impl SdhciDevice {
         crc_check: bool,
         idx_check: bool,
     ) -> Option<[u32; 4]> {
+        // The choke point of every write-class command: refused here, before
+        // any register access, unless the card was proven LeandrOS's own.
+        // CMD55 arms `APP_NEXT`, which every following command consumes, so
+        // ACMD23 and CMD23 (and CMD24 vs an ACMD24) are told apart.
+        let app = APP_NEXT.swap(false, Ordering::Relaxed);
+        // Card removed or (re)inserted since the grant: the grant belonged to
+        // the card that was probed. Lock until the next probe.
+        if WRITE_GRANT.load(Ordering::Acquire) && self.card_changed() {
+            WRITE_GRANT.store(false, Ordering::Release);
+            SD_STATE.store(2, Ordering::Relaxed);
+            SD_REASON.store(crate::rpi_misc_logic::sdgrant::R_CARD_CHANGED, Ordering::Relaxed);
+            crate::kenv::pci::serial_debug("[sdhci] card removed/inserted: write grant revoked\n");
+        }
+        let granted = WRITE_GRANT.load(Ordering::Acquire);
+        if !crate::rpi_misc_logic::sdgrant::allows(granted, index, app) {
+            SD_WR_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if granted && crate::rpi_misc_logic::sdgrant::is_write_cmd(index, app) {
+            SD_WR_ISSUED.fetch_add(1, Ordering::Relaxed);
+        }
         self.wait_cmd_inhibit_clear(data_present || resp == RESP_48B);
 
         // Clear both interrupt-status registers before issuing anything.
@@ -704,24 +811,40 @@ impl SdhciDevice {
         self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
         self.w16(REG_ERROR_INT_STATUS, EI_ALL);
 
-        self.w32(REG_ARGUMENT1, arg);
-
         let mut word = ((index as u16) << 8) | resp;
         if data_present { word |= CMD_DATA_PRESENT; }
         if crc_check { word |= CMD_CRC_CHECK; }
         if idx_check { word |= CMD_IDX_CHECK; }
-        self.w16(REG_COMMAND, word);
+        // The one place a command reaches the controller: the tested seam
+        // (allowlist check, then Argument 1, then Command).
+        if !crate::rpi_misc_logic::sdgrant::issue(&mut CmdRegs(self), granted, index, app, arg, word) {
+            SD_WR_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
 
         if !self.wait_normal_int(NI_CMD_COMPLETE) {
             return None;
         }
+        let r0 = self.r32(REG_RESPONSE0);
+        // Only an ACCEPTED CMD55 makes the next command an ACMD.
+        if index == CMD_APP_CMD && crate::rpi_misc_logic::sdgrant::app_cmd_accepted(r0) {
+            APP_NEXT.store(true, Ordering::Relaxed);
+        }
 
         Some([
-            self.r32(REG_RESPONSE0),
+            r0,
             self.r32(REG_RESPONSE0 + 4),
             self.r32(REG_RESPONSE0 + 8),
             self.r32(REG_RESPONSE0 + 12),
         ])
+    }
+
+    /// Card-detect changed since the grant, or a removal/insertion IRQ latched.
+    unsafe fn card_changed(&self) -> bool {
+        crate::rpi_misc_logic::sdgrant::card_revoked(
+            CD_AT_GRANT.load(Ordering::Relaxed),
+            self.r32(REG_PRESENT_STATE) & PSTATE_CARD_INSERTED != 0,
+            self.r16(REG_NORMAL_INT_STATUS) & (NI_CARD_INS | NI_CARD_REM) != 0)
     }
 
     /// Read or write one 512-byte sector via single-block PIO.
@@ -860,6 +983,16 @@ impl SdhciDevice {
         }
     }
 
+    /// A command issued outside `send_command` (manual CMD12, tuning CMD19):
+    /// still through the grant allowlist, and it consumes `APP_NEXT`.
+    unsafe fn gated_cmd(&self, index: u8, arg: u32, word: u16) {
+        let app = APP_NEXT.swap(false, Ordering::Relaxed);
+        let granted = WRITE_GRANT.load(Ordering::Acquire);
+        if !crate::rpi_misc_logic::sdgrant::issue(&mut CmdRegs(self), granted, index, app, arg, word) {
+            SD_WR_REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// After a failed multi-block transfer: reset CMD/DAT, send a manual
     /// CMD12 so a card left in the data or receive state returns to
     /// transfer state (an error reply from a card already there is fine),
@@ -870,7 +1003,7 @@ impl SdhciDevice {
         self.wait_cmd_inhibit_clear(false);
         self.w16(REG_NORMAL_INT_STATUS, NI_ALL);
         self.w16(REG_ERROR_INT_STATUS, EI_ALL);
-        self.w16(REG_COMMAND, ((CMD_STOP_TRANSMISSION as u16) << 8) | RESP_48B
+        self.gated_cmd(CMD_STOP_TRANSMISSION as u8, 0, ((CMD_STOP_TRANSMISSION as u16) << 8) | RESP_48B
             | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_TYPE_ABORT);
         let _ = self.wait_normal_int(NI_CMD_COMPLETE);
         self.wait_cmd_inhibit_clear(true);
@@ -990,6 +1123,7 @@ impl SdhciDevice {
     /// first; on any failure the span is redone with the single-sector path,
     /// which stays the only path once multi-block has proven unreliable.
     fn do_io_span(&self, is_write: bool, blk: u64, nblocks: usize, buf: *mut u8) -> bool {
+        if write_refused(is_write) { return false; }
         self.maybe_retune();
         if self.boot_fat {
             // Single-sector commands only (no multi-block), see `do_io`.
@@ -1075,6 +1209,7 @@ impl SdhciDevice {
     }
 
     fn do_io(&self, is_write: bool, blk: u64, buf: *mut u8) -> bool {
+        if write_refused(is_write) { return false; }
         let abs_blk = blk + self.partition_offset;
         for i in 0..SECTORS_PER_BLOCK {
             let sector = abs_blk * SECTORS_PER_BLOCK as u64 + i as u64;
@@ -1725,8 +1860,7 @@ impl SdhciDevice {
             self.w16(REG_BLOCK_SIZE, 64);
             self.w16(REG_BLOCK_COUNT, 1);
             self.w16(REG_TRANSFER_MODE, TM_DIR_READ);
-            self.w32(REG_ARGUMENT1, 0);
-            self.w16(REG_COMMAND, ((CMD_SEND_TUNING as u16) << 8) | RESP_48 | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_DATA_PRESENT);
+            self.gated_cmd(CMD_SEND_TUNING as u8, 0, ((CMD_SEND_TUNING as u16) << 8) | RESP_48 | CMD_CRC_CHECK | CMD_IDX_CHECK | CMD_DATA_PRESENT);
             let mut got = false;
             let mut spins: u32 = 0;
             loop {
@@ -1966,7 +2100,7 @@ unsafe fn negotiate_uhs(dev: &SdhciDevice, rca: u32) -> bool {
 /// assuming a fixed offset, which would silently corrupt data if a future
 /// partitioning-tool version changes the exact start sector.
 #[cfg(feature = "rpi5")]
-unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
+unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Result<Option<u64>, ()> {
     use crate::rpi_misc_logic::sdmbr;
     // Every read here is ABSOLUTE on the card: a raw copy with offset 0, so
     // this stays right even if `dev` already carries the root offset (it did
@@ -1974,16 +2108,57 @@ unsafe fn find_f2fs_partition(dev: &SdhciDevice) -> Option<u64> {
     // was unknown and the guard covered p2..end of card, EBUSY for p3/p4).
     let raw = SdhciDevice { base: dev.base, high_capacity: dev.high_capacity, partition_offset: 0, limit_blocks: 0, boot_fat: false };
     let mut mbr = [0u8; BLOCK_SIZE];
-    if !raw.do_io(false, 0, mbr.as_mut_ptr()) { return None; }
+    if !read_retry(&raw, 0, &mut mbr) { return Err(()); }
     // A dual-boot card has two 0x83 partitions (F2FS root, Raspberry Pi OS
-    // ext4 root): take the one whose superblock carries the F2FS magic.
-    let g = sdmbr::root_guard(&mbr[..512], |blk, buf| raw.do_io(false, blk, buf.as_mut_ptr()))?;
+    // ext4 root): take the one whose superblock carries the F2FS magic, the
+    // labelled one first. A failed read is an error, never "not found".
+    let Some((g, pick)) = sdmbr::root_guard_t(&mbr[..512], |blk, buf| read_retry(&raw, blk, buf))? else { return Ok(None) };
     ROOT_FS_BYTES.store(g.bytes, Ordering::Relaxed);
+    PICK_PNO.store(pick.pno, Ordering::Relaxed);
+    DISK_ID.store(sdmbr::disk_id(&mbr[..512]), Ordering::Relaxed);
     crate::kenv::pci::serial_debug(&alloc::format!(
-        "[sdhci] root guard: raw writes EBUSY in sectors {}..{} (root fs {} bytes, from {})\n",
-        g.start_lba, g.end_lba(), g.bytes, if g.from_sb { "superblock" } else { "MBR entry: fs size unknown" }));
-    // MBR LBA is in 512-byte sectors; our blocks are 4096 bytes.
-    Some(g.start_lba / SECTORS_PER_BLOCK as u64)
+        "[sdhci] root guard: raw writes EBUSY in sectors {}..{} (root fs {} bytes, from {}; partition {}, {})\n",
+        g.start_lba, g.end_lba(), g.bytes, if g.from_sb { "superblock" } else { "MBR entry: fs size unknown" },
+        pick.pno, if pick.labelled { "labelled leandros-root" } else { "NOT labelled leandros-root" }));
+    // MBR LBA is in 512-byte sectors; our blocks are 4096 bytes (lba % 8 == 0, enforced by the picker).
+    Ok(Some(g.start_lba / SECTORS_PER_BLOCK as u64))
+}
+
+/// One absolute 4 KiB block read, retried up to 3 times with a CMD/DAT reset
+/// and a retune in between: a single transient error is not an answer.
+unsafe fn read_retry(raw: &SdhciDevice, blk: u64, buf: &mut [u8; BLOCK_SIZE]) -> bool {
+    for _ in 0..3 {
+        // Test knob `sdhci.rderr=N`: the first N attempts fail (transient-error injection).
+        if INJECT_RDERR.load(Ordering::Relaxed) > 0 && INJECT_RDERR.fetch_sub(1, Ordering::Relaxed) > 0 {
+            raw.reset_cmd_dat();
+            // Rate limited: only the first 8 injections are logged.
+            if INJECT_LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] rderr: injected read error on block {}, retrying\n", blk));
+            }
+            continue;
+        }
+        if raw.do_io(false, blk, buf.as_mut_ptr()) {
+            if INJECT_LOGGED.load(Ordering::Relaxed) > 0 && INJECT_RECOVERED.swap(true, Ordering::Relaxed) == false {
+                crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] rderr: read of block {} recovered after {} injected error(s)\n", blk, INJECT_LOGGED.load(Ordering::Relaxed)));
+            }
+            return true;
+        }
+        raw.reset_cmd_dat();
+        raw.retune();
+    }
+    false
+}
+
+/// Read the superblock through the FINAL partition offset of `dev` (the exact
+/// bytes the root mount will see): magic and label. `Err` = unreadable.
+unsafe fn probe_final_sb(dev: &SdhciDevice) -> Result<(bool, alloc::string::String), ()> {
+    use crate::rpi_misc_logic::sdmbr;
+    let mut b = [0u8; BLOCK_SIZE];
+    if !read_retry(dev, 0, &mut b) { return Err(()); }
+    match sdmbr::probe_sb(&b[F2FS_SB_OFFSET..]) {
+        sdmbr::Probe::F2fs { .. } => Ok((true, alloc::string::String::from(sdmbr::sb_label(&b[F2FS_SB_OFFSET..]).as_str()))),
+        _ => Ok((false, alloc::string::String::new())),
+    }
 }
 
 /// Whole card in 4096-byte blocks, from the CSD (0 = unknown).
@@ -2071,9 +2246,11 @@ unsafe fn probe_card(base: usize) -> Option<SdhciDevice> {
             "[sdhci] UHS not used: SD I/O voltage / power GPIOs unavailable on this board\n"
         });
     }
+    READ_ERR.store(false, Ordering::Relaxed);
     if let Some(d) = probe_card_inner(base, uhs, uhs) { return Some(d); }
-    if uhs {
-        crate::kenv::pci::serial_debug("[sdhci] UHS bring-up failed: power-cycling the card, retrying at 3.3V HS\n");
+    if uhs || READ_ERR.load(Ordering::Relaxed) {
+        READ_ERR.store(false, Ordering::Relaxed);
+        crate::kenv::pci::serial_debug("[sdhci] bring-up or F2FS probe failed: power-cycling the card, retrying at 3.3V HS\n");
         UHS_ACTIVE.store(false, Ordering::Relaxed);
         return probe_card_inner(base, false, true);
     }
@@ -2185,9 +2362,25 @@ unsafe fn probe_card_inner(base: usize, uhs: bool, cycle: bool) -> Option<SdhciD
         negotiate_bus(&dev, rca, tran_speed_khz);
     }
 
+    // F2FS root: where, and is it ours? Every read is tri-state (yes / no /
+    // read error, retried); an error fails the probe so `probe_card` re-runs
+    // it at 3.3 V instead of locking on one transient failure.
+    F2FS_FOUND.store(false, Ordering::Relaxed);
+    SB_LABEL.lock().clear();
     #[cfg(feature = "rpi5")]
     {
-        dev.partition_offset = find_f2fs_partition(&dev)?;
+        // No F2FS root (another OS's card): the device is still probed, so
+        // `init` can expose it read-only on request; it is never written.
+        match find_f2fs_partition(&dev) {
+            Err(()) => { READ_ERR.store(true, Ordering::Relaxed); return None; }
+            Ok(Some(o)) => dev.partition_offset = o,
+            Ok(None) => return Some(dev),
+        }
+    }
+    // The magic (and label) again through the final offset, on every board.
+    match probe_final_sb(&dev) {
+        Err(()) => { READ_ERR.store(true, Ordering::Relaxed); return None; }
+        Ok((found, label)) => { F2FS_FOUND.store(found, Ordering::Relaxed); *SB_LABEL.lock() = label; }
     }
 
     Some(dev)
@@ -2200,6 +2393,41 @@ static DEVICES: Mutex<[Option<SdhciDevice>; MAX_BLK_DEVICES]> =
 static DEVICE_COUNT: Mutex<usize> = Mutex::new(0);
 
 // ── Public API (matches virtio_blk.rs) ───────────────────────────────────────
+
+/// Decide, once, whether this driver may ever write the probed card, and log
+/// the verdict. Runs before any device is registered, so before the first
+/// legitimate write (the root mount, the card tools, the panic log).
+fn decide_grant(_d: &SdhciDevice) -> bool {
+    // The magic and label were read (tri-state, retried) through the final
+    // partition offset by `probe_card_inner`; no root partition: no grant.
+    let found = F2FS_FOUND.load(Ordering::Relaxed);
+    let label = SB_LABEL.lock().clone();
+    let cmdline = CMDLINE.lock();
+    let ctx = crate::rpi_misc_logic::sdgrant::Ctx {
+        found, label: &label,
+        disk_id: DISK_ID.load(Ordering::Relaxed), pno: PICK_PNO.load(Ordering::Relaxed),
+        rw: RW_ON.load(Ordering::Relaxed),
+        cmdline: if CMDLINE_SET.load(Ordering::Relaxed) { Some(&cmdline) } else { None },
+        require_root: cfg!(feature = "rpi5"),
+    };
+    let (granted, reason) = crate::rpi_misc_logic::sdgrant::evaluate(&ctx);
+    SD_REASON.store(reason, Ordering::Relaxed);
+    if granted {
+        SD_STATE.store(1, Ordering::Relaxed);
+        let cd = unsafe { _d.w16(REG_NORMAL_INT_STATUS, NI_CARD_INS | NI_CARD_REM); _d.r32(REG_PRESENT_STATE) & PSTATE_CARD_INSERTED != 0 };
+        CD_AT_GRANT.store(cd, Ordering::Relaxed);
+        crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] card-detect at grant: inserted={}\n", cd as u8));
+        WRITE_GRANT.store(true, Ordering::Release);
+    }
+    if cmdline.split_ascii_whitespace().any(|t| t.starts_with("sdhci.trust=")) && granted && label != crate::rpi_misc_logic::sdgrant::LEANDROS_LABEL {
+        crate::kenv::pci::serial_debug("[sdhci] write grant by sdhci.trust= (volume label is not leandros-root)\n");
+    }
+    crate::kenv::pci::serial_debug(&alloc::format!(
+        "[sdhci] write grant: {} ({}; label '{}', partition {})\n",
+        if granted { "GRANTED" } else { "LOCKED: this driver will not write the card" },
+        crate::rpi_misc_logic::sdgrant::reason_str(reason), label, ctx.pno));
+    granted
+}
 
 pub fn init() {
     let virt_base = mm::phys_to_virt(SDHCI_BASE);
@@ -2215,8 +2443,19 @@ pub fn init() {
     // code keeps `/dev/vdb` working unmodified everywhere.
     *cnt = match unsafe { probe_card(virt_base) } {
         Some(d) => {
+            let granted = decide_grant(&d);
+            if !granted && !EXPOSE_RO.load(Ordering::Relaxed) {
+                // Not LeandrOS's card: no SD device at all.
+                SD_STATE.store(2, Ordering::Relaxed);
+                PROBE_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            if !granted {
+                SD_STATE.store(3, Ordering::Relaxed);
+                LOCKED_RO.store(true, Ordering::Relaxed);
+            }
             #[cfg(feature = "rpi5")]
-            let boot = unsafe { find_boot_partition(&d) };
+            let boot = if granted { unsafe { find_boot_partition(&d) } } else { None };
             devs[1] = Some(d);
             // MBR partition 1 as /dev/vdc (read-only; BLKWRWIN windows only).
             // Registered only; nothing reads, mounts or scans it.
@@ -2234,7 +2473,7 @@ pub fn init() {
             #[cfg(feature = "rpi5")]
             let n = {
                 let cb = CARD_BLOCKS.load(Ordering::Relaxed);
-                if let (true, Some(d1)) = (cb > 0, devs[1].as_ref()) {
+                if let (true, Some(d1)) = (cb > 0 && granted, devs[1].as_ref()) {
                     devs[WHOLE_IDX] = Some(SdhciDevice {
                         base: d1.base, high_capacity: d1.high_capacity,
                         partition_offset: 0, limit_blocks: cb, boot_fat: false,
@@ -2242,12 +2481,17 @@ pub fn init() {
                     crate::kenv::pci::serial_debug("[sdhci] whole card exposed as /dev/mmcblk0\n");
                     WHOLE_IDX + 1
                 } else {
-                    crate::kenv::pci::serial_debug("[sdhci] whole card NOT exposed: capacity unknown (CSD)\n");
+                    crate::kenv::pci::serial_debug(if !granted {
+                        "[sdhci] whole card NOT exposed: write grant withheld\n"
+                    } else {
+                        "[sdhci] whole card NOT exposed: capacity unknown (CSD)\n"
+                    });
                     n
                 }
             };
             #[cfg(not(feature = "rpi5"))]
             let n = 2;
+            let _ = granted;
             // ADMA2: allocate the bounce buffer, then prove one read against PIO.
             let dma_state: &str = if !DMA_ON.load(Ordering::Relaxed) { "off (sdhci.dma=0)" }
             else if !MULTI_ON.load(Ordering::Relaxed) { DMA_ON.store(false, Ordering::Relaxed); "off (multi-block off)" }
@@ -2271,7 +2515,16 @@ pub fn init() {
             });
             n
         }
-        None => { dbg(b'-'); 0 }
+        None => {
+            dbg(b'-');
+            if READ_ERR.load(Ordering::Relaxed) {
+                // Retried reads and the 3.3 V fallback both failed: locked, not granted.
+                SD_STATE.store(2, Ordering::Relaxed);
+                SD_REASON.store(crate::rpi_misc_logic::sdgrant::R_READ_ERROR, Ordering::Relaxed);
+                crate::kenv::pci::serial_debug("[sdhci] write grant: LOCKED: this driver will not write the card (read-error)\n");
+            }
+            0
+        }
     };
     PROBE_DONE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
@@ -2316,8 +2569,19 @@ fn maybe_sdtest() {
         && SDTEST_PENDING.swap(false, Ordering::Relaxed) {
         let devs = DEVICES.lock();
         if let Some(Some(d1)) = devs.get(1) {
+            let log = |m: &str| crate::kenv::pci::serial_debug(&alloc::format!("[sdhci] sdtest REFUSED: {}\n", m));
+            // Writes only on a card proven ours, that is exactly the card the
+            // scratch window was cut for, and with no partition in the window.
+            if !WRITE_GRANT.load(Ordering::Acquire) { log("write grant withheld"); return; }
+            let cap = CARD_BLOCKS.load(Ordering::Relaxed) * SECTORS_PER_BLOCK as u64;
+            if cap != SCRATCH_END { log("card capacity is not the expected card"); return; }
             let raw = SdhciDevice { base: d1.base, high_capacity: d1.high_capacity,
                 partition_offset: 0, limit_blocks: 0, boot_fat: false };
+            let mut mbr = [0u8; BLOCK_SIZE];
+            if !unsafe { read_retry(&raw, 0, &mut mbr) } { log("MBR unreadable"); return; }
+            if !crate::rpi_misc_logic::sdmbr::window_free(&mbr[..512], SCRATCH_FIRST, SCRATCH_END) {
+                log("a partition overlaps the scratch window"); return;
+            }
             unsafe { raw.sdtest(SDTEST_MIB.load(Ordering::Relaxed)); }
         }
     }
@@ -2331,6 +2595,7 @@ fn maybe_sdtest() {
 fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -> bool {
     maybe_sdtest();
     if len == 0 || len % BLOCK_SIZE != 0 { return false; }
+    if write_refused(is_write) { return false; }
     let total = len / BLOCK_SIZE;
     {
         let devs = DEVICES.lock();
@@ -2383,7 +2648,7 @@ fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -
 /// The boot-FAT device is always read-only (writable only inside a BLKWRWIN window).
 pub fn read_only(dev_idx: usize) -> bool {
     let devs = DEVICES.lock();
-    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat)
+    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat || LOCKED_RO.load(Ordering::Relaxed))
 }
 
 pub fn is_boot_fat(dev_idx: usize) -> bool {
@@ -2398,6 +2663,7 @@ pub fn flush(dev_idx: usize) -> bool {
 
 /// Write one 4096-byte block to device `dev_idx` at logical block `blk`.
 pub fn write_block(dev_idx: usize, blk: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
+    if write_refused(true) { return false; }
     if whole_write_blocked(dev_idx, blk, 1) { return false; }
     let devs = DEVICES.lock();
     if let Some(ref dev) = devs[dev_idx] {

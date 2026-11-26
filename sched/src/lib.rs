@@ -8030,6 +8030,13 @@ fn scheduler_run_loop() -> ! {
             let mut late_leader: Option<alloc::boxed::Box<Task>> = None;
             let mut zombie_sole = false;
             let mut leader_sole = false;
+            // Lane lateleader: this pass marked `AS_DROP_TGID[id]` (and so must
+            // clear it under RUN_QUEUE and look at the group again), and what
+            // the group-settle recheck needs: (tgid, pid, uid, parent, zdone).
+            let mut drop_marked = false;
+            let mut recheck: Option<(Pid, Pid, u32, Pid, bool)> = None;
+            // (parent tgid, tgid) whose wait/pidfd waiters must look again.
+            let mut wake: Option<(Pid, Pid)> = None;
             let zombie = {
                 let mut rq = RUN_QUEUE.lock();
                 let mut runnable = false;
@@ -8117,15 +8124,29 @@ fn scheduler_run_loop() -> ! {
                     // group is not done (`group_settled`), and its last
                     // thread's `exit` waits for the drop before it frees the
                     // space itself (`release_exiting_address_space`).
-                    if has_as { AS_DROP_TGID[id].store(ztgid, Ordering::Release); }
+                    if has_as { AS_DROP_TGID[id].store(ztgid, Ordering::Release); drop_marked = true; }
                     let removed = rq.remove(idx);
                     // The last unfinished member of an exited group left
                     // here (two threads exiting at once after their leader,
                     // neither of them last when it looked): this CPU tells
                     // the parent, once the drop below is done.
-                    if !zdone && group_settled(&rq, ztgid) {
+                    //
+                    // Lane lateleader: with this member's own drop pending
+                    // (`has_as`) the group cannot be settled here (its mark
+                    // is set), and nothing else would look again: the
+                    // recheck after the drop does. Without a drop pending the
+                    // group may be settled now; a leader reaped here that
+                    // still holds the space is marked in this same hold.
+                    if has_as {
+                        recheck = Some((ztgid, zpid, zuid, parent_tgid, zdone));
+                    } else if !zdone && group_settled(&rq, ztgid) {
                         if zpid != ztgid { late_leader = reap_delayed_leader(&mut rq, ztgid); }
+                        if late_leader.as_ref().map_or(false, |l| l.address_space.is_some()) {
+                            AS_DROP_TGID[id].store(ztgid, Ordering::Release);
+                            drop_marked = true;
+                        }
                         late_notice = group_exit_notice(&rq, ztgid, zuid).map(|n| (ztgid, n));
+                        wake = Some((parent_tgid, ztgid));
                     }
                     // Last holder of its space? Decided here, with every
                     // removal of this pass done (see `reap_close_space`).
@@ -8144,6 +8165,7 @@ fn scheduler_run_loop() -> ! {
 
             if let Some(l) = late_leader.take() { finish_reaped_leader(l, leader_sole); }
             if let Some(t) = zombie {
+                if asfree::any_armed() { asfree::drop_delay(t.tgid); }
                 // This CPU ran the task to its death and holds the only
                 // reference now — safe to run the exit hook and free its
                 // kernel stack.  Dropping the Box releases the address space.
@@ -8160,9 +8182,52 @@ fn scheduler_run_loop() -> ! {
                 mm::buddy::free(t.kernel_stack, KERNEL_STACK_ORDER);
                 reap_close_space(&t, zombie_sole);
                 drop(t);
-                if AS_DROP_TGID[id].swap(0, Ordering::AcqRel) != 0 {
+                // Lane lateleader: the drop is done. Clear the mark under
+                // RUN_QUEUE, as the settle check reads it there, and look at
+                // the group again: this may have been the member whose
+                // pending drop kept the group from settling, while the
+                // others (a delayed leader parked off-CPU) are already done
+                // and will not look again.
+                if drop_marked {
+                    let mut relead: Option<alloc::boxed::Box<Task>> = None;
+                    let mut relead_sole = false;
+                    {
+                        let mut rq = RUN_QUEUE.lock();
+                        AS_DROP_TGID[id].store(0, Ordering::Release);
+                        if let Some((ztgid, zpid, zuid, zparent, zdone)) = recheck {
+                            let lead_ok = match rq.find_pid(ztgid) {
+                                None => true,
+                                Some(l) => l.state == TaskState::Zombie && l.delayed_leader,
+                            };
+                            if !zdone && lead_ok && group_settled(&rq, ztgid) {
+                                if zpid != ztgid { relead = reap_delayed_leader(&mut rq, ztgid); }
+                                if let Some(l) = relead.as_ref() {
+                                    relead_sole = removed_space_unshared(&rq, l);
+                                    if l.address_space.is_some() {
+                                        AS_DROP_TGID[id].store(ztgid, Ordering::Release);
+                                    }
+                                }
+                                late_notice = group_exit_notice(&rq, ztgid, zuid).map(|n| (ztgid, n));
+                                wake = Some((zparent, ztgid));
+                            } else if zdone {
+                                wake = Some((zparent, ztgid));
+                            }
+                        }
+                    }
+                    if let Some(l) = relead.take() {
+                        finish_reaped_leader(l, relead_sole);
+                        let _rq = RUN_QUEUE.lock();
+                        AS_DROP_TGID[id].store(0, Ordering::Release);
+                    }
                     // `group_settled` (a pidfd's "exited") may have changed.
                     percpu::pexit_bump();
+                }
+                if let Some((parent, tgid)) = wake.take() {
+                    // Also when there is no notice (the parent ignores
+                    // SIGCHLD, the exit was auto-reaped): its wait4 must
+                    // look again.
+                    request_poll_wake_key(poll_key(poll_class::WAIT, parent));
+                    request_poll_wake_key(poll_key(poll_class::PIDFD, tgid));
                 }
                 if let Some((tgid, n)) = late_notice.take() {
                     // SIGCHLD needs task context (it takes RUN_QUEUE and may
@@ -8866,6 +8931,7 @@ pub fn exit(code: i32) -> ! {
     // the task turns Zombie and becomes waitable (Linux: `exit_mm` precedes
     // `exit_notify`).
     release_exiting_address_space(pid);
+    if asfree::any_armed() { asfree::exit_race(pid, tgid); }
 
     let (notice, reaped_leader) = {
         let mut rq = RUN_QUEUE.lock();
@@ -8895,7 +8961,13 @@ pub fn exit(code: i32) -> ! {
             (group_exit_notice(&rq, tgid, uid), l)
         } else { (None, None) }
     };
-    if let Some(l) = reaped_leader { finish_reaped_leader(l, false); }
+    // Task context with no pending drop of its own: the leader's space was
+    // taken by `release_exiting_address_space` above (`finish_reaped_leader`
+    // marks `AS_DROP_TGID` only for a Box that still holds one).
+    if let Some(l) = reaped_leader {
+        debug_assert!(l.address_space.is_none());
+        finish_reaped_leader(l, false);
+    }
     // Release the /proc/self/exe side-table slot when the process leader dies.
     if last { clear_exe_path(tgid); sysacct::free_tgid(tgid); }
     clear_comm(pid);
@@ -8950,6 +9022,7 @@ pub fn exit(code: i32) -> ! {
     if let Some(t) = RUN_QUEUE.lock().find_pid_mut(pid) {
         if t.state != TaskState::Zombie { t.set_state(TaskState::Zombie); }
     }
+    if asfree::any_armed() { asfree::leader_delay(pid, tgid); }
     yield_now("exit");
     loop { core::hint::spin_loop(); }
 }

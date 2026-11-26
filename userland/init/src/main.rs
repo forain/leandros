@@ -18,6 +18,7 @@ use leandros_libc::{
 };
 #[path = "../../../lib/utmpx/utmpx.rs"]
 mod utmpx;
+mod rootspec;
 use leandros_libc::syscall::{nr, syscall0, syscall2, syscall3, syscall4, syscall5};
 
 const O_CLOEXEC: usize = 0x8_0000;
@@ -539,6 +540,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     write_str("Mounting F2FS root /dev/root to /mnt...\n");
     if !mount_root() {
         write_str("ERROR: Failed to mount the root filesystem to /mnt!\n");
+        root_failed(false);
         // Park without burning a CPU (there is nothing to run without a root).
         loop { usleep(1_000_000); }
     }
@@ -556,6 +558,7 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8, _envp: *const
     let pivot_res = pivot_root(b"/mnt\0".as_ptr(), b"/mnt/old_root\0".as_ptr());
     if pivot_res < 0 {
         write_str("ERROR: pivot_root failed!\n");
+        root_failed(true);
         loop { sched_yield(); }
     }
     write_str("pivot_root successful! Root is now F2FS.\n");
@@ -2294,26 +2297,100 @@ unsafe fn mount_raw(src: &[u8], dst: &[u8], fstype: &[u8]) -> isize {
              fstype.as_ptr() as usize, 0, 0)
 }
 
+/// The kernel command line (empty when /proc/cmdline is unreadable, which is
+/// logged: root=/rootwait=/root.fail= are then silently at their defaults).
+unsafe fn read_cmdline(buf: &mut [u8; 4096]) -> &[u8] {
+    let n = read_file(b"/proc/cmdline\0", buf);
+    if n == 0 {
+        write_str("[init] warning: /proc/cmdline unreadable or empty; root=, rootwait= and root.fail= use their defaults\n");
+    }
+    &buf[..n]
+}
+
+/// Flush filesystems in a forked child, waiting at most 5 s: a stuck disk
+/// must not be able to block the reboot (the child is abandoned on timeout).
+unsafe fn bounded_sync() {
+    const WNOHANG: i32 = 1;
+    let pid = fork();
+    if pid < 0 { return; }
+    if pid == 0 {
+        syscall0(nr::SYNC);
+        exit(0);
+    }
+    let start = monotonic_ms();
+    loop {
+        let mut status = 0i32;
+        let r = wait4(pid, &mut status, WNOHANG, core::ptr::null_mut());
+        if r == pid || r < 0 { return; }
+        if monotonic_ms().saturating_sub(start) > 5_000 {
+            write_str("[init] sync did not finish in 5 s; rebooting anyway\n");
+            syscall2(nr::KILL, pid as usize, 9);
+            return;
+        }
+        usleep(20_000);
+    }
+}
+
+/// The root could not be mounted or pivoted. With `root.fail=reboot` on the
+/// command line (opt-in, meant for trial boot entries that must fall back to
+/// the previous entry; never set on a default entry): say so, wait 10 s (time
+/// to read the console) and restart. Without it, return and let the caller
+/// park (the default). Only after a failed pivot (`mounted`) is there a
+/// filesystem to flush, and then the sync is time-bounded.
+unsafe fn root_failed(mounted: bool) {
+    let mut cl = [0u8; 4096];
+    if !rootspec::fail_reboot(read_cmdline(&mut cl)) { return; }
+    write_str("[init] root.fail=reboot: restarting in 10 s\n");
+    usleep(10_000_000);
+    if mounted { bounded_sync(); }
+    let r = syscall4(nr::REBOOT, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2, LINUX_REBOOT_CMD_RESTART, 0);
+    write_str("[init] ERROR: reboot(2) failed: ");
+    write_u32((-r) as u32);
+    write_str("\n");
+}
+
 /// Mount `/dev/root` on /mnt.
 ///
 /// ENODEV means "no root device yet": a USB stick can finish enumerating
-/// well after init starts, so retry every 100 ms for up to 30 s, saying so
-/// once a second. EINVAL is a kernel that does not know `/dev/root` at all;
-/// that (or a root that never appeared) falls back to the historical
-/// `/dev/vdb`, QEMU's root disk.
+/// well after init starts, so retry every 100 ms for `rootwait=<seconds>`
+/// (default 30), saying so once a second.
+///
+/// With `root=` on the command line the named device is the only candidate:
+/// a root that never appears (or a kernel that cannot resolve it) fails,
+/// printing the wanted id; it never falls back to another disk. Without
+/// `root=` a missing root or a kernel that does not know `/dev/root`
+/// (EINVAL) falls back to the historical `/dev/vdb`, QEMU's root disk.
 unsafe fn mount_root() -> bool {
     const ENODEV: isize = 19;
     const EINVAL: isize = 22;
     const ENOTUNIQ: isize = 76;
     const STEP_MS: u32 = 100;
-    const LIMIT_MS: u32 = 30_000;
+    let mut cl = [0u8; 4096];
+    let cmdline = read_cmdline(&mut cl);
+    let wanted = rootspec::root_spec(cmdline);
+    let limit_ms = rootspec::rootwait_secs(cmdline).saturating_mul(1000);
+    const EIO: isize = 5;
     let mut waited_ms: u32 = 0;
+    let mut transient_retries = 0u32;
     loop {
         let r = mount_raw(b"/dev/root\0", b"/mnt\0", b"f2fs\0");
         if r == 0 { return true; }
-        if r == -ENODEV && waited_ms < LIMIT_MS {
+        // A named root that answers EINVAL/EIO may be a stick still settling:
+        // retry 3 times, 500 ms apart, before giving up.
+        if wanted.is_some() && (r == -EINVAL || r == -EIO) && transient_retries < 3 {
+            transient_retries += 1;
+            write_str("mount /dev/root: transient error, retrying\n");
+            usleep(500_000);
+            continue;
+        }
+        if r == -ENODEV && waited_ms < limit_ms {
             if waited_ms % 1000 == 0 {
-                write_str("Waiting for the root device (");
+                write_str("Waiting for the root device");
+                if let Some(w) = wanted {
+                    write_str(" root=");
+                    out_bytes(w);
+                }
+                write_str(" (");
                 write_u32(waited_ms / 1000);
                 write_str(" s)...\n");
             }
@@ -2324,6 +2401,13 @@ unsafe fn mount_root() -> bool {
         write_str("mount /dev/root failed (errno ");
         write_u32((-r) as u32);
         write_str(")");
+        if let Some(w) = wanted {
+            write_str(": root=");
+            out_bytes(w);
+            write_str(" is not available; not falling back to another disk\n");
+            if r == -ENOTUNIQ { write_str("(more than one candidate matched)\n"); }
+            return false;
+        }
         if r == -ENODEV || r == -EINVAL {
             write_str(", falling back to /dev/vdb\n");
             return mount_raw(b"/dev/vdb\0", b"/mnt\0", b"f2fs\0") == 0;

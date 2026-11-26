@@ -29,6 +29,9 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
         read(gfd, b.as_mut_ptr(), 1);
         return 0;
     }
+    if argc >= 2 && cstr_eq(*argv.add(1), b"lateleader") {
+        return if test_late_leader_all() { 0 } else { 1 };
+    }
     if argc >= 2 {
         let a = *argv.add(1);
         if *a == b'h' && *a.add(1) == b'o' && *a.add(2) == b'g' && *a.add(3) == 0 {
@@ -143,6 +146,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_asfree_mt_kill() { failures += 1; }
     if !test_asfree_leader_exit_first() { failures += 1; }
     if !test_asfree_vfork() { failures += 1; }
+    if !test_late_leader_all() { failures += 1; }
     if !test_wait_memory_drift() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
@@ -2679,6 +2683,237 @@ unsafe fn test_asfree_leader_exit_first() -> bool {
     write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, armed && reported && status == 0 && at_wait == before + 1)
+}
+
+
+// ── Late leader: the last members of a group leave while its leader is parked (lane lateleader) ──
+// A leader that pthread_exit()s first stays as a delayed Zombie until the rest
+// of its group is gone; the group is reported when that rest is settled. These
+// cases make the last two members become Zombies together (`exitrace`) and
+// hold the dispatch loop's drop of a removed member open (`dropdelay`), then
+// check everything a parent can observe of the process. Every wait is bounded.
+
+#[cfg(target_arch = "x86_64")]
+mod llnr { pub const SIGPROCMASK: usize = 14; pub const SIGTIMEDWAIT: usize = 128; pub const PPOLL: usize = 271; pub const SIGACTION: usize = 13; }
+#[cfg(target_arch = "aarch64")]
+mod llnr { pub const SIGPROCMASK: usize = 135; pub const SIGTIMEDWAIT: usize = 137; pub const PPOLL: usize = 73; pub const SIGACTION: usize = 134; }
+const LL_PIDFD_OPEN: usize = 434;
+const LL_TOUCHED_PAGES: usize = 2048; // 8 MiB
+
+unsafe fn ll_now_ms() -> u64 {
+    let mut ts = [0u64; 2];
+    syscall2(nr::CLOCK_GETTIME, 1, ts.as_mut_ptr() as usize);
+    ts[0] * 1000 + ts[1] / 1_000_000
+}
+
+unsafe fn ll_sigchld_mask(how: usize) {
+    let set: u64 = 1 << 16;
+    syscall4(llnr::SIGPROCMASK, how, &set as *const u64 as usize, 0, 8);
+}
+
+/// One SIGCHLD consumed within `ms` (0 = poll).
+unsafe fn ll_take_sigchld(ms: usize) -> bool {
+    let set: u64 = 1 << 16;
+    let mut info = [0u8; 128];
+    let ts = [(ms / 1000) as u64, ((ms % 1000) * 1_000_000) as u64];
+    syscall4(llnr::SIGTIMEDWAIT, &set as *const u64 as usize, info.as_mut_ptr() as usize, ts.as_ptr() as usize, 8) as isize == 17
+}
+
+unsafe fn ll_sigchld_ignore(on: bool) {
+    let mut sa = [0u64; 4];
+    sa[0] = if on { 1 } else { 0 };
+    syscall4(llnr::SIGACTION, 17, sa.as_ptr() as usize, 0, 8);
+}
+
+/// `"<verb> <pid> <a> <b>"` written to the asfree file.
+unsafe fn ll_knob(verb: &[u8], pid: i32, a: usize, b: &[u8]) -> bool {
+    let mut cmd = [0u8; 64];
+    let mut p = 0;
+    for &c in verb { cmd[p] = c; p += 1; }
+    for v in [pid as usize, a] {
+        cmd[p] = b' '; p += 1;
+        let mut t = [0u8; 16]; let n = fmt_num(v, &mut t);
+        for i in 0..n { cmd[p] = t[i]; p += 1; }
+    }
+    if !b.is_empty() { cmd[p] = b' '; p += 1; for &c in b { cmd[p] = c; p += 1; } }
+    asfree_cmd(&cmd[..p])
+}
+
+unsafe fn ll_print_kv(k: &[u8], v: usize) {
+    write(STDOUT_FILENO, b" ".as_ptr(), 1);
+    write(STDOUT_FILENO, k.as_ptr(), k.len());
+    write(STDOUT_FILENO, b"=".as_ptr(), 1);
+    print_dec(v);
+}
+
+/// One late-leader case; `race`: (threads, mode) of `exitrace`, `delay_us`:
+/// `dropdelay` (0 = none), `ign`: SIGCHLD ignored (auto-reap) instead of blocked.
+unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize, &[u8])>, delay_us: usize, ign: bool, sig_first: bool) -> bool {
+    let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+    if pipe2(ready.as_mut_ptr(), 0o4000) != 0 || pipe(go.as_mut_ptr()) != 0 { return report(name, false); }
+    ll_sigchld_mask(0);
+    while ll_take_sigchld(0) {}
+    if ign { ll_sigchld_ignore(true); }
+    let pid = fork();
+    if pid == 0 {
+        close(ready[0]); close(go[1]);
+        let (mut w, mut g, mut n) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+        fmt_num(ready[1] as usize, &mut w); fmt_num(go[0] as usize, &mut g); fmt_num(nw, &mut n);
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"late_leader\0".as_ptr(), w.as_ptr(), g.as_ptr(), n.as_ptr(),
+            if lead_waits { b"x\0".as_ptr() } else { core::ptr::null() }, core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(ready[1]); close(go[0]);
+    let mut ok = pid > 0;
+    // Ready byte, bounded 5 s.
+    let t0 = ll_now_ms();
+    let mut rb = [0u8; 1];
+    let mut reported = false;
+    while ll_now_ms() - t0 < 5000 {
+        if read(ready[0], rb.as_mut_ptr(), 1) == 1 { reported = true; break; }
+        usleep(1000);
+    }
+    ok &= reported;
+    let pidfd = syscall2(LL_PIDFD_OPEN, pid as usize, 0) as isize;
+    let before = asfree_count(pid).unwrap_or(99);
+    let mut armed = true;
+    if !lead_waits { usleep(200_000); } // the leader is gone and parked
+    if let Some((n, m)) = race { armed &= ll_knob(b"exitrace", pid, n, m); }
+    if delay_us != 0 { armed &= ll_knob(b"dropdelay", pid, delay_us, b""); }
+    ok &= armed;
+    let t1 = ll_now_ms();
+    for _ in 0..(nw + lead_waits as usize) { write(go[1], b"x".as_ptr(), 1); }
+    // The signal (or, ignored, the pid's disappearance) is awaited BEFORE any
+    // wait4: a wait4 poll runs the kernel's own settle scan and can paper over
+    // a group nobody reported. `sig_first = false` is the poll-only variant.
+    let mut sigs = 0usize; let mut stray = 0usize; let mut pollin = false; let mut gone = true;
+    let mut st = -1i32;
+    let mut r: isize = 0;
+    if ign {
+        gone = false;
+        while ll_now_ms() - t1 <= 3000 {
+            if syscall2(nr::KILL, pid as usize, 0) as isize == -3 { gone = true; break; }
+            usleep(500);
+        }
+    } else if sig_first {
+        if ll_take_sigchld(3000) { sigs = 1; }
+    }
+    loop {
+        r = syscall4(nr::WAIT4, pid as usize, &mut st as *mut i32 as usize, 1, 0) as isize;
+        if r != 0 || ll_now_ms() - t1 > 3000 { break; }
+        usleep(500);
+    }
+    let waited_ms = (ll_now_ms() - t1) as usize;
+    let mut a = asfree_new();
+    let (mut cnt, mut last) = if asfree_read(&mut a) { asfree_of(&a, pid as usize) } else { (99, AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }) };
+    if ign {
+        // An auto-reaped group is gone for the parent when its leader is
+        // logged; the leader's space is closed right after, so the ring
+        // entry is awaited (bounded) instead of read once.
+        let t2 = ll_now_ms();
+        while cnt != before + 1 && ll_now_ms() - t2 < 1000 {
+            usleep(1000);
+            if asfree_read(&mut a) { let (c, l) = asfree_of(&a, pid as usize); cnt = c; last = l; }
+        }
+    }
+    if ign {
+        ok &= gone && r == -10 && waited_ms < 500;
+    } else {
+        ok &= r == pid as isize && st == 0 && waited_ms < 500;
+        if !sig_first && ll_take_sigchld(3000) { sigs = 1; }
+        if ll_take_sigchld(200) { stray = 1; }
+        ok &= sigs == 1 && stray == 0;
+        if pidfd >= 0 {
+            let mut pf = [0u8; 8];
+            pf[0..4].copy_from_slice(&(pidfd as i32).to_ne_bytes());
+            pf[4..6].copy_from_slice(&1i16.to_ne_bytes());
+            let ts = [1u64, 0u64];
+            let n = syscall4(llnr::PPOLL, pf.as_mut_ptr() as usize, 1, ts.as_ptr() as usize, 0) as isize;
+            pollin = n == 1 && pf[6] & 1 != 0;
+        }
+        ok &= pollin;
+    }
+    ok &= cnt == before + 1 && last.pages >= LL_TOUCHED_PAGES;
+    if pidfd >= 0 { close(pidfd as i32); }
+    asfree_do(b"release", pid, 0);
+    if !ok && r == 0 { syscall2(nr::KILL, pid as usize, 9); } // best effort, never waited for
+    if ign { ll_sigchld_ignore(false); }
+    close(ready[0]); close(go[1]);
+    ll_sigchld_mask(1);
+    write(STDOUT_FILENO, b" ".as_ptr(), 1);
+    write(STDOUT_FILENO, name.as_ptr(), name.len() - 1);
+    ll_print_kv(b"wait_ret", if r < 0 { 1000 + (-r) as usize } else { r as usize });
+    ll_print_kv(b"status", st as usize);
+    ll_print_kv(b"ms", waited_ms);
+    ll_print_kv(b"ring_before", before); ll_print_kv(b"ring", cnt); ll_print_kv(b"pages", last.pages);
+    ll_print_kv(b"sigchld", sigs); ll_print_kv(b"stray", stray); ll_print_kv(b"pollin", pollin as usize);
+    ll_print_kv(b"gone", gone as usize); ll_print_kv(b"armed", armed as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok)
+}
+
+unsafe fn test_late_leader_all() -> bool {
+    let mut ok = true;
+    ok &= test_late_leader_i1();
+    ok &= test_late_leader_i2();
+    ok &= test_late_leader_i3();
+    ok &= test_late_leader_i2_poll();
+    ok &= test_late_leader_i1_ign();
+    ok &= test_late_leader_i2_ign();
+    ok &= test_late_leader_i3_ign();
+    ok &= test_late_leader_churn();
+    ok
+}
+
+unsafe fn test_late_leader_i1() -> bool { ll_case(b"late_leader_i1\0", 2, false, Some((2, b"w")), 0, false, true) }
+unsafe fn test_late_leader_i2() -> bool { ll_case(b"late_leader_i2\0", 1, true, Some((2, b"l")), 0, false, true) }
+unsafe fn test_late_leader_i3() -> bool { ll_case(b"late_leader_i3\0", 1, true, Some((2, b"l")), 2000, false, true) }
+unsafe fn test_late_leader_i2_poll() -> bool { ll_case(b"late_leader_i2_poll\0", 1, true, Some((2, b"l")), 0, false, false) }
+unsafe fn test_late_leader_i1_ign() -> bool { ll_case(b"late_leader_i1_ign\0", 2, false, Some((2, b"w")), 0, true, false) }
+unsafe fn test_late_leader_i2_ign() -> bool { ll_case(b"late_leader_i2_ign\0", 1, true, Some((2, b"l")), 0, true, false) }
+unsafe fn test_late_leader_i3_ign() -> bool { ll_case(b"late_leader_i3_ign\0", 1, true, Some((2, b"l")), 2000, true, false) }
+
+/// Total threads in the system (`/proc/loadavg` "R/T").
+unsafe fn ll_task_total() -> usize {
+    let mut buf = [0u8; 256];
+    let n = slurp(b"/proc/loadavg\0", &mut buf);
+    let mut sp = 0; let mut i = 0;
+    while i < n && sp < 3 { if buf[i] == b' ' { sp += 1; } i += 1; }
+    while i < n && buf[i] != b'/' { i += 1; }
+    parse_num(&buf[(i + 1).min(n)..n]).unwrap_or(0)
+}
+
+/// 2000 knob-less rounds of a barrier exit (1-3 workers and the leader leave
+/// together), run by `pthreadtest late_leader_churn` with SIGCHLD blocked in
+/// its parent role: no drift in free memory, thread count or SIGCHLD count.
+unsafe fn test_late_leader_churn() -> bool {
+    let name = b"late_leader_churn\0";
+    let (ram0, th0) = (free_ram() / PAGE, ll_task_total());
+    let pid = fork();
+    if pid == 0 {
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"late_leader_churn\0".as_ptr(), b"2000\0".as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    let t0 = ll_now_ms();
+    let mut st = -1i32; let mut r: isize;
+    loop {
+        r = syscall4(nr::WAIT4, pid as usize, &mut st as *mut i32 as usize, 1, 0) as isize;
+        if r != 0 || ll_now_ms() - t0 > 600_000 { break; }
+        usleep(20_000);
+    }
+    if r == 0 { syscall2(nr::KILL, pid as usize, 9); }
+    usleep(300_000);
+    let (ram1, th1) = (free_ram() / PAGE, ll_task_total());
+    let dram = if ram0 > ram1 { ram0 - ram1 } else { 0 };
+    let dth = if th1 > th0 { th1 - th0 } else { 0 };
+    write(STDOUT_FILENO, b"  helper_status=".as_ptr(), 16); print_dec(st as usize);
+    ll_print_kv(b"ram_lost_pages", dram); ll_print_kv(b"threads_gained", dth);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, r == pid as isize && st == 0 && dram <= 512 && dth <= 2)
 }
 
 /// clone(CLONE_VM|CLONE_VFORK|SIGCHLD); the child (sharing this process's
