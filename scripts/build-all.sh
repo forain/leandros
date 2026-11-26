@@ -1281,7 +1281,7 @@ for arch in "${ARCHS[@]}"; do
         "$ROOT_DIR/scripts/kmod/testblob.sh" "$arch"
     fi
     # Rust modules (CONFIG_X=m, $KMOD_EXTRA); a no-op when there is nothing to build.
-    KMOD_BOARD="$([[ "$arch" == "aarch64" && "$RPI5" == "true" ]] && echo rpi5 || { [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]] && echo raspi4b; } || true)" \
+    KMOD_BOARD="${KMOD_BOARD:-$([[ "$arch" == "aarch64" && "$RPI5" == "true" ]] && echo rpi5 || { [[ "$arch" == "aarch64" && "${RASPI4B:-}" == "true" ]] && echo raspi4b; } || true)}" \
         phase kmod_build "$ROOT_DIR/scripts/kmod/kmod-build.sh" "$arch"
     phase create_initrd create_initrd "$arch"
     # Fail the build when a shipped kernel variant has no lib/modules/<its build-id> (any =m set).

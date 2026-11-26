@@ -40,7 +40,7 @@ def build():
         return False
     with open(os.path.join(VAR, ".config"), "w") as f:
         f.write("CONFIG_MODULES=y\nCONFIG_VIRTIO_NET=m\nCONFIG_NVME=m\nCONFIG_IWLWIFI=m\nCONFIG_BRCMF=m\n")
-    env = dict(os.environ, KMOD_ONLY="1", KMOD_EXTRA="sdhci", LEANDROS_RUN_ID=f"{rid}-var")
+    env = dict(os.environ, KMOD_ONLY="1", KMOD_EXTRA="sdhci" if arch == "aarch64" else "", KMOD_BOARD="raspi4b" if arch == "aarch64" else "", LEANDROS_RUN_ID=f"{rid}-var")
     env.pop("KMOD_TEST", None)
     with open(os.path.join(VAR, "kmodsuite-build.log"), "w") as lg:
         r = subprocess.run(["./scripts/build-all.sh", "--arch", arch], cwd=VAR, env=env, stdout=lg,
@@ -107,7 +107,7 @@ def main():
             check(f"nvme cycle #{i} unload", "RM_RC=0" in o, o.strip()[-120:])
             check(f"nvme cycle #{i} node gone then block 1 readable", ("No such" in o or "cannot access" in o) and MAGIC.decode() in o)
         # ---- hardware-less modules: load-only smoke
-        for mod in ("iwlwifi", "brcmf", "sdhci"):
+        for mod in ("iwlwifi", "brcmf") + (("sdhci",) if arch == "aarch64" else ()):
             for i in (1, 2):
                 o = run(f"kmodctl load {mod}; echo LD_RC=$?; grep '^{mod} ' /proc/modules; kmodctl rmmod {mod}; echo RM_RC=$?; "
                         f"grep -c '^{mod} ' /proc/modules; echo SM_END")

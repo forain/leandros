@@ -21,6 +21,8 @@ mod irq {
 mod blockdev;
 #[path = "../../../drivers/src/partscan.rs"]
 mod partscan;
+#[path = "../../../drivers/src/flush_logic.rs"]
+mod flush_logic;
 #[path = "../../../drivers/src/blkmod.rs"]
 mod blkdev;
 #[path = "../../../drivers/src/nvme.rs"]
