@@ -1331,7 +1331,14 @@ static void test_dhcp6_refresh(void) {
     int r = inject_ra(0x40, NULL, 0);
     int got = d6_wait("info-sent") || d6_wait("done");
     d6_state(m, s, x, &rep);
-    if (r != 0 || !got || !strcmp(s, "done")) { printf("  note: dhcp6 refresh skipped (wire server answered first)\n"); d6_reset(); return; }
+    if (r == 0 && got && !strcmp(s, "done")) {
+        /* The wire server (slirp) answered and sends no refresh option: the default applies. */
+        long t = d6_field("refresh");
+        CHECK("dhcp6_refresh_default_86400", t >= 86300 && t <= 86400);
+        d6_reset();
+        return;
+    }
+    if (r != 0 || !got) { CHECK("dhcp6_refresh_min_600", 0); d6_reset(); return; }
     r = d6_send(7, x, o, sizeof o);
     int ok = r == 0 && d6_wait("done");
     long t = d6_field("refresh");
