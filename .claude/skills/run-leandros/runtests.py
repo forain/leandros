@@ -48,6 +48,7 @@ Options:
                              ec2init  host:ec2inittest.py alone (ec2init vs a fake IMDSv2 behind a slirp guestfwd)
                              a64its   host:a64itstest.py alone (aarch64 GICv3 ITS: virtio-net + NVMe on MSI-X LPIs, /proc/interrupts, gic.its=0 fallback)
                              udppeer  host:udppeertest.py alone (udptest peer vs a raw-frame host peer on a 2nd NIC)
+                             v6inject host:v6injecttest.py alone (host-injected RA MTU option + DAD claims on a 2nd NIC)
                              ssh      host:sshsmoke.py (the guest sshd from the host's ssh client)
                              sshfull  host:sshsmoke.py --full (keys, sftp/scp, git over ssh/https)
                              straysweep host:straysweeptest.py (greetd exit spares detached ssh jobs, own boot)
@@ -339,6 +340,8 @@ SUITES = {
                 "host:netwatchtest.py",
                 # Hung virtio-blk backend: slow-request warning, system alive, completes on resume (~40 s; lane blkhang).
                 "host:blkhangtest.py",
+                # Virtio-blk I/O error completion (blkdebug inject-error): mapped fault = SIGBUS, read() = EIO, system alive (~22 s; lane blkfaultfix).
+                "host:blkfaulttest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
                 "host:uartgaptest.py", "host:conlosstest.py", "host:conlossnoisetest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
                 # Out-of-tree host suites that were solo-green 3x x86_64 KVM + aarch64 TCG (lane hostcov 2026-11-22): USB unplug, F2FS checkpoint, power control (~2-5 min each).
@@ -524,7 +527,7 @@ SUITES = {
     # switch on cpu1 (x86_64; own boot via cmdline timer.dead_delay=1); the CPU's tick must survive.
     "deadtimer": ["/bin/timertest deadtick"],
     "deadtimerhost": ["host:deadtimertest.py"],
-    # Dead virtio-blk: a mapped-page fault must SIGBUS (own boot, ~2 min; not in regress).
+    # Virtio-blk I/O error completion: a mapped-page fault must SIGBUS, read() EIO (own boots, ~22 s; in regress).
     "blkfault": ["host:blkfaulttest.py"],
     # NVMe command timeout: the driver resets the controller and the stalled
     # read finishes with intact data (own boot, ~2 min; not in regress).
@@ -563,7 +566,9 @@ SUITES = {
                 "host:nettxtest.py --shape eth0:20000:20000:64:256:2",
                 # IP fragmentation, ICMP errors, IGMP, broadcast, cmsgs against
                 # a frame-level host peer on a second NIC: udppeertest.py.
-                "host:udppeertest.py"],
+                "host:udppeertest.py",
+                # RA MTU option + NIC DADFAILED over a real wire: v6injecttest.py.
+                "host:v6injecttest.py"],
     # netroamtest.py alone.
     "netroam": ["host:netroamtest.py"],
     "netmetric": ["host:netmetrictest.py"],
@@ -572,6 +577,8 @@ SUITES = {
     "a64its": ["host:a64itstest.py"],
     # udppeertest.py alone (udptest peer against the raw-Ethernet host peer).
     "udppeer": ["host:udppeertest.py"],
+    # v6injecttest.py alone (host-injected RA MTU option and DAD claims on a 2nd NIC).
+    "v6inject": ["host:v6injecttest.py"],
     # linkmontest.py alone.
     "linkmon": ["host:linkmontest.py"],
     # netidletest.py alone.
@@ -612,7 +619,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
+HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "v6injecttest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600, "kmodbuildtest.py": 1500}
 

@@ -1419,7 +1419,30 @@ static void test_vif_ns_if_inet6(void) {
     CHECK("vif_ns_not_in_initial", !if_inet6_find("dh6t0", "2001", NULL, 0));
 }
 
+/* Host-wire helpers (v6injecttest.py): `mtu <addr>` prints the IPV6_MTU of a connected UDP socket
+ * to <addr>; `bindchk <addr>` prints whether bind() to the local address <addr> succeeds. */
+static int wire_mtu(const char *a) {
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6; d.sin6_port = htons(9);
+    if (inet_pton(AF_INET6, a, &d.sin6_addr) != 1) return 2;
+    int s = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (s < 0 || connect(s, (struct sockaddr *)&d, sizeof d) != 0) { printf("mtu connect errno %d\n", errno); return 1; }
+    int m = 0; socklen_t l = sizeof m;
+    if (getsockopt(s, IPPROTO_IPV6, IPV6_MTU, &m, &l) != 0) { printf("mtu getsockopt errno %d\n", errno); return 1; }
+    printf("ip6mtu %d\n", m);
+    return 0;
+}
+static int wire_bindchk(const char *a) {
+    struct sockaddr_in6 d; memset(&d, 0, sizeof d); d.sin6_family = AF_INET6;
+    if (inet_pton(AF_INET6, a, &d.sin6_addr) != 1) return 2;
+    int s = socket(AF_INET6, SOCK_DGRAM, 0);
+    int r = bind(s, (struct sockaddr *)&d, sizeof d);
+    printf("ip6bind %s\n", r == 0 ? "ok" : (errno == EADDRNOTAVAIL ? "EADDRNOTAVAIL" : "other"));
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 3 && !strcmp(argv[1], "mtu")) return wire_mtu(argv[2]);
+    if (argc >= 3 && !strcmp(argv[1], "bindchk")) return wire_bindchk(argv[2]);
     if (argc >= 4 && !strcmp(argv[1], "banner")) return banner(argv[2], atoi(argv[3]));
     test_socket6();
     test_bad_len6();
