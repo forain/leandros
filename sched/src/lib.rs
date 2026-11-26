@@ -679,6 +679,15 @@ fn group_exit_notice(rq: &RunQueue, tgid: Pid, uid: u32) -> Option<(Pid, ExitSta
     hit
 }
 
+/// The parent recorded for `tgid`'s exit right now (None: no record).
+fn exit_logged_parent(tgid: Pid) -> Option<Pid> {
+    let mut hit = None;
+    EXIT_LOG.lock().any_pending(|e| {
+        if e.pid == tgid && e.is_process { hit = Some(e.parent_tgid); true } else { false }
+    });
+    hit
+}
+
 /// Send a settled process's SIGCHLD and wake its waiters (no locks held).
 fn send_group_exit_notice(tgid: Pid, n: (Pid, ExitStatus, u32, u8)) {
     let (parent, status, uid, exit_sig) = n;
@@ -8141,6 +8150,10 @@ fn scheduler_run_loop() -> ! {
                         recheck = Some((ztgid, zpid, zuid, parent_tgid, zdone));
                     } else if !zdone && group_settled(&rq, ztgid) {
                         if zpid != ztgid { late_leader = reap_delayed_leader(&mut rq, ztgid); }
+                        // Defensive: the leader's drop below
+                        // (`finish_reaped_leader`) marks and restores the flag
+                        // itself; this keeps it set until the pass ends so the
+                        // group cannot settle early on another CPU.
                         if late_leader.as_ref().map_or(false, |l| l.address_space.is_some()) {
                             AS_DROP_TGID[id].store(ztgid, Ordering::Release);
                             drop_marked = true;
@@ -8188,7 +8201,7 @@ fn scheduler_run_loop() -> ! {
                 // pending drop kept the group from settling, while the
                 // others (a delayed leader parked off-CPU) are already done
                 // and will not look again.
-                if drop_marked {
+                if recheck.is_some() {
                     let mut relead: Option<alloc::boxed::Box<Task>> = None;
                     let mut relead_sole = false;
                     {
@@ -8221,8 +8234,16 @@ fn scheduler_run_loop() -> ! {
                     }
                     // `group_settled` (a pidfd's "exited") may have changed.
                     percpu::pexit_bump();
+                } else if drop_marked {
+                    // Only a late leader reaped in this pass's own hold set
+                    // the mark (no recheck needed): clear it, as before.
+                    AS_DROP_TGID[id].store(0, Ordering::Release);
+                    percpu::pexit_bump();
                 }
                 if let Some((parent, tgid)) = wake.take() {
+                    // The parent may have changed since it was captured
+                    // (reparenting): the exit record has the current one.
+                    let parent = exit_logged_parent(tgid).unwrap_or(parent);
                     // Also when there is no notice (the parent ignores
                     // SIGCHLD, the exit was auto-reaped): its wait4 must
                     // look again.
@@ -8239,6 +8260,12 @@ fn scheduler_run_loop() -> ! {
                         let _ = wq.queue_fn(move || send_group_exit_notice(tgid, n));
                     }
                 }
+            } else if drop_marked {
+                // `rq.remove` returned nothing: no drop will run, so the mark
+                // set for it must not stay (it would hold the group open).
+                let _rq = RUN_QUEUE.lock();
+                AS_DROP_TGID[id].store(0, Ordering::Release);
+                klog_line(format_args!("[sched] AS_DROP mark cleared without a removed task (cpu {})\n", id));
             }
         } else {
             // Always-on per-CPU idle time (/proc/stat idle jiffies).
