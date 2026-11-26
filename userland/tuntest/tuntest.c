@@ -104,6 +104,44 @@ static void tap_settle(int fd)
     fcntl(fd, F_SETFL, fl);
 }
 
+/* Describe a frame for FAIL diagnostics: ethertype, IP proto, ICMPv6 type, first bytes. */
+static void describe_frame(const char *what, const unsigned char *b, int n)
+{
+    printf("%s: %d bytes ethertype %02x%02x", what, n, n > 13 ? b[12] : 0, n > 13 ? b[13] : 0);
+    if (n > 23 && b[12] == 0x08 && b[13] == 0x00) printf(" ip_proto %d", b[23]);
+    if (n > 54 && b[12] == 0x86 && b[13] == 0xdd) {
+        int nh = b[20], off = 54;
+        if (nh == 0 && n > 62) { nh = b[54]; off = 62; }
+        printf(" v6_nh %d", nh);
+        if (nh == 58 && n > off) printf(" icmp6_type %d", b[off]);
+    }
+    printf(" first:");
+    for (int i = 0; i < n && i < 24; i++) printf(" %02x", b[i]);
+    printf("\n");
+}
+
+/* Frames Linux itself emits on an up Ethernet interface with IPv6 enabled: DAD NS,
+ * router solicitation, MLD listener reports/queries. Anything else is not autoconf. */
+static int is_v6_autoconf(const unsigned char *b, int n)
+{
+    if (n < 14 + 40 + 4 || b[12] != 0x86 || b[13] != 0xdd) return 0;
+    int nh = b[20], off = 54;
+    if (nh == 0 && n > 62) { nh = b[54]; off = 62; }
+    if (nh != 58 || n <= off) return 0;
+    int t = b[off];
+    return t == 133 || t == 135 || t == 130 || t == 131 || t == 132 || t == 143;
+}
+
+/* Next frame within ms, skipping (only) the known IPv6 autoconf frames. */
+static int rd_skip_autoconf(int fd, unsigned char *b, int n, int ms)
+{
+    for (int i = 0; i < 64; i++) {
+        int r = rd_timeout(fd, b, n, ms);
+        if (r < 0 || !is_v6_autoconf(b, r)) return r;
+    }
+    return -1;
+}
+
 static uint16_t csum16(const unsigned char *d, int n)
 {
     uint32_t s = 0;
@@ -425,8 +463,9 @@ static int vec_cases(void)
         memcpy(a + 32, tapmac, 6); memcpy(a + 38, "\x0a\x09\x00\x01", 4);
         CHECK("vec_tap_write_arp", write(fd, a, 42) == 42);
         unsigned char hb[128];   /* the queued "hello" datagram, now resolved */
-        int hn = rd_timeout(fd, hb, sizeof hb, 3000);
+        int hn = rd_skip_autoconf(fd, hb, sizeof hb, 3000);
         CHECK("vec_tap_udp_frame", hn >= 14 + 20 + 8 + 5 && hb[12] == 0x08 && hb[13] == 0x00);
+        if (!(hn >= 14 + 20 + 8 + 5 && hb[12] == 0x08 && hb[13] == 0x00)) describe_frame("vec_tap_udp_frame got", hb, hn < 0 ? 0 : hn);
     }
     /* tap writev of 3 iovecs (eth | ip | udp+payload) is ONE frame */
     {
@@ -544,7 +583,16 @@ static int selfconn_cases(void)
     /* nothing was written to the tap fd */
     fcntl(fd, F_SETFL, O_NONBLOCK);
     unsigned char b[2048];
-    CHECK("selfconn_tap_quiet", read(fd, b, sizeof b) < 0 && errno == EAGAIN);
+    {   /* IPv6 autoconf frames (DAD NS, RS, MLD) are what Linux sends too; nothing else may appear */
+        int bad = 0, nb;
+        for (int i = 0; i < 64; i++) {
+            nb = read(fd, b, sizeof b);
+            if (nb < 0) break;
+            if (!is_v6_autoconf(b, nb)) { bad = 1; describe_frame("selfconn_tap_quiet got", b, nb); break; }
+            usleep(10 * 1000);
+        }
+        CHECK("selfconn_tap_quiet", !bad && nb < 0 && errno == EAGAIN);
+    }
     printf("selfconn_cases: %d passed, %d failed\n", npass, nfail);
     return nfail != 0;
 }
@@ -807,32 +855,32 @@ static int tun6_l3_cases(void)
 int main(void)
 {
     pid_t c = fork();
-    if (c == 0) _exit(ns_cases());
+    if (c == 0) { npass = nfail = 0; _exit(ns_cases()); }
     int st = 0;
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("ns_cases: FAIL (status %d)\n", st); }
     c = fork();
-    if (c == 0) _exit(tcp_cases());
+    if (c == 0) { npass = nfail = 0; _exit(tcp_cases()); }
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tcp_cases: FAIL (status %d)\n", st); }
 
     c = fork();
-    if (c == 0) _exit(vec_cases());
+    if (c == 0) { npass = nfail = 0; _exit(vec_cases()); }
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("vec_cases: FAIL (status %d)\n", st); }
 
     c = fork();
-    if (c == 0) _exit(selfconn_cases());
+    if (c == 0) { npass = nfail = 0; _exit(selfconn_cases()); }
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("selfconn_cases: FAIL (status %d)\n", st); }
 
     c = fork();
-    if (c == 0) _exit(tun6_cases());
+    if (c == 0) { npass = nfail = 0; _exit(tun6_cases()); }
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tun6_cases: FAIL (status %d)\n", st); }
 
     c = fork();
-    if (c == 0) _exit(tun6_l3_cases());
+    if (c == 0) { npass = nfail = 0; _exit(tun6_l3_cases()); }
     waitpid(c, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { nfail++; printf("tun6_l3_cases: FAIL (status %d)\n", st); }
 
