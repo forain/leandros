@@ -277,6 +277,7 @@ SUITES = {
                 # ripgrep (rg): file match, recursive dir walk, stdin, exit codes 0/1.
                 "/bin/sh -c 'rg --version >/dev/null && rg -n root /etc/passwd >/dev/null && rg -l root /etc >/dev/null && echo foo | rg -q foo && { echo foo | rg -q zzz; [ $? -eq 1 ]; }'",
                 "/bin/sh -c '[ \"$(echo foo | grep -c foo)\" = 1 ] && grep -n root /etc/passwd >/dev/null && grep -r PATH /etc >/dev/null && echo ab | grep -q \"a\\\\|zz\" && { grep -q x /nonexistent 2>/dev/null; [ $? -eq 2 ]; } && { echo foo | grep -q zzz; [ $? -eq 1 ]; }'",
+                "/bin/sh -c 'echo foo | grep -c zzz | grep -qx 0 && echo foo > /tmp/gc1 && echo bar > /tmp/gc2 && { grep -c foo /tmp/gc1 /tmp/gc2 | grep -qx \"/tmp/gc2:0\"; } && { grep -c foo /tmp/gc1 /tmp/gc2 | grep -qx \"/tmp/gc1:1\"; } && { echo foo | grep -v -c foo | grep -qx 0; } && { echo foo | grep -vc zzz | grep -qx 1; } && { echo foo | grep -q foo; } && { echo foo | grep -q zzz; [ $? -eq 1 ]; } && { echo foo | grep -l foo >/dev/null; } && { echo foo | grep -l zzz >/dev/null; [ $? -eq 1 ]; } && { echo foo | grep -c foo /nonexistent >/dev/null 2>&1; [ $? -eq 2 ]; } && rm -f /tmp/gc1 /tmp/gc2'",
                 # su + sudo (sudo-rs): identity, groups, env, auth, policy.
                 "/bin/sudotest",
                 # Scheduler stress (lane percpu): lost wakes, stop/cont, group
