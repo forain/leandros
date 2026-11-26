@@ -591,15 +591,20 @@ unsafe fn program_periodic() {
     apic::write(apic::LAPIC_TIMER_INIT, cnt);
     // Test knob (`timer.dead_delay=<cpu>`): stall once inside the window.
     let c = super::smp::arch_cpu_id();
+    let mut stalled = false;
     if DBG_DELAY_CPU.load(Ordering::Relaxed) == c as i32
         && DBG_DELAY_CPU.compare_exchange(c as i32, -1, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     {
         let per = TSC_PER_TICK.load(Ordering::Relaxed);
         let t0 = rdtsc();
         DBG_STALLS.fetch_add(1, Ordering::Relaxed);
+        stalled = true;
         while rdtsc().wrapping_sub(t0) < per + per / 2 {} // 15 ms
     }
     apic::write(apic::LAPIC_LVT_TIMER, LVT_PERIODIC);
+    if stalled && apic::read(apic::LAPIC_TIMER_CURR) == 0 {
+        DBG_KILLED.fetch_add(1, Ordering::Relaxed);
+    }
     if DBG_FIXMASK.load(Ordering::Relaxed) & 1 != 0 {
         apic::write(apic::LAPIC_TIMER_INIT, cnt);
     }
@@ -619,6 +624,9 @@ static LOCAL_TICKS: [AtomicU64; TIMER_MAX_CPUS] = [const { AtomicU64::new(0) }; 
 static REC_BY_STATE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Times the `timer.dead_delay` stall actually ran (the test requires exactly 1).
 static DBG_STALLS: AtomicU64 = AtomicU64::new(0);
+/// Stalls after which the countdown read 0 at the LVT flip (the one-shot had expired: tick dead
+/// unless fix 1 reloads it).
+static DBG_KILLED: AtomicU64 = AtomicU64::new(0);
 /// Stale one-shot deadlines ignored (fix 3).
 static STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
 
@@ -628,8 +636,15 @@ pub extern "C" fn arch_timer_debug(delay_cpu: i32, fixmask: u32) {
     DBG_FIXMASK.store(fixmask, Ordering::Relaxed);
 }
 
+/// Re-arm the `timer.dead_delay` stall on `cpu` (written via `/proc/leandros_timer`, root only).
+#[no_mangle]
+pub extern "C" fn arch_timer_rearm_stall(cpu: i32) {
+    DBG_DELAY_CPU.store(cpu, Ordering::Relaxed);
+}
+
 /// `out[0]` = dead ticks recovered by `check_alive` (all states), `out[1]` = `dead_delay` stalls consumed,
-/// `out[2..5]` = recoveries by state, `out[5]` stale ignored, `out[6..6+n]` = per-CPU timer interrupts.
+/// `out[2..5]` = recoveries by state, `out[5]` stale ignored, `out[6]` = stalls that killed the tick,
+/// `out[7..7+n]` = per-CPU timer interrupts.
 #[no_mangle]
 pub extern "C" fn arch_timer_cpu_stats(out: *mut u64, n: usize) {
     unsafe {
@@ -637,7 +652,8 @@ pub extern "C" fn arch_timer_cpu_stats(out: *mut u64, n: usize) {
         out.add(1).write(DBG_STALLS.load(Ordering::Relaxed));
         for i in 0..3 { out.add(2 + i).write(REC_BY_STATE[i].load(Ordering::Relaxed)); }
         out.add(5).write(STALE_IGNORED.load(Ordering::Relaxed));
-        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(6 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
+        out.add(6).write(DBG_KILLED.load(Ordering::Relaxed));
+        for i in 0..n.min(TIMER_MAX_CPUS) { out.add(7 + i).write(LOCAL_TICKS[i].load(Ordering::Relaxed)); }
     }
 }
 
