@@ -61,7 +61,11 @@ def main():
         f.truncate(4 << 20)
         f.seek(512)
         f.write(MAGIC)
+    # The farm points the driver at the images of the tree under test through env: boot the variant's own instead.
     env = dict(os.environ, LEANDROS_RUN_ID=f"{rid}-var",
+               LEANDROS_DISK_IMAGE=os.path.join(VAR, f"leandros-limine-{arch}.img"),
+               LEANDROS_ROOT_IMAGE=os.path.join(VAR, f"f2fs-data0-{arch}.img"),
+               LEANDROS_VARS_FD=os.path.join(VAR, f"{arch}_vars.fd"),
                LEANDROS_QEMU_EXTRA=f"-drive if=none,id=kmnv,format=raw,file={nv} -device nvme,drive=kmnv,serial=kmodsuite")
     drv = [sys.executable, os.path.join(VAR, ".claude/skills/run-leandros/driver.py")]
 
