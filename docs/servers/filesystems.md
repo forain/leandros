@@ -199,7 +199,7 @@ Block ioctls are routed by **fd kind**. A loop device takes its **own** open of 
 
 `mount("/dev/root")` is resolved by the kernel, in order:
 
-1. `root=/dev/<name>` or `root=PARTUUID=…` on the kernel command line (read through Limine's executable-cmdline request). An explicit `root=` that matches nothing is `ENODEV`; the kernel does not guess.
+1. `root=/dev/<name>` or `root=PARTUUID=…` on the kernel command line (read through Limine's executable-cmdline request). An explicit `root=` that matches nothing, or has a form the kernel does not know (`UUID=`, a typo), is `ENODEV`; a `PARTUUID=` carried by two partitions is `ENOTUNIQ`. The kernel does not guess. Init waits `rootwait=<seconds>` (default 30) for the named root, never falls back to `/dev/vdb` when `root=` is given, and with `root.fail=reboot` restarts the machine instead of parking. `root.fail=reboot` is opt-in and meant for trial boot entries only (so the firmware or bootloader can fall back to the previous entry); do not put it on a default entry.
 2. Index 1, if it is a whole `vd` disk carrying the f2fs magic (the QEMU layout).
 3. The unique removable or `sd*` disk or partition with f2fs magic that is not the home volume (label `leandros-home`), ties broken first by the boot disk (Limine's GPT GUID or MBR signature), then by partition type `0x83` / the Linux filesystem GUID. Two candidates are `ENOTUNIQ` with a log line listing them.
 
