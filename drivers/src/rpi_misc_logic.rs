@@ -535,19 +535,107 @@ pub mod sdmbr {
     /// 0x83 partitions: the first whose superblock magic (read through
     /// `magic_at(lba)`) is F2FS. A dual-boot card also carries an ext4 0x83
     /// partition (Raspberry Pi OS root, p4), so the type alone is not enough.
-    /// No 0x83 with the magic (unreadable / unformatted): the first 0x83, as
-    /// before. `None` without a 55AA signature or any 0x83 entry.
+    /// No 0x83 with the magic (another OS's card, unreadable, unformatted):
+    /// `None`, so the caller never treats a foreign ext4 as ours. `None` as
+    /// well without a 55AA signature or any 0x83 entry.
     pub fn pick_f2fs(mbr: &[u8], mut magic_at: impl FnMut(u64) -> Option<u32>) -> Option<u64> {
         if mbr.len() < 512 || mbr[510] != 0x55 || mbr[511] != 0xAA { return None; }
-        let mut first = None;
         for i in 0..4usize {
             let e = &mbr[446 + i * 16..446 + i * 16 + 16];
             if e[4] != 0x83 { continue; }
             let lba = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
-            if first.is_none() { first = Some(lba); }
+            if lba == 0 || lba % 8 != 0 { continue; } // 4 KiB blocks: the offset must be block aligned
             if magic_at(lba) == Some(F2FS_MAGIC) { return Some(lba); }
         }
-        first
+        None
+    }
+
+    /// Superblock volume label: UTF-16LE at byte 124 of the superblock.
+    pub const SB_LABEL_OFFSET: usize = 124;
+
+    /// An ASCII copy of the superblock label (non-ASCII units become '?').
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Label { pub b: [u8; 64], pub n: usize }
+    impl Label {
+        pub fn as_str(&self) -> &str { core::str::from_utf8(&self.b[..self.n]).unwrap_or("") }
+    }
+
+    /// The label of the superblock slice `sb` (the 1024.. bytes of the partition).
+    pub fn sb_label(sb: &[u8]) -> Label {
+        let mut l = Label { b: [0; 64], n: 0 };
+        for i in 0..64usize {
+            let at = SB_LABEL_OFFSET + 2 * i;
+            if at + 2 > sb.len() { break; }
+            let u = u16::from_le_bytes([sb[at], sb[at + 1]]);
+            if u == 0 { break; }
+            l.b[l.n] = if u < 128 && u >= 0x20 { u as u8 } else { b'?' };
+            l.n += 1;
+        }
+        l
+    }
+
+    /// One tri-state probe of a candidate partition's superblock.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Probe {
+        /// The read failed (not "no": the caller retries and then falls back).
+        Err,
+        NotF2fs,
+        F2fs { labelled: bool },
+    }
+
+    /// Classify a superblock slice that was read successfully.
+    pub fn probe_sb(sb: &[u8]) -> Probe {
+        if sb.len() < 4 || u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]) != F2FS_MAGIC { return Probe::NotF2fs; }
+        Probe::F2fs { labelled: sb_label(sb).as_str() == super::sdgrant::LEANDROS_LABEL }
+    }
+
+    /// MBR disk signature (bytes 440..444), Linux's PARTUUID prefix.
+    pub fn disk_id(mbr: &[u8]) -> u32 {
+        if mbr.len() < 444 { return 0; }
+        u32::from_le_bytes([mbr[440], mbr[441], mbr[442], mbr[443]])
+    }
+
+    /// The picked root partition.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Pick { pub lba: u64, pub pno: u8, pub labelled: bool }
+
+    /// Pick the F2FS root among the MBR's block-aligned 0x83 partitions,
+    /// preferring one labelled `leandros-root` over the first F2FS. `Err(())`
+    /// when any probe read failed (never "not found" on a transient error).
+    pub fn pick_root(mbr: &[u8], mut probe_at: impl FnMut(u64) -> Probe) -> Result<Option<Pick>, ()> {
+        if mbr.len() < 512 || mbr[510] != 0x55 || mbr[511] != 0xAA { return Ok(None); }
+        let mut best: Option<Pick> = None;
+        for i in 0..4usize {
+            let e = &mbr[446 + i * 16..446 + i * 16 + 16];
+            if e[4] != 0x83 { continue; }
+            let lba = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+            if lba == 0 || lba % 8 != 0 { continue; }
+            match probe_at(lba) {
+                Probe::Err => return Err(()),
+                Probe::NotF2fs => {}
+                Probe::F2fs { labelled } => {
+                    if best.map_or(true, |b| labelled && !b.labelled) {
+                        best = Some(Pick { lba, pno: (i + 1) as u8, labelled });
+                    }
+                }
+            }
+        }
+        Ok(best)
+    }
+
+    /// Whether the sector window `[first, end)` is free: a valid MBR and no
+    /// partition entry (any type) overlapping it.
+    pub fn window_free(mbr: &[u8], first: u64, end: u64) -> bool {
+        if mbr.len() < 512 || mbr[510] != 0x55 || mbr[511] != 0xAA { return false; }
+        for i in 0..4usize {
+            let e = &mbr[446 + i * 16..446 + i * 16 + 16];
+            let ty = e[4];
+            let lba = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64;
+            let n = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64;
+            if ty == 0 && lba == 0 && n == 0 { continue; }
+            if lba < end && first < lba.saturating_add(n.max(1)) { return false; }
+        }
+        true
     }
 
     /// The bytes of the card the mounted root F2FS owns: raw writes that
@@ -589,30 +677,210 @@ pub mod sdmbr {
     /// partition offset (the 2026-11-20 bug: the superblock was looked up at
     /// twice the partition offset, the size stayed unknown and the guard
     /// covered everything from p2 to the end of the card).
-    pub fn root_guard(mbr: &[u8], mut read_blk: impl FnMut(u64, &mut [u8; 4096]) -> bool) -> Option<RootGuard> {
+    pub fn root_guard(mbr: &[u8], read_blk: impl FnMut(u64, &mut [u8; 4096]) -> bool) -> Option<RootGuard> {
+        root_guard_t(mbr, read_blk).ok().flatten().map(|(g, _)| g)
+    }
+
+    /// `root_guard` with the picked partition and a tri-state result: `Err`
+    /// when a candidate's superblock could not be read.
+    pub fn root_guard_t(mbr: &[u8], mut read_blk: impl FnMut(u64, &mut [u8; 4096]) -> bool) -> Result<Option<(RootGuard, Pick)>, ()> {
         let mut buf = [0u8; 4096];
         let sb_at = |lba: u64| (lba * 512 + F2FS_SB_OFFSET) / 4096;
         let sb_off = |lba: u64| ((lba * 512 + F2FS_SB_OFFSET) % 4096) as usize;
-        let start = pick_f2fs(mbr, |lba| {
+        let pick = pick_root(mbr, |lba| {
             let o = sb_off(lba);
-            if o + 4 > 4096 || !read_blk(sb_at(lba), &mut buf) { return None; }
-            Some(u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]))
+            if o + 4 > 4096 || !read_blk(sb_at(lba), &mut buf) { return Probe::Err; }
+            probe_sb(&buf[o..])
         })?;
+        let Some(pick) = pick else { return Ok(None) };
+        let start = pick.lba;
         let o = sb_off(start);
         let fs = if o + 44 <= 4096 && read_blk(sb_at(start), &mut buf) { f2fs_bytes(&buf[o..]) } else { None };
         if let Some(bytes) = fs {
-            return Some(RootGuard { start_lba: start, bytes, from_sb: true });
+            return Ok(Some((RootGuard { start_lba: start, bytes, from_sb: true }, pick)));
         }
         // Unknown size: the partition's MBR entry, else the rest of the card.
         let len = (0..4usize).map(|i| &mbr[446 + i * 16..462 + i * 16])
             .find(|e| e[4] == 0x83 && u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as u64 == start)
             .map_or(0, |e| u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as u64 * 512);
-        Some(RootGuard { start_lba: start, bytes: if len == 0 { u64::MAX / 2 } else { len }, from_sb: false })
+        Ok(Some((RootGuard { start_lba: start, bytes: if len == 0 { u64::MAX / 2 } else { len }, from_sb: false }, pick)))
+    }
+}
+
+// ── SD write grant: LeandrOS writes only a card that is its own ──────────────
+pub mod sdgrant {
+    use super::Regs32;
+
+    pub const R_OK: u8 = 0;
+    pub const R_NO_F2FS: u8 = 1;
+    pub const R_RW_OFF: u8 = 2;
+    pub const R_OTHER_ROOT: u8 = 3;
+    pub const R_NO_LABEL: u8 = 4;
+    pub const R_BAD_CMDLINE: u8 = 5;
+    pub const R_READ_ERROR: u8 = 6;
+    pub const R_CARD_CHANGED: u8 = 7;
+
+    /// The F2FS volume label LeandrOS's installer and image builders write.
+    pub const LEANDROS_LABEL: &str = "leandros-root";
+    /// Kernel command line capacity (boot::COMMAND_LINE_SIZE) minus the NUL:
+    /// a line this long was cut.
+    pub const CMDLINE_TRUNCATED_AT: usize = 2047;
+
+    pub fn reason_str(r: u8) -> &'static str {
+        match r {
+            R_OK => "ok",
+            R_NO_F2FS => "no-f2fs-magic",
+            R_RW_OFF => "sdhci.rw=0",
+            R_OTHER_ROOT => "root=-names-another-device",
+            R_NO_LABEL => "label-is-not-leandros-root",
+            R_BAD_CMDLINE => "cmdline-unreadable-or-without-root",
+            R_READ_ERROR => "read-error",
+            R_CARD_CHANGED => "card-removed-or-inserted",
+            _ => "unknown",
+        }
+    }
+
+    /// What the grant decision knows about the picked partition.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Ctx<'a> {
+        /// The F2FS magic was read (tri-state read, through the final offset).
+        pub found: bool,
+        /// The superblock volume label of the picked partition.
+        pub label: &'a str,
+        /// MBR disk signature (bytes 440..444, little endian).
+        pub disk_id: u32,
+        /// MBR partition number (1-4) of the picked partition; 0 = none (whole device).
+        pub pno: u8,
+        pub rw: bool,
+        /// `None`: the command line was never delivered / unreadable.
+        pub cmdline: Option<&'a str>,
+        /// A real board (rpi5): its firmware always passes root=, so a line
+        /// without one is not evidence the card is ours.
+        pub require_root: bool,
+    }
+
+    /// Printable ASCII (and blanks), short of the truncation point.
+    pub fn cmdline_valid(c: &str) -> bool {
+        c.len() < CMDLINE_TRUNCATED_AT && c.bytes().all(|b| (0x20..0x7f).contains(&b) || b == b'\t' || b == b'\n')
+    }
+
+    fn hex(s: &str) -> Option<u32> {
+        if s.is_empty() || s.len() > 8 || !s.bytes().all(|b| b.is_ascii_hexdigit()) { return None; }
+        u32::from_str_radix(s, 16).ok()
+    }
+
+    /// `PARTUUID=` in Linux's MBR form `<disk id %08x>-<partition %02x>`.
+    pub fn partuuid_matches(v: &str, disk_id: u32, pno: u8) -> bool {
+        if pno == 0 { return false; }
+        let Some((a, b)) = v.split_once('-') else { return false };
+        a.len() == 8 && b.len() <= 2 && hex(a) == Some(disk_id) && hex(b) == Some(pno as u32)
+    }
+
+    /// Whether the kernel `root=` value (`/dev/vdb`, `/dev/mmcblk0pN` with N
+    /// the picked partition, `LABEL=<this partition's label>`,
+    /// `PARTUUID=<disk id>-<N>`) names this card. Another label / partition
+    /// number / device: no.
+    pub fn root_names_this_card(root: &str, c: &Ctx) -> bool {
+        if let Some(l) = root.strip_prefix("LABEL=") { return !c.label.is_empty() && l == c.label; }
+        if let Some(p) = root.strip_prefix("PARTUUID=") { return partuuid_matches(p, c.disk_id, c.pno); }
+        if root == "/dev/vdb" { return true; }
+        match root.strip_prefix("/dev/mmcblk0p") {
+            Some(n) => n.len() <= 3 && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                && c.pno != 0 && n.parse::<u32>().ok() == Some(c.pno as u32),
+            None => false,
+        }
+    }
+
+    /// The write-grant decision, evaluated once at the end of SD init:
+    /// `(granted, reason)`. Grant iff the F2FS magic was found AND `rw` AND a
+    /// readable command line AND the volume label is `leandros-root` (or
+    /// `sdhci.trust=<PARTUUID of the picked partition>`) AND (no `root=` on a
+    /// board that need not have one | it names this card).
+    pub fn evaluate(c: &Ctx) -> (bool, u8) {
+        if !c.found { return (false, R_NO_F2FS); }
+        if !c.rw { return (false, R_RW_OFF); }
+        let cl = match c.cmdline {
+            Some(s) if cmdline_valid(s) => s,
+            // QEMU raspi4b boots with no command line at all; a real board never does.
+            None if !c.require_root => "",
+            _ => return (false, R_BAD_CMDLINE),
+        };
+        let trusted = cl.split_ascii_whitespace().filter_map(|t| t.strip_prefix("sdhci.trust=")).last()
+            .map_or(false, |v| c.disk_id != 0 && partuuid_matches(v, c.disk_id, c.pno));
+        if !trusted && c.label != LEANDROS_LABEL { return (false, R_NO_LABEL); }
+        let root = cl.split_ascii_whitespace().filter_map(|t| t.strip_prefix("root=")).last();
+        match root {
+            Some(r) if r.is_empty() || !root_names_this_card(r, c) => (false, R_OTHER_ROOT),
+            Some(_) => (true, R_OK),
+            None if c.require_root => (false, R_BAD_CMDLINE),
+            None => (true, R_OK),
+        }
+    }
+
+    /// Revoke the grant? Only on a CHANGE of the card-detect bit from the value
+    /// recorded at grant time, or a latched insertion/removal interrupt: a
+    /// stable 0 (unreliable pin) never revokes.
+    pub fn card_revoked(at_grant: bool, now: bool, irq_latched: bool) -> bool { irq_latched || now != at_grant }
+
+    /// Commands that change card contents or state: CMD24/25 (write), 27 (CSD
+    /// program), 28/29 (write protect), 32/33/38 (erase), 42 (lock/unlock),
+    /// 56 (general command, write direction), and ACMD23 (pre-erase count).
+    /// Used for the issued-writes counter only; the gate is `locked_allows`.
+    pub fn is_write_cmd(index: u8, app: bool) -> bool {
+        if app { index == 23 } else { matches!(index, 24 | 25 | 27 | 28 | 29 | 32 | 33 | 38 | 42 | 56) }
+    }
+
+    /// The only commands a LOCKED card ever sees: identification, bus setup,
+    /// status, reads, tuning and CMD55 (CMD 0,2,3,6,7,8,9,11,12,13,16,17,18,19,55;
+    /// ACMD 6,13,41,51). Everything else is denied whatever `app` says.
+    pub fn locked_allows(index: u8, app: bool) -> bool {
+        if app { matches!(index, 6 | 13 | 41 | 51) }
+        else { matches!(index, 0 | 2 | 3 | 6 | 7 | 8 | 9 | 11 | 12 | 13 | 16 | 17 | 18 | 19 | 55) }
+    }
+
+    /// May this command go out? A granted card: all. Locked: the allowlist.
+    pub fn allows(granted: bool, index: u8, app: bool) -> bool { granted || locked_allows(index, app) }
+
+    /// Whether a CMD55 response (R1) means the next command is an ACMD: the
+    /// card did not flag ILLEGAL_COMMAND (bit 22).
+    pub fn app_cmd_accepted(r1: u32) -> bool { r1 & (1 << 22) == 0 }
+
+    /// SDHCI Argument 1 / Command register offsets (the 16-bit Command
+    /// register is written through its 32-bit-aligned window in the mock).
+    pub const REG_ARGUMENT1: usize = 0x08;
+    pub const REG_COMMAND: usize = 0x0E;
+
+    /// The command-issue step of the driver in seam form: refuse (no register
+    /// access at all) or program Argument 1 then the Command register.
+    pub fn issue(regs: &mut impl Regs32, granted: bool, index: u8, app: bool, arg: u32, word: u16) -> bool {
+        if !allows(granted, index, app) { return false; }
+        regs.w(REG_ARGUMENT1, arg);
+        regs.w(REG_COMMAND, word as u32);
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn card_detect_revokes_only_on_change() {
+        use sdgrant::card_revoked;
+        assert!(!card_revoked(false, false, false)); // stable 0: no revoke
+        assert!(!card_revoked(true, true, false));
+        assert!(card_revoked(true, false, false));   // 1 -> 0
+        assert!(card_revoked(false, false, true));   // latched IRQ
+    }
+
+    #[test]
+    fn trust_rejected_for_zero_disk_id() {
+        use sdgrant::*;
+        let c = |disk_id| Ctx { found: true, label: "custom", disk_id, pno: 2, rw: true,
+            cmdline: Some("root=/dev/mmcblk0p2 sdhci.trust=00000000-02"), require_root: true };
+        assert_eq!(evaluate(&c(0)), (false, R_NO_LABEL));
+        let ok = Ctx { cmdline: Some("root=/dev/mmcblk0p2 sdhci.trust=1234abcd-02"), ..c(0x1234abcd) };
+        assert_eq!(evaluate(&ok), (true, R_OK));
+    }
+
     use super::*;
 
     struct Fake { rsts: u32, writes: u32 }
@@ -676,9 +944,9 @@ mod tests {
         // ext4 ahead of the F2FS partition in the table: still the F2FS one.
         let m = mbr(&[(0x0c, 8192), (0x83, 41_000_000), (0x0c, 40_000_000), (0x83, 1_056_768)]);
         assert_eq!(sdmbr::pick_f2fs(&m, magic), Some(1_056_768));
-        // Single-boot card, magic unreadable: first 0x83 as before.
+        // Magic unreadable / foreign ext4 only (another OS card): no root, never the first 0x83.
         let m = mbr(&[(0x0c, 8192), (0x83, 1_056_768)]);
-        assert_eq!(sdmbr::pick_f2fs(&m, |_| None), Some(1_056_768));
+        assert_eq!(sdmbr::pick_f2fs(&m, |_| None), None);
         // No signature / no Linux partition.
         let mut bad = m; bad[511] = 0;
         assert_eq!(sdmbr::pick_f2fs(&bad, |_| None), None);
@@ -735,13 +1003,23 @@ mod tests {
         // already adds the partition offset (block 2 x 125440) finds no
         // magic. The guard must then fall back to p2's MBR length, not
         // "everything from p2 to the end of the card".
-        let (m, mut rd) = real_card();
-        let g = sdmbr::root_guard(&m, |b, buf| rd(if b == 0 { 0 } else { b + 125_440 }, buf)).unwrap();
+        // (A card with no readable magic is no longer a root at all: pick_f2fs
+        // returns None. The fallback is for a magic whose size fields are bogus.)
+        let (m, _) = real_card();
+        let bogus_sb = |b: u64, buf: &mut [u8; 4096]| {
+            *buf = [0u8; 4096];
+            if b == 125_440 { buf[1024..1028].copy_from_slice(&sdmbr::F2FS_MAGIC.to_le_bytes()); }
+            true
+        };
+        let g = sdmbr::root_guard(&m, bogus_sb).unwrap();
         assert_eq!(g, sdmbr::RootGuard { start_lba: 1_003_520, bytes: 7_495_680 * 512, from_sb: false });
         assert!(!g.overlaps(8_503_296 * 512, 4 << 20));
-        // Zero-length MBR entry and no superblock: rest of the card.
+        // The old premise: the reader that adds the partition offset finds no magic.
+        let (m2, mut rd) = real_card();
+        assert_eq!(sdmbr::root_guard(&m2, |b, buf| rd(if b == 0 { 0 } else { b + 125_440 }, buf)), None);
+        // Zero-length MBR entry and a bogus superblock: rest of the card.
         let mut z = m; z[446 + 16 + 12..446 + 16 + 16].fill(0);
-        let g = sdmbr::root_guard(&z, |_, buf| { *buf = [0u8; 4096]; true }).unwrap();
+        let g = sdmbr::root_guard(&z, bogus_sb).unwrap();
         assert_eq!((g.start_lba, g.bytes, g.from_sb), (1_003_520, u64::MAX / 2, false));
     }
 }

@@ -108,13 +108,13 @@ pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<us
     if let Some(spec) = cmdline.and_then(parse_root_arg) {
         match crate::blockdev::root_form(spec) {
             crate::blockdev::RootForm::Dev(name) => {
-                if let Some(i) = lookup_name(name) { return Ok(i); }
+                if let Some(i) = lookup_name(name).filter(|&i| !read_only(i)) { return Ok(i); }
                 // The Pi firmware's own default (no cmdline.txt) is the one
                 // hint that names no device here and is still the card.
                 if !name.starts_with("mmcblk0p") { return Err(RootErr::NotFound); }
             }
             crate::blockdev::RootForm::Label(label) => {
-                if label_is(1, label) { return Ok(1); }
+                if label_is(1, label) && !read_only(1) { return Ok(1); }
                 return Err(RootErr::NotFound);
             }
             // PARTUUID=, UUID=, a typo: nothing here can verify them.
@@ -126,7 +126,7 @@ pub fn resolve_root(cmdline: Option<&str>, _boot: Option<BootDisk>) -> Result<us
             crate::pci::serial_debug(" names no device on this board; using the SD card\n");
         }
     }
-    if 1 < device_count() && has_f2fs(1) { Ok(1) } else { Err(RootErr::NotFound) }
+    if 1 < device_count() && has_f2fs(1) && !read_only(1) { Ok(1) } else { Err(RootErr::NotFound) }
 }
 
 /// The SD path has no runtime registration; always `Unsupported`.

@@ -7902,6 +7902,22 @@ fn gen_v3d_headless(dump: bool) -> Option<VnodeKind> {
     proc_snapshot(if dump { b"/tmp/.v3d_headless_fb" } else { b"/tmp/.v3d_headless" }, &d, false)
 }
 
+/// `/proc/leandros_sd` text source (drivers::sdhci::proc_text), set by the kernel
+/// on the SD-card boards; elsewhere the file does not exist.
+static PROC_SD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_proc_sd(f: fn() -> Option<alloc::string::String>) {
+    PROC_SD.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn gen_leandros_sd() -> Option<VnodeKind> {
+    let f = PROC_SD.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn() -> Option<alloc::string::String> = unsafe { core::mem::transmute(f) };
+    let s = f()?;
+    proc_snapshot(b"/tmp/.leandros_sd", s.as_bytes(), false)
+}
+
 /// `/proc/pcipm` text source (drivers::pci::pm_report), set by the kernel.
 static PROC_PCIPM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -9173,7 +9189,7 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// and what a `/proc/<pid>` directory lists. `/proc/<pid>/fd` is served too
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
-const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer", b"/proc/leandros_asfree",
+const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer", b"/proc/leandros_asfree", b"/proc/leandros_sd",
                                      b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
                                      b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/leandros_hvs", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
@@ -10219,6 +10235,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             }
         } else if lookup_path == b"/proc/klog" {
             match gen_klog() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
+        } else if lookup_path == b"/proc/leandros_sd" {
+            match gen_leandros_sd() {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
@@ -17946,7 +17967,9 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     }
     // LeandrOS's diagnostic /proc files exist only in handle_open's chain;
     // without this, stat and access(2) said ENOENT while open worked.
-    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path)) {
+    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path))
+        // /proc/leandros_sd exists only where the SD driver registered its source.
+        && (strip_trailing_slash(path) != b"/proc/leandros_sd" || PROC_SD.load(core::sync::atomic::Ordering::Acquire) != 0) {
         write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
         return ok_reply();
     }
