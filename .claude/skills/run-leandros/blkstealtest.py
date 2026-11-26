@@ -164,6 +164,9 @@ def main():
                 ok = False; print("FAIL: no [LOCKWAIT] VIRTIO_BLK line: the device lock was never contended")
             if any(h > 4000 for h in holds):
                 ok = False; print(f"FAIL: [F2FS] long hold above 4 s (injection is 2.5 s): {sorted(holds)[-3:]}")
+            nto = len(re.findall(r"\[IOLOCK\] non-sleeping wait for VIRTIO_BLK timed out", log))
+            if nto:
+                ok = False; print(f"FAIL: {nto} [IOLOCK] non-sleeping wait for VIRTIO_BLK timed out")
             if wl:
                 ok = False; MSGS.append("FAIL: [WDOG]"); print("FAIL: [WDOG] on a running vCPU")
                 for l in wl[:8]: print("  " + l[:240])
