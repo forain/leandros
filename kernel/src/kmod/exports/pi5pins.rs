@@ -1,12 +1,20 @@
-//! kapi export: the Pi 5 Wi-Fi pins (SDIO2 mux, WL_REG_ON), for the module named `brcmf` only.
+//! kapi export: the Pi 5 Wi-Fi pins (SDIO2 mux, WL_REG_ON), for the module named `brcmf` only, and the SD host's
+//! two gio_aon lines (vqmmc 1.8 V select, card power) as high-level ops, for the module named `sdhci` only.
+//!
+//! NOTE for lane sdlock (unmerged): when merged, SD_POWER / SD_IO_1V8 sets must be routed through its "foreign card:
+//! no state change" grant check before touching the line.
 use super::*;
 
 /// See `kmod_abi::plat::sys_plat::kapi_pi5_pins`. -1 for any other module, -22 bad op or missing `out`.
 #[no_mangle]
 pub extern "C" fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64) -> i32 {
     use kmod_abi::plat::pi5_pins as P;
-    if crate::kmod::name_str(&crate::kmod::registry::name_of(owner)) != "brcmf" { return -1; }
-    if op > P::WL_ON_READY || (op == P::MUX_SDIO2 && out.is_null()) { return -22; }
+    // Normalise through the running generation, never trust the module-claimed id.
+    let name = crate::kmod::registry::name_of(crate::kmod::gate::owner(owner));
+    let who = crate::kmod::name_str(&name);
+    if op > P::MAX_OP { return -22; }
+    if who != P::module_for(op) { return -1; }
+    if op == P::MUX_SDIO2 && out.is_null() { return -22; }
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
     {
         use drivers::bcm2712_gpio::{self as gpio, Block, Chip, GROUP_SDIO2_WL_ON, WL_ON};
@@ -14,6 +22,11 @@ pub extern "C" fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64)
         match op {
             P::WL_ON_SET => { let _ = gpio::gpio_set_output(Chip::Gio, WL_ON, arg != 0); return 0; }
             P::WL_ON_READY => return if gpio::gpio_is_output(Chip::Gio, WL_ON).is_ok() { 0 } else { -19 },
+            P::SD_IO_1V8_GET | P::SD_IO_1V8_SET | P::SD_POWER_GET | P::SD_POWER_SET => {
+                let Some((line, set)) = P::sd_line(op) else { return -22 };
+                return if set { if gpio::gpio_set_output(Chip::GioAon, line, arg != 0).is_ok() { 0 } else { -19 } }
+                else { match gpio::gpio_get(Chip::GioAon, line) { Ok(v) => v as i32, Err(_) => -19 } };
+            }
             _ => {}
         }
         let st = bcm2712_id::stepping().stepping;

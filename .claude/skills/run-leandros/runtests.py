@@ -24,6 +24,7 @@ Options:
                              blkslow  host:blkslowtest.py alone (3 s late virtio-blk request survives; page-in EIO = SIGBUS)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             kmodbuild host:kmodbuildtest.py (every loadable module builds and links against the kernel export table)
                              failevid  host:failevidtest.py (failing suites leave <out>/fail/<NN>-<name>/ evidence)
                              harness   host:harnesstest.py (line-buffering, auto -D on host tracing, quoted-command survival)
                              nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
@@ -457,6 +458,8 @@ SUITES = {
     "blkmany": ["host:blkmanytest.py"],
     # --features rpi5 kernel compile-check (cargo check, no boot; integ lanes run it).
     "rpi5check": ["host:rpi5checktest.py"],
+    # every loadable module builds + links against the kernel export table (kapi drift guard, host only).
+    "kmodbuild": ["host:kmodbuildtest.py"],
     "harness": ["host:harnesstest.py"],
     "failevid": ["host:failevidtest.py"],
     "stdev": ["host:stdevtest.py"],
@@ -605,7 +608,7 @@ SUITES = {
 # their timeout (seconds, before scaling) when it exceeds --timeout.
 HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
-                 "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
+                 "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600, "kmodbuildtest.py": 1500}
 
 
 def find_fails(out):

@@ -12,6 +12,30 @@ mod kenv {
     pub use kmod_kapi::blk::env::*;
 }
 
+// The driver source names the kernel's `crate::kdiag`.
+mod kdiag {
+    pub use kmod_kapi::kdiag::*;
+}
+
+// Pi 5 only: the UHS-I voltage switch drives two gio_aon lines (`kapi_pi5_pins`) and the card-MBR parser is pure logic.
+#[cfg(feature = "rpi5")]
+mod bcm2712_gpio {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Chip { Gio, GioAon }
+    pub fn gpio_get(chip: Chip, line: u32) -> Result<bool, i32> {
+        if chip != Chip::GioAon { return Err(-19); }
+        match line { 3 => kmod_kapi::plat::pi5_sd_io_1v8_get(), 4 => kmod_kapi::plat::pi5_sd_power_get(), _ => Err(-22) }
+    }
+    pub fn gpio_set_output(chip: Chip, line: u32, on: bool) -> Result<(), i32> {
+        if chip != Chip::GioAon { return Err(-19); }
+        match line { 3 => kmod_kapi::plat::pi5_sd_io_1v8_set(on), 4 => kmod_kapi::plat::pi5_sd_power_set(on), _ => Err(-22) }
+    }
+}
+#[cfg(feature = "rpi5")]
+#[path = "../../../drivers/src/rpi_misc_logic.rs"]
+#[allow(dead_code)]
+mod rpi_misc_logic;
+
 #[path = "../../../drivers/src/blockdev.rs"]
 mod blockdev;
 #[path = "../../../drivers/src/partscan.rs"]

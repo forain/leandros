@@ -42,14 +42,37 @@ pub(super) fn irq_handler(h: KIrqHandler) -> drivers::irq::IrqHandler {
     unsafe { core::mem::transmute::<KIrqHandler, drivers::irq::IrqHandler>(h) }
 }
 
-/// Single-vector MSI (x86_64). Returns the vector, or -errno (-95 where MSI is unsupported).
+/// The key a held interrupt is registered and freed by: the IDT vector, or the ITS LPI with `KIRQ_LPI` set.
+pub(super) fn irq_key(h: &drivers::irq::IrqHandle) -> u64 {
+    match (h.vector(), h.lpi()) {
+        (Some(v), _) => v as u64,
+        (None, Some(l)) => l as u64 | kmod_abi::KIRQ_LPI,
+        _ => 0,
+    }
+}
+
+/// Can this machine deliver MSI / MSI-X (x86_64 always; aarch64 with a live ITS)?
+#[no_mangle]
+pub extern "C" fn kapi_msi_supported() -> bool { drivers::irq::msi_supported() }
+
+/// Free one interrupt `owner` holds, by the key its request returned. False when it holds no such one.
+/// Task context. A MSI-X handle must be freed before `kapi_msix_disable` of its function.
+#[no_mangle]
+pub extern "C" fn kapi_irq_free(owner: KmodId, key: u64) -> bool {
+    let o = crate::kmod::gate::owner(owner);
+    if !crate::kmod::lower::release_irq(o, key) { return false; }
+    crate::kmod::registry::drop_registration(o, RegKind::IRQ, key);
+    true
+}
+
+/// Single-vector MSI. Returns the key (vector, or LPI | `KIRQ_LPI`), or -errno (-95 where MSI is unsupported).
 #[no_mangle]
 pub extern "C" fn kapi_irq_request_msi(owner: KmodId, bdf: u32, handler: KIrqHandler, ctx: usize) -> i64 {
     let (hf, hc) = match crate::kmod::lower::wrap_irq(owner, handler, ctx) { Some(x) => x, None => return -19 };
     crate::kmod::lower::note_pci(bdf);
     match drivers::irq::request_msi(func_of(bdf), hf, hc) {
         Ok(h) => {
-            let v = h.vector().unwrap_or(0) as u64;
+            let v = irq_key(&h);
             crate::kmod::lower::hold_irq(owner, v, h);
             crate::kmod::registry::note_registration(owner, RegKind::IRQ, v);
             v as i64
