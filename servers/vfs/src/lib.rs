@@ -7703,19 +7703,29 @@ fn gen_leandros_timer() -> Option<VnodeKind> {
     #[cfg(target_arch = "x86_64")]
     {
         extern "C" { fn arch_timer_cpu_stats(out: *mut u64, n: usize); }
-        let mut st = [0u64; 6 + 16];
+        let mut st = [0u64; 7 + 16];
         let n = (sched::active_cpu_count()).min(16);
         unsafe { arch_timer_cpu_stats(st.as_mut_ptr(), n); }
         let _ = writeln!(s, "dead_recovered {}", st[0]);
         let _ = writeln!(s, "stall_consumed {}", st[1]);
         let _ = writeln!(s, "recovered_by_state {} {} {}", st[2], st[3], st[4]);
         let _ = writeln!(s, "stale_ignored {}", st[5]);
-        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[6 + i]); }
+        let _ = writeln!(s, "stall_killed {}", st[6]);
+        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[7 + i]); }
     }
     #[cfg(not(target_arch = "x86_64"))]
     { let _ = writeln!(s, "dead_recovered 0"); let _ = writeln!(s, "stall_consumed 0"); }
-    proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_TIMER_W);
+    if !tmp_fill_kernel(&mut tmp, idx, s.as_bytes()) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
+
+/// Fake path of the `/proc/leandros_timer` snapshot. Writing `stall <cpu>` (CAP_SYS_ADMIN in the
+/// initial user namespace, x86_64 debug knob) re-arms the `timer.dead_delay` stall on that CPU.
+const PROC_TIMER_W: &[u8] = b"/tmp/.leandros_timer";
 
 /// Fake path of the writable `/proc/leandros_asfree` snapshot (open and write
 /// need CAP_SYS_ADMIN in the initial user namespace).
@@ -11343,6 +11353,27 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let mut v = 0usize;
                 for &c in s { v = v.saturating_mul(10).saturating_add((c - b'0') as usize); }
                 return match inotify::limit_set(k, v) { Ok(()) => val_reply(count as u64), Err(e) => err_reply(e) };
+            }
+            let is_timer = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_TIMER_W
+            };
+            if is_timer {
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(31);
+                let mut b = [0u8; 31];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let t = core::str::from_utf8(&b[..n]).unwrap_or("").trim();
+                let cpu = t.strip_prefix("stall ").and_then(|v| v.trim().parse::<i32>().ok());
+                #[cfg(target_arch = "x86_64")]
+                if let Some(c) = cpu {
+                    extern "C" { fn arch_timer_rearm_stall(cpu: i32); }
+                    unsafe { arch_timer_rearm_stall(c); }
+                    return val_reply(count as u64);
+                }
+                let _ = cpu;
+                return err_reply(-22);
             }
             let is_asfree = {
                 let tmp = TMP_FILES.lock();
