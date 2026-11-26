@@ -16,6 +16,7 @@
 #include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -1288,13 +1289,94 @@ static void test_dhcp6_info(void) {
     if (!strcmp(s, "done")) printf("  note: a server on the wire (slirp) already answered the Information-Request\n");
     CHECK("dhcp6_info_request_sent", r == 0 && got && !strcmp(m, "info"));
     if (strcmp(s, "done")) {
+        int rep0 = rep;
         r = d6_send(7, x, DNS_OPTS, sizeof DNS_OPTS);
-        CHECK("dhcp6_info_reply_dns", r == 0 && resolv_wait("nameserver 2001:db8:d6::53", 1) && resolv_has("dh6.test"));
+        int dns = r == 0 && resolv_wait("nameserver 2001:db8:d6::53", 1) && resolv_has("dh6.test");
         d6_state(m, s, x, &rep);
-        CHECK("dhcp6_info_done", !strcmp(s, "done"));
+        if (!dns && r == 0 && !strcmp(s, "done") && rep == rep0 + 1 && !resolv_has("nameserver 2001:db8:d6::53")) {
+            /* The wire server (slirp) answered between our state read and our reply; the client keeps
+             * only the first Reply of a transaction, so ours was (correctly) ignored. */
+            printf("  note: a server on the wire answered the Information-Request just before our reply\n");
+        } else {
+            CHECK("dhcp6_info_reply_dns", dns);
+            CHECK("dhcp6_info_done", !strcmp(s, "done"));
+        }
     }
     d6_reset();
     CHECK("dhcp6_info_cleared", resolv_wait("2001:db8:d6::53", 0));
+}
+
+/* A field of the "# eth0 ..." detail line of /proc/net/dhcp6 (t1, t2, refresh, solicits, renews, rebinds,
+ * inforeqs); LONG_MIN when absent. */
+static long d6_field(const char *key) {
+    FILE *f = fopen("/proc/net/dhcp6", "r");
+    if (!f) return LONG_MIN;
+    char b[512], pat[32]; long v = LONG_MIN;
+    snprintf(pat, sizeof pat, " %s=", key);
+    while (fgets(b, sizeof b, f)) {
+        if (strncmp(b, "# eth0 ", 7)) continue;
+        char *p = strstr(b, pat);
+        if (p) v = strtol(p + strlen(pat), NULL, 10);
+        break;
+    }
+    fclose(f);
+    return v;
+}
+static void test_dhcp6_refresh(void) {
+    char m[16] = "", s[16] = "", x[8] = ""; int rep = 0;
+    unsigned char o[sizeof DNS_OPTS + 8];
+    memcpy(o, DNS_OPTS, sizeof DNS_OPTS);
+    unsigned char rt[8] = { 0, 32, 0, 4, 0, 0, 0, 30 };    /* INFORMATION_REFRESH_TIME 30 s: floored to 600 */
+    memcpy(o + sizeof DNS_OPTS, rt, 8);
+    int r = inject_ra(0x40, NULL, 0);
+    int got = d6_wait("info-sent") || d6_wait("done");
+    d6_state(m, s, x, &rep);
+    if (r != 0 || !got || !strcmp(s, "done")) { printf("  note: dhcp6 refresh skipped (wire server answered first)\n"); d6_reset(); return; }
+    r = d6_send(7, x, o, sizeof o);
+    int ok = r == 0 && d6_wait("done");
+    long t = d6_field("refresh");
+    CHECK("dhcp6_refresh_min_600", ok && t >= 590 && t <= 600);
+    d6_reset();
+    r = inject_ra(0x40, NULL, 0);
+    got = d6_wait("info-sent") || d6_wait("done");
+    d6_state(m, s, x, &rep);
+    if (r != 0 || !got || !strcmp(s, "done")) { d6_reset(); return; }
+    r = d6_send(7, x, DNS_OPTS, sizeof DNS_OPTS);
+    ok = r == 0 && d6_wait("done");
+    t = d6_field("refresh");
+    CHECK("dhcp6_refresh_default_86400", ok && t >= 86300 && t <= 86400);
+    d6_reset();
+}
+
+/* T1/T2 with short timers: Renew goes out at T1 (same address, no Solicit), Rebind at T2 when the
+ * Renew stays unanswered, the address is kept while valid, a Reply to the Renew closes it. */
+static void test_dhcp6_renew(void) {
+    char m[16] = "", s[16] = "", x[8] = "", x2[8] = "", x3[8] = ""; int rep = 0;
+    unsigned char ia[] = { 0, 3, 0, 40, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 5,   /* iaid, T1 = 2 s, T2 = 5 s */
+        0, 5, 0, 24, 0x20, 0x01, 0x0d, 0xb8, 0, 0xd6, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x35,
+        0, 0, 0x0e, 0x10, 0, 0, 0x1c, 0x20 };
+    const char *addr = "20010db800d600000000000000001235";
+    int r = inject_ra(0x80, NULL, 0);
+    int ok = r == 0 && d6_wait("solicit") && d6_state(m, s, x, &rep);
+    if (ok) { r = d6_send(2, x, ia, sizeof ia); ok = r == 0 && d6_wait("request"); }
+    d6_state(m, s, x2, &rep);
+    unsigned char rp[sizeof ia + sizeof DNS_OPTS]; memcpy(rp, ia, sizeof ia); memcpy(rp + sizeof ia, DNS_OPTS, sizeof DNS_OPTS);
+    if (ok) r = d6_send(7, x2, rp, sizeof rp);
+    for (int i = 0; i < 50 && ok && inet6_flags(addr) != 0x80; i++) usleep(100000);
+    CHECK("dhcp6_renew_bound", ok && r == 0 && inet6_flags(addr) == 0x80);
+    long t1 = d6_field("t1"), t2 = d6_field("t2");
+    CHECK("dhcp6_renew_timers", t1 >= 0 && t1 <= 2 && t2 >= 3 && t2 <= 5);
+    int renew = d6_wait("renew");
+    d6_state(m, s, x3, &rep);
+    CHECK("dhcp6_renew_sent", renew && d6_field("renews") >= 1 && d6_field("solicits") == 1 && strcmp(x2, x3) != 0 && inet6_flags(addr) == 0x80);
+    int reb = d6_wait("rebind");                       /* the Renew went unanswered: T2 */
+    CHECK("dhcp6_rebind_sent", reb && d6_field("rebinds") >= 1 && d6_field("solicits") == 1 && inet6_flags(addr) == 0x80);
+    d6_state(m, s, x3, &rep);
+    r = d6_send(7, x3, rp, sizeof rp);                 /* a server answers the Rebind */
+    int done = r == 0 && d6_wait("done");
+    CHECK("dhcp6_renew_done_same_addr", done && inet6_flags(addr) == 0x80 && d6_field("solicits") == 1 && d6_field("t1") >= 0);
+    d6_reset();
+    CHECK("dhcp6_renew_released", inet6_flags(addr) < 0);
 }
 
 static void test_dhcp6_stateful(void) {
@@ -1493,6 +1575,8 @@ int main(int argc, char **argv) {
     test_rdnss_linklocal_scope();
     test_dhcp6_info();
     test_dhcp6_stateful();
+    test_dhcp6_refresh();
+    test_dhcp6_renew();
     test_vif_ns_if_inet6();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
