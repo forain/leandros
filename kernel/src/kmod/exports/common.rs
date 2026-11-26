@@ -145,7 +145,10 @@ pub extern "C" fn kapi_pci_scan(index: u32, out: *mut KPciDev) -> i32 {
     }
 }
 
-static MSIX_TABLES: sched::ksync::KSpinLock<Vec<(u32, &'static drivers::irq::MsixTable)>> = sched::ksync::KSpinLock::new(Vec::new());
+/// (bdf, owner that enabled the table, table). The table (and its mapping) is leaked on purpose and never freed: an
+/// `IrqHandle::MsiX` holds the raw table VA and an interrupt in flight may still touch it, and `kapi_irq_request_msix`
+/// copies the `&'static` out of the lock, so the reference stays valid forever (no use-after-free window).
+static MSIX_TABLES: sched::ksync::KSpinLock<Vec<(u32, KmodId, &'static drivers::irq::MsixTable)>> = sched::ksync::KSpinLock::new(Vec::new());
 
 /// Quiesce dropped MSI-X enable: forget the cached table so the next request enables it again (the table mapping leaks).
 pub fn msix_forget(bdf: u32) { MSIX_TABLES.lock().retain(|t| t.0 != bdf); }
@@ -153,13 +156,13 @@ pub fn msix_forget(bdf: u32) { MSIX_TABLES.lock().retain(|t| t.0 != bdf); }
 /// One MSI-X vector (`entry`) of `bdf`; the table is enabled on the first call. Returns the vector or -errno.
 #[no_mangle]
 pub extern "C" fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, handler: KIrqHandler, ctx: usize) -> i64 {
-    let known = MSIX_TABLES.lock().iter().find(|t| t.0 == bdf).map(|t| t.1);
+    let known = MSIX_TABLES.lock().iter().find(|t| t.0 == bdf).map(|t| t.2);
     let tab = match known {
         Some(t) => { t.reenable(); t }
         None => match drivers::irq::MsixTable::enable(super::irq::func_of(bdf)) {
             Ok(t) => {
                 let t: &'static drivers::irq::MsixTable = Box::leak(Box::new(t));
-                MSIX_TABLES.lock().push((bdf, t));
+                MSIX_TABLES.lock().push((bdf, crate::kmod::gate::owner(owner), t));
                 t
             }
             Err(e) => return super::irq::irq_errno(e),
@@ -170,12 +173,28 @@ pub extern "C" fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, han
     crate::kmod::lower::note_pci(bdf);
     match tab.request(entry, hf, hc) {
         Ok(h) => {
-            let v = h.vector().unwrap_or(0) as u64;
+            let v = super::irq::irq_key(&h);
             crate::kmod::lower::hold_irq(owner, v, h);
             crate::kmod::registry::note_registration(owner, RegKind::IRQ, v);
             v as i64
         }
         Err(e) => super::irq::irq_errno(e),
+    }
+}
+
+/// Turn MSI-X off on `bdf` (the table `kapi_irq_request_msix` enabled). Refused (false) when no table is enabled there,
+/// when the running generation is not the one that enabled it (EPERM-style), or while any MSI-X handle of the function
+/// is still held (EBUSY): free every vector (`kapi_irq_free`) first. The table stays listed, mapped and leaked (like
+/// `msix_forget`): only the enable bit is cleared, so a later request re-enables it without a second mapping, and a
+/// late interrupt can never touch an unmapped table.
+#[no_mangle]
+pub extern "C" fn kapi_msix_disable(bdf: u32) -> bool {
+    let caller = crate::kmod::gate::running_owner().0;
+    let (owner, tab) = match MSIX_TABLES.lock().iter().find(|t| t.0 == bdf) { Some(t) => (Some(t.1 .0), Some(t.2)), None => (None, None) };
+    let busy = tab.map_or(false, |t| crate::kmod::lower::has_msix_handle(t.table_va()));
+    match kmod_abi::plat::msix_disable_verdict(owner, caller, busy) {
+        Ok(()) => { tab.unwrap().quiesce(); true }
+        Err(e) => { crate::kmod::log(&alloc::format!("[kmod] msix_disable bdf {:#x} refused ({})\n", bdf, e)); false }
     }
 }
 
@@ -204,7 +223,7 @@ pub extern "C" fn kapi_secret_peek(owner: KmodId, key: *const u8, klen: usize, b
     if key.is_null() || buf.is_null() || klen == 0 || klen > 64 { return -22; }
     // A network registration, or a Wi-Fi module itself (iwlwifi, brcmf) (it reads the legacy credential during probe,
     // before it can register its netif).
-    let mut net = matches!(crate::kmod::name_str(&crate::kmod::registry::name_of(owner)), "iwlwifi" | "brcmf");
+    let mut net = matches!(crate::kmod::name_str(&crate::kmod::registry::name_of(crate::kmod::gate::owner(owner))), "iwlwifi" | "brcmf");
     crate::kmod::registry::registrations(owner, &mut |k, _| if k == RegKind::NETDEV { net = true });
     if !net { return -1; }
     let Ok(k) = core::str::from_utf8(unsafe { core::slice::from_raw_parts(key, klen) }) else { return -22 };

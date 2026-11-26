@@ -73,7 +73,13 @@ fn write_u32(addr: usize, v: u32) { let _ = sched::uaccess::write_user::<u32>(ad
 /// The fence a sync-file fd holds; `None` if `fd` is not a sync file.
 fn fence_of_fd(pid: u32, fd: i32) -> Option<Fence> {
     if fd < 0 { return None; }
-    vfs::eventfd_sync_token(pid, fd as usize).map(sync_file::fence_of)
+    if let Some(t) = vfs::eventfd_sync_token(pid, fd as usize) { return Some(sync_file::fence_of(t)); }
+    // A virtgpu EXECBUFFER out-fence is a sync file too (Linux): an eventfd armed on a backend fence.
+    match vfs::eventfd_fence_meta(pid, fd as usize) {
+        Some((vfs::EVFD_ORIGIN_FENCE, 0)) => Some(Fence::Signaled),
+        Some((vfs::EVFD_ORIGIN_FENCE, f)) => Some(Fence::One(f)),
+        _ => None,
+    }
 }
 
 /// Mint a sync-file fd holding `fence` (O_CLOEXEC, as every Linux producer

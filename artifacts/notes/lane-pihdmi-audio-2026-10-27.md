@@ -23,7 +23,7 @@ Lane 5 of `lane-pisound-design-2026-10-26.md`. Builds on pihdmi-probe (pixel clo
   touched) -> buddy ring + dma40 `claim(Some(10))` -> MAI startup + prepare + ACR (N/CTS from the probe's
   spec table, Linux formula fallback) + InfoFrame (RMW, AVI slot preserved) -> cyclic DMA (DREQ cell
   0x41fa000a) into MAI_DATA at CPU 0x10_7c72_001c, verified by the position moving within 40 ms, else
-  retried at bus 0x7c72001c, else inert. Every step is SError-checkpointed (`set_serror_check`).
+  (the bus 0x7c72001c retry was REMOVED by lane/hdmidreq: that address is DRAM on >= 2 GiB boards) else inert. Every step is SError-checkpointed (`set_serror_check`).
 - Runtime: MAI ERRORE/ERRORF/DLATE counted and cleared; a firmware re-train (MAI_CTL.ENABLE dropped or
   CRP_CFG N changed) or 30 ticks without DMA progress reprograms and restarts (bounded logs); writer
   starvation resyncs as HDA does (`writer starved #n`).
@@ -49,7 +49,7 @@ Lane 5 of `lane-pisound-design-2026-10-26.md`. Builds on pihdmi-probe (pixel clo
   then `[PW] playback device: HDMI audio (hdmi0)` and `[INIT] PipeWire server port (HDMI audio): N`.
 - Test: `sndtest info` (shows `backend: hdmi`, counters), `sndtest tone 440 5` (5 s 440 Hz tone), `sndtest all`.
 - Failure lines: `[hdmiaud] inert: <reason>` (no sink / DVI / unknown clock / dma never moved). On
-  `no progress pos=.. cs=.. debug=.. mai_ctl=..` for both FIFOs, DREQ 10 never asserted: check MAI_CTL
+  `no progress pos=.. cs=.. debug=.. mai_ctl=..` (now `dma not paced by the FIFO` with src/cs/debug/ti); DREQ never asserted (D0 needs 12, C0 10): check MAI_CTL
   and the dma40 DEBUG bits.
 
 ## Open

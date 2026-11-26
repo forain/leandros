@@ -59,6 +59,12 @@ pub fn take_pages(id: KmodId) -> Vec<(usize, usize)> {
     match g.iter().position(|x| x.0 == id) { Some(i) => g.remove(i).1, None => Vec::new() }
 }
 
+/// Drop one registration record the module released itself (`owner` already normalised by the caller).
+pub fn drop_registration(owner: KmodId, kind: RegKind, handle: u64) {
+    let mut r = REGS.lock();
+    if let Some(i) = r.iter().position(|x| x.0 == owner && x.1 == kind && x.2 == handle) { r.remove(i); }
+}
+
 /// Drop every remaining registration record of a generation (their gates are closed for good).
 pub fn forget_regs(id: KmodId) { REGS.lock().retain(|r| r.0 != id); }
 

@@ -31,6 +31,7 @@
 //! [`HostIo`], so the CMD52/CMD53 logic runs unchanged against a mock register
 //! file in `drivers/sdio-tests`. `sdhci.rs` is not modified.
 
+use crate::kenv::sched;
 use super::bus::{BusError, SdioBus, FUNC_BACKPLANE, FUNC_BUS};
 
 // ── Register-level access the core needs ─────────────────────────────────────

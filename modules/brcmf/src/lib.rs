@@ -67,6 +67,7 @@ pub mod sched {
         pub const SLOT_SDIO: u32 = 2;
         pub fn mark(_slot: u32, _code: u32, _arg: u64) {}
         pub fn set_namer(_slot: u32, _f: fn(u64) -> &'static str) {}
+        pub use kmod_kapi::sched::wedge::park_check;
     }
 }
 

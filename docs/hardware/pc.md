@@ -97,7 +97,7 @@ an older script that refers to a runner which no longer exists; use `write-usb.s
 The kernel resolves `/dev/root` in this order (`cab4ee0`, `d39f97c`):
 
 1. `root=/dev/<name>` or `root=PARTUUID=…` on the kernel command line (matching is case-insensitive).
-   An explicit `root=` that matches nothing gives `ENODEV`; the kernel does not guess.
+   An explicit `root=` that matches nothing, or is of an unknown form, gives `ENODEV`; a duplicated `PARTUUID=` gives `ENOTUNIQ`; the kernel does not guess. `root.fail=reboot` (restart instead of parking on a failed root) is opt-in, for trial boot entries only.
 2. Index 1, if it is a whole `vd` disk with F2FS magic — the QEMU default layout.
 3. The unique removable or `sd*` disk or partition with F2FS magic that is not the home volume
    (f2fs label `leandros-home`). Ties are broken first by the

@@ -246,6 +246,13 @@ pub mod mm {
     /// Physical address of a direct-map address (0 for a module-image address: not DMA-able).
     pub fn virt_to_phys(va: usize) -> usize { super::sys_common::virt_to_phys(va).unwrap_or(0) as usize }
 
+    /// The kernel's `mm::dma_cache` clean / invalidate over `kapi_dma_sync` (`dma_dir::CLEAN` / `INVALIDATE`; no-ops off aarch64).
+    /// `va` is a direct-map or `kva` window address.
+    pub mod dma_cache {
+        pub fn clean_range(va: usize, len: usize) { crate::sys_common::dma_sync(va, len, kmod_abi::plat::dma_dir::CLEAN) }
+        pub fn invalidate_range(va: usize, len: usize) { crate::sys_common::dma_sync(va, len, kmod_abi::plat::dma_dir::INVALIDATE) }
+    }
+
     pub mod paging {
         use super::*;
 
@@ -314,8 +321,42 @@ pub mod mm {
     }
 }
 
+/// The kernel's `kdiag` (clock and bounded busy-wait) for driver sources that name `crate::kdiag`.
+pub mod kdiag {
+    use super::*;
+    pub fn now_ns() -> u64 { unsafe { sys::kapi_monotonic_ns() } }
+    /// Bounded busy-wait.
+    pub fn delay_us(us: u64) { unsafe { sys::kapi_udelay(us) } }
+}
+
 pub mod sched {
     use super::*;
+
+    /// Kexec park point of the kernel's `sched::wedge` (the other wedge markers are kernel diagnostics).
+    pub mod wedge {
+        pub fn park_check() { unsafe { kmod_abi::sys::kapi_park_check() } }
+    }
+
+    /// The kernel's `sched::ksync::KMutex` (`new(value)`) over the kapi mutex.
+    pub mod ksync {
+        use core::cell::UnsafeCell;
+        use core::ops::{Deref, DerefMut};
+        pub struct KMutex<T> { h: usize, v: UnsafeCell<T> }
+        unsafe impl<T: Send> Send for KMutex<T> {}
+        unsafe impl<T: Send> Sync for KMutex<T> {}
+        pub struct KMutexGuard<'a, T> { m: &'a KMutex<T> }
+        impl<T> KMutex<T> {
+            pub fn new(v: T) -> Self { KMutex { h: crate::sys_common::mutex_new("kmutex"), v: UnsafeCell::new(v) } }
+            pub fn try_lock(&self) -> Option<KMutexGuard<'_, T>> {
+                if crate::sys_common::mutex_trylock(self.h) { Some(KMutexGuard { m: self }) } else { None }
+            }
+            pub fn is_locked(&self) -> bool { self.try_lock().is_none() }
+            pub fn lock(&self) -> KMutexGuard<'_, T> { crate::sys_common::mutex_lock(self.h); KMutexGuard { m: self } }
+        }
+        impl<T> Deref for KMutexGuard<'_, T> { type Target = T; fn deref(&self) -> &T { unsafe { &*self.m.v.get() } } }
+        impl<T> DerefMut for KMutexGuard<'_, T> { fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.m.v.get() } } }
+        impl<T> Drop for KMutexGuard<'_, T> { fn drop(&mut self) { crate::sys_common::mutex_unlock(self.m.h); } }
+    }
 
     pub fn monotonic_ns() -> u64 { unsafe { sys::kapi_monotonic_ns() } }
     pub fn monotonic_us() -> u64 { monotonic_ns() / 1000 }
@@ -325,6 +366,8 @@ pub mod sched {
         use alloc::boxed::Box;
 
         pub fn udelay(us: u64) { unsafe { sys::kapi_udelay(us) } }
+        /// Poll point for loops that run with IRQs masked (reaches kexec's park page, lets interrupts in).
+        pub fn masked_poll_point() { unsafe { sys::kapi_masked_poll_point() } }
         pub fn msleep(ms: u64) { unsafe { sys::kapi_msleep(ms) } }
         /// True once the owning module generation is being unloaded: thread bodies must return.
         pub fn should_stop() -> bool { unsafe { sys::kapi_kthread_should_stop() } }
@@ -397,11 +440,27 @@ pub mod irq {
 
     /// An installed interrupt; permanent (modules never free it in v1).
     #[derive(Clone, Copy, Debug)]
-    pub struct IrqHandle { vector: Option<u8>, line: Option<u32> }
+    pub struct IrqHandle { vector: Option<u8>, line: Option<u32>, lpi: Option<u32>, key: u64 }
     impl IrqHandle {
         pub fn vector(&self) -> Option<u8> { self.vector }
         pub fn line(&self) -> Option<u32> { self.line }
+        /// The ITS LPI INTID (aarch64 MSI / MSI-X), if any.
+        pub fn lpi(&self) -> Option<u32> { self.lpi }
+        /// From the key `kapi_irq_request_msi` / `_msix` return: an IDT vector, or an LPI with `KIRQ_LPI` set.
+        fn from_key(key: u64) -> IrqHandle {
+            if key & kmod_abi::KIRQ_LPI != 0 {
+                IrqHandle { vector: None, line: None, lpi: Some(key as u32), key }
+            } else {
+                IrqHandle { vector: Some(key as u8), line: None, lpi: None, key }
+            }
+        }
     }
+
+    /// Can this machine deliver MSI / MSI-X (x86_64 always; aarch64 with a live ITS)?
+    pub fn msi_supported() -> bool { unsafe { sys::kapi_msi_supported() } }
+
+    /// Give an interrupt back (task context). A MSI-X handle goes before `MsixTable::disable`.
+    pub fn free_irq(h: IrqHandle) { unsafe { sys::kapi_irq_free(owner(), h.key); } }
 
     fn raw(h: IrqHandler) -> kmod_abi::KIrqHandler { unsafe { core::mem::transmute(h) } }
 
@@ -425,16 +484,18 @@ pub mod irq {
         }
         pub fn request(&self, entry: u16, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
             match super::sys_common::irq_request_msix(self.bdf, entry, raw(h), ctx) {
-                Ok(v) => Ok(IrqHandle { vector: Some(v), line: None }),
+                Ok(k) => Ok(IrqHandle::from_key(k)),
                 Err(e) => Err(err(e)),
             }
         }
+        /// Disable MSI-X and unmap the table. Free every `request`ed handle first.
+        pub fn disable(self) { unsafe { sys::kapi_msix_disable(self.bdf); } }
     }
 
     /// Single-vector MSI on the function `bdf`.
     pub fn request_msi(bdf: impl Into<u32>, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
         match unsafe { sys::kapi_irq_request_msi(owner(), bdf.into(), raw(h), ctx) } {
-            v if v >= 0 => Ok(IrqHandle { vector: Some(v as u8), line: None }),
+            k if k >= 0 => Ok(IrqHandle::from_key(k as u64)),
             e => Err(err(e)),
         }
     }
@@ -442,7 +503,7 @@ pub mod irq {
     /// The function's INTx line.
     pub fn request_line(bdf: impl Into<u32>, h: IrqHandler, ctx: usize) -> Result<IrqHandle, IrqError> {
         match unsafe { sys::kapi_irq_request_line(owner(), bdf.into(), raw(h), ctx) } {
-            l if l >= 0 => Ok(IrqHandle { vector: None, line: Some(l as u32) }),
+            l if l >= 0 => Ok(IrqHandle { vector: None, line: Some(l as u32), lpi: None, key: l as u64 }),
             e => Err(err(e)),
         }
     }
@@ -670,8 +731,8 @@ pub mod sys_common {
         let mut d = core::mem::MaybeUninit::<KPciDev>::uninit();
         if unsafe { sys::kapi_pci_scan(index, d.as_mut_ptr()) } == 0 { Some(unsafe { d.assume_init() }) } else { None }
     }
-    pub fn irq_request_msix(bdf: u32, entry: u16, handler: KIrqHandler, ctx: usize) -> Result<u8, i64> {
-        match unsafe { sys::kapi_irq_request_msix(owner(), bdf, entry, handler, ctx) } { v if v < 0 => Err(v), v => Ok(v as u8) }
+    pub fn irq_request_msix(bdf: u32, entry: u16, handler: KIrqHandler, ctx: usize) -> Result<u64, i64> {
+        match unsafe { sys::kapi_irq_request_msix(owner(), bdf, entry, handler, ctx) } { v if v < 0 => Err(v), v => Ok(v as u64) }
     }
     pub fn fw_root_ready() -> bool { unsafe { sys::kapi_fw_root_ready() } }
     /// Load firmware: (handle, data, len). The data stays valid until `fw_release(handle)`.

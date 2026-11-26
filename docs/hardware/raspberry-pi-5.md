@@ -468,8 +468,10 @@ Open: BSS `84:78:48:d8:7e:79` rejected with reason 2 on every boot in the last l
 
 - **dma40** (`drivers/src/bcm2712_dma40/`, `pidma40`): the BCM2712 40-bit DMA engine, with a pure control-block
   layer (32-byte `Scb`, memcpy chains, cyclic memory-to-FIFO rings with `D_DREQ`), interrupt or polled
-  completion, channel selection and a boot self-test. Its DREQ numbers for hdmi0/hdmi1 are 10/17 (decoded
-  from the DTB cells as Linux does), not 12/13 as the first design note guessed.
+  completion, channel selection and a boot self-test. Its DREQ numbers for hdmi0/hdmi1 depend on the stepping and come from the
+  two DTBs: C0 `0x41fa000a`/`0x41fa0011` = 10/17, D0 (`bcm2712d0-rpi-5-b.dtb`) `0x41fa000c`/`0x41fa000d` = 12/13
+  (`cb::hdmi_dreq_cell`; `hdmi.dreq=N` overrides). The only FIFO address is the CPU physical MAI_DATA; there is no 32-bit
+  bus alias (it would be DRAM on >= 2 GiB boards).
 - **GPIO / pinctrl / l2 intc** (`bcm2712_gpio.rs`, `pigio`): brcmstb `gio` and `gio_aon` banks, `pinctrl` tables
   for the C0 and D0 steppings generated from Linux by `scripts/gen-bcm2712-pinctrl.py`, and chained l2
   interrupt controllers. The stepping always comes from the chip id (SUN_TOP_CTRL); an unknown stepping

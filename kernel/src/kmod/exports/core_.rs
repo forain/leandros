@@ -57,6 +57,15 @@ pub extern "C" fn kapi_monotonic_ns() -> u64 { sched::monotonic_ns() }
 pub extern "C" fn kapi_msleep(ms: u64) { sched::kthread::msleep(ms) }
 #[no_mangle]
 pub extern "C" fn kapi_udelay(us: u64) { sched::kthread::udelay(us) }
+
+/// Poll point for module loops that run with IRQs masked: reach kexec's park page, then let pending
+/// interrupts in (`sched::kthread::masked_poll_point`).
+#[no_mangle]
+pub extern "C" fn kapi_masked_poll_point() { sched::kthread::masked_poll_point() }
+
+/// Reach kexec's park page when a stop-and-jump is under way (`sched::wedge::park_check`); may not return.
+#[no_mangle]
+pub extern "C" fn kapi_park_check() { sched::wedge::park_check() }
 #[no_mangle]
 pub extern "C" fn kapi_spin_held(acquired: bool) { sched::spinheld::account(acquired) }
 #[no_mangle]

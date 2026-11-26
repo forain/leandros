@@ -477,6 +477,15 @@ pub struct AddressSpace {
     /// scheduler lock stalls every other CPU (see
     /// `sched::lock_leader_address_space`).
     pub busy: core::sync::atomic::AtomicBool,
+    /// Set (under `busy`, before it is released) once the exiting owner has
+    /// decided this space's contents are being torn down although other
+    /// `Arc`s may still exist (an observer's transient clone, a debug hold).
+    /// A taker that wins `busy` and sees it must release `busy` and use
+    /// nothing: the regions and the page tables are gone or going.
+    pub closed: core::sync::atomic::AtomicBool,
+    /// `release_contents` has run (it is idempotent; the ring entry is
+    /// written once, by the run that did the work).
+    contents_released: bool,
     /// Bumped on every release of `busy`; a chunked operation compares it
     /// across its own unlock/relock to detect a foreign holder in between.
     pub lock_epoch: core::sync::atomic::AtomicU64,
@@ -503,6 +512,62 @@ pub struct AddressSpace {
     /// Atomic because `find` takes `&self`; Relaxed is enough because the
     /// hint is never trusted.
     pub find_hint: AtomicUsize,
+    /// Thread-group id of the process this space belongs to (0 = not yet
+    /// attached to a Task). Set where the space gets its Task (fork, exec,
+    /// clone); read only by the teardown ring (`/proc/leandros_asfree`).
+    pub owner_tgid: AtomicUsize,
+}
+
+/// Entries of the address-space teardown ring.
+pub const ASFREE_RING: usize = 256;
+struct AsFreeSlot {
+    /// Entry sequence number + 1 (0 = never written); stored last.
+    seq: core::sync::atomic::AtomicU64,
+    tgid: AtomicUsize,
+    pages: AtomicUsize,
+    pt_pages: AtomicUsize,
+}
+#[allow(clippy::declare_interior_mutable_const)]
+const ASFREE_SLOT0: AsFreeSlot = AsFreeSlot {
+    seq: core::sync::atomic::AtomicU64::new(0),
+    tgid: AtomicUsize::new(0), pages: AtomicUsize::new(0), pt_pages: AtomicUsize::new(0),
+};
+static ASFREE_SLOTS: [AsFreeSlot; ASFREE_RING] = [ASFREE_SLOT0; ASFREE_RING];
+/// Teardowns recorded so far (the next entry's sequence number).
+static ASFREE_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// One teardown ring entry: `(seq, owner tgid, pages whose refcount reached
+/// zero, page-table pages freed)`.
+pub type AsFreeEntry = (u64, usize, usize, usize);
+
+fn asfree_record(tgid: usize, pages: usize, pt_pages: usize) {
+    let n = ASFREE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let s = &ASFREE_SLOTS[(n as usize) % ASFREE_RING];
+    s.seq.store(0, Ordering::Relaxed);
+    // Seqlock writer: the 0 must be visible before any field store (a Release
+    // store only orders what precedes it; aarch64 may otherwise reorder).
+    core::sync::atomic::fence(Ordering::Release);
+    s.tgid.store(tgid, Ordering::Relaxed);
+    s.pages.store(pages, Ordering::Relaxed);
+    s.pt_pages.store(pt_pages, Ordering::Relaxed);
+    s.seq.store(n + 1, Ordering::Release);
+}
+
+/// Snapshot the teardown ring, oldest first. Returns the total number of
+/// teardowns recorded since boot (more than [`ASFREE_RING`] means older
+/// entries were overwritten).
+pub fn asfree_snapshot(out: &mut Vec<AsFreeEntry>) -> u64 {
+    let total = ASFREE_SEQ.load(Ordering::Acquire);
+    let first = total.saturating_sub(ASFREE_RING as u64);
+    for n in first..total {
+        let s = &ASFREE_SLOTS[(n as usize) % ASFREE_RING];
+        let a = s.seq.load(Ordering::Acquire);
+        let (t, p, q) = (s.tgid.load(Ordering::Relaxed), s.pages.load(Ordering::Relaxed), s.pt_pages.load(Ordering::Relaxed));
+        // Seqlock reader: the field loads must complete before the re-check.
+        core::sync::atomic::fence(Ordering::Acquire);
+        if a == n + 1 && s.seq.load(Ordering::Relaxed) == a { out.push((n, t, p, q)); }
+    }
+    total
 }
 
 /// Called every [`TEARDOWN_BATCH`] pages of an address-space teardown:
@@ -549,14 +614,28 @@ impl Drop for AddressSpace {
     /// any page boundary: every [`TEARDOWN_BATCH`] pages it passes a
     /// reschedule point. A multi-GiB teardown used to run start to end with
     /// IRQs masked.
-    fn drop(&mut self) {
+    fn drop(&mut self) { self.release_contents(); }
+}
+
+impl AddressSpace {
+    /// Tear down the CONTENTS (VMAs, backing pages, page-table tree), leaving
+    /// the empty shell. Idempotent: the regions are taken, the root is zeroed
+    /// after it is freed, and the teardown ring entry is written once, at the
+    /// end of the run that did the work. Exit calls it explicitly (after
+    /// `closed` is set under `busy`) whatever the `Arc` count; `Drop` calls it
+    /// for every other last reference.
+    pub fn release_contents(&mut self) {
+        if self.contents_released { return; }
+        self.contents_released = true;
         let mut batch = 0usize;
+        let mut freed = 0usize;
+        let mut pt_freed = 0usize;
         // Free all VMA backing pages.
         for slot in self.regions.iter_mut() {
             if let Some(region) = slot.take() {
                 if region.lazy {
                     for (_, phys) in region.lazy_pages.present() {
-                        crate::pageref::unref_or_free(phys, 0);
+                        if crate::pageref::unref_or_free(phys, 0) { freed += 1; }
                         batch += 1;
                         if batch >= TEARDOWN_BATCH {
                             batch = 0;
@@ -569,6 +648,7 @@ impl Drop for AddressSpace {
                 } else if region.phys != 0 {
                     let pages = (region.end - region.start) / PAGE_SIZE;
                     buddy_free(region.phys, pages_to_order(pages));
+                    freed += pages;
                 }
                 if is_file_backed(region.file_cap) {
                     file_release(region.file_cap);
@@ -591,9 +671,11 @@ impl Drop for AddressSpace {
             // root before its table pages are returned (normally none: a
             // dying address space is loaded nowhere).
             tlb_flush_as(self.page_table_root);
-            unsafe { crate::paging::free_user_page_tables(self.page_table_root); }
+            pt_freed = unsafe { crate::paging::free_user_page_tables(self.page_table_root) };
             buddy_free(self.page_table_root, 0);
+            self.page_table_root = 0;
         }
+        asfree_record(self.owner_tgid.load(Ordering::Relaxed), freed, pt_freed);
     }
 }
 
@@ -606,6 +688,8 @@ impl AddressSpace {
             heap_start: 0,
             heap_end: 0,
             busy: core::sync::atomic::AtomicBool::new(false),
+            closed: core::sync::atomic::AtomicBool::new(false),
+            contents_released: false,
             lock_epoch: core::sync::atomic::AtomicU64::new(0),
             stack_top: 0,
             hiwater_rss: 0,
@@ -613,6 +697,7 @@ impl AddressSpace {
             min_flt: core::sync::atomic::AtomicU64::new(0),
             maj_flt: core::sync::atomic::AtomicU64::new(0),
             find_hint: AtomicUsize::new(0),
+            owner_tgid: AtomicUsize::new(0),
         }
     }
 

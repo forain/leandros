@@ -7703,18 +7703,42 @@ fn gen_leandros_timer() -> Option<VnodeKind> {
     #[cfg(target_arch = "x86_64")]
     {
         extern "C" { fn arch_timer_cpu_stats(out: *mut u64, n: usize); }
-        let mut st = [0u64; 6 + 16];
+        let mut st = [0u64; 7 + 16];
         let n = (sched::active_cpu_count()).min(16);
         unsafe { arch_timer_cpu_stats(st.as_mut_ptr(), n); }
         let _ = writeln!(s, "dead_recovered {}", st[0]);
         let _ = writeln!(s, "stall_consumed {}", st[1]);
         let _ = writeln!(s, "recovered_by_state {} {} {}", st[2], st[3], st[4]);
         let _ = writeln!(s, "stale_ignored {}", st[5]);
-        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[6 + i]); }
+        let _ = writeln!(s, "stall_killed {}", st[6]);
+        for i in 0..n { let _ = writeln!(s, "cpu{} irqs {}", i, st[7 + i]); }
     }
     #[cfg(not(target_arch = "x86_64"))]
     { let _ = writeln!(s, "dead_recovered 0"); let _ = writeln!(s, "stall_consumed 0"); }
-    proc_snapshot(b"/tmp/.leandros_timer", s.as_bytes(), false)
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_TIMER_W);
+    if !tmp_fill_kernel(&mut tmp, idx, s.as_bytes()) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
+
+/// Fake path of the `/proc/leandros_timer` snapshot. Writing `stall <cpu>` (CAP_SYS_ADMIN in the
+/// initial user namespace, x86_64 debug knob) re-arms the `timer.dead_delay` stall on that CPU.
+const PROC_TIMER_W: &[u8] = b"/tmp/.leandros_timer";
+
+/// Fake path of the writable `/proc/leandros_asfree` snapshot (open and write
+/// need CAP_SYS_ADMIN in the initial user namespace).
+const PROC_ASFREE_W: &[u8] = b"/tmp/.proc_asfree";
+fn gen_asfree() -> Option<VnodeKind> {
+    let mut s = alloc::string::String::new();
+    sched::asfree::render(&mut s);
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_ASFREE_W);
+    if !tmp_fill_kernel(&mut tmp, idx, s.as_bytes()) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
 }
 
 /// `/proc/wakestat`: who issues poll-channel wakes and how many tasks each
@@ -7886,6 +7910,22 @@ fn gen_v3d_headless(dump: bool) -> Option<VnodeKind> {
     let f: fn(bool) -> Option<alloc::vec::Vec<u8>> = unsafe { core::mem::transmute(f) };
     let d = f(dump)?;
     proc_snapshot(if dump { b"/tmp/.v3d_headless_fb" } else { b"/tmp/.v3d_headless" }, &d, false)
+}
+
+/// `/proc/leandros_sd` text source (drivers::sdhci::proc_text), set by the kernel
+/// on the SD-card boards; elsewhere the file does not exist.
+static PROC_SD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_proc_sd(f: fn() -> Option<alloc::string::String>) {
+    PROC_SD.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn gen_leandros_sd() -> Option<VnodeKind> {
+    let f = PROC_SD.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 { return None; }
+    let f: fn() -> Option<alloc::string::String> = unsafe { core::mem::transmute(f) };
+    let s = f()?;
+    proc_snapshot(b"/tmp/.leandros_sd", s.as_bytes(), false)
 }
 
 /// `/proc/pcipm` text source (drivers::pci::pm_report), set by the kernel.
@@ -9159,10 +9199,10 @@ fn gen_proc_self(reader: u32, pid: u32, path: &[u8]) -> Option<VnodeKind> {
 /// and what a `/proc/<pid>` directory lists. `/proc/<pid>/fd` is served too
 /// (`proc_pid_fd_dir`); the rest of `/proc/<pid>/` is still `/proc/self/`-only.
 /// Synthesized at open (see handle_open) and not in RAMFS: stat must know them.
-const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer",
+const PROC_DIAG_FILES: &[&[u8]] = &[b"/proc/sysstat", b"/proc/kmemstat", b"/proc/wakestat", b"/proc/leandros_timer", b"/proc/leandros_asfree", b"/proc/leandros_sd",
                                      b"/proc/vtstat", b"/proc/vtgrid", b"/proc/pollfds", b"/proc/rqhold", b"/proc/pcsample",
                                      b"/proc/lockstat", b"/proc/i915", b"/proc/cpufreq", b"/proc/thermal",
-                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
+                                     b"/proc/pcache", b"/proc/f2fsstat", b"/proc/f2fsdropcache", b"/proc/epollstat", b"/proc/pcipm", b"/proc/klog", b"/proc/modules", b"/proc/kmod_buildid", b"/proc/kmod_initrd", b"/proc/tryboot", b"/proc/mntselftest", b"/proc/cgroups", b"/proc/drm/fence_stats", b"/proc/drm/fence_hold", b"/proc/leandros_hvs", b"/proc/v3d_headless", b"/proc/v3d_headless_fb"];
 /// The regular files `handle_open` generates through `gen_proc_system` (and
 /// the `/proc/sys/fs` ones), none of which is a RAMFS entry: stat must answer
 /// for them or they cannot be a bind-mount target.
@@ -10139,6 +10179,15 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/leandros_asfree" {
+            // CAP_SYS_ADMIN in the initial user namespace (not euid 0: a
+            // container's user-namespace root or a root with the capability
+            // dropped is refused); an unknown pid is refused too.
+            if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_asfree() {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
         } else if lookup_path == b"/proc/wakestat" {
             match gen_wakestat() {
                 Some(v) => v,
@@ -10199,6 +10248,11 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                 Some(v) => v,
                 None    => return err_reply(-2),
             }
+        } else if lookup_path == b"/proc/leandros_sd" {
+            match gen_leandros_sd() {
+                Some(v) => v,
+                None    => return err_reply(-2),
+            }
         } else if lookup_path == b"/proc/pcipm" {
             match gen_pcipm() {
                 Some(v) => v,
@@ -10219,6 +10273,14 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
             let mut g = alloc::vec![0u8; 2048];
             let n = unsafe { kernel_drm_fence_stats(g.as_mut_ptr(), g.len()) };
             match proc_snapshot(b"/tmp/.drm_fence_stats", &g[..n], false) {
+                Some(v) => v,
+                None    => return err_reply(-23),
+            }
+        } else if lookup_path == b"/proc/leandros_hvs" {
+            // Counters read by anyone; `reset` written by root (CAP_SYS_ADMIN in the initial userns).
+            let write = flags & 0o3 != 0;
+            if write && !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+            match gen_leandros_hvs(write) {
                 Some(v) => v,
                 None    => return err_reply(-23),
             }
@@ -11240,6 +11302,23 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let r = sched::ns::limit_set_in(sched::ns::userns_of(pid), c, v);
                 return if r < 0 { err_reply(r as i32) } else { val_reply(count as u64) };
             }
+            let hvs_w = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_HVS_W
+            };
+            if hvs_w {
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(15);
+                let mut b = [0u8; 15];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let mut s = &b[..n];
+                while let Some((&l, r)) = s.split_last() { if l == b'\n' || l == b' ' { s = r } else { break } }
+                if s != b"reset" { return err_reply(-22); }
+                extern "C" { fn kernel_hvs_stats_reset(); }
+                unsafe { kernel_hvs_stats_reset() };
+                return val_reply(count as u64);
+            }
             let drm_hold = {
                 let tmp = TMP_FILES.lock();
                 let e = &tmp[idx];
@@ -11274,6 +11353,41 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 let mut v = 0usize;
                 for &c in s { v = v.saturating_mul(10).saturating_add((c - b'0') as usize); }
                 return match inotify::limit_set(k, v) { Ok(()) => val_reply(count as u64), Err(e) => err_reply(e) };
+            }
+            let is_timer = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_TIMER_W
+            };
+            if is_timer {
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(31);
+                let mut b = [0u8; 31];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let t = core::str::from_utf8(&b[..n]).unwrap_or("").trim();
+                let cpu = t.strip_prefix("stall ").and_then(|v| v.trim().parse::<i32>().ok());
+                #[cfg(target_arch = "x86_64")]
+                if let Some(c) = cpu {
+                    extern "C" { fn arch_timer_rearm_stall(cpu: i32); }
+                    unsafe { arch_timer_rearm_stall(c); }
+                    return val_reply(count as u64);
+                }
+                let _ = cpu;
+                return err_reply(-22);
+            }
+            let is_asfree = {
+                let tmp = TMP_FILES.lock();
+                let e = &tmp[idx];
+                e.in_use() && e.ephemeral() && e.path() == PROC_ASFREE_W
+            };
+            if is_asfree {
+                // Same gate as the open: an fd handed to someone else gains nothing.
+                if !sched::caps::pid_capable_in(pid, 0, 21) { return err_reply(-13); }
+                let n = count.min(63);
+                let mut b = [0u8; 63];
+                if unsafe { sched::uaccess::copy_raw(b.as_mut_ptr(), buf, n) } != 0 { return err_reply(-14); }
+                let r = match core::str::from_utf8(&b[..n]) { Ok(t) => sched::asfree::control(t), Err(_) => -22 };
+                return if r < 0 { err_reply(r) } else { val_reply(count as u64) };
             }
             let oom_tid = {
                 let tmp = TMP_FILES.lock();
@@ -13805,6 +13919,22 @@ fn gen_proc_nslimit(pid: u32, c: usize, write: bool) -> Option<VnodeKind> {
 }
 
 const PROC_DRMH_W: &[u8] = b"/tmp/.proc_drmhold";
+
+const PROC_HVS_W: &[u8] = b"/tmp/.proc_hvs";
+
+/// `/proc/leandros_hvs`: Pi 5 HVS flip-path counters; a write of `reset` zeroes them (root only).
+fn gen_leandros_hvs(write: bool) -> Option<VnodeKind> {
+    extern "C" { fn kernel_hvs_stats(buf: *mut u8, cap: usize) -> usize; }
+    let mut buf = [0u8; TMP_BUF_SIZE];
+    let n = unsafe { kernel_hvs_stats(buf.as_mut_ptr(), buf.len()) };
+    if !write { return gen_proc_system_file(&buf, n); }
+    let mut tmp = TMP_FILES.lock();
+    let idx = tmp_free_slot(&mut *tmp)?;
+    tmp.claim(idx, b"", true);
+    tmp.set_path(idx, PROC_HVS_W);
+    if !tmp_fill_kernel(&mut tmp, idx, &buf[..n]) { tmp.release(idx); return None; }
+    Some(VnodeKind::TmpFile { idx, pos: 0, writable: true, ofd: 0 })
+}
 
 /// `/proc/drm/fence_hold`: "1\n" while the fence-retirement hold is active.
 /// A write of 0 or 1 routes through `handle_write` (test knob, root only).
@@ -17868,7 +17998,9 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
     }
     // LeandrOS's diagnostic /proc files exist only in handle_open's chain;
     // without this, stat and access(2) said ENOENT while open worked.
-    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path)) {
+    if PROC_DIAG_FILES.contains(&strip_trailing_slash(path))
+        // /proc/leandros_sd exists only where the SD driver registered its source.
+        && (strip_trailing_slash(path) != b"/proc/leandros_sd" || PROC_SD.load(core::sync::atomic::Ordering::Acquire) != 0) {
         write_stat_full(stat_ptr, 0o100444, 1, 0, path_ino(path, 7), 0, 0);
         return ok_reply();
     }
