@@ -922,7 +922,7 @@ impl VirtioDisk {
             return Err(BlkErr::OutOfRange);
         }
         let mut dev = if try_only {
-            match self.dev.try_lock() { Some(g) => g, None => return Err(BlkErr::Io) }
+            match self.dev.try_lock_nowait() { Some(g) => g, None => return Err(BlkErr::Io) }
         } else {
             match self.dev.lock_bounded() { Some(g) => g, None => return Err(BlkErr::Io) }
         };
@@ -948,7 +948,8 @@ impl crate::blockdev::BlockDevice for VirtioDisk {
         // do_io only reads from `buf` for T_OUT (copies it into the DMA page).
         self.rw(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len())
     }
-    /// Panic-path write: never parks and never waits for the device lock.
+    /// Panic-path write: never waits for the device lock (nor its internal spinlock). The
+    /// request itself still parks for its completion IRQ like any other.
     fn try_write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), crate::blockdev::BlkErr> {
         self.rw_impl(VIRTIO_BLK_T_OUT, lba, buf.as_ptr() as *mut u8, buf.len(), true)
     }

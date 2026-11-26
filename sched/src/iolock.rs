@@ -173,6 +173,16 @@ impl<T> IoMutex<T> {
     /// Take the lock only if it is free right now (any context).
     pub fn try_lock(&self) -> Option<IoGuard<'_, T>> {
         if !self.raw.try_lock() { return None; }
+        self.note_acquired()
+    }
+
+    /// `try_lock` that also never waits for the mutex's internal spinlock (panic path).
+    pub fn try_lock_nowait(&self) -> Option<IoGuard<'_, T>> {
+        if !self.raw.try_lock_nowait() { return None; }
+        self.note_acquired()
+    }
+
+    fn note_acquired(&self) -> Option<IoGuard<'_, T>> {
         self.acquires.fetch_add(1, Ordering::Relaxed);
         self.win_acquires.fetch_add(1, Ordering::Relaxed);
         self.hold_since.store(crate::monotonic_ns(), Ordering::Relaxed);

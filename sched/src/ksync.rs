@@ -333,6 +333,8 @@ pub fn deadline_after(timeout_ns: u64) -> u64 {
 fn relax() {
     if irqctx::in_interrupt() || irqctx::atomic_depth() != 0 {
         mm::paging::tlb_service_pending();
+        // aarch64 kexec park hook, as the spin lock's relax does.
+        spin::held::park_poll();
         core::hint::spin_loop();
     } else if crate::irqs_masked() {
         // Let the tick (and on the boot path, device completions) in, but
@@ -498,6 +500,17 @@ impl KRawMutex {
 
     #[inline]
     fn me() -> u32 { crate::current_pid() + 1 }
+
+    /// Like [`Self::try_lock`] but never waits for the internal spinlock either
+    /// (panic path: another CPU may be dead inside it).
+    pub fn try_lock_nowait(&self) -> bool {
+        let Some(f) = self.lock.try_lock_irqsave() else { return false };
+        let o = unsafe { &mut *self.owner.get() };
+        let ok = *o == 0;
+        if ok { *o = Self::me(); klock_inc(Self::me() - 1); }
+        self.lock.unlock_irqrestore(f);
+        ok
+    }
 
     pub fn try_lock(&self) -> bool {
         let f = self.lock.lock_irqsave();
