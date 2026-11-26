@@ -1,8 +1,12 @@
 //! DHCPv6 client of the NIC stacks (RFC 8415), the part of NetworkManager / systemd-networkd that
 //! acts on a router advertisement's flags: the O flag starts a stateless Information-Request
 //! (DNS servers and search list only), the M flag a stateful Solicit / Advertise / Request / Reply
-//! exchange for an IA_NA address (/128, valid lifetime enforced; T1/T2 renewal is not done: the
-//! lease is solicited again when it ends). Servers and domains join the RDNSS/DNSSL ones in
+//! exchange for an IA_NA address (/128, valid lifetime enforced; Renew to the server at T1, Rebind
+//! to any server at T2, the lease is kept while it is valid and is solicited again only when it
+//! ends or a server answers NoBinding). The stateless answer is refreshed after
+//! OPTION_INFORMATION_REFRESH_TIME (default 86400 s, at least 600 s). The client DUID is a DUID-LL
+//! of the NIC's own MAC: stable across reboots by construction (RFC 8415 11.4), so nothing needs
+//! storing (the net server has no file-write path to /var/lib). Servers and domains join the RDNSS/DNSSL ones in
 //! `/etc/resolv.conf` (`ip6::dns_publish`). The client talks UDP 546 -> [ff02::1:2]:547 through a
 //! smoltcp UDP socket of the stack. State is in `/proc/net/dhcp6`.
 
@@ -26,6 +30,11 @@ const SOLICIT: u8 = 2;
 const REQUEST: u8 = 3;
 const DONE: u8 = 4;
 const GAVE_UP: u8 = 5;
+const RENEW: u8 = 6;
+const REBIND: u8 = 7;
+/// OPTION_INFORMATION_REFRESH_TIME default and floor (RFC 8415 21.23, RFC 4242).
+const REFRESH_DEFAULT: u64 = 86400;
+const REFRESH_MIN: u64 = 600;
 /// Transmissions of one message before giving up (RFC 8415 IRT 1 s, doubling, capped at 16 s here).
 const MAX_TRIES: u8 = 6;
 
@@ -45,11 +54,18 @@ struct D6 {
     dns: Vec<[u8; 16]>,
     dom: Vec<Vec<u8>>,
     replies: u32,
+    /// T1 / T2 of the bound lease and the refresh time of the stateless answer (absolute ns, MAX = never).
+    t1_at: u64,
+    t2_at: u64,
+    refresh_at: u64,
+    /// Messages sent, for /proc/net/dhcp6: solicits, renews, rebinds, information-requests.
+    sent: [u32; 4],
 }
 impl D6 {
     const fn new() -> D6 {
         D6 { mode: MODE_NONE, st: IDLE, xid: [0; 3], tries: 0, next: 0, server: Vec::new(), offer: None, bound: None,
-             dns: Vec::new(), dom: Vec::new(), replies: 0 }
+             dns: Vec::new(), dom: Vec::new(), replies: 0,
+             t1_at: u64::MAX, t2_at: u64::MAX, refresh_at: u64::MAX, sent: [0; 4] }
     }
 }
 static ST: Mutex<Vec<D6>> = Mutex::new(Vec::new());
@@ -162,12 +178,12 @@ fn build(msg: u8, d: &D6, mac: [u8; 6], iaid: u32) -> Vec<u8> {
     let mut duid = alloc::vec![0u8, 3, 0, 1];
     duid.extend_from_slice(&mac);
     opt(&mut p, 1, &duid);
-    if !d.server.is_empty() && msg != 1 { opt(&mut p, 2, &d.server); }
+    if !d.server.is_empty() && msg != 1 && msg != 6 { opt(&mut p, 2, &d.server); }
     if msg != 11 {
         let mut ia = Vec::new();
         ia.extend_from_slice(&iaid.to_be_bytes());
         ia.extend_from_slice(&[0u8; 8]);
-        if msg == 3 {
+        if matches!(msg, 3 | 5 | 6) {
             if let Some((a, pref, valid)) = d.offer {
                 let mut ad = a.to_vec();
                 ad.extend_from_slice(&pref.to_be_bytes());
@@ -232,9 +248,17 @@ pub(crate) fn pass(nif: netdev::Netif, s: &mut crate::NetStack, now: u64) -> Opt
                     d.xid = fresh_xid(id, now ^ 1);
                     d.next = now;
                 }
-                (INFO_SENT, 7) | (REQUEST, 7) | (SOLICIT, 7) => {
+                (RENEW, 7) | (REBIND, 7) if status_bad || ia_addr.is_none() => {
+                    // NoBinding & co: the server forgot the lease, start over; the address stays until it expires.
+                    d.replies += 1;
+                    d.st = IDLE;
+                    d.tries = 0;
+                    d.next = now;
+                }
+                (INFO_SENT, 7) | (REQUEST, 7) | (SOLICIT, 7) | (RENEW, 7) | (REBIND, 7) => {
                     d.replies += 1;
                     if status_bad { d.st = GAVE_UP; return; }
+                    if let Some((_, sid)) = o.iter().find(|x| x.0 == 2) { d.server = sid.to_vec(); }
                     for x in &o {
                         if x.0 == 23 { d.dns = x.1.chunks_exact(16).map(|c| c.try_into().unwrap()).collect(); dns_changed = true; }
                         if x.0 == 24 { d.dom = parse_domains(x.1); dns_changed = true; }
@@ -245,7 +269,26 @@ pub(crate) fn pass(nif: netdev::Netif, s: &mut crate::NetStack, now: u64) -> Opt
                         let end = if a.2 == u32::MAX { u64::MAX } else { now.saturating_add(a.2 as u64 * SEC) };
                         if let Some(old) = d.bound { if old.0 != a.0 { drop_addr = Some(old.0); } }
                         d.bound = Some((a.0, end));
+                        d.offer = Some(a);
+                        // T1/T2 from the IA_NA header; 0 = the client picks 0.5 / 0.8 of the preferred
+                        // lifetime (valid when that is 0), infinity = never renew.
+                        let ia_t = o.iter().find(|x| x.0 == 3 && x.1.len() >= 12)
+                            .map(|x| (u32::from_be_bytes(x.1[4..8].try_into().unwrap()), u32::from_be_bytes(x.1[8..12].try_into().unwrap())))
+                            .unwrap_or((0, 0));
+                        let base = if a.1 != 0 && a.1 != u32::MAX { a.1 as u64 } else { a.2 as u64 };
+                        let (mut t1, mut t2) = (ia_t.0 as u64, ia_t.1 as u64);
+                        if t1 == 0 { t1 = base / 2; }
+                        if t2 == 0 { t2 = base * 4 / 5; }
+                        if t2 < t1 { t2 = t1; }
+                        let at = |t: u64, inf: bool| if inf || a.2 == u32::MAX { u64::MAX } else { now.saturating_add(t * SEC) };
+                        d.t1_at = at(t1, ia_t.0 == u32::MAX);
+                        d.t2_at = at(t2, ia_t.1 == u32::MAX);
                         install = Some((a.0, end));
+                    }
+                    if d.mode == MODE_INFO {
+                        let r = o.iter().find(|x| x.0 == 32 && x.1.len() == 4)
+                            .map(|x| u32::from_be_bytes(x.1[..4].try_into().unwrap()) as u64).unwrap_or(REFRESH_DEFAULT);
+                        d.refresh_at = if r == u32::MAX as u64 { u64::MAX } else { now.saturating_add(r.max(REFRESH_MIN) * SEC) };
                     }
                     d.st = DONE;
                     crate::iface::serial(&[b"[NET] dhcp6: reply on ", nif.name().as_bytes(), b"\r\n"]);
@@ -268,6 +311,19 @@ pub(crate) fn pass(nif: netdev::Netif, s: &mut crate::NetStack, now: u64) -> Opt
     if let Some(a) = expired { remove_addr(s, a); iface::notify(nif.id); }
     if dns_changed { crate::ip6::dns_publish(); }
 
+    // Timers: T1 -> Renew, T2 -> Rebind, refresh time -> a new Information-Request.
+    with(id, |d| {
+        if d.mode == MODE_FULL && d.bound.is_some() {
+            if matches!(d.st, DONE | RENEW) && now >= d.t2_at {
+                d.st = REBIND; d.xid = fresh_xid(id, now ^ 3); d.tries = 0; d.next = now;
+            } else if d.st == DONE && now >= d.t1_at {
+                d.st = RENEW; d.xid = fresh_xid(id, now ^ 2); d.tries = 0; d.next = now;
+            }
+        } else if d.mode == MODE_INFO && d.st == DONE && now >= d.refresh_at {
+            d.st = IDLE; d.tries = 0; d.next = now; d.refresh_at = u64::MAX;
+        }
+    });
+
     // Transmission.
     let go = with(id, |d| {
         if d.mode == MODE_NONE || matches!(d.st, DONE | GAVE_UP) || now < d.next { return None; }
@@ -276,10 +332,11 @@ pub(crate) fn pass(nif: netdev::Netif, s: &mut crate::NetStack, now: u64) -> Opt
             d.st = if d.mode == MODE_FULL { SOLICIT } else { INFO_SENT };
             d.tries = 0;
         }
-        if d.tries >= MAX_TRIES { d.st = GAVE_UP; return None; }
-        let msg = match d.st { SOLICIT => 1, REQUEST => 3, _ => 11 };
+        if d.tries >= MAX_TRIES && !matches!(d.st, RENEW | REBIND) { d.st = GAVE_UP; return None; }
+        let msg = match d.st { SOLICIT => 1, REQUEST => 3, RENEW => 5, REBIND => 6, _ => 11 };
+        d.sent[match msg { 1 | 3 => 0, 5 => 1, 6 => 2, _ => 3 }] += (msg != 3) as u32;
         let p = build(msg, d, mac, iaid);
-        d.tries += 1;
+        d.tries = d.tries.saturating_add(1);
         d.next = now + (SEC << (d.tries - 1).min(4));
         Some(p)
     });
@@ -292,6 +349,8 @@ pub(crate) fn pass(nif: netdev::Netif, s: &mut crate::NetStack, now: u64) -> Opt
         if d.mode == MODE_NONE || matches!(d.st, GAVE_UP) { return None; }
         let mut next = if d.st == DONE { u64::MAX } else { d.next };
         if let Some((_, e)) = d.bound { next = next.min(e); }
+        if d.st == DONE { next = next.min(d.t1_at).min(d.t2_at).min(d.refresh_at); }
+        if d.st == RENEW { next = next.min(d.t2_at); }
         if next == u64::MAX { None } else { Some(next.saturating_sub(now).max(1_000_000)) }
     })
 }
@@ -302,10 +361,17 @@ pub(crate) fn proc_dhcp6(out: &mut impl Write) {
     for nif in netdev::iter() {
         let Some(d) = t.get(nif.id as usize) else { continue };
         let mode = ["none", "info", "stateful"][d.mode as usize];
-        let st = ["idle", "info-sent", "solicit", "request", "done", "gave-up"][d.st as usize];
+        let st = ["idle", "info-sent", "solicit", "request", "done", "gave-up", "renew", "rebind"][d.st as usize];
         let _ = write!(out, "{} {} {} {:02x}{:02x}{:02x} {} {} ", nif.name(), mode, st, d.xid[0], d.xid[1], d.xid[2], d.tries, d.replies);
         match d.bound { Some((a, _)) => { for b in a { let _ = write!(out, "{:02x}", b); } } None => { let _ = write!(out, "-"); } }
         for a in &d.dns { let _ = write!(out, " "); for b in a { let _ = write!(out, "{:02x}", b); } }
+        let _ = writeln!(out);
+        // Detail line (the leading '#' keeps it out of the per-interface parse): lease timers in
+        // seconds from now (-1 = none), message counters, the client DUID.
+        let secs = |at: u64| if at == u64::MAX { -1i64 } else { (at.saturating_sub(sched::monotonic_ns()) / SEC) as i64 };
+        let _ = write!(out, "# {} t1={} t2={} refresh={} solicits={} renews={} rebinds={} inforeqs={} duid=00030001", nif.name(),
+            secs(d.t1_at), secs(d.t2_at), secs(d.refresh_at), d.sent[0], d.sent[1], d.sent[2], d.sent[3]);
+        if let Some(m) = nif.mac() { for b in m { let _ = write!(out, "{:02x}", b); } }
         let _ = writeln!(out);
     }
 }
