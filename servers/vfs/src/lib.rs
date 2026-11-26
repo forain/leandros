@@ -5903,6 +5903,49 @@ fn pts_meta_init(n: usize, pid: u32) {
         None => (sched::fsuid_of(pid), GID_TTY, 0o620),
     };
     if let Some(e) = PTS_META.lock().get_mut(n) { *e = (uid, gid, mode); }
+    tty_stamp_new(n);
+}
+
+/// Timestamps of tty nodes, as `(atime, mtime, ctime)` seconds: slots
+/// `0..MAX_PTYS` are `/dev/pts/N`, `TTY_T_CONSOLE` is the console and every
+/// `/dev/ttyN` (one shared console). Atomics, no lock: the read/write hot path
+/// does one compare. A zero ctime means "not stamped yet" (console: lazily at
+/// first stat). Linux `tty_update_time`: only move a time forward when it is
+/// 8 s or more behind, so a streaming tty costs one load per call.
+const TTY_T_CONSOLE: usize = tty_server::pty::MAX_PTYS;
+static TTY_T: [[atomic::AtomicI64; 3]; tty_server::pty::MAX_PTYS + 1] =
+    [const { [atomic::AtomicI64::new(0), atomic::AtomicI64::new(0), atomic::AtomicI64::new(0)] };
+     tty_server::pty::MAX_PTYS + 1];
+
+/// A node was created (new pty pair): all three times become now.
+fn tty_stamp_new(slot: usize) {
+    if let Some(t) = TTY_T.get(slot) {
+        let now = sched::clock_ts().0;
+        for x in t.iter() { x.store(now, atomic::Ordering::Relaxed); }
+    }
+}
+
+/// A read (`write == false`, atime) or write (mtime) happened on `slot`.
+pub fn tty_touch(slot: usize, write: bool) {
+    if let Some(t) = TTY_T.get(slot) {
+        let x = &t[write as usize];
+        let now = sched::clock_ts().0;
+        if now - x.load(atomic::Ordering::Relaxed) >= 8 { x.store(now, atomic::Ordering::Relaxed); }
+    }
+}
+
+/// Console read/write, called from the kernel's console fast path.
+pub fn tty_touch_console(write: bool) { tty_touch(TTY_T_CONSOLE, write); }
+
+/// Fill `st_atim/st_mtim/st_ctim` of an already-filled stat for tty `slot`.
+fn tty_stat_times(stat_ptr: usize, slot: usize) {
+    let Some(t) = TTY_T.get(slot) else { return };
+    let mut c = t[2].load(atomic::Ordering::Relaxed);
+    if c == 0 { c = sched::clock_ts().0; t[2].store(c, atomic::Ordering::Relaxed); }
+    let a = t[0].load(atomic::Ordering::Relaxed);
+    let m = t[1].load(atomic::Ordering::Relaxed);
+    let (a, m) = (if a == 0 { c } else { a }, if m == 0 { c } else { m });
+    write_stat_times(stat_ptr, (a, 0), (m, 0), (c, 0));
 }
 
 /// chmod(2) of `/dev/pts/N`: the owner or root.
@@ -10850,6 +10893,7 @@ fn handle_read(pid: u32, fd: usize, buf_ptr: usize, count: usize) -> Message {
                 if m { tty_server::pty::master_read(p, buf, count) }
                 else { tty_server::pty::slave_read(p, buf, count) }
             };
+            if !m && n > 0 { tty_touch(p, false); }
             make_reply(n as i64)
         }
         VnodeKind::TmpFile { .. } => {
@@ -11122,6 +11166,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
                 if m { tty_server::pty::master_write(p, buf, count) }
                 else { tty_server::pty::slave_write(p, buf, count) }
             };
+            if !m && n > 0 { tty_touch(p, true); }
             make_reply(n as i64)
         }
         VnodeKind::Pipe { ring, is_write: true } => {
@@ -17754,6 +17799,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
             let m = pts_meta(pair as usize);
             write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(pair, false), m.uid, m.gid,
                                  char_dev_rdev(&kind));
+            tty_stat_times(stat_ptr, pair as usize);
             return ok_reply();
         }
     }
@@ -18059,10 +18105,12 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
                 if let Some(n) = tty_server::pty::ctty_for_sid(sched::current_sid()) {
                     let rdev = match tty_server::pty::vt_of(n) { 0 => pts_rdev(tty_server::pty::ident(n).1 as u32), v => makedev(4, v as u32) };
                     write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, pty_ino(n as u16, false), 0, 0, rdev);
+                    tty_stat_times(stat_ptr, n);
                     return ok_reply();
                 }
             }
             write_stat_full_rdev(stat_ptr, 0o020666, 1, 0, CONSOLE_INO, 0, 0, dev_node_rdev(lookup_path));
+            tty_stat_times(stat_ptr, TTY_T_CONSOLE);
             return ok_reply();
         }
         // The virtual consoles. Same reason as /dev/ptmx below: the RAMFS sweep
@@ -18071,6 +18119,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         // has VTs would conclude it does not.
         if let Some(vt) = vt_number(lookup_path) {
             write_stat_full_rdev(stat_ptr, 0o020620, 1, 0, VT_INO_BASE + vt as u64, 0, 0, dev_node_rdev(lookup_path));
+            tty_stat_times(stat_ptr, TTY_T_CONSOLE);
             return ok_reply();
         }
         // Special device files.
@@ -18100,6 +18149,7 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         if let Some(n) = pts_number(lookup_path) {
             let m = pts_meta(n);
             write_stat_full_rdev(stat_ptr, m.mode as u32, 1, 0, pty_ino(n as u16, false), m.uid, m.gid, pts_rdev(tty_server::pty::ident(n).1 as u32));
+            tty_stat_times(stat_ptr, n);
             return ok_reply();
         }
         // Block device nodes. Must agree byte for byte with what `handle_fstat`

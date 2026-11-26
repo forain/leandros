@@ -7600,6 +7600,7 @@ fn sys_write_impl(fd: usize, buf_ptr: usize, count: usize, append_held: bool) ->
 
             trace_fd_route(fd, "console");
             console_write_user(kbuf.as_slice());
+            vfs::tty_touch_console(true);
             count as isize
         }
 
@@ -7819,6 +7820,7 @@ fn sys_read_impl(fd: usize, buf_ptr: usize, count: usize, is_kernel: bool) -> is
                 if !copy_to_user_bytes(buf_ptr, &kbuf[..n]) { return -14; }
             }
 
+            vfs::tty_touch_console(false);
             n as isize
         }
         // read(2) on a socket ≡ recv(fd, buf, len, 0) — see the matching
