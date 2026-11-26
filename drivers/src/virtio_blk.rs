@@ -416,6 +416,11 @@ fn spin_window_ns() -> u64 {
 struct WaitingCpu(u64);
 impl WaitingCpu {
     fn enter() -> Self {
+        // The device lock is a sleeping mutex: its holder can be preempted and
+        // migrated mid-request. Stay on this CPU while its bit is set, so the
+        // completion IRQ kick finds the CPU that really waits and Drop clears
+        // the same bit.
+        sched::preempt_disable();
         let cpu = crate::kenv::ipi::cpu_id();
         let bit = if cpu < 64 { 1u64 << cpu } else { 0 };
         WAITING_CPUS.fetch_or(bit, core::sync::atomic::Ordering::SeqCst);
@@ -423,7 +428,10 @@ impl WaitingCpu {
     }
 }
 impl Drop for WaitingCpu {
-    fn drop(&mut self) { WAITING_CPUS.fetch_and(!self.0, core::sync::atomic::Ordering::SeqCst); }
+    fn drop(&mut self) {
+        WAITING_CPUS.fetch_and(!self.0, core::sync::atomic::Ordering::SeqCst);
+        sched::preempt_enable_no_resched();
+    }
 }
 
 /// Park the CPU until an interrupt arrives unless `done()` already holds. The
