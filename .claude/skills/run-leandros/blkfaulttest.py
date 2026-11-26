@@ -50,29 +50,45 @@ def main():
         f.write('[set-state]\nstate = "1"\nevent = "write_aio"\nnew_state = "2"\n\n'
                 '[inject-error]\nevent = "read_aio"\nstate = "2"\nerrno = "5"\n'
                 'immediately = "off"\nonce = "off"\n')
+    dev = "-device virtio-blk-pci,drive=hang" + (",disable-legacy=on" if arch == "aarch64" else "")
+    penv = dict(os.environ)
+    # Phase 1 (plain disk): populate the volume. The error injection must not
+    # exist yet, or the setup writes would trip the state change.
+    penv["LEANDROS_QEMU_EXTRA"] = f"-drive if=none,id=hang,driver=raw,file={img} " + dev
     env = dict(os.environ)
     env["LEANDROS_QEMU_EXTRA"] = (
         # blkdebug only sees the read_aio event (and so the break) when a
         # format driver sits above it: raw emits BLKDBG_READ_AIO on its file.
         f"-drive if=none,id=hang,driver=raw,file.driver=blkdebug,"
         f"file.config={cfg},file.image.driver=file,file.image.filename={img} "
-        "-device virtio-blk-pci,drive=hang" + (",disable-legacy=on" if arch == "aarch64" else ""))
+        + dev)
     ok = True
     try:
         drv("stop", timeout=60)  # runtests may leave its own VM running
-        rc, out = drv("start", arch, timeout=300, env=env)
+        rc, out = drv("start", arch, timeout=300, env=penv)
         if rc != 0:
             print("FAIL: boot\n" + out[-800:]); return 1
-        rc, out = drv("login", "root", "root", "180", timeout=400, env=env)
+        rc, out = drv("login", "root", "root", "180", timeout=400, env=penv)
         if rc != 0:
             print("FAIL: login\n" + out[-800:]); return 1
         rc, out = drv("run",
                       f"mkdir -p /mnt/bf && mount -t f2fs LABEL={LABEL} /mnt/bf && "
-                      "dd if=/dev/urandom of=/mnt/bf/f bs=4096 count=256 && dd if=/dev/urandom of=/mnt/bf/g bs=4096 count=64 && sync && umount /mnt/bf && "
-                      f"mount -t f2fs LABEL={LABEL} /mnt/bf && echo MOUNT_OK", "120", timeout=200)
+                      "dd if=/dev/urandom of=/mnt/bf/f bs=4096 count=256 && dd if=/dev/urandom of=/mnt/bf/g bs=4096 count=64 && sync && umount /mnt/bf && echo PREP_OK", "120", timeout=200)
         print(out.strip()[-300:])
-        if "MOUNT_OK" not in out:
+        if "PREP_OK" not in out:
             print("FAIL: could not prepare the volume"); return 1
+        drv("stop", timeout=60)
+        # Phase 2: same disk behind blkdebug, state 1 (reads fine) until the trigger write.
+        rc, out = drv("start", arch, timeout=300, env=env)
+        if rc != 0:
+            print("FAIL: boot 2\n" + out[-800:]); return 1
+        rc, out = drv("login", "root", "root", "180", timeout=400, env=env)
+        if rc != 0:
+            print("FAIL: login 2\n" + out[-800:]); return 1
+        rc, out = drv("run", f"mkdir -p /mnt/bf && mount -t f2fs LABEL={LABEL} /mnt/bf && echo MOUNT_OK", "120", timeout=200)
+        print(out.strip()[-200:])
+        if "MOUNT_OK" not in out:
+            print("FAIL: could not mount the volume"); return 1
         drv("run", "sh -c '/bin/f2fstest mmapfault /mnt/bf/f 10 > /tmp/fo 2>&1; "
                    "echo FRC=$? > /tmp/frc' </dev/null >/dev/null 2>&1 & true", "20")
         mapped = False
