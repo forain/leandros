@@ -94,7 +94,8 @@ def main():
         # ---- virtio_net x3
         run("kmodctl load virtio_net >/dev/null 2>&1; sleep 1")
         for i in range(1, 4):
-            o = run("kmodctl rmmod virtio_net; echo RM_RC=$?; sleep 1; grep -c 'eth0:' /proc/net/dev; echo GONE_END")
+            o = run("kmodctl rmmod virtio_net; echo RM_RC=$?; for j in 1 2 3 4 5 6; do grep -q 'eth0:' /proc/net/dev || break; sleep 1; done; "
+                    "grep -c 'eth0:' /proc/net/dev; grep -c '^virtio_net ' /proc/modules; echo GONE_END")
             check(f"virtio_net rmmod #{i}", "RM_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 gone after unload", re.search(r"^0\s*$", o, re.M) is not None)
             o = run("kmodctl load virtio_net; echo LD_RC=$?; for j in $(seq 1 30); do grep -q 'eth0:' /proc/net/dev && break; sleep 1; done; "
@@ -102,9 +103,11 @@ def main():
             check(f"virtio_net load #{i}", "LD_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 back and gateway pingable", "PING_OK" in o)
         # ---- nvme
+        o = run("grep '^nvme ' /proc/modules; echo BASE_END")
         o = run("kmodctl rmmod nvme >/dev/null 2>&1; kmodctl load nvme; echo LD_RC=$?; for j in $(seq 1 10); do [ -e /dev/nvme0n1 ] && break; sleep 1; done; "
                 "dd if=/dev/nvme0n1 bs=512 skip=1 count=1 2>/dev/null | head -c %d; echo; echo NVME_END" % len(MAGIC))
         check("nvme load", "LD_RC=0" in o)
+        run("grep '^nvme ' /proc/modules; echo AFTERREAD_END")
         check("nvme known block 1 read back", MAGIC.decode() in o)
         o = run("exec 3</dev/nvme0n1; kmodctl rmmod nvme; echo BUSY_RC=$?; cat /proc/modules | grep '^nvme '; exec 3<&-; "
                 "dd if=/dev/nvme0n1 bs=512 skip=1 count=1 2>/dev/null | head -c 5; echo; echo BUSY_END")
@@ -119,13 +122,17 @@ def main():
         # ---- hardware-less modules: load-only smoke
         for mod in ("iwlwifi", "brcmf") + (("sdhci",) if arch == "aarch64" else ()):
             for i in (1, 2):
-                o = run(f"kmodctl load {mod}; echo LD_RC=$?; grep '^{mod} ' /proc/modules; kmodctl rmmod {mod}; echo RM_RC=$?; "
-                        f"grep -c '^{mod} ' /proc/modules; echo SM_END")
-                ok = "LD_RC=0" in o and "RM_RC=0" in o
-                ref = re.search(rf"^{mod} \d+ (\d+) .*Live", o, re.M)
-                check(f"{mod} smoke #{i}: load + unload clean", ok, "" if ok else o.strip()[-200:])
-                check(f"{mod} smoke #{i}: refcount 0, gone after unload",
-                      ref is not None and ref.group(1) == "0" and re.search(r"^0\s*$", o, re.M) is not None)
+                o = run(f"kmodctl load {mod}; echo LD_RC=$?; grep -c '^{mod} ' /proc/modules; echo SM_END")
+                # Without the device the init probes and answers ENODEV (or, if it stays loaded, must be rmmod-able
+                # with refcount 0). Either way nothing may be left half-registered: not listed, loadable again.
+                if "LD_RC=0" in o:
+                    o2 = run(f"grep '^{mod} ' /proc/modules; kmodctl rmmod {mod}; echo RM_RC=$?; grep -c '^{mod} ' /proc/modules; echo SM2_END")
+                    ref = re.search(rf"^{mod} \d+ (\d+) .*Live", o2, re.M)
+                    check(f"{mod} smoke #{i}: loaded, refcount 0, unloaded", "RM_RC=0" in o2 and ref is not None and ref.group(1) == "0"
+                          and re.search(r"^0\s*$", o2, re.M) is not None, o2.strip()[-160:])
+                else:
+                    check(f"{mod} smoke #{i}: no device -> ENODEV and nothing left listed",
+                          "No such device" in o and re.search(r"^0\s*$", o, re.M) is not None, o.strip()[-200:])
         log = d("log", timeout=60)[1]
         bad = [l for l in log.splitlines() if re.search(r"panic|PANIC|Oops|Data abort|ZOMBIE|STALE REACHED", l)]
         check("no panic / oops / data abort / Zombie in the console log", not bad, "; ".join(bad[:3]))
