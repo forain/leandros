@@ -822,9 +822,12 @@ impl BlockDevice for Ns {
     }
     fn flush(&self) -> Result<(), BlkErr> {
         // Read-only: nothing was written, and Flush is on the never-send list.
-        if self.ctrl.read_only.load(Ordering::Relaxed) || !self.ctrl.vwc { return Ok(()); }
         let mut st = self.ctrl.st.lock();
-        if st.shut_down { return Err(BlkErr::Io); }
+        match crate::flush_logic::nvme_flush_plan(self.ctrl.read_only.load(Ordering::Relaxed), self.ctrl.vwc, st.shut_down) {
+            crate::flush_logic::NvmeFlushPlan::Send => {}
+            // CC.SHN already committed the cache (shutdown_all in the prepare phase).
+            _ => return Ok(()),
+        }
         self.ctrl.flushes.fetch_add(1, Ordering::Relaxed);
         match st.exec(true, Cmd::new(IO_FLUSH, self.nsid), self.ctrl.io_timeout_ns) {
             Ok(_) => Ok(()),

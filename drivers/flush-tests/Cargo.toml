@@ -1,0 +1,14 @@
+# Host unit tests for the shutdown-time write-cache flush decisions
+# (drivers/src/flush_logic.rs).
+#
+#   cd drivers/flush-tests && cargo test
+[package]
+name = "flush-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
