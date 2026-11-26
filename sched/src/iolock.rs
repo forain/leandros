@@ -123,6 +123,11 @@ impl<T> IoMutex<T> {
         }
     }
 
+    /// Flag the owner as parked on device I/O with preemption enabled (see
+    /// `KRawMutex::holder_io_parked`); non-sleeping waiters then let the tick
+    /// switch to it.
+    pub fn holder_io_parked_flag(&self) -> &core::sync::atomic::AtomicBool { &self.raw.holder_io_parked }
+
     #[inline]
     #[track_caller]
     pub fn lock(&self) -> IoGuard<'_, T> {

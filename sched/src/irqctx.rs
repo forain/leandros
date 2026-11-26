@@ -219,3 +219,10 @@ pub fn might_sleep() -> bool {
         }
     }
 }
+
+/// True in a plain task context that a tick may switch away from: not in an
+/// interrupt, no atomic section, preemption on, no spin lock held.
+pub fn preemptible_task_ctx() -> bool {
+    has_task() && !in_interrupt() && atomic_depth() == 0
+        && !crate::preempt_disabled() && crate::spinheld::held() == 0
+}

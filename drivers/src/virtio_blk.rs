@@ -293,7 +293,28 @@ impl VirtQueue {
         }
         ST_WAITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let parked = armed;
-        let _w = if armed { Some(WaitingCpu::enter()) } else { None };
+        // The long park: drop the request's preempt-off (the lock stays held)
+        // so the holder is preemptible while it waits, and tell non-sleeping
+        // waiters so they let the tick switch to it. A masked caller (page
+        // fault, aarch64 syscall) is never switched in `irq_window_if_masked`
+        // (it disables preemption around the window), so for it this only
+        // ends the single watchdog-visible section between parks.
+        let pflag = self.park_flag;
+        let drop_pp = armed && self.holds_preempt_off;
+        if drop_pp {
+            if !pflag.is_null() { (*pflag).store(true, core::sync::atomic::Ordering::SeqCst); }
+            sched::preempt_enable_no_resched();
+        }
+        struct Reown(*const core::sync::atomic::AtomicBool, bool);
+        impl Drop for Reown {
+            fn drop(&mut self) {
+                if self.1 {
+                    sched::preempt_disable();
+                    if !self.0.is_null() { unsafe { (*self.0).store(false, core::sync::atomic::Ordering::SeqCst); } }
+                }
+            }
+        }
+        let _ro = Reown(pflag, drop_pp);
         let mut warn_at = slow_ns;
         let mut slow = false;
         while self.last_used_idx == core::ptr::addr_of!((*self.used).idx).read_volatile() {
@@ -433,28 +454,6 @@ impl<G: core::ops::DerefMut> core::ops::DerefMut for HeldNoPreempt<G> {
     fn deref_mut(&mut self) -> &mut G::Target { &mut self.g }
 }
 
-/// Registers this CPU as a parked waiter for the guard's lifetime.
-struct WaitingCpu(u64);
-impl WaitingCpu {
-    fn enter() -> Self {
-        // The device lock is a sleeping mutex: its holder can be preempted and
-        // migrated mid-request. Stay on this CPU while its bit is set, so the
-        // completion IRQ kick finds the CPU that really waits and Drop clears
-        // the same bit.
-        sched::preempt_disable();
-        let cpu = crate::kenv::ipi::cpu_id();
-        let bit = if cpu < 64 { 1u64 << cpu } else { 0 };
-        WAITING_CPUS.fetch_or(bit, core::sync::atomic::Ordering::SeqCst);
-        WaitingCpu(bit)
-    }
-}
-impl Drop for WaitingCpu {
-    fn drop(&mut self) {
-        WAITING_CPUS.fetch_and(!self.0, core::sync::atomic::Ordering::SeqCst);
-        sched::preempt_enable_no_resched();
-    }
-}
-
 /// Park the CPU until an interrupt arrives unless `done()` already holds. The
 /// check and the park are atomic against the completion interrupt (aarch64
 /// `wfi` wakes on a pending masked interrupt; x86_64 `sti; hlt` recognises it
@@ -463,9 +462,20 @@ impl Drop for WaitingCpu {
 /// lock); an unmasked one has IRQs re-enabled on return.
 fn park_until_irq(done: impl Fn() -> bool) -> bool {
     let mut halted = false;
+    // The completion IRQ kick finds this CPU through its WAITING_CPUS bit. It
+    // is set only for this park (IRQs off / preemption off below, so the task
+    // cannot migrate between set and clear), before the final `done()` check.
+    fn my_bit() -> u64 {
+        let cpu = crate::kenv::ipi::cpu_id();
+        if cpu < 64 { 1u64 << cpu } else { 0 }
+    }
+    use core::sync::atomic::Ordering::SeqCst;
+    let mut bit = 0u64;
     unsafe {
         if sched::irqs_masked() {
             sched::preempt_disable();
+            bit = my_bit();
+            WAITING_CPUS.fetch_or(bit, SeqCst);
             if !done() {
                 halted = true;
                 #[cfg(target_arch = "aarch64")]
@@ -474,20 +484,26 @@ fn park_until_irq(done: impl Fn() -> bool) -> bool {
                 core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
             }
             sched::irq_window();
+            WAITING_CPUS.fetch_and(!bit, SeqCst);
             sched::preempt_enable_no_resched();
         } else {
             #[cfg(target_arch = "aarch64")]
             {
                 core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+                bit = my_bit();
+                WAITING_CPUS.fetch_or(bit, SeqCst);
                 if !done() { halted = true; core::arch::asm!("wfi", options(nomem, nostack)); }
                 core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
             }
             #[cfg(target_arch = "x86_64")]
             {
                 core::arch::asm!("cli", options(nomem, nostack));
+                bit = my_bit();
+                WAITING_CPUS.fetch_or(bit, SeqCst);
                 if !done() { halted = true; core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                 else { core::arch::asm!("sti", options(nomem, nostack)); }
             }
+            WAITING_CPUS.fetch_and(!bit, SeqCst);
         }
     }
     halted
@@ -610,6 +626,10 @@ struct VirtioBlkReqHdr { type_: u32, reserved: u32, sector: u64 }
 
 struct VirtioBlkDevice {
     _pci: PciDevice,
+    /// The device lock's `holder_io_parked` flag (set by `rw_impl`), or null.
+    park_flag: *const core::sync::atomic::AtomicBool,
+    /// `rw_impl` holds one `PreemptOff` for this request, which a long park may drop.
+    holds_preempt_off: bool,
     common_cfg: *mut VirtioPciCommonCfg,
     notify_cfg: *mut u32,
     notify_off_multiplier: u32,
@@ -804,6 +824,8 @@ impl VirtioBlkDevice {
             data_phys,
             capacity_sectors,
             dead: false,
+            park_flag: core::ptr::null(),
+            holds_preempt_off: false,
             irq_armed: false,
             isr_cfg,
         })
@@ -951,14 +973,17 @@ impl VirtioDisk {
         // preempted holder leaves every non-sleeping waiter spinning with no handoff to
         // steal. Waiters still sleep and IRQs stay open.
         let mut dev = HeldNoPreempt { g, _p: PreemptOff::new() };
+        dev.park_flag = self.dev.holder_io_parked_flag() as *const _;
+        dev.holds_preempt_off = true;
         let mut done = 0usize;
         while done < len {
             let n = (len - done).min(MAX_IO_BYTES);
             let ok = dev.do_io(type_, lba + (done / SECTOR) as u64,
                                unsafe { buf.add(done) }, n);
-            if !ok { return Err(BlkErr::Io); }
+            if !ok { dev.holds_preempt_off = false; return Err(BlkErr::Io); }
             done += n;
         }
+        dev.holds_preempt_off = false;
         Ok(())
     }
 }
