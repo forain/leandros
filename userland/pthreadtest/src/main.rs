@@ -697,6 +697,13 @@ static PI_WORD: AtomicU32 = AtomicU32::new(0);
 static mut PI_COUNTER: u32 = 0;
 static PI_KERNEL_LOCKS: AtomicI32 = AtomicI32::new(0);
 static PI_ERRORS: AtomicI32 = AtomicI32::new(0);
+/// First error seen, for the failure line: kind (1 lock errno, 2 lock word not ours, 3 unlock errno) << 32 | detail.
+static PI_FIRST_ERR: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+fn pi_err(kind: i64, detail: i64, word: u32) {
+    PI_ERRORS.fetch_add(1, SeqCst);
+    let _ = PI_FIRST_ERR.compare_exchange(0, (kind << 56) | ((detail & 0xffff) << 32) | word as i64, SeqCst, SeqCst);
+}
 
 unsafe fn pi_lock(tid: u32) {
     if PI_WORD.compare_exchange(0, tid, SeqCst, SeqCst).is_ok() { return; }
@@ -704,14 +711,16 @@ unsafe fn pi_lock(tid: u32) {
     loop {
         let r = pi(&PI_WORD, FUTEX_LOCK_PI, core::ptr::null());
         if r == 0 { break; }
-        if r != -4 { PI_ERRORS.fetch_add(1, SeqCst); break; }
+        if r != -4 { pi_err(1, r, PI_WORD.load(SeqCst)); break; }
     }
-    if PI_WORD.load(SeqCst) & 0x3fff_ffff != tid { PI_ERRORS.fetch_add(1, SeqCst); }
+    let wv = PI_WORD.load(SeqCst);
+    if wv & 0x3fff_ffff != tid { pi_err(2, 0, wv); }
 }
 
 unsafe fn pi_unlock(tid: u32) {
     if PI_WORD.compare_exchange(tid, 0, SeqCst, SeqCst).is_ok() { return; }
-    if pi(&PI_WORD, FUTEX_UNLOCK_PI, core::ptr::null()) != 0 { PI_ERRORS.fetch_add(1, SeqCst); }
+    let r = pi(&PI_WORD, FUTEX_UNLOCK_PI, core::ptr::null());
+    if r != 0 { pi_err(3, r, PI_WORD.load(SeqCst)); }
 }
 
 extern "C" fn pi_worker(_arg: *mut c_void) -> *mut c_void {
@@ -735,6 +744,7 @@ unsafe fn test_futex_pi_contended() -> bool {
     PI_COUNTER = 0;
     PI_KERNEL_LOCKS.store(0, SeqCst);
     PI_ERRORS.store(0, SeqCst);
+    PI_FIRST_ERR.store(0, SeqCst);
     let mut t = [core::ptr::null_mut::<c_void>(); 4];
     for th in t.iter_mut() {
         if pthread_create(th, core::ptr::null(), pi_worker, core::ptr::null_mut()) != 0 {
@@ -744,7 +754,18 @@ unsafe fn test_futex_pi_contended() -> bool {
     for th in t.iter() { pthread_join(*th, core::ptr::null_mut()); }
     let ok = PI_COUNTER == 12000 && PI_ERRORS.load(SeqCst) == 0 && PI_WORD.load(SeqCst) == 0
         && PI_KERNEL_LOCKS.load(SeqCst) > 0;
-    if !ok { say(b"[futex_pi_contended] counter/errors/final word/kernel-path mismatch\n"); }
+    if !ok {
+        say(b"[futex_pi_contended] counter/errors/final word/kernel-path mismatch\n");
+        let f = PI_FIRST_ERR.load(SeqCst);
+        use core::fmt::Write;
+        struct B([u8; 200], usize);
+        impl Write for B { fn write_str(&mut self, t: &str) -> core::fmt::Result {
+            let n = t.len().min(self.0.len() - self.1); self.0[self.1..self.1 + n].copy_from_slice(&t.as_bytes()[..n]); self.1 += n; Ok(()) } }
+        let mut b = B([0; 200], 0);
+        let _ = write!(b, "[futex_pi_contended] counter={} errors={} final={:#x} kernel_locks={} first_err kind={} detail={} word={:#x}\n",
+            PI_COUNTER, PI_ERRORS.load(SeqCst), PI_WORD.load(SeqCst), PI_KERNEL_LOCKS.load(SeqCst), f >> 56, ((f >> 32) & 0xffff) as i16, f as u32);
+        say(&b.0[..b.1]);
+    }
     report(name, ok)
 }
 
