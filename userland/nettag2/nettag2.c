@@ -51,6 +51,7 @@
 #include <netinet/ip_icmp.h>
 #include <poll.h>
 #include <pthread.h>
+#include "../vcpucanary.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -356,7 +357,7 @@ static int check_prompt(const char *n, const char *what, struct waiter *w, long 
     long long d = w->at - t1;
     if (d < 0) d = 0;
     printf("%s: %s returned it after %lld us (rv %ld errno %d events %#x)\n", n, what, d, w->rv, w->err, w->rev);
-    if (d > LIMIT_US) { fail(n, "%s returned it %lld us late (limit 20 ms)", what, d); return 1; }
+    if (d > LIMIT_US) { char cb[160]; fail(n, "%s returned it %lld us late (limit 20 ms) %s", what, d, canary_report(t1, w->at, cb, sizeof cb)); return 1; }
     return 0;
 }
 
@@ -646,7 +647,7 @@ static void connect_lo_case(void) {
             if (k == 1 && (r == 0 || e != ECONNREFUSED)) { fail(n, "connect %d to a closed port: rv %d errno %d", i, r, e); bad = 1; }
             if (k == 0 && d > worst_ok) worst_ok = d;
             if (k == 1 && d > worst_ref) worst_ref = d;
-            if (!bad && d > LIMIT_US) { fail(n, "connect %d (%s) took %lld us", i, k ? "refused" : "accepted", d); bad = 1; }
+            if (!bad && d > LIMIT_US) { char cb[160]; fail(n, "connect %d (%s) took %lld us %s", i, k ? "refused" : "accepted", d, canary_report(t1, t1 + d, cb, sizeof cb)); bad = 1; }
             close(s);
             if (k == 0) { int c = accept(l, NULL, NULL); if (c >= 0) close(c); }
         }
@@ -667,6 +668,7 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < sizeof all / sizeof *all; i++) skip(all[i], "(no /proc/sysstat)");
     } else {
         close(sfd);
+        canary_start();
         tcp_recv_case();
         udp_recv_case("udp_recv", INADDR_LOOPBACK);
         udp_recv_case("udpany_recv", INADDR_ANY);
@@ -676,6 +678,7 @@ int main(int argc, char **argv) {
         icmp_unbound_case();
         connect_pending_case();
         connect_lo_case();
+        canary_stop();
     }
     printf("nettag2: %d passed, %d failed, %d skipped\n", n_pass, n_fail, n_skip);
     return n_fail > 125 ? 125 : n_fail;
