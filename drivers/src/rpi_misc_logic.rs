@@ -822,6 +822,15 @@ pub mod sdgrant {
     /// stable 0 (unreliable pin) never revokes.
     pub fn card_revoked(at_grant: bool, now: bool, irq_latched: bool) -> bool { irq_latched || now != at_grant }
 
+    /// Policy for the SD host's two gio_aon pins when the `sdhci` MODULE asks the kernel to change one
+    /// (`kapi_pi5_pins` SD_*_SET). The built-in driver, on a card it has not (yet) granted, already does exactly:
+    /// power cycle (SD_PWR_ON low, I/O 3.3 V, SD_PWR_ON high) and, only after ACMD41 (card powered), I/O 1.8 V.
+    /// So every set the built-in performs is allowed; the one thing it never does, and the module must not, is
+    /// select 1.8 V I/O on an unpowered card. `io_1v8`: the I/O select line (else SD_PWR_ON).
+    pub fn pin_set_allowed(io_1v8: bool, on: bool, power_on: bool) -> bool {
+        !(io_1v8 && on && !power_on)
+    }
+
     /// Commands that change card contents or state: CMD24/25 (write), 27 (CSD
     /// program), 28/29 (write protect), 32/33/38 (erase), 42 (lock/unlock),
     /// 56 (general command, write direction), and ACMD23 (pre-erase count).
@@ -1021,5 +1030,15 @@ mod tests {
         let mut z = m; z[446 + 16 + 12..446 + 16 + 16].fill(0);
         let g = sdmbr::root_guard(&z, bogus_sb).unwrap();
         assert_eq!((g.start_lba, g.bytes, g.from_sb), (1_003_520, u64::MAX / 2, false));
+    }
+
+    #[test]
+    fn sd_pin_policy_matches_builtin() {
+        use sdgrant::pin_set_allowed as ok;
+        // Built-in power cycle: power off, I/O 3.3 V, power on: all allowed whatever the state.
+        assert!(ok(false, false, true) && ok(true, false, true) && ok(true, false, false) && ok(false, true, false));
+        // UHS switch on a powered card is allowed; on an unpowered card it never is.
+        assert!(ok(true, true, true));
+        assert!(!ok(true, true, false));
     }
 }

@@ -31,11 +31,6 @@ mod bcm2712_gpio {
         match line { 3 => kmod_kapi::plat::pi5_sd_io_1v8_set(on), 4 => kmod_kapi::plat::pi5_sd_power_set(on), _ => Err(-22) }
     }
 }
-#[cfg(feature = "rpi5")]
-#[path = "../../../drivers/src/rpi_misc_logic.rs"]
-#[allow(dead_code)]
-mod rpi_misc_logic;
-
 #[path = "../../../drivers/src/blockdev.rs"]
 mod blockdev;
 #[path = "../../../drivers/src/partscan.rs"]
@@ -43,6 +38,7 @@ mod partscan;
 #[path = "../../../drivers/src/blkmod.rs"]
 mod blkdev;
 #[path = "../../../drivers/src/rpi_misc_logic.rs"]
+#[allow(dead_code)]
 mod rpi_misc_logic;
 #[path = "../../../drivers/src/sdhci.rs"]
 mod sdhci;
