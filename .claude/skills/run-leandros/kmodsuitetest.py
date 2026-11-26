@@ -70,7 +70,13 @@ def main():
         return p.returncode, p.stdout + p.stderr
 
     def run(cmd, to=120):
-        return d("run", cmd, str(to), timeout=to + 60)[1]
+        o = d("run", cmd, str(to), timeout=to + 60)[1]
+        # kernel [FORK]/diag lines land in the middle of the serial capture and glue onto the next echo: drop them
+        # before matching, and keep the cleaned text in the log so a failure can be read.
+        o = "\n".join(l for l in o.splitlines() if not re.match(r"^\[\s*\d+\.\d+\]", l))
+        o = re.sub(r"(?<=\d)(?=(RM_RC|LD_RC|BUSY_RC)=)", "\n", o)
+        print("    | " + o.strip().replace("\n", " / ")[-400:], flush=True)
+        return o
 
     try:
         rc, out = d("start", arch, timeout=300)
