@@ -231,6 +231,9 @@ pub struct KPmOps {
 }
 /// Interrupt handler: returns 1 when handled, 0 when the interrupt was not the device's.
 pub type KIrqHandler = extern "C" fn(ctx: usize) -> u32;
+/// Set in the key `kapi_irq_request_msi` / `kapi_irq_request_msix` return (and `kapi_irq_free` takes) when
+/// the low 32 bits are an aarch64 ITS LPI INTID instead of an x86_64 IDT vector.
+pub const KIRQ_LPI: u64 = 1 << 32;
 
 
 // ── video (L7a): the camera ops table behind /dev/video0, and the USB class-driver seam ──
@@ -539,6 +542,11 @@ pub mod sys {
         pub fn kapi_copy_to_user(uaddr: usize, src: *const u8, n: usize) -> i32;
         pub fn kapi_pci_scan(index: u32, out: *mut super::KPciDev) -> i32;
         pub fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, handler: super::KIrqHandler, ctx: usize) -> i64;
+        pub fn kapi_msi_supported() -> bool;
+        pub fn kapi_irq_free(owner: KmodId, key: u64) -> bool;
+        pub fn kapi_msix_disable(bdf: u32) -> bool;
+        pub fn kapi_masked_poll_point();
+        pub fn kapi_park_check();
         pub fn kapi_fw_root_ready() -> bool;
         pub fn kapi_fw_request(path: *const u8, len: usize, max: usize, size: *mut usize, data: *mut *const u8) -> usize;
         pub fn kapi_fw_release(h: usize);

@@ -12,6 +12,11 @@ mod kenv {
     pub use kmod_kapi::blk::env::*;
 }
 
+// The driver source names the kernel's `crate::kdiag`.
+mod kdiag {
+    pub use kmod_kapi::kdiag::*;
+}
+
 #[path = "../../../drivers/src/blockdev.rs"]
 mod blockdev;
 #[path = "../../../drivers/src/partscan.rs"]

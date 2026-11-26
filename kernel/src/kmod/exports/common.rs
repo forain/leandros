@@ -170,13 +170,26 @@ pub extern "C" fn kapi_irq_request_msix(owner: KmodId, bdf: u32, entry: u16, han
     crate::kmod::lower::note_pci(bdf);
     match tab.request(entry, hf, hc) {
         Ok(h) => {
-            let v = h.vector().unwrap_or(0) as u64;
+            let v = super::irq::irq_key(&h);
             crate::kmod::lower::hold_irq(owner, v, h);
             crate::kmod::registry::note_registration(owner, RegKind::IRQ, v);
             v as i64
         }
         Err(e) => super::irq::irq_errno(e),
     }
+}
+
+/// Disable the MSI-X table `kapi_irq_request_msix` enabled on `bdf` and unmap it. Every vector of the
+/// function must have been freed (`kapi_irq_free`) first. False when no table is enabled there.
+#[no_mangle]
+pub extern "C" fn kapi_msix_disable(bdf: u32) -> bool {
+    let t = {
+        let mut v = MSIX_TABLES.lock();
+        match v.iter().position(|t| t.0 == bdf) { Some(i) => v.remove(i).1, None => return false }
+    };
+    // SAFETY: the table was `Box::leak`ed by `kapi_irq_request_msix` and is no longer listed.
+    unsafe { Box::from_raw(t as *const drivers::irq::MsixTable as *mut drivers::irq::MsixTable) }.disable();
+    true
 }
 
 #[no_mangle]
