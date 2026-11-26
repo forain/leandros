@@ -182,6 +182,11 @@ const _: unsafe extern "C" fn(*mut u64) = kapi_mem_info;
 const _: unsafe extern "C" fn() -> u64 = kapi_irq_save;
 const _: unsafe extern "C" fn(u64) = kapi_irq_restore;
 const _: sys::V4l2UnregisterFn = kapi_v4l2_unregister;
+const _: unsafe extern "C" fn() -> bool = kapi_msi_supported;
+const _: unsafe extern "C" fn(KmodId, u64) -> bool = kapi_irq_free;
+const _: unsafe extern "C" fn(u32) -> bool = kapi_msix_disable;
+const _: unsafe extern "C" fn() = kapi_masked_poll_point;
+const _: unsafe extern "C" fn() = kapi_park_check;
 const _: kmod_abi::plat::sys_plat::PlatRegisterFn = kapi_plat_register;
 const _: kmod_abi::plat::sys_plat::PlatUnregisterFn = kapi_plat_unregister;
 const _: kmod_abi::plat::sys_plat::DtbBlobFn = kapi_dtb_blob;
@@ -225,7 +230,7 @@ const _: () = {
 
 macro_rules! sym { ($n:literal, $f:ident) => { KSym { name: concat!($n, "\0").as_ptr(), addr: $f as *const () } }; }
 
-pub const NEXPORTS: usize = 170;
+pub const NEXPORTS: usize = 175;
 
 #[used]
 #[link_section = ".ksymtab"]
@@ -400,6 +405,11 @@ static KSYMTAB: [KSym; NEXPORTS] = [
     sym!("kapi_rp1_irq_request", kapi_rp1_irq_request),
     sym!("kapi_rp1_irq_free", kapi_rp1_irq_free),
     sym!("kapi_pi5_pins", kapi_pi5_pins),
+    sym!("kapi_msi_supported", kapi_msi_supported),
+    sym!("kapi_irq_free", kapi_irq_free),
+    sym!("kapi_msix_disable", kapi_msix_disable),
+    sym!("kapi_masked_poll_point", kapi_masked_poll_point),
+    sym!("kapi_park_check", kapi_park_check),
 ];
 
 extern "C" {

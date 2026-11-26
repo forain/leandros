@@ -1,0 +1,19 @@
+# LeandrOS one-shot boot for a Batocera Pi 5. The firmware reads this file
+# INSTEAD of config.txt only when the tryboot flag is set (reboot "0 tryboot");
+# a normal boot never sees it. Installed by scripts/stage-batocera-rpi5.sh.
+# Explicit leandros/ paths (kernel=, initramfs, cmdline= are documented
+# per-file settings) instead of os_prefix, so no prefix semantics are assumed.
+# No device_tree=: the firmware picks Batocera's own bcm2712-rpi-5-b.dtb or
+# bcm2712d0-rpi-5-b.dtb from the boot root by board stepping.
+# No partition-switching boot scheme is used with this setup.
+arm_64bit=1
+kernel=leandros/kernel.img
+kernel_address=0x200000
+initramfs leandros/initrd.cpio 0x10000000
+cmdline=leandros/cmdline.txt
+framebuffer_width=1920
+framebuffer_height=1080
+framebuffer_depth=32
+hdmi_force_hotplug=1
+enable_uart=1
+uart_2ndstage=1

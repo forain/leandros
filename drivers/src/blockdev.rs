@@ -136,3 +136,64 @@ pub fn parse_root_arg(cmdline: &str) -> Option<&str> {
         .filter(|v| !v.is_empty())
         .last()
 }
+
+/// The form of a `root=` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootForm<'a> {
+    /// `/dev/<name>`
+    Dev(&'a str),
+    /// `PARTUUID=<id>`
+    PartUuid(&'a str),
+    /// `LABEL=<f2fs label>`
+    Label(&'a str),
+    /// Anything else (`UUID=`, a typo): never a reason to guess a root.
+    Unknown(&'a str),
+}
+
+/// Classify a `root=` value.
+pub fn root_form(spec: &str) -> RootForm<'_> {
+    if let Some(n) = spec.strip_prefix("/dev/") { return RootForm::Dev(n); }
+    if let Some(i) = spec.strip_prefix("PARTUUID=") { return RootForm::PartUuid(i); }
+    if let Some(l) = spec.strip_prefix("LABEL=") { return RootForm::Label(l); }
+    RootForm::Unknown(spec)
+}
+
+/// The one index in `matches`: none is `NotFound`, several `Ambiguous`
+/// (an identity that is not unique is never resolved by enumeration order).
+pub fn pick_unique(matches: impl Iterator<Item = usize>) -> Result<usize, RootErr> {
+    let mut it = matches;
+    match (it.next(), it.next()) {
+        (None, _) => Err(RootErr::NotFound),
+        (Some(i), None) => Ok(i),
+        (Some(_), Some(_)) => Err(RootErr::Ambiguous),
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn forms() {
+        assert_eq!(root_form("/dev/vdb"), RootForm::Dev("vdb"));
+        assert_eq!(root_form("PARTUUID=ab-02"), RootForm::PartUuid("ab-02"));
+        assert_eq!(root_form("LABEL=leandros-root"), RootForm::Label("leandros-root"));
+        assert_eq!(root_form("UUID=1234"), RootForm::Unknown("UUID=1234"));
+        assert_eq!(root_form("/devv/sda"), RootForm::Unknown("/devv/sda"));
+        assert_eq!(root_form("partuuid=ab"), RootForm::Unknown("partuuid=ab"));
+    }
+    #[test]
+    fn unique() {
+        assert_eq!(pick_unique([].into_iter()), Err(RootErr::NotFound));
+        assert_eq!(pick_unique([3].into_iter()), Ok(3));
+        assert_eq!(pick_unique([3, 5].into_iter()), Err(RootErr::Ambiguous));
+        assert_eq!(pick_unique([5, 3, 4].into_iter()), Err(RootErr::Ambiguous));
+    }
+    #[test]
+    fn last_nonempty_root_wins() {
+        assert_eq!(parse_root_arg("root=/dev/a root="), Some("/dev/a"));
+        assert_eq!(parse_root_arg("root= root=/dev/a root=/dev/b"), Some("/dev/b"));
+        assert_eq!(parse_root_arg("root="), None);
+        assert_eq!(parse_root_arg("xroot=/dev/a"), None);
+    }
+}

@@ -680,7 +680,16 @@ def main():
     SER.pump(float(os.environ.get("FFS_GREETER_PAINT", 3)) * SCALE)  # greeter first paint (virgl: ~90 s)
     typ("leandro"); key("ret")
     log("greeter login typed")
-    wait_for("desktop", have("cosmic-panel"), T_DESKTOP)
+    if not wait_for("desktop", have("cosmic-panel"), T_DESKTOP):
+        # Session never started: keep what each process waits on (diagnostics only).
+        open(f"{OUT}/desktopfail.txt", "w").write(sh(
+            "tail -n 40 /var/log/greetd.log; tail -n 40 /tmp/cosmic-session-*.log 2>&1; "
+            "echo ===PROCS; for p in /proc/[0-9]*; do echo \"## $p $(head -c 200 $p/cmdline 2>/dev/null | tr '\\0' ' ')\"; "
+            "head -n 3 $p/status 2>/dev/null | tr '\\n' ' '; echo; cat $p/wchan $p/syscall 2>/dev/null; echo; "
+            "ls -l $p/fd 2>/dev/null | cut -c1-160 | tail -n 24; done; "
+            "echo ===STAT; cat /proc/[0-9]*/stat; echo ===WAKE; cat /proc/wakestat; "
+            "echo ===POLLFDS; cat /proc/pollfds; echo ===SYS; cat /proc/sysstat; echo ===PC; cat /proc/pcsample; echo ===LOAD; cat /proc/loadavg", 300))
+        log("desktop: dumped desktopfail.txt")
     SER.pump(3 * SCALE)
     drv("screenshot", f"{OUT}/desktop.ppm", t=90)
     n_brush0 = None

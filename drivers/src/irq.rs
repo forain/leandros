@@ -103,6 +103,10 @@ impl IrqHandle {
             _ => None,
         }
     }
+    /// VA of the MSI-X vector table this handle uses, if it is an MSI-X handle.
+    pub fn msix_table(&self) -> Option<usize> {
+        match self.kind { HandleKind::MsiX { table, .. } => Some(table), _ => None }
+    }
     /// The ITS LPI INTID (aarch64 MSI / MSI-X), if any.
     pub fn lpi(&self) -> Option<u32> {
         match self.kind {
@@ -344,6 +348,7 @@ pub extern "C" fn drivers_irq_report(buf: *mut u8, cap: usize) -> usize {
             let _ = writeln!(w, "{:>5}: {:>10}  IDT-MSI", v, s.count.load(Ordering::Relaxed));
         }
     }
+    #[cfg(feature = "drv-virtio-blk")]
     crate::virtio_blk::wait_stats(&mut w);
     w.n
 }
@@ -632,6 +637,13 @@ impl MsixTable {
     }
 
     pub fn entries(&self) -> u16 { self.entries }
+    /// VA of the vector table (identifies the table in `IrqHandle::msix_table`).
+    pub fn table_va(&self) -> usize { self.table }
+    /// Clear MSI-X enable and function mask, leaving the mapping in place (undo with `reenable`).
+    pub fn quiesce(&self) {
+        let c = self.func.read16(self.cap + 2);
+        self.func.write16(self.cap + 2, c & !0xC000);
+    }
     pub fn function(&self) -> PciFunction { self.func }
 
     /// Program entry `entry` with a fresh vector, install `handler(ctx)`, and
