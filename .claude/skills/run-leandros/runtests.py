@@ -1153,6 +1153,10 @@ def main(argv):
     if gpu in ("venus", "virgl") and any(("venustest" in c or "drmsmoke" in c) for c in cmds) \
             and "nvrm.desktop" not in (cmdline or ""):
         cmdline = " ".join(x for x in (cmdline, "nvrm.desktop=0") if x)
+    # venustest imports out-fence eventfds into syncobjs (phase 7f/7h): the sync-file gate is off on virtio by default.
+    if gpu in ("venus", "virgl") and any("venustest" in c for c in cmds) \
+            and "drm.syncfile" not in (cmdline or ""):
+        cmdline = " ".join(x for x in (cmdline, "drm.syncfile=1") if x)
 
     scale = driver.wait_scale(arch, mode)
     accel = driver.accel_kind(arch, mode)
