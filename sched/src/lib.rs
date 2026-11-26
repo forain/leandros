@@ -6567,6 +6567,14 @@ pub fn preempt_disable() {
     }
 }
 
+/// Start a fresh preempt section for the soft-lockup detector. Only for a CPU
+/// that halts waiting on a device (`park_until_irq`): it is idle, not locked up.
+#[inline]
+pub fn softlockup_touch() {
+    let id = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    PREEMPT_SECTION_SEQ[id].fetch_add(1, Ordering::Relaxed);
+}
+
 // ── Soft-lockup detector (lane usbladder, L8.2) ─────────────────────────────
 //
 // The tick watchdog above only sees a CPU that takes no timer interrupt. A CPU

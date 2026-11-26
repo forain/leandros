@@ -348,19 +348,6 @@ fn relax() {
     }
 }
 
-/// `relax` for a non-sleeping waiter of a lock whose owner is parked on device
-/// I/O with preemption enabled. A plain task context (nothing held, preemption
-/// on) opens a window the tick may switch in, so the owner gets the CPU if it
-/// is Ready behind us; any other context relaxes as before.
-#[inline]
-fn relax_owner_parked() {
-    if irqctx::preemptible_task_ctx() && crate::irqs_masked() {
-        crate::irq_window();
-    } else {
-        relax();
-    }
-}
-
 /// Park the current task until `node.granted` (read under `lock`) or the
 /// deadline. The node must already be linked (or granted). Returns whether it
 /// was granted. On timeout the node is unlinked. Caller has IRQs masked.
@@ -499,9 +486,6 @@ pub struct KRawMutex {
     /// yet (null once it did). A spinning arrival may take the lock back from
     /// it: the sleeper can be Ready but CPU-less behind the spinner itself.
     handoff: UnsafeCell<*mut WaitNode>,
-    /// The owner is parked waiting for device I/O with preemption enabled: it
-    /// may be Ready but CPU-less behind a spinning waiter on the same CPU.
-    pub holder_io_parked: AtomicBool,
 }
 unsafe impl Sync for KRawMutex {}
 unsafe impl Send for KRawMutex {}
@@ -511,7 +495,7 @@ static RELOCK_WARNED: AtomicBool = AtomicBool::new(false);
 impl KRawMutex {
     pub const fn new() -> Self {
         Self { lock: RawSpinLock::new(), owner: UnsafeCell::new(0), waiters: UnsafeCell::new(WaitList::new()),
-               handoff: UnsafeCell::new(core::ptr::null_mut()), holder_io_parked: AtomicBool::new(false) }
+               handoff: UnsafeCell::new(core::ptr::null_mut()) }
     }
 
     #[inline]
@@ -691,7 +675,7 @@ impl KRawMutex {
                 return false;
             }
             self.lock.unlock_irqrestore(f2);
-            if self.holder_io_parked.load(Ordering::Relaxed) { relax_owner_parked(); } else { relax(); }
+            relax();
         }
     }
 
