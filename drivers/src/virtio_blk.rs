@@ -270,7 +270,8 @@ impl VirtQueue {
     /// slow. On failure the request is still owned by the device, so the
     /// caller must not touch the ring or DMA pages again.
     unsafe fn wait_for_completion(&mut self, cfg: *mut VirtioPciCommonCfg, t0: u64, slow_ns: u64,
-                                  type_: u32, sector: u64, armed: bool) -> Result<bool, WaitErr> {
+                                  type_: u32, sector: u64, armed: bool,
+                                  park_flag: *const core::sync::atomic::AtomicBool, holds_pp: bool) -> Result<bool, WaitErr> {
         let mut spins: u32 = 0;
         let used_idx = core::ptr::addr_of!((*self.used).idx);
         let last = self.last_used_idx;
@@ -299,8 +300,8 @@ impl VirtQueue {
         // fault, aarch64 syscall) is never switched in `irq_window_if_masked`
         // (it disables preemption around the window), so for it this only
         // ends the single watchdog-visible section between parks.
-        let pflag = self.park_flag;
-        let drop_pp = armed && self.holds_preempt_off;
+        let pflag = park_flag;
+        let drop_pp = armed && holds_pp;
         if drop_pp {
             if !pflag.is_null() { (*pflag).store(true, core::sync::atomic::Ordering::SeqCst); }
             sched::preempt_enable_no_resched();
@@ -907,7 +908,8 @@ impl VirtioBlkDevice {
             }
             self.notify();
             match self.queue.wait_for_completion(self.common_cfg, t0, k.slow_ns, type_, sector,
-                self.irq_armed && sched::current_pid() != 0 && irq_knob_on()) {
+                self.irq_armed && sched::current_pid() != 0 && irq_knob_on(),
+                self.park_flag, self.holds_preempt_off) {
                 Ok(false) => {}
                 Ok(true) => crate::kenv::pci::serial_debug(&alloc::format!(
                     "[VIRTIO-BLK] slow request: type {} sector {} completed after {} ms (status {})\n",
