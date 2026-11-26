@@ -207,6 +207,10 @@ pub fn plan(prog: &str, args: &[String], is_dir: &dyn Fn(&str) -> bool) -> Plan 
         Syntax::Perl => p.rg_args.push("-P".into()),
         _ => {}
     }
+    // grep -c prints 0 for files without a match; rg omits them unless told.
+    if flags.iter().any(|f| f == "-c" || f.starts_with("--count")) {
+        p.rg_args.push("--include-zero".into());
+    }
     p.rg_args.extend(flags);
     for pat in patterns {
         // a -e/operand pattern may hold several lines: each is a pattern
@@ -290,6 +294,13 @@ mod tests {
     fn stdin_when_no_operand() {
         let p = plan("grep", &s(&["-c", "foo"]), &nodir);
         assert_eq!(tail(&p), s(&["-c", "-e", "foo", "-"]));
+    }
+    #[test]
+    fn count_includes_zero() {
+        let p = plan("grep", &s(&["-c", "foo", "f"]), &nodir);
+        assert!(p.rg_args.contains(&"--include-zero".to_string()));
+        let p = plan("grep", &s(&["foo", "f"]), &nodir);
+        assert!(!p.rg_args.contains(&"--include-zero".to_string()));
     }
     #[test]
     fn recursive_has_no_dash_and_no_r() {
