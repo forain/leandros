@@ -40,7 +40,7 @@ def build():
         return False
     with open(os.path.join(VAR, ".config"), "w") as f:
         f.write("CONFIG_MODULES=y\nCONFIG_VIRTIO_NET=m\nCONFIG_NVME=m\nCONFIG_IWLWIFI=m\nCONFIG_BRCMF=m\n")
-    env = dict(os.environ, KMOD_EXTRA="sdhci", LEANDROS_RUN_ID=f"{rid}-var")
+    env = dict(os.environ, KMOD_ONLY="1", KMOD_EXTRA="sdhci", LEANDROS_RUN_ID=f"{rid}-var")
     env.pop("KMOD_TEST", None)
     with open(os.path.join(VAR, "kmodsuite-build.log"), "w") as lg:
         r = subprocess.run(["./scripts/build-all.sh", "--arch", arch], cwd=VAR, env=env, stdout=lg,

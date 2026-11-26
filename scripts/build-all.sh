@@ -1233,7 +1233,12 @@ else
     ARCHS=("$ARCH")
 fi
 
+# KMOD_ONLY=1 (kmodsuite test, run in a reflink copy of an already built tree): rebuild the kernel, the modules, the
+# initrd and the boot image only; the userland, the ports and the populated f2fs volumes of the copy are reused.
 for arch in "${ARCHS[@]}"; do
+  if [[ "${KMOD_ONLY:-}" == "1" ]]; then
+    phase build_kernel build_kernel "$arch" || exit 1
+  else
     phase build_userland build_userland "$arch"
     phase build_doom build_doom "$arch"
     phase build_floattest build_floattest "$arch" || exit 1
@@ -1268,6 +1273,7 @@ for arch in "${ARCHS[@]}"; do
     phase build_disktester build_disktester "$arch"
     phase build_grep build_grep "$arch"
     phase stage_dbus_session stage_dbus_session "$arch"
+  fi
     # The initrd is built after the kernel: module blobs are linked against the
     # kernel's exported symbols and keyed by its build-id.
     rm -rf "$ROOT_DIR/target/kmod/$arch"
@@ -1281,6 +1287,7 @@ for arch in "${ARCHS[@]}"; do
     # Fail the build when a shipped kernel variant has no lib/modules/<its build-id> (any =m set).
     python3 "$ROOT_DIR/scripts/kmod/bidcheck.py" build "$arch"
     phase create_disk_image create_disk_image "$arch" "$LIMINE_DIR"
+    [[ "${KMOD_ONLY:-}" == "1" ]] && continue
     echo "💾 Creating populated F2FS images for $arch..."
     phase mkfs_f2fs_populated python3 scripts/mkfs-f2fs-populated.py "f2fs-data0-$arch.img" "$arch"
     # The persistent /home volume (vdc): user data, so never rewritten by a
