@@ -157,9 +157,10 @@ pub(crate) fn proc_if_inet6(out: &mut impl Write) {
         let Some(a) = ll_cfg(nif.id) else { continue };
         for b in a { let _ = write!(out, "{:02x}", b); }
         let _ = writeln!(out, " {:02x} 40 20 {:02x} {:>8}", nif.id as u32 + 2, 0x80 | dad_flags(nif.id, &a), nif.name());
-        if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr {
+        let sl = SLAAC.lock()[nif.id as usize].addrs;
+        for (g, _) in sl.iter().flatten() {
             for b in g { let _ = write!(out, "{:02x}", b); }
-            let _ = writeln!(out, " {:02x} 40 00 {:02x} {:>8}", nif.id as u32 + 2, 0x80 | dad_flags(nif.id, &g), nif.name());
+            let _ = writeln!(out, " {:02x} 40 00 {:02x} {:>8}", nif.id as u32 + 2, 0x80 | dad_flags(nif.id, g), nif.name());
         }
         if let Some(g) = crate::dhcp6::addr_of(nif.id) {
             for b in g { let _ = write!(out, "{:02x}", b); }
@@ -294,12 +295,14 @@ const RS_MAX: u8 = 3;
 /// Interval between them (Linux router_solicitation_interval).
 const RS_GAP: u64 = 4 * SEC;
 const ONE_SHOT: u64 = u64::MAX;
+/// SLAAC addresses kept per NIC.
+const SLAAC_MAX: usize = 4;
 
 /// What router advertisements told one netif.
 #[derive(Clone, Copy)]
 struct Slaac {
-    /// SLAAC address and when its valid lifetime ends.
-    addr: Option<([u8; 16], u64)>,
+    /// SLAAC addresses (one per advertised prefix, like Linux) and when their valid lifetimes end.
+    addrs: [Option<([u8; 16], u64)>; SLAAC_MAX],
     /// On-link prefix learned (with L flag): prefix, length, expiry.
     pfx: Option<([u8; 16], u8, u64)>,
     /// Default router (its link-local address) and when its lifetime ends.
@@ -307,7 +310,7 @@ struct Slaac {
     rs_sent: u8,
     next_rs: u64,
 }
-impl Slaac { const NONE: Slaac = Slaac { addr: None, pfx: None, router: None, rs_sent: 0, next_rs: 0 }; }
+impl Slaac { const NONE: Slaac = Slaac { addrs: [None; SLAAC_MAX], pfx: None, router: None, rs_sent: 0, next_rs: 0 }; }
 /// Netifs that received a router advertisement (IF_RA_RCVD).
 /// The MTU a router advertised (RA option 5) per netif, 0 = none. Linux ndisc_router_discovery:
 /// ignored below IPV6_MIN_MTU (1280) or above the device MTU (1500 here), else it becomes the
@@ -480,7 +483,7 @@ fn withdraw(id: usize, s: &mut crate::NetStack) {
     crate::dhcp6::reset(id, s);
     if dns_expire(id, 0, true) { dns_publish(); }
     let sid = iface::sid_of(id as u8);
-    if let Some((a, _)) = st.addr {
+    for (a, _) in st.addrs.iter().flatten().copied() {
         dad_forget(id as u8, &a);
         s.interface.update_ip_addrs(|v| {
             let keep: Vec<IpCidr> = v.iter().copied().filter(|c| c.address() != IpAddress::Ipv6(Ipv6Address(a))).collect();
@@ -491,7 +494,7 @@ fn withdraw(id: usize, s: &mut crate::NetStack) {
     if st.router.is_some() { s.interface.routes_mut().remove_default_ipv6_route(); }
     PREFIXES.lock().retain(|e| e.0 != sid);
     ROUTERS.lock().retain(|e| e.0 != sid);
-    if st.addr.is_some() || st.router.is_some() { iface::notify(id as u8); }
+    if st.addrs.iter().any(|a| a.is_some()) || st.router.is_some() { iface::notify(id as u8); }
 }
 
 /// Apply one router advertisement (`ip` is the whole IPv6 packet) to netif `id`.
@@ -540,16 +543,17 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
                 if flags & 0x40 != 0 && autoconf {
                     let mut a = pfx; a[8..].copy_from_slice(&iid);
                     let mut t = SLAAC.lock();
+                    let have = t[id].addrs.iter().position(|x| x.map_or(false, |x| x.0 == a));
                     if valid == 0 {
-                        if t[id].addr.map_or(false, |x| x.0 == a) { drop(t); withdraw_addr(id, s); changed = true; }
-                    } else if t[id].addr.map_or(true, |x| x.0 == a) {
-                        if t[id].addr.is_none() {
-                            if dad_register(id as u8, nic_name(id).as_bytes(), a, 64, false) {
-                                s.interface.update_ip_addrs(|v| { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(a)), 64)); });
-                            }
-                            changed = true;
+                        if have.is_some() { drop(t); withdraw_addr(id, s, &a); changed = true; }
+                    } else if let Some(i) = have {
+                        t[id].addrs[i] = Some((a, life(valid, now)));
+                    } else if let Some(i) = t[id].addrs.iter().position(|x| x.is_none()) {
+                        if dad_register(id as u8, nic_name(id).as_bytes(), a, 64, false) {
+                            s.interface.update_ip_addrs(|v| { let _ = v.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address(a)), 64)); });
                         }
-                        t[id].addr = Some((a, life(valid, now)));
+                        changed = true;
+                        t[id].addrs[i] = Some((a, life(valid, now)));
                     }
                 }
             }
@@ -575,9 +579,12 @@ fn handle_ra(id: usize, s: &mut crate::NetStack, ip: &[u8], now: u64, autoconf: 
     if changed { iface::notify(id as u8); }
 }
 
-fn withdraw_addr(id: usize, s: &mut crate::NetStack) {
-    let a = SLAAC.lock()[id].addr.take();
-    if let Some((a, _)) = a {
+fn withdraw_addr(id: usize, s: &mut crate::NetStack, a: &[u8; 16]) {
+    let a = *a;
+    let mut t = SLAAC.lock();
+    let had = t[id].addrs.iter_mut().find(|x| x.map_or(false, |x| x.0 == a)).map(|x| x.take()).is_some();
+    drop(t);
+    if had {
         dad_forget(id as u8, &a);
         s.interface.update_ip_addrs(|v| {
             let keep: Vec<IpCidr> = v.iter().copied().filter(|c| c.address() != IpAddress::Ipv6(Ipv6Address(a))).collect();
@@ -619,7 +626,7 @@ fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, no
     for p in pkts { handle_ra(id, s, p, now, autoconf); }
     if dns_expire(id, now, false) { dns_publish(); }
     let st = SLAAC.lock()[id];
-    if st.addr.map_or(false, |a| a.1 <= now) { withdraw_addr(id, s); iface::notify(nif.id); }
+    for (a, _) in st.addrs.iter().flatten().filter(|a| a.1 <= now) { withdraw_addr(id, s, a); iface::notify(nif.id); }
     if st.router.map_or(false, |r| r.1 <= now) {
         SLAAC.lock()[id].router = None;
         s.interface.routes_mut().remove_default_ipv6_route();
@@ -631,7 +638,7 @@ fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, no
         PREFIXES.lock().retain(|e| e.0 != iface::sid_of(nif.id));
     }
     let st = SLAAC.lock()[id];
-    if st.router.is_none() && st.addr.is_none() {
+    if st.router.is_none() && st.addrs.iter().all(|a| a.is_none()) {
         if st.rs_sent < RS_MAX && now >= st.next_rs {
             if let (Some(ll), Some(mac)) = (LL.lock()[id], nif.mac()) {
                 let p = rs_packet(ll, mac);
@@ -648,7 +655,7 @@ fn slaac_inner(nif: netdev::Netif, s: &mut crate::NetStack, admin_down: bool, no
         return None;
     }
     let mut next = ONE_SHOT;
-    for e in [st.addr.map(|a| a.1), st.router.map(|r| r.1), st.pfx.map(|p| p.2)].into_iter().flatten() { next = next.min(e); }
+    for e in st.addrs.iter().flatten().map(|a| a.1).chain([st.router.map(|r| r.1), st.pfx.map(|p| p.2)].into_iter().flatten()) { next = next.min(e); }
     if let Some(e) = dns_next(id) { next = next.min(e); }
     if next == ONE_SHOT { None } else { Some(next.saturating_sub(now).max(1_000_000)) }
 }
@@ -718,7 +725,8 @@ pub(crate) fn addrs6() -> Vec<A6> {
     for nif in netdev::iter() {
         let idx = nif.id as u32 + 2;
         if let Some(a) = ll_cfg(nif.id) { v.push(A6 { index: idx, addr: a, prefix: 64, scope: 253, flags: 0x80 | dad_flags(nif.id, &a) }); }
-        if let Some((g, _)) = SLAAC.lock()[nif.id as usize].addr { v.push(A6 { index: idx, addr: g, prefix: 64, scope: 0, flags: 0x80 | dad_flags(nif.id, &g) }); }
+        let sl = SLAAC.lock()[nif.id as usize].addrs;
+        for (g, _) in sl.iter().flatten().copied() { v.push(A6 { index: idx, addr: g, prefix: 64, scope: 0, flags: 0x80 | dad_flags(nif.id, &g) }); }
         if let Some(g) = crate::dhcp6::addr_of(nif.id) { v.push(A6 { index: idx, addr: g, prefix: 128, scope: 0, flags: 0x80 }); }
     }
     for &(idx, a, p) in STATIC_A.lock().iter() { v.push(A6 { index: idx, addr: a, prefix: p, scope: scope_of(&a), flags: 0x80 | nic_of(idx).map_or(0, |n| dad_flags(n.id, &a)) }); }
@@ -865,7 +873,8 @@ fn sync_static_routes(oif: u32) {
 
 /// The NIC's global v6 address (SLAAC, else a static one with scope global).
 pub(crate) fn nic_global(id: u8) -> Option<[u8; 16]> {
-    if let Some((g, _)) = SLAAC.lock()[id as usize].addr { if dad_ok(id, &g) { return Some(g); } }
+    let sl = SLAAC.lock()[id as usize].addrs;
+    if let Some((g, _)) = sl.iter().flatten().copied().find(|(g, _)| dad_ok(id, g)) { return Some(g); }
     let idx = id as u32 + 2;
     STATIC_A.lock().iter().find(|&&(i, a, _)| i == idx && !is_link_local(&a) && a[0] != 0xff && dad_ok(id, &a)).map(|&(_, a, _)| a)
 }
