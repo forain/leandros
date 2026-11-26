@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 arch="$1"
 HERE="$ROOT/scripts/kmod"
-OUT="$ROOT/target/kmod/$arch"
+OUT="${KMOD_OUT:-$ROOT/target/kmod/$arch}"   # KMOD_OUT: stage elsewhere (the kmodbuild regress check)
 
 names=""
 if [[ -s "$ROOT/target/kconfig-$arch/kmod-list" ]]; then
@@ -21,13 +21,11 @@ if [[ -s "$ROOT/target/kconfig-$arch/kmod-list" ]]; then
 fi
 extra="${KMOD_EXTRA:-}"
 if [[ " $extra " == *" all "* ]]; then
-    extra="${extra//all/}"
-    # Per-arch exclusions: hardware that exists only on the other architecture's boards (the crate cannot
-    # link or its driver source is gated on the other arch). Keep this list short and justified.
+    extra="$(printf '%s\n' $extra | grep -vx all | tr '\n' ' ')"
+    # Per-arch exclusions: crates whose driver source only exists on the other architecture. Keep this short.
     case "$arch" in
-        x86_64)  skip=" sdhci macb hdmi_audio v3d brcmf " ;;
-        aarch64) skip=" iwlwifi i915 hda " ;;
-        *)       skip=" " ;;
+        x86_64) skip=" v3d " ;;   # Pi 5 V3D (driver module gated on aarch64)
+        *)      skip=" " ;;
     esac
     for d in "$ROOT"/modules/*/Cargo.toml; do
         m="$(basename "$(dirname "$d")")"; m="${m//-/_}"
@@ -35,7 +33,7 @@ if [[ " $extra " == *" all "* ]]; then
         [[ "$skip" == *" $m "* ]] && continue
         extra="$extra $m"
     done
-    [[ "$arch" == aarch64 ]] && : "${KMOD_BOARD:=rpi5}"
+    : "${KMOD_BOARD:=rpi5}"
 fi
 names="$(printf '%s\n' $names $extra | sed '/^$/d; s/-/_/g' | sort -u | tr '\n' ' ')"
 if [[ -z "${names// /}" ]]; then
@@ -79,7 +77,10 @@ build_one() { # build_one <name>: 0 = staged; any failure returns 1 after saying
     echo "kmod-build: $name ($arch) slot $base size $size"
     # Board-specific modules (sdhci): the crate features mirror the kernel build's board.
     feat=""
-    if [[ "$dash" == "sdhci" && -n "${KMOD_BOARD:-}" ]]; then feat="--features $KMOD_BOARD"; fi
+    if [[ "$dash" == "sdhci" ]]; then
+        [[ -n "${KMOD_BOARD:-}" ]] || { echo "kmod-build: sdhci needs KMOD_BOARD=rpi5 or raspi4b (the driver has no board-less build)" >&2; return 1; }
+        feat="--features $KMOD_BOARD"
+    fi
     if ! RUSTFLAGS= cargo build -q -p "kmod-$dash" $feat --target "$SPEC" --target-dir "$ROOT/target/kmod-build" --release \
         -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec >"$OUT/cargo-$name.log" 2>&1; then
         grep -E '^error' -A3 "$OUT/cargo-$name.log" | head -n 30 >&2; echo "kmod-build: cargo build of kmod-$dash failed (log: $OUT/cargo-$name.log)" >&2; return 1

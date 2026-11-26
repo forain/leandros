@@ -5,8 +5,11 @@ use super::*;
 #[no_mangle]
 pub extern "C" fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64) -> i32 {
     use kmod_abi::plat::pi5_pins as P;
-    if crate::kmod::name_str(&crate::kmod::registry::name_of(owner)) != "brcmf" { return -1; }
-    if op > P::WL_ON_READY || (op == P::MUX_SDIO2 && out.is_null()) { return -22; }
+    let name = crate::kmod::registry::name_of(owner);
+    let who = crate::kmod::name_str(&name);
+    if op > P::AON_SET { return -22; }
+    if who != if op >= P::AON_GET { "sdhci" } else { "brcmf" } { return -1; }
+    if op == P::MUX_SDIO2 && out.is_null() { return -22; }
     #[cfg(all(target_arch = "aarch64", feature = "rpi5"))]
     {
         use drivers::bcm2712_gpio::{self as gpio, Block, Chip, GROUP_SDIO2_WL_ON, WL_ON};
@@ -14,6 +17,8 @@ pub extern "C" fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64)
         match op {
             P::WL_ON_SET => { let _ = gpio::gpio_set_output(Chip::Gio, WL_ON, arg != 0); return 0; }
             P::WL_ON_READY => return if gpio::gpio_is_output(Chip::Gio, WL_ON).is_ok() { 0 } else { -19 },
+            P::AON_GET => return match gpio::gpio_get(Chip::GioAon, arg) { Ok(v) => v as i32, Err(_) => -19 },
+            P::AON_SET => return if gpio::gpio_set_output(Chip::GioAon, arg & 0xFF, arg >> 8 != 0).is_ok() { 0 } else { -19 },
             _ => {}
         }
         let st = bcm2712_id::stepping().stepping;

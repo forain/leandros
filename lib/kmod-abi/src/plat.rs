@@ -30,7 +30,11 @@ pub type KDmaQuiesceFn = extern "C" fn(ctx: usize) -> bool;
 /// `kapi_dma_quiesce_register` stages.
 pub mod quiesce_stage { pub const DEVICE: u32 = 0; pub const BUS: u32 = 1; }
 /// `kapi_pi5_pins` operations.
-pub mod pi5_pins { pub const MUX_SDIO2: u32 = 0; pub const WL_ON_SET: u32 = 1; pub const WL_ON_READY: u32 = 2; }
+pub mod pi5_pins {
+    pub const MUX_SDIO2: u32 = 0; pub const WL_ON_SET: u32 = 1; pub const WL_ON_READY: u32 = 2;
+    /// The SD host's vqmmc / card-power lines on gio_aon (module `sdhci` only): read `arg` = line; write `arg` = line | value << 8.
+    pub const AON_GET: u32 = 3; pub const AON_SET: u32 = 4;
+}
 /// `kapi_board_mac` selectors.
 pub mod board_mac { pub const ETH: u32 = 0; pub const WIFI: u32 = 1; pub const BT: u32 = 2; }
 /// `kapi_dma_sync` directions beyond 0..2: raw cache maintenance on any mapped VA (also `kapi_vmap` aliases).
@@ -102,6 +106,8 @@ pub mod sys_plat {
         /// Pi 5 Wi-Fi pins, for the module named `brcmf` only (-1 otherwise): `pi5_pins::MUX_SDIO2` (out[0] stepping 0 C0 / 1 D0,
         /// out[1] packed fsel nibbles of gpio30..35 before, out[2] register writes; -19 unknown stepping or off the Pi 5, -5 mux
         /// failure), `WL_ON_SET` (arg 0/1), `WL_ON_READY` (0, or -19 when the gio block is unavailable).
+        /// `AON_GET` / `AON_SET` are for the module named `sdhci` only (-1 otherwise; the other ops are `brcmf`'s): the gio_aon
+        /// line `arg` (0..31) read (returns 0/1, -19 when unavailable) or driven (0, -19), see `pi5_pins`.
         pub fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64) -> i32;
         /// Pending SError syndrome since the last checkpoint, 0 when clean (always 0 off aarch64).
         pub fn kapi_serror_checkpoint() -> u64;
