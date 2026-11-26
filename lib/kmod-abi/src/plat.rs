@@ -30,7 +30,60 @@ pub type KDmaQuiesceFn = extern "C" fn(ctx: usize) -> bool;
 /// `kapi_dma_quiesce_register` stages.
 pub mod quiesce_stage { pub const DEVICE: u32 = 0; pub const BUS: u32 = 1; }
 /// `kapi_pi5_pins` operations.
-pub mod pi5_pins { pub const MUX_SDIO2: u32 = 0; pub const WL_ON_SET: u32 = 1; pub const WL_ON_READY: u32 = 2; }
+pub mod pi5_pins {
+    pub const MUX_SDIO2: u32 = 0; pub const WL_ON_SET: u32 = 1; pub const WL_ON_READY: u32 = 2;
+    /// The SD host's two gio_aon lines (module `sdhci` only), as high-level ops, never raw line numbers: SD_IO_1V8 is
+    /// SD_IOVDD_SEL (vqmmc 1.8 V), SD_POWER is SD_PWR_ON. `*_GET` returns 0/1; `*_SET` takes `arg` 0/1.
+    pub const SD_IO_1V8_GET: u32 = 3; pub const SD_IO_1V8_SET: u32 = 4;
+    pub const SD_POWER_GET: u32 = 5; pub const SD_POWER_SET: u32 = 6;
+    pub const MAX_OP: u32 = SD_POWER_SET;
+    /// The only gio_aon lines the SD host uses (the built-in `drivers/src/sdhci.rs` board module): SD_IOVDD_SEL, SD_PWR_ON.
+    pub const GIO_AON_SD_IOVDD_SEL: u32 = 3; pub const GIO_AON_SD_PWR_ON: u32 = 4;
+    /// Kernel-side whitelist: (gio_aon line, is_set) for an SD op, None for any other op.
+    pub fn sd_line(op: u32) -> Option<(u32, bool)> {
+        match op {
+            SD_IO_1V8_GET => Some((GIO_AON_SD_IOVDD_SEL, false)),
+            SD_IO_1V8_SET => Some((GIO_AON_SD_IOVDD_SEL, true)),
+            SD_POWER_GET => Some((GIO_AON_SD_PWR_ON, false)),
+            SD_POWER_SET => Some((GIO_AON_SD_PWR_ON, true)),
+            _ => None,
+        }
+    }
+    /// Module that may use `op`.
+    pub fn module_for(op: u32) -> &'static str { if sd_line(op).is_some() { "sdhci" } else { "brcmf" } }
+}
+/// `kapi_msix_disable` policy, pure. `table_owner` = who enabled the table (0 none), `caller` = normalised caller
+/// (0 = no running generation), `live_handles` = MSI-X handles of the function still held.
+/// Err(-1) not the owner (EPERM-style), Err(-16) EBUSY.
+pub fn msix_disable_verdict(table_owner: Option<u16>, caller: u16, live_handles: bool) -> Result<(), i32> {
+    match table_owner {
+        None => Err(-19),
+        Some(o) if caller == 0 || o != caller => Err(-1),
+        Some(_) if live_handles => Err(-16),
+        Some(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+    #[test] fn sd_whitelist() {
+        assert_eq!(pi5_pins::sd_line(3), Some((3, false)));
+        assert_eq!(pi5_pins::sd_line(4), Some((3, true)));
+        assert_eq!(pi5_pins::sd_line(5), Some((4, false)));
+        assert_eq!(pi5_pins::sd_line(6), Some((4, true)));
+        for op in [0, 1, 2, 7, 255] { assert_eq!(pi5_pins::sd_line(op), None); }
+        assert_eq!(pi5_pins::module_for(4), "sdhci");
+        assert_eq!(pi5_pins::module_for(1), "brcmf");
+    }
+    #[test] fn msix_verdict() {
+        assert_eq!(msix_disable_verdict(None, 5, false), Err(-19));
+        assert_eq!(msix_disable_verdict(Some(5), 6, false), Err(-1));
+        assert_eq!(msix_disable_verdict(Some(5), 0, false), Err(-1));
+        assert_eq!(msix_disable_verdict(Some(5), 5, true), Err(-16));
+        assert_eq!(msix_disable_verdict(Some(5), 5, false), Ok(()));
+    }
+}
 /// `kapi_board_mac` selectors.
 pub mod board_mac { pub const ETH: u32 = 0; pub const WIFI: u32 = 1; pub const BT: u32 = 2; }
 /// `kapi_dma_sync` directions beyond 0..2: raw cache maintenance on any mapped VA (also `kapi_vmap` aliases).
@@ -39,6 +92,7 @@ pub mod dma_dir { pub const CLEAN: u32 = 3; pub const INVALIDATE: u32 = 4; }
 /// HDMI sink facts from the boot probe (`kapi_hdmi_sink_info`). `size` is `size_of::<KHdmiSink>()`.
 /// `state`: hdmi_probe PROBE_* (2 = done). `port_flags`: bit0 valid, 1 hpd, 2 hdmi mode, 3 active, 4 gate open (hdmi0).
 /// `pix_khz`: measured pixel clock (0 unknown). `sink`: EDID verdict, 0 unknown, 1 HDMI, 2 DVI.
+/// `d0`: 0 = C0, 1 = D0, 2 = stepping unknown (counts as D0, the DMA pacing is then verified).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KHdmiSink { pub size: u32, pub state: u32, pub port_flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: u32 }
@@ -101,6 +155,9 @@ pub mod sys_plat {
         /// Pi 5 Wi-Fi pins, for the module named `brcmf` only (-1 otherwise): `pi5_pins::MUX_SDIO2` (out[0] stepping 0 C0 / 1 D0,
         /// out[1] packed fsel nibbles of gpio30..35 before, out[2] register writes; -19 unknown stepping or off the Pi 5, -5 mux
         /// failure), `WL_ON_SET` (arg 0/1), `WL_ON_READY` (0, or -19 when the gio block is unavailable).
+        /// `SD_IO_1V8_*` / `SD_POWER_*` are for the module named `sdhci` only (-1 otherwise; the other ops are `brcmf`'s):
+        /// the SD host's vqmmc 1.8 V select / card power (kernel-side whitelist of gio_aon lines 3 and 4; returns 0/1 or 0,
+        /// -19 when unavailable). Unknown ops -22.
         pub fn kapi_pi5_pins(owner: KmodId, op: u32, arg: u32, out: *mut u64) -> i32;
         /// Pending SError syndrome since the last checkpoint, 0 when clean (always 0 off aarch64).
         pub fn kapi_serror_checkpoint() -> u64;

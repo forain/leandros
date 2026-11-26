@@ -12,6 +12,11 @@ extern crate alloc;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+// The driver source names the kernel's `crate::kdiag`.
+mod kdiag {
+    pub use kmod_kapi::kdiag::*;
+}
+
 pub mod kenv {
     pub use kmod_kapi::{mm, serial_raw};
     pub use crate::sched;

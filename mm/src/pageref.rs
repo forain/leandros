@@ -58,17 +58,20 @@ pub fn dec(phys: usize) {
 
 /// Release a reference to a single physical page, freeing it back to the
 /// buddy allocator only if this was the last reference.
-pub fn unref_or_free(phys: usize, order: usize) {
+/// Returns true when this was the last reference and the block was freed.
+pub fn unref_or_free(phys: usize, order: usize) -> bool {
     let mut refs = PAGE_REFS.lock();
     match refs.get_mut(&phys) {
         Some(count) if *count > 1 => {
             *count -= 1;
             if *count <= 1 { refs.remove(&phys); }
+            false
         }
         _ => {
             refs.remove(&phys);
             drop(refs);
             crate::buddy::free(phys, order);
+            true
         }
     }
 }

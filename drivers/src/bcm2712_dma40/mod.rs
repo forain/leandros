@@ -3,7 +3,7 @@
 //! [`cb`] is the pure part (register map, 40-bit SCB encoding, DREQ cells, cyclic rings,
 //! start/abort sequences), host-tested in `drivers/dma40-tests`. The hardware part is rpi5-only:
 //! channel claim from the DT mask (0x7c0 = 6..10), mem-to-mem copies, cyclic mem-to-FIFO rings
-//! paced by a peripheral DREQ (HDMI audio: channel 10, DREQ 10/17 from the DTB), per-channel interrupts with
+//! paced by a peripheral DREQ (HDMI audio: channel 10, DREQ 12/13 on D0 and 10/17 on C0, from the two DTBs), per-channel interrupts with
 //! a polled fallback, and a boot self-test.
 //!
 //! Kernel API for a peripheral driver (pihdmi-audio):

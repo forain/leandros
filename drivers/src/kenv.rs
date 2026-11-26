@@ -170,6 +170,7 @@ pub mod pm {
 #[cfg(all(target_arch = "aarch64", feature = "rpi5", feature = "hdmi-audio"))]
 pub mod hdmi {
     pub use crate::bcm2712_dma40 as dma;
+    pub use crate::bcm2712_dma40::cb;
     pub use crate::bcm2712_dma40::dcache_clean_inval;
     pub use crate::hdmi_probe::decode::acr_n_cts;
     pub use crate::hdmi_probe::{PORT_ACTIVE, PORT_HDMI_MODE, PORT_HPD, PORT_VALID, PROBE_DONE, PROBE_NOT_RUN, PROBE_SKIPPED, SINK_DVI, SINK_HDMI};
@@ -178,10 +179,10 @@ pub mod hdmi {
     pub const TX_BUF_BYTES: usize = crate::snd::TX_BUF_BYTES;
 
     /// Boot-probe facts for hdmi0 plus the SoC stepping.
-    pub struct Sink { pub state: u32, pub flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: bool }
+    pub struct Sink { pub state: u32, pub flags: u32, pub pix_khz: u32, pub sink: u32, pub d0: bool, pub d0_unknown: bool }
     pub fn sink() -> Sink {
         let (state, flags, pix_khz, sink) = crate::hdmi_plat::sink_info();
-        Sink { state, flags, pix_khz, sink, d0: crate::hdmi_plat::is_d0() }
+        Sink { state, flags, pix_khz, sink, d0: crate::hdmi_plat::is_d0(), d0_unknown: crate::hdmi_plat::stepping_code() == 2 }
     }
     pub fn monotonic_ns() -> u64 { ::sched::monotonic_ns() }
     /// Uncached device mapping; 0 on failure.

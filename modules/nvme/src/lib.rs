@@ -12,6 +12,11 @@ mod kenv {
     pub use kmod_kapi::blk::env::*;
 }
 
+// The driver source names the kernel's `crate::irq`.
+mod irq {
+    pub use kmod_kapi::irq::*;
+}
+
 #[path = "../../../drivers/src/blockdev.rs"]
 mod blockdev;
 #[path = "../../../drivers/src/partscan.rs"]

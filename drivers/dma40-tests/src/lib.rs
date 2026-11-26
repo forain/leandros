@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn hdmi_dreq_cells_decode_like_linux() {
-        // 0x41fa000a (DTB): BURST(30) | WIDE_SOURCE(24) | QOS 0xa | PANIC_QOS 0xf | DREQ 10.
+        // 0x41fa000a (C0 DTB): BURST(30) | WIDE_SOURCE(24) | QOS 0xa | PANIC_QOS 0xf | DREQ 10.
         let d = DreqCfg::from_cell(DREQ_CELL_HDMI0);
         assert_eq!(d.per_map, 10);
         assert_eq!(d.cs_flags, cs_qos(0xa) | cs_panic_qos(0xf));
@@ -52,6 +52,13 @@ mod tests {
         assert_eq!(d.src_xi, XI_SIZE_128 | (3 << 8));
         assert_eq!(d.dst_xi, 3 << 8);
         assert_eq!(DreqCfg::from_cell(DREQ_CELL_HDMI1).per_map, 17);
+        // C0 stepping cells (bcm2712-rpi-5-b.dtb); the D0 DTB (bcm2712d0-rpi-5-b.dtb) says 12 / 13.
+        assert_eq!((DREQ_CELL_HDMI0, DREQ_CELL_HDMI1), (hdmi_dreq_cell(false, 0), hdmi_dreq_cell(false, 1)));
+        assert_eq!((DREQ_CELL_HDMI0_D0, DREQ_CELL_HDMI1_D0), (0x41fa_000c, 0x41fa_000d));
+        let d0 = DreqCfg::from_cell(hdmi_dreq_cell(true, 0));
+        assert_eq!((d0.per_map, d0.ti), (12, TI_WAIT_RESP | (12 << 9)));
+        assert_eq!(d0.cs_flags, DreqCfg::from_cell(DREQ_CELL_HDMI0).cs_flags, "only PER_MAP differs between steppings");
+        assert_eq!(DreqCfg::from_cell(hdmi_dreq_cell(true, 1)).per_map, 13);
         // NO_WAIT_RESP drops WAIT_RESP; a plain cell has no burst/width.
         let p = DreqCfg::from_cell((1 << 27) | 5);
         assert_eq!((p.ti, p.src_xi, p.dst_xi, p.cs_flags), (5 << 9, 0, 0, 0));
@@ -105,12 +112,20 @@ mod tests {
         let mut hops = 1;
         while cur != (0x10_0000u64 >> 5) as u32 { cur = t[(cur as usize * 32 - 0x10_0000) / 32].next_cb; hops += 1; }
         assert_eq!(hops, n);
-        let n = build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 65536, 0x7c72_001c, &d, false).unwrap();
+        let n = build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 65536, 0x10_7c72_001c, &d, false).unwrap();
         assert_eq!((n, t[0].next_cb, t[0].ti & TI_INTEN), (1, 0x10_0000 >> 5, 0));
         assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 3000, 0, &d, false), Err(Dma40Error::BadLength));
         assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 6, 0, &d, false), Err(Dma40Error::BadLength));
         assert_eq!(build_cyclic_tx(&mut t[..4], 0x10_0000, ring, 65536, 4096, 0, &d, false), Err(Dma40Error::TooManyCbs));
         assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 4096, 0x7c72_001e, &d, false), Err(Dma40Error::Misaligned));
+        // The FIFO must sit in the peripheral window 0x10_7c00_0000..0x10_8000_0000: a bus alias or
+        // a RAM address would have the engine write over memory (also guards the module export).
+        for bad in [0u64, 0x7c72_001c, 0x4000_0000, 0x10_7bff_fffc, 0x10_8000_0000, 0xff_ffff_fffc] {
+            assert_eq!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 4096, bad, &d, false), Err(Dma40Error::AddrRange), "{:#x}", bad);
+        }
+        for ok in [0x10_7c00_0000u64, 0x10_7c72_001c, 0x10_7fff_fffc] {
+            assert!(build_cyclic_tx(&mut t, 0x10_0000, ring, 65536, 4096, ok, &d, false).is_ok(), "{:#x}", ok);
+        }
     }
 
     #[test]

@@ -484,6 +484,7 @@ pub fn fork_current_with(frame_ptr: usize, opts: ForkOpts, before_enqueue: impl 
         child.tls_base      = tls_base;
         // fork copies the user GS base along with everything else (Linux).
         child.user_gs_base  = super::get_user_gs_base();
+        child_as.owner_tgid.store(child_pid as usize, core::sync::atomic::Ordering::Relaxed);
         child.address_space = Some(alloc::sync::Arc::new(child_as));
         child.ppid          = pid;
         child.tgid          = child_pid;
@@ -880,8 +881,9 @@ pub fn clone_thread(
         // on) could reap the leader while it, and other siblings, were still
         // running on those tables — a freed root under a live CPU. The
         // space is now freed when the *last* thread's Task drops, which the
-        // scheduler only does once that thread is off its CPU and the CPU
-        // has switched back to the kernel page table.
+        // scheduler only does once that thread is off its CPU (x86_64: and
+        // the CPU has reloaded the kernel CR3; aarch64: TTBR0 may stay stale,
+        // which is harmless, see `reap_close_space`).
         child.address_space = leader_as;
         child.pgid       = pgid;
         child.sid        = sid;

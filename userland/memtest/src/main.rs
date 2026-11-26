@@ -21,6 +21,17 @@ const PAGE:          usize = 4096;
 
 #[no_mangle]
 pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *const u8) -> i32 {
+    if argc >= 4 && cstr_eq(*argv.add(1), b"asfreechild") {
+        // The exec'd image of `test_asfree_exec`: report, wait for the go byte, exit.
+        let (wfd, gfd) = (parse_cnum(*argv.add(2)), parse_cnum(*argv.add(3)));
+        write(wfd, b"r".as_ptr(), 1);
+        let mut b = [0u8; 1];
+        read(gfd, b.as_mut_ptr(), 1);
+        return 0;
+    }
+    if argc >= 2 && cstr_eq(*argv.add(1), b"lateleader") {
+        return if test_late_leader_all() { 0 } else { 1 };
+    }
     if argc >= 2 {
         let a = *argv.add(1);
         if *a == b'h' && *a.add(1) == b'o' && *a.add(2) == b'g' && *a.add(3) == 0 {
@@ -124,6 +135,19 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_pagecache_map_shared_unchanged() { failures += 1; }
     if !test_pagecache_memory_returns() { failures += 1; }
     if !test_wait_releases_memory_exactly() { failures += 1; }
+    if !test_wait_teardown_exact_per_child() { failures += 1; }
+    if !test_wait_teardown_hold() { failures += 1; }
+    if !test_wait_teardown_busyhold() { failures += 1; }
+    if !test_wait_teardown_legacy() { failures += 1; }
+    if !test_wait_teardown_pause() { failures += 1; }
+    if !test_asfree_arm_hygiene() { failures += 1; }
+    if !test_asfree_access() { failures += 1; }
+    if !test_asfree_exec() { failures += 1; }
+    if !test_asfree_mt_kill() { failures += 1; }
+    if !test_asfree_leader_exit_first() { failures += 1; }
+    if !test_asfree_vfork() { failures += 1; }
+    if !test_late_leader_all() { failures += 1; }
+    if !test_wait_memory_drift() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
     if !test_mmap_reuses_freed_va() { failures += 1; }
     if !test_munmap_frees_page_tables() { failures += 1; }
@@ -2088,6 +2112,923 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
     write(STDOUT_FILENO, b"  worst_lost_pages=".as_ptr(), 19); print_dec(worst);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, ok)
+}
+
+// ── Exact teardown accounting through /proc/leandros_asfree (lane memexact) ──
+// The kernel records every address-space teardown in a 256-entry ring: owner
+// tgid, sequence number, pages whose refcount reached zero, page-table pages
+// freed. A test sees *which* teardown happened, not a system-wide free-memory
+// difference that unrelated churn can move.
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct AsFreeEnt { seq: u64, tgid: usize, pages: usize, pt: usize }
+struct AsFree { total: u64, cpus: usize, overlaps: usize, pause_result: usize, armed: usize, n: usize, e: [AsFreeEnt; 256] }
+
+const ASFREE_PATH: &[u8] = b"/proc/leandros_asfree\0";
+
+/// Parse the ring; false when the file cannot be read (not root, old kernel).
+unsafe fn asfree_read(out: &mut AsFree) -> bool {
+    let mut buf = [0u8; 16384];
+    let n = slurp(ASFREE_PATH, &mut buf);
+    if n == 0 { return false; }
+    out.total = 0; out.n = 0;
+    let mut got_total = false;
+    for line in buf[..n].split(|&c| c == b'\n') {
+        if line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix(b"total ") {
+            out.total = parse_num(rest).unwrap_or(0) as u64;
+            got_total = true;
+            continue;
+        }
+        if let Some(r) = line.strip_prefix(b"cpus ") { out.cpus = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"overlaps ") { out.overlaps = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"pause_result ") { out.pause_result = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"armed ") { out.armed = parse_num(r).unwrap_or(0); continue; }
+        if line.starts_with(b"busy_waits ") { continue; }
+        let mut f = [0usize; 4];
+        let mut k = 0;
+        for w in line.split(|&c| c == b' ') {
+            if k < 4 { if let Some(v) = parse_num(w) { f[k] = v; k += 1; } }
+        }
+        if k == 4 && out.n < 256 {
+            out.e[out.n] = AsFreeEnt { seq: f[0] as u64, tgid: f[1], pages: f[2], pt: f[3] };
+            out.n += 1;
+        }
+    }
+    got_total
+}
+
+/// Write one command (`hold <pid>`, `busyhold <pid> <us>`, `release <pid>`).
+unsafe fn asfree_cmd(cmd: &[u8]) -> bool {
+    let fd = open(ASFREE_PATH.as_ptr(), 2, 0);
+    if fd < 0 { return false; }
+    let r = write(fd, cmd.as_ptr(), cmd.len());
+    close(fd);
+    r == cmd.len() as isize
+}
+
+/// `"<verb> <pid>[ <us>]"` into `out`; returns the length.
+fn asfree_fmt(verb: &[u8], pid: i32, us: usize, out: &mut [u8; 48]) -> usize {
+    let mut p = 0;
+    for &b in verb { out[p] = b; p += 1; }
+    for (i, v) in [pid as usize, us].iter().enumerate() {
+        if i == 1 && *v == 0 { break; }
+        out[p] = b' '; p += 1;
+        let mut d = [0u8; 20]; let mut k = 0; let mut x = *v;
+        loop { d[k] = b'0' + (x % 10) as u8; k += 1; x /= 10; if x == 0 { break; } }
+        while k > 0 { k -= 1; out[p] = d[k]; p += 1; }
+    }
+    p
+}
+
+unsafe fn asfree_do(verb: &[u8], pid: i32, us: usize) -> bool {
+    let mut b = [0u8; 48];
+    let n = asfree_fmt(verb, pid, us, &mut b);
+    asfree_cmd(&b[..n])
+}
+
+/// Entries of `a` whose owner is `tgid`: (count, last).
+fn asfree_of(a: &AsFree, tgid: usize) -> (usize, AsFreeEnt) {
+    let mut c = 0; let mut last = AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 };
+    for i in 0..a.n { if a.e[i].tgid == tgid { c += 1; last = a.e[i]; } }
+    (c, last)
+}
+
+unsafe fn asfree_new() -> AsFree {
+    AsFree { total: 0, cpus: 0, overlaps: 0, pause_result: 0, armed: 0, n: 0, e: [AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }; 256] }
+}
+
+unsafe fn kill_and_reap(pid: i32) {
+    syscall2(nr::KILL, pid as usize, 9);
+    wait_status(pid);
+}
+
+/// `kB` value of a `/proc/meminfo` line (0 when absent).
+unsafe fn meminfo_kb(key: &[u8]) -> usize {
+    let mut buf = [0u8; 2048];
+    let n = slurp(b"/proc/meminfo\0", &mut buf);
+    for line in buf[..n].split(|&c| c == b'\n') {
+        if let Some(rest) = line.strip_prefix(key) { return parse_num(rest).unwrap_or(0); }
+    }
+    0
+}
+
+/// free RAM + Cached + Shmem, in pages.
+unsafe fn ram_plus_cache_pages() -> usize {
+    free_ram() / PAGE + (meminfo_kb(b"Cached:") + meminfo_kb(b"Shmem:")) / (PAGE / 1024)
+}
+
+/// The child of the old exactness test: 1024 touched anonymous pages and a
+/// burst of long mm syscalls, then exit(0).
+unsafe fn teardown_child_body() -> ! {
+    const PAGES: usize = 1024;
+    let p = mmap(core::ptr::null_mut(), PAGES * PAGE, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if p as isize == -1 { exit(2); }
+    for pg in 0..PAGES { core::ptr::write_volatile(p.add(pg * PAGE), 1); }
+    for i in 0..1024usize {
+        let prot = if i % 2 == 0 { PROT_READ } else { PROT_READ | PROT_WRITE };
+        leandros_libc::syscall::syscall3(SYS_MPROTECT_NR, p as usize, PAGES * PAGE, prot as usize);
+    }
+    exit(0)
+}
+
+/// Per child, exact: right after wait4 returns, the ring holds exactly one
+/// entry for the child's pid, with the pages and page tables it had. No
+/// polling, no slack; the /proc hammer of the old test runs here too. A
+/// wrapped ring (more than 256 teardowns during a round) is a failure of the
+/// measurement, so it fails.
+unsafe fn test_wait_teardown_exact_per_child() -> bool {
+    let name = b"wait_teardown_exact_per_child\0";
+    let mut ok = true;
+    let mut before = asfree_new();
+    if !asfree_read(&mut before) { return report(name, false); }
+    let shared = mmap(core::ptr::null_mut(), PAGE, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0) as *mut u64;
+    if shared as isize == -1 { return report(name, false); }
+    let mut missing = 0usize; let mut dup = 0usize; let mut few = 0usize; let mut wrapped = 0usize;
+    let mut a = asfree_new();
+    for _ in 0..20 {
+        core::ptr::write_volatile(shared, 0);
+        let hammer = fork();
+        if hammer == 0 {
+            let mut buf = [0u8; 1024];
+            let mut path = [0u8; 64];
+            loop {
+                let c = core::ptr::read_volatile(shared) as i32;
+                if c == 0 { continue; }
+                proc_path(c, b"status", &mut path);
+                slurp(&path, &mut buf);
+                proc_path(c, b"statm", &mut path);
+                slurp(&path, &mut buf);
+            }
+        }
+        if !asfree_read(&mut before) { kill_and_reap(hammer); ok = false; break; }
+        let pid = fork();
+        if pid == 0 { teardown_child_body(); }
+        core::ptr::write_volatile(shared, pid as u64);
+        let status = wait_status(pid);
+        let read_ok = asfree_read(&mut a);
+        kill_and_reap(hammer);
+        if status != 0 || !read_ok { ok = false; continue; }
+        if a.total.saturating_sub(before.total) > 256 { wrapped += 1; continue; }
+        let (c, e) = asfree_of(&a, pid as usize);
+        if c == 0 { missing += 1; continue; }
+        if c > 1 { dup += 1; }
+        if e.pages < 1024 || e.pt < 4 { few += 1; }
+    }
+    write(STDOUT_FILENO, b"  missing=".as_ptr(), 10); print_dec(missing);
+    write(STDOUT_FILENO, b" dup=".as_ptr(), 5); print_dec(dup);
+    write(STDOUT_FILENO, b" few=".as_ptr(), 5); print_dec(few);
+    write(STDOUT_FILENO, b" wrapped=".as_ptr(), 9); print_dec(wrapped);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok && missing == 0 && dup == 0 && few == 0 && wrapped == 0)
+}
+
+/// Child that blocks on `go` until the parent has armed a knob, then touches
+/// some pages and exits.
+unsafe fn spawn_gated_child(go: &mut [i32; 2]) -> i32 {
+    if pipe(go.as_mut_ptr()) != 0 { return -1; }
+    let pid = fork();
+    if pid == 0 {
+        close(go[1]);
+        let mut b = [0u8; 1];
+        read(go[0], b.as_mut_ptr(), 1);
+        let p = mmap(core::ptr::null_mut(), 64 * PAGE, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize != -1 { for pg in 0..64 { core::ptr::write_volatile(p.add(pg * PAGE), 1); } }
+        exit(0);
+    }
+    close(go[0]);
+    pid
+}
+
+/// Poll the ring up to `ms` for an entry of `tgid`; returns its count.
+unsafe fn asfree_wait_entry(tgid: usize, ms: u32) -> usize {
+    let mut a = asfree_new();
+    let mut waited = 0;
+    loop {
+        if asfree_read(&mut a) {
+            let (c, _) = asfree_of(&a, tgid);
+            if c > 0 || waited >= ms { return c; }
+        } else { return 0; }
+        usleep(5_000);
+        waited += 5;
+    }
+}
+
+/// Deterministic `hold`: the kernel keeps a strong reference to the child's
+/// address space (no `busy`) while it exits; wait4 must still report only
+/// after the teardown ran, so the ring entry must be present right after
+/// wait4. A kernel whose wait4 does not wait for the last reference fails
+/// here. The hold is released and the child reaped on every path.
+unsafe fn test_wait_teardown_hold() -> bool {
+    let name = b"wait_teardown_hold\0";
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"hold", pid, 0);
+    if armed { usleep(2_000); }
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    let mut a = asfree_new();
+    let at_wait = asfree_read(&mut a) && asfree_of(&a, pid as usize).0 == 1;
+    asfree_do(b"release", pid, 0);
+    let after_release = asfree_wait_entry(pid as usize, 2_000);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait as usize);
+    write(STDOUT_FILENO, b" after_release=".as_ptr(), 15); print_dec(after_release);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && status == 0 && at_wait && after_release == 1)
+}
+
+/// `busyhold`: a kernel observer takes the child's `busy` flag (IRQs masked,
+/// as real holders have it) at the moment the child's exit decides to close
+/// its space, and keeps it until the closing exit is seen waiting on it. The
+/// teardown must be done by wait4's return (entry present, exactly once), and
+/// every round must have overlapped (`overlaps` rose by one): a run in which
+/// the holder and the closer never met proves nothing. One CPU cannot
+/// overlap them: FAIL.
+unsafe fn test_wait_teardown_busyhold() -> bool {
+    let name = b"wait_teardown_busyhold\0";
+    const ROUNDS: usize = 10;
+    let mut ok = true;
+    let mut late = 0usize;
+    let mut a = asfree_new();
+    if !asfree_read(&mut a) { return report(name, false); }
+    if a.cpus < 2 {
+        puts(b"  busyhold: needs 2 CPUs, have fewer\0".as_ptr());
+        return report(name, false);
+    }
+    let overlaps0 = a.overlaps;
+    for round in 0..ROUNDS {
+        let mut go = [0i32; 2];
+        let pid = spawn_gated_child(&mut go);
+        if pid <= 0 { return report(name, false); }
+        let armed = asfree_do(b"busyhold", pid, 2_000 + 300 * round);
+        write(go[1], b"x".as_ptr(), 1);
+        close(go[1]);
+        let status = wait_status(pid);
+        let mut a = asfree_new();
+        if !(asfree_read(&mut a) && asfree_of(&a, pid as usize).0 == 1) { late += 1; }
+        asfree_do(b"release", pid, 0);
+        let c = asfree_wait_entry(pid as usize, 1_000);
+        // `release` returns only when the worker's tail is done and the slot is
+        // free, so the next round's arm cannot meet the old worker.
+        ok &= armed && status == 0 && c == 1;
+    }
+    let mut a = asfree_new();
+    let overlapped = if asfree_read(&mut a) { a.overlaps.saturating_sub(overlaps0) } else { 0 };
+    write(STDOUT_FILENO, b"  not_yet_at_wait=".as_ptr(), 18); print_dec(late);
+    write(STDOUT_FILENO, b" overlapped=".as_ptr(), 12); print_dec(overlapped);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok && late == 0 && overlapped == ROUNDS)
+}
+
+/// Permanent negative control: `legacy` puts that pid's exit back on the old
+/// Arc-count rule. With the kernel's `hold` the teardown then does NOT happen
+/// by wait4 (no entry), and does when the hold is released. If this ever
+/// shows an entry at wait4, the hold or the control stopped working and the
+/// green of `wait_teardown_hold` means nothing.
+unsafe fn test_wait_teardown_legacy() -> bool {
+    let name = b"wait_teardown_legacy\0";
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"legacy", pid, 0) && asfree_do(b"hold", pid, 0);
+    if armed { usleep(2_000); }
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    let mut a = asfree_new();
+    let at_wait = if asfree_read(&mut a) { asfree_of(&a, pid as usize).0 } else { 99 };
+    asfree_do(b"release", pid, 0);
+    let after_release = asfree_wait_entry(pid as usize, 2_000);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b" after_release=".as_ptr(), 15); print_dec(after_release);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && status == 0 && at_wait == 0 && after_release == 1)
+}
+
+/// `pause`: between exit's sole-owner decision and the close an extra strong
+/// reference appears (a racing observer's upgrade). The close must not care:
+/// the entry is present at wait4, and the observer, trying the space after the
+/// close, gets nothing (`pause_result` 1; 2 would be a space handed out).
+unsafe fn test_wait_teardown_pause() -> bool {
+    let name = b"wait_teardown_pause\0";
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"pause", pid, 0);
+    if armed { usleep(2_000); }
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    let mut a = asfree_new();
+    let (read_ok, at_wait) = if asfree_read(&mut a) { (true, asfree_of(&a, pid as usize).0) } else { (false, 99) };
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b" observer=".as_ptr(), 10); print_dec(a.pause_result);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && read_ok && status == 0 && at_wait == 1 && a.pause_result == 1)
+}
+
+unsafe fn cstr_eq(p: *const u8, want: &[u8]) -> bool {
+    for (i, &c) in want.iter().enumerate() { if *p.add(i) != c { return false; } }
+    *p.add(want.len()) == 0
+}
+
+unsafe fn parse_cnum(p: *const u8) -> i32 {
+    let mut v = 0i32; let mut i = 0;
+    while (*p.add(i)).is_ascii_digit() { v = v * 10 + (*p.add(i) - b'0') as i32; i += 1; }
+    v
+}
+
+/// `"<n>"` into `out` (NUL-terminated), returns the length without the NUL.
+fn fmt_num(mut v: usize, out: &mut [u8; 16]) -> usize {
+    let mut d = [0u8; 16]; let mut k = 0;
+    loop { d[k] = b'0' + (v % 10) as u8; k += 1; v /= 10; if v == 0 { break; } }
+    let mut p = 0;
+    while k > 0 { k -= 1; out[p] = d[k]; p += 1; }
+    out[p] = 0;
+    p
+}
+
+/// Wait up to `ms` for `pipe[0]` to deliver its byte (the child's ready byte).
+unsafe fn read_ready(fd: i32) -> bool {
+    let mut b = [0u8; 1];
+    read(fd, b.as_mut_ptr(), 1) == 1
+}
+
+/// Every `pause`/`legacy` arm is bounded and honest: an unknown pid is
+/// refused (ESRCH) and leaves nothing armed; `pause` clears the previous
+/// result when armed; `release` disarms it (`armed 0`, `pause_result 0`).
+unsafe fn test_asfree_arm_hygiene() -> bool {
+    let name = b"asfree_arm_hygiene\0";
+    let bogus_pause = asfree_do(b"pause", 999_999_999, 0);
+    let bogus_legacy = asfree_do(b"legacy", 999_999_999, 0);
+    let mut a = asfree_new();
+    let r0 = asfree_read(&mut a);
+    let clean_after_bogus = r0 && a.armed == 0;
+    let mut go = [0i32; 2];
+    let pid = spawn_gated_child(&mut go);
+    if pid <= 0 { return report(name, false); }
+    let armed = asfree_do(b"pause", pid, 0);
+    let mut a = asfree_new();
+    let r1 = asfree_read(&mut a);
+    let (set, result_cleared) = (a.armed == 1, a.pause_result == 0);
+    asfree_do(b"release", pid, 0);
+    let mut a = asfree_new();
+    let r2 = asfree_read(&mut a);
+    let disarmed = a.armed == 0 && a.pause_result == 0;
+    write(go[1], b"x".as_ptr(), 1);
+    close(go[1]);
+    let status = wait_status(pid);
+    write(STDOUT_FILENO, b"  bogus_pause=".as_ptr(), 14); print_dec(bogus_pause as usize);
+    write(STDOUT_FILENO, b" bogus_legacy=".as_ptr(), 14); print_dec(bogus_legacy as usize);
+    write(STDOUT_FILENO, b" clean=".as_ptr(), 7); print_dec(clean_after_bogus as usize);
+    write(STDOUT_FILENO, b" armed=".as_ptr(), 7); print_dec(set as usize);
+    write(STDOUT_FILENO, b" result_cleared=".as_ptr(), 16); print_dec(result_cleared as usize);
+    write(STDOUT_FILENO, b" disarmed=".as_ptr(), 10); print_dec(disarmed as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, !bogus_pause && !bogus_legacy && clean_after_bogus && armed && r1 && r2
+        && set && result_cleared && disarmed && status == 0)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod capnr { pub const UNSHARE: usize = 272; pub const CAPGET: usize = 125; pub const CAPSET: usize = 126; }
+#[cfg(target_arch = "aarch64")]
+mod capnr { pub const UNSHARE: usize = 97; pub const CAPGET: usize = 90; pub const CAPSET: usize = 91; }
+
+/// open(`/proc/leandros_asfree`, O_RDWR) straight through the syscall: the
+/// raw -errno.
+unsafe fn asfree_open_raw() -> isize {
+    syscall4(nr::OPENAT, (-100isize) as usize, ASFREE_PATH.as_ptr() as usize, 2, 0)
+}
+
+/// `/proc/leandros_asfree` needs CAP_SYS_ADMIN in the INITIAL user namespace
+/// for open and write: a container-style root (user-namespace root: euid 0
+/// with full capabilities, but not in the init namespace) and root with
+/// CAP_SYS_ADMIN dropped are refused. Plain root still works (control).
+unsafe fn test_asfree_access() -> bool {
+    let name = b"asfree_access\0";
+    // Control: this process is root with the capability.
+    let ctl = asfree_open_raw();
+    if ctl >= 0 { close(ctl as i32); }
+    let mut res = [0i32; 3]; // 0 userns open, 1 dropped open, 2 dropped write on an inherited fd
+    for mode in 0..3 {
+        let mut p = [0i32; 2];
+        if pipe(p.as_mut_ptr()) != 0 { return report(name, false); }
+        let inherited = if mode == 2 { asfree_open_raw() } else { -1 };
+        let pid = fork();
+        if pid == 0 {
+            close(p[0]);
+            let r: isize;
+            if mode == 0 {
+                if syscall2(capnr::UNSHARE, 0x1000_0000, 0) != 0 { exit(90); }
+                // Map root to root of the new namespace (best effort: the
+                // kernel's euid stays 0 either way).
+                let fd = open(b"/proc/self/uid_map\0".as_ptr(), 1, 0);
+                if fd >= 0 { write(fd, b"0 0 1\n".as_ptr(), 6); close(fd); }
+                r = asfree_open_raw();
+            } else {
+                // capget/capset v3: drop CAP_SYS_ADMIN (bit 21 of word 0)
+                // from effective, permitted and inheritable.
+                let hdr = [0x2008_0522u32, 0];
+                let mut data = [0u32; 6];
+                if syscall2(capnr::CAPGET, hdr.as_ptr() as usize, data.as_mut_ptr() as usize) != 0 { exit(91); }
+                data[0] &= !(1 << 21); data[1] &= !(1 << 21); data[2] &= !(1 << 21);
+                if syscall2(capnr::CAPSET, hdr.as_ptr() as usize, data.as_ptr() as usize) != 0 { exit(92); }
+                if mode == 1 { r = asfree_open_raw(); }
+                else { r = syscall3(nr::WRITE, inherited as usize, b"release 1".as_ptr() as usize, 9); }
+            }
+            let code = (-r) as i32;
+            write(p[1], &code as *const i32 as *const u8, 4);
+            exit(0);
+        }
+        close(p[1]);
+        let mut code = 0i32;
+        let got = read(p[0], &mut code as *mut i32 as *mut u8, 4);
+        close(p[0]);
+        let status = wait_status(pid);
+        if inherited >= 0 { close(inherited as i32); }
+        res[mode] = if got == 4 && status == 0 { code } else { -status.max(1) };
+    }
+    write(STDOUT_FILENO, b"  control_open=".as_ptr(), 15); print_dec((ctl >= 0) as usize);
+    write(STDOUT_FILENO, b" userns_errno=".as_ptr(), 14); print_dec(res[0].max(0) as usize);
+    write(STDOUT_FILENO, b" nocap_open_errno=".as_ptr(), 18); print_dec(res[1].max(0) as usize);
+    write(STDOUT_FILENO, b" nocap_write_errno=".as_ptr(), 19); print_dec(res[2].max(0) as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    let refused = |e: i32| e == 13 || e == 1;
+    report(name, ctl >= 0 && refused(res[0]) && refused(res[1]) && refused(res[2]))
+}
+
+/// Entries for `tgid` in a fresh read of the ring (None: unreadable).
+unsafe fn asfree_count(tgid: i32) -> Option<usize> {
+    let mut a = asfree_new();
+    if asfree_read(&mut a) { Some(asfree_of(&a, tgid as usize).0) } else { None }
+}
+
+/// exec: with a stray strong reference on the old image (`hold`, an observer),
+/// the exec still closes and tears down the displaced image: its entry is in
+/// the ring before the NEW image has reported, and the new image's own exit
+/// makes the second one.
+unsafe fn test_asfree_exec() -> bool {
+    let name = b"asfree_exec\0";
+    let (mut go, mut ready, mut go2) = ([0i32; 2], [0i32; 2], [0i32; 2]);
+    if pipe(go.as_mut_ptr()) != 0 || pipe(ready.as_mut_ptr()) != 0 || pipe(go2.as_mut_ptr()) != 0 { return report(name, false); }
+    let pid = fork();
+    if pid == 0 {
+        close(go[1]); close(ready[0]); close(go2[1]);
+        let mut b = [0u8; 1];
+        read(go[0], b.as_mut_ptr(), 1);
+        let p = mmap(core::ptr::null_mut(), 64 * PAGE, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if p as isize != -1 { for pg in 0..64 { core::ptr::write_volatile(p.add(pg * PAGE), 1); } }
+        let (mut w, mut g) = ([0u8; 16], [0u8; 16]);
+        fmt_num(ready[1] as usize, &mut w); fmt_num(go2[0] as usize, &mut g);
+        let argv = [b"/bin/memtest\0".as_ptr(), b"asfreechild\0".as_ptr(), w.as_ptr(), g.as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/memtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(go[0]); close(ready[1]); close(go2[0]);
+    let armed = asfree_do(b"hold", pid, 0);
+    write(go[1], b"x".as_ptr(), 1);
+    let reported = read_ready(ready[0]);
+    // The new image has reported: the old image's entry must already exist.
+    let before_new_exit = asfree_count(pid).unwrap_or(99);
+    let mut a = asfree_new();
+    let old_pages = if asfree_read(&mut a) { asfree_of(&a, pid as usize).1.pages } else { 0 };
+    write(go2[1], b"x".as_ptr(), 1);
+    let status = wait_status(pid);
+    let at_wait = asfree_count(pid).unwrap_or(99);
+    asfree_do(b"release", pid, 0);
+    close(go[1]); close(ready[0]); close(go2[1]);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" old_image_entries=".as_ptr(), 19); print_dec(before_new_exit);
+    write(STDOUT_FILENO, b" old_pages=".as_ptr(), 11); print_dec(old_pages);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && reported && status == 0 && before_new_exit == 1 && old_pages >= 64 && at_wait == 2)
+}
+
+/// A multithreaded child (leader + 3 parked threads) SIGKILLed with a stray
+/// strong reference on its space: the entry is in the ring at wait4.
+unsafe fn test_asfree_mt_kill() -> bool {
+    let name = b"asfree_mt_kill\0";
+    let mut ready = [0i32; 2];
+    if pipe(ready.as_mut_ptr()) != 0 { return report(name, false); }
+    let pid = fork();
+    if pid == 0 {
+        close(ready[0]);
+        let mut w = [0u8; 16];
+        fmt_num(ready[1] as usize, &mut w);
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"asfree_mt\0".as_ptr(), w.as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(ready[1]);
+    let reported = read_ready(ready[0]);
+    // The exec of the helper already tore down the forked copy of memtest's
+    // space; only entries after this point count.
+    let before = asfree_count(pid).unwrap_or(99);
+    let armed = asfree_do(b"hold", pid, 0);
+    syscall2(nr::KILL, pid as usize, 9);
+    let status = wait_status(pid);
+    let at_wait = asfree_count(pid).unwrap_or(99);
+    asfree_do(b"release", pid, 0);
+    close(ready[0]);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" before=".as_ptr(), 8); print_dec(before);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && reported && status == 9 && at_wait == before + 1)
+}
+
+/// pthread_exit of the LEADER first, the last thread (a worker) later: the
+/// group's one teardown is in the ring at wait4. One worker only, so this is
+/// not the two-threads-exit-at-once case.
+unsafe fn test_asfree_leader_exit_first() -> bool {
+    let name = b"asfree_leader_exit_first\0";
+    let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+    if pipe(ready.as_mut_ptr()) != 0 || pipe(go.as_mut_ptr()) != 0 { return report(name, false); }
+    let pid = fork();
+    if pid == 0 {
+        close(ready[0]); close(go[1]);
+        let (mut w, mut g) = ([0u8; 16], [0u8; 16]);
+        fmt_num(ready[1] as usize, &mut w); fmt_num(go[0] as usize, &mut g);
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"asfree_leader\0".as_ptr(), w.as_ptr(), g.as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(ready[1]); close(go[0]);
+    let reported = read_ready(ready[0]);
+    let before = asfree_count(pid).unwrap_or(99);
+    let armed = asfree_do(b"hold", pid, 0);
+    // Let the leader's pthread_exit land before the last thread is released.
+    usleep(200_000);
+    write(go[1], b"x".as_ptr(), 1);
+    let status = wait_status(pid);
+    let at_wait = asfree_count(pid).unwrap_or(99);
+    asfree_do(b"release", pid, 0);
+    close(ready[0]); close(go[1]);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" before=".as_ptr(), 8); print_dec(before);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && reported && status == 0 && at_wait == before + 1)
+}
+
+
+// ── Late leader: the last members of a group leave while its leader is parked (lane lateleader) ──
+// A leader that pthread_exit()s first stays as a delayed Zombie until the rest
+// of its group is gone; the group is reported when that rest is settled. These
+// cases make the last two members become Zombies together (`exitrace`) and
+// hold the dispatch loop's drop of a removed member open (`dropdelay`), then
+// check everything a parent can observe of the process. Every wait is bounded.
+
+#[cfg(target_arch = "x86_64")]
+mod llnr { pub const SIGPROCMASK: usize = 14; pub const SIGTIMEDWAIT: usize = 128; pub const PPOLL: usize = 271; pub const SIGACTION: usize = 13; }
+#[cfg(target_arch = "aarch64")]
+mod llnr { pub const SIGPROCMASK: usize = 135; pub const SIGTIMEDWAIT: usize = 137; pub const PPOLL: usize = 73; pub const SIGACTION: usize = 134; }
+const LL_PIDFD_OPEN: usize = 434;
+const LL_TOUCHED_PAGES: usize = 2048; // 8 MiB
+
+unsafe fn ll_now_ms() -> u64 {
+    let mut ts = [0u64; 2];
+    syscall2(nr::CLOCK_GETTIME, 1, ts.as_mut_ptr() as usize);
+    ts[0] * 1000 + ts[1] / 1_000_000
+}
+
+unsafe fn ll_sigchld_mask(how: usize) {
+    let set: u64 = 1 << 16;
+    syscall4(llnr::SIGPROCMASK, how, &set as *const u64 as usize, 0, 8);
+}
+
+/// One SIGCHLD consumed within `ms` (0 = poll).
+unsafe fn ll_take_sigchld(ms: usize) -> bool {
+    let set: u64 = 1 << 16;
+    let mut info = [0u8; 128];
+    let ts = [(ms / 1000) as u64, ((ms % 1000) * 1_000_000) as u64];
+    syscall4(llnr::SIGTIMEDWAIT, &set as *const u64 as usize, info.as_mut_ptr() as usize, ts.as_ptr() as usize, 8) as isize == 17
+}
+
+unsafe fn ll_sigchld_ignore(on: bool) {
+    let mut sa = [0u64; 4];
+    sa[0] = if on { 1 } else { 0 };
+    syscall4(llnr::SIGACTION, 17, sa.as_ptr() as usize, 0, 8);
+}
+
+/// `"<verb> <pid> <a> <b>"` written to the asfree file.
+unsafe fn ll_knob(verb: &[u8], pid: i32, a: usize, b: &[u8]) -> bool {
+    let mut cmd = [0u8; 64];
+    let mut p = 0;
+    for &c in verb { cmd[p] = c; p += 1; }
+    for v in [pid as usize, a] {
+        cmd[p] = b' '; p += 1;
+        let mut t = [0u8; 16]; let n = fmt_num(v, &mut t);
+        for i in 0..n { cmd[p] = t[i]; p += 1; }
+    }
+    if !b.is_empty() { cmd[p] = b' '; p += 1; for &c in b { cmd[p] = c; p += 1; } }
+    asfree_cmd(&cmd[..p])
+}
+
+unsafe fn ll_print_kv(k: &[u8], v: usize) {
+    write(STDOUT_FILENO, b" ".as_ptr(), 1);
+    write(STDOUT_FILENO, k.as_ptr(), k.len());
+    write(STDOUT_FILENO, b"=".as_ptr(), 1);
+    print_dec(v);
+}
+
+/// One late-leader case; `race`: (threads, mode) of `exitrace`, `delay_us`:
+/// `dropdelay` (0 = none), `ign`: SIGCHLD ignored (auto-reap) instead of blocked.
+unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize, &[u8])>, delay_us: usize, ign: bool, sig_first: bool) -> bool {
+    let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+    if pipe2(ready.as_mut_ptr(), 0o4000) != 0 || pipe(go.as_mut_ptr()) != 0 { return report(name, false); }
+    ll_sigchld_mask(0);
+    while ll_take_sigchld(0) {}
+    if ign { ll_sigchld_ignore(true); }
+    let pid = fork();
+    if pid == 0 {
+        close(ready[0]); close(go[1]);
+        let (mut w, mut g, mut n) = ([0u8; 16], [0u8; 16], [0u8; 16]);
+        fmt_num(ready[1] as usize, &mut w); fmt_num(go[0] as usize, &mut g); fmt_num(nw, &mut n);
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"late_leader\0".as_ptr(), w.as_ptr(), g.as_ptr(), n.as_ptr(),
+            if lead_waits { b"x\0".as_ptr() } else { core::ptr::null() }, core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    close(ready[1]); close(go[0]);
+    let mut ok = pid > 0;
+    // Ready byte, bounded 5 s.
+    let t0 = ll_now_ms();
+    let mut rb = [0u8; 1];
+    let mut reported = false;
+    while ll_now_ms() - t0 < 5000 {
+        if read(ready[0], rb.as_mut_ptr(), 1) == 1 { reported = true; break; }
+        usleep(1000);
+    }
+    ok &= reported;
+    let pidfd = syscall2(LL_PIDFD_OPEN, pid as usize, 0) as isize;
+    let before = asfree_count(pid).unwrap_or(99);
+    let mut armed = true;
+    if !lead_waits { usleep(200_000); } // the leader is gone and parked
+    if let Some((n, m)) = race { armed &= ll_knob(b"exitrace", pid, n, m); }
+    if delay_us != 0 { armed &= ll_knob(b"dropdelay", pid, delay_us, b""); }
+    ok &= armed;
+    let t1 = ll_now_ms();
+    for _ in 0..(nw + lead_waits as usize) { write(go[1], b"x".as_ptr(), 1); }
+    // The signal (or, ignored, the pid's disappearance) is awaited BEFORE any
+    // wait4: a wait4 poll runs the kernel's own settle scan and can paper over
+    // a group nobody reported. `sig_first = false` is the poll-only variant.
+    let mut sigs = 0usize; let mut stray = 0usize; let mut pollin = false; let mut gone = true;
+    let mut st = -1i32;
+    let mut r: isize = 0;
+    if ign {
+        gone = false;
+        while ll_now_ms() - t1 <= 3000 {
+            if syscall2(nr::KILL, pid as usize, 0) as isize == -3 { gone = true; break; }
+            usleep(500);
+        }
+    } else if sig_first {
+        if ll_take_sigchld(3000) { sigs = 1; }
+    }
+    loop {
+        r = syscall4(nr::WAIT4, pid as usize, &mut st as *mut i32 as usize, 1, 0) as isize;
+        if r != 0 || ll_now_ms() - t1 > 3000 { break; }
+        usleep(500);
+    }
+    let waited_ms = (ll_now_ms() - t1) as usize;
+    let mut a = asfree_new();
+    let (mut cnt, mut last) = if asfree_read(&mut a) { asfree_of(&a, pid as usize) } else { (99, AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }) };
+    if ign {
+        // An auto-reaped group is gone for the parent when its leader is
+        // logged; the leader's space is closed right after, so the ring
+        // entry is awaited (bounded) instead of read once.
+        let t2 = ll_now_ms();
+        while cnt != before + 1 && ll_now_ms() - t2 < 1000 {
+            usleep(1000);
+            if asfree_read(&mut a) { let (c, l) = asfree_of(&a, pid as usize); cnt = c; last = l; }
+        }
+    }
+    if ign {
+        ok &= gone && r == -10 && waited_ms < 500;
+    } else {
+        ok &= r == pid as isize && st == 0 && waited_ms < 500;
+        if !sig_first && ll_take_sigchld(3000) { sigs = 1; }
+        if ll_take_sigchld(200) { stray = 1; }
+        ok &= sigs == 1 && stray == 0;
+        if pidfd >= 0 {
+            let mut pf = [0u8; 8];
+            pf[0..4].copy_from_slice(&(pidfd as i32).to_ne_bytes());
+            pf[4..6].copy_from_slice(&1i16.to_ne_bytes());
+            let ts = [1u64, 0u64];
+            let n = syscall4(llnr::PPOLL, pf.as_mut_ptr() as usize, 1, ts.as_ptr() as usize, 0) as isize;
+            pollin = n == 1 && pf[6] & 1 != 0;
+        }
+        ok &= pollin;
+    }
+    ok &= cnt == before + 1 && last.pages >= LL_TOUCHED_PAGES;
+    if pidfd >= 0 { close(pidfd as i32); }
+    asfree_do(b"release", pid, 0);
+    if !ok && r == 0 { syscall2(nr::KILL, pid as usize, 9); } // best effort, never waited for
+    if ign { ll_sigchld_ignore(false); }
+    close(ready[0]); close(go[1]);
+    ll_sigchld_mask(1);
+    write(STDOUT_FILENO, b" ".as_ptr(), 1);
+    write(STDOUT_FILENO, name.as_ptr(), name.len() - 1);
+    ll_print_kv(b"wait_ret", if r < 0 { 1000 + (-r) as usize } else { r as usize });
+    ll_print_kv(b"status", st as usize);
+    ll_print_kv(b"ms", waited_ms);
+    ll_print_kv(b"ring_before", before); ll_print_kv(b"ring", cnt); ll_print_kv(b"pages", last.pages);
+    ll_print_kv(b"sigchld", sigs); ll_print_kv(b"stray", stray); ll_print_kv(b"pollin", pollin as usize);
+    ll_print_kv(b"gone", gone as usize); ll_print_kv(b"armed", armed as usize);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok)
+}
+
+unsafe fn test_late_leader_all() -> bool {
+    let mut ok = true;
+    ok &= test_late_leader_i1();
+    ok &= test_late_leader_i2();
+    ok &= test_late_leader_i3();
+    ok &= test_late_leader_i2_poll();
+    ok &= test_late_leader_i1_ign();
+    ok &= test_late_leader_i2_ign();
+    ok &= test_late_leader_i3_ign();
+    ok &= test_late_leader_churn();
+    ok
+}
+
+unsafe fn test_late_leader_i1() -> bool { ll_case(b"late_leader_i1\0", 2, false, Some((2, b"w")), 0, false, true) }
+unsafe fn test_late_leader_i2() -> bool { ll_case(b"late_leader_i2\0", 1, true, Some((2, b"l")), 0, false, true) }
+unsafe fn test_late_leader_i3() -> bool { ll_case(b"late_leader_i3\0", 1, true, Some((2, b"l")), 2000, false, true) }
+unsafe fn test_late_leader_i2_poll() -> bool { ll_case(b"late_leader_i2_poll\0", 1, true, Some((2, b"l")), 0, false, false) }
+unsafe fn test_late_leader_i1_ign() -> bool { ll_case(b"late_leader_i1_ign\0", 2, false, Some((2, b"w")), 0, true, false) }
+unsafe fn test_late_leader_i2_ign() -> bool { ll_case(b"late_leader_i2_ign\0", 1, true, Some((2, b"l")), 0, true, false) }
+unsafe fn test_late_leader_i3_ign() -> bool { ll_case(b"late_leader_i3_ign\0", 1, true, Some((2, b"l")), 2000, true, false) }
+
+/// Total threads in the system (`/proc/loadavg` "R/T").
+unsafe fn ll_task_total() -> usize {
+    let mut buf = [0u8; 256];
+    let n = slurp(b"/proc/loadavg\0", &mut buf);
+    let mut sp = 0; let mut i = 0;
+    while i < n && sp < 3 { if buf[i] == b' ' { sp += 1; } i += 1; }
+    while i < n && buf[i] != b'/' { i += 1; }
+    parse_num(&buf[(i + 1).min(n)..n]).unwrap_or(0)
+}
+
+/// 2000 knob-less rounds of a barrier exit (1-3 workers and the leader leave
+/// together), run by `pthreadtest late_leader_churn` with SIGCHLD blocked in
+/// its parent role: no drift in free memory, thread count or SIGCHLD count.
+unsafe fn test_late_leader_churn() -> bool {
+    let name = b"late_leader_churn\0";
+    let (ram0, th0) = (free_ram() / PAGE, ll_task_total());
+    let pid = fork();
+    if pid == 0 {
+        let argv = [b"/bin/pthreadtest\0".as_ptr(), b"late_leader_churn\0".as_ptr(), b"2000\0".as_ptr(), core::ptr::null()];
+        let envp = [core::ptr::null::<u8>()];
+        execve(b"/bin/pthreadtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr());
+        exit(127);
+    }
+    let t0 = ll_now_ms();
+    let mut st = -1i32; let mut r: isize;
+    loop {
+        r = syscall4(nr::WAIT4, pid as usize, &mut st as *mut i32 as usize, 1, 0) as isize;
+        if r != 0 || ll_now_ms() - t0 > 600_000 { break; }
+        usleep(20_000);
+    }
+    if r == 0 { syscall2(nr::KILL, pid as usize, 9); }
+    usleep(300_000);
+    let (ram1, th1) = (free_ram() / PAGE, ll_task_total());
+    let dram = if ram0 > ram1 { ram0 - ram1 } else { 0 };
+    let dth = if th1 > th0 { th1 - th0 } else { 0 };
+    write(STDOUT_FILENO, b"  helper_status=".as_ptr(), 16); print_dec(st as usize);
+    ll_print_kv(b"ram_lost_pages", dram); ll_print_kv(b"threads_gained", dth);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, r == pid as isize && st == 0 && dram <= 512 && dth <= 2)
+}
+
+/// clone(CLONE_VM|CLONE_VFORK|SIGCHLD); the child (sharing this process's
+/// space and, until it execs, its stack: it touches no memory) execve()s
+/// `path` when non-null, else exits 0. Returns the child's pid.
+#[cfg(target_arch = "x86_64")]
+unsafe fn vfork_run(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov eax, 56", "mov edi, 0x4111", "xor esi, esi", "xor edx, edx", "xor r10d, r10d", "xor r8d, r8d",
+        "syscall",
+        "test rax, rax", "jnz 2f",
+        "test r12, r12", "jz 3f",
+        "mov rdi, r12", "mov rsi, r13", "mov rdx, r14", "mov eax, 59", "syscall",
+        "mov edi, 127", "jmp 4f",
+        "3:", "xor edi, edi",
+        "4:", "mov eax, 60", "syscall",
+        "2:",
+        in("r12") path, in("r13") argv, in("r14") envp,
+        lateout("rax") r, out("rdi") _, out("rsi") _, out("rdx") _, out("r10") _, out("r8") _,
+        out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn vfork_run(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
+    let r: i64;
+    core::arch::asm!(
+        "mov x0, #0x4111", "mov x1, xzr", "mov x2, xzr", "mov x3, xzr", "mov x4, xzr", "mov x8, #220",
+        "svc #0",
+        "cbnz x0, 2f",
+        "cbz x9, 3f",
+        "mov x0, x9", "mov x1, x10", "mov x2, x11", "mov x8, #221", "svc #0",
+        "mov x0, #127", "b 4f",
+        "3:", "mov x0, xzr",
+        "4:", "mov x8, #93", "svc #0",
+        "2:",
+        in("x9") path, in("x10") argv, in("x11") envp,
+        lateout("x0") r, out("x1") _, out("x2") _, out("x3") _, out("x4") _, out("x8") _,
+        options(nostack),
+    );
+    r
+}
+
+/// A vfork child shares the parent's address space: its exit, and its exec,
+/// must record NO teardown for that space (nothing for the parent's tgid nor
+/// the child's), while the exec'd image's own exit records its one.
+unsafe fn test_asfree_vfork() -> bool {
+    let name = b"asfree_vfork\0";
+    let me = getpid();
+    let envp = [core::ptr::null::<u8>()];
+    // exit variant
+    let t0 = asfree_new();
+    let mut a0 = t0;
+    if !asfree_read(&mut a0) { return report(name, false); }
+    let parent_before = asfree_of(&a0, me as usize).0;
+    let cpid = vfork_run(core::ptr::null(), core::ptr::null(), envp.as_ptr()) as i32;
+    if cpid <= 0 { return report(name, false); }
+    let st1 = wait_status(cpid);
+    let mut a1 = asfree_new();
+    let ok_read1 = asfree_read(&mut a1);
+    let exit_child_entries = asfree_of(&a1, cpid as usize).0;
+    let exit_parent_delta = asfree_of(&a1, me as usize).0.saturating_sub(parent_before);
+    // exec variant
+    let (mut ready, mut go2) = ([0i32; 2], [0i32; 2]);
+    if pipe(ready.as_mut_ptr()) != 0 || pipe(go2.as_mut_ptr()) != 0 { return report(name, false); }
+    let (mut w, mut g) = ([0u8; 16], [0u8; 16]);
+    fmt_num(ready[1] as usize, &mut w); fmt_num(go2[0] as usize, &mut g);
+    let argv = [b"/bin/memtest\0".as_ptr(), b"asfreechild\0".as_ptr(), w.as_ptr(), g.as_ptr(), core::ptr::null()];
+    let pid2 = vfork_run(b"/bin/memtest\0".as_ptr(), argv.as_ptr(), envp.as_ptr()) as i32;
+    if pid2 <= 0 { return report(name, false); }
+    close(ready[1]);
+    let reported = read_ready(ready[0]);
+    let mut a2 = asfree_new();
+    let ok_read2 = asfree_read(&mut a2);
+    let exec_child_entries = asfree_of(&a2, pid2 as usize).0;
+    let exec_parent_delta = asfree_of(&a2, me as usize).0.saturating_sub(parent_before);
+    write(go2[1], b"x".as_ptr(), 1);
+    let st2 = wait_status(pid2);
+    let at_wait = asfree_count(pid2).unwrap_or(99);
+    close(ready[0]); close(go2[0]); close(go2[1]);
+    write(STDOUT_FILENO, b"  exit: child=".as_ptr(), 14); print_dec(exit_child_entries);
+    write(STDOUT_FILENO, b" parent=".as_ptr(), 8); print_dec(exit_parent_delta);
+    write(STDOUT_FILENO, b" exec: child=".as_ptr(), 13); print_dec(exec_child_entries);
+    write(STDOUT_FILENO, b" parent=".as_ptr(), 8); print_dec(exec_parent_delta);
+    write(STDOUT_FILENO, b" new_image_at_wait=".as_ptr(), 19); print_dec(at_wait);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok_read1 && ok_read2 && reported && st1 == 0 && st2 == 0
+        && exit_child_entries == 0 && exit_parent_delta == 0
+        && exec_child_entries == 0 && exec_parent_delta == 0 && at_wait == 1)
+}
+
+/// Whole-test drift: after a batch of children has come and gone, free RAM +
+/// Cached + Shmem is back within 64 pages, polled up to 5 s (a late free is
+/// allowed to be late, a missing one is not).
+unsafe fn test_wait_memory_drift() -> bool {
+    let name = b"wait_memory_drift\0";
+    let before = ram_plus_cache_pages();
+    let mut ok = true;
+    for _ in 0..30 {
+        let pid = fork();
+        if pid == 0 { teardown_child_body(); }
+        ok &= wait_status(pid) == 0;
+    }
+    let mut drift = before.saturating_sub(ram_plus_cache_pages());
+    let mut tries = 0;
+    while drift >= 64 && tries < 100 {
+        usleep(50_000);
+        drift = before.saturating_sub(ram_plus_cache_pages());
+        tries += 1;
+    }
+    write(STDOUT_FILENO, b"  drift_pages=".as_ptr(), 14); print_dec(drift);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, ok && drift < 64)
 }
 
 

@@ -128,7 +128,11 @@ fn f_queue(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverErro
         (fb.obj, fb.phys, fb.w, fb.h, fb.pitch)
     };
     if src_x >= w || src_y >= h { return Err(DriverError::InvalidParameter); }
-    if !dri::v3d_scanout_wait(obj, 200_000_000) {
+    let (t0, v0) = (sched::monotonic_ns(), crate::hvs_plane::ksync_now());
+    let waited = dri::v3d_scanout_wait(obj, 200_000_000);
+    crate::hvs_plane::stats::record_fence_wait(sched::monotonic_ns().wrapping_sub(t0));
+    crate::hvs_plane::stats::KSYNC.fetch_add(crate::hvs_plane::ksync_now().wrapping_sub(v0), Ordering::Relaxed);
+    if !waited {
         let n = WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
         if kms_v3d::flip_log_due(n) { log("[kms] pi-scanout: BO job wait timed out, presenting anyway\n"); }
     }
@@ -142,7 +146,11 @@ fn f_queue(token: u32, src_x: u32, src_y: u32, ev: u32) -> Result<(), DriverErro
 }
 
 fn f_event(ev: u32) { crate::hvs_plane::event(ev) }
-fn f_busy() -> bool { crate::hvs_plane::busy() }
+fn f_busy() -> bool {
+    let b = crate::hvs_plane::busy();
+    if b { crate::hvs_plane::stats::BUSY_REFUSED.fetch_add(1, Ordering::Relaxed); }
+    b
+}
 fn f_wait(timeout_ns: u64) -> bool { crate::hvs_plane::wait_idle(timeout_ns) }
 
 static HVS_FLIP: gpu_kms::KmsFlip = gpu_kms::KmsFlip { queue: f_queue, event: f_event, busy: f_busy, wait_idle: f_wait, queue_async: None, frame: None, wait_frame: None };
@@ -178,7 +186,11 @@ fn present(token: u32, src_x: u32, src_y: u32, _rects: Option<&[(i32, i32, i32, 
     let sink = sink().ok_or(DriverError::NotFound)?;
     if src_x >= w || src_y >= h { return Err(DriverError::InvalidParameter); }
     // The GPU writes the BO behind the CPU's back: copy only once its last job retired.
-    if !dri::v3d_scanout_wait(obj, 200_000_000) {
+    let (t0, v0) = (sched::monotonic_ns(), crate::hvs_plane::ksync_now());
+    let waited = dri::v3d_scanout_wait(obj, 200_000_000);
+    crate::hvs_plane::stats::record_fence_wait(sched::monotonic_ns().wrapping_sub(t0));
+    crate::hvs_plane::stats::KSYNC.fetch_add(crate::hvs_plane::ksync_now().wrapping_sub(v0), Ordering::Relaxed);
+    if !waited {
         let n = WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
         if kms_v3d::flip_log_due(n) { log("[kms] pi-scanout: BO job wait timed out, presenting anyway\n"); }
     }

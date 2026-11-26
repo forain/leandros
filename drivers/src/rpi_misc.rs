@@ -7,6 +7,8 @@
 //!   `[RTC] rpi ...`            firmware RTC → CLOCK_REALTIME
 //!   `[WDT] bcm2712-pm ...`     wedge watchdog, on by default (`wdt.off=1`)
 //!   `[thermal] ...`            AVS monitor (firmware GET_TEMPERATURE fallback)
+//!   `[power] ...`              undervoltage/throttle changes (GET_THROTTLED, polled 2 s by
+//!                              the board thread; `power.uvolt=off` disables; /proc/thermal `power:`)
 //!   `[cpufreq] rpi ...`        ARM clock min/cur/max + governor (`pi.cpufreq=0` off,
 //!                              `pi.cpufreq=max` pins the max rate)
 //!
@@ -18,7 +20,7 @@ use leandros_lib::mmio::{MmioRd, MmioWr};
 use spin::Mutex;
 
 use crate::pci::serial_debug;
-use crate::rpi_misc_logic::{avs, fw, rng200, Buf, Governor, Regs32};
+use crate::rpi_misc_logic::{avs, fw, rng200, uvolt, Buf, Governor, Regs32};
 
 const RNG_PHYS: u64 = 0x10_7D20_8000;
 const AVS_PHYS: u64 = 0x10_7D54_2000;
@@ -84,6 +86,34 @@ pub fn fw_raw(words: &[u32], out: &mut [u32]) -> Result<usize, i32> {
         Err(_) => Err(-5),
     }
 }
+
+// ── Undervoltage monitor (GET_THROTTLED) ─────────────────────────────────────
+
+static UVOLT: Mutex<uvolt::Monitor> = Mutex::new(uvolt::Monitor::new(false));
+
+fn uvolt_init(cmdline: &str) {
+    if uvolt::knob_off(opt(cmdline, "power.uvolt")) {
+        *UVOLT.lock() = uvolt::Monitor::new(true);
+        serial_debug("[power] undervoltage monitor off (power.uvolt=off)\n");
+        return;
+    }
+    uvolt_poll();
+}
+
+/// One poll from the board thread (never from IRQ context). `fw_tag` is a
+/// bounded mailbox call under the shared firmware lock; the monitor lock is
+/// not held across it.
+pub fn uvolt_poll() {
+    if UVOLT.lock().disabled() { return; }
+    let r = fw_tag(uvolt::GET_THROTTLED, &uvolt::REQUEST).map(|v| v[0]);
+    let out = UVOLT.lock().feed(r, sched::monotonic_ns());
+    if let Some((m, v)) = out {
+        line(|b| uvolt::render(m, v, b));
+    }
+}
+
+/// The `power:` line for `/proc/thermal`.
+pub fn uvolt_report(b: &mut Buf) { UVOLT.lock().report(b); }
 
 static TRIAL_BOOT: AtomicBool = AtomicBool::new(false);
 static TRIAL_CLEARED: AtomicBool = AtomicBool::new(false);
@@ -446,6 +476,7 @@ pub fn boot(cmdline: &str, hhdm_offset: u64) {
     wdt_init(cmdline);
     thermal_init();
     cpufreq_init(cmdline);
+    uvolt_init(cmdline);
     let want_thread = GOV_MODE.load(Ordering::Relaxed) == 1;
     if want_thread && sched::kthread::spawn("pi-house", housekeeping).is_none() {
         serial_debug("[cpufreq] rpi fail kthread\n");
