@@ -55,12 +55,17 @@ pub fn pi5_sdio2_mux() -> Result<Sdio2Mux, i32> {
 }
 /// Drive WL_REG_ON.
 pub fn pi5_wl_on(on: bool) { unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::WL_ON_SET, on as u32, core::ptr::null_mut()); } }
-/// A gio_aon line (the SD host's vqmmc / card power; module `sdhci` only). Err(-19) unavailable, Err(-1) not that module.
-pub fn pi5_aon_get(line: u32) -> Result<bool, i32> {
-    match unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::AON_GET, line, core::ptr::null_mut()) } { v if v >= 0 => Ok(v != 0), e => Err(e) }
+/// The SD host's vqmmc 1.8 V select (module `sdhci` only). Err(-19) unavailable, Err(-1) not that module.
+pub fn pi5_sd_io_1v8_get() -> Result<bool, i32> { sd_get(pi5_pins::SD_IO_1V8_GET) }
+pub fn pi5_sd_io_1v8_set(on: bool) -> Result<(), i32> { sd_set(pi5_pins::SD_IO_1V8_SET, on) }
+/// The SD card power switch (module `sdhci` only).
+pub fn pi5_sd_power_get() -> Result<bool, i32> { sd_get(pi5_pins::SD_POWER_GET) }
+pub fn pi5_sd_power_set(on: bool) -> Result<(), i32> { sd_set(pi5_pins::SD_POWER_SET, on) }
+fn sd_get(op: u32) -> Result<bool, i32> {
+    match unsafe { sys_plat::kapi_pi5_pins(crate::owner(), op, 0, core::ptr::null_mut()) } { v if v >= 0 => Ok(v != 0), e => Err(e) }
 }
-pub fn pi5_aon_set(line: u32, on: bool) -> Result<(), i32> {
-    match unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::AON_SET, (line & 0xFF) | (on as u32) << 8, core::ptr::null_mut()) } { 0 => Ok(()), e => Err(e) }
+fn sd_set(op: u32, on: bool) -> Result<(), i32> {
+    match unsafe { sys_plat::kapi_pi5_pins(crate::owner(), op, on as u32, core::ptr::null_mut()) } { 0 => Ok(()), e => Err(e) }
 }
 /// The WL_REG_ON line is usable.
 pub fn pi5_wl_on_ready() -> bool { unsafe { sys_plat::kapi_pi5_pins(crate::owner(), pi5_pins::WL_ON_READY, 0, core::ptr::null_mut()) == 0 } }

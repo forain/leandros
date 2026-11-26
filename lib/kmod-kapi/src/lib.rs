@@ -246,11 +246,11 @@ pub mod mm {
     /// Physical address of a direct-map address (0 for a module-image address: not DMA-able).
     pub fn virt_to_phys(va: usize) -> usize { super::sys_common::virt_to_phys(va).unwrap_or(0) as usize }
 
-    /// The kernel's `mm::dma_cache` clean / invalidate over `kapi_dma_sync` (dir 3 / 4; no-ops off aarch64).
+    /// The kernel's `mm::dma_cache` clean / invalidate over `kapi_dma_sync` (`dma_dir::CLEAN` / `INVALIDATE`; no-ops off aarch64).
     /// `va` is a direct-map or `kva` window address.
     pub mod dma_cache {
-        pub fn clean_range(va: usize, len: usize) { crate::sys_common::dma_sync(va, len, 3) }
-        pub fn invalidate_range(va: usize, len: usize) { crate::sys_common::dma_sync(va, len, 4) }
+        pub fn clean_range(va: usize, len: usize) { crate::sys_common::dma_sync(va, len, kmod_abi::plat::dma_dir::CLEAN) }
+        pub fn invalidate_range(va: usize, len: usize) { crate::sys_common::dma_sync(va, len, kmod_abi::plat::dma_dir::INVALIDATE) }
     }
 
     pub mod paging {

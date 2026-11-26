@@ -24,11 +24,11 @@ mod bcm2712_gpio {
     pub enum Chip { Gio, GioAon }
     pub fn gpio_get(chip: Chip, line: u32) -> Result<bool, i32> {
         if chip != Chip::GioAon { return Err(-19); }
-        kmod_kapi::plat::pi5_aon_get(line)
+        match line { 3 => kmod_kapi::plat::pi5_sd_io_1v8_get(), 4 => kmod_kapi::plat::pi5_sd_power_get(), _ => Err(-22) }
     }
     pub fn gpio_set_output(chip: Chip, line: u32, on: bool) -> Result<(), i32> {
         if chip != Chip::GioAon { return Err(-19); }
-        kmod_kapi::plat::pi5_aon_set(line, on)
+        match line { 3 => kmod_kapi::plat::pi5_sd_io_1v8_set(on), 4 => kmod_kapi::plat::pi5_sd_power_set(on), _ => Err(-22) }
     }
 }
 #[cfg(feature = "rpi5")]
