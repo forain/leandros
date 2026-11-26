@@ -55,7 +55,7 @@ pub mod pi5_pins {
 /// `kapi_msix_disable` policy, pure. `table_owner` = who enabled the table (0 none), `caller` = normalised caller
 /// (0 = no running generation), `live_handles` = MSI-X handles of the function still held.
 /// Err(-1) not the owner (EPERM-style), Err(-16) EBUSY.
-pub fn msix_disable_verdict(table_owner: Option<u32>, caller: u32, live_handles: bool) -> Result<(), i32> {
+pub fn msix_disable_verdict(table_owner: Option<u16>, caller: u16, live_handles: bool) -> Result<(), i32> {
     match table_owner {
         None => Err(-19),
         Some(o) if caller == 0 || o != caller => Err(-1),
