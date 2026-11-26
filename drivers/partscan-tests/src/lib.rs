@@ -134,6 +134,21 @@ mod tests {
     }
 
     #[test]
+    fn usbroot_stick_layout_root_p1_home_p2_log_p3() {
+        // scripts/write-usb-rpi5.py: root 0x83 (p1), home 0x83 (p2), log 0xDA (p3).
+        let mut d = Disk::new(SS, 1 << 20);
+        d.at(0)[440..444].copy_from_slice(&0x1234_ABCDu32.to_le_bytes());
+        mbr_entry(&mut d, 0, 0x00, 0x83, 2048, 4096);
+        mbr_entry(&mut d, 1, 0x00, 0x83, 6144, 4096);
+        mbr_entry(&mut d, 2, 0x00, 0xDA, 10240, 2048);
+        let r = d.scan();
+        assert_eq!(r.parts.len(), 3);
+        assert!(r.parts[0].uuid.matches("1234abcd-01"));
+        assert!(r.parts[2].ptype.is_log());
+        assert!(!r.parts[0].ptype.is_log() && !r.parts[1].ptype.is_log());
+    }
+
+    #[test]
     fn mbr_entry_past_end_is_dropped() {
         let mut d = Disk::new(SS, 10_000);
         mbr_entry(&mut d, 0, 0, 0x83, 2048, 20_000);

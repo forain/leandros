@@ -1,0 +1,4 @@
+		hdmi0: hdmi@7c701400 {
+			dmas = <0x16 0x41fa000c>;
+		hdmi1: hdmi@7c706400 {
+			dmas = <0x16 0x41fa000d>;

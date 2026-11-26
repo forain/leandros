@@ -11,14 +11,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 board="${CHECK_FEATURE:-rpi5}"
+# CHECK_PROFILE=usbroot: Pi 5 with no SD driver (configs/rpi5_usbroot_defconfig).
+profile="$board"
+if [[ "${CHECK_PROFILE:-}" == "usbroot" ]]; then board=rpi5; profile=rpi5_usbroot; fi
 arch=aarch64
-kdir="$ROOT_DIR/target/kconfig-check-$board"
+kdir="$ROOT_DIR/target/kconfig-check-$profile"
 mkdir -p "$kdir"
 if [[ -f "$ROOT_DIR/.config" ]]; then
-    cat "$ROOT_DIR/configs/${board}_defconfig" "$ROOT_DIR/.config" > "$kdir/.config.in"
+    cat "$ROOT_DIR/configs/${profile}_defconfig" "$ROOT_DIR/.config" > "$kdir/.config.in"
     python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" olddefconfig --arch "$arch" --config "$kdir/.config.in" --out "$kdir/.config" >&2
 else
-    python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" defconfig --arch "$arch" --defconfig "$ROOT_DIR/configs/${board}_defconfig" --out "$kdir/.config" >&2
+    python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" defconfig --arch "$arch" --defconfig "$ROOT_DIR/configs/${profile}_defconfig" --out "$kdir/.config" >&2
 fi
 kc="$(python3 "$ROOT_DIR/scripts/kconfig/to-cargo.py" features --arch "$arch" --config "$kdir/.config" --kmod-list "$kdir/kmod-list")"
 feats="$board"
@@ -29,7 +32,7 @@ spec="$ROOT_DIR/targets/aarch64-unknown-kernel.json"
 rc=0
 RUSTFLAGS="-C link-arg=-T$ROOT_DIR/linkers/aarch64.ld" \
 cargo check -p kernel --features "$feats" --target "$spec" \
-    --target-dir "target/check-aarch64-$board" --release \
+    --target-dir "target/check-aarch64-$profile" --release \
     -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec \
     >"$kdir/check.log" 2>&1 || rc=$?
 tail -n "${CHECK_TAIL:-20}" "$kdir/check.log"
@@ -45,4 +48,13 @@ fi
 # must pass sdgrant::issue, via send_command or gated_cmd).
 bad="$(grep -n 'REG_COMMAND' "$ROOT_DIR/drivers/src/sdhci.rs" | grep -E '\.w(16|32)\(REG_COMMAND' || true)"
 if [[ -n "$bad" ]]; then echo "$bad"; echo "check-rpi5: ungated REG_COMMAND write in sdhci.rs FAILED"; rc=1; else echo "check-rpi5: REG_COMMAND only written via the grant gate ok"; fi
+
+# The hdmi-audio module compiles the built-in driver source against the kmod-kapi shim: a
+# private-module re-export or a kapi drift there is invisible to `cargo check -p kernel`.
+if RUSTFLAGS= cargo build -p kmod-hdmi-audio --target "$spec" --target-dir "$ROOT_DIR/target/kmod-build" --release \
+    -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec >"$kdir/kmod-hdmi-audio.log" 2>&1; then
+    echo "check-rpi5: kmod-hdmi-audio builds"
+else
+    grep -E '^error' -A6 "$kdir/kmod-hdmi-audio.log" | head -n 30; echo "check-rpi5: kmod-hdmi-audio build FAILED"; rc=1
+fi
 exit "$rc"

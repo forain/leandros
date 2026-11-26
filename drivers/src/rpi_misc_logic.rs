@@ -205,6 +205,137 @@ pub mod fw {
     pub fn rtc_plausible(secs: u32) -> bool { secs >= RTC_SANE_MIN }
 }
 
+// ── Undervoltage / throttling monitor (firmware GET_THROTTLED) ───────────────
+
+/// Pure state machine behind the `[power]` log lines and `/proc/thermal`'s
+/// `power:` line. Firmware tag 0x00030046 (Linux raspberrypi-hwmon): bits 0..3
+/// are the live state (under-voltage, ARM frequency capped, throttled, soft
+/// temperature limit), bits 16..19 the same conditions "has occurred" (sticky
+/// since the firmware booted). The request carries one 32-bit value that Linux
+/// uses as a mask of sticky bits to clear; we send 0 and never clear.
+pub mod uvolt {
+    use super::Buf;
+
+    pub const GET_THROTTLED: u32 = 0x0003_0046;
+    /// Request value words: 0 = clear no sticky bits.
+    pub const REQUEST: [u32; 1] = [0];
+
+    pub const UNDER_NOW: u32 = 1 << 0;
+    pub const FREQ_CAP_NOW: u32 = 1 << 1;
+    pub const THROTTLED_NOW: u32 = 1 << 2;
+    pub const SOFT_TEMP_NOW: u32 = 1 << 3;
+    pub const LIVE_MASK: u32 = 0xf;
+    pub const STICKY_SHIFT: u32 = 16;
+    pub const UNDER_OCCURRED: u32 = UNDER_NOW << STICKY_SHIFT;
+
+    /// Poll period in milliseconds.
+    pub const POLL_MS: u64 = 2_000;
+    /// Consecutive mailbox failures before the monitor switches itself off.
+    pub const MAX_FAILS: u32 = 3;
+    /// Minimum spacing of log lines.
+    pub const LOG_MIN_NS: u64 = 10_000_000_000;
+
+    pub fn live(v: u32) -> u32 { v & LIVE_MASK }
+    pub fn sticky(v: u32) -> u32 { (v >> STICKY_SHIFT) & LIVE_MASK }
+    pub fn undervolt_now(v: u32) -> bool { v & UNDER_NOW != 0 }
+    pub fn undervolt_occurred(v: u32) -> bool { v & UNDER_OCCURRED != 0 }
+    pub fn freq_capped(v: u32) -> bool { v & FREQ_CAP_NOW != 0 }
+    pub fn throttled(v: u32) -> bool { v & THROTTLED_NOW != 0 }
+    pub fn soft_temp(v: u32) -> bool { v & SOFT_TEMP_NOW != 0 }
+
+    /// `power.uvolt=off` (or `0`).
+    pub fn knob_off(v: Option<&str>) -> bool { matches!(v, Some("off") | Some("0")) }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Msg { BootOk, BootOccurred, Under, Normal, Changed, Disabled }
+
+    pub fn render(m: Msg, v: u32, b: &mut Buf) {
+        match m {
+            Msg::BootOk => { b.s("[power] voltage ok"); }
+            Msg::BootOccurred => { b.s("[power] voltage normal, undervoltage occurred since firmware boot"); }
+            Msg::Under => { b.s("[power] undervoltage detected"); }
+            Msg::Normal => { b.s("[power] voltage normal"); }
+            Msg::Changed => { b.s("[power] throttle state changed"); }
+            Msg::Disabled => { b.s("[power] undervoltage monitor disabled: firmware mailbox failed"); return; }
+        }
+        b.s(" (throttled=").x(v as u64).s(")");
+    }
+
+    pub struct Monitor {
+        disabled: bool,
+        fails: u32,
+        last: Option<u32>,
+        logged_live: Option<u32>,
+        last_log_ns: Option<u64>,
+        events: u32,
+        last_event_ns: Option<u64>,
+    }
+
+    impl Monitor {
+        pub const fn new(off: bool) -> Self {
+            Monitor { disabled: off, fails: 0, last: None, logged_live: None, last_log_ns: None, events: 0, last_event_ns: None }
+        }
+        pub fn disabled(&self) -> bool { self.disabled }
+        pub fn events(&self) -> u32 { self.events }
+        pub fn last_event_ns(&self) -> Option<u64> { self.last_event_ns }
+        pub fn live(&self) -> Option<u32> { self.last.map(live) }
+        pub fn sticky(&self) -> Option<u32> { self.last.map(sticky) }
+
+        /// Feed one poll result (`None` = mailbox failure). Returns a line to log.
+        pub fn feed(&mut self, r: Option<u32>, now_ns: u64) -> Option<(Msg, u32)> {
+            if self.disabled { return None; }
+            let Some(v) = r else {
+                self.fails += 1;
+                if self.fails >= MAX_FAILS {
+                    self.disabled = true;
+                    return Some((Msg::Disabled, 0));
+                }
+                return None;
+            };
+            self.fails = 0;
+            let prev = self.last;
+            self.last = Some(v);
+            // Event: live under-voltage rising edge, or the sticky bit newly
+            // set with no live edge (a dip between two polls). A sticky bit
+            // already set at the first read predates this monitor: not counted.
+            let rose = undervolt_now(v) && !prev.map_or(false, undervolt_now);
+            let dipped = prev.map_or(false, |p| !undervolt_occurred(p)) && undervolt_occurred(v);
+            if rose || dipped {
+                self.events += 1;
+                self.last_event_ns = Some(now_ns);
+            }
+            let lv = live(v);
+            if self.logged_live == Some(lv) { return None; }
+            if let Some(t) = self.last_log_ns {
+                if now_ns.saturating_sub(t) < LOG_MIN_NS { return None; }
+            }
+            let first = self.logged_live.is_none();
+            let was_under = self.logged_live.map_or(false, |l| l & UNDER_NOW != 0);
+            self.logged_live = Some(lv);
+            self.last_log_ns = Some(now_ns);
+            let m = if lv & UNDER_NOW != 0 && !was_under { Msg::Under }
+                else if first { if undervolt_occurred(v) { Msg::BootOccurred } else { Msg::BootOk } }
+                else if was_under && lv & UNDER_NOW == 0 { Msg::Normal }
+                else { Msg::Changed };
+            Some((m, v))
+        }
+
+        /// `power:` line for `/proc/thermal`.
+        pub fn report(&self, b: &mut Buf) {
+            let Some(v) = self.last else {
+                b.s(if self.disabled { "power: disabled\n" } else { "power: no data\n" });
+                return;
+            };
+            b.s("power: throttled=").x(v as u64).s(" live=").x(live(v) as u64)
+                .s(" sticky=").x(sticky(v) as u64)
+                .s(" undervolt_events=").u(self.events as u64);
+            if let Some(t) = self.last_event_ns { b.s(" last_event_s=").u(t / 1_000_000_000); }
+            if self.disabled { b.s(" (monitor stopped)"); }
+            b.s("\n");
+        }
+    }
+}
+
 // ── cpufreq governor (ondemand-style, two-level) ─────────────────────────────
 
 /// Decides the ARM clock from periodic load samples. A sample is "busy" when

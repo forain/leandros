@@ -1,0 +1,7 @@
+# Raspberry Pi 5, USB-root profile: no SD/eMMC driver at all.
+# The root is a USB stick (usb-storage built in, runtime blkdev registry).
+# Select with RPI5_USBROOT=1 ./scripts/build-all.sh --rpi5. Never =m on this board.
+CONFIG_BOARD_RPI5=y
+# CONFIG_SDHCI is not set
+CONFIG_USB_STORAGE=y
+# CONFIG_VIRTIO_BLK is not set

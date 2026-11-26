@@ -34,6 +34,7 @@ Options:
                              busdact  busd activation contract, no portal (slow service waited for, exit -> Spawn.ChildExited, never claims -> TimedOut at 120 s); ~2.5 min
                              portalshot host:portalshottest.py alone (live COSMIC session: portal Screenshot returns response 0 and a non-empty PNG)
                              cmdline  host:cmdlinetest.py alone (>1500-byte kernel command line: the last knob reaches /proc/cmdline; over-long line warns)
+                             rootstrict host:rootstricttest.py alone (named root= on a USB stick never falls back to vdb; rootwait, root.fail=reboot, hot-add, two sticks)
                              rootpick host:rootpicktest.py alone (extra modern virtio disk ahead: root still found by LABEL)
                              net-e2e  netctltest + nmtest (mock, full and --ro) + host:nmrealtest.py
                                       (the NM shim on the real /dev/netctl + wifi_sim stack, own boot)
@@ -508,6 +509,7 @@ SUITES = {
              "host:pagecache-crashtest.py", "host:usbunplugtest.py", "host:powerctltest.py",
              "host:f2fsfulltest.py", "host:trialwatchtest.py"],
     "rootpick": ["host:rootpicktest.py"],
+    "rootstrict": ["host:rootstricttest.py"],
     "cmdline": ["host:cmdlinetest.py"],
     # Dead local LAPIC tick (lane deadtimer): the kernel stalls 15 ms inside the one-shot -> periodic
     # switch on cpu1 (x86_64; own boot via cmdline timer.dead_delay=1); the CPU's tick must survive.
@@ -601,7 +603,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
+HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600}
 
