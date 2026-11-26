@@ -21,7 +21,7 @@ if [[ -s "$ROOT/target/kconfig-$arch/kmod-list" ]]; then
 fi
 extra="${KMOD_EXTRA:-}"
 if [[ " $extra " == *" all "* ]]; then
-    extra="$(printf '%s\n' $extra | grep -vx all | tr '\n' ' ')"
+    extra="$(printf '%s\n' $extra | { grep -vx all || true; } | tr '\n' ' ')"
     # Per-arch exclusions: crates whose driver source only exists on the other architecture. Keep this short.
     case "$arch" in
         x86_64) skip=" v3d " ;;   # Pi 5 V3D (driver module gated on aarch64)
