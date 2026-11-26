@@ -486,7 +486,7 @@ def main():
         "waittest", "sigchldtest", "sigtest2", "jobtest", "exectest", "scmtest", "epolltest", "wakepolltest", "smpwaketest", "idletest", "drmsmoke", "gpuqtest", "evtest2", "uinputtest", "evsplit", "vttest", "venustest", "i915test",
         "mount", "umount", "fstab", "lsblk", "lspci", "lsusb", "ping", "xattr",
         "meminfo", "dbusprobe", "uptrtest", "strtest", "loadkmap", "privtest", "memcpybench-musl", "nettest", "ip6test", "netlinktest", "nfttest", "udpselftest", "udptest", "pollnarrow", "listentag", "vfstag", "nettag2", "kparks", "netcheck", "ec2init", "fsbench", "pcachetest",
-        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "execdev", "chroottest", "nstest", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "inotifytest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "exitracetest", "exitwrap", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest", "w", "users", "lastlog", "utmptest",
+        "sndtest", "syscalltest", "uaccesstest", "camtest", "proctest", "proctest-cold.bin", "execdev", "chroottest", "nstest", "leakns", "tuntest", "brtest", "cgtest", "ovltest", "ovlmknodtest", "idmaptest", "inotifytest", "captest", "mnttest", "seccomptest", "bpftest", "preadtest", "kexectest", "memfdtest", "conmontest", "exitracetest", "exitwrap", "kexec", "kmodctl", "kmodctltest", "suspendtest", "serrx", "netctl", "netctltest", "ps", "pstest", "btd", "btctl", "bttest", "bthid", "fusetest", "w", "users", "lastlog", "utmptest",
     ]
     for b in bins:
         p = os.path.join(userland_dir, b)

@@ -26,10 +26,11 @@ stage_alpine() {
   leandros_pick_alpine || { echo "no Alpine backend: $ALPINE_WHY"; return 1; }
   SNAP=$(mktemp -d "${TMPDIR:-/tmp}/e2fsprogs-port-src.XXXXXX")
   cp "$HERE/build-in-alpine.sh" "$HERE"/patches/*.patch "$ROOT/ports/mesa/ssp_guard.c" "$SNAP/"
-  leandros_alpine_run --arch "$ARCH" -v "$SNAP:/src:ro" -v "$OUT:/out" \
-      -- sh /src/build-in-alpine.sh "$ARCH" > "$OUT/$ARCH.alpine.log" 2>&1 || true
+  _rc=0
+  leandros_alpine_stage "$OUT/$ARCH.alpine.log" --arch "$ARCH" -v "$SNAP:/src:ro" -v "$OUT:/out" \
+      -- sh /src/build-in-alpine.sh "$ARCH" || _rc=1
   rm -rf "$SNAP"
-  tail -1 "$OUT/$ARCH.alpine.log" | grep -q '=== rc=0 '
+  return $_rc
 }
 
 rc=0

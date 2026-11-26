@@ -172,6 +172,11 @@ pub fn flush_all_disks() -> (usize, usize) {
     (ok, bad)
 }
 
+pub fn flush_all_disks_tally() -> crate::flush_logic::FlushTally {
+    let (ok, bad) = flush_all_disks();
+    crate::flush_logic::FlushTally { ok, unsupported: 0, failed: bad }
+}
+
 /// `LABEL=` / `PARTUUID=` mount sources are not resolved on the SD-card
 /// build (no partition registry): `None` lets the caller fall back to a
 /// plain device path.

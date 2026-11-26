@@ -126,18 +126,12 @@ esac
     exit 4
   fi
   TARB=/out/e2fsprogs-$E2V.tar.xz
-  if [ ! -s "$TARB" ]; then
-    apk add --no-cache wget xz ca-certificates >/dev/null
-    net_wget -q -O "$TARB.part" "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz"
-    mv "$TARB.part" "$TARB"
-  fi
-  # Pinned from kernel.org's signed sha256sums.asc (v$E2V, fetched over https);
-  # a cached or downloaded tarball that does not match is refused and removed.
+  # sha256 pinned here (kernel.org's signed sha256sums.asc, v$E2V); net_fetch_verified
+  # reuses TARB or the shared distfile cache when it matches, else downloads and
+  # refuses a file that does not.
   E2SHA=fd5bf388cbdbe006a3d3b318d983b2948382440acc85a87f1e7d108653e8db0b
-  if [ "$(sha256sum "$TARB" | cut -d' ' -f1)" != "$E2SHA" ]; then
-    echo "e2fsprogs-$E2V.tar.xz sha256 mismatch (want $E2SHA); refusing" >&2
-    rm -f "$TARB" "$TARB.part"; exit 4
-  fi
+  apk add --no-cache wget xz ca-certificates >/dev/null
+  net_fetch_verified "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$E2V/e2fsprogs-$E2V.tar.xz" "$TARB" "$E2SHA" || exit 1
   apk add --no-cache xz patch make pkgconf linux-headers util-linux-dev >/dev/null
   [ "$(uname -m)" = "$ARCH" ] || $APK add --no-cache util-linux-dev >/dev/null
   B=/tmp/e2fs-build-$ARCH

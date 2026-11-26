@@ -204,6 +204,7 @@ if scripts/toolchain/ensure.sh "${ZT%%-*}"; then
     # serrx: framed, ACKed file receiver over the serial console (scripts/pi-serial-push.py).
     echo "[userland] Building nstest (clang $ZT)..."
     "$CCT" -O2 -s -Wall -o "${OUT}/nstest" userland/nstest/nstest.c
+    "$CCT" -O2 -s -Wall -o "${OUT}/leakns" userland/leakns/leakns.c
     echo "[userland] Building tuntest (clang $ZT)..."
     "$CCT" -O2 -s -Wall -o "${OUT}/tuntest" userland/tuntest/tuntest.c
     echo "[userland] Building brtest (clang $ZT)..."

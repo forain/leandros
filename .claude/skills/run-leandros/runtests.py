@@ -384,6 +384,7 @@ SUITES = {
     # socket_vmnet (192.168.105.x); LEANDROS_NET=user forces slirp. Its DNS
     # cases resolve example.com, so the host needs internet access.
     "busdact": ["/usr/libexec/leandros-sysbus activation-test"],
+    "leakdns": ["/bin/leakns 16", "/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus pk-test"],
     "pktest": ["/bin/sh /usr/bin/dbus-run-session -- /usr/libexec/leandros-sysbus pk-test"],
     "net": ["/bin/nettest"],
     "netlink": ["/bin/netlinktest"],

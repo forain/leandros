@@ -42,10 +42,11 @@ stage_alpine() {
     MNT="$MNT -v $d:/imglib/$n:ro"; n=$((n + 1))
   done
   # shellcheck disable=SC2086
-  leandros_alpine_run --arch "$PLAT" $MNT -v "$SNAP:/src:ro" -v "$OUT:/out" \
-      -- sh /src/build-in-alpine.sh "$ARCH" > "$OUT/$ARCH.alpine.log" 2>&1 || true
+  _rc=0
+  leandros_alpine_stage "$OUT/$ARCH.alpine.log" --arch "$PLAT" $MNT -v "$SNAP:/src:ro" -v "$OUT:/out" \
+      -- sh /src/build-in-alpine.sh "$ARCH" || _rc=1
   rm -rf "$SNAP"
-  tail -1 "$OUT/$ARCH.alpine.log" | grep -q '=== rc=0 '
+  return $_rc
 }
 
 
