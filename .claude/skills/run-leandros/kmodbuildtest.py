@@ -28,11 +28,12 @@ bad = 0
 for name, extra in runs:
     env = dict(os.environ, KMOD_STRICT="1", KMOD_OUT=os.path.join(REPO, "target", "kmod-check", arch), **extra)
     r = subprocess.run([os.path.join(REPO, "scripts/kmod/kmod-build.sh"), arch], cwd=REPO, env=env,
-                       capture_output=True, text=True)
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode:
         bad += 1
         print(f"FAIL kmodbuild_{arch}_{name}")
-        print((r.stderr or "")[-3000:] + (r.stdout or "")[-500:])
+        print(f"rc={r.returncode}; last 40 lines of kmod-build.sh output:")
+        print("\n".join((r.stdout or "").splitlines()[-40:]))
     else:
-        print(f"PASS kmodbuild_{arch}_{name}: " + r.stdout.strip().splitlines()[-1])
+        print(f"PASS kmodbuild_{arch}_{name}: " + (r.stdout.strip().splitlines() or ["ok"])[-1])
 sys.exit(1 if bad else 0)
