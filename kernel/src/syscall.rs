@@ -5991,7 +5991,8 @@ fn sys_madvise(addr: usize, len: usize, advice: usize) -> isize {
     const MADV_DONTFORK: usize = 10;
     const MADV_DOFORK: usize = 11;
     if addr & 0xFFF != 0 { return -22; } // EINVAL
-    if (advice == MADV_DONTFORK || advice == MADV_DOFORK) && len != 0 {
+    // Gated on drv-kvm: a default build keeps the silent no-op of main (ungating needs a forktest).
+    if cfg!(feature = "drv-kvm") && (advice == MADV_DONTFORK || advice == MADV_DOFORK) && len != 0 {
         return match with_current_address_space_mut(|as_| as_.set_dontfork(addr, len, advice == MADV_DONTFORK)) {
             Some(true)  => 0,
             Some(false) => -12,
