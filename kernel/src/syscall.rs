@@ -5979,7 +5979,16 @@ fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// may ignore, MADV_FREE included (its contract allows the old data to stay).
 fn sys_madvise(addr: usize, len: usize, advice: usize) -> isize {
     const MADV_DONTNEED: usize = 4;
+    const MADV_DONTFORK: usize = 10;
+    const MADV_DOFORK: usize = 11;
     if addr & 0xFFF != 0 { return -22; } // EINVAL
+    if (advice == MADV_DONTFORK || advice == MADV_DOFORK) && len != 0 {
+        return match with_current_address_space_mut(|as_| as_.set_dontfork(addr, len, advice == MADV_DONTFORK)) {
+            Some(true)  => 0,
+            Some(false) => -12,
+            None        => -22,
+        };
+    }
     if advice != MADV_DONTNEED || len == 0 { return 0; }
     match with_current_address_space_mut(|as_| as_.discard_range(addr, len)) {
         Some(true)  => 0,
