@@ -333,8 +333,7 @@ fn handle_exit(vm: &Arc<Vm>, v: &Arc<Vcpu>, hw: &mut VcpuHw, run: *mut KvmRun, r
         }
         Exit::SysReg(t) => {
             // GICv3 SGI generation traps (HCR_EL2.IMO): ICC_SGI1R/ASGI1R/SGI0R.
-            if !t.is_read && t.op0 == 3 && t.crn == 12 && t.crm == 11
-                && matches!((t.op1, t.op2), (0, 5) | (1, 6) | (0, 7)) {
+            if t.is_sgi_write() {
                 let val = if t.rt == 31 { 0 } else { hw.gp[t.rt as usize] };
                 let kicks = vm.vgic.lock().as_mut().map(|g| g.inject_sgi(v.id as usize, val));
                 match kicks {

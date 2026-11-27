@@ -58,6 +58,15 @@ pub struct SysRegTrap {
     pub is_read: bool,
 }
 
+impl SysRegTrap {
+    /// A write to one of the GICv3 SGI generation registers: ICC_SGI1R_EL1 (3,0,12,11,5),
+    /// ICC_ASGI1R_EL1 (3,1,12,11,6) or ICC_SGI0R_EL1 (3,2,12,11,7).
+    pub fn is_sgi_write(&self) -> bool {
+        !self.is_read && self.op0 == 3 && self.crn == 12 && self.crm == 11
+            && matches!((self.op1, self.op2), (0, 5) | (1, 6) | (2, 7))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
     /// WFI (`is_wfe` false) or WFE.

@@ -135,3 +135,14 @@ fn layout() {
     let h = VcpuHw::new(3, HostRegs::zeroed());
     assert_eq!((h.vmpidr, h.pstate), (0x8000_0003, 0x3c5));
 }
+
+#[test]
+fn sgi_register_decode() {
+    use kvm::esr::SysRegTrap;
+    let t = |op1, crm, op2, is_read| SysRegTrap { op0: 3, op1, crn: 12, crm, op2, rt: 0, is_read };
+    assert!(t(0, 11, 5, false).is_sgi_write()); // ICC_SGI1R_EL1
+    assert!(t(1, 11, 6, false).is_sgi_write()); // ICC_ASGI1R_EL1
+    assert!(t(2, 11, 7, false).is_sgi_write()); // ICC_SGI0R_EL1
+    assert!(!t(0, 11, 7, false).is_sgi_write()); // the old, wrong SGI0R encoding
+    assert!(!t(0, 11, 5, true).is_sgi_write());
+}
