@@ -142,6 +142,17 @@ pub fn clone_as_step(src: &mut AddressSpace, c: &mut CloneCursor, budget_pages: 
             Some(r) => r,
             None    => { c.region += 1; c.page = 0; continue; }
         };
+        // MADV_DONTFORK: the child gets nothing here, and the parent's
+        // frames (hypervisor guest RAM) are never downgraded to CoW.
+        if region.map_flags & crate::vmm::MAP_DONTFORK != 0 {
+            c.region += 1; c.page = 0;
+            continue;
+        }
+        // A forked-from page becomes read-only: a hypervisor mapping it
+        // writable in stage 2 must drop it first (once per region).
+        if c.page == 0 {
+            crate::vmm::notify_range_invalidate(src_root, region.start, region.end - region.start);
+        }
         let dst_slot = &mut c.dst.regions[ri];
 
         let is_shared = region.map_flags & MAP_SHARED != 0;

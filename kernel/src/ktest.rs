@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 5] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw"];
+const EXTRA: [&str; 6] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw", "kvmmem"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -83,6 +83,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
             "gpulock" => t_gpulock(),
+            "kvmmem" => t_kvmmem(),
             "spinfw" => t_spinfw(fw.as_deref()),
             _ => continue,
         };
@@ -2176,4 +2177,74 @@ fn kmodkapi_k2b(t: &mut T) {
     let m2 = exports::kapi_irqs_masked();
     exports::kapi_irq_restore(f1);
     t.check(m1 && m2 && exports::kapi_irqs_masked() == was, "k2b: irq_save masks, nested restore keeps mask, outer restore returns to the prior state");
+}
+
+// ── kvmmem: pin_user_page / unpin / range-invalidate hook / MADV_DONTFORK ─────
+// Opt-in (`ktest=kvmmem`). Uses a private AddressSpace (never installed), so it
+// needs no user process: pages fault in through the same code the fault path uses.
+static KVMMEM_CALLS: AtomicUsize = AtomicUsize::new(0);
+static KVMMEM_AS: AtomicUsize = AtomicUsize::new(0);
+static KVMMEM_BYTES: AtomicUsize = AtomicUsize::new(0);
+fn kvmmem_hook(as_id: usize, _va: usize, len: usize) {
+    if as_id == KVMMEM_AS.load(Ordering::Relaxed) {
+        KVMMEM_CALLS.fetch_add(1, Ordering::Relaxed);
+        KVMMEM_BYTES.fetch_add(len, Ordering::Relaxed);
+    }
+}
+
+fn t_kvmmem() -> T {
+    use mm::vmm::AddressSpace;
+    use mm::paging::PageFlags;
+    extern "C" { fn arch_alloc_page_table_root() -> usize; }
+    let mut t = T::new("kvmmem");
+    let root = unsafe { arch_alloc_page_table_root() };
+    if root == 0 { t.skip("no page table root"); return t; }
+    let mut as_ = AddressSpace::new(root);
+    KVMMEM_AS.store(root, Ordering::Relaxed);
+    mm::vmm::set_range_invalidate_hook(kvmmem_hook);
+    let base = 0x5000_0000usize;
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
+    t.check(as_.map_lazy(base, 4 * 4096, flags, false), "map 4 lazy pages");
+
+    // pin faults in and takes a reference
+    let p0 = as_.pin_user_page(base, true);
+    t.check(p0.is_some(), "pin_user_page(write) faults the page in");
+    let p0 = p0.unwrap_or(0);
+    t.check(mm::pageref::get(p0) == 2, "pin adds one reference (2)");
+    t.check(as_.pin_user_page(base + 0x123, false) == Some(p0), "second pin of the same page returns the same frame");
+    t.check(mm::pageref::get(p0) == 3, "refcount 3 after two pins");
+    t.check(as_.pin_user_page(base + 8 * 4096, false).is_none(), "pin outside any VMA fails");
+    mm::vmm::unpin_user_page(p0);
+    mm::vmm::unpin_user_page(p0);
+    t.check(mm::pageref::get(p0) == 1, "unpin x2 returns the count to baseline");
+
+    // invalidate hook reaches every path
+    let c0 = KVMMEM_CALLS.load(Ordering::Relaxed);
+    let _ = as_.mprotect(base, 4096, mm::vmm::PROT_READ);
+    t.check(KVMMEM_CALLS.load(Ordering::Relaxed) > c0, "mprotect calls the invalidate hook");
+    let c1 = KVMMEM_CALLS.load(Ordering::Relaxed);
+    let _ = as_.discard_range(base + 4096, 4096);
+    t.check(KVMMEM_CALLS.load(Ordering::Relaxed) > c1, "MADV_DONTNEED (discard_range) calls the hook");
+
+    // a pinned frame outlives unmap_range and is freed by the last unpin
+    let p1 = as_.pin_user_page(base + 2 * 4096, true).unwrap_or(0);
+    let c2 = KVMMEM_CALLS.load(Ordering::Relaxed);
+    let b2 = KVMMEM_BYTES.load(Ordering::Relaxed);
+    as_.unmap_range(base, 4 * 4096);
+    t.check(KVMMEM_CALLS.load(Ordering::Relaxed) > c2, "unmap_range calls the hook");
+    t.check(KVMMEM_BYTES.load(Ordering::Relaxed) - b2 >= 4 * 4096, "hook covers the unmapped range");
+    t.check(p1 != 0 && mm::pageref::get(p1) == 1, "pinned frame still referenced (not freed) after unmap");
+    mm::vmm::unpin_user_page(p1); // last reference: frame goes back to the buddy
+
+    // MADV_DONTFORK marks the VMA; DOFORK clears it
+    t.check(as_.map_lazy(base, 4 * 4096, flags, false), "remap 4 lazy pages");
+    t.check(as_.set_dontfork(base + 4096, 2 * 4096, true), "set_dontfork on the middle pages");
+    let df = |a: &AddressSpace, va| a.find(va).map_or(false, |r| r.map_flags & mm::vmm::MAP_DONTFORK != 0);
+    t.check(!df(&as_, base) && df(&as_, base + 4096) && df(&as_, base + 2 * 4096) && !df(&as_, base + 3 * 4096), "only the middle range is DONTFORK");
+    t.check(as_.set_dontfork(base + 4096, 2 * 4096, false) && !df(&as_, base + 4096), "DOFORK clears it");
+    t.check(!as_.set_dontfork(base, 16 * 4096, true), "DONTFORK over an unmapped range fails (ENOMEM)");
+
+    KVMMEM_AS.store(0, Ordering::Relaxed);
+    drop(as_);
+    t
 }

@@ -180,6 +180,34 @@ pub fn set_file_backing_hooks(read: FileReadFn, retain: FileRefFn, release: File
     FILE_RELEASE_HOOK.store(release as usize, Ordering::Release);
 }
 
+/// `MADV_DONTFORK` marker kept in `VmaRegion::map_flags` (bit 31 is not a
+/// user-visible mmap flag): `clone_as` skips such a region, so the child has
+/// nothing there and the parent's guest-RAM frames never become CoW-shared.
+pub const MAP_DONTFORK: u32 = 1 << 31;
+
+/// Range-invalidate hook (KVM stage 2): `fn(as_id, va, len)`, `as_id` being the
+/// address space's page-table root. Called with the address space's `busy`
+/// flag held, BEFORE frames of `[va, va+len)` are released, replaced, made
+/// read-only or moved, so a hypervisor can unmap its stage-2 range, flush TLBs
+/// and unpin. The hook must not take the address-space lock (lock order is
+/// address space, then the hypervisor's own lock).
+pub type RangeInvalidateFn = fn(as_id: usize, va: usize, len: usize);
+static RANGE_INVALIDATE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_range_invalidate_hook(f: RangeInvalidateFn) {
+    RANGE_INVALIDATE_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// Notify the hook (one relaxed-cost atomic load when no hypervisor exists).
+#[inline]
+pub fn notify_range_invalidate(as_id: usize, va: usize, len: usize) {
+    let f = RANGE_INVALIDATE_HOOK.load(Ordering::Acquire);
+    if f != 0 && len != 0 {
+        let f: RangeInvalidateFn = unsafe { core::mem::transmute(f) };
+        f(as_id, va, len);
+    }
+}
+
 /// Reference a device range that a VMA maps (`phys`, `len` bytes). Called once
 /// per device VMA that comes into being by aliasing (fork), and the release
 /// once per device VMA that goes away (munmap, exit/exec teardown). The first
@@ -1953,6 +1981,7 @@ impl AddressSpace {
         // fully contained within it.
         self.split_at(virt);
         self.split_at(end);
+        notify_range_invalidate(self.page_table_root, virt, end - virt);
 
         let pt = self.page_table_root;
         let mut did_unmap = false;
@@ -2104,6 +2133,7 @@ impl AddressSpace {
         let end  = match virt.checked_add(len) { Some(e) => e, None => return false };
         if len == 0 { return true; }
         self.update_hiwater();
+        notify_range_invalidate(self.page_table_root, virt, end - virt);
 
         let pt = self.page_table_root;
         let mut covered = 0usize;
@@ -2333,6 +2363,7 @@ impl AddressSpace {
             }
         }
         if !self.range_is_free(old_end, new_end - old_end) { return -12; }
+        notify_range_invalidate(self.page_table_root, addr, old_len);
         let pt = self.page_table_root;
         let r = self.regions[idx].as_mut().unwrap();
         r.make_lazy();
@@ -2383,6 +2414,7 @@ impl AddressSpace {
             Some(i) => i,
             None => return -14,
         };
+        notify_range_invalidate(self.page_table_root, addr, old_len);
         let pt = self.page_table_root;
         let mut r = self.regions[idx].take().unwrap();
         let old_pages = r.pages();
@@ -2740,6 +2772,7 @@ impl AddressSpace {
         // `.data` pages read-only.
         self.split_at(addr);
         self.split_at(end);
+        notify_range_invalidate(self.page_table_root, addr, end - addr);
 
         // Build the new PageFlags from the POSIX prot bits.
         let mut new_flags = PageFlags::PRESENT | PageFlags::USER;
@@ -2818,6 +2851,52 @@ impl AddressSpace {
     ///   - Failure (OOM, overlap) → return the **current** break unchanged.
     ///     (musl detects failure by comparing the return value to the requested value,
     ///     NOT by checking for a negative return.)
+    /// Fault in (if needed) and pin the page containing `hva` for a
+    /// hypervisor: returns its physical page address with one extra
+    /// `pageref` reference, so the frame survives munmap/exit until
+    /// [`unpin_user_page`] runs. `write` requires a private, writable frame
+    /// (CoW is broken first). Call with this address space locked (it is the
+    /// same work the fault path does). Returns None for an unmapped address,
+    /// a PROT-incompatible VMA, a device mapping, or an absent file page
+    /// (the caller faults it in unlocked, via `sched::prefault_user_page`, and
+    /// retries).
+    pub fn pin_user_page(&mut self, hva: usize, write: bool) -> Option<usize> {
+        let hva = hva & !(PAGE_SIZE - 1);
+        {
+            let r = self.find(hva)?;
+            if r.file_cap == usize::MAX { return None; }
+            if r.prot & PROT_READ == 0 && r.prot & PROT_WRITE == 0 { return None; }
+            if write && r.prot & PROT_WRITE == 0 { return None; }
+        }
+        let missing = if write { self.prefault_range(hva, PAGE_SIZE) }
+                      else { self.prefault_range_ro(hva, PAGE_SIZE) };
+        if missing.is_some() { return None; }
+        let phys = self.virt_to_phys(hva)? & !(PAGE_SIZE - 1);
+        crate::pageref::inc(phys);
+        Some(phys)
+    }
+
+    /// `madvise(MADV_DONTFORK / MADV_DOFORK)` over `[addr, addr+len)`; false
+    /// if part of the range is unmapped (ENOMEM).
+    pub fn set_dontfork(&mut self, addr: usize, len: usize, on: bool) -> bool {
+        let addr = addr & !(PAGE_SIZE - 1);
+        let end = match addr.checked_add((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) {
+            Some(e) => e, None => return false };
+        if end == addr { return true; }
+        let mut va = addr;
+        while va < end {
+            match self.find(va) { Some(r) => va = r.end, None => return false }
+        }
+        self.split_at(addr);
+        self.split_at(end);
+        for r in self.regions.iter_mut().filter_map(|r| r.as_mut()) {
+            if r.start >= addr && r.end <= end {
+                if on { r.map_flags |= MAP_DONTFORK } else { r.map_flags &= !MAP_DONTFORK }
+            }
+        }
+        true
+    }
+
     /// Return the page table root physical address.
     pub fn root(&self) -> usize {
         self.page_table_root
@@ -3392,4 +3471,10 @@ pub struct CensusCursor {
     pub next_start: usize,
     pub page: usize,
     pub partial: Option<VmaStat>,
+}
+
+/// Drop the reference taken by [`AddressSpace::pin_user_page`]; frees the
+/// frame when the pin was the last holder (its mapping already gone).
+pub fn unpin_user_page(phys: usize) {
+    crate::pageref::unref_or_free(phys, 0);
 }
