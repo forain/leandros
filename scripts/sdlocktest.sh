@@ -47,9 +47,12 @@ verdict="$(grep -a "\[sdhci\] write grant" "$log" | tail -1)"
 echo "verdict: ${verdict:-<none>}"
 ok=1
 case "$expect" in
-    granted) grep -aq "write grant: GRANTED" "$log" || ok=0 ;;
+    granted) grep -aq "write grant: GRANTED" "$log" || ok=0
+        grep -aq "lock state: granted card=own whole-card node write=window-only" "$log" || { echo "missing lock-state line (granted/own)"; ok=0; } ;;
     locked:*)
         grep -aq "write grant: LOCKED.*${expect#locked:}" "$log" || ok=0
+        grep -aq "lock state: locked card=foreign" "$log" || { echo "missing lock-state line (locked/foreign)"; ok=0; }
+        grep -aq "write grant: GRANTED" "$log" && { echo "granted while expecting locked"; ok=0; }
         [ "$before" = "$after" ] || { echo "IMAGE CHANGED"; ok=0; }
         grep -aq "whole card exposed\|exposed as /dev/vdc" "$log" && { echo "device exposed while locked"; ok=0; }
         ;;
