@@ -101,7 +101,7 @@ def main():
         run("kmodctl load virtio_net >/dev/null 2>&1; sleep 1")
         for i in range(1, 4):
             o = run("kmodctl rmmod virtio_net; echo RM_RC=$?; for j in 1 2 3 4 5 6; do grep -q 'eth0:' /proc/net/dev || break; sleep 1; done; "
-                    "echo ETH0=$(grep -c 'eth0:' /proc/net/dev) MOD=$(grep -c '^virtio_net ' /proc/modules); echo GONE_END")
+                    "n=$(grep 'eth0:' /proc/net/dev | wc -l); m=$(grep '^virtio_net ' /proc/modules | wc -l); echo ETH0=$((n)) MOD=$((m)); echo GONE_END")
             check(f"virtio_net rmmod #{i}", "RM_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 gone after unload", "ETH0=0" in o, o.strip()[-300:])
             o = run("kmodctl load virtio_net; echo LD_RC=$?; for j in $(seq 1 30); do grep -q 'eth0:' /proc/net/dev && break; sleep 1; done; "
@@ -110,6 +110,7 @@ def main():
             check(f"virtio_net #{i} eth0 back and gateway pingable", "PING_OK" in o)
         # ---- nvme
         o = run("grep '^nvme ' /proc/modules; echo BASE_END")
+        open("/tmp/kmodsuite-diag.txt", "a").write("nvme base: " + o.strip()[-200:] + "\n")
         o = run("kmodctl rmmod nvme >/dev/null 2>&1; kmodctl load nvme; echo LD_RC=$?; for j in $(seq 1 10); do [ -e /dev/nvme0n1 ] && break; sleep 1; done; "
                 "dd if=/dev/nvme0n1 bs=512 skip=1 count=1 2>/dev/null | head -c %d; echo; echo NVME_END" % len(MAGIC))
         check("nvme load", "LD_RC=0" in o)
@@ -128,11 +129,11 @@ def main():
         # ---- hardware-less modules: load-only smoke
         for mod in ("iwlwifi", "brcmf") + (("sdhci",) if arch == "aarch64" else ()):
             for i in (1, 2):
-                o = run(f"kmodctl load {mod}; echo LD_RC=$?; echo LISTED=$(grep -c '^{mod} ' /proc/modules); echo SM_END")
+                o = run(f"kmodctl load {mod}; echo LD_RC=$?; n=$(grep '^{mod} ' /proc/modules | wc -l); echo LISTED=$((n)); echo SM_END")
                 # Without the device the init probes and answers ENODEV (or, if it stays loaded, must be rmmod-able
                 # with refcount 0). Either way nothing may be left half-registered: not listed, loadable again.
                 if "LD_RC=0" in o:
-                    o2 = run(f"grep '^{mod} ' /proc/modules; kmodctl rmmod {mod}; echo RM_RC=$?; echo LISTED=$(grep -c '^{mod} ' /proc/modules); echo SM2_END")
+                    o2 = run(f"grep '^{mod} ' /proc/modules; kmodctl rmmod {mod}; echo RM_RC=$?; n=$(grep '^{mod} ' /proc/modules | wc -l); echo LISTED=$((n)); echo SM2_END")
                     ref = re.search(rf"^{mod} \d+ (\d+) .*Live", o2, re.M)
                     check(f"{mod} smoke #{i}: loaded, refcount 0, unloaded", "RM_RC=0" in o2 and ref is not None and ref.group(1) == "0"
                           and "LISTED=0" in o2, o2.strip()[-160:])
