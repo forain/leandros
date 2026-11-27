@@ -112,6 +112,18 @@ pub fn init(cmdline: &str) {
     TARGET.store(nif.id, Ordering::Release);
 }
 
+/// The netif `id` was unregistered: drop its shaper state (queued frames included).
+pub fn forget(id: u8) {
+    if TARGET.load(Ordering::Acquire) != id { return; }
+    let mut s = SHAPER.lock();
+    s.tx.q.clear();
+    s.rx.q.clear();
+    s.held = false;
+    s.nif = None;
+    TARGET.store(0xff, Ordering::Release);
+    NEXT_DUE.store(0, Ordering::Relaxed);
+}
+
 /// This netif's data path goes through the shaper.
 #[inline]
 pub fn shaped(id: u8) -> bool { TARGET.load(Ordering::Relaxed) == id }

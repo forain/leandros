@@ -192,6 +192,28 @@ struct NDad { id: u8, addr: [u8; 16], prefix: u8, st: DadSt }
 /// Addresses not yet usable. An address with no entry is permanent.
 static NDAD: Mutex<Vec<NDad>> = Mutex::new(Vec::new());
 
+/// Netif `id` was removed: forget every address, prefix, router, RA and DNS item learned for it.
+pub(crate) fn detach(id: usize) {
+    let sid = iface::sid_of(id as u8);
+    let ifx = id as u32 + 2;
+    LL.lock()[id] = None;
+    NDAD.lock().retain(|d| d.id as usize != id);
+    PREFIXES.lock().retain(|e| e.0 != sid);
+    ROUTERS.lock().retain(|e| e.0 != sid);
+    STATIC_A.lock().retain(|e| e.0 != ifx);
+    STATIC_R.lock().retain(|r| r.oif != ifx);
+    RA_MTU.lock()[id] = 0;
+    let dns = {
+        let mut a = RDNSS.lock(); let n = a.len(); a.retain(|e| e.0 != id);
+        let mut b = DNSSL.lock(); let m = b.len(); b.retain(|e| e.0 != id);
+        n != a.len() || m != b.len()
+    };
+    RA_SEEN.lock()[id] = false;
+    SLAAC.lock()[id] = Slaac::NONE;
+    RAW.lock()[id] = None;
+    if dns { dns_publish(); }
+}
+
 /// May `addr` of netif `id` be used (no pending or failed DAD)?
 fn dad_ok(id: u8, addr: &[u8; 16]) -> bool { !NDAD.lock().iter().any(|d| d.id == id && d.addr == *addr) }
 /// IFA_F_* of `addr` on netif `id`.

@@ -52,6 +52,9 @@ static V3: Mutex<BTreeMap<Sid, IfState>> = Mutex::new(BTreeMap::new());
 /// which interface heard the query.
 static POLL_SID: AtomicU8 = AtomicU8::new(0);
 
+/// Stack `sid` was removed.
+pub(crate) fn forget(sid: Sid) { V3.lock().remove(&sid); }
+
 pub(crate) fn set_poll_sid(sid: Sid) { POLL_SID.store(sid, Ordering::Relaxed); }
 pub(crate) fn poll_sid() -> Sid { POLL_SID.load(Ordering::Relaxed) as Sid }
 

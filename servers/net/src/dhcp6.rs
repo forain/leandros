@@ -100,6 +100,9 @@ pub(crate) fn ra_flags(id: usize, flags: u8, now: u64) {
     });
 }
 
+/// Netif `id` was removed: its socket handle went with the stack.
+pub(crate) fn detach(id: usize) { SOCK.lock()[id] = None; }
+
 /// Forget everything of `id` (link down, accept_ra off): the address, the servers.
 pub(crate) fn reset(id: usize, s: &mut crate::NetStack) {
     let (had_addr, had_dns) = with(id, |d| {

@@ -302,6 +302,17 @@ impl Stats {
     }
 }
 
+/// A netif was removed: its routing, lease, admin and counter state start from scratch for the next one in the slot.
+pub(crate) fn reset_nic(id: u8) {
+    IFRT.lock()[id as usize] = IfRt::new();
+    *DHCP[id as usize].lock() = DhcpState { lease: None, restarts: 0, leases: 0, lost: 0 };
+    ADMIN_DOWN[id as usize].store(false, Ordering::Relaxed);
+    let st = &STATS[id as usize];
+    for c in [&st.rx_bytes, &st.rx_pkts, &st.rx_drop, &st.tx_bytes, &st.tx_pkts, &st.tx_drop, &st.tx_held, &st.rx_weak_host] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
 pub(crate) static STATS: [Stats; MAX_NETIF] = [const { Stats::new() }; MAX_NETIF];
 
 // ── per-netif DHCP client state (/proc/net/nic) ─────────────────────────────

@@ -122,6 +122,12 @@ pub fn attach(driver: &str, ifindex: u32, ifname: &str) -> bool {
     true
 }
 
+/// The netif of `ifindex` is gone: drop its netctl control side (and a pending attach for it).
+pub fn detach(ifindex: u32) {
+    PENDING.lock().retain(|e| e.1 != ifindex);
+    crate::wifi_api::unregister(ifindex);
+}
+
 pub fn lookup(name: &str) -> Option<&'static Mgr> {
     REGISTRY.lock().iter().find(|e| e.name == name).map(|e| e.mgr)
 }

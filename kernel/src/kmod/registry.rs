@@ -137,8 +137,8 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
         RegKind::BLK => { drivers::blkdev::remove_disk(handle as usize); true }
         RegKind::INPUT => super::exports::input_release(handle),
         RegKind::SND => super::exports::snd_release(),
-        // The netif entry stays (name kept); its gate is closed for good, so nothing reaches the module.
-        RegKind::NETDEV => true,
+        // Idempotent: a normal unload already removed the netif in unbind_upper.
+        RegKind::NETDEV => { super::exports::netdev_unregister(handle); true }
         RegKind::V3D => { drivers::v3d_class::unregister(); true }
         _ => false,
     }
@@ -181,22 +181,10 @@ pub fn reopened(id: KmodId) {
     for (k, h) in recs { if k == RegKind::USB_CLASS { super::exports::usb_class_reopened(h); } }
 }
 
-/// Unload step 2: tell consumers the module's upper-edge objects are going (netifs record what a reload needs).
+/// Unload step 2: the module's netifs are removed (the net daemon tears their stacks down before this returns).
 pub fn unbind_upper(owner: KmodId) {
     let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == owner).map(|r| (r.1, r.2)).collect();
-    for (k, h) in recs { if k == RegKind::NETDEV { super::exports::netdev_detach(h); } }
-}
-
-/// Both unload drains succeeded: netifs become rebindable.
-pub fn commit_upper(owner: KmodId) {
-    let recs: Vec<u64> = REGS.lock().iter().filter(|r| r.0 == owner && r.1 == RegKind::NETDEV).map(|r| r.2).collect();
-    for h in recs { super::exports::netdev_commit_detach(h); }
-}
-
-/// Unload gave up (Zombie): pending netif detaches are dropped, the netif stays bound to the zombie.
-pub fn abort_upper(owner: KmodId) {
-    let recs: Vec<u64> = REGS.lock().iter().filter(|r| r.0 == owner && r.1 == RegKind::NETDEV).map(|r| r.2).collect();
-    for h in recs { super::exports::netdev_abort_detach(h); }
+    for (k, h) in recs { if k == RegKind::NETDEV { super::exports::netdev_unregister(h); } }
 }
 
 /// Failed init: unregister every registration that can be taken back, dropping its record.
