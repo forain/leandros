@@ -789,7 +789,11 @@ static int find_global(char *hex) {
     if (!f) return 0;
     char b[256]; int found = 0;
     while (fgets(b, sizeof b, f)) {
-        if (strncmp(b, "fe80", 4) && strstr(b, "eth0") && strncmp(b, "0000000000000000", 16)) {
+        unsigned idx, plen, scope, fl;
+        /* A tentative address (IFA_F_TENTATIVE 0x40, DAD still probing) is
+         * listed but not yet usable, on Linux as here: skip it. */
+        if (strncmp(b, "fe80", 4) && strstr(b, "eth0") && strncmp(b, "0000000000000000", 16)
+            && sscanf(b + 33, "%x %x %x %x", &idx, &plen, &scope, &fl) == 4 && !(fl & 0x40)) {
             memcpy(hex, b, 32); hex[32] = 0; found = 1; break;
         }
     }
