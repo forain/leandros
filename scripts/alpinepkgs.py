@@ -42,8 +42,8 @@ def stage(arch):
         _size, _gz, _info, members = apkdb.read_apk(f, content=False)
         for m, _ in members:
             path = "/" + m.name.rstrip("/")
-            # linux-pam (via shadow-libs): unix_chkpwd is root:shadow(42) setgid; no PAM here, image owner stays root
-            if m.uid == 0 and m.gid == 42 and path == "/usr/sbin/unix_chkpwd":
+            # linux-pam (via shadow-libs): unix_chkpwd is root:shadow (gid 42 on 3.x, 148 on edge) setgid; no PAM here, image owner stays root
+            if m.uid == 0 and m.gid in (42, 148) and path == "/usr/sbin/unix_chkpwd":
                 pass
             elif m.uid or m.gid:
                 sys.exit("alpinepkgs: %s: %s owned by %d:%d (only root expected)" % (name, path, m.uid, m.gid))
