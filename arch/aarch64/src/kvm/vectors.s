@@ -10,10 +10,10 @@
     b    kvm_exit_common
 .endm
 
+// A fault of the world switch itself: take the normal exit path with kind 4
+// (EXIT_PARK) so the host state is restored and enter() panics with the syndrome.
 .macro PARK
-    .balign 128
-1:  wfe
-    b    1b
+    GUEST_EXIT 4
 .endm
 
     .text

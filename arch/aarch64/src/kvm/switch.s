@@ -273,6 +273,7 @@ kvm_exit_common:
     isb
     HOST_LOAD S3_0_C4_C2_3, F_PSTATE   // PAN back to the host value
     HOST_LOAD vbar_el2,    F_VBAR
+    isb
     HOST_LOAD cptr_el2,    F_CPTR
     HOST_LOAD mdcr_el2,    F_MDCR
     HOST_LOAD cnthctl_el2, F_CNTHCTL

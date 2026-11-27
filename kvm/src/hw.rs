@@ -112,6 +112,8 @@ pub const EXIT_SYNC: u8 = 0;
 pub const EXIT_IRQ: u8 = 1;
 pub const EXIT_FIQ: u8 = 2;
 pub const EXIT_SERROR: u8 = 3;
+/// A vector slot that is never live was taken (a fault of the world switch).
+pub const EXIT_PARK: u8 = 4;
 
 /// What the exit vector captured. `esr`/`far`/`hpfar` are only meaningful for
 /// `EXIT_SYNC` (hpfar only for stage-2 aborts).

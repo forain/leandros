@@ -29,6 +29,9 @@ extern "C" {
 pub unsafe fn enter(hw: &mut VcpuHw) -> RawExit {
     let mut out = RawExit::default();
     kvm_enter_raw(hw, &mut out);
+    if out.kind == EXIT_PARK {
+        panic!("kvm: world-switch fault esr={:#x} far={:#x} elr={:#x}", out.esr, out.far, hw.pc);
+    }
     out
 }
 
