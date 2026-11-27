@@ -81,8 +81,14 @@ pub fn sys_delete_module(name: usize, _flags: usize) -> isize {
     let nm = match user_name(name) { Ok(n) => n, Err(e) => return e };
     let m = match registry::find_by_name(&nm) { Some(m) => m, None => return ENOENT };
     let s = super::name_str(&nm);
-    if !m.unloadable || m.exit == 0 { return EBUSY; }
-    if registry::begin_unload(m.id).is_err() { return EBUSY; }
+    if !m.unloadable || m.exit == 0 {
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: not unloadable (unloadable={} exit={})\n", s, m.unloadable, m.exit != 0));
+        return EBUSY;
+    }
+    if let Err(e) = registry::begin_unload(m.id) {
+        drivers::pci::serial_debug(&alloc::format!("[kmod] {} busy: begin_unload refused ({:?})\n", s, e));
+        return EBUSY;
+    }
     let g = match gate::get(m.id) { Some(g) => g, None => return zombie(m.id, s, "no gate") };
     if gate::current().map_or(false, |c| c.id == m.id) { registry::set_state(m.id, State::Live); return -35; }
     let t0 = sched::monotonic_ns();
