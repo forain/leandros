@@ -79,8 +79,17 @@ leader_of() {
 # (a different flag set in one app would thrash the shared dir again).
 extra_for() {
   [[ "$(leader_of "$1")" == cosmic-edit ]] || return 0
-  local o="$M6_OUT/ssp_guard-$2.o"
-  "$M6/toolchain/$2-linux-musl-cc" -fno-stack-protector -c "$(dirname "$0")/../mesa/ssp_guard.c" -o "$o" || return 1
+  # Stable, content-named, shared by all trees: per-tree paths would change the
+  # rustflags (and so every crate's metadata hash) in each worktree.
+  local c o h
+  c="$(dirname "$0")/../mesa/ssp_guard.c"
+  h=$(sha1sum "$c" | cut -c1-8)
+  o="$M6/toolchain/ssp_guard-$h-$2.o"
+  if [[ ! -f "$o" ]]; then
+    local t; t=$(mktemp "$o.XXXXXX")
+    "$M6/toolchain/$2-linux-musl-cc" -fno-stack-protector -c "$c" -o "$t" || { rm -f "$t"; return 1; }
+    mv -f "$t" "$o"
+  fi
   echo "--config=target.$2-unknown-linux-musl.rustflags=[\"-C\",\"link-arg=$o\"]"
 }
 
