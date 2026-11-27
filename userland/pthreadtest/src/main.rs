@@ -87,6 +87,7 @@ extern "C" {
     );
     pub fn _pthread_cleanup_pop(cb: *mut CleanupLinkedListEntry, execute: i32);
     pub fn pthread_exit(retval: *mut c_void) -> !;
+    pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
 }
 
 macro_rules! pthread_cleanup_push {
@@ -180,6 +181,9 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         }
         pthread_exit(core::ptr::null_mut());
     }
+    if argc >= 2 && arg_eq(argv, 1, b"gkexit") {
+        return if test_group_kill_exiting_sibling() { 0 } else { 1 };
+    }
     if argc >= 3 && arg_eq(argv, 1, b"late_leader_churn") {
         return churn_barrier_exit(arg_num(argv, 2));
     }
@@ -209,6 +213,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
     if !test_futex_pi_basic() { failures += 1; }
     if !test_futex_pi_contended() { failures += 1; }
     if !test_futex_pi_timeout() { failures += 1; }
+    if !test_group_kill_exiting_sibling() { failures += 1; }
     #[cfg(target_arch = "x86_64")]
     if !test_arch_gs_base() { failures += 1; }
 
@@ -992,4 +997,81 @@ unsafe fn run_exit_kills_siblings() {
     let msg = b"EXITKILL: main calling exit(3)\n";
     write(1, msg.as_ptr(), msg.len());
     exit(3);
+}
+
+// ── Lane groupkillexit: a group kill must not skip a mid-exit sibling's exit steps ──
+// A thread T of process A is held inside exit() (`exithold`) before its
+// clear_child_tid step; the leader calls exit_group meanwhile. T's TID word
+// lives in shared memory and process B futex-waits on it: Linux wakes B and
+// clears the word whatever the group kill does, so must we.
+
+#[cfg(target_arch = "x86_64")]
+mod gknr { pub const FUTEX: i64 = 202; pub const SET_TID_ADDRESS: i64 = 218; pub const EXIT: i64 = 60; }
+#[cfg(target_arch = "aarch64")]
+mod gknr { pub const FUTEX: i64 = 98; pub const SET_TID_ADDRESS: i64 = 96; pub const EXIT: i64 = 93; }
+
+static mut GK_WORD: *mut u32 = core::ptr::null_mut();
+
+extern "C" fn gk_thread(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        syscall(gknr::SET_TID_ADDRESS, GK_WORD as i64);
+        usleep(200_000); // the parent arms `exithold` meanwhile
+        syscall(gknr::EXIT, 0i64); // raw thread exit: kernel exit() with clear_child_tid = word
+    }
+    core::ptr::null_mut()
+}
+
+unsafe fn test_group_kill_exiting_sibling() -> bool {
+    let name = b"group_kill_exiting_sibling\0";
+    let w = mmap(core::ptr::null_mut(), 4096, 3, 0x21, -1, 0) as *mut u32; // RW, SHARED|ANON
+    if w as isize == -1 || w.is_null() { puts(b"gkexit: mmap failed\n\0".as_ptr()); return false; }
+    core::ptr::write_volatile(w, 0x777);
+    GK_WORD = w;
+    let waiter = fork();
+    if waiter == 0 {
+        // Wait (shared futex) while the word is 0x777, at most 3 s in total.
+        let ts = [3u64, 0u64];
+        let r = syscall(gknr::FUTEX, w as i64, 0i64, 0x777i64, ts.as_ptr() as i64, 0i64, 0i64);
+        let ok = core::ptr::read_volatile(w) == 0 && (r == 0 || r == -11 || r == -1);
+        // r == -1: musl maps a -errno to -1; the word check is the real test,
+        // a timeout leaves the word at 0x777.
+        exit(if ok { 0 } else { 1 });
+    }
+    usleep(100_000);
+    let victim = fork();
+    if victim == 0 {
+        let mut t: pthread_t = core::ptr::null_mut();
+        if pthread_create(&mut t, core::ptr::null(), gk_thread, core::ptr::null_mut()) != 0 { exit(2); }
+        usleep(300_000); // T is inside exit() by now (held 600 ms)
+        exit(0); // exit_group while T is mid-exit
+    }
+    usleep(100_000);
+    let mut armed = false;
+    let fd = open(b"/proc/leandros_asfree\0".as_ptr(), 1);
+    if fd >= 0 {
+        let mut cmd = [0u8; 40];
+        let pre = b"exithold ";
+        cmd[..pre.len()].copy_from_slice(pre);
+        let mut p = pre.len();
+        let mut digits = [0u8; 12]; let mut n = 0; let mut v = victim as u32;
+        while v > 0 { digits[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+        while n > 0 { n -= 1; cmd[p] = digits[n]; p += 1; }
+        let post = b" 600000";
+        cmd[p..p + post.len()].copy_from_slice(post);
+        p += post.len();
+        armed = write(fd, cmd.as_ptr(), p) == p as isize;
+        close(fd);
+    }
+    let (mut sv, mut sw) = (-1i32, -1i32);
+    waitpid(victim, &mut sv, 0);
+    waitpid(waiter, &mut sw, 0);
+    let word = core::ptr::read_volatile(w);
+    let ok = armed && sv == 0 && sw == 0 && word == 0;
+    ll_print(b"gkexit armed=", armed as i64);
+    ll_print(b"gkexit victim_status=", sv as i64);
+    ll_print(b"gkexit waiter_status=", sw as i64);
+    ll_print(b"gkexit word=", word as i64);
+    let _ = name;
+    puts(if ok { b"gkexit: PASS\n\0".as_ptr() } else { b"gkexit: FAIL\n\0".as_ptr() });
+    ok
 }

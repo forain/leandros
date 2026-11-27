@@ -8962,6 +8962,8 @@ pub fn exit(code: i32) -> ! {
     // clear_child_tid wake, as Linux's mm_release does.
     robust::release_current();
 
+    if asfree::any_armed() { asfree::exit_hold(pid, tgid); }
+
     let clear_addr = {
         let rq = RUN_QUEUE.lock();
         rq.find_pid(pid).map(|t| t.clear_child_tid).unwrap_or(0)

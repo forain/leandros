@@ -40,6 +40,10 @@
 //!                           passed, so that they become Zombies together.
 //!                           `w` = only non-leader threads count and wait, `l`
 //!                           = the leader too;
+//!   `exithold <tgid> <us>`  lane groupkillexit: one non-leader thread of `tgid`
+//!                           parks `us` (<= 2 s) inside exit(), after the
+//!                           teardown steps and before its clear_child_tid
+//!                           write; once, auto-disarms after 10 s;
 //!   `dropdelay <tgid> <us>` (us <= 2000) the dispatch loop holds the drop of a
 //!                           removed member of `tgid` open for `us` after it
 //!                           released RUN_QUEUE (the window in which
@@ -86,6 +90,10 @@ static BUSY_HELD: AtomicBool = AtomicBool::new(false);
 static ARMED_SPACE: AtomicUsize = AtomicUsize::new(0);
 static BUSY_WAITS: AtomicU64 = AtomicU64::new(0);
 static OVERLAPS: AtomicU64 = AtomicU64::new(0);
+// Lane groupkillexit knob: one non-leader thread of HOLD_PID parks inside exit().
+static HOLD_PID: AtomicU32 = AtomicU32::new(0);
+static HOLD_US: AtomicU64 = AtomicU64::new(0);
+static HOLD_DEADLINE: AtomicU64 = AtomicU64::new(0);
 // Lane lateleader knobs.
 static RACE_PID: AtomicU32 = AtomicU32::new(0);
 static RACE_N: AtomicU32 = AtomicU32::new(0);
@@ -117,7 +125,10 @@ fn refresh_any() {
     if DELAY_PID.load(Ordering::Relaxed) != 0 && now >= DELAY_DEADLINE.load(Ordering::Relaxed) {
         DELAY_PID.store(0, Ordering::Relaxed);
     }
-    ANY.store(RACE_PID.load(Ordering::Relaxed) != 0 || DELAY_PID.load(Ordering::Relaxed) != 0
+    if HOLD_PID.load(Ordering::Relaxed) != 0 && now >= HOLD_DEADLINE.load(Ordering::Relaxed) {
+        HOLD_PID.store(0, Ordering::Relaxed);
+    }
+    ANY.store(RACE_PID.load(Ordering::Relaxed) != 0 || HOLD_PID.load(Ordering::Relaxed) != 0 || DELAY_PID.load(Ordering::Relaxed) != 0
         || LEGACY_PID.load(Ordering::Relaxed) != 0 || PAUSE_PID.load(Ordering::Relaxed) != 0
         || GATE_PID.load(Ordering::Relaxed) != 0 || ARMED_SPACE.load(Ordering::Relaxed) != 0, Ordering::Relaxed);
 }
@@ -183,6 +194,21 @@ pub fn exit_race(pid: Pid, tgid: Pid) {
     crate::klog_line(format_args!("[llred] race leave pid={} arrived={} n={}\n", pid, RACE_ARRIVED.load(Ordering::Relaxed), n));
     if RACE_ARRIVED.load(Ordering::Acquire) >= n { LL_RACE_FULL.fetch_add(1, Ordering::Relaxed); }
     else { LL_RACE_TIMEOUT.fetch_add(1, Ordering::Relaxed); }
+}
+
+/// `exithold`: a non-leader thread of `tgid` in `exit`, before its
+/// clear_child_tid step, parks for the armed time (once; no lock held). Call
+/// only after `any_armed()`.
+pub fn exit_hold(pid: Pid, tgid: Pid) {
+    if pid == tgid || HOLD_PID.load(Ordering::Relaxed) != tgid { return; }
+    let t0 = crate::monotonic_ns();
+    if t0 >= HOLD_DEADLINE.load(Ordering::Relaxed) { return; }
+    if HOLD_PID.compare_exchange(tgid, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() { return; }
+    let us = HOLD_US.load(Ordering::Relaxed);
+    while crate::monotonic_ns().saturating_sub(t0) < us * 1000 {
+        if crate::irqctx::can_sleep() { crate::kthread::msleep(1); }
+        else { crate::irq_window(); core::hint::spin_loop(); }
+    }
 }
 
 /// `dropdelay`: the dispatch loop, with a removed member of `tgid` whose drop
@@ -305,6 +331,15 @@ pub fn control(cmd: &str) -> i32 {
             RACE_ARRIVED.store(0, Ordering::Relaxed);
             RACE_DEADLINE.store(crate::monotonic_ns().saturating_add(AUTO_RELEASE_NS), Ordering::Relaxed);
             RACE_PID.store(pid, Ordering::Release);
+            ANY.store(true, Ordering::Relaxed);
+            0
+        }
+        Some("exithold") => {
+            if crate::task_as(pid).is_none() { return -3; }
+            let us = match num(it.next()) { Some(u) if u >= 1 && u <= 2_000_000 => u, _ => return -22 };
+            HOLD_US.store(us, Ordering::Relaxed);
+            HOLD_DEADLINE.store(crate::monotonic_ns().saturating_add(AUTO_RELEASE_NS), Ordering::Relaxed);
+            HOLD_PID.store(pid, Ordering::Release);
             ANY.store(true, Ordering::Relaxed);
             0
         }
