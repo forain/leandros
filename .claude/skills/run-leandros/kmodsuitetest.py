@@ -30,6 +30,12 @@ fails = []
 def check(name, ok, detail=""):
     print(f"  {'ok  ' if ok else 'FAIL'} {name} {detail}", flush=True)
     if not ok:
+        try:
+            with open("/tmp/kmodsuite-diag.txt", "a") as fh:
+                fh.write(f"FAIL {name}\n{detail}\n")
+        except OSError:
+            pass
+    if not ok:
         fails.append(name)
 
 
@@ -97,7 +103,7 @@ def main():
             o = run("kmodctl rmmod virtio_net; echo RM_RC=$?; for j in 1 2 3 4 5 6; do grep -q 'eth0:' /proc/net/dev || break; sleep 1; done; "
                     "echo ETH0=$(grep -c 'eth0:' /proc/net/dev) MOD=$(grep -c '^virtio_net ' /proc/modules); echo GONE_END")
             check(f"virtio_net rmmod #{i}", "RM_RC=0" in o, o.strip()[-120:])
-            check(f"virtio_net #{i} eth0 gone after unload", "ETH0=0" in o)
+            check(f"virtio_net #{i} eth0 gone after unload", "ETH0=0" in o, o.strip()[-300:])
             o = run("kmodctl load virtio_net; echo LD_RC=$?; for j in $(seq 1 30); do grep -q 'eth0:' /proc/net/dev && break; sleep 1; done; "
                     "for j in $(seq 1 20); do ping -c 1 -W 2 10.0.2.2 >/dev/null 2>&1 && echo PING_OK && break; sleep 1; done; echo NET_END", 150)
             check(f"virtio_net load #{i}", "LD_RC=0" in o, o.strip()[-120:])
@@ -118,7 +124,7 @@ def main():
                     "for j in $(seq 1 10); do [ -e /dev/nvme0n1 ] && break; sleep 1; done; "
                     "dd if=/dev/nvme0n1 bs=512 skip=1 count=1 2>/dev/null | head -c %d; echo; echo CY_END" % len(MAGIC))
             check(f"nvme cycle #{i} unload", "RM_RC=0" in o, o.strip()[-120:])
-            check(f"nvme cycle #{i} node gone then block 1 readable", ("No such" in o or "cannot access" in o) and MAGIC.decode() in o)
+            check(f"nvme cycle #{i} node gone then block 1 readable", ("No such" in o or "cannot access" in o) and MAGIC.decode() in o, o.strip()[-300:])
         # ---- hardware-less modules: load-only smoke
         for mod in ("iwlwifi", "brcmf") + (("sdhci",) if arch == "aarch64" else ()):
             for i in (1, 2):
@@ -132,10 +138,11 @@ def main():
                           and "LISTED=0" in o2, o2.strip()[-160:])
                 else:
                     check(f"{mod} smoke #{i}: no device -> ENODEV and nothing left listed",
-                          "No such device" in o and "LISTED=0" in o, o.strip()[-200:])
+                          "No such device" in o and "LISTED=0" in o, o.strip()[-400:])
         log = d("log", timeout=60)[1]
         bad = [l for l in log.splitlines() if re.search(r"panic|PANIC|Oops|Data abort|ZOMBIE|STALE REACHED", l)]
-        for l in [l for l in log.splitlines() if "[kmod]" in l][-25:]:
+        for l in [l for l in log.splitlines() if "[kmod]" in l][-40:]:
+            open("/tmp/kmodsuite-diag.txt", "a").write("kmodlog " + l.strip()[:200] + "\n")
             print("    kmod-log: " + l.strip()[:200])
         check("no panic / oops / data abort / Zombie in the console log", not bad, "; ".join(bad[:3]))
     finally:
