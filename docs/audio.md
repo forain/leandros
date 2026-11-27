@@ -153,3 +153,4 @@ Audio is verified at the destination: QEMU's `wav` backend captures the guest's 
 - [Desktop session](desktop/session.md) — where PipeWire is started, and the ScreenCast portal that also uses it.
 - [Ports](userland/ports.md) — PipeWire, Firefox, MAME and DOOM ports.
 - [Running](getting-started/running.md) — host audio backend selection (`coreaudio` on macOS; on Linux `pa` only when a live PulseAudio socket exists, else QEMU's `pipewire`, else `alsa`, else `none` — QEMU aborts at start-up if its backend cannot open, so a headless host must never get a guess).
+
