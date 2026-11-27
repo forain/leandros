@@ -215,6 +215,16 @@ pub fn register(ifindex: IfIndex, backend: &'static dyn WifiBackend) -> bool {
     ok
 }
 
+/// Drop the backend of `ifindex` (its netif was unregistered). False when none was registered.
+pub fn unregister(ifindex: IfIndex) -> bool {
+    let mut t = BACKENDS.lock();
+    let mut hit = false;
+    for e in t.iter_mut() {
+        if e.as_ref().map_or(false, |x| x.ifindex == ifindex) { *e = None; hit = true; }
+    }
+    hit
+}
+
 static REGISTER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Called (no lock held) after each successful [`register`]: lets the

@@ -163,6 +163,8 @@ pub fn load_image(img: &[u8], src: Source) -> Result<KmodId, KmodErr> {
         log(&alloc::format!("[kmod] {} loaded id {} slot {:#x} {} pages\n", nm, id.0, base, pages.len()));
         return Ok(id);
     }
+    // Nothing may call into the half-initialised module while its registrations are taken back and its pages freed.
+    if let Some(g) = super::gate::get(id) { g.close_and_drain(super::gate::Class::Upper, 2000); }
     if registry::release_all(id) {
         // Callbacks that can be taken back were unregistered; nothing can reference the slot: unmap, free, release, forget, so a retry works.
         for &(v, _, _) in &pages { unsafe { kmodwin::unmap(v, 1); } }

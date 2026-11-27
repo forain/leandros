@@ -949,10 +949,10 @@ fn kmodkapi_w2(t: &mut T) {
         t.check(registry::release_all(owner) && crate::syscall::v4l2::camera_count() == n0, "w2: failed init releases the camera");
 
         // kinds with no unregister path keep the slot mapped (leak-safe), and the record stays.
-        for k in [RegKind::IRQ, RegKind::NETDEV, RegKind::HWRNG, RegKind::KTHREAD, RegKind::USB_CLASS] {
+        for k in [RegKind::IRQ, RegKind::HWRNG, RegKind::KTHREAD, RegKind::USB_CLASS] {
             registry::note_registration(owner, k, 1);
         }
-        t.check(!registry::release_all(owner) && registry::reg_count(owner) == 5, "w2: irq/netdev/hwrng/kthread/usb_class stay recorded");
+        t.check(!registry::release_all(owner) && registry::reg_count(owner) == 4, "w2: irq/hwrng/kthread/usb_class stay recorded");
         registry::remove(owner);
 
         // virt_to_phys: HHDM yes, module window and kernel statics no.
@@ -1187,6 +1187,19 @@ fn kmodkapi_l6a(t: &mut T) {
         }
         kick(); kirq();
         t.check(true, "netdev kick / kick_from_irq callable");
+        if id >= 0 {
+            // Unregister: the slot reads as absent, then a re-registration reuses it with the next generation and the same name.
+            let g0 = drivers::netdev::slot_state(id as usize).0;
+            crate::kmod::exports::netdev_unregister(id as u64);
+            t.check(drivers::netdev::get(id as usize).is_none() && drivers::netdev::by_name("ktn0").is_none(), "netdev unregister: get/by_name None");
+            t.check(drivers::netdev::slot_state(id as usize) == (g0, false), "netdev unregister: slot dead, same gen");
+            let id2 = nreg(owner, 0, b"ktn".as_ptr(), 3, ops, 5);
+            t.check(id2 == id, "netdev re-register reuses the slot id");
+            t.check(drivers::netdev::slot_state(id as usize) == (g0 + 1, true), "netdev re-register: gen + 1, live");
+            t.check(drivers::netdev::get(id as usize).map_or(false, |n| n.name() == "ktn0"), "netdev re-register keeps the name");
+            crate::kmod::exports::netdev_unregister(id as u64);
+            t.check(drivers::netdev::get(id as usize).is_none(), "netdev unregister again: absent");
+        }
 
         // PM hooks
         t.check(exports::pm_count(owner) == 0, "no pm hooks before register");

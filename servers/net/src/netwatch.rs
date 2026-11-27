@@ -24,6 +24,12 @@ static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 static DISARMED: AtomicBool = AtomicBool::new(false);
 
 /// Stop the watchdog for the rest of this boot (the running trial was promoted).
+/// Stack `sid` was removed: drop a probe socket that lived on it.
+pub(crate) fn forget_sid(sid: Sid) {
+    let mut p = PROBE.lock();
+    if p.as_ref().map_or(false, |x| x.sid == sid) { *p = None; }
+}
+
 pub fn disarm() { DISARMED.store(true, Ordering::Release); }
 pub fn disarmed() -> bool { DISARMED.load(Ordering::Acquire) }
 

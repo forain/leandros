@@ -47,6 +47,8 @@ struct IfState {
 }
 
 static V6: Mutex<BTreeMap<Sid, IfState>> = Mutex::new(BTreeMap::new());
+/// Stack `sid` was removed.
+pub(crate) fn forget(sid: Sid) { V6.lock().remove(&sid); }
 
 /// ff02::2 (all routers): where an MLDv1 Done goes.
 const ALL_ROUTERS: A6 = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];

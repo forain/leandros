@@ -7,9 +7,12 @@
 //!
 //! * [`count`] / [`get`] / [`iter`] / [`by_name`]: the registered netifs. A
 //!   netif's `id` (0-based, dense, in registration order) never changes and
-//!   is never reused; `ifindex()` is `id + 2` (Linux numbering: 1 is `lo`,
-//!   which the net server owns). Registration happens only during
-//!   [`init`] (kernel init, single-threaded), so the table is read lock-free.
+//!   is stable while live; `ifindex()` is `id + 2` (Linux numbering: 1 is `lo`,
+//!   which the net server owns). Registration happens during [`init`] and
+//!   for loadable modules ([`register_late`]); a module unload calls
+//!   [`unregister`], after which the slot reads as absent ([`get`] is None)
+//!   until the net server acked it ([`ack_reaped`]) and a later registration
+//!   reuses it with the next generation ([`slot_state`]).
 //! * [`Netif`]: `name()`, `kind`, `driver()`, `mac()`, `link()`,
 //!   `link_generation()`, `send()`, `tx_ready()`, `recv()`, `rx_rearm()`,
 //!   `rx_irq_driven()`, `info_lines()`.
@@ -47,7 +50,7 @@
 //! up when it associates (the link generation changes). Routing between the
 //! interfaces is the net server's (`servers/net/src/iface.rs`).
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Most netifs the registry holds (the net server sizes its stack table on
 /// this, plus one for `lo`).
@@ -129,62 +132,137 @@ impl Netif {
     }
 }
 
-/// Write-once table: entries `< COUNT` are initialised and never change.
+/// Slot table. An entry below `COUNT` is only rewritten while its slot is dead (STATE live bit clear)
+/// and acked; readers copy it between two loads of STATE (seqlock style).
 struct Table(core::cell::UnsafeCell<[Option<Netif>; MAX_NETIF]>);
 unsafe impl Sync for Table {}
 static TABLE: Table = Table(core::cell::UnsafeCell::new([None; MAX_NETIF]));
 static COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Per slot: generation << 1 | live.
+static STATE: [AtomicU32; MAX_NETIF] = [const { AtomicU32::new(0) }; MAX_NETIF];
+/// Per slot: the generation the net daemon finished tearing down.
+static REAPED: [AtomicU32; MAX_NETIF] = [const { AtomicU32::new(0) }; MAX_NETIF];
+/// The net daemon runs (it acks dead slots); before that an unregister has nobody to wait for.
+static DAEMON_UP: AtomicBool = AtomicBool::new(false);
 
-/// Add a netif named `<prefix><n>` (n = how many of that prefix exist).
-/// Kernel init only (single-threaded). `None` when the table is full.
+/// Called by the net daemon when it starts.
+pub fn daemon_started() { DAEMON_UP.store(true, Ordering::Release); }
+
+/// (generation, live) of slot `id`.
+pub fn slot_state(id: usize) -> (u32, bool) {
+    if id >= MAX_NETIF { return (0, false); }
+    let s = STATE[id].load(Ordering::Acquire);
+    (s >> 1, s & 1 != 0)
+}
+
+/// The entry of a slot whether live or not (the daemon needs a dead netif's name and ops to tear down).
+pub fn peek(id: usize) -> Option<Netif> {
+    if id >= count() { return None; }
+    unsafe { core::ptr::read_volatile(&(*TABLE.0.get())[id]) }
+}
+
+/// The generation of slot `id` the net daemon last tore down.
+pub fn reaped(id: usize) -> u32 { if id < MAX_NETIF { REAPED[id].load(Ordering::Acquire) } else { 0 } }
+
+/// The net daemon finished tearing down generation `gen` of slot `id`.
+pub fn ack_reaped(id: usize, gen: u32) {
+    if id < MAX_NETIF { REAPED[id].store(gen, Ordering::Release); }
+}
+
+/// Add a netif named `<prefix><n>` (lowest n not used by a live netif of that prefix).
+/// Caller holds LATE_LOCK. A dead, acked slot is reused with the next generation.
 fn register(kind: Kind, prefix: &str, ops: &'static NetifOps, dev: u8) -> Option<u8> {
     let n = COUNT.load(Ordering::Acquire);
-    if n >= MAX_NETIF { return None; }
-    let same = iter().filter(|i| i.name().starts_with(prefix)
-        && i.name()[prefix.len()..].bytes().all(|b| b.is_ascii_digit())).count();
+    let mut slot = None;
+    for i in 0..n {
+        let s = STATE[i].load(Ordering::Acquire);
+        if s & 1 == 0 && REAPED[i].load(Ordering::Acquire) == s >> 1 { slot = Some(i); break; }
+    }
+    let id = match slot { Some(i) => i, None => { if n >= MAX_NETIF { return None; } n } };
+    let mut k = 0usize;
+    loop {
+        let same = iter().any(|i| i.name().starts_with(prefix)
+            && i.name()[prefix.len()..].bytes().all(|b| b.is_ascii_digit())
+            && i.name()[prefix.len()..].parse::<usize>().ok() == Some(k));
+        if !same { break; }
+        k += 1;
+    }
     let mut name = [0u8; 8];
     let p = prefix.as_bytes();
     name[..p.len()].copy_from_slice(p);
     let mut len = p.len();
-    if same >= 10 { name[len] = b'0' + (same / 10) as u8; len += 1; }
-    name[len] = b'0' + (same % 10) as u8;
+    if k >= 10 { name[len] = b'0' + (k / 10) as u8; len += 1; }
+    name[len] = b'0' + (k % 10) as u8;
     len += 1;
-    let nif = Netif { id: n as u8, kind, dev, ops, name, name_len: len as u8 };
-    unsafe { (*TABLE.0.get())[n] = Some(nif); }
-    COUNT.store(n + 1, Ordering::Release);
+    let nif = Netif { id: id as u8, kind, dev, ops, name, name_len: len as u8 };
+    let ng = (STATE[id].load(Ordering::Acquire) >> 1) + 1;
+    STATE[id].store(ng << 1, Ordering::Release);
+    unsafe { core::ptr::write_volatile(&mut (*TABLE.0.get())[id], Some(nif)); }
+    STATE[id].store((ng << 1) | 1, Ordering::Release);
+    if slot.is_none() { COUNT.store(n + 1, Ordering::Release); }
     extern "C" { fn arch_serial_putc(b: u8); }
     for &b in b"[NET] netif " { unsafe { arch_serial_putc(b); } }
     for &b in nif.name().as_bytes() { unsafe { arch_serial_putc(b); } }
     for &b in b" = " { unsafe { arch_serial_putc(b); } }
     for &b in nif.driver().as_bytes() { unsafe { arch_serial_putc(b); } }
     for &b in b"\r\n" { unsafe { arch_serial_putc(b); } }
-    Some(n as u8)
+    Some(id as u8)
 }
 
 static LATE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// `register` for a driver that probes after boot (a loadable module): serialised,
 /// and the net daemon is kicked so its next pass builds the stack for the new netif.
-/// Readers need no lock: entries below `COUNT` never change.
 pub fn register_late(kind: Kind, prefix: &str, ops: &'static NetifOps, dev: u8) -> Option<u8> {
     let id = { let _g = LATE_LOCK.lock(); register(kind, prefix, ops, dev) };
     if id.is_some() { kick(); }
     id
 }
 
-/// How many netifs are registered.
-pub fn count() -> usize { COUNT.load(Ordering::Acquire) }
-
-/// The netif with registry index `id`.
-pub fn get(id: usize) -> Option<Netif> {
-    if id >= count() { return None; }
-    unsafe { (*TABLE.0.get())[id] }
+/// Remove netif `id`: it reads as absent from now on, its shaper state is dropped, and (when the net
+/// daemon runs) this waits up to 2 s for the daemon to tear the stack down (DELLINK/DELADDR/DELROUTE
+/// are emitted then). Task context, never from the daemon itself. Idempotent.
+pub fn unregister(id: usize) {
+    if id >= count() { return; }
+    let (gen, nif) = {
+        let _g = LATE_LOCK.lock();
+        let s = STATE[id].load(Ordering::Acquire);
+        if s & 1 == 0 { return; }
+        let nif = peek(id);
+        STATE[id].store(s & !1, Ordering::Release);
+        crate::netshape::forget(id as u8);
+        (s >> 1, nif)
+    };
+    #[cfg(feature = "wifi-stack")]
+    if let Some(n) = nif { if n.kind == Kind::Wifi { crate::wifi_class::detach(n.ifindex()); } }
+    if !DAEMON_UP.load(Ordering::Acquire) { ack_reaped(id, gen); return; }
+    kick();
+    for _ in 0..2000 {
+        if REAPED[id].load(Ordering::Acquire) == gen { return; }
+        sched::kthread::msleep(1);
+    }
+    extern "C" { fn serial_print_str_raw(s: *const u8, len: usize); }
+    let msg = alloc::format!("[NET] {}: unregister not acked\n", nif.map(|n| alloc::string::String::from(n.name())).unwrap_or_default());
+    unsafe { serial_print_str_raw(msg.as_ptr(), msg.len()); }
 }
 
-/// Every registered netif, in registry order.
+/// How many netif slots were ever used (the high-water mark; dead slots included).
+pub fn count() -> usize { COUNT.load(Ordering::Acquire) }
+
+/// The live netif with registry index `id`.
+pub fn get(id: usize) -> Option<Netif> {
+    if id >= count() { return None; }
+    let s = STATE[id].load(Ordering::Acquire);
+    if s & 1 == 0 { return None; }
+    let nif = unsafe { core::ptr::read_volatile(&(*TABLE.0.get())[id]) };
+    if STATE[id].load(Ordering::Acquire) != s { return None; }
+    nif
+}
+
+/// Every live netif, in registry order.
 pub fn iter() -> impl Iterator<Item = Netif> { (0..count()).filter_map(get) }
 
-/// The netif called `name` (`eth0`, `wifi0`, ...).
+/// The live netif called `name` (`eth0`, `wifi0`, ...).
 pub fn by_name(name: &str) -> Option<Netif> { iter().find(|i| i.name() == name) }
 
 /// What the net daemon saw happen to a netif's carrier.

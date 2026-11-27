@@ -3736,6 +3736,8 @@ struct NicTrack {
     rebind_until: u64,
     /// Administratively down as of the last pass (`iface::set_admin`).
     admin_down: bool,
+    /// Generation of the netif slot the stack was built for (0: no stack built).
+    built_gen: u32,
 }
 
 /// Apply a netif's administrative state, once per pass. Down: the address
@@ -3762,6 +3764,71 @@ fn track_admin(nif: drivers::netdev::Netif, t: &mut NicTrack) -> bool {
         }
     }
     down
+}
+
+/// Demote every socket that holds a smoltcp handle of stack `sid` to its unconnected state: handles are
+/// indices, and a stale close must never reach a later stack built under the same sid. Such a socket then
+/// fails like one on a dead link (ENOTCONN / EPIPE; Linux would say ECONNRESET / ENETDOWN).
+fn strip_sid_handles(sid: Sid) {
+    fn demote(sid: Sid, st: &mut SockState, domain: u8, sock_type: u8, port: u16) {
+        *st = match *st {
+            SockState::InetConnected { sid: s2, .. } if s2 == sid => SockState::InetBound {
+                domain, sock_type, local_endpoint: IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), port),
+            },
+            SockState::IcmpBound { sid: s2, .. } if s2 == sid => SockState::IcmpUnbound,
+            other => other,
+        };
+    }
+    let mut tbls = SOCK_TABLES.lock();
+    for t in tbls.iter_mut() {
+        if !t.in_use { continue; }
+        for e in t.socks.iter_mut().filter(|e| e.in_use) {
+            let (d, ty, p) = (e.domain, e.sock_type, e.bound_port);
+            let before = e.state;
+            demote(sid, &mut e.state, d, ty, p);
+            if !matches!(e.state, SockState::InetConnected { .. } | SockState::IcmpBound { .. })
+                && matches!(before, SockState::InetConnected { .. } | SockState::IcmpBound { .. }) { e.connecting = false; }
+        }
+    }
+    let ofds: alloc::vec::Vec<u32> = tbls.inet.keys().copied().collect();
+    for o in ofds {
+        if let Some(sh) = tbls.inet.get_mut(&o) {
+            let (d, ty, p) = (0u8, 0u8, sh.bound_port);
+            demote(sid, &mut sh.state, d, ty, p);
+        }
+    }
+}
+
+/// A netif left the registry (its module unloaded): take its whole presence in the server away so a
+/// later netif in the slot starts clean. Each lock is taken alone. The caller acks the slot afterwards.
+fn teardown_nic(id: u8, sigs: &mut [alloc::vec::Vec<Sig>; MAX_STACKS], track: &mut NicTrack) {
+    let sid = iface::sid_of(id);
+    if let Some(nif) = drivers::netdev::peek(id as usize) {
+        deconfigure(nif, "device removed");
+        iface::serial(&[b"[NET] ", nif.name().as_bytes(), b": device removed, stack torn down\r\n"]);
+    }
+    {
+        let mut stack = stack_for(sid);
+        if let Some(ref mut s) = *stack { dhcp6::reset(id as usize, s); }
+    }
+    ip6::detach(id as usize);
+    dhcp6::detach(id as usize);
+    l2::forget(sid);
+    igmp3::forget(sid);
+    mld2::forget(sid);
+    mcast::forget_sid(sid);
+    udpany::forget_sid(sid);
+    netwatch::forget_sid(sid);
+    strip_sid_handles(sid);
+    *stack_for(sid) = None;
+    smoltcp::pmtu::clear_scope(sid as u16);
+    sigs[sid as usize].clear();
+    iface::reset_nic(id);
+    *track = NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0, admin_down: false, built_gen: 0 };
+    drivers::netdev::note_link(id, drivers::netdev::LinkEvent::Down);
+    iface::notify(id);
+    nlsock::poll_notify(); // DELLINK / DELADDR / DELROUTE: the slot reads as absent
+    sched::wake_poll();
 }
 
 /// Take a netif's address and default route away: its lease is gone (or its
@@ -3875,12 +3942,13 @@ fn poll_stack<D: syngate::Frames>(s: &mut NetStack, dev: &mut D, timestamp: Inst
 }
 
 pub fn net_daemon() -> ! {
+    drivers::netdev::daemon_started();
     vif::init();
     tunbe::init();
     // Readiness snapshots of each stack's sockets taken just before a poll
     // (see `readiness_sigs`), reused across passes.
     let mut sigs: [alloc::vec::Vec<Sig>; MAX_STACKS] = [const { alloc::vec::Vec::new() }; MAX_STACKS];
-    let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0, admin_down: false }; drivers::netdev::MAX_NETIF];
+    let mut track = [NicTrack { gen: 0, carrier: true, down_since: 0, rebind_until: 0, admin_down: false, built_gen: 0 }; drivers::netdev::MAX_NETIF];
     for nif in drivers::netdev::iter() { track[nif.id as usize].carrier = iface::rt(nif.id).carrier; }
     let mut last_broadcast = 0u64;
     let mut immediate_streak = 0u32;
@@ -3909,6 +3977,18 @@ pub fn net_daemon() -> ! {
         }
         let timestamp = stack_now();
 
+        // Netifs removed (module unload) or replaced since the last pass: tear their stacks down,
+        // then ack so the unregistering task may go on and the slot may be reused.
+        for id in 0..drivers::netdev::count() {
+            let (gen, live) = drivers::netdev::slot_state(id);
+            if !live && drivers::netdev::reaped(id) != gen {
+                teardown_nic(id as u8, &mut sigs, &mut track[id]);
+                drivers::netdev::ack_reaped(id, gen);
+            } else if live && track[id].built_gen != 0 && track[id].built_gen != gen {
+                teardown_nic(id as u8, &mut sigs, &mut track[id]);
+            }
+        }
+
         let mut readiness_changed = false;
         let mut wake_mask = 0u64;
         let mut wake_keys = sched::WakeKeys::new();
@@ -3930,6 +4010,7 @@ pub fn net_daemon() -> ! {
                 rxpolicy::NifAction::InitStack => {
                     init_nic(nif);
                     if stack_for(sid).is_none() { discard_rx(nif); continue; }
+                    tr.built_gen = drivers::netdev::slot_state(nif.id as usize).0;
                 }
                 rxpolicy::NifAction::Discard => { discard_rx(nif); continue; }
             }
