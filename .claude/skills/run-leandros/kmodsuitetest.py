@@ -39,6 +39,13 @@ def check(name, ok, detail=""):
         fails.append(name)
 
 
+def build_id(path):
+    """GNU build-id (hex) of an ELF, or None."""
+    r = subprocess.run(["readelf", "-n", path], capture_output=True, text=True)
+    m = re.search(r"Build ID:\s*([0-9a-f]+)", r.stdout)
+    return m.group(1) if m else None
+
+
 def build():
     r = subprocess.run(["cp", "-a", "--reflink=auto", REPO, VAR], capture_output=True, text=True)
     if r.returncode:
@@ -96,6 +103,18 @@ def main():
         rc, out = d("login", "root", "root", "180", timeout=400)
         if rc:
             print("FAIL: login\n" + out[-600:])
+            return 1
+        # The variant must be the kernel that booted: its build-id (printed by the guest as "[kmod] build-id") has to
+        # equal the variant's, and differ from the base tree's all-built-in kernel. Fail loudly, never skip.
+        vb = build_id(os.path.join(VAR, "target", f"final-{arch}", "kernel"))
+        bb = build_id(os.path.join(REPO, "target", f"final-{arch}", "kernel"))
+        o = run("dmesg 2>/dev/null | grep -a 'kmod. build-id'; cat /proc/version", 60)
+        m = re.search(r"build-id ([0-9a-f]{40})", o)
+        gb = m.group(1) if m else None
+        print(f"  kernel build-ids: variant={vb} base={bb} booted={gb}", flush=True)
+        check("booted kernel is the variant's kernel", bool(vb) and gb == vb, f"variant={vb} base={bb} booted={gb}")
+        if not (bool(vb) and gb == vb):
+            print("FAIL: guest did not boot the variant kernel; the module tests below would be meaningless")
             return 1
         # ---- virtio_net x3
         run("kmodctl load virtio_net >/dev/null 2>&1; sleep 1")
