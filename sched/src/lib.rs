@@ -8371,6 +8371,7 @@ pub fn exit_group(code: i32) -> ! {
 fn exit_group_as(code: i32, signo: u32) -> ! {
     let pid = current_pid();
     errtrace_exit(pid, code, signo, "group");
+    klog_line(format_args!("[llx] exit_group_as pid={} code={} signo={}\n", pid, code, signo));
     let tgid = match claim_group_exit(pid) {
         GroupExitClaim::Owner { tgid } => tgid,
         GroupExitClaim::AlreadyDying => {
