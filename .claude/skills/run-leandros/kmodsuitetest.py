@@ -12,6 +12,7 @@ images of the tree under test are never touched. Then, in a QEMU guest with an e
   whole run   no panic / oops / data abort / Zombie in the console log
 Usage: kmodsuitetest.py [arch]   (default $LEANDROS_TEST_ARCH)
 """
+import glob
 import os
 import re
 import shutil
@@ -51,6 +52,9 @@ def build():
     if r.returncode:
         print("FAIL: cp of tree: " + r.stderr[-300:])
         return False
+    # A copied final kernel must never survive a failed rebuild and masquerade as the variant's.
+    for stale in glob.glob(os.path.join(VAR, "target", f"final-{arch}", "kernel*")):
+        os.unlink(stale)
     with open(os.path.join(VAR, ".config"), "w") as f:
         f.write("CONFIG_MODULES=y\nCONFIG_VIRTIO_NET=m\nCONFIG_NVME=m\nCONFIG_IWLWIFI=m\nCONFIG_BRCMF=m\n")
     env = dict(os.environ, KMOD_ONLY="1", KMOD_EXTRA="sdhci" if arch == "aarch64" else "", KMOD_BOARD="raspi4b" if arch == "aarch64" else "", LEANDROS_RUN_ID=f"{rid}-var")
@@ -112,8 +116,9 @@ def main():
         m = re.search(r"build-id ([0-9a-f]{40})", o)
         gb = m.group(1) if m else None
         print(f"  kernel build-ids: variant={vb} base={bb} booted={gb}", flush=True)
-        check("booted kernel is the variant's kernel", bool(vb) and gb == vb, f"variant={vb} base={bb} booted={gb}")
-        if not (bool(vb) and gb == vb):
+        ok_bid = bool(vb) and gb == vb and vb != bb
+        check("booted kernel is the variant's kernel (not the base tree's)", ok_bid, f"variant={vb} base={bb} booted={gb}")
+        if not ok_bid:
             print("FAIL: guest did not boot the variant kernel; the module tests below would be meaningless")
             return 1
         # ---- virtio_net x3
