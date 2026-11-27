@@ -9682,6 +9682,16 @@ fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
             if ns == sched::current_mntns() { return Ok(p); }
         }
     }
+    // A descriptor opened on a bound nsfs file (bwrap's /run/.userns) is an
+    // anon_inode with no backing path: it names the mount it was opened through.
+    if vfs::nsfd_target(current_pid(), fd).is_ok() {
+        let mns = sched::current_mntns();
+        if let Some((n, m)) = vfs::fd_mnt(current_pid(), fd) {
+            if mns != 0 && n as sched::ns::NsId == mns {
+                if let Some(p) = vfs::mnt::nsfs_mountpoint(mns, m) { return Ok(p); }
+            }
+        }
+    }
     let mut host = fd_host_path(fd).ok_or(-2isize)?;
     // A cgroup2 directory reports its absolute cgroup path, but the tree is
     // served relative to the reader's cgroup namespace root: a descriptor
