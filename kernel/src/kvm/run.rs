@@ -183,11 +183,13 @@ fn run_loop(vm: &Arc<Vm>, v: &Arc<Vcpu>, run: *mut KvmRun, gfp: *mut u8) -> isiz
             | if lines & vcpu::IRQ_PENDING != 0 { HCR_VI } else { 0 }
             | if lines & vcpu::FIQ_PENDING != 0 { HCR_VF } else { 0 }
             | if vse { HCR_VSE } else { 0 };
-        vgic_enter(vm, v, hw);
         let forced = vt;
-        super::timer::load(hw, forced);
-
+        // Per-CPU guest state (list registers, timer) is loaded with IRQs off, so a
+        // preemption cannot move the vCPU between the load and the entry. An abort
+        // below still runs timer::save and vgic_leave, which undo both loads.
         let flags = sched::ksync::irq_save();
+        vgic_enter(vm, v, hw);
+        super::timer::load(hw, forced);
         v.guest_cpu.store(unsafe { sched::cpu_id() }, Ordering::Relaxed);
         v.in_guest.store(true, Ordering::SeqCst);
         sched::set_current_vcpu_mode(sched::task::VCPU_IN_GUEST);
