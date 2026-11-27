@@ -195,6 +195,8 @@ fn build(msg: u8, d: &D6, mac: [u8; 6], iaid: u32) -> Vec<u8> {
     }
     opt(&mut p, 6, &[0, 23, 0, 24]);
     opt(&mut p, 8, &[0, 0]);
+    // Rapid Commit (RFC 8415 option 14): ask for a two-message exchange.
+    if msg == 1 { opt(&mut p, 14, &[]); }
     p
 }
 
@@ -237,7 +239,10 @@ pub(crate) fn pass(nif: netdev::Netif, s: &mut crate::NetStack, now: u64) -> Opt
                     (a, u32::from_be_bytes(y.1[16..20].try_into().unwrap()), u32::from_be_bytes(y.1[20..24].try_into().unwrap()))
                 })
             });
+            let rapid = o.iter().any(|x| x.0 == 14);
             match (d.st, ty) {
+                // A Reply to a Solicit counts only with Rapid Commit (RFC 8415 18.2.1); otherwise it is stray.
+                (SOLICIT, 7) if !rapid => {}
                 (SOLICIT, 2) if !status_bad => {
                     let (Some((_, sid)), Some(a)) = (o.iter().find(|x| x.0 == 2), ia_addr) else { return };
                     if !valid_addr(&a.0) || a.2 == 0 { return; }
