@@ -884,7 +884,13 @@ static void test_ping6_own_global(void) {
         if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
     }
     close(s);
-    if (good != 4) printf("  ping own global: %d/4\n", good);
+    if (good != 4) {
+        printf("  ping own global: %d/4 errno=%d target=%s\n", good, errno, g);
+        FILE *f = fopen("/proc/net/if_inet6", "r");
+        char b[256];
+        while (f && fgets(b, sizeof b, f)) printf("    %s", b);
+        if (f) fclose(f);
+    }
     CHECK("ping6_own_global", good == 4);
 }
 
