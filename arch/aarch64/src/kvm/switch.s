@@ -139,6 +139,7 @@ kvm_enter_raw:
     HOST_SAVE sp_el0,      F_SPEL0
     HOST_SAVE tpidr_el1,   F_TPIDR1
     HOST_SAVE tpidr_el0,   F_TPIDR0
+    HOST_SAVE S3_0_C4_C2_3, F_PSTATE   // PSTATE.PAN (the guest overwrites it)
     HOST_SAVE tpidr_el2,   F_TPIDR2
     HOST_SAVE vbar_el2,    F_VBAR
     HOST_SAVE hcr_el2,     F_HCR
@@ -270,6 +271,7 @@ kvm_exit_common:
     mov  sp, x4
     HOST_LOAD hcr_el2,     F_HCR
     isb
+    HOST_LOAD S3_0_C4_C2_3, F_PSTATE   // PAN back to the host value
     HOST_LOAD vbar_el2,    F_VBAR
     HOST_LOAD cptr_el2,    F_CPTR
     HOST_LOAD mdcr_el2,    F_MDCR
