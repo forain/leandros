@@ -91,13 +91,10 @@ pub(super) fn create(pid: u32, arg: usize) -> isize {
     let Some(as_root) = sched::with_current_address_space(|a| a.root()) else { return -22 };
     let s2 = match Stage2::new(KFrames, want) { Ok(s) => s, Err((_, _)) => return -12 };
     let mut slot = VmidSlot::default();
-    let vmid = {
-        let mut a = VMIDS.lock();
-        match a.get(&mut slot) {
-            Some((v, flush)) => { if flush { unsafe { arch_aarch64::kvm::tlb::tlbi_all_vmids(); } } v }
-            None => return -12,
-        }
-    };
+    // The VMID is fixed for the VM's life (the run loop never re-calls get()), so it is
+    // taken without rollover; when all 255 are live CREATE_VM fails with ENOMEM. A VMID
+    // freed by a destroyed VM was flushed by that VM's tlbi_vmid in Drop.
+    let Some(vmid) = VMIDS.lock().alloc_fixed(&mut slot) else { return -12 };
     let vttbr = s2.vttbr(vmid);
     let vtcr = s2.vtcr_with(super::parange(), false);
     let id = next_serial();

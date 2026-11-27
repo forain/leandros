@@ -93,3 +93,22 @@ fn many_rollovers_never_duplicate_running() {
     }
     assert_eq!(a.get(&mut live).map(|x| x.0).is_some(), true);
 }
+
+#[test]
+fn alloc_fixed_never_rolls_over() {
+    let mut a = VmidAlloc::new(8);
+    let mut slots = vec![VmidSlot::default(); 255];
+    let gen = a.generation();
+    for s in slots.iter_mut() { assert!(a.alloc_fixed(s).is_some()); }
+    let mut ids: Vec<u16> = slots.iter().map(|s| s.vmid).collect();
+    ids.sort(); ids.dedup();
+    assert_eq!(ids.len(), 255);
+    assert!(!ids.contains(&0));
+    let mut extra = VmidSlot::default();
+    assert_eq!(a.alloc_fixed(&mut extra), None); // ENOMEM, no rollover reuse
+    assert_eq!(a.generation(), gen);
+    // Releasing one makes exactly that id available again.
+    let freed = slots[7].vmid;
+    a.release(&mut slots[7]);
+    assert_eq!(a.alloc_fixed(&mut extra), Some(freed));
+}

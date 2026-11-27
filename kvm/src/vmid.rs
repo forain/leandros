@@ -111,6 +111,17 @@ impl VmidAlloc {
         Some((slot.vmid, flush))
     }
 
+    /// A VMID that stays with its VM for the VM's whole life (never rolled over, so
+    /// the VM needs no per-entry `get`). `None` when every VMID is taken: the caller
+    /// fails VM creation (ENOMEM). The generation never advances through this path.
+    pub fn alloc_fixed(&mut self, slot: &mut VmidSlot) -> Option<u16> {
+        let id = self.find_free()?;
+        set(&mut self.in_use, id);
+        slot.vmid = id as u16;
+        slot.gen = self.gen;
+        Some(slot.vmid)
+    }
+
     /// A vCPU of the VM owning `vmid` is about to enter the guest.
     pub fn enter(&mut self, vmid: u16) {
         let r = &mut self.running[vmid as usize];
