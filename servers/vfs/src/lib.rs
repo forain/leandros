@@ -17897,7 +17897,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // The owner, as path stat reports it. fstat answered uid/gid 0 for
         // every tmpfs file, so a program checking that the directory it just
         // created is its own (Bun: /tmp/claude-<uid>) refused it.
-        write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
+        let rdev = { let t = TMP_FILES.lock(); let e = &t[owner]; if e.devtype != 0 { e.rdev as u64 } else { 0 } };
+        write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, rdev);
         write_stat_times(stat_ptr, at, mt, ct);
         if let Some(b) = blocks {
             unsafe { sched::uaccess::copy_raw((stat_ptr as *mut u8).add(64), &b as *const u64 as *const u8, 8); }

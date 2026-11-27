@@ -10844,7 +10844,7 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 { return -22; } // EINVAL
     if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         let empty = path_ptr == 0
-            || (validate_user_buf(path_ptr, 1) && unsafe { *(path_ptr as *const u8) } == 0);
+            || (copy_user_path(path_ptr).map_or(false, |p| p.is_empty()));
         if empty { return sys_fchmod(dirfd, mode); }
     }
     sys_fchmodat(dirfd, path_ptr, mode, flags & AT_SYMLINK_NOFOLLOW)
@@ -11067,7 +11067,7 @@ fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: us
     // AT_EMPTY_PATH with an empty path: fchown(dirfd) (also for O_PATH fds).
     if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         let empty = path_ptr == 0
-            || (validate_user_buf(path_ptr, 1) && unsafe { *(path_ptr as *const u8) } == 0);
+            || (copy_user_path(path_ptr).map_or(false, |p| p.is_empty()));
         if empty { return fchown_kids(dirfd, uid, gid); }
     }
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
