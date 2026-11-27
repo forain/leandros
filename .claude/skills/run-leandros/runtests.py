@@ -464,6 +464,9 @@ SUITES = {
     "pcibridge": ["host:pcibridgetest.py"],
     # lane nitrox86: x86_64 with no PIT/HPET/i8042/display (EC2 Nitro-like): login on serial, TSC stated, clock true (own boot).
     "nitrox86": ["/bin/timertest", "host:nitrotest.py"],
+    # kvm-plan: /dev/kvm API, memslot, MMIO/PSCI/vtimer/WFI exits, kick (aarch64 TCG, virtualization=on; GICv3 / GICv2 machine).
+    "kvm": ["/bin/kvmtest all"],
+    "kvmv2": ["/bin/kvmtest all"],
     "usbisoch": ["host:usbisochtest.py"],
     "blkslow": ["host:blkslowtest.py"],
     "blksteal": ["host:blkstealtest.py"],
@@ -1156,6 +1159,16 @@ def main(argv):
             print(f"unknown suite {s!r}; known: {', '.join(SUITES)}")
             return 2
         cmds += SUITES[s]
+    if "kvm" in suites or "kvmv2" in suites:
+        # EL2 for the guest kernel exists only under TCG (virtualization=on); HVF/KVM
+        # hosts SKIP (A76 has no FEAT_NV, so nested KVM is unavailable there too).
+        _fl = driver._accel_flags(arch, mode) if arch == "aarch64" else []
+        if "-accel" not in _fl or not _fl[_fl.index("-accel") + 1].startswith("tcg"):
+            print("SKIP kvm suites: need aarch64 under TCG (virtualization=on)")
+            return 0
+        os.environ["LEANDROS_VIRT"] = "1"  # driver.py: virt,virtualization=on + -cpu cortex-a76
+        if "kvmv2" in suites:
+            os.environ["LEANDROS_GIC"] = "2"  # GICv2 virt machine (Pi 5 shape)
     if "nitrox86" in suites:
         os.environ["LEANDROS_NITRO"] = "1"  # x86_64: no PIT/HPET/i8042/display device
     if "deadtimer" in suites and cmdline is None:

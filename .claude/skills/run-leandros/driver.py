@@ -524,6 +524,25 @@ def _gic_version(accel_flags) -> str:
     return "host" if "kvm" in accel_flags else "3"
 
 
+def _virt_knob(cpu_flags, gic):
+    """LEANDROS_VIRT=1 (kvm/kvmv2 suites): expose EL2 to the guest kernel so LeandrOS
+    can host KVM. Only under TCG; HVF/KVM keep their flags (A76 has no FEAT_NV, so
+    runtests.py SKIPs those runs). Returns (machine_options, cpu_flags); with the
+    knob off both come back exactly as the default command line has them.
+    LEANDROS_GIC=2 selects a GICv2 virt machine, LEANDROS_VIRT_CPU the TCG CPU
+    (default cortex-a76: Pi-like, no SVE/SME/MTE/PAuth/LPA2; fallback
+    max,lpa2=off,sve=off,sme=off,pauth=off,mte=off)."""
+    opts = "gic-version=" + gic
+    if os.environ.get("LEANDROS_VIRT") != "1":
+        return opts, cpu_flags
+    if "-accel" not in cpu_flags or not cpu_flags[cpu_flags.index("-accel") + 1].startswith("tcg"):
+        return opts, cpu_flags
+    opts = "gic-version=" + os.environ.get("LEANDROS_GIC", "3") + ",virtualization=on"
+    flags = list(cpu_flags)
+    flags[flags.index("-cpu") + 1] = os.environ.get("LEANDROS_VIRT_CPU", "cortex-a76")
+    return opts, flags
+
+
 def _accel_flags(guest_arch: str, mode: str):
     """Best available accelerator for this host/guest pair.
 
@@ -1048,6 +1067,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
         # The direct-kernel-boot path stays TCG-only regardless — it hits a
         # separate, still-unfixed QEMU PL011-timer hang under HVF.
         cpu_flags = _accel_flags("aarch64", mode)
+        virt_opts, cpu_flags = _virt_knob(cpu_flags, _gic_version(cpu_flags))
         # Auto-create the writable VARS pflash the same way the x86_64 branch
         # below does. Without this file QEMU fails to open the pflash drive
         # and exits within the first second, before the serial chardev socket
@@ -1077,7 +1097,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             # gic-version=3: QEMU >= 11.1 HVF refuses a GICv2 machine outright;
             # the kernel detects v2/v3 at boot, so TCG uses the same line.
             # KVM on an aarch64 Linux host (Pi 5 = GICv2) needs gic-version=host.
-            "-machine", "virt,gic-version=" + _gic_version(cpu_flags), "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
+            "-machine", "virt," + virt_opts, "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -1304,9 +1324,11 @@ def _build_direct_cmd(arch):
         initrd = os.path.join(REPO_ROOT, "initrd-aarch64.cpio")
         if not os.path.exists(kernel):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
+        virt_opts, virt_cpu = _virt_knob(["-cpu", "max", "-accel", "tcg"], "3")
+        virt_cpu = virt_cpu[:2]
         return [
             _qemu_bin("qemu-system-aarch64"),
-            "-machine", "virt,gic-version=3", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
+            "-machine", "virt," + virt_opts, "-smp", "4", *virt_cpu, "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             # Stand-in for the Limine disk (vda in the UEFI layout): a bare
