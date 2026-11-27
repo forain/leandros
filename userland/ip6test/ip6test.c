@@ -1350,10 +1350,18 @@ static void test_dhcp6_refresh(void) {
         return;
     }
     if (r != 0 || !got) { CHECK("dhcp6_refresh_min_600", 0); d6_reset(); return; }
+    int rep0 = rep;
     r = d6_send(7, x, o, sizeof o);
     int ok = r == 0 && d6_wait("done");
     long t = d6_field("refresh");
-    CHECK("dhcp6_refresh_min_600", ok && t >= 590 && t <= 600);
+    d6_state(m, s, x, &rep);
+    if (ok && rep == rep0 + 1 && t >= 86300 && t <= 86400) {
+        /* The wire server (slirp) answered between our state read and our reply; the client keeps
+         * only the first Reply of a transaction, so our floored one was (correctly) ignored. */
+        printf("  note: a server on the wire answered the Information-Request just before our reply (floor not exercised)\n");
+    } else {
+        CHECK("dhcp6_refresh_min_600", ok && t >= 590 && t <= 600);
+    }
     d6_reset();
     r = inject_ra(0x40, NULL, 0);
     got = d6_wait("info-sent") || d6_wait("done");
