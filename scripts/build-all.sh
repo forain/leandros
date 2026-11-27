@@ -7,7 +7,8 @@ set -e  # Exit on any error
 # Make a failed build unmistakable. The script itself exits non-zero on a
 # failed kernel compile (set -e), but callers that pipe it (`build-all.sh | tail`,
 # `| tee`) see the pipe's last status; use `set -o pipefail` or PIPESTATUS there.
-trap 'rc=$?; [[ $rc -ne 0 ]] && echo "build-all.sh: FAILED (exit $rc)" >&2' EXIT
+PHASE_CUR=""
+trap 'rc=$?; [[ $rc -ne 0 ]] && echo "BUILD FAILED: ${PHASE_CUR:-build-all.sh} (exit $rc)" >&2' EXIT
 # macOS: pick an SDK whose libSystem the linker can read (see darwin-sdk.sh).
 source "$(dirname "${BASH_SOURCE[0]}")/darwin-sdk.sh"
 
@@ -1183,10 +1184,13 @@ done
 # --- per-phase timing; BUILD_JOBS>1 runs the independent per-arch builds concurrently (see par_run) ---
 BUILD_T0=$SECONDS
 phase() { # <name> <cmd...>: run it, print its wall time (the status is the command's)
-    local n=$1 t=$SECONDS rc=0; shift
-    "$@" || rc=$?
-    echo "⏱ phase $n: $((SECONDS - t))s (rc=$rc, build total $((SECONDS - BUILD_T0))s)"
-    return $rc
+    local n=$1 t=$SECONDS; shift
+    PHASE_CUR=$n
+    # No `|| rc=$?` here: that context turns errexit OFF inside the whole function body, which
+    # swallowed a failed cargo build (the rest of the function ran on and returned success).
+    # With errexit live the first failing command aborts the build; the EXIT trap names $PHASE_CUR.
+    "$@"
+    echo "⏱ phase $n: $((SECONDS - t))s (rc=0, build total $((SECONDS - BUILD_T0))s)"
 }
 PAR_DIR="${TMPDIR:-/tmp}/build-all-par.$$"; PAR_PIDS=(); PAR_NAMES=()
 par_run() { # <name> <cmd...>: like phase, but in the background when BUILD_JOBS > 1 (log shown by par_wait)
@@ -1200,7 +1204,7 @@ par_run() { # <name> <cmd...>: like phase, but in the background when BUILD_JOBS
 par_wait() { # wait for every par_run job, print their logs in start order, fail when any failed
     local i bad=0
     for i in "${!PAR_PIDS[@]}"; do
-        wait "${PAR_PIDS[$i]}" || { bad=1; echo "❌ parallel build step ${PAR_NAMES[$i]} failed"; }
+        wait "${PAR_PIDS[$i]}" || { bad=1; echo "BUILD FAILED: ${PAR_NAMES[$i]} (parallel step)" >&2; PHASE_CUR="${PAR_NAMES[$i]}"; }
         [[ -f "$PAR_DIR/${PAR_NAMES[$i]}.log" ]] && cat "$PAR_DIR/${PAR_NAMES[$i]}.log"
     done
     PAR_PIDS=(); PAR_NAMES=(); rm -rf "$PAR_DIR"
@@ -1236,8 +1240,8 @@ fi
 for arch in "${ARCHS[@]}"; do
     phase build_userland build_userland "$arch"
     phase build_doom build_doom "$arch"
-    phase build_floattest build_floattest "$arch" || exit 1
-    phase build_memcpybench build_memcpybench "$arch" || exit 1
+    phase build_floattest build_floattest "$arch"
+    phase build_memcpybench build_memcpybench "$arch"
     phase build_mame build_mame "$arch"
     phase build_portal build_portal "$arch"
     phase build_pipewire build_pipewire "$arch"
@@ -1287,6 +1291,13 @@ for arch in "${ARCHS[@]}"; do
     # build. Created when missing (8 GiB sparse), replaced once when it is an
     # old /data root clone, recreated only on --reset-home.
     python3 scripts/mkfs-f2fs-home.py ensure "f2fs-data1-$arch.img" ${RESET_HOME:+--reset}
+done
+
+# Every required final artifact must exist (an earlier step that "succeeded" without producing one is a failed build).
+for arch in "${ARCHS[@]}"; do
+    for f in "target/final-$arch/kernel" "target/final-$arch/kernel-direct" "initrd-$arch.cpio"; do
+        [[ -s "$ROOT_DIR/$f" ]] || { PHASE_CUR="missing final artifact $f"; echo "BUILD FAILED: $PHASE_CUR" >&2; exit 1; }
+    done
 done
 
 echo "🎉 Build Complete!"
