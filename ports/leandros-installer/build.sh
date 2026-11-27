@@ -5,6 +5,7 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-both}" in
