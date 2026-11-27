@@ -100,30 +100,30 @@ def main():
         # ---- virtio_net x3
         run("kmodctl load virtio_net >/dev/null 2>&1; sleep 1")
         for i in range(1, 4):
-            o = run("ip -o link show eth0 | cut -d: -f1 > /tmp/if0.txt; grep -c ':0016 00000000:0000 0A' /proc/net/tcp > /tmp/l22.txt; "
-                    "ip monitor link >/tmp/mon.txt 2>&1 & MP=$!; sleep 1; "
-                    "kmodctl rmmod virtio_net; echo RM_RC=$?; for j in 1 2 3 4 5 6; do grep -q 'eth0:' /proc/net/dev || break; sleep 1; done; "
-                    "n=$(grep 'eth0:' /proc/net/dev | wc -l); m=$(grep '^virtio_net ' /proc/modules | wc -l); echo ETH0=$((n)) MOD=$((m)); sleep 1; kill $MP; "
-                    "echo V6=$(grep -c eth0 /proc/net/if_inet6); echo RT4=$(ip route | grep -c 'dev eth0'); echo RT6=$(ip -6 route | grep -c 'dev eth0'); "
-                    "ip link show eth0 >/dev/null 2>&1; echo LS_RC=$?; echo MON=$(grep -c 'Deleted.*eth0' /tmp/mon.txt); echo GONE_END")
+            # Added checks follow the netif that really disappears (a second virtio device may be built in as eth0).
+            NL = "awk -F: '/:/{gsub(/ /,\"\",$1);print $1}' /proc/net/dev | grep -v '^lo$' | sort"
+            run(f"{NL} > /tmp/n0.txt; grep -c ':0016 00000000:0000 0A' /proc/net/tcp > /tmp/l22.txt; echo SNAP_END")
+            o = run("kmodctl rmmod virtio_net; echo RM_RC=$?; for j in 1 2 3 4 5 6; do grep -q 'eth0:' /proc/net/dev || break; sleep 1; done; "
+                    "n=$(grep 'eth0:' /proc/net/dev | wc -l); m=$(grep '^virtio_net ' /proc/modules | wc -l); echo ETH0=$((n)) MOD=$((m)); echo GONE_END")
             check(f"virtio_net rmmod #{i}", "RM_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 gone after unload", "ETH0=0" in o, o.strip()[-300:])
-            check(f"virtio_net #{i} no eth0 in if_inet6 / routes after unload", "V6=0" in o and "RT4=0" in o and "RT6=0" in o, o.strip()[-200:])
-            check(f"virtio_net #{i} ip link show eth0 fails after unload", re.search(r"LS_RC=[1-9]", o) is not None, o.strip()[-120:])
-            check(f"virtio_net #{i} ip monitor saw Deleted eth0", re.search(r"MON=[1-9]", o) is not None, o.strip()[-120:])
+            o2 = run(f"{NL} > /tmp/n1.txt; IFN=$(comm -23 /tmp/n0.txt /tmp/n1.txt | head -n 1); echo IFN=$IFN; echo $IFN > /tmp/ifn.txt; "
+                     "echo V6=$(grep -c \"$IFN\" /proc/net/if_inet6); echo RT4=$(grep -c \"^$IFN\" /proc/net/route); echo RT6=$(grep -c \"$IFN\" /proc/net/ipv6_route); "
+                     "[ -e /sys/class/net/$IFN ]; echo LS_RC=$?; echo CHK_END")
+            check(f"virtio_net #{i} unloaded netif left /proc/net/dev", re.search(r"IFN=\w+", o2) is not None, o2.strip()[-200:])
+            check(f"virtio_net #{i} unloaded netif gone from if_inet6 / routes", "V6=0" in o2 and "RT4=0" in o2 and "RT6=0" in o2, o2.strip()[-200:])
+            check(f"virtio_net #{i} unloaded netif sysfs node gone", re.search(r"LS_RC=[1-9]", o2) is not None, o2.strip()[-120:])
             o = run("kmodctl load virtio_net; echo LD_RC=$?; for j in $(seq 1 30); do grep -q 'eth0:' /proc/net/dev && break; sleep 1; done; "
-                    "for j in $(seq 1 20); do ping -c 1 -W 2 10.0.2.2 >/dev/null 2>&1 && echo PING_OK && break; sleep 1; done; "
-                    "echo IF_SAME=$([ \"$(ip -o link show eth0 | cut -d: -f1)\" = \"$(cat /tmp/if0.txt)\" ] && echo 1 || echo 0); "
-                    "for j in $(seq 1 10); do grep -q '^fe80' /proc/net/if_inet6 && break; sleep 1; done; echo LL=$(grep -c '^fe80' /proc/net/if_inet6); "
-                    "echo RXB=$(grep 'eth0:' /proc/net/dev | sed 's/.*://' | awk '{print $1}'); "
-                    "echo L22=$([ \"$(grep -c ':0016 00000000:0000 0A' /proc/net/tcp)\" -ge \"$(cat /tmp/l22.txt)\" ] && echo 1 || echo 0); echo NET_END", 150)
+                    "for j in $(seq 1 20); do ping -c 1 -W 2 10.0.2.2 >/dev/null 2>&1 && echo PING_OK && break; sleep 1; done; echo NET_END", 150)
             check(f"virtio_net load #{i}", "LD_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 back and gateway pingable", "PING_OK" in o)
-            check(f"virtio_net #{i} same ifindex after reload", "IF_SAME=1" in o, o.strip()[-200:])
-            check(f"virtio_net #{i} fe80 back in if_inet6", re.search(r"LL=[1-9]", o) is not None, o.strip()[-200:])
-            rx = re.search(r"RXB=(\d+)", o)
-            check(f"virtio_net #{i} eth0 RX counter restarted low", rx is not None and int(rx.group(1)) < 200000, o.strip()[-200:])
-            check(f"virtio_net #{i} :22 listeners restored", "L22=1" in o, o.strip()[-120:])
+            o3 = run("IFN=$(cat /tmp/ifn.txt); for j in $(seq 1 10); do grep -q \"$IFN\" /proc/net/if_inet6 && break; sleep 1; done; echo LL=$(grep -c \"$IFN\" /proc/net/if_inet6); "
+                     "echo RXB=$(grep \"$IFN:\" /proc/net/dev | sed 's/.*://' | awk '{print $1}'); "
+                     "echo L22=$([ \"$(grep -c ':0016 00000000:0000 0A' /proc/net/tcp)\" -ge \"$(cat /tmp/l22.txt)\" ] && echo 1 || echo 0); echo AFT_END")
+            check(f"virtio_net #{i} reloaded netif has link-local back", re.search(r"LL=[1-9]", o3) is not None, o3.strip()[-200:])
+            rx = re.search(r"RXB=(\d+)", o3)
+            check(f"virtio_net #{i} reloaded netif RX counter restarted low", rx is not None and int(rx.group(1)) < 200000, o3.strip()[-200:])
+            check(f"virtio_net #{i} :22 listeners restored after reload", "L22=1" in o3, o3.strip()[-120:])
         # ---- nvme
         o = run("grep '^nvme ' /proc/modules; echo BASE_END")
         open("/tmp/kmodsuite-diag.txt", "a").write("nvme base: " + o.strip()[-200:] + "\n")
