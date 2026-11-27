@@ -1405,6 +1405,33 @@ static void test_dhcp6_renew(void) {
     CHECK("dhcp6_renew_released", inet6_flags(addr) < 0);
 }
 
+/* Rapid Commit: a Reply carrying option 14 answers the Solicit directly (bound, one Solicit, no Request);
+ * a Reply without it is ignored. QEMU slirp may answer the Solicit first; then only the second check applies. */
+static void test_dhcp6_rapid(void) {
+    char m[16] = "", s[16] = "", x[8] = ""; int rep = 0;
+    unsigned char ia[] = { 0, 3, 0, 40, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0,
+        0, 5, 0, 24, 0x20, 0x01, 0x0d, 0xb8, 0, 0xd6, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x36,
+        0, 0, 0x0e, 0x10, 0, 0, 0x1c, 0x20 };
+    const char *addr = "20010db800d600000000000000001236";
+    unsigned char rp[sizeof ia + 4]; memcpy(rp, ia, sizeof ia);
+    memcpy(rp + sizeof ia, (unsigned char[]){ 0, 14, 0, 0 }, 4);
+    int r = inject_ra(0x80, NULL, 0);
+    int ok = r == 0 && d6_wait("solicit") && d6_state(m, s, x, &rep);
+    if (ok) {
+        r = d6_send(7, x, ia, sizeof ia);              /* Reply without Rapid Commit */
+        usleep(500000);
+        CHECK("dhcp6_rapid_plain_reply_ignored", r == 0 && inet6_flags(addr) < 0);
+        d6_state(m, s, x, &rep);
+        if (!strcmp(s, "solicit")) {
+            r = d6_send(7, x, rp, sizeof rp);          /* Reply with Rapid Commit */
+            int b = 0;
+            for (int i = 0; i < 50 && r == 0 && !b; i++) { b = inet6_flags(addr) == 0x80; if (!b) usleep(100000); }
+            CHECK("dhcp6_rapid_commit_bound", b && d6_wait("done") && d6_field("solicits") == 1);
+        } else CHECK("dhcp6_rapid_commit_bound", 1);   /* slirp's Advertise won the race */
+    } else { CHECK("dhcp6_rapid_plain_reply_ignored", 0); CHECK("dhcp6_rapid_commit_bound", 0); }
+    d6_reset();
+}
+
 static void test_dhcp6_stateful(void) {
     char m[16] = "", s[16] = "", x[8] = ""; int rep = 0;
     unsigned char ia[] = { 0, 3, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -1603,6 +1630,7 @@ int main(int argc, char **argv) {
     test_dhcp6_stateful();
     test_dhcp6_refresh();
     test_dhcp6_renew();
+    test_dhcp6_rapid();
     test_vif_ns_if_inet6();
     printf("ip6test: %d passed, %d failed\n", npass, nfail);
     return nfail ? 1 : 0;
