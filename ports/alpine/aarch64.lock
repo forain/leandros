@@ -121,9 +121,7 @@ pkg libstdc++ 15.2.0-r9 main Q1E7P5gTguWspC84S5Z61N/+brlho= 36e8a2cee1ee14df5180
 pkg libtasn1 4.21.0-r0 main Q1GLj1tV4Psr/uUBV3kBlkud8ymh0= 0d26ec98db730cebc1ba291aaf213bcaa63e0b9f31b561490777896220b80b07 -
 pkg libtheora 1.2.0-r1 main Q1GMCtV8ZVzFs8hxOgJh5SHX0aVbk= e6da9499db4437b2e1725eaa97e6d607101d65cf11b11fa3c0bbdea251f6122f -
 pkg libunistring 1.4.2-r0 main Q1qi9eSXubd2LhfxtSNHp+X782HpA= 2c2a871d7cf19eae35e3a6a57d74fd194bd3d68742d78d7b54b698f62fcdde0e -
-pkg libunwind 1.8.3-r0 main Q1OKxdP1OEO0SDJsDD+EkMgvyHa9w= 2c36cf1db4c68d5e23e5c8065b98a74cde3c075e7765015be2ce941e7c4d798c -
 pkg libuuid 2.42.4-r3 main Q1TnkLui9+tQjcR4Hh8OSAEbbvcBs= 61844afc7b573f6b21cb6c644ba485ea1597c9969219b5ad8c8e9f5f0dc2590b -
-pkg libuv 1.52.1-r0 main Q1MwWzt4jDKe4Josf0vWv2gojR0+M= 5d4c39678b40b280db3d6e5106a61d178269ff3bc084c76812641352cd50edb9 -
 pkg libva 2.24.1-r0 main Q1cgNOz+uWU1K2vD/YjWpnlXjZca0= 38ad98cf82b14b39d4ef4730a1bf51a8252cbd860fb07cc89fd302fb307eaebc -
 pkg libvdpau 1.5-r4 main Q1SW3BQZPK9gQpy3TtHviivREVJAQ= c30ac256ab6c9797e7505de343d178bce7feaf49e15e2b6bf46dba59a1a46317 -
 pkg libvorbis 1.3.7-r2 main Q1OQJmCSotaqTTSENINTnekB581w4= 2db4f1c8f6144120adc7859259d41366cc1ecd760ea8905879996ffd6864323d -
@@ -172,14 +170,12 @@ pkg passt 2026.10.02-r0 community Q135eWqi60FtlKVWBDo+O3uaNHf2I= 169125f9b3fbc7b
 pkg pciutils-libs 3.15.0-r0 main Q1tBv5Xy61ZnidVcC/07tJ3xcnQiY= a2b839de1b8aa105f5f1006f362c2471d10d0d74f2e186728d0f7231128a82e0 -
 pkg pcre2 10.49-r0 main Q1IJzWyD82EWXBoB6E11lnAVo/Xpw= bf8b7b3bdae48c257711c290194da70521df3c68e2963e436b9bfbd834c45b81 -
 pkg pinentry 1.3.2-r0 main Q1VeZCCuipbSkWH4rMbbMWSGIbj/M= e702a084d37b3548c1025e5ed4c40ac0e09a7a83425e54108cc35e0c6bf7c037 post-install,post-upgrade
-pkg pipewire-libs 1.6.12-r1 community Q1tLhoMHY7HXWBdp3F5YFec6acavY= ead9acefd99ca861792f7b3572f2e3034bf895a4cbcb89c49da957f5a843fbc0 -
 pkg pixman 0.46.4-r0 main Q178theXDXQkuidPKFX3WpPgNhUhw= bb00353d1a9123ade62fe7779c6efaeb6606650d5cfd005532ef06478e445acd -
 pkg pkgconf 3.0.11-r0 main Q1kHvHaWtiKHUVHONJng+QayAHqcM= 5436871a06a2c42160a8fcb7463635b7cb30b1636029b6dced0ccd5ff85a8cdc -
 pkg podman 6.1.4-r1 community Q1UPscW1rLp4VV6wT9fe6b46wFzTM= 2477de53fe08d102d60f2c81b0144fe22038ab5cb9d1a6bc94d111f56705c145 post-install,post-upgrade
 pkg rav1e-libs 0.8.1-r0 community Q1RiucukLoAB4RS2HL9cg2AKKsqPc= c236c1372a8a8c9d9ea87919f39ba0aa525e3a40258d999b9478ec1d1e10227c -
 pkg readline 8.3.3-r1 main Q1QCfXo0vQv4/OwHnLmOG2hyxew5Y= ef3339d5a240b3501b57b21b48da192b429780af9e8a1ba3def629a72810dfbf -
 pkg ripgrep 16.0.0-r0 community Q1S2Vw3s3QJQMuSOJ6NDKCLi0aNGU= bceac6b0797694ea1289d75c51ecce0476a765bc71eb411c17217605b9ea9712 -
-pkg roc-toolkit-libs 0.4.0-r1 community Q13Gi2Tg/7A5BYxehr5fnvUh/rKgA= 09926be2635f553fabde426c5c5efc22b47c7ec59249e535d276efee206060ce -
 pkg scudo-malloc 23.1.6-r0 main Q1WKHRb9yI26a+wJGtyZlb/WWLgl4= 1a5eaef472903dd22814f18aabc4e1e6198468fb5fd9c7f02e184f8bcd6e4dc0 -
 pkg shadow-libs 4.20.4-r1 community Q1kJV2w0PKFvW7AbzWOiXDF0Kjtc4= d12a1b3e6ffb0cc5e415374a800e15db12f9798c4ca86129fa17493fa91e9773 -
 pkg shadow-subids 4.20.4-r1 community Q1OPQ+XW+od2KNTr7l5Z5MIOxA+so= 66054ee3d4a12bc6b4dc5978add39fd889e5a71bc2bb852be49d39e10aef5da5 -
@@ -228,6 +224,6 @@ held so:libdrm.so.2 ffmpeg-libavutil
 held so:libdrm.so.2 kmscube
 held so:libdrm.so.2 libva
 held so:libgbm.so.1 kmscube
+held so:libpipewire-0.3.so.0 firefox
 held so:libudev.so.1 libinput-libs
-held so:libudev.so.1 pipewire-libs
 generated 4d65de5fd9373b5ba82ef0d4a3e2bf823ef4c18851aef326f7bc299c6eac6937
