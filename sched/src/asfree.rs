@@ -178,6 +178,8 @@ pub fn exit_race(pid: Pid, tgid: Pid) {
         crate::irq_window();
         crate::yield_now("asfree_exitrace");
     }
+    if RACE_ARRIVED.load(Ordering::Acquire) >= n { LL_RACE_FULL.fetch_add(1, Ordering::Relaxed); }
+    else { LL_RACE_TIMEOUT.fetch_add(1, Ordering::Relaxed); }
 }
 
 /// `dropdelay`: the dispatch loop, with a removed member of `tgid` whose drop
@@ -238,6 +240,9 @@ static GEN: AtomicU64 = AtomicU64::new(1);
 /// user tasks).
 pub static LL_RECHECK_REAPS: AtomicU64 = AtomicU64::new(0);
 pub static LL_SETTLE_REAPS: AtomicU64 = AtomicU64::new(0);
+pub static LL_RACE_FULL: AtomicU64 = AtomicU64::new(0);
+pub static LL_RACE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+pub static LL_EXIT_REAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Text of the file.
 pub fn render(s: &mut alloc::string::String) {
@@ -253,6 +258,9 @@ pub fn render(s: &mut alloc::string::String) {
     let _ = writeln!(s, "armed {}", any_armed() as u8);
     let _ = writeln!(s, "ll_recheck_reaps {}", LL_RECHECK_REAPS.load(Ordering::Relaxed));
     let _ = writeln!(s, "ll_settle_reaps {}", LL_SETTLE_REAPS.load(Ordering::Relaxed));
+    let _ = writeln!(s, "ll_race_full {}", LL_RACE_FULL.load(Ordering::Relaxed));
+    let _ = writeln!(s, "ll_race_timeout {}", LL_RACE_TIMEOUT.load(Ordering::Relaxed));
+    let _ = writeln!(s, "ll_exit_reaps {}", LL_EXIT_REAPS.load(Ordering::Relaxed));
     for (n, t, p, q) in v { let _ = writeln!(s, "{} {} {} {}", n, t, p, q); }
 }
 

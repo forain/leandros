@@ -2123,7 +2123,7 @@ unsafe fn test_wait_releases_memory_exactly() -> bool {
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 struct AsFreeEnt { seq: u64, tgid: usize, pages: usize, pt: usize }
-struct AsFree { ll_recheck: usize, total: u64, cpus: usize, overlaps: usize, pause_result: usize, armed: usize, n: usize, e: [AsFreeEnt; 256] }
+struct AsFree { ll_recheck: usize, ll_full: usize, ll_tmo: usize, ll_exit: usize, total: u64, cpus: usize, overlaps: usize, pause_result: usize, armed: usize, n: usize, e: [AsFreeEnt; 256] }
 
 const ASFREE_PATH: &[u8] = b"/proc/leandros_asfree\0";
 
@@ -2147,6 +2147,9 @@ unsafe fn asfree_read(out: &mut AsFree) -> bool {
         if let Some(r) = line.strip_prefix(b"armed ") { out.armed = parse_num(r).unwrap_or(0); continue; }
         if let Some(r) = line.strip_prefix(b"ll_recheck_reaps ") { out.ll_recheck = parse_num(r).unwrap_or(0); continue; }
         if line.starts_with(b"ll_settle_reaps ") { continue; }
+        if let Some(r) = line.strip_prefix(b"ll_race_full ") { out.ll_full = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"ll_race_timeout ") { out.ll_tmo = parse_num(r).unwrap_or(0); continue; }
+        if let Some(r) = line.strip_prefix(b"ll_exit_reaps ") { out.ll_exit = parse_num(r).unwrap_or(0); continue; }
         if line.starts_with(b"busy_waits ") { continue; }
         let mut f = [0usize; 4];
         let mut k = 0;
@@ -2198,7 +2201,7 @@ fn asfree_of(a: &AsFree, tgid: usize) -> (usize, AsFreeEnt) {
 }
 
 unsafe fn asfree_new() -> AsFree {
-    AsFree { ll_recheck: 0, total: 0, cpus: 0, overlaps: 0, pause_result: 0, armed: 0, n: 0, e: [AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }; 256] }
+    AsFree { ll_recheck: 0, ll_full: 0, ll_tmo: 0, ll_exit: 0, total: 0, cpus: 0, overlaps: 0, pause_result: 0, armed: 0, n: 0, e: [AsFreeEnt { seq: 0, tgid: 0, pages: 0, pt: 0 }; 256] }
 }
 
 unsafe fn kill_and_reap(pid: i32) {
@@ -2780,7 +2783,8 @@ unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize,
     ok &= reported;
     let pidfd = syscall2(LL_PIDFD_OPEN, pid as usize, 0) as isize;
     let before = asfree_count(pid).unwrap_or(99);
-    let rc_before = { let mut x = asfree_new(); if asfree_read(&mut x) { x.ll_recheck } else { 0 } };
+    let c_before = { let mut x = asfree_new(); asfree_read(&mut x); (x.ll_recheck, x.ll_full, x.ll_tmo, x.ll_exit) };
+    let rc_before = c_before.0;
     let mut ll_rc_delta = 0usize;
     let mut armed = true;
     if !lead_waits { usleep(200_000); } // the leader is gone and parked
@@ -2841,9 +2845,11 @@ unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize,
     }
     ok &= cnt == before + 1 && last.pages >= LL_TOUCHED_PAGES;
     // The post-drop recheck is the only reaper/notifier of these groups.
-    let rc_after = { let mut x = asfree_new(); if asfree_read(&mut x) { x.ll_recheck } else { 0 } };
+    let c_after = { let mut x = asfree_new(); asfree_read(&mut x); (x.ll_recheck, x.ll_full, x.ll_tmo, x.ll_exit) };
+    let rc_after = c_after.0;
     if race.is_some() && (sig_first || ign) { ok &= rc_after == rc_before + 1; }
     ll_rc_delta = rc_after.wrapping_sub(rc_before);
+    let (d_full, d_tmo, d_exit) = (c_after.1.wrapping_sub(c_before.1), c_after.2.wrapping_sub(c_before.2), c_after.3.wrapping_sub(c_before.3));
     if pidfd >= 0 { close(pidfd as i32); }
     asfree_do(b"release", pid, 0);
     if !ok && r == 0 { syscall2(nr::KILL, pid as usize, 9); } // best effort, never waited for
@@ -2858,6 +2864,7 @@ unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize,
     ll_print_kv(b"ring_before", before); ll_print_kv(b"ring", cnt); ll_print_kv(b"pages", last.pages);
     ll_print_kv(b"sigchld", sigs); ll_print_kv(b"stray", stray); ll_print_kv(b"pollin", pollin as usize);
     ll_print_kv(b"rc", ll_rc_delta);
+    ll_print_kv(b"race_full", d_full); ll_print_kv(b"race_tmo", d_tmo); ll_print_kv(b"exit_reaps", d_exit);
     ll_print_kv(b"gone", gone as usize); ll_print_kv(b"armed", armed as usize);
     write(STDOUT_FILENO, b"\n".as_ptr(), 1);
     report(name, ok)

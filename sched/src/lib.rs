@@ -9014,6 +9014,7 @@ pub fn exit(code: i32) -> ! {
     // taken by `release_exiting_address_space` above (`finish_reaped_leader`
     // marks `AS_DROP_TGID` only for a Box that still holds one).
     if let Some(l) = reaped_leader {
+        asfree::LL_EXIT_REAPS.fetch_add(1, Ordering::Relaxed);
         debug_assert!(l.address_space.is_none());
         finish_reaped_leader(l, false);
     }
