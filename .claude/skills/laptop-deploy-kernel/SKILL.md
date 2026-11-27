@@ -125,3 +125,13 @@ Never `promote` a kernel that did not boot.
   is supplied only at run time (environment variable or prompt), never stored in
   a script, file, log or commit. Then start Firefox as `leandro` with `su` /
   `sudo -u leandro env WAYLAND_DISPLAY=wayland-1 ...`.
+
+## Use scripts/device-update.sh
+
+Prefer `scripts/device-update.sh laptop <expected-tag> [--via-linux USER@HOST]`
+(release x86_64 build in the current tree; LEANDROS_REMOTE set). It re-execs
+itself under ONE `lock3.sh laptop` hold and does deploy-kernel --reboot, checks
+(booted trial id == deployed id, `uname -v` has the tag, ssh, klog without
+panic/WDOG/oops, no netwatch reboot within its window) and `promote` in that
+same hold; on any failure nothing is promoted and it exits 1. Do not split
+deploy and promote into two lock holds.
