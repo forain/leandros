@@ -296,6 +296,9 @@ get_nth_int (const GValue *val, int idx, int *res)
     } else if (idx == 2) {
       *res = gst_value_get_int_range_max (val);
       return true;
+    } else if (idx == 3 && gst_value_get_int_range_step (val) > 1) {
+      *res = gst_value_get_int_range_step (val);
+      return true;
     }
   } else if (type == GST_TYPE_LIST) {
     GArray *array = g_value_peek_pointer (val);
@@ -341,44 +344,26 @@ get_nth_fraction (const GValue *val, int idx, struct spa_fraction *f)
 static gboolean
 get_nth_rectangle (const GValue *width, const GValue *height, int idx, struct spa_rectangle *r)
 {
-  const GValue *w = NULL, *h = NULL;
-  GType wt = G_VALUE_TYPE (width);
-  GType ht = G_VALUE_TYPE (height);
+  gboolean wrange = GST_VALUE_HOLDS_INT_RANGE (width);
+  gboolean hrange = GST_VALUE_HOLDS_INT_RANGE (height);
+  int w, h;
 
-  if (wt == G_TYPE_INT && ht == G_TYPE_INT && idx == 0) {
-    w = width;
-    h = height;
-  } else if (wt == GST_TYPE_INT_RANGE && ht == GST_TYPE_INT_RANGE) {
-    if (idx == 0 || idx == 1) {
-      r->width = gst_value_get_int_range_min (width);
-      r->height = gst_value_get_int_range_min (height);
-      return true;
-    } else if (idx == 2) {
-      r->width = gst_value_get_int_range_max (width);
-      r->height = gst_value_get_int_range_max (height);
-      return true;
-    } else if (idx == 3) {
-      r->width = gst_value_get_int_range_step (width);
-      r->height = gst_value_get_int_range_step (height);
-      if (r->width > 1 || r->height > 1)
-        return true;
-      else
-        return false;
-    }
-  } else if (wt == GST_TYPE_LIST && ht == GST_TYPE_LIST) {
-    GArray *wa = g_value_peek_pointer (width);
-    GArray *ha = g_value_peek_pointer (height);
-    if (idx < (int)(wa->len + 1))
-      w = &g_array_index (wa, GValue, SPA_MAX (idx-1, 0));
-    if (idx < (int)(ha->len + 1))
-      h = &g_array_index (ha, GValue, SPA_MAX (idx-1, 0));
+  if ((wrange || hrange) && idx == 3) {
+    w = wrange ? gst_value_get_int_range_step (width) : 1;
+    h = hrange ? gst_value_get_int_range_step (height) : 1;
+    if (w == 1 && h == 1)
+      return false;
+  } else {
+    int wi = (wrange || hrange) && G_VALUE_HOLDS_INT (width) ? 0 : idx;
+    int hi = (wrange || hrange) && G_VALUE_HOLDS_INT (height) ? 0 : idx;
+
+    if (idx > 2 || !get_nth_int (width, wi, &w) ||
+        !get_nth_int (height, hi, &h))
+      return false;
   }
-  if (w && h) {
-    r->width = g_value_get_int (w);
-    r->height = g_value_get_int (h);
-    return true;
-  }
-  return false;
+  r->width = w;
+  r->height = h;
+  return true;
 }
 
 static uint32_t
@@ -531,11 +516,11 @@ add_video_format (gpointer format_ptr,
 
     g_hash_table_iter_init (&iter, modifiers);
     g_hash_table_iter_next (&iter, &key, &value);
-    spa_pod_builder_long (&b.b, (uint64_t) key);
+    spa_pod_builder_long (&b.b, *(uint64_t *) key);
 
     if (n_mods > 1) {
       do {
-        spa_pod_builder_long (&b.b, (uint64_t) key);
+        spa_pod_builder_long (&b.b, *(uint64_t *) key);
       } while (g_hash_table_iter_next (&iter, &key, &value));
     }
 
@@ -545,6 +530,21 @@ add_video_format (gpointer format_ptr,
   add_limits (&b, d);
 
   g_ptr_array_add (d->array, spa_pod_builder_pop (&b.b, &f));
+}
+
+static GHashTable *
+new_modifier_set (void)
+{
+  return g_hash_table_new_full (g_int64_hash, g_int64_equal, g_free, NULL);
+}
+
+static void
+add_modifier (GHashTable *modifiers, uint64_t modifier)
+{
+  uint64_t *key = g_new (uint64_t, 1);
+
+  *key = modifier;
+  g_hash_table_add (modifiers, key);
 }
 
 static void
@@ -592,13 +592,13 @@ handle_video_fields (ConvertData *d)
                   g_hash_table_lookup (formats,
                                        GINT_TO_POINTER (video_format_map[idx2]));
               if (!modifiers) {
-                modifiers = g_hash_table_new (NULL, NULL);
+                modifiers = new_modifier_set ();
                 g_hash_table_insert (formats,
                                      GINT_TO_POINTER (video_format_map[idx2]),
                                      modifiers);
               }
 
-              g_hash_table_add (modifiers, GINT_TO_POINTER (mod));
+              add_modifier (modifiers, mod);
             }
           }
         }
@@ -610,15 +610,15 @@ handle_video_fields (ConvertData *d)
               g_hash_table_lookup (formats,
                                    GINT_TO_POINTER (video_format_map[idx]));
           if (!modifiers) {
-            modifiers = g_hash_table_new (NULL, NULL);
+            modifiers = new_modifier_set ();
             g_hash_table_insert (formats,
                                  GINT_TO_POINTER (video_format_map[idx]),
                                  modifiers);
           }
 
           if (dmabuf_caps) {
-            g_hash_table_add (modifiers, GINT_TO_POINTER (DRM_FORMAT_MOD_LINEAR));
-            g_hash_table_add (modifiers, GINT_TO_POINTER (DRM_FORMAT_MOD_INVALID));
+            add_modifier (modifiers, DRM_FORMAT_MOD_LINEAR);
+            add_modifier (modifiers, DRM_FORMAT_MOD_INVALID);
           }
       }
     }
@@ -857,8 +857,12 @@ gst_caps_to_format_all (GstCaps *caps)
 
   d.array = g_ptr_array_new_full (gst_caps_get_size (caps), (GDestroyNotify)g_free);
 
+  /* SPA choices cannot nest a range inside an enum. Split list alternatives
+   * into separate structures, preserving their preference order. */
+  caps = gst_caps_normalize (gst_caps_copy (caps));
   gst_caps_foreach (caps, (GstCapsForeachFunc) foreach_func_dmabuf, &d);
   gst_caps_foreach (caps, (GstCapsForeachFunc) foreach_func_no_dmabuf, &d);
+  gst_caps_unref (caps);
 
   return d.array;
 }
@@ -1097,6 +1101,115 @@ handle_dmabuf_prop (const struct spa_pod_prop *prop,
   }
 }
 
+/* A SPA fraction is a pair of uint32; a GstFraction is a pair of gint. A source that
+ * advertises a long maximum frame interval inverts into a framerate whose denominator
+ * does not fit: v4l2loopback uses UINT32_MAX, and so does the in-tree mgb4 capture
+ * driver, where 0xFFFFFFFF / MGB4_HW_FREQ is a perfectly ordinary "slowest frame"
+ * of 34 seconds. Passed on as it is, the value arrives as -1, gst_caps_set_simple()
+ * decides the range starts after it ends and drops it, and the whole framerate field
+ * is lost from the caps.
+ *
+ * Reduce first, which is exact and enough for mgb4, and scale only if that still does
+ * not fit, which is the case for v4l2loopback's 1/UINT32_MAX. */
+static void
+fraction_to_gst (const struct spa_fraction *f, gint *num, gint *denom)
+{
+  uint32_t n = f->num, d = f->denom, a, b, g;
+
+  if (d == 0) {
+    *num = 0;
+    *denom = 1;
+    return;
+  }
+
+  for (a = n, b = d; b != 0; ) {
+    uint32_t t = a % b;
+    a = b;
+    b = t;
+  }
+  g = a ? a : 1;
+  n /= g;
+  d /= g;
+
+  if (n > G_MAXINT || d > G_MAXINT) {
+    uint64_t m = SPA_MAX (n, d);
+    uint32_t n0 = n;
+
+    n = (uint32_t) ((uint64_t) n * G_MAXINT / m);
+    d = (uint32_t) ((uint64_t) d * G_MAXINT / m);
+    /* 0/1 is how GStreamer spells a variable frame rate, so do not let a very
+     * small rate round down into it. */
+    if (n == 0 && n0 != 0)
+      n = 1;
+    if (d == 0)
+      d = 1;
+  }
+
+  *num = (gint) n;
+  *denom = (gint) d;
+}
+
+/* A GST_TYPE_INT_RANGE is resolved by gst_caps_fixate() to its minimum, so the value
+ * the source said it preferred - values[0] of the choice - was dropped on the way
+ * into caps, and every consumer without a preference of its own ended up at the
+ * bottom of every range. Keep it as the first entry of a list with the range behind
+ * it: fixation lands on the preferred value, and a consumer that does have a
+ * preference still finds the range. */
+static void
+set_pref_int_range (GstCaps *res, const char *key, int pref, int min, int max)
+{
+  GValue list = { 0 }, v = { 0 };
+
+  if (min == max) {
+    gst_caps_set_simple (res, key, G_TYPE_INT, min, NULL);
+    return;
+  }
+
+  if (pref <= min || pref > max) {
+    gst_caps_set_simple (res, key, GST_TYPE_INT_RANGE, min, max, NULL);
+    return;
+  }
+
+  g_value_init (&list, GST_TYPE_LIST);
+  g_value_init (&v, G_TYPE_INT);
+  g_value_set_int (&v, pref);
+  gst_value_list_append_and_take_value (&list, &v);
+  g_value_init (&v, GST_TYPE_INT_RANGE);
+  gst_value_set_int_range (&v, min, max);
+  gst_value_list_append_and_take_value (&list, &v);
+  gst_caps_set_value (res, key, &list);
+  g_value_unset (&list);
+}
+
+static void
+set_pref_fraction_range (GstCaps *res, const char *key,
+    const struct spa_fraction *pref, const struct spa_fraction *min,
+    const struct spa_fraction *max)
+{
+  GValue list = { 0 }, v = { 0 };
+  gint pn, pd, mn, md, xn, xd;
+
+  fraction_to_gst (pref, &pn, &pd);
+  fraction_to_gst (min, &mn, &md);
+  fraction_to_gst (max, &xn, &xd);
+
+  if (gst_util_fraction_compare (pn, pd, mn, md) <= 0 ||
+      gst_util_fraction_compare (pn, pd, xn, xd) > 0) {
+    gst_caps_set_simple (res, key, GST_TYPE_FRACTION_RANGE, mn, md, xn, xd, NULL);
+    return;
+  }
+
+  g_value_init (&list, GST_TYPE_LIST);
+  g_value_init (&v, GST_TYPE_FRACTION);
+  gst_value_set_fraction (&v, pn, pd);
+  gst_value_list_append_and_take_value (&list, &v);
+  g_value_init (&v, GST_TYPE_FRACTION_RANGE);
+  gst_value_set_fraction_range_full (&v, mn, md, xn, xd);
+  gst_value_list_append_and_take_value (&list, &v);
+  gst_caps_set_value (res, key, &list);
+  g_value_unset (&list);
+}
+
 static void
 handle_int_prop (const struct spa_pod_prop *prop, const char *key, GstCaps *res)
 {
@@ -1119,7 +1232,7 @@ handle_int_prop (const struct spa_pod_prop *prop, const char *key, GstCaps *res)
     {
       if (n_items < 3)
         return;
-      gst_caps_set_simple (res, key, GST_TYPE_INT_RANGE, ints[1], ints[2], NULL);
+      set_pref_int_range (res, key, ints[0], ints[1], ints[2]);
       break;
     }
     case SPA_CHOICE_Enum:
@@ -1172,32 +1285,33 @@ handle_rect_prop (const struct spa_pod_prop *prop, const char *width, const char
             height, G_TYPE_INT, rect[1].height,
             NULL);
       } else {
-        gst_caps_set_simple (res,
-            width, GST_TYPE_INT_RANGE, rect[1].width, rect[2].width,
-            height, GST_TYPE_INT_RANGE, rect[1].height, rect[2].height,
-            NULL);
+	struct spa_rectangle max = SPA_RECTANGLE(
+			SPA_MIN(rect[2].width, (uint32_t)INT_MAX),
+			SPA_MIN(rect[2].height, (uint32_t)INT_MAX));
+
+        set_pref_int_range (res, width, rect[0].width, rect[1].width, max.width);
+        set_pref_int_range (res, height, rect[0].height, rect[1].height, max.height);
       }
       break;
     }
     case SPA_CHOICE_Enum:
     {
-      GValue l1 = { 0 }, l2 = { 0 }, v1 = { 0 }, v2 = { 0 };
+      GstCaps *templates = gst_caps_copy (res);
+      uint32_t j;
 
-      g_value_init (&l1, GST_TYPE_LIST);
-      g_value_init (&l2, GST_TYPE_LIST);
+      while (gst_caps_get_size (res) > 0)
+        gst_caps_remove_structure (res, 0);
       for (i = 1; i < n_items; i++) {
-        g_value_init (&v1, G_TYPE_INT);
-        g_value_set_int (&v1, rect[i].width);
-        gst_value_list_append_and_take_value (&l1, &v1);
+        for (j = 0; j < gst_caps_get_size (templates); j++) {
+          GstStructure *s = gst_structure_copy (gst_caps_get_structure (templates, j));
+          GstCapsFeatures *f = gst_caps_features_copy (gst_caps_get_features (templates, j));
 
-        g_value_init (&v2, G_TYPE_INT);
-        g_value_set_int (&v2, rect[i].height);
-        gst_value_list_append_and_take_value (&l2, &v2);
+          gst_structure_set (s, width, G_TYPE_INT, rect[i].width,
+              height, G_TYPE_INT, rect[i].height, NULL);
+          gst_caps_append_structure_full (res, s, f);
+        }
       }
-      gst_caps_set_value (res, width, &l1);
-      gst_caps_set_value (res, height, &l2);
-      g_value_unset (&l1);
-      g_value_unset (&l2);
+      gst_caps_unref (templates);
       break;
     }
     default:
@@ -1230,13 +1344,11 @@ handle_fraction_prop (const struct spa_pod_prop *prop, const char *key, GstCaps 
 
       if (fract[1].num == fract[2].num &&
           fract[1].denom == fract[2].denom) {
-        gst_caps_set_simple (res, key, GST_TYPE_FRACTION,
-            fract[1].num, fract[1].denom, NULL);
+        gint n1, d1;
+        fraction_to_gst (&fract[1], &n1, &d1);
+        gst_caps_set_simple (res, key, GST_TYPE_FRACTION, n1, d1, NULL);
       } else {
-        gst_caps_set_simple (res, key, GST_TYPE_FRACTION_RANGE,
-            fract[1].num, fract[1].denom,
-            fract[2].num, fract[2].denom,
-            NULL);
+        set_pref_fraction_range (res, key, &fract[0], &fract[1], &fract[2]);
       }
       break;
     }
