@@ -80,7 +80,7 @@ leader_of() {
 extra_for() {
   [[ "$(leader_of "$1")" == cosmic-edit ]] || return 0
   # Stable, content-named, shared by all trees: per-tree paths would change the
-  # rustflags (and thus every crate's metadata hash) in each worktree.
+  # rustflags (and so every crate's metadata hash) in each worktree.
   local c o h
   c="$(dirname "$0")/../mesa/ssp_guard.c"
   h=$(sha1sum "$c" | cut -c1-8)
