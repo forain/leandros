@@ -2325,6 +2325,11 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
             t.sig_kick();
             // KVM: a vCPU thread inside the guest only notices the signal when
             // it exits; kick its CPU (no-op SGI) so KVM_RUN returns EINTR.
+            // Dekker with the vCPU side: sig_hint store -> fence -> vcpu_mode load here,
+            // vcpu_mode store -> fence -> signal check there. Only when KVM hooked in.
+            if KVM_KICK_HOOK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
             if t.vcpu_mode.load(core::sync::atomic::Ordering::Acquire) == task::VCPU_IN_GUEST {
                 if let Some(cpu) = t.on_cpu() { kvm_kick_cpu(cpu); }
             }

@@ -201,6 +201,9 @@ fn run_loop(vm: &Arc<Vm>, v: &Arc<Vcpu>, run: *mut KvmRun, gfp: *mut u8) -> isiz
         v.guest_cpu.store(unsafe { sched::cpu_id() }, Ordering::Relaxed);
         v.in_guest.store(true, Ordering::SeqCst);
         sched::set_current_vcpu_mode(sched::task::VCPU_IN_GUEST);
+        // Pairs with the fence in post_signal_thread: a signal posted after this store
+        // sees IN_GUEST (and kicks); one posted before is seen by the check below.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let abort = v.req.load(Ordering::SeqCst) != 0
             || unsafe { (*run).immediate_exit } != 0
             || sched::signal::has_deliverable_signal();
