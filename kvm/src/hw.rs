@@ -154,7 +154,7 @@ pub const GUEST_HCR: u64 = HCR_VM | HCR_SWIO | HCR_FMO | HCR_IMO | HCR_AMO | HCR
     | HCR_TWI | HCR_TWE | HCR_TID3 | HCR_TSC | HCR_TIDCP | HCR_TACR | HCR_TSW
     | HCR_RW | HCR_E2H | HCR_API | HCR_APK;
 
-/// MDCR_EL2: TPMCR|TPM|TDA|TDOSA|TDRA.
+/// MDCR_EL2: TPMCR|TPM|TDA|TDOSA|TDRA. HPMN (bits 4:0) is OR-ed in from the host value by switch.s.
 pub const GUEST_MDCR: u64 = (1 << 5) | (1 << 6) | (1 << 9) | (1 << 10) | (1 << 11);
 /// CPTR_EL2 (E2H layout): FPEN=0b11 (no FP/SIMD trap), ZEN=0, TTA=0.
 pub const GUEST_CPTR: u64 = 0b11 << 20;

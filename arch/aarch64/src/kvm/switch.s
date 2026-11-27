@@ -178,7 +178,11 @@ kvm_enter_raw:
     msr  spsr_el2, x2
     mov  x2, #G_CPTR
     msr  cptr_el2, x2
+    // HPMN = 0 is UNPREDICTABLE on a core with counters (A76): keep the host's value.
     mov  x2, #G_MDCR
+    ldr  x3, [sp, #F_MDCR]
+    and  x3, x3, #0x1f
+    orr  x2, x2, x3
     msr  mdcr_el2, x2
     mov  x2, #G_CNTHCTL
     msr  cnthctl_el2, x2
