@@ -2852,6 +2852,9 @@ unsafe fn ll_case(name: &[u8], nw: usize, lead_waits: bool, race: Option<(usize,
     if race.is_some() && (sig_first || ign) { ok &= rc_after == rc_before + 1; }
     ll_rc_delta = rc_after.wrapping_sub(rc_before);
     let (d_full, d_tmo, d_exit) = (c_after.1.wrapping_sub(c_before.1), c_after.2.wrapping_sub(c_before.2), c_after.3.wrapping_sub(c_before.3));
+    // The race must have been real: every thread of the group met at the barrier
+    // (a group kill that reaps a member mid-barrier makes the case vacuous).
+    if let Some((n, _)) = race { ok &= d_full == n; }
     if pidfd >= 0 { close(pidfd as i32); }
     asfree_do(b"release", pid, 0);
     if !ok && r == 0 { syscall2(nr::KILL, pid as usize, 9); } // best effort, never waited for
