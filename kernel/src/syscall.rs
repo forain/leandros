@@ -9134,6 +9134,21 @@ fn proc_own_anon_fd(ns_path: &[u8]) -> Option<usize> {
     Some(h)
 }
 
+/// `/proc/<own>/fd/N` naming a tmpfs inode (a regular file, or a mknod'ed
+/// device node, which is a tmpfs entry with a device type): the VFS handle.
+/// chmod/chown through the magic link act on the inode, as on Linux, even for
+/// an O_PATH descriptor (crun: openat(O_PATH|O_NOFOLLOW) of a fresh mknod'ed
+/// /dev/null, then fchmodat(procfd, "self/fd/N")). The VFS cannot resolve the
+/// /proc spelling as a path, so this goes through fchmod/fchown on the handle.
+fn proc_own_tmp_inode_fd(ns_path: &[u8]) -> Option<usize> {
+    let (fd, below) = proc_own_fd(ns_path)?;
+    if !below.is_empty() || fd >= net_server::SOCK_FD_BASE { return None; }
+    match vfs::vfs_get_node_kind(current_pid(), fd) {
+        Some(vfs::VnodeKind::TmpFile { .. }) => Some(fd_handle(fd)),
+        _ => None,
+    }
+}
+
 /// `/proc/<own>/fd/N` naming a directory on a non-mounted filesystem (tmpfs
 /// instance, RamFS): the VFS handle. stat/chmod act on the descriptor itself
 /// (fstat / fchmod), so no backing path (the hidden `/.leandros-sb` pool in
@@ -10829,7 +10844,7 @@ fn sys_fchmodat2(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> is
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 { return -22; } // EINVAL
     if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
         let empty = path_ptr == 0
-            || (validate_user_buf(path_ptr, 1) && unsafe { *(path_ptr as *const u8) } == 0);
+            || (copy_user_path(path_ptr).map_or(false, |p| p.is_empty()));
         if empty { return sys_fchmod(dirfd, mode); }
     }
     sys_fchmodat(dirfd, path_ptr, mode, flags & AT_SYMLINK_NOFOLLOW)
@@ -10845,6 +10860,9 @@ fn sys_fchmodat(dirfd: usize, path_ptr: usize, mode: usize, flags: usize) -> isi
             let mut kb = [0u64; STAT_SIZE.div_ceil(8)];
             let r = fstat_into(fd, kb.as_mut_ptr() as usize, false);
             return if r >= 0 { 0 } else { r };
+        }
+        if let Some(h) = proc_own_tmp_inode_fd(path.ns_bytes()) {
+            return sys_fchmod(h, mode);
         }
     }
     let path = if flags & AT_SYMLINK_NOFOLLOW == 0 {
@@ -11022,6 +11040,11 @@ fn sys_removexattr(target: usize, name: usize, is_fd: bool, nofollow: bool) -> i
 
 fn sys_fchown(fd: usize, uid: usize, gid: usize) -> isize {
     let (uid, gid) = match chown_kids(uid, gid) { Some(v) => v, None => return -22 }; // EINVAL: unmapped in the caller's userns
+    fchown_kids(fd, uid, gid)
+}
+
+/// fchown with ids already translated by `chown_kids`.
+fn fchown_kids(fd: usize, uid: usize, gid: usize) -> isize {
     let pid = current_pid();
     let msg = make_vfs_msg(vfs::VFS_FCHOWN, &[fd as u64, uid as u64, gid as u64]);
     vfs_reply_val(&vfs::handle(&msg, pid))
@@ -11041,7 +11064,18 @@ fn chown_kids(uid: usize, gid: usize) -> Option<(usize, usize)> {
 
 fn sys_fchownat(dirfd: usize, path_ptr: usize, uid: usize, gid: usize, flags: usize) -> isize {
     let (uid, gid) = match chown_kids(uid, gid) { Some(v) => v, None => return -22 };
+    // AT_EMPTY_PATH with an empty path: fchown(dirfd) (also for O_PATH fds).
+    if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
+        let empty = path_ptr == 0
+            || (copy_user_path(path_ptr).map_or(false, |p| p.is_empty()));
+        if empty { return fchown_kids(dirfd, uid, gid); }
+    }
     let path = match resolve_at_path(dirfd, path_ptr) { Ok(p) => p, Err(e) => return e };
+    if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        if let Some(h) = proc_own_tmp_inode_fd(path.ns_bytes()) {
+            return fchown_kids(h, uid, gid);
+        }
+    }
     let pid = current_pid();
     let tag = if flags & AT_SYMLINK_NOFOLLOW != 0 { vfs::VFS_LCHOWN } else { vfs::VFS_CHOWN };
     let msg = make_vfs_msg(tag, &[path.ptr() as u64, uid as u64, gid as u64]);

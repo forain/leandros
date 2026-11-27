@@ -421,6 +421,7 @@ SUITES = {
     "kparks": ["host:kparkstest.py"],
     # Root `podman run --rm alpine echo hi` (skips without the LEANDROS_IMAGE_ARCHIVE image).
     "podsmoke": ["host:podsmoketest.py"],
+    "memfd": ["/bin/memfdtest"],
     # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # podman pause/unpause freeze and resume a container (needs LEANDROS_IMAGE_ARCHIVE image).
@@ -844,6 +845,10 @@ def host_run(c, timeout, arch=None, scale=1.0):
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
         out = r.stdout + r.stderr
         st = "skip" if SKIP_ALLOWED and script in HOST_NEEDS_GL and r.returncode == 0 and re.search(r"^\S+: SKIP \(", out, re.M) else "ok"
+        # A podman suite with no OCI image in the build (no LEANDROS_IMAGE_ARCHIVE) is a
+        # visible skip on every arch, never a silent 4 s "ok" that proves nothing.
+        if r.returncode == 0 and re.search(r"^pod\w*: SKIP no alpine image", out, re.M):
+            st = "skip"
         return {"rc": r.returncode, "status": st, "output": out,
                 "secs": round(time.time() - t0, 1)}
     except subprocess.TimeoutExpired as e:
