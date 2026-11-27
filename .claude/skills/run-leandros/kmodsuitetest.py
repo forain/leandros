@@ -101,13 +101,13 @@ def main():
         run("kmodctl load virtio_net >/dev/null 2>&1; sleep 1")
         for i in range(1, 4):
             # Added checks follow the netif that really disappears (a second virtio device may be built in as eth0).
-            NL = "awk -F: '/:/{gsub(/ /,\"\",$1);print $1}' /proc/net/dev | grep -v '^lo$' | sort"
+            NL = "sed -n 's/^ *\\([a-z0-9]*\\):.*/\\1/p' /proc/net/dev | grep -v '^lo$' | sort"
             run(f"{NL} > /tmp/n0.txt; grep -c ':0016 00000000:0000 0A' /proc/net/tcp > /tmp/l22.txt; echo SNAP_END")
             o = run("kmodctl rmmod virtio_net; echo RM_RC=$?; for j in 1 2 3 4 5 6; do grep -q 'eth0:' /proc/net/dev || break; sleep 1; done; "
                     "n=$(grep 'eth0:' /proc/net/dev | wc -l); m=$(grep '^virtio_net ' /proc/modules | wc -l); echo ETH0=$((n)) MOD=$((m)); echo GONE_END")
             check(f"virtio_net rmmod #{i}", "RM_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 gone after unload", "ETH0=0" in o, o.strip()[-300:])
-            o2 = run(f"{NL} > /tmp/n1.txt; IFN=$(comm -23 /tmp/n0.txt /tmp/n1.txt | head -n 1); echo IFN=$IFN; echo $IFN > /tmp/ifn.txt; "
+            o2 = run(f"{NL} > /tmp/n1.txt; IFN=$(grep -vxFf /tmp/n1.txt /tmp/n0.txt | head -n 1); echo IFN=$IFN; echo $IFN > /tmp/ifn.txt; "
                      "echo V6=$(grep -c \"$IFN\" /proc/net/if_inet6); echo RT4=$(grep -c \"^$IFN\" /proc/net/route); echo RT6=$(grep -c \"$IFN\" /proc/net/ipv6_route); "
                      "[ -e /sys/class/net/$IFN ]; echo LS_RC=$?; echo CHK_END")
             check(f"virtio_net #{i} unloaded netif left /proc/net/dev", re.search(r"IFN=\w+", o2) is not None, o2.strip()[-200:])
@@ -118,7 +118,7 @@ def main():
             check(f"virtio_net load #{i}", "LD_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 back and gateway pingable", "PING_OK" in o)
             o3 = run("IFN=$(cat /tmp/ifn.txt); for j in $(seq 1 10); do grep -q \"$IFN\" /proc/net/if_inet6 && break; sleep 1; done; echo LL=$(grep -c \"$IFN\" /proc/net/if_inet6); "
-                     "echo RXB=$(grep \"$IFN:\" /proc/net/dev | sed 's/.*://' | awk '{print $1}'); "
+                     "echo RXB=$(grep \"$IFN:\" /proc/net/dev | sed 's/.*: *//' | cut -d' ' -f1); "
                      "echo L22=$([ \"$(grep -c ':0016 00000000:0000 0A' /proc/net/tcp)\" -ge \"$(cat /tmp/l22.txt)\" ] && echo 1 || echo 0); echo AFT_END")
             check(f"virtio_net #{i} reloaded netif has link-local back", re.search(r"LL=[1-9]", o3) is not None, o3.strip()[-200:])
             rx = re.search(r"RXB=(\d+)", o3)
