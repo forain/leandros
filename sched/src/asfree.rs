@@ -88,6 +88,7 @@ static BUSY_WAITS: AtomicU64 = AtomicU64::new(0);
 static OVERLAPS: AtomicU64 = AtomicU64::new(0);
 // Lane lateleader knobs.
 static RACE_PID: AtomicU32 = AtomicU32::new(0);
+pub fn race_pid() -> u32 { RACE_PID.load(Ordering::Relaxed) }
 static RACE_N: AtomicU32 = AtomicU32::new(0);
 static RACE_LEADER: AtomicBool = AtomicBool::new(false);
 static RACE_ARRIVED: AtomicU32 = AtomicU32::new(0);
@@ -179,6 +180,17 @@ pub fn exit_race(pid: Pid, tgid: Pid) {
     while RACE_ARRIVED.load(Ordering::Acquire) < n && crate::monotonic_ns().saturating_sub(now) < 2_000_000_000 {
         crate::irq_window();
         crate::yield_now("asfree_exitrace");
+        crate::klog_line(format_args!("[llx] resumed pid={} arrived={} cpu={}\n", pid, RACE_ARRIVED.load(Ordering::Relaxed), unsafe { crate::cpu_id() }));
+    }
+    if RACE_ARRIVED.load(Ordering::Acquire) >= n {
+        let rq = crate::RUN_QUEUE.lock();
+        for i in rq.live_slots() {
+            if let Some(t) = rq.get(i) {
+                if t.tgid == tgid && t.pid != pid {
+                    crate::klog_line(format_args!("[llx] other pid={} state={:?} exiting={} zm={} on_cpu={:?}\n", t.pid, t.state, t.exiting, t.zombie_marked, crate::slot::on_cpu(i)));
+                }
+            }
+        }
     }
     crate::klog_line(format_args!("[llred] race leave pid={} arrived={} n={}\n", pid, RACE_ARRIVED.load(Ordering::Relaxed), n));
     if RACE_ARRIVED.load(Ordering::Acquire) >= n { LL_RACE_FULL.fetch_add(1, Ordering::Relaxed); }

@@ -562,7 +562,10 @@ fn group_settled(rq: &RunQueue, tgid: Pid) -> bool {
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.tgid != tgid { continue; }
-            if t.state == TaskState::Zombie && t.mm_released { continue; }
+            if t.state == TaskState::Zombie && t.mm_released {
+                if t.exiting && !t.zombie_marked && asfree::race_pid() == tgid { klog_line(format_args!("[llx] group_settled skips exiting non-zm pid={}\n", t.pid)); }
+                continue;
+            }
             // L5.12: a leader that exited ahead of its threads is done once it
             // is off its CPU (its slot is reaped by `reap_delayed_leader`).
             if t.state == TaskState::Zombie && t.delayed_leader && slot::on_cpu(i).is_none() { continue; }
@@ -9010,6 +9013,7 @@ pub fn exit(code: i32) -> ! {
             (group_exit_notice(&rq, tgid, uid), l)
         } else { (None, None) }
     };
+    if asfree::race_pid() == tgid { klog_line(format_args!("[llx] exit reap pid={} tgid={} reaped_leader={}\n", pid, tgid, reaped_leader.is_some())); }
     // Task context with no pending drop of its own: the leader's space was
     // taken by `release_exiting_address_space` above (`finish_reaped_leader`
     // marks `AS_DROP_TGID` only for a Box that still holds one).
@@ -9364,6 +9368,7 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
                     continue;
                 }
                 if t.pid == tgid { leader = Some(i); continue; }
+                if t.exiting { klog_line(format_args!("[llx] kill_next picks exiting pid={} zm={}\n", t.pid, t.zombie_marked)); }
                 target = Some(i);
                 break;
             }
