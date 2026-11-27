@@ -149,12 +149,15 @@ fn release_one(owner: KmodId, kind: RegKind, handle: u64) -> bool {
 /// netdev, input, hwrng and USB class detach instead.
 pub fn busy_reason(id: KmodId) -> Option<&'static str> {
     let recs: Vec<(RegKind, u64)> = REGS.lock().iter().filter(|r| r.0 == id).map(|r| (r.1, r.2)).collect();
+    super::log(&alloc::format!("[kmod] busy_reason id {} regs {}\n", id.0, recs.len()));
     for (k, h) in recs {
         match k {
             RegKind::V4L2 => { if crate::syscall::v4l2::open_by(id) { return Some("camera open"); } }
             RegKind::BLK => {
                 let paths = drivers::blkdev::family_paths(h as usize);
-                if let Some(why) = vfs_server::block_family_busy(&paths) { return Some(why); }
+                let r = vfs_server::block_family_busy(&paths);
+                super::log(&alloc::format!("[kmod] busy check blk handle {} paths {:?} -> {:?}\n", h, paths, r));
+                if let Some(why) = r { return Some(why); }
             }
             RegKind::SND => { if super::exports::snd_busy() { return Some("sound open"); } }
             RegKind::DRM | RegKind::KMS => return Some("display in use"),

@@ -72,7 +72,10 @@ pub extern "C" fn kapi_blk_register(owner: KmodId, desc: *const KBlkDesc, ops: *
     if (d.size as usize) < core::mem::size_of::<KBlkDesc>() || (o.size as usize) < core::mem::size_of::<KBlkOps>() { return -22; }
     let Some(class) = leak_str(&d.class) else { return -22 };
     let owner = crate::kmod::gate::owner(owner);
-    let Some(gate) = crate::kmod::gate::get(owner) else { return -19 };
+    let Some(gate) = crate::kmod::gate::get(owner) else {
+        crate::kmod::log(&alloc::format!("[kmod] blk register refused: owner {} has no gate (-19)\n", owner.0));
+        return -19;
+    };
     let gate = Some(gate);
     let md: &'static ModDisk = Box::leak(Box::new(ModDisk {
         ops: o, ctx, ss: d.sector_size, nsectors: d.nsectors, removable: d.removable != 0,
@@ -81,10 +84,14 @@ pub extern "C" fn kapi_blk_register(owner: KmodId, desc: *const KBlkDesc, ops: *
     match drivers::blkdev::register(md) {
         Ok(idx) => {
             crate::kmod::registry::note_registration(owner, RegKind::BLK, idx as u64);
+            crate::kmod::log(&alloc::format!("[kmod] blk registered idx {} owner {}\n", idx, owner.0));
             crate::klog::on_disk_registered();
             idx as i64
         }
-        Err(_) => -5,
+        Err(e) => {
+            crate::kmod::log(&alloc::format!("[kmod] blk register failed: {:?} ({} sectors) owner {}\n", e, d.nsectors, owner.0));
+            -5
+        }
     }
 }
 
