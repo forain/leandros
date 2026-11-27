@@ -9990,7 +9990,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             return err_reply(-13); // EACCES
                         }
                     }
-                    if tmp[idx].devtype != 0 {
+                    // An O_PATH open of a mknod'ed node is a handle on the tmpfs inode
+                    // itself (no driver is reached, as on Linux): fchmod/fchown through
+                    // it (crun's mknod_and_set_attrs) must find the entry again.
+                    if tmp[idx].devtype != 0 && flags & O_PATH == 0 {
                         let (blk, rdev) = (tmp[idx].devtype == 2, tmp[idx].rdev);
                         drop(tmp);
                         return devnode_open(pid, blk, rdev, flags, mode);
@@ -17894,7 +17897,8 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // The owner, as path stat reports it. fstat answered uid/gid 0 for
         // every tmpfs file, so a program checking that the directory it just
         // created is its own (Bun: /tmp/claude-<uid>) refused it.
-        write_stat_full(stat_ptr, mode, nlink, size, ino, uid, gid);
+        let rdev = { let t = TMP_FILES.lock(); let e = &t[owner]; if e.devtype != 0 { e.rdev as u64 } else { 0 } };
+        write_stat_full_rdev(stat_ptr, mode, nlink, size, ino, uid, gid, rdev);
         write_stat_times(stat_ptr, at, mt, ct);
         if let Some(b) = blocks {
             unsafe { sched::uaccess::copy_raw((stat_ptr as *mut u8).add(64), &b as *const u64 as *const u8, 8); }

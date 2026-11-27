@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -145,6 +146,45 @@ int main(int argc, char **argv, char **envp)
     waitpid(p, &stt, 0);
     errno = WIFEXITED(stt) ? WEXITSTATUS(stt) : -1;
     ok("exec_proc_self_fd_child_ok", WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+
+    // 7: crun mknod_and_set_attrs: mknodat, openat O_PATH|O_NOFOLLOW, then
+    // fchmodat(procfd, "self/fd/N") through a /proc dirfd (O_PATH fds cannot fchmod),
+    // then fchownat(fd, "", AT_EMPTY_PATH).  Failure was "fchmod `/dev/null`: ENOENT".
+    {
+        const char *dirs[] = {"/tmp", "/dev/shm"};  // tmpfs: where a container /dev lives
+        for (int i = 0; i < 2; i++) {
+            char nm[64], what[96];
+            snprintf(nm, sizeof nm, ".devnode-%d", (int)getpid());
+            int dfd = open(dirs[i], O_DIRECTORY | O_RDONLY);
+            if (dfd < 0) continue;
+            unlinkat(dfd, nm, 0);
+            int r = mknodat(dfd, nm, S_IFCHR | 0666, makedev(1, 3));
+            snprintf(what, sizeof what, "devnode_mknod_%s", dirs[i]);
+            ok(what, r == 0);
+            int pf = open("/proc", O_DIRECTORY | O_CLOEXEC);
+            int nf = openat(dfd, nm, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            snprintf(what, sizeof what, "devnode_open_opath_%s", dirs[i]);
+            ok(what, nf >= 0);
+            struct stat dst;
+            snprintf(what, sizeof what, "devnode_fstat_rdev_%s", dirs[i]);
+            ok(what, nf >= 0 && fstat(nf, &dst) == 0 && S_ISCHR(dst.st_mode) && dst.st_rdev == makedev(1, 3));
+            char fp[64];
+            snprintf(fp, sizeof fp, "self/fd/%d", nf);
+            errno = 0;
+            r = fchmodat(pf, fp, 0620, 0);
+            snprintf(what, sizeof what, "devnode_fchmodat_procfd_%s", dirs[i]);
+            ok(what, r == 0);
+            struct stat ast;
+            snprintf(what, sizeof what, "devnode_mode_applied_%s", dirs[i]);
+            ok(what, fstatat(dfd, nm, &ast, AT_SYMLINK_NOFOLLOW) == 0 && (ast.st_mode & 07777) == 0620);
+            errno = 0;
+            r = fchownat(nf, "", 0, 0, AT_EMPTY_PATH);
+            snprintf(what, sizeof what, "devnode_fchownat_empty_%s", dirs[i]);
+            ok(what, r == 0);
+            unlinkat(dfd, nm, 0);
+            close(nf); close(pf); close(dfd);
+        }
+    }
 
     printf(fails ? "memfdtest: %d FAILED\n" : "memfdtest: ALL PASS\n", fails);
     return fails != 0;

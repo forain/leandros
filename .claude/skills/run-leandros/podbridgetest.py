@@ -146,6 +146,7 @@ def main():
         rc, base = run("nft list ruleset | md5sum")
         rc, out = srv_tcp("pbpub", "-p 18081:80", 80)
         rc, rs = run("nft list ruleset 2>&1")
+        print("podbridge: nft ruleset after -p 18081:80:\n" + rs[-6000:], flush=True)
         check("podman_nft_driver", re.search(r"dport 18081", rs) is not None and "NETAVARK-HOSTPORT-DNAT" in rs,
               "ruleset: " + rs.strip()[-160:].replace("\n", " | "))
         for nm, u in (("lo", "127.0.0.1"), ("nicip", nicip)):
