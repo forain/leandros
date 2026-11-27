@@ -1493,3 +1493,16 @@ pub fn shutdown_all() {
         let _ = (c.pci, c.timeout_ms);
     }
 }
+
+/// Module unload: shut every controller down (queues deleted, CC.SHN, then CC.EN = 0 so no DMA
+/// is left pointing at memory the module owned) and forget them, so a reload probes from scratch.
+/// The disks themselves were already taken back by the registry (`remove_disk`) before this runs.
+/// Leaves the per-controller allocations (queues, namespace records) leaked, like a failed init.
+pub fn unload() {
+    shutdown_all();
+    let ctrls: Vec<&'static Ctrl> = CTRLS.lock().drain(..).collect();
+    for c in ctrls {
+        let st = c.st.lock();
+        disable(&st, c.timeout_ms.clamp(500, 2_000));
+    }
+}

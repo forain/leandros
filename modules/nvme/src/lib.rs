@@ -31,6 +31,7 @@ mod nvme;
 kmod_rt::module! {
     name: "nvme",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci_class(0x010802, 0xffffff)]
 }
 
@@ -61,4 +62,9 @@ fn init() -> i32 {
     if nvme::init(kmod_kapi::cmdline()) == 0 { return -19; }
     let _ = kmod_kapi::pm::register2(&PM, 0);
     0
+}
+
+fn exit() {
+    nvme::unload();
+    DONE.store(false, Ordering::SeqCst);
 }
