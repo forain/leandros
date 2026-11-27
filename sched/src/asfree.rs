@@ -170,8 +170,9 @@ pub fn exit_before_close(pid: Pid, old: &Arc<AddressSpace>) -> Option<Arc<Addres
 pub fn exit_race(pid: Pid, tgid: Pid) {
     if RACE_PID.load(Ordering::Relaxed) != tgid { return; }
     let now = crate::monotonic_ns();
-    if now >= RACE_DEADLINE.load(Ordering::Relaxed) { return; }
-    if pid == tgid && !RACE_LEADER.load(Ordering::Relaxed) { return; }
+    if now >= RACE_DEADLINE.load(Ordering::Relaxed) { LL_RACE_SKIP.fetch_add(1, Ordering::Relaxed); return; }
+    if pid == tgid && !RACE_LEADER.load(Ordering::Relaxed) { LL_RACE_SKIP.fetch_add(1, Ordering::Relaxed); return; }
+    LL_RACE_ENTER.fetch_add(1, Ordering::Relaxed);
     RACE_ARRIVED.fetch_add(1, Ordering::AcqRel);
     let n = RACE_N.load(Ordering::Relaxed);
     while RACE_ARRIVED.load(Ordering::Acquire) < n && crate::monotonic_ns().saturating_sub(now) < 2_000_000_000 {
@@ -242,6 +243,8 @@ pub static LL_RECHECK_REAPS: AtomicU64 = AtomicU64::new(0);
 pub static LL_SETTLE_REAPS: AtomicU64 = AtomicU64::new(0);
 pub static LL_RACE_FULL: AtomicU64 = AtomicU64::new(0);
 pub static LL_RACE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+pub static LL_RACE_ENTER: AtomicU64 = AtomicU64::new(0);
+pub static LL_RACE_SKIP: AtomicU64 = AtomicU64::new(0);
 pub static LL_EXIT_REAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Text of the file.
@@ -260,6 +263,8 @@ pub fn render(s: &mut alloc::string::String) {
     let _ = writeln!(s, "ll_settle_reaps {}", LL_SETTLE_REAPS.load(Ordering::Relaxed));
     let _ = writeln!(s, "ll_race_full {}", LL_RACE_FULL.load(Ordering::Relaxed));
     let _ = writeln!(s, "ll_race_timeout {}", LL_RACE_TIMEOUT.load(Ordering::Relaxed));
+    let _ = writeln!(s, "ll_race_enter {}", LL_RACE_ENTER.load(Ordering::Relaxed));
+    let _ = writeln!(s, "ll_race_skip {}", LL_RACE_SKIP.load(Ordering::Relaxed));
     let _ = writeln!(s, "ll_exit_reaps {}", LL_EXIT_REAPS.load(Ordering::Relaxed));
     for (n, t, p, q) in v { let _ = writeln!(s, "{} {} {} {}", n, t, p, q); }
 }
