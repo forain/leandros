@@ -31,7 +31,7 @@ _cc_tree_hash() { # <dir> -> content hash of the source tree
     fi ) | sha1sum | cut -d' ' -f1
 }
 
-_cc_key() { # <label> <arch> <srcdir> <extra text> <extra files>
+_cc_manifest() { # <label> <arch> <srcdir> <extra text> <extra files> -> the exact text that is hashed
   local label="$1" arch="$2" src="$3" text="$4" files="$5" m6 s3 f d
   m6="${M6:-$HOME/code/leandros-artifacts/m6-session-bins}"
   s3="${DYN_S3:-$HOME/code/leandros-artifacts/m3-gl-stack}"
@@ -55,7 +55,7 @@ _cc_key() { # <label> <arch> <srcdir> <extra text> <extra files>
       | grep -v '^CARGO_HOME=\|^RUSTUP_HOME=' | LC_ALL=C sort
     echo "sysroot"
     find "$s3/sysroot-$arch" -printf '%P %y %s %T@ %l\n' 2>/dev/null | LC_ALL=C sort
-  } | sha1sum | cut -d' ' -f1
+  }
 }
 
 _cc_stage() { # <dir with files> <spec...>
@@ -80,13 +80,15 @@ cosmic_cache_build() {
   local root="$m6/bincache" key k8 sp names=() sps=() dir tmp rc
   mkdir -p "$root" "$M6_OUT"
   # a working .cargo/config.toml is part of the key: callers generate it before calling
-  key=$(_cc_key "$label" "$arch" "$src" "$text" "$files") || return 1
+  local man; man=$(mktemp "$root/.man.XXXXXX") || return 1
+  _cc_manifest "$label" "$arch" "$src" "$text" "$files" > "$man" || { rm -f "$man"; return 1; }
+  key=$(sha1sum < "$man" | cut -d' ' -f1)
   k8=${key:0:8}; dir="$root/$key"
   for sp in $specs; do sps+=("$sp"); names+=("${sp#*|}"); done
   local hit=1
   for sp in "${names[@]}"; do [ -f "$dir/$sp" ] || hit=0; done
   if [ $hit = 1 ]; then
-    touch "$dir"; _cc_stage "$dir" "${sps[@]}" || return 1
+    rm -f "$man"; touch "$dir"; _cc_stage "$dir" "${sps[@]}" || return 1
     echo "[cosmic-cache] hit $label $arch $k8"; return 0
   fi
   # miss: build under the key lock so a concurrent tree waits and then hits
@@ -95,16 +97,18 @@ cosmic_cache_build() {
     ok=1; for sp in "${names[@]}"; do [ -f "$dir/$sp" ] || ok=0; done
     if [ $ok = 1 ]; then echo "[cosmic-cache] hit $label $arch $k8"; exit 20; fi
     echo "[cosmic-cache] miss $label $arch $k8"
+    mkdir -p "$root/.last-inputs"; cp "$man" "$root/.last-inputs/$label-$arch.txt"
     for sp in "${sps[@]}"; do rm -f "${sp%%|*}"; done   # build-rust.sh's exit status does not reflect cargo's
     "$@" || exit 1
     for sp in "${sps[@]}"; do [ -x "${sp%%|*}" ] || { echo "cosmic-cache: $label build for $arch left no ${sp%%|*}" >&2; exit 1; }; done
     tmp=$(mktemp -d "$root/.tmp.XXXXXX") || exit 1
     for sp in "${sps[@]}"; do cp "${sp%%|*}" "$tmp/${sp#*|}" && chmod 0755 "$tmp/${sp#*|}" || { rm -rf "$tmp"; exit 1; }; done
+    cp "$man" "$tmp/inputs.txt"
     mv -T "$tmp" "$dir" 2>/dev/null || rm -rf "$tmp"      # store-if-absent
     for sp in "${sps[@]}"; do stage_file 0755 "${sp%%|*}" "$M6_OUT/${sp#*|}" || exit 1; done
     exit 0
   )
-  rc=$?
+  rc=$?; rm -f "$man"
   if [ $rc = 20 ]; then touch "$dir"; _cc_stage "$dir" "${sps[@]}" || return 1
   elif [ $rc != 0 ]; then return 1; fi
   _cc_prune "$root" "${names[@]}"
