@@ -1730,14 +1730,7 @@ impl RunQueue {
 
     /// Remove the task at `idx` from the run queue and return it so the caller
     /// can free its resources.  Decrements the task count.
-    #[track_caller]
     pub fn remove(&mut self, idx: usize) -> Option<Box<Task>> {
-        if let Some(tk) = self.tasks[idx].as_ref() {
-            if (tk.exiting && !tk.zombie_marked) || crate::asfree::race_pid() == tk.tgid {
-                let l = core::panic::Location::caller();
-                crate::klog_line(format_args!("[llx] remove pid={} tgid={} state={:?} exiting={} zm={} from {}:{}\n", tk.pid, tk.tgid, tk.state, tk.exiting, tk.zombie_marked, l.file(), l.line()));
-            }
-        }
         let mut t = self.tasks[idx].take();
         if let Some(task) = t.as_mut() {
             // R5: freed under TASKS + its queue lock, off-CPU (on_remove
