@@ -64,10 +64,7 @@ fn internal_error(run: *mut KvmRun, sub: u32, data: &[u64]) -> Flow {
 /// KVM_RUN.
 pub(super) fn run(vm: &Arc<Vm>, v: &Arc<Vcpu>) -> isize {
     let run = v.run_ptr();
-    unsafe {
-        if (*run).immediate_exit != 0 { (*run).exit_reason = KVM_EXIT_INTR; return -EINTR; }
-    }
-    // Finish an MMIO read userspace has now served.
+    // Finish an MMIO read userspace has now served (before immediate_exit, as Linux).
     {
         let pr = v.run.lock().pending_read.take();
         if let Some(p) = pr {
@@ -75,6 +72,9 @@ pub(super) fn run(vm: &Arc<Vm>, v: &Arc<Vcpu>) -> isize {
             let mut g = v.arch.lock();
             if let Some(hw) = g.hw_mut() { ::kvm::mmio::finish_read(hw, p.rt, p.sse, p.sf, p.sas, data); }
         }
+    }
+    unsafe {
+        if (*run).immediate_exit != 0 { (*run).exit_reason = KVM_EXIT_INTR; return -EINTR; }
     }
     let gfp: *mut u8 = {
         let mut g = v.arch.lock();
