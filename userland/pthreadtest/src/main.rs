@@ -171,7 +171,7 @@ pub unsafe extern "C" fn main(argc_c: i32, argv: *mut *mut u8, _envp: *mut *mut 
         while pg < LL_BIG_LEN { core::ptr::write_volatile(big.add(pg), 1); pg += 4096; }
         let mut t: pthread_t = core::ptr::null_mut();
         for _ in 0..nw {
-            if pthread_create(&mut t, core::ptr::null(), asfree_waiter, core::ptr::null_mut()) != 0 { return 1; }
+            if pthread_create(&mut t, core::ptr::null(), ll_waiter, core::ptr::null_mut()) != 0 { return 1; }
         }
         write(rfd, b"r".as_ptr(), 1);
         if lead_waits {
@@ -250,9 +250,9 @@ unsafe fn test_pthread_create_join() -> bool {
 // (`MOZ_RELEASE_ASSERT(mMyProcInfo == ... EndpointProcInfo::Current())`).
 
 #[cfg(target_arch = "x86_64")]
-mod ids { pub const GETPID: i64 = 39; pub const GETPPID: i64 = 110; pub const GETTID: i64 = 186; }
+mod ids { pub const EXIT: i64 = 60; pub const GETPID: i64 = 39; pub const GETPPID: i64 = 110; pub const GETTID: i64 = 186; }
 #[cfg(target_arch = "aarch64")]
-mod ids { pub const GETPID: i64 = 172; pub const GETPPID: i64 = 173; pub const GETTID: i64 = 178; }
+mod ids { pub const EXIT: i64 = 93; pub const GETPID: i64 = 172; pub const GETPPID: i64 = 173; pub const GETTID: i64 = 178; }
 
 static mut THREAD_IDS: [i64; 3] = [0; 3];
 
@@ -922,6 +922,20 @@ extern "C" fn asfree_waiter(_arg: *mut c_void) -> *mut c_void {
     unsafe {
         let mut b = [0u8; 1];
         read(ASFREE_GOFD, b.as_mut_ptr(), 1);
+    }
+    core::ptr::null_mut()
+}
+
+/// `asfree_waiter` for the late-leader cases: ends with a raw exit(2), not a
+/// return. The libc's thread exit counts live threads and makes the LAST one
+/// call exit_group, whose group kill then reaps a sibling that is still in the
+/// kernel's exit barrier (the race never happens). A raw exit leaves the libc
+/// count alone, so both workers reach the kernel's `exitrace` barrier.
+extern "C" fn ll_waiter(_arg: *mut c_void) -> *mut c_void {
+    unsafe {
+        let mut b = [0u8; 1];
+        read(ASFREE_GOFD, b.as_mut_ptr(), 1);
+        syscall(ids::EXIT, 0i64);
     }
     core::ptr::null_mut()
 }

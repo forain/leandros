@@ -8157,6 +8157,17 @@ fn scheduler_run_loop() -> ! {
                     if has_as {
                         recheck = Some((ztgid, zpid, zuid, parent_tgid, zdone));
                     } else if !zdone && group_settled(&rq, ztgid) {
+                        // Defensive: unreachable for user tasks (see the
+                        // invariants at the `has_as` / drop_marked sites
+                        // above); only kernel threads reach it, where it
+                        // does nothing. Logged once if it ever fires.
+                        asfree::LL_SETTLE_REAPS.fetch_add(1, Ordering::Relaxed);
+                        {
+                            static SETTLE_LOGGED: AtomicBool = AtomicBool::new(false);
+                            if !SETTLE_LOGGED.swap(true, Ordering::Relaxed) {
+                                klog_line(format_args!("[sched] settle-at-removal reached tgid={}\n", ztgid));
+                            }
+                        }
                         if zpid != ztgid { late_leader = reap_delayed_leader(&mut rq, ztgid); }
                         // Defensive: the leader's drop below
                         // (`finish_reaped_leader`) marks and restores the flag
@@ -8222,6 +8233,9 @@ fn scheduler_run_loop() -> ! {
                             };
                             if !zdone && lead_ok && group_settled(&rq, ztgid) {
                                 if zpid != ztgid { relead = reap_delayed_leader(&mut rq, ztgid); }
+                                if relead.is_some() || zpid == ztgid {
+                                    asfree::LL_RECHECK_REAPS.fetch_add(1, Ordering::Relaxed);
+                                }
                                 if let Some(l) = relead.as_ref() {
                                     relead_sole = removed_space_unshared(&rq, l);
                                     if l.address_space.is_some() {
@@ -9000,6 +9014,7 @@ pub fn exit(code: i32) -> ! {
     // taken by `release_exiting_address_space` above (`finish_reaped_leader`
     // marks `AS_DROP_TGID` only for a Box that still holds one).
     if let Some(l) = reaped_leader {
+        asfree::LL_EXIT_REAPS.fetch_add(1, Ordering::Relaxed);
         debug_assert!(l.address_space.is_none());
         finish_reaped_leader(l, false);
     }
