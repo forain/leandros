@@ -15,6 +15,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
 
@@ -31,10 +32,11 @@ if [[ ! -x "$M6/build-rust.sh" || ! -d "$SRC/cosmic-applet-network" ]]; then
 fi
 
 for arch in "${ARCHES[@]}"; do
-  if ! "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-network > /dev/null; then
+  cosmic_cache_build cosmic-applet-network "$arch" "$SRC" "-p cosmic-applet-network" "" \
+    "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-network|cosmic-applet-network-$arch" -- \
+    sh -c '"$0" "$@" > /dev/null' "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-network || {
     echo "cosmic-applet-network: build failed for $arch (log: $M6/logs/cosmic-applets-$arch.log)" >&2
     exit 1
-  fi
-  stage_file 0755 "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-network" "$M6_OUT/cosmic-applet-network-$arch"
+  }
   echo "staged $arch: $M6_OUT/cosmic-applet-network-$arch"
 done

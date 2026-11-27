@@ -8,6 +8,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 ART=${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 D=$ART/m6-session-bins
 HERE=$(cd "$(dirname "$0")" && pwd)
 CI=$D/src/cosmic-idle
@@ -32,9 +33,7 @@ sh "$D/gen-cargo-config.sh" "$CI" >/dev/null
 mkdir -p "$M6_OUT"
 for arch in "$@"; do
     bin=$CI/target/$arch-unknown-linux-musl/release/cosmic-idle
-    rm -f "$bin"   # build-rust.sh's exit status does not reflect cargo's
-    sh "$D/build-rust.sh" "$CI" "$arch"
-    [ -x "$bin" ] || { echo "cosmic-idle build failed for $arch" >&2; exit 1; }
-    stage_file 0755 "$bin" "$M6_OUT/cosmic-idle-$arch"
+    cosmic_cache_build cosmic-idle "$arch" "$CI" "" "$(echo "$HERE"/0*.patch)" \
+        "$bin|cosmic-idle-$arch" -- sh "$D/build-rust.sh" "$CI" "$arch" || { echo "cosmic-idle build failed for $arch" >&2; exit 1; }
     echo "staged $D/out/cosmic-idle-$arch"
 done

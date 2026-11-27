@@ -16,6 +16,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
 APPLETS=(cosmic-applet-time cosmic-applet-battery cosmic-applet-notifications
@@ -37,12 +38,13 @@ fi
 
 PKGS=(); for a in "${APPLETS[@]}"; do PKGS+=(-p "$a"); done
 for arch in "${ARCHES[@]}"; do
-  if ! "$M6/build-rust.sh" "$SRC" "$arch" "${PKGS[@]}" > /dev/null; then
+  specs=(); for a in "${APPLETS[@]}"; do specs+=("$SRC/target/$arch-unknown-linux-musl/release/$a|$a-$arch"); done
+  cosmic_cache_build cosmic-applets-panel "$arch" "$SRC" "${PKGS[*]}" "" "${specs[*]}" -- \
+    sh -c '"$0" "$@" > /dev/null' "$M6/build-rust.sh" "$SRC" "$arch" "${PKGS[@]}" || {
     echo "cosmic-applets-panel: build failed for $arch (log: $M6/logs/cosmic-applets-$arch.log)" >&2
     exit 1
-  fi
+  }
   for a in "${APPLETS[@]}"; do
-    stage_file 0755 "$SRC/target/$arch-unknown-linux-musl/release/$a" "$M6_OUT/$a-$arch"
     echo "staged $arch: $M6_OUT/$a-$arch"
   done
 done
