@@ -135,6 +135,10 @@ name = "jobtest"
 version = "0.1.0"
 
 [[package]]
+name = "kvmtest"
+version = "0.1.0"
+
+[[package]]
 name = "leandros-greeter-launch"
 version = "0.1.0"
 dependencies = [

@@ -521,6 +521,8 @@ def _kvm_usable(guest_arch: str) -> bool:
 def _gic_version(accel_flags) -> str:
     """virt GIC: 3 everywhere (HVF refuses v2), except KVM, where the host's own
     GIC must be mirrored (Pi 5 is GICv2; KVM cannot emulate v3 there)."""
+    if os.environ.get("LEANDROS_VIRT") == "1" and os.environ.get("LEANDROS_GIC") and "kvm" not in accel_flags:
+        return os.environ["LEANDROS_GIC"]  # kvmv2 suite: GICv2 virt machine
     return "host" if "kvm" in accel_flags else "3"
 
 
