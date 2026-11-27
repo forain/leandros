@@ -465,7 +465,11 @@ unsafe fn init_cpu_v3() {
     gicr_w32(sgi, GICR_ICENABLER0, 0xFFFF_FFFF);
     gicr_wait_rwp(rd);
     gicr_w32(sgi, GICR_IGROUPR0, 0xFFFF_FFFF);
-    for id in [ppi_virt_timer(), SGI_RESCHED, SGI_KVM_KICK, PPI_KVM_MAINT, PPI_GUEST_VTIMER] {
+    #[cfg(feature = "kvm")]
+    let prio_ids = [ppi_virt_timer(), SGI_RESCHED, SGI_KVM_KICK, PPI_KVM_MAINT, PPI_GUEST_VTIMER];
+    #[cfg(not(feature = "kvm"))]
+    let prio_ids = [ppi_virt_timer(), SGI_RESCHED];
+    for id in prio_ids {
         let off   = GICR_IPRIORITYR + (id as usize / 4) * 4;
         let shift = (id % 4) * 8;
         let v = (gicr_r32(sgi, off) & !(0xFF << shift)) | (IRQ_PRIORITY << shift);
