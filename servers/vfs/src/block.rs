@@ -813,7 +813,14 @@ pub fn sd_policy_text() -> alloc::string::String {
         let disk = match e.backing { Backing::Disk(i) => Some((i, e.start)), Backing::Part { parent, .. } => Some((parent, e.start)), _ => None };
         let busy = disk.and_then(|(i, st)| ops().and_then(|o| (o.busy)(i as usize)).map(|(bs, bl)| (st, bs, bl)))
             .map_or(false, |(st, bs, bl)| st < bs.saturating_add(bl) && bs < st + e.size);
-        let pol = if busy { "ebusy-mounted-root" } else if e.ro { "read-only(window-only)" } else { "writable" };
+        // Every policy that applies, '+'-joined: a read-only node that overlaps
+        // the mounted root is EROFS outside the root range and EBUSY inside it.
+        let pol = match (e.ro, busy) {
+            (true, true) => "read-only(window-only)+ebusy-root-range",
+            (true, false) => "read-only(window-only)",
+            (false, true) => "ebusy-mounted-root",
+            (false, false) => "writable",
+        };
         let _ = writeln!(out, "node={} start={} bytes={} write={}", name, e.start, e.size, pol);
     }
     let _ = writeln!(out, "node_writes_refused={}", WR_REFUSED.load(core::sync::atomic::Ordering::Relaxed));
