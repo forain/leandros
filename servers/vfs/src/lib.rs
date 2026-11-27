@@ -9990,7 +9990,10 @@ fn handle_open(pid: u32, path_ptr: usize, flags: u32, mode: u32) -> Message {
                             return err_reply(-13); // EACCES
                         }
                     }
-                    if tmp[idx].devtype != 0 {
+                    // An O_PATH open of a mknod'ed node is a handle on the tmpfs inode
+                    // itself (no driver is reached, as on Linux): fchmod/fchown through
+                    // it (crun's mknod_and_set_attrs) must find the entry again.
+                    if tmp[idx].devtype != 0 && flags & O_PATH == 0 {
                         let (blk, rdev) = (tmp[idx].devtype == 2, tmp[idx].rdev);
                         drop(tmp);
                         return devnode_open(pid, blk, rdev, flags, mode);
