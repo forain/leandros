@@ -162,6 +162,8 @@ static RW: AtomicBool = AtomicBool::new(false);
 static APST_KEEP: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_ON: AtomicBool = AtomicBool::new(true);
 static DISABLED: AtomicBool = AtomicBool::new(false);
+/// Namespaces that made it into the block registry (a module init fails when this stays 0).
+pub static NS_REGISTERED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 /// `nvme.quirks=amzn`: apply the Amazon quirks to every controller (QEMU
 /// test hook; real Amazon controllers are recognised by PCI id).
 static QUIRK_AMZN: AtomicBool = AtomicBool::new(false);
@@ -1281,6 +1283,7 @@ fn probe(dev: &PciDevice, index: usize) {
         let t = sched::monotonic_ns();
         match blkdev::register(ns) {
             Ok(idx) => {
+                NS_REGISTERED.fetch_add(1, Ordering::Relaxed);
                 nlog!("{}: registered as block device {} (partition scan {} us)", ns.name, idx, us_since(t));
                 report_partitions(ns);
             }
@@ -1491,5 +1494,19 @@ pub fn shutdown_all() {
             nlog!("nvme{}: shutdown NOT confirmed after {} ms (CSTS {:#x})", c.index, us_since(t) / 1000, csts);
         }
         let _ = (c.pci, c.timeout_ms);
+    }
+}
+
+/// Module unload: shut every controller down (queues deleted, CC.SHN, then CC.EN = 0 so no DMA
+/// is left pointing at memory the module owned) and forget them, so a reload probes from scratch.
+/// The disks themselves were already taken back by the registry (`remove_disk`) before this runs.
+/// Leaves the per-controller allocations (queues, namespace records) leaked, like a failed init.
+pub fn unload() {
+    NS_REGISTERED.store(0, Ordering::Relaxed);
+    shutdown_all();
+    let ctrls: Vec<&'static Ctrl> = CTRLS.lock().drain(..).collect();
+    for c in ctrls {
+        let st = c.st.lock();
+        disable(&st, c.timeout_ms.clamp(500, 2_000));
     }
 }

@@ -45,6 +45,11 @@ static PORTS: Mutex<crate::latestack::Registry<(u16, Option<smoltcp::wire::IpVer
 /// Stack `sid` was just built (wifi0, once its MAC is known): give every
 /// wildcard server a mirror there. Returns how many it carries. Caller
 /// holds no net lock.
+/// Stack `sid` was removed: its mirror sockets went with it.
+pub(crate) fn forget_sid(sid: Sid) {
+    for hs in MIRRORS.lock().values_mut() { hs[sid as usize] = None; }
+}
+
 pub(crate) fn adopt(sid: Sid) -> usize {
     let snap = PORTS.lock().snapshot();
     // The commit below checks, under MIRRORS, that the server still is one;

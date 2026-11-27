@@ -48,6 +48,13 @@ static MEMB: Mutex<alloc::collections::BTreeMap<u32, alloc::vec::Vec<G>>> =
     Mutex::new(alloc::collections::BTreeMap::new());
 static NOALL: Mutex<alloc::collections::BTreeSet<u32>> = Mutex::new(alloc::collections::BTreeSet::new());
 
+/// Stack `sid` was removed: the memberships on it go.
+pub(crate) fn forget_sid(sid: Sid) {
+    let mut g = GROUPS.lock();
+    for v in g.values_mut() { v.retain(|e| e.1 != sid); }
+    g.retain(|_, v| !v.is_empty());
+}
+
 pub(crate) fn set_all(ofd: u32, on: bool) {
     let mut n = NOALL.lock();
     if on { n.remove(&ofd); } else { n.insert(ofd); }

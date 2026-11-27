@@ -25,6 +25,7 @@ Options:
                              blksteal host:blkstealtest.py alone (late device-lock holder: no [WDOG] on running CPUs)
                              blkmany  host:blkmanytest.py alone (12 extra virtio-blk disks: all in /dev, all mount)
                              rpi5check host:rpi5checktest.py (cargo check of the --features rpi5 kernel)
+                             kmodsuite host:kmodsuitetest.py (private =m build; real kmodctl load/unload of virtio_net, nvme, iwlwifi, brcmf, sdhci)
                              kmodbuild host:kmodbuildtest.py (every loadable module builds and links against the kernel export table)
                              failevid  host:failevidtest.py (failing suites leave <out>/fail/<NN>-<name>/ evidence)
                              harness   host:harnesstest.py (line-buffering, auto -D on host tracing, quoted-command survival)
@@ -343,6 +344,8 @@ SUITES = {
                 "host:blkhangtest.py",
                 # Virtio-blk I/O error completion (blkdebug inject-error): mapped fault = SIGBUS, read() = EIO, system alive (~22 s; lane blkfaultfix).
                 "host:blkfaulttest.py",
+                # Private =m kernel: kmodctl load/unload of virtio_net, nvme (EBUSY while open), iwlwifi/brcmf (+sdhci on aarch64); booted build-id checked (~3 min; lane kmodint).
+                "host:kmodsuitetest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
                 "host:uartgaptest.py", "host:conlosstest.py", "host:conlossnoisetest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
                 # Out-of-tree host suites that were solo-green 3x x86_64 KVM + aarch64 TCG (lane hostcov 2026-11-22): USB unplug, F2FS checkpoint, power control (~2-5 min each).
@@ -470,6 +473,8 @@ SUITES = {
     "rpi5check": ["host:rpi5checktest.py"],
     # every loadable module builds + links against the kernel export table (kapi drift guard, host only).
     "kmodbuild": ["host:kmodbuildtest.py"],
+    # lane kmodsuite: private =m variant build; kmodctl load/unload of virtio_net x3, nvme (+EBUSY), iwlwifi/brcmf/sdhci smoke.
+    "kmodsuite": ["host:kmodsuitetest.py"],
     "harness": ["host:harnesstest.py"],
     "failevid": ["host:failevidtest.py"],
     "stdev": ["host:stdevtest.py"],
@@ -622,7 +627,7 @@ SUITES = {
 # their timeout (seconds, before scaling) when it exceeds --timeout.
 HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "v6injecttest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
-                 "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600, "kmodbuildtest.py": 1500}
+                 "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600, "kmodbuildtest.py": 1500, "kmodsuitetest.py": 1800}
 
 
 def find_fails(out):
