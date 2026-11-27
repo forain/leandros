@@ -146,6 +146,9 @@ pub(super) fn mmap_vcpu(pid: u32, fd: usize, len: usize, off: usize, flags: usiz
                         virt: usize, place: MmapCand) -> Option<isize> {
     const MAP_SHARED: usize = 1;
     const MAP_FIXED: usize = 0x10;
+    // No VM alive (a vCPU fd keeps its VM alive): no fd of ours can be a vCPU, so skip the
+    // fd-table lookup on every file mmap.
+    if vm::NVMS.load(Ordering::Acquire) == 0 { return None; }
     let id = vfs::kvm_obj_of_fd(pid, fd)?;
     let Some(Obj::Vcpu(v)) = lookup(id) else { return Some(-19) }; // ENODEV: only vCPU fds map
     if sched::tgid_of(pid) != v.vm.tgid { return Some(-5); }
