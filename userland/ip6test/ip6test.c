@@ -882,6 +882,7 @@ static void test_ping6_own_global(void) {
         if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
         int got = await_reply(s, seq, r, sizeof r);
         if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+        else printf("  own global seq %d: got=%d errno=%d\n", seq, got, errno);
     }
     close(s);
     if (good != 4) {
