@@ -8,8 +8,10 @@
 //! pending host interrupt (tick, kick SGI, maintenance, the guest-timer PPI) is
 //! taken before the exit is handled.
 //!
-//! Locking: `Vcpu::arch` is held for the whole iteration except while blocked (WFI /
-//! powered off), so other vCPUs (PSCI CPU_ON) only touch `Vcpu::boot` and kick.
+//! Locking: `Vcpu::arch` (a spin lock) is held while the iteration prepares the entry and
+//! not across `enter()` or `handle_exit` (which can sleep or yield); the loop runs on a stack
+//! copy that is stored back after every exit. Other vCPUs (PSCI CPU_ON) only touch
+//! `Vcpu::boot` and kick.
 use super::*;
 use ::kvm::abi::exit::*;
 use ::kvm::esr::{self, Exit};
@@ -184,6 +186,12 @@ fn run_loop(vm: &Arc<Vm>, v: &Arc<Vcpu>, run: *mut KvmRun, gfp: *mut u8) -> isiz
             | if lines & vcpu::FIQ_PENDING != 0 { HCR_VF } else { 0 }
             | if vse { HCR_VSE } else { 0 };
         let forced = vt;
+        // Run on a stack copy: `v.arch` is a spin lock and handle_exit can sleep
+        // (stage-2 fault -> prefault_user_page) or yield, so it is not held across
+        // the entry. The copy is stored back before handle_exit's result is used.
+        let mut local = *hw;
+        drop(g);
+        let hw = &mut local;
         // Per-CPU guest state (list registers, timer) is loaded with IRQs off, so a
         // preemption cannot move the vCPU between the load and the entry. An abort
         // below still runs timer::save and vgic_leave, which undo both loads.
@@ -205,13 +213,20 @@ fn run_loop(vm: &Arc<Vm>, v: &Arc<Vcpu>, run: *mut KvmRun, gfp: *mut u8) -> isiz
         unsafe { core::arch::asm!("msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)); }
         sched::ksync::irq_restore(flags);
         if k != 0 { super::kick::kick_mask(vm, k & !(1u64 << v.id)); }
-        let Some(raw) = raw else { continue };
+        let Some(raw) = raw else { store_hw(v, hw); continue };
 
-        match handle_exit(vm, v, hw, run, &raw) {
+        let flow = handle_exit(vm, v, hw, run, &raw);
+        store_hw(v, hw);
+        match flow {
             Flow::Resume => {}
             Flow::User(r) => return r,
         }
     }
+}
+
+/// Publish the run loop's working copy of the vCPU state back into `Vcpu::arch`.
+fn store_hw(v: &Vcpu, hw: &VcpuHw) {
+    if let Some(h) = v.arch.lock().hw_mut() { *h = *hw; }
 }
 
 // ---- vGIC <-> hardware ------------------------------------------------------------------
