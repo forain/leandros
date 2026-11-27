@@ -18,6 +18,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src"
 
@@ -93,6 +94,13 @@ extra_for() {
   echo "--config=target.$2-unknown-linux-musl.rustflags=[\"-C\",\"link-arg=$o\"]"
 }
 
+cosmic_apps_cargo() { # <app> <arch> <feats> <extra>
+  if ! "$M6/build-rust.sh" "$SRC/$1" "$2" $3 $4 > /dev/null; then
+    echo "cosmic-apps: $1 build failed for $2 (log: $M6/logs/$1-$2.log)" >&2
+    return 1
+  fi
+}
+
 build_one() {
   local app="$1" lead arch
   if [[ ! -f "$SRC/$app/Cargo.toml" ]]; then
@@ -109,11 +117,10 @@ build_one() {
   mkdir -p "$SRC/$lead/target"
   sh "$M6/gen-cargo-config.sh" "$SRC/$app" > /dev/null
   for arch in "${ARCHES[@]}"; do
-    if ! "$M6/build-rust.sh" "$SRC/$app" "$arch" $(feat_for "$app") $(extra_for "$app" "$arch") > /dev/null; then
-      echo "cosmic-apps: $app build failed for $arch (log: $M6/logs/$app-$arch.log)" >&2
-      return 1
-    fi
-    stage_file 0755 "$SRC/$app/target/$arch-unknown-linux-musl/release/$app" "$M6_OUT/$app-$arch"
+    local feats extra; feats=$(feat_for "$app"); extra=$(extra_for "$app" "$arch")
+    cosmic_cache_build "$app" "$arch" "$SRC/$app" "feats=$feats extra=$extra" "$(dirname "$0")/../mesa/ssp_guard.c" \
+      "$SRC/$app/target/$arch-unknown-linux-musl/release/$app|$app-$arch" -- \
+      cosmic_apps_cargo "$app" "$arch" "$feats" "$extra" || return 1
     echo "staged $arch: $M6_OUT/$app-$arch"
   done
 }

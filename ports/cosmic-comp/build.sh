@@ -12,6 +12,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 ART=${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 D=$ART/m6-session-bins
 HERE=$(cd "$(dirname "$0")" && pwd)
 COMP_REV=dec1ee863368737c6900e1ae75424813e27e24af
@@ -41,9 +42,7 @@ sh "$D/gen-cargo-config.sh" "$CC" >/dev/null
 mkdir -p "$M6_OUT"
 for arch in "$@"; do
     bin=$CC/target/$arch-unknown-linux-musl/release/cosmic-comp
-    rm -f "$bin"   # build-rust.sh's exit status does not reflect cargo's
-    sh "$D/build-rust.sh" "$CC" "$arch" --no-default-features
-    [ -x "$bin" ] || { echo "cosmic-comp build failed for $arch" >&2; exit 1; }
-    stage_file 0755 "$bin" "$M6_OUT/cosmic-comp-$arch"
+    cosmic_cache_build cosmic-comp "$arch" "$CC" "--no-default-features" "$(echo "$HERE"/0*.patch)" \
+        "$bin|cosmic-comp-$arch" -- sh "$D/build-rust.sh" "$CC" "$arch" --no-default-features || { echo "cosmic-comp build failed for $arch" >&2; exit 1; }
     echo "staged $D/out/cosmic-comp-$arch"
 done
