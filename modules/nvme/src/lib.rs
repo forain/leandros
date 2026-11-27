@@ -31,6 +31,7 @@ mod nvme;
 kmod_rt::module! {
     name: "nvme",
     init: init,
+    exit: exit,
     ids: [kmod_rt::pci_class(0x010802, 0xffffff)]
 }
 
@@ -58,7 +59,18 @@ static DONE: AtomicBool = AtomicBool::new(false);
 
 fn init() -> i32 {
     if DONE.swap(true, Ordering::SeqCst) { return -16; }
-    if nvme::init(kmod_kapi::cmdline()) == 0 { return -19; }
+    if nvme::init(kmod_kapi::cmdline()) == 0 { DONE.store(false, Ordering::SeqCst); return -19; }
+    if nvme::NS_REGISTERED.load(Ordering::Relaxed) == 0 {
+        // Controllers answered but no namespace reached the registry: never "load fine" without a disk.
+        nvme::unload();
+        DONE.store(false, Ordering::SeqCst);
+        return -5;
+    }
     let _ = kmod_kapi::pm::register2(&PM, 0);
     0
+}
+
+fn exit() {
+    nvme::unload();
+    DONE.store(false, Ordering::SeqCst);
 }
