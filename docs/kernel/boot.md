@@ -162,3 +162,20 @@ Every change to boot is verified by booting **both** architectures to a login pr
 - [hardware/raspberry-pi-5.md](../hardware/raspberry-pi-5.md) and [hardware/pc.md](../hardware/pc.md) — real-hardware boot
 - [getting-started/running.md](../getting-started/running.md) — boot modes and accelerators
 - [development/conventions.md](../development/conventions.md) — the Limine revision rule as project policy
+
+## EL2 / VHE (KVM builds only)
+
+Default builds (Kconfig `KVM` off, cargo feature `drv-kvm` off) drop every entry
+path from EL2 to EL1 as always: `check_el2` in `kernel/src/entry_aarch64.s` and the
+AP stub in `arch/aarch64/src/smp.rs` assemble with `KVM_VHE=0`, so the `.if KVM_VHE`
+blocks are not emitted and the instruction stream is the pre-KVM one.
+
+With `drv-kvm` (`KVM_VHE=1`) and a CPU with VHE (`ID_AA64MMFR1_EL1.VH`), the BSP
+and the APs stay at EL2 with `HCR_EL2 = RW|TGE|E2H` (+`API|APK` with PAuth) on both
+the Limine path (rev 6 already enters at EL2 with E2H=1, MMU on) and the direct path
+(MMU off). `CNTHCTL_EL2` is written in the E2H layout, `CPTR_EL2` opens FP/SVE/SME,
+and `ICC_SRE_EL2` gets SRE|Enable. A CPU without VHE, or an MMU-on entry with E2H=0,
+still takes the EL1 drop. The host tick moves from CNTV (PPI 27) to CNTHP (INTID 26,
+GTDT "EL2 timer GSIV" when ACPI provides it); `cntp_*_el0` at EL2 is redirected to
+CNTHP by E2H. The boot log prints `[el] running at EL2 (VHE)`. Test: `runtests kvmvhe`
+(QEMU `virt,virtualization=on`, `LEANDROS_VIRT=1`) and `ktest=elcheck`.
