@@ -344,6 +344,8 @@ SUITES = {
                 "host:blkhangtest.py",
                 # Virtio-blk I/O error completion (blkdebug inject-error): mapped fault = SIGBUS, read() = EIO, system alive (~22 s; lane blkfaultfix).
                 "host:blkfaulttest.py",
+                # Private =m kernel: kmodctl load/unload of virtio_net, nvme (EBUSY while open), iwlwifi/brcmf (+sdhci on aarch64); booted build-id checked (~3 min; lane kmodint).
+                "host:kmodsuitetest.py",
                 # Console must not starve serial RX; NVMe MSI-X vectors (<30 s each; lane suitefail).
                 "host:uartgaptest.py", "host:conlosstest.py", "host:conlossnoisetest.py", "host:nvmemsixtest.py", "host:reboottest.py", "host:usbstalltest.py", "host:espresettest.py", "host:a64acpitest.py", "host:cmdlinetest.py",
                 # Out-of-tree host suites that were solo-green 3x x86_64 KVM + aarch64 TCG (lane hostcov 2026-11-22): USB unplug, F2FS checkpoint, power control (~2-5 min each).
