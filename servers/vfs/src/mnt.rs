@@ -247,6 +247,16 @@ pub fn flags_of(ns: NsId, id: u32) -> u8 {
     NS.lock().get(&ns).and_then(|n| n.mnts.iter().find(|m| m.id == id)).map_or(0, |m| m.flags)
 }
 
+/// Mount point of mount `id` in `ns` when it is a bound nsfs file (a
+/// descriptor opened on one is an anon_inode with no backing path of its own,
+/// so mount_setattr/move_mount through it name the mount this way).
+pub fn nsfs_mountpoint(ns: NsId, id: u32) -> Option<Vec<u8>> {
+    let g = NS.lock();
+    let t = &g.get(&ns)?.mnts;
+    let i = t.iter().position(|m| m.id == id && m.fstype == "nsfs")?;
+    Some(ns_mountpoint(t, i))
+}
+
 /// Absolute namespace path of the mountpoint of `m`.
 fn ns_mountpoint(t: &[Mnt], mut i: usize) -> Vec<u8> {
     let mut parts: Vec<&[u8]> = Vec::new();

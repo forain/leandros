@@ -16,7 +16,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL"; exit 3; }
+  [ "${ALPINE_REL:?}" = edge ] || grep -q "^${ALPINE_REL}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL"; exit 3; }
   PKGS="flatpak ostree xdg-dbus-proxy"
   DEVPKGS="flatpak-dev ostree-dev json-glib-dev libxmlb-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then
