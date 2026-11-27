@@ -1,0 +1,11 @@
+[package]
+name = "kvm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "KVM UAPI (Linux arm64) ABI constants and structures shared by the kvm-* lanes and userland kvmtest"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
