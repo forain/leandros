@@ -149,9 +149,12 @@ pub fn clone_as_step(src: &mut AddressSpace, c: &mut CloneCursor, budget_pages: 
             continue;
         }
         // A forked-from page becomes read-only: a hypervisor mapping it
-        // writable in stage 2 must drop it first (once per region).
-        if c.page == 0 {
-            crate::vmm::notify_range_invalidate(src_root, region.start, region.end - region.start);
+        // writable in stage 2 must drop it first. The address-space lock is dropped
+        // between steps (a hypervisor can map new pages of the remaining range
+        // meanwhile), so every step notifies the range it has still to process.
+        {
+            let from = (region.start + c.page * 4096).min(region.end);
+            crate::vmm::notify_range_invalidate(src_root, from, region.end - from);
         }
         let dst_slot = &mut c.dst.regions[ri];
 
