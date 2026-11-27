@@ -52,7 +52,10 @@ def build():
     # the symlinks, so the variant build would write (and the stale-kernel delete would hit) the base tree.
     # Copy the real checkout instead.
     src = os.path.dirname(os.path.realpath(os.path.join(REPO, "scripts")))
-    r = subprocess.run(["cp", "-a", "--reflink=auto", src, VAR], capture_output=True, text=True)
+    # The farm's rw tree also holds logs/ (with every shard's tree and this variant's own directory): skip it.
+    os.makedirs(VAR, exist_ok=True)
+    ents = [os.path.join(src, n) for n in sorted(os.listdir(src)) if n != "logs" and not n.startswith(".busy")]
+    r = subprocess.run(["cp", "-a", "--reflink=auto", *ents, VAR + "/"], capture_output=True, text=True)
     if r.returncode:
         print("FAIL: cp of tree: " + r.stderr[-300:])
         return False
