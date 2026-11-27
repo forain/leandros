@@ -246,6 +246,8 @@ def main():
             _, dg = run(f"podman create --name pbdiag --network pb6 {IMG} true >/dev/null 2>&1; podman inspect --format '{{{{.HostConfig.Sysctls}}}}' pbdiag 2>&1; podman rm -f pbdiag >/dev/null 2>&1; grep -rn sysctl /usr/share/containers/containers.conf /etc/containers/containers.conf 2>&1 | head -5; podman --version; crun --version | head -1")
             print("podman_v6_ping_diag2: " + dg.strip().replace("\n", " | "), flush=True)
             _, dg = run(f"podman run --rm --network pb6 --sysctl net.ipv4.ping_group_range='0 0' {IMG} sh -c 'cat /proc/sys/net/ipv4/ping_group_range; ping -6 -c1 -W 5 {gw6}' 2>&1")
+            _, dg = run(f"cat /proc/sys/net/ipv4/ping_group_range; podman run --log-level=debug --rm --network pb6 {IMG} true 2>&1 | grep -i 'sysctl\\|ping_group' | cut -c1-200 | head -8")
+            print("podman_v6_ping_diag4: " + dg.strip().replace("\n", " | "), flush=True)
             print("podman_v6_ping_diag3: " + dg.strip().replace("\n", " | ")[-300:], flush=True)
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
         check6("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
