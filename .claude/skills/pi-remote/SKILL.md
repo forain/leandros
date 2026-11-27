@@ -107,3 +107,13 @@ python3 scripts/remote.py pi-sync                     # apply (then reboot or pi
 - A second run must print `up to date: 0 bytes uploaded`.
 - Test against QEMU: `$SP/lock.sh qemu scripts/pi-sync-qemutest.sh` (stale-seeded guest,
   apply, idempotence, protected-file hashes, group merge, reboot).
+
+## Use scripts/device-update.sh
+
+Prefer `scripts/device-update.sh pi <expected-tag>` (normal `--rpi5` build in
+the current tree, never RPI5_USBROOT; LEANDROS_REMOTE=pi + LEANDROS_PI_HOST).
+One `lock3.sh pi` hold covers pi-deploy, the checks (trial info == HEAD, booted
+slot trial, `uname -v` tag, ssh, dmesg without panic/WDOG/oops, prints
+`/proc/leandros_sd`) and pi-promote; nothing is promoted if a check fails.
+Limit: the card's kernel.img is unchanged, so after a power cycle you still run
+`remote.py pi-boot good`.
