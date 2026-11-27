@@ -6,11 +6,12 @@
 //   0 hw  8..104 x19..x30  104 out  112 daif  120 sp_el0  128 tpidr_el1
 //   136 tpidr_el2  144 vbar  152 hcr  160 cptr  168 mdcr  176 cnthctl
 //   184 mdscr  192 csselr  200 par  208 vmpidr  216 vpidr  224 cntvoff  232 vttbr
-//   (240 bytes)
+//   240 tpidr_el0  248 host PSTATE.PAN
+//   (256 bytes)
 // VcpuHw: gp 0, sp_el0 248, sp_el1 256, pc 264, pstate 272, el1 288.. (El1Regs is align 16; first 26 u64 switched), hcr 1056,
 // vttbr 1064, vmpidr 1072, cntvoff 1080, vtcr 1088 (asserted in ctx.rs).
 
-.equ F_SIZE,   240
+.equ F_SIZE,   256
 .equ F_HW,     0
 .equ F_X19,    8
 .equ F_OUT,    104
@@ -30,6 +31,8 @@
 .equ F_VPIDR,  216
 .equ F_CNTVOFF,224
 .equ F_VTTBR,  232
+.equ F_TPIDR0, 240
+.equ F_PSTATE, 248
 
 .equ HW_SPEL0, 248
 .equ HW_SPEL1, 256
@@ -135,6 +138,7 @@ kvm_enter_raw:
     msr  daifset, #0xf
     HOST_SAVE sp_el0,      F_SPEL0
     HOST_SAVE tpidr_el1,   F_TPIDR1
+    HOST_SAVE tpidr_el0,   F_TPIDR0
     HOST_SAVE tpidr_el2,   F_TPIDR2
     HOST_SAVE vbar_el2,    F_VBAR
     HOST_SAVE hcr_el2,     F_HCR
@@ -276,6 +280,7 @@ kvm_exit_common:
     HOST_LOAD cntvoff_el2, F_CNTVOFF
     HOST_LOAD sp_el0,      F_SPEL0
     HOST_LOAD tpidr_el1,   F_TPIDR1
+    HOST_LOAD tpidr_el0,   F_TPIDR0
     HOST_LOAD mdscr_el1,   F_MDSCR
     HOST_LOAD csselr_el1,  F_CSSELR
     HOST_LOAD par_el1,     F_PAR
