@@ -173,12 +173,14 @@ pub fn exit_race(pid: Pid, tgid: Pid) {
     if now >= RACE_DEADLINE.load(Ordering::Relaxed) { LL_RACE_SKIP.fetch_add(1, Ordering::Relaxed); return; }
     if pid == tgid && !RACE_LEADER.load(Ordering::Relaxed) { LL_RACE_SKIP.fetch_add(1, Ordering::Relaxed); return; }
     LL_RACE_ENTER.fetch_add(1, Ordering::Relaxed);
+    crate::klog_line(format_args!("[llred] race enter pid={} tgid={} arrived={}\n", pid, tgid, RACE_ARRIVED.load(Ordering::Relaxed)));
     RACE_ARRIVED.fetch_add(1, Ordering::AcqRel);
     let n = RACE_N.load(Ordering::Relaxed);
     while RACE_ARRIVED.load(Ordering::Acquire) < n && crate::monotonic_ns().saturating_sub(now) < 2_000_000_000 {
         crate::irq_window();
         crate::yield_now("asfree_exitrace");
     }
+    crate::klog_line(format_args!("[llred] race leave pid={} arrived={} n={}\n", pid, RACE_ARRIVED.load(Ordering::Relaxed), n));
     if RACE_ARRIVED.load(Ordering::Acquire) >= n { LL_RACE_FULL.fetch_add(1, Ordering::Relaxed); }
     else { LL_RACE_TIMEOUT.fetch_add(1, Ordering::Relaxed); }
 }
