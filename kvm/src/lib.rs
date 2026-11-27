@@ -2,6 +2,8 @@
 #![no_std]
 
 pub mod abi;
+pub mod psci;
+pub mod sysreg;
 pub use abi::*;
 
 pub mod ioevent;
