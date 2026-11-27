@@ -54,7 +54,11 @@ _cc_manifest() { # <label> <arch> <srcdir> <extra text> <extra files> -> the exa
     env | grep -E '^(CARGO|RUST|CC|CXX|AR|CFLAGS|CXXFLAGS|LDFLAGS|PKG_CONFIG|SDKROOT|DYN_|LEANDROS_WGPU)' \
       | grep -v '^CARGO_HOME=\|^RUSTUP_HOME=' | LC_ALL=C sort
     echo "sysroot"
-    find "$s3/sysroot-$arch" -printf '%P %y %s %T@ %l\n' 2>/dev/null | LC_ALL=C sort
+    # Non-directories only, and the alpine-dev stamp by CONTENT: alpine-dev.py
+    # rewrites the stamp (and so bumps usr/ and usr/bin/ mtimes) on every build
+    # even when nothing changed, which gave every tree a new key.
+    find "$s3/sysroot-$arch" ! -type d ! -name .alpine-dev.stamp -printf '%P %y %s %T@ %l\n' 2>/dev/null | LC_ALL=C sort
+    for _st in "$s3/sysroot-$arch"/usr/.alpine-dev.stamp; do [ -f "$_st" ] && echo "stamp $(sha1sum < "$_st" | cut -c1-40)"; done
   }
 }
 
