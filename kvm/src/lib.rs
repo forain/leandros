@@ -4,5 +4,7 @@
 pub mod abi;
 pub use abi::*;
 
+pub mod ioevent;
+pub mod memslot;
 pub mod s2;
 pub mod vmid;

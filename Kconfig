@@ -69,7 +69,7 @@ config NVIDIA
 	default n
 
 config KVM
-	bool "KVM host support (EL2/VHE; /dev/kvm in later lanes)"
+	bool "KVM host support (EL2/VHE; /dev/kvm, Linux KVM ioctl ABI)"
 	depends on ARCH_ARM64
 	default n
 	help

@@ -48,7 +48,7 @@ drv-lapinv = ["drivers/drv-lapinv"]
 drv-i2c-hid = ["drivers/drv-i2c-hid"]
 # kmodW2: gates for drivers that become tristate in later lanes (declared now so
 # every lane edits only its own driver). Y-only: the features do not gate code yet.
-drv-kvm = ["arch-aarch64/kvm"]
+drv-kvm = ["arch-aarch64/kvm", "dep:kvm"]
 drv-nvme = ["drivers/drv-nvme"]
 drv-sdhci = ["drivers/drv-sdhci"]
 mod-sdhci = []
@@ -95,3 +95,4 @@ nvidia-rm = { path = "../drivers/nvidia", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 arch-aarch64 = { path = "../arch/aarch64" }
+kvm = { path = "../kvm", optional = true }

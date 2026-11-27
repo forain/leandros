@@ -34,6 +34,9 @@ use vfs_server as vfs;
 mod syncfile_ioctl;
 #[path = "v4l2.rs"]
 pub(crate) mod v4l2;
+#[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+#[path = "kvm/mod.rs"]
+pub(crate) mod kvm_dev;
 use net_server;
 use tty_server;
 use evdev_server;
@@ -3054,6 +3057,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         && with_current_address_space(|as_| as_.overlap_end(virt, len).is_some()) == Some(true)
     {
         return -17; // EEXIST
+    }
+
+    // KVM vCPU fd: the kvm_run page (drv-kvm; inert for every other fd).
+    #[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+    if flags & MAP_ANONYMOUS == 0 {
+        if let Some(r) = kvm_dev::mmap_vcpu(sched::current_pid(), fd, len, off, flags, prot, virt, place) { return r; }
     }
 
     let end = match virt.checked_add(len) {
@@ -13031,6 +13040,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // gate in drivers::sync_file is open and the fd/flags are ones it handles.
     if let Some(r) = syncfile_ioctl::intercept(pid, fd, cmd, arg) { return r; }
     if let Some(r) = v4l2::intercept(pid, fd, cmd, arg) { return r; }
+    #[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+    if let Some(r) = kvm_dev::intercept(pid, fd, cmd, arg) { return r; }
 
     // ── PRIME / dmabuf export+import (intercepted here, not in the DRM server) ──
     // The DRM server (drivers crate) has no fd-table access; building a dmabuf fd
