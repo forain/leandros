@@ -233,6 +233,11 @@ const RELEASE_WAIT_NS: u64 = 500_000_000;
 struct Held { gen: u64, pid: Pid, busy: bool, cancel: bool, _arc: Option<Arc<AddressSpace>> }
 static SLOT: spin::Mutex<Option<Held>> = spin::Mutex::new(None);
 static GEN: AtomicU64 = AtomicU64::new(1);
+/// Late-leader accounting (lane llred): reaps/notifies done by the post-drop
+/// recheck, and by the settle-at-removal branch (defensive, unreachable for
+/// user tasks).
+pub static LL_RECHECK_REAPS: AtomicU64 = AtomicU64::new(0);
+pub static LL_SETTLE_REAPS: AtomicU64 = AtomicU64::new(0);
 
 /// Text of the file.
 pub fn render(s: &mut alloc::string::String) {
@@ -246,6 +251,8 @@ pub fn render(s: &mut alloc::string::String) {
     let _ = writeln!(s, "overlaps {}", OVERLAPS.load(Ordering::Relaxed));
     let _ = writeln!(s, "pause_result {}", PAUSE_RESULT.load(Ordering::Relaxed));
     let _ = writeln!(s, "armed {}", any_armed() as u8);
+    let _ = writeln!(s, "ll_recheck_reaps {}", LL_RECHECK_REAPS.load(Ordering::Relaxed));
+    let _ = writeln!(s, "ll_settle_reaps {}", LL_SETTLE_REAPS.load(Ordering::Relaxed));
     for (n, t, p, q) in v { let _ = writeln!(s, "{} {} {} {}", n, t, p, q); }
 }
 
