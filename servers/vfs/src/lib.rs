@@ -7967,7 +7967,8 @@ fn gen_leandros_sd() -> Option<VnodeKind> {
     let f = PROC_SD.load(core::sync::atomic::Ordering::Acquire);
     if f == 0 { return None; }
     let f: fn() -> Option<alloc::string::String> = unsafe { core::mem::transmute(f) };
-    let s = f()?;
+    let mut s = f()?;
+    s.push_str(&block::sd_policy_text());
     proc_snapshot(b"/tmp/.leandros_sd", s.as_bytes(), false)
 }
 

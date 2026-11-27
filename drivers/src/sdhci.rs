@@ -421,8 +421,15 @@ pub fn proc_text() -> Option<alloc::string::String> {
     let st = match SD_STATE.load(Ordering::Relaxed) {
         1 => "granted", 2 => "locked", 3 => "locked-ro-exposed", _ => "unprobed",
     };
-    Some(alloc::format!("state={} reason={} writes_issued={} writes_refused={}\n", st,
-        crate::rpi_misc_logic::sdgrant::reason_str(SD_REASON.load(Ordering::Relaxed)),
+    let card = match SD_STATE.load(Ordering::Relaxed) { 1 => "own", 0 => "unknown", _ => "foreign" };
+    let range = if SD_STATE.load(Ordering::Relaxed) == 1 {
+        match busy_range(1) {
+            Some((s, l)) => alloc::format!("controller-wide; root fs bytes {}+{}", s, l.min(u64::MAX / 2)),
+            None => alloc::string::String::from("controller-wide"),
+        }
+    } else { alloc::string::String::from("none") };
+    Some(alloc::format!("state={} reason={} card={} grant_range={} writes_issued={} writes_refused={}\n", st,
+        crate::rpi_misc_logic::sdgrant::reason_str(SD_REASON.load(Ordering::Relaxed)), card, range,
         SD_WR_ISSUED.load(Ordering::Relaxed), SD_WR_REFUSED.load(Ordering::Relaxed)))
 }
 
@@ -2426,6 +2433,9 @@ fn decide_grant(_d: &SdhciDevice) -> bool {
         "[sdhci] write grant: {} ({}; label '{}', partition {})\n",
         if granted { "GRANTED" } else { "LOCKED: this driver will not write the card" },
         crate::rpi_misc_logic::sdgrant::reason_str(reason), label, ctx.pno));
+    crate::kenv::pci::serial_debug(&alloc::format!(
+        "[sdhci] lock state: {} card={} whole-card node write=window-only\n",
+        if granted { "granted" } else { "locked" }, if granted { "own" } else { "foreign" }));
     granted
 }
 
@@ -2648,7 +2658,7 @@ fn span_io(dev_idx: usize, is_write: bool, blk: u64, buf: *mut u8, len: usize) -
 /// The boot-FAT device is always read-only (writable only inside a BLKWRWIN window).
 pub fn read_only(dev_idx: usize) -> bool {
     let devs = DEVICES.lock();
-    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat || LOCKED_RO.load(Ordering::Relaxed))
+    matches!(devs.get(dev_idx), Some(Some(d)) if d.boot_fat || dev_idx == WHOLE_IDX || LOCKED_RO.load(Ordering::Relaxed))
 }
 
 pub fn is_boot_fat(dev_idx: usize) -> bool {

@@ -798,29 +798,58 @@ pub fn dev_read_only(dev: u16) -> bool {
     b.get(dev as usize).map_or(false, |e| e.in_use && e.ro)
 }
 
+/// Raw block-node writes refused (EROFS read-only/outside window, EBUSY mounted root).
+static WR_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `/proc/leandros_sd` per-node write policy for the SD card (`mmcblk0*`) plus
+/// the refused-write counter of the raw block-node path.
+pub fn sd_policy_text() -> alloc::string::String {
+    use alloc::string::String;
+    use core::fmt::Write;
+    let mut out = String::new();
+    let b = BDEVS.lock();
+    for e in b.iter().filter(|e| e.in_use && e.nlen >= 7 && &e.name[..7] == b"mmcblk0") {
+        let name = core::str::from_utf8(&e.name[..e.nlen as usize]).unwrap_or("?");
+        let disk = match e.backing { Backing::Disk(i) => Some((i, e.start)), Backing::Part { parent, .. } => Some((parent, e.start)), _ => None };
+        let busy = disk.and_then(|(i, st)| ops().and_then(|o| (o.busy)(i as usize)).map(|(bs, bl)| (st, bs, bl)))
+            .map_or(false, |(st, bs, bl)| st < bs.saturating_add(bl) && bs < st + e.size);
+        let pol = if busy { "ebusy-mounted-root" } else if e.ro { "read-only(window-only)" } else { "writable" };
+        let _ = writeln!(out, "node={} start={} bytes={} write={}", name, e.start, e.size, pol);
+    }
+    let _ = writeln!(out, "node_writes_refused={}", WR_REFUSED.load(core::sync::atomic::Ordering::Relaxed));
+    out
+}
+
 /// `write(2)` on a block node. Writes past the end of the device are refused
 /// with ENOSPC rather than silently truncated; a read-only disk (NVMe without
 /// `nvme.rw=1`) answers EROFS.
 fn write_chunk(dev: u16, off: u64, buf_ptr: usize, len: usize) -> isize {
     let (root, base, size) = match resolve(dev) { Some(r) => r, None => return -6 };
-    if off >= size { return if dev_read_only(dev) { -30 } else { -28 }; } // EROFS / ENOSPC
+    if off >= size { return if dev_read_only(dev) { WR_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); -30 } else { -28 }; } // EROFS / ENOSPC
     let n = len.min((size - off) as usize).min(MAX_XFER);
     // Bytes a mounted filesystem owns are never written through a raw node.
     if let (Root::Disk(i), Some(o)) = (root, ops()) {
         if let Some((bs, bl)) = (o.busy)(i as usize) {
             let a = base + off;
-            if n > 0 && a < bs.saturating_add(bl) && bs < a + n as u64 { return -16; } // EBUSY
+            if n > 0 && a < bs.saturating_add(bl) && bs < a + n as u64 {
+                WR_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return -16; // EBUSY
+            }
         }
     }
     // A live BLKWRWIN window on this disk is the only way to write it when it
     // is read-only, and confines writes to its ranges when it is not.
-    match root {
+    let refused = match root {
         Root::Disk(i) => match window_check(i, base + off, n as u64) {
-            WinCheck::Inside => {}
-            WinCheck::Outside => return -30, // EROFS
-            WinCheck::None => if dev_read_only(dev) { return -30; },
+            WinCheck::Inside => false,
+            WinCheck::Outside => true,
+            WinCheck::None => dev_read_only(dev),
         },
-        _ => if dev_read_only(dev) { return -30; },
+        _ => dev_read_only(dev),
+    };
+    if refused {
+        WR_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return -30; // EROFS
     }
     if n == 0 { return 0; }
     let mut v = alloc::vec![0u8; n];
