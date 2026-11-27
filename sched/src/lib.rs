@@ -9361,7 +9361,14 @@ fn kill_next_group_member_except(exit_code: i32, skip: Pid) -> GroupKillStep {
     for i in rq.live_slots() {
         if let Some(t) = rq.get(i) {
             if t.tgid == tgid && t.pid != pid && t.pid != skip {
-                if ksync::klocks_held(t.pid) != 0 {
+                // Lane groupkillexit: a member already inside `exit` (and not yet a
+                // Zombie) finishes its own exit: reaping it here would skip its
+                // clear_child_tid write + futex wake, thread_children_on_exit and
+                // the exit notifications, which waiters outside the group (a
+                // shared-memory TID word) depend on. It cannot return to user
+                // mode, so waiting for it (`Deferred`) is safe. A Zombie one (a
+                // delayed leader, or a member past its steps) is reaped as before.
+                if ksync::klocks_held(t.pid) != 0 || (t.exiting && t.state != TaskState::Zombie) {
                     if deferred == 0 { deferred = t.pid; }
                     continue;
                 }
