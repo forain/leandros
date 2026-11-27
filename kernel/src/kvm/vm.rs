@@ -39,6 +39,8 @@ pub struct Vm {
     pub s2: Mutex<Stage2<KFrames>>,
     pub vmid: Mutex<VmidSlot>,
     pub vttbr: AtomicU64,
+    /// VTCR_EL2 for this VM (8-bit VMIDs, so VS=0), loaded on every entry.
+    pub vtcr: u64,
     pub vcpus: Mutex<[Option<Weak<Vcpu>>; KVM_MAX_VCPUS as usize]>,
     pub ioevents: Mutex<Vec<IoEvent>>,
     /// Object id of the in-kernel irqchip device (0 = none).
@@ -97,11 +99,12 @@ pub(super) fn create(pid: u32, arg: usize) -> isize {
         }
     };
     let vttbr = s2.vttbr(vmid);
+    let vtcr = s2.vtcr_with(super::parange(), false);
     let id = next_serial();
     let vm = Arc::new(Vm {
         id, tgid: sched::tgid_of(pid), as_root, ipa_bits: want,
         slots: Mutex::new(SlotTable::new()), s2: Mutex::new(s2), vmid: Mutex::new(slot),
-        vttbr: AtomicU64::new(vttbr), vcpus: Mutex::new([const { None }; KVM_MAX_VCPUS as usize]),
+        vttbr: AtomicU64::new(vttbr), vtcr, vcpus: Mutex::new([const { None }; KVM_MAX_VCPUS as usize]),
         ioevents: Mutex::new(Vec::new()), vgic_dev: AtomicU32::new(0), vgic: Mutex::new(None),
     });
     NVMS.fetch_add(1, Ordering::AcqRel);

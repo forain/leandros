@@ -178,6 +178,7 @@ fn run_loop(vm: &Arc<Vm>, v: &Arc<Vcpu>, run: *mut KvmRun, gfp: *mut u8) -> isiz
         let lines = v.irq_lines.load(Ordering::Acquire);
         let vse = core::mem::take(&mut v.run.lock().vse);
         hw.vttbr = vm.vttbr();
+        hw.vtcr = vm.vtcr;
         hw.hcr = GUEST_HCR
             | if lines & vcpu::IRQ_PENDING != 0 { HCR_VI } else { 0 }
             | if lines & vcpu::FIQ_PENDING != 0 { HCR_VF } else { 0 }

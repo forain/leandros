@@ -102,6 +102,7 @@ pub struct VcpuHw {
     pub vttbr: u64,
     pub vmpidr: u64,
     pub cntvoff: u64,
+    pub vtcr: u64,
     pub ich: IchState,
     pub host: HostRegs,
 }
@@ -171,7 +172,7 @@ impl VcpuHw {
         el1.sctlr = RESET_SCTLR_EL1;
         VcpuHw {
             gp: [0; 31], sp_el0: 0, sp_el1: 0, pc: 0, pstate: RESET_PSTATE, el1,
-            hcr: 0, vttbr: 0, vmpidr: 0x8000_0000 | (id as u64 & 0xff), cntvoff: 0,
+            hcr: 0, vttbr: 0, vmpidr: 0x8000_0000 | (id as u64 & 0xff), cntvoff: 0, vtcr: 0,
             ich: IchState { hcr: 0, vmcr: 0, elrsr: 0, lr: [0; 16], ap0r: [0; 4], ap1r: [0; 4] },
             host,
         }

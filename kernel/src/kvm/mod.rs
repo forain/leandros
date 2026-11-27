@@ -95,10 +95,14 @@ pub(crate) fn wr<T>(arg: usize, v: &T) -> isize {
 }
 
 /// Host IPA limit: min(ID_AA64MMFR0_EL1.PARange, 44).
-pub(crate) fn ipa_max_bits() -> u32 {
+pub(crate) fn parange() -> u64 {
     let r: u64;
     unsafe { core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) r, options(nomem, nostack)); }
-    let pa = match r & 0xf { 0 => 32, 1 => 36, 2 => 40, 3 => 42, 4 => 44, _ => 48 };
+    r & 0xf
+}
+
+pub(crate) fn ipa_max_bits() -> u32 {
+    let pa = match parange() { 0 => 32, 1 => 36, 2 => 40, 3 => 42, 4 => 44, _ => 48 };
     pa.min(44)
 }
 

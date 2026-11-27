@@ -8,7 +8,7 @@
 //   184 mdscr  192 csselr  200 par  208 vmpidr  216 vpidr  224 cntvoff  232 vttbr
 //   (240 bytes)
 // VcpuHw: gp 0, sp_el0 248, sp_el1 256, pc 264, pstate 272, el1 288.. (El1Regs is align 16; first 26 u64 switched), hcr 1056,
-// vttbr 1064, vmpidr 1072, cntvoff 1080 (asserted in ctx.rs).
+// vttbr 1064, vmpidr 1072, cntvoff 1080, vtcr 1088 (asserted in ctx.rs).
 
 .equ F_SIZE,   240
 .equ F_HW,     0
@@ -40,6 +40,7 @@
 .equ HW_VTTBR, 1064
 .equ HW_VMPIDR,1072
 .equ HW_CNTVOFF,1080
+.equ HW_VTCR,  1088
 
 // guest constants (see kvm::hw)
 .equ G_CPTR,    0x300000
@@ -151,6 +152,8 @@ kvm_enter_raw:
     msr  tpidr_el2, x2
 
     // Stage 2 and virtual IDs first, then the EL1 file, HCR (TGE=0) last.
+    ldr  x2, [x0, #HW_VTCR]
+    msr  vtcr_el2, x2
     ldr  x2, [x0, #HW_VTTBR]
     msr  vttbr_el2, x2
     ldr  x2, [x0, #HW_VMPIDR]

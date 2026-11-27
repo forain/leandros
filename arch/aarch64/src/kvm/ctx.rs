@@ -43,6 +43,7 @@ const _: () = {
     assert!(offset_of!(VcpuHw, vttbr) == 1064);
     assert!(offset_of!(VcpuHw, vmpidr) == 1072);
     assert!(offset_of!(VcpuHw, cntvoff) == 1080);
+    assert!(offset_of!(VcpuHw, vtcr) == 1088);
     // switched EL1 file: indices used by switch.s (G_SAVE/G_LOAD n)
     assert!(offset_of!(El1Regs, sctlr) == 0 && offset_of!(El1Regs, tpidr_el1) == 13 * 8);
     assert!(offset_of!(El1Regs, par) == 16 * 8 && offset_of!(El1Regs, mdscr) == 19 * 8);
