@@ -240,6 +240,9 @@ def main():
         # the 1 s IPv6 DAD on the container veth (tentative address is held out of the stack, as on Linux): wait it out
         rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; ping -6 -c3 -W 5 {gw6}' 2>&1")
         check6("podman_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        if rc != 0:
+            _, dg = run(f"podman run --rm --network pb6 {IMG} sh -c 'cat /proc/sys/net/ipv4/ping_group_range; grep -i cap /proc/self/status; id' 2>&1")
+            print("podman_v6_ping_diag: " + dg.strip().replace("\n", " | "), flush=True)
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
         check6("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         if port6 and v6ok:
