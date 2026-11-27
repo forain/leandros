@@ -789,7 +789,11 @@ static int find_global(char *hex) {
     if (!f) return 0;
     char b[256]; int found = 0;
     while (fgets(b, sizeof b, f)) {
-        if (strncmp(b, "fe80", 4) && strstr(b, "eth0") && strncmp(b, "0000000000000000", 16)) {
+        unsigned idx, plen, scope, fl;
+        /* A tentative address (IFA_F_TENTATIVE 0x40, DAD still probing) is
+         * listed but not yet usable, on Linux as here: skip it. */
+        if (strncmp(b, "fe80", 4) && strstr(b, "eth0") && strncmp(b, "0000000000000000", 16)
+            && sscanf(b + 33, "%x %x %x %x", &idx, &plen, &scope, &fl) == 4 && !(fl & 0x40)) {
             memcpy(hex, b, 32); hex[32] = 0; found = 1; break;
         }
     }
@@ -882,9 +886,16 @@ static void test_ping6_own_global(void) {
         if (sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a) != (ssize_t)n) continue;
         int got = await_reply(s, seq, r, sizeof r);
         if (got == 24 && !memcmp(r + 8, q + 8, 16)) good++;
+        else printf("  own global seq %d: got=%d errno=%d\n", seq, got, errno);
     }
     close(s);
-    if (good != 4) printf("  ping own global: %d/4\n", good);
+    if (good != 4) {
+        printf("  ping own global: %d/4 errno=%d target=%s\n", good, errno, g);
+        FILE *f = fopen("/proc/net/if_inet6", "r");
+        char b[256];
+        while (f && fgets(b, sizeof b, f)) printf("    %s", b);
+        if (f) fclose(f);
+    }
     CHECK("ping6_own_global", good == 4);
 }
 
