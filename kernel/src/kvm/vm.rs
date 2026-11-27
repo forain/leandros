@@ -43,6 +43,8 @@ pub struct Vm {
     pub ioevents: Mutex<Vec<IoEvent>>,
     /// Object id of the in-kernel irqchip device (0 = none).
     pub vgic_dev: AtomicU32,
+    /// The in-kernel vGIC state machine (created by KVM_CREATE_DEVICE; `vgicdev.rs`).
+    pub vgic: Mutex<Option<::kvm::vgic::Vgic>>,
 }
 
 impl Vm {
@@ -100,7 +102,7 @@ pub(super) fn create(pid: u32, arg: usize) -> isize {
         id, tgid: sched::tgid_of(pid), as_root, ipa_bits: want,
         slots: Mutex::new(SlotTable::new()), s2: Mutex::new(s2), vmid: Mutex::new(slot),
         vttbr: AtomicU64::new(vttbr), vcpus: Mutex::new([const { None }; KVM_MAX_VCPUS as usize]),
-        ioevents: Mutex::new(Vec::new()), vgic_dev: AtomicU32::new(0),
+        ioevents: Mutex::new(Vec::new()), vgic_dev: AtomicU32::new(0), vgic: Mutex::new(None),
     });
     NVMS.fetch_add(1, Ordering::AcqRel);
     { let mut v = VMS.lock(); v.retain(|w| w.strong_count() > 0); v.push(Arc::downgrade(&vm)); }

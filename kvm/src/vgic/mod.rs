@@ -147,6 +147,16 @@ impl Vgic {
         g
     }
 
+    /// Shrink to the number of vCPUs the VM really created (KVM_CREATE_DEVICE runs
+    /// before any vCPU exists, so the device starts at the maximum). Call before
+    /// GRP_CTRL INIT; a no-op once `ready` or when `n` is not smaller.
+    pub fn set_nr_vcpus(&mut self, n: usize) {
+        let n = n.clamp(1, self.nr_vcpus);
+        if self.ready || n >= self.nr_vcpus { return; }
+        self.cpus.truncate(n);
+        self.nr_vcpus = n;
+    }
+
     /// Resize the SPI array (only meaningful before init).
     pub fn set_nr_irqs(&mut self, nr_irqs: u32) {
         let n = nr_irqs.clamp(32, MAX_IRQS);

@@ -193,6 +193,41 @@ unsafe fn gicr_virt(i: usize) -> Option<usize> {
 /// SGI used as the cross-CPU reschedule IPI.
 pub const SGI_RESCHED: u32 = 1;
 
+/// SGI that kicks a CPU out of guest mode (KVM_RUN signal/IRQ-line kick). The
+/// handler is a no-op: taking the IRQ out of the guest is the point.
+pub const SGI_KVM_KICK: u32 = 2;
+/// vGIC maintenance interrupt (PPI 9 = INTID 25 on GIC-400 and QEMU virt).
+pub const PPI_KVM_MAINT: u32 = 25;
+/// The guest's EL1 virtual timer PPI (architectural INTID 27). With KVM the host
+/// tick moved to the EL2 timer (`ppi_virt_timer()`), so 27 is free for guests; it
+/// is enabled only while a guest runs (`ppi_set_enabled`).
+pub const PPI_GUEST_VTIMER: u32 = 27;
+#[inline] pub fn ppi_virt_timer_guest() -> u32 { PPI_GUEST_VTIMER }
+
+/// Enable or disable banked PPI/SGI `id` (< 32) on the calling CPU. Used by KVM
+/// to arm the guest-timer PPI around a guest run.
+#[cfg(feature = "kvm")]
+pub fn ppi_set_enabled(id: u32, on: bool) {
+    static RD: [core::sync::atomic::AtomicUsize; sched::MAX_CPUS] = [const { core::sync::atomic::AtomicUsize::new(0) }; sched::MAX_CPUS];
+    unsafe {
+        if is_v3() {
+            let cpu = sched::cpu_id().min(sched::MAX_CPUS - 1);
+            let mut rd = RD[cpu].load(Ordering::Relaxed);
+            if rd == 0 {
+                rd = own_redistributor().unwrap_or(0);
+                RD[cpu].store(rd, Ordering::Relaxed);
+            }
+            if rd == 0 { return; }
+            gicr_w32(rd + GICR_SGI_BASE, if on { GICR_ISENABLER0 } else { GICR_ICENABLER0 }, 1 << id);
+        } else {
+            gicd_w32(if on { GICD_ISENABLER0 } else { GICD_ICENABLER0 }, 1 << id);
+        }
+    }
+}
+
+/// Extra banked enables only a KVM build turns on (SGI 2 and the maintenance PPI).
+pub const KVM_ENABLE_MASK: u32 = if cfg!(feature = "kvm") { (1 << SGI_KVM_KICK) | (1 << PPI_KVM_MAINT) } else { 0 };
+
 /// PPI carrying the EL1 *virtual* timer (CNTV) — the tick this kernel runs on.
 const PPI_VIRT_TIMER_DEFAULT: u32 = 27;
 /// PPI carrying the EL1 *physical* timer (CNTP). Not enabled by us, but
@@ -430,13 +465,13 @@ unsafe fn init_cpu_v3() {
     gicr_w32(sgi, GICR_ICENABLER0, 0xFFFF_FFFF);
     gicr_wait_rwp(rd);
     gicr_w32(sgi, GICR_IGROUPR0, 0xFFFF_FFFF);
-    for id in [ppi_virt_timer(), SGI_RESCHED] {
+    for id in [ppi_virt_timer(), SGI_RESCHED, SGI_KVM_KICK, PPI_KVM_MAINT, PPI_GUEST_VTIMER] {
         let off   = GICR_IPRIORITYR + (id as usize / 4) * 4;
         let shift = (id % 4) * 8;
         let v = (gicr_r32(sgi, off) & !(0xFF << shift)) | (IRQ_PRIORITY << shift);
         gicr_w32(sgi, off, v);
     }
-    gicr_w32(sgi, GICR_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED));
+    gicr_w32(sgi, GICR_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED) | KVM_ENABLE_MASK);
     dsb_st();
 
     // CPU interface: system registers on (SRE), accept every priority, Group 1
@@ -751,7 +786,7 @@ pub fn init() {
         // Enable PPI 27 (Virtual Timer) and SGI 1 (reschedule IPI).
         // This word is banked per CPU for IRQs 0-31 — this enables them for
         // the BSP; each AP does the same in init_cpu_interface().
-        gicd_w32(GICD_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED));
+        gicd_w32(GICD_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED) | KVM_ENABLE_MASK);
         gicd_set_byte_field(GICD_IPRIORITYR, ppi_virt_timer(), IRQ_PRIORITY);
         gicd_set_byte_field(GICD_ITARGETSR,  ppi_virt_timer(), v2_iface_mask(0));
         dsb_st();
@@ -1087,7 +1122,7 @@ pub fn init_cpu_interface() {
     unsafe {
         record_v2_iface();
         // Banked per-CPU enables: virtual timer PPI 27 + reschedule SGI 1.
-        gicd_w32(GICD_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED));
+        gicd_w32(GICD_ISENABLER0, (1 << ppi_virt_timer()) | (1 << SGI_RESCHED) | KVM_ENABLE_MASK);
 
         // Banked per-CPU priority for PPI 27 (match the BSP's).
         gicd_set_byte_field(GICD_IPRIORITYR, ppi_virt_timer(), IRQ_PRIORITY);

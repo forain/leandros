@@ -15,6 +15,17 @@ pub struct Vcpu {
     /// Level of the CPU IRQ/FIQ lines driven by KVM_IRQ_LINE type CPU.
     pub irq_lines: AtomicU8,
     pub mp_state: AtomicU32,
+    /// KVM_RUN loop state (only the vCPU's own thread locks it; see `run.rs`).
+    pub run: Mutex<run::RunState>,
+    /// Request bits (`kick.rs`): set by kick(), consumed by the run loop.
+    pub req: AtomicU32,
+    /// True while the thread executes guest code; `guest_cpu` is where.
+    pub in_guest: AtomicBool,
+    pub guest_cpu: AtomicUsize,
+    /// Poll-channel tag of this vCPU's blocked state (WFI / powered off).
+    pub wait_tag: u64,
+    /// PSCI CPU_ON request for a stopped vCPU: (entry, context id).
+    pub boot: Mutex<Option<(u64, u64)>>,
 }
 
 impl Vcpu {
@@ -37,6 +48,9 @@ pub(super) fn create(vm: &Arc<Vm>, pid: u32, id: usize) -> isize {
     let v = Arc::new(Vcpu {
         id: id as u32, vm: vm.clone(), run_pa, arch: Mutex::new(arch), init: Mutex::new(None),
         irq_lines: AtomicU8::new(0), mp_state: AtomicU32::new(KVM_MP_STATE_UNINITIALIZED),
+        run: Mutex::new(run::RunState::default()), req: AtomicU32::new(0),
+        in_guest: AtomicBool::new(false), guest_cpu: AtomicUsize::new(0),
+        wait_tag: 1u64 << (next_serial() & 63), boot: Mutex::new(None),
     });
     {
         let mut t = vm.vcpus.lock();

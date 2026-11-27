@@ -312,6 +312,10 @@ pub const RLIMIT_DEFAULTS: [[u64; 2]; RLIM_NLIMITS] = {
 /// Most supplementary groups a task may hold; mirrors `xattr::NGROUPS_MAX`.
 pub const NGROUPS_MAX: usize = 32;
 
+/// [`Task::vcpu_mode`] values.
+pub const VCPU_OUTSIDE: u8 = 0;
+pub const VCPU_IN_GUEST: u8 = 1;
+
 #[repr(C)]
 pub struct Task {
     pub pid:          Pid,
@@ -708,6 +712,12 @@ pub struct Task {
     /// 1 only costs one locked check. Starts at 1.
     pub sig_hint: core::sync::atomic::AtomicU32,
 
+    /// KVM vCPU thread state (lane kvm-run): `VCPU_OUTSIDE` normally, `VCPU_IN_GUEST`
+    /// while this thread executes guest code at EL1/EL0. A signal posted to an
+    /// InGuest thread on another CPU sends it the KVM kick SGI so the guest
+    /// exits and KVM_RUN returns EINTR.
+    pub vcpu_mode: core::sync::atomic::AtomicU8,
+
     // ââ epoll ready list (lane epollready) âââââââââââââââââââââââââââââââââââ
     /// The poll-wake listener of an epoll_wait caller (see `crate::PollListen`):
     /// which wakes reached this thread's epoll interest set since its last
@@ -980,6 +990,7 @@ impl Task {
             exiting: false,
             kthread: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
+            vcpu_mode: core::sync::atomic::AtomicU8::new(VCPU_OUTSIDE),
             seccomp: crate::seccomp::SeccompSlot::new(),
             listen: crate::PollListen::OFF,
             ep_cache: None,
@@ -1289,6 +1300,9 @@ impl Task {
         let sig_hint_ptr = (dest as usize + core::mem::offset_of!(Task, sig_hint))
             as *mut core::sync::atomic::AtomicU32;
         core::ptr::write(sig_hint_ptr, core::sync::atomic::AtomicU32::new(1));
+        let vcpu_mode_ptr = (dest as usize + core::mem::offset_of!(Task, vcpu_mode))
+            as *mut core::sync::atomic::AtomicU8;
+        core::ptr::write(vcpu_mode_ptr, core::sync::atomic::AtomicU8::new(VCPU_OUTSIDE));
         let seccomp_ptr = (dest as usize + core::mem::offset_of!(Task, seccomp))
             as *mut crate::seccomp::SeccompSlot;
         core::ptr::write(seccomp_ptr, crate::seccomp::SeccompSlot::new());
@@ -1428,6 +1442,7 @@ impl Task {
             exiting: false,
             kthread: false,
             sig_hint: core::sync::atomic::AtomicU32::new(1),
+            vcpu_mode: core::sync::atomic::AtomicU8::new(VCPU_OUTSIDE),
             seccomp: crate::seccomp::SeccompSlot::new(),
             listen: crate::PollListen::OFF,
             ep_cache: None,

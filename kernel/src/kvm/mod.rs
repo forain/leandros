@@ -4,23 +4,29 @@
 //! at EL2 with VHE. Files: `dev.rs` (/dev/kvm system ioctls), `vm.rs` (VM,
 //! stage 2, VM ioctls), `vcpu.rs` (vCPU ioctls, kvm_run page), `memslot.rs`
 //! (memslots, stage-2 fault, invalidate hook), `eventfd.rs` (IOEVENTFD),
-//! `device.rs` (CREATE_DEVICE), `iface.rs` (seams to kvm-switch/-sysreg/-vgic/-run).
+//! `device.rs` (CREATE_DEVICE), `iface.rs` (seams to kvm-switch/-sysreg/-vgic/-run),
+//! `arch.rs` (arch backend), `vgicdev.rs` (vGIC backend), `run.rs`/`timer.rs`/`kick.rs` (KVM_RUN).
 use super::*;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use spin::Mutex;
 use ::kvm::abi::*;
 use ::kvm::abi::cap;
 
+mod arch;
 mod dev;
 mod device;
 mod eventfd;
 mod iface;
+mod kick;
 mod memslot;
+mod run;
+mod timer;
 mod vcpu;
+mod vgicdev;
 mod vm;
 
 pub use device::Device;
@@ -104,6 +110,11 @@ pub(crate) fn init() {
     let Some(port) = ipc::port::create(0) else { return };
     if !ipc::port::register_kernel_handler(port, dev::handle) { return; }
     KVM_PORT.store(port, Ordering::Release);
+    set_arch_backend(&arch::BACKEND);
+    set_vgic_backend(&vgicdev::BACKEND);
+    set_run_fn(run::run);
+    set_kick_fn(kick::kick);
+    kick::init();
     vfs::set_kvm_hooks(obj_get, obj_put);
     mm::vmm::set_range_invalidate_hook(memslot::invalidate);
     vfs::register_device("/dev/kvm", port, 0, 10, 232);

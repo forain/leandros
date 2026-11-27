@@ -14,6 +14,10 @@ pub trait ArchVcpu: Send {
     fn set_one(&mut self, _id: u64, _buf: &[u8]) -> Result<(), i32> { Err(ENOSYS) }
     /// KVM_GET_REG_LIST.
     fn reg_list(&self) -> &'static [u64] { &[] }
+    /// The hardware context the KVM_RUN loop enters the guest with (None for the stub).
+    fn hw_mut(&mut self) -> Option<&mut ::kvm::hw::VcpuHw> { None }
+    /// PSCI CPU_ON / first start of a vCPU that was powered off: reset, then pc=`entry`, x0=`ctx`.
+    fn power_on(&mut self, _entry: u64, _ctx: u64) {}
 }
 
 pub trait ArchBackend: Sync {

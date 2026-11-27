@@ -9,6 +9,8 @@ core::arch::global_asm!(include_str!("vectors.s"));
 
 pub mod tlb;
 #[cfg(feature = "kvm")]
+pub mod vgic_hw;
+#[cfg(feature = "kvm")]
 pub mod ctx;
 #[cfg(feature = "kvm")]
 pub use ctx::{enter, RawExit, VcpuHw};

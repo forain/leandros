@@ -621,3 +621,18 @@ fn hw_trait_flush_fold_cycle_many_vcpus() {
     g.flush(0, &mut lrs, &V3Codec);
     assert_eq!(lrs.iter().filter(|&&r| r != 0).count(), n);
 }
+
+#[test]
+fn shrink_to_created_vcpus_before_init() {
+    // KVM_CREATE_DEVICE runs before any vCPU exists; the kernel device shrinks to the
+    // real count before CTRL INIT so a REDIST_REGION sized for them is accepted.
+    let mut g = Vgic::new(Version::V3, 64, 8);
+    g.set_nr_vcpus(2);
+    assert_eq!(g.nr_vcpus, 2);
+    g.attr_set(GRP_ADDR, V3_ADDR_DIST, &mut { DIST }).unwrap();
+    g.attr_set(GRP_ADDR, V3_ADDR_REDIST_REGION, &mut { REDIST | 2u64 << 52 }).unwrap();
+    g.attr_set(GRP_CTRL, CTRL_INIT, &mut 0).unwrap();
+    g.set_nr_vcpus(1); // too late: ignored
+    assert_eq!(g.nr_vcpus, 2);
+    g.set_nr_vcpus(0); // clamps
+}

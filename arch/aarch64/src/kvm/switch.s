@@ -225,6 +225,19 @@ kvm_exit_common:
     stp  x26, x27, [x0, #208]
     stp  x28, x29, [x0, #224]
     str  x30, [x0, #240]
+
+    // Spectre-BHB (Cortex-A76, k=24 loop as Linux): overwrite the branch history
+    // the guest trained before any host indirect branch runs. Guest x0-x30 are saved.
+    // TODO(kvm-run review): use CLRBHB where ID_AA64ISAR2.CLRBHB is set, and an
+    // SMCCC_ARCH_WORKAROUND_3 call where firmware needs one; CSV2==0 hosts also need
+    // a branch-predictor invalidate here (BCM2712 is CSV2>=1, check on the card).
+    mov  x2, #24
+8:  b    9f
+9:  subs x2, x2, #1
+    b.ne 8b
+    dsb  nsh
+    isb
+
     mrs  x2, sp_el0
     str  x2, [x0, #HW_SPEL0]
     mrs  x2, sp_el1
