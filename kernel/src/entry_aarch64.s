@@ -166,6 +166,65 @@ check_el2:
     mov     x6, #1
     str     x6, [x5]
 
+.if KVM_VHE
+    // ── KVM_VHE=1: stay at EL2 with VHE (E2H=TGE=1) if the CPU has it ─────────
+    // ID_AA64MMFR1_EL1.VH (bits 11:8).  No VHE → fall through to the EL1 drop
+    // below (unchanged).  With the MMU already on (Limine rev 6 hands over at
+    // EL2 with E2H=1) only a CPU that already has E2H set may stay; flipping
+    // E2H under a live EL2 translation regime is not safe.
+    mrs     x4, id_aa64mmfr1_el1
+    ubfx    x4, x4, #8, #4
+    cbz     x4, el2_drop_to_el1
+    mrs     x4, hcr_el2
+    tbnz    x4, #34, el2_vhe_stay   // E2H already set (Limine path)
+    mrs     x4, sctlr_el2
+    tbnz    x4, #0, el2_drop_to_el1 // MMU on without E2H: cannot convert
+el2_vhe_stay:
+    // HCR_EL2 = RW | TGE | E2H (+ API|APK when any PAuth algorithm exists).
+    movz    x4, #0x8800, lsl #16    // RW (bit 31) | TGE (bit 27)
+    mov     x5, #1
+    lsl     x5, x5, #34             // E2H
+    orr     x4, x4, x5
+    mrs     x5, id_aa64isar1_el1
+    mov     x6, #0x0ff0
+    movk    x6, #0x0ff0, lsl #16    // APA|API|GPA|GPI fields
+    and     x5, x5, x6
+    cbz     x5, 1f
+    mov     x5, #3
+    lsl     x5, x5, #40             // APK | API
+    orr     x4, x4, x5
+1:  msr     hcr_el2, x4
+    isb
+    // E2H layout: EL0PCTEN|EL0VCTEN (bits 0,1), EL1PCTEN|EL1PTEN (bits 10,11).
+    mov     x4, #0x0c03
+    msr     cnthctl_el2, x4
+    msr     cntvoff_el2, xzr
+    // CPACR_EL1 accesses are redirected to CPTR_EL2 (E2H form): no FP/SVE/SME trap.
+    movz    x4, #0x0333, lsl #16    // FPEN | ZEN | SMEN
+    msr     cptr_el2, x4
+    // GICv3 system-register interface for EL2 (same block as the drop path).
+    mrs     x4, id_aa64pfr0_el1
+    ubfx    x4, x4, #24, #4
+    cbz     x4, 2f
+    mrs     x4, S3_4_C12_C9_5       // ICC_SRE_EL2
+    mov     x5, #0x9                // SRE | Enable
+    orr     x4, x4, x5
+    msr     S3_4_C12_C9_5, x4
+    isb
+2:
+    // Direct boot enters with the MMU off: give SCTLR_EL2 (now SCTLR_EL1's
+    // alias) its reset value.  Limine keeps its MMU-on state untouched.
+    mrs     x4, sctlr_el2
+    tbnz    x4, #0, 3f
+    movz    x5, #0x0800
+    movk    x5, #0x30d0, lsl #16
+    msr     sctlr_el1, x5
+    isb
+3:  msr     daifset, #0xf
+    b       at_el1                  // never eret: the kernel stays at EL2
+.endif
+el2_drop_to_el1:
+
     // Let EL1 read the physical/virtual counter without trapping to EL2,
     // otherwise the timer init later faults into nonexistent EL2 vectors.
     mrs     x4, cnthctl_el2

@@ -723,6 +723,9 @@ unsafe fn init_dist_v3() {
 }
 
 pub fn init() {
+    // KVM builds at EL2: the host tick is CNTHP (INTID 26), not CNTV (PPI 27).
+    #[cfg(feature = "kvm")]
+    PPI_VIRT_RT.store(super::hyp::host_timer_intid(ppi_virt_timer()), RtOrd::Relaxed);
     // Claim the built-in interrupts before anything can be delivered. IRQs are
     // still masked at EL1 here (`timer::init` does the `daifclr` afterwards),
     // but doing this first also means the distributor is never enabled with an

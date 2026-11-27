@@ -11,6 +11,9 @@ rpi5 = []
 # Target QEMU's -M raspi4b machine (BCM2711). Testable stepping stone for
 # the sdhci driver (see drivers/src/sdhci.rs) — not a hardware target.
 raspi4b = []
+# KVM host support (Kconfig KVM / kernel feature drv-kvm): stay at EL2 with VHE
+# (E2H=TGE=1) instead of dropping to EL1; host tick moves to CNTHP. Default OFF.
+kvm = []
 
 [dependencies]
 boot    = { path = "../../boot" }

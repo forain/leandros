@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 6] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw", "kvmmem"];
+const EXTRA: [&str; 7] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw", "kvmmem", "elcheck"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -85,6 +85,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "gpulock" => t_gpulock(),
             "kvmmem" => t_kvmmem(),
             "spinfw" => t_spinfw(fw.as_deref()),
+            "elcheck" => t_elcheck(),
             _ => continue,
         };
         if t.skipped && t.fails == 0 { say!("{} SKIP", t.name); skip += 1; }
@@ -92,6 +93,34 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
         else { say!("{} FAIL ({} checks failed)", t.name, t.fails); fail += 1; }
     }
     say!("summary: {} pass, {} fail, {} skip; sleep-in-atomic detections {}", pass, fail, skip, irqctx::sleep_violations());
+}
+
+// ── elcheck (kvm-vhe) ───────────────────────────────────────────────────────
+
+/// CurrentEL: EL1 in a default build (every entry path drops EL2 to EL1); EL2
+/// with VHE (E2H=TGE=1) and the host tick on CNTHP (INTID 26) in a `drv-kvm`
+/// build booted with `virtualization=on`. A `drv-kvm` build on a machine
+/// without EL2 stays at EL1 and is checked as such. Not in `ktest=all`.
+fn t_elcheck() -> T {
+    let mut t = T::new("elcheck");
+    #[cfg(not(target_arch = "aarch64"))]
+    { t.skip("aarch64 only"); }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use arch_aarch64::hyp;
+        let el = hyp::current_el();
+        say!("elcheck: CurrentEL={} at_el2={} vhe={} hcr={:#x}", el, hyp::at_el2(), hyp::vhe(), hyp::host_hcr());
+        t.check(el == 1 || el == 2, "CurrentEL is EL1 or EL2");
+        t.check(hyp::at_el2() == (el == 2), "hyp::at_el2() agrees with CurrentEL");
+        if cfg!(not(feature = "drv-kvm")) {
+            t.check(el == 1, "default build (no drv-kvm) runs at EL1");
+        } else if el == 2 {
+            t.check(hyp::vhe(), "EL2 host has HCR_EL2.E2H set");
+            t.check(hyp::host_hcr() & hyp::HCR_TGE != 0, "EL2 host has HCR_EL2.TGE set");
+            t.check(arch_aarch64::gic::ppi_virt_timer() == 26, "host tick is CNTHP (INTID 26), not CNTV (27)");
+        }
+    }
+    t
 }
 
 // ── irqctx ──────────────────────────────────────────────────────────────────

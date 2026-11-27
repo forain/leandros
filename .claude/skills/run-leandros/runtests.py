@@ -32,6 +32,7 @@ Options:
                              nvmeebs  host:nvmeebstest.py alone (Amazon EBS NVMe quirks via nvme.quirks=amzn: by-id links, writable root, 300 s stall cap)
                              stdev    host:stdevtest.py alone (two cloned f2fs mounts: distinct st_dev, cp -a works)
                              vkwl     host:vkwltest.py alone (x86_64 --venus: Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted)
+                             kvmvhe   host:kvmvhetest.py alone (aarch64 TCG, needs a CONFIG_KVM=y kernel: virtualization=on, Limine + direct, "[el] running at EL2 (VHE)")
                              kexecacpi host:kexecacpitest.py alone (x86_64: ACPI tables in Reserved RAM > 2 GiB after kexec, own boot)
                              audio-session|ffaudio|video|clickmove|udevhot|minimize|notifpanel|coreutils  host:virglsessiontest.py <name> (virgl COSMIC session suites, own boot; coreutils = brush guest; `virgl` = the first four)
                              busdact  busd activation contract, no portal (slow service waited for, exit -> Spawn.ChildExited, never claims -> TimedOut at 120 s); ~2.5 min
@@ -453,6 +454,7 @@ SUITES = {
     "serialxfer": ["host:serialxfertest.py"],
     # lane kexecfdt: the kexec boot FDT block returns to the map along a gen1..gen4 chain (leaves the VM kexec'd).
     "kexecfdt": ["host:kexecfdttest.py"],
+    "kvmvhe": ["host:kvmvhetest.py"],
     # lane kmodblk: a kexec'd kernel mounts root with VIRTIO_BLK=m (CONFIG_VIRTIO_BLK=m build only).
     "kexecblk": ["host:kexecblktest.py"],
     # lane kexecacpi: x86_64 ACPI tables in Reserved RAM above 2 GiB survive kexec (own boot, 6G + max-ram-below-4g=3G).
@@ -625,7 +627,7 @@ SUITES = {
 
 # Host scripts that boot their own VM and take longer than one command:
 # their timeout (seconds, before scaling) when it exceeds --timeout.
-HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "v6injecttest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
+HOST_TIMEOUTS = {"rootstricttest.py": 3600, "deadtimertest.py": 900, "virglsessiontest.py": 1800, "appstreamtest.py": 900, "flatpaktest.py": 900, "sshsmoke.py": 900, "churn127live.py": 900, "podbridgetest.py": 2400, "podpausetest.py": 900, "podpastatest.py": 2400, "netroamtest.py": 1500, "udppeertest.py": 1500, "v6injecttest.py": 1500, "pcibridgetest.py": 600, "kexecacpitest.py": 900, "kvmvhetest.py": 1200, "vkwltest.py": 1500, "vkwlload.py": 1800, "usbisochtest.py": 900, "f2fsckpttest.py": 1500,
                  "netwatchtest.py": 1200, "blkhangtest.py": 600, "powerctltest.py": 600, "f2fsfulltest.py": 900, "espresettest.py": 900, "trialwatchtest.py": 1200, "usbunplugtest.py": 1200, "f2fscrashtest.py": 900, "portalshottest.py": 900,
                  "f2fscptest.py": 900, "f2fsorphantest.py": 900, "pagecache-crashtest.py": 600, "kmodbuildtest.py": 1500, "kmodsuitetest.py": 1800}
 
@@ -644,7 +646,7 @@ def find_fails(out):
 
 # Host scripts that only make sense on one arch (they boot their own VM of that
 # arch). A run of the other arch reports them as a skip, not a failure.
-HOST_ARCH_ONLY = {"kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
+HOST_ARCH_ONLY = {"kvmvhetest.py": "aarch64", "kexecacpitest.py": "x86_64", "nvmemsixtest.py": "x86_64",
                   "nitrotest.py": "x86_64", "a64itstest.py": "aarch64", "vkwltest.py": "x86_64", "vkwlload.py": "x86_64",
                   "a64acpitest.py": "aarch64", "deadtimertest.py": "x86_64"}
 
