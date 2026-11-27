@@ -16,6 +16,7 @@ dependencies = [
  "boot",
  "drivers",
  "evdev-server",
+ "kvm",
  "leandros-lib",
  "mm",
  "sched",

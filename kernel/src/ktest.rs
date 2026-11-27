@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 6] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw", "elcheck"];
+const EXTRA: [&str; 7] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw", "elcheck", "kvmswitch"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -85,6 +85,7 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "gpulock" => t_gpulock(),
             "spinfw" => t_spinfw(fw.as_deref()),
             "elcheck" => t_elcheck(),
+            "kvmswitch" => t_kvmswitch(),
             _ => continue,
         };
         if t.skipped && t.fails == 0 { say!("{} SKIP", t.name); skip += 1; }
@@ -118,6 +119,57 @@ fn t_elcheck() -> T {
             t.check(hyp::host_hcr() & hyp::HCR_TGE != 0, "EL2 host has HCR_EL2.TGE set");
             t.check(arch_aarch64::gic::ppi_virt_timer() == 26, "host tick is CNTHP (INTID 26), not CNTV (27)");
         }
+    }
+    t
+}
+
+// ── kvmswitch (kvm-switch) ──────────────────────────────────────────────────
+
+/// Enter a one-page guest (hand-built stage 2, IPA 0x4000_0000) that executes
+/// `hvc #0`, and check the exit. Opt-in; needs a `drv-kvm` build running at EL2
+/// with VHE (`virtualization=on`), otherwise SKIP. Written, not yet run.
+fn t_kvmswitch() -> T {
+    let mut t = T::new("kvmswitch");
+    #[cfg(not(all(target_arch = "aarch64", feature = "drv-kvm")))]
+    { t.skip("needs aarch64 + drv-kvm"); }
+    #[cfg(all(target_arch = "aarch64", feature = "drv-kvm"))]
+    {
+        use arch_aarch64::kvm::{enter, VcpuHw};
+        use arch_aarch64::hyp;
+        if !hyp::vhe() { t.skip("not running at EL2 with VHE"); return t; }
+        const IPA: u64 = 0x4000_0000;
+        let pages: Vec<usize> = (0..4).filter_map(|_| mm::buddy::alloc(0)).collect();
+        if pages.len() != 4 { t.check(false, "allocate 4 pages"); return t; }
+        let (l1, l2, l3, code) = (pages[0], pages[1], pages[2], pages[3]);
+        unsafe {
+            for p in &pages { core::ptr::write_bytes(mm::phys_to_virt(*p) as *mut u8, 0, 4096); }
+            let w = |pa: usize, idx: usize, v: u64| (mm::phys_to_virt(pa) as *mut u64).add(idx).write_volatile(v);
+            w(l1, (IPA >> 30) as usize, l2 as u64 | 3);
+            w(l2, ((IPA >> 21) & 0x1FF) as usize, l3 as u64 | 3);
+            // page: MemAttr WB (0b1111<<2), S2AP RW, SH inner, AF; XN clear (executable)
+            w(l3, ((IPA >> 12) & 0x1FF) as usize, code as u64 | 3 | (0xF << 2) | (3 << 6) | (3 << 8) | (1 << 10));
+            (mm::phys_to_virt(code) as *mut u32).write_volatile(0xD400_0002); // hvc #0
+            let va = mm::phys_to_virt(code);
+            core::arch::asm!("dc civac, {0}", "dsb ish", "ic ialluis", "dsb ish", "isb", in(reg) va, options(nostack));
+        }
+        let parange: u64;
+        unsafe { core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) parange, options(nomem, nostack)); }
+        // T0SZ=32 (4 GiB IPA), SL0=1 (start L1), WB/WB/IS, 4K granule, PS=PARange, RES1 bit 31
+        let vtcr = 32 | (1 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | ((parange & 0xF).min(6) << 16) | (1 << 31);
+        unsafe { core::arch::asm!("msr vtcr_el2, {}", "isb", in(reg) vtcr, options(nomem, nostack)); }
+        let mut hw = VcpuHw::new_boot(IPA);
+        hw.vttbr = l1 as u64 | (0x7E57u64 << 48);
+        hw.gp[5] = 0x1234_5678;
+        hw.vmpidr = 0x8000_0000;
+        let hcr_before = hyp::host_hcr();
+        let r = unsafe { enter(&mut hw) };
+        say!("kvmswitch: kind={} esr={:#x} far={:#x} hpfar={:#x} pc={:#x}", r.kind, r.esr, r.far, r.hpfar, hw.pc);
+        t.check(r.kind == arch_aarch64::kvm::hw::EXIT_SYNC, "exit kind is sync");
+        t.check(matches!(arch_aarch64::kvm::esr::decode_raw(&r), arch_aarch64::kvm::esr::Exit::Hvc { imm: 0 }), "exit decodes as hvc #0");
+        t.check(hw.pc == IPA + 4, "guest pc is the instruction after hvc");
+        t.check(hw.gp[5] == 0x1234_5678, "guest x5 survived the round trip");
+        t.check(hyp::host_hcr() == hcr_before && hyp::vhe(), "host HCR_EL2 restored (TGE/E2H)");
+        for p in pages { mm::buddy::free(p, 0); }
     }
     t
 }

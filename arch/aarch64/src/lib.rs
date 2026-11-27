@@ -6,6 +6,8 @@ pub mod early;
 pub mod exception;
 pub mod gic;
 pub mod hyp;
+#[cfg(feature = "kvm")]
+pub mod kvm;
 pub mod its;
 pub mod mmu;
 pub mod paging;
