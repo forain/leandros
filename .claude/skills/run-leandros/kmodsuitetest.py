@@ -108,7 +108,7 @@ def main():
             check(f"virtio_net rmmod #{i}", "RM_RC=0" in o, o.strip()[-120:])
             check(f"virtio_net #{i} eth0 gone after unload", "ETH0=0" in o, o.strip()[-300:])
             o2 = run(f"{NL} > /tmp/n1.txt; IFN=; for n in $(cat /tmp/n0.txt); do grep -qx $n /tmp/n1.txt || IFN=$n; done; echo IFN=$IFN; echo $IFN > /tmp/ifn.txt; "
-                     "echo V6=$(grep -c \"$IFN\" /proc/net/if_inet6); echo RT4=$(grep -c \"^$IFN\" /proc/net/route); echo RT6=$(grep -c \"$IFN\" /proc/net/ipv6_route); "
+                     "echo V6=$(grep -c \"$IFN\" /proc/net/if_inet6)0; echo RT4=$(grep -c \"^$IFN\" /proc/net/route)0; echo RT6=$(grep -c \"$IFN\" /proc/net/ipv6_route)0; "
                      "[ -e /sys/class/net/$IFN ]; echo LS_RC=$?; echo CHK_END")
             check(f"virtio_net #{i} unloaded netif left /proc/net/dev", re.search(r"IFN=\w+", o2) is not None, o2.strip()[-200:])
             check(f"virtio_net #{i} unloaded netif gone from if_inet6 / routes", "V6=0" in o2 and "RT4=0" in o2 and "RT6=0" in o2, o2.strip()[-200:])
