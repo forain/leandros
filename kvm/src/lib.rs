@@ -8,3 +8,6 @@ pub mod ioevent;
 pub mod memslot;
 pub mod s2;
 pub mod vmid;
+pub mod hw;
+pub mod esr;
+pub mod mmio;
