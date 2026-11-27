@@ -179,7 +179,7 @@ pub fn exit_race(pid: Pid, tgid: Pid) {
     let n = RACE_N.load(Ordering::Relaxed);
     while RACE_ARRIVED.load(Ordering::Acquire) < n && crate::monotonic_ns().saturating_sub(now) < 2_000_000_000 {
         crate::irq_window();
-        crate::yield_now("asfree_exitrace");
+        core::hint::spin_loop();
         crate::klog_line(format_args!("[llx] resumed pid={} arrived={} cpu={}\n", pid, RACE_ARRIVED.load(Ordering::Relaxed), unsafe { crate::cpu_id() }));
     }
     if RACE_ARRIVED.load(Ordering::Acquire) >= n {
