@@ -421,8 +421,8 @@ SUITES = {
     "kparks": ["host:kparkstest.py"],
     # Root `podman run --rm alpine echo hi` (skips without the LEANDROS_IMAGE_ARCHIVE image).
     "podsmoke": ["host:podsmoketest.py"],
-    # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "memfd": ["/bin/memfdtest"],
+    # Root podman on the default bridge network (needs LEANDROS_IMAGE_ARCHIVE image).
     "podbridge": ["host:podbridgetest.py"],
     # podman pause/unpause freeze and resume a container (needs LEANDROS_IMAGE_ARCHIVE image).
     "podpause": ["host:podpausetest.py"],
