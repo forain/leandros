@@ -111,9 +111,9 @@ def main():
         # ---- nvme
         o = run("grep '^nvme ' /proc/modules; echo BASE_END")
         open("/tmp/kmodsuite-diag.txt", "a").write("nvme base: " + o.strip()[-200:] + "\n")
-        o = run("kmodctl rmmod nvme >/dev/null 2>&1; kmodctl load nvme; echo LD_RC=$?; for j in $(seq 1 10); do [ -e /dev/nvme0n1 ] && break; sleep 1; done; "
+        o = run("for j in $(seq 1 20); do kmodctl rmmod nvme >/dev/null 2>&1 && break; sleep 1; done; echo BASE_RM_TRIES=$j; kmodctl load nvme; echo LD_RC=$?; for j in $(seq 1 10); do [ -e /dev/nvme0n1 ] && break; sleep 1; done; "
                 "dd if=/dev/nvme0n1 bs=512 skip=1 count=1 2>/dev/null | head -c %d; echo; echo NVME_END" % len(MAGIC))
-        check("nvme load", "LD_RC=0" in o)
+        check("nvme load", "LD_RC=0" in o, o.strip()[-200:])
         run("grep '^nvme ' /proc/modules; echo AFTERREAD_END")
         check("nvme known block 1 read back", MAGIC.decode() in o)
         o = run("exec 3</dev/nvme0n1; kmodctl rmmod nvme; echo BUSY_RC=$?; cat /proc/modules | grep '^nvme '; exec 3<&-; "
@@ -121,7 +121,7 @@ def main():
         check("nvme rmmod refused while an fd is open", re.search(r"BUSY_RC=[1-9]", o) is not None, o.strip()[-160:])
         check("nvme still Live after the refusal", re.search(r"^nvme .*Live", o, re.M) is not None)
         for i in range(1, 4):
-            o = run("kmodctl rmmod nvme; echo RM_RC=$?; ls /dev/nvme0n1 2>&1 | head -n 1; kmodctl load nvme; echo LD_RC=$?; "
+            o = run("kmodctl rmmod nvme; echo RM_RC=$?; for j in 1 2 3 4 5 6 7 8; do [ -e /dev/nvme0n1 ] || break; sleep 1; done; ls /dev/nvme0n1 2>&1 | head -n 1; kmodctl load nvme; echo LD_RC=$?; "
                     "for j in $(seq 1 10); do [ -e /dev/nvme0n1 ] && break; sleep 1; done; "
                     "dd if=/dev/nvme0n1 bs=512 skip=1 count=1 2>/dev/null | head -c %d; echo; echo CY_END" % len(MAGIC))
             check(f"nvme cycle #{i} unload", "RM_RC=0" in o, o.strip()[-120:])
