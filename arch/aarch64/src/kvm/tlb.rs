@@ -62,7 +62,15 @@ pub unsafe fn tlbi_range(vttbr: u64, ipa: u64, len: u64) {
     const FLUSH_ALL_PAGES: u64 = 64;
     let pages = (len + 4095) / 4096;
     if pages > FLUSH_ALL_PAGES { return tlbi_vmid(vttbr); }
-    for i in 0..pages { tlbi_ipa(vttbr, ipa + i * 4096); }
+    // One guest-regime switch: IPAS2E1IS per page, then a single VMALLE1IS
+    // (drops the combined stage-1+2 entries) once the stage-2 ones are gone.
+    in_guest_regime(vttbr, || {
+        for i in 0..pages {
+            let arg = ((ipa + i * 4096) >> 12) & 0x0000_0FFF_FFFF_FFFF;
+            asm!("tlbi ipas2e1is, {a}", a = in(reg) arg, options(nostack));
+        }
+        asm!("dsb ish", "tlbi vmalle1is", "dsb ish", options(nostack));
+    });
 }
 
 /// Invalidate the whole stage-1+2 TLB of every VMID on all CPUs (VMID
