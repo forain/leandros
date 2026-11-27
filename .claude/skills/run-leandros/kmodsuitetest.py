@@ -48,11 +48,18 @@ def build_id(path):
 
 
 def build():
-    r = subprocess.run(["cp", "-a", "--reflink=auto", REPO, VAR], capture_output=True, text=True)
+    # In a runtests shard REPO is a view of symlinks into the real checkout; copying it with cp -a would copy
+    # the symlinks, so the variant build would write (and the stale-kernel delete would hit) the base tree.
+    # Copy the real checkout instead.
+    src = os.path.dirname(os.path.realpath(os.path.join(REPO, "scripts")))
+    r = subprocess.run(["cp", "-a", "--reflink=auto", src, VAR], capture_output=True, text=True)
     if r.returncode:
         print("FAIL: cp of tree: " + r.stderr[-300:])
         return False
     # A copied final kernel must never survive a failed rebuild and masquerade as the variant's.
+    if os.path.realpath(os.path.join(VAR, "target")) != os.path.join(VAR, "target"):
+        print("FAIL: variant tree shares its target dir with another tree")
+        return False
     for stale in glob.glob(os.path.join(VAR, "target", f"final-{arch}", "kernel*")):
         os.unlink(stale)
     with open(os.path.join(VAR, ".config"), "w") as f:
