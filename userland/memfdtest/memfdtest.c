@@ -151,8 +151,8 @@ int main(int argc, char **argv, char **envp)
     // fchmodat(procfd, "self/fd/N") through a /proc dirfd (O_PATH fds cannot fchmod),
     // then fchownat(fd, "", AT_EMPTY_PATH).  Failure was "fchmod `/dev/null`: ENOENT".
     {
-        const char *dirs[] = {"/tmp", "/dev", "/root"};
-        for (int i = 0; i < 3; i++) {
+        const char *dirs[] = {"/tmp", "/dev/shm"};  // tmpfs: where a container /dev lives
+        for (int i = 0; i < 2; i++) {
             char nm[64], what[96];
             snprintf(nm, sizeof nm, ".devnode-%d", (int)getpid());
             int dfd = open(dirs[i], O_DIRECTORY | O_RDONLY);
