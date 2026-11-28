@@ -12,9 +12,9 @@ Three shapes recur, and each port's recipe says which it uses:
 
 | Shape | Used for | How |
 |---|---|---|
-| **Cross-built from source, static musl** | busd, greetd, `leandros-sysbus`, `mkfs.fat`, `mkfs.xfs`, brush, coreutils | `cargo +nightly` for `*-unknown-linux-musl`, `-C relocation-model=static`, Rust's or Alpine's musl ([libc.md](libc.md#static-musl)); each port's `build.sh` owns its toolchain details |
+| **Cross-built from source, static musl** | busd, greetd, `leandros-sysbus`, brush, coreutils | `cargo +nightly` for `*-unknown-linux-musl`, `-C relocation-model=static`, Rust's or Alpine's musl ([libc.md](libc.md#static-musl)); each port's `build.sh` owns its toolchain details |
 | **Cross-built from source, dynamic musl** | COSMIC, Mesa, the libseat/libudev shims, pop-launcher, xdg-desktop-portal-cosmic | the shared toolchain in the artifacts tree (`build-rust.sh`, `gen-cargo-config.sh`, merged sysroots); meson cross files for C libraries |
-| **Repackaged from Alpine 3.21** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside Alpine 3.21 of the target architecture (a podman/docker container on the host, a chroot staged with `apk.static` inside LeandrOS — see [In-guest builds](#in-guest-builds-apk-without-containers)), collect the `DT_NEEDED` closure, keep the ELFs as Alpine built them (no soname rewrite or SSP shim for PipeWire, GStreamer, the portal and the GPU Mesa stage; Firefox and git still rewrite), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
+| **Repackaged from Alpine (edge)** | Firefox, PipeWire + WirePlumber, the xdg-desktop-portal frontend, the GPU Mesa stage | `apk add` inside Alpine of the lock's release (edge) for the target architecture (a podman/docker container on the host, a chroot staged with `apk.static` inside LeandrOS — see [In-guest builds](#in-guest-builds-apk-without-containers)), collect the `DT_NEEDED` closure, keep the ELFs as Alpine built them (no soname rewrite or SSP shim for PipeWire, GStreamer, the portal and the GPU Mesa stage; Firefox and git still rewrite), write a rootfs-shaped tree to `ports/<name>/out/<arch>/` that mkfs overlays |
 
 Repackaging was chosen where compiling the upstream C/C++ stack would have been the whole
 project (Gecko, GLib): the same binaries run on Linux, and LeandrOS's job is to be Linux enough
@@ -25,6 +25,14 @@ audio stack or portal is worse than a clear error. A container tool must *answer
 `LEANDROS_CT_TIMEOUT` (20 s), so a hung daemon is a fast failure, not a build that waits
 forever.
 
+**Which Alpine.** Every port and the image itself take the Alpine release from one place: the first line of [`ports/alpine/toolchain.lock`](../../ports/alpine/toolchain.lock) (`# release edge` or `vX.Y`), read by [`scripts/lib/alpine-release.sh`](../../scripts/lib/alpine-release.sh) and sourced through `container-lib.sh` (`ALPINE_REL`, `ALPINE_IMAGE`, `ALPINE_REPO_BASE`). No script hard-codes a release. The image tracks **Alpine edge** (rolling): `scripts/alpine-lock.py refresh` re-resolves the lock, and the per-arch lock files pin exactly what was resolved (versions and sha256), so a build is reproducible until the next refresh. The edge lock carries musl 1.2.6, Firefox 161, podman 6.1, netavark 2.1, crun 1.31, bubblewrap 0.13 and PipeWire 1.6 at the time of writing. A refresh needs the full test set, because it moves libc and every library at once.
+
+**Fetch retries.** Host-side fetches (curl, wget and git in `build-all.sh`, the port fetchers, `alpine-lock.py`, the soundfont) go through [`scripts/lib/netretry.sh`](../../scripts/lib/netretry.sh) and `netretry.py`: five attempts with 1 to 8 s backoff, on transient failures only (DNS, connect, timeout, HTTP 429 and 5xx), because the build hosts' resolver occasionally drops replies under load. A 404 or a checksum failure is never retried. Inside the Alpine build containers `apk`, `pip` and `wget` retry the same way (`net_apk`, `net_pip`, `net_shim`; an unsatisfiable dependency fails at once).
+
+**`build-all.sh` exit status.** A failing build step now fails the script (`phase()` no longer runs its step in a context that swallows the exit status), so a half-built image cannot pass as a build.
+
+**COSMIC binary cache.** The COSMIC cargo builds (cosmic-apps, the applets, the panel applets, the installer, cosmic-comp, cosmic-idle) sit behind a content-keyed cache, [`scripts/lib/cosmic-cache.sh`](../../scripts/lib/cosmic-cache.sh). The key is a hash of the scripts and patches, the source tree contents (and git HEAD and status), the generated cargo config, the toolchain wrappers, rustc and cargo versions, the build environment and a listing of the sysroot it links (`alpine-dev` rewrites sysroot files at every build, so a content listing, not an mtime, decides). On a hit the cached binaries are staged into the tree's `target/m6-out` ([`scripts/lib/m6out.sh`](../../scripts/lib/m6out.sh); `LEANDROS_M6_OUT` overrides, the old shared directory is only a per-file fallback baseline) and cargo does not run; on a miss the build runs and the binaries are stored by key (`[cosmic-cache] hit|miss <label> <arch> <key8>` is logged; `flock` serialises two trees that miss at once; the newest 6 keys per binary are kept). Two things keep the cargo target directories shared between trees: the apps link a content-named, shared `ssp_guard` object instead of a per-tree path (the per-tree rustflag used to re-hash about 640 crates in every tree, about 18 GB per hour of cache growth), and `cosmic-apps` builds one cargo target directory per libcosmic revision, grouping apps whose `Cargo.lock` pins the same one.
+
 ### In-guest builds: apk without containers
 
 The long-term goal is building LeandrOS inside LeandrOS, and there are no containers in the
@@ -32,11 +40,11 @@ guest. No port calls podman/docker directly; each runs its Alpine step through
 `leandros_alpine_run [--arch A] [--image I] [-e K=V]... [-v HOST:DIR[:ro]]... -- CMD`
 in [`scripts/container-lib.sh`](../../scripts/container-lib.sh). That helper has two backends:
 
-- **container**, on the host: the same `run --rm --platform ... alpine:3.21` command line as
+- **container**, on the host: the same `run --rm --platform ... alpine:<release>` command line as
   before. Cross-arch runs use binfmt/qemu-user.
 - **local**, chosen automatically when `uname -s` is `Leandros` (or `/etc/os-release` has
   `ID=leandros`). `LEANDROS_ALPINE_BACKEND=container|local` overrides the choice. The first
-  run stages a base root matching the `alpine:3.21` image under `$LEANDROS_ALPINE_DIR`
+  run stages a base root matching the `alpine:<release>` image under `$LEANDROS_ALPINE_DIR`
   (default `/var/lib/leandros-alpine/<arch>-base`). Each run then copies that root, copies
   the `-v` directories into it, and runs `CMD` under `chroot` with a clean environment.
   Afterwards it copies the writable mounts back. The helper predates bind mounts (the
@@ -58,7 +66,7 @@ apk-tools-static and alpine-keys are pinned by version and sha256. It runs as a
 |---|---|
 | `/usr/sbin/apk.static` | apk-tools 2.14.6, statically linked: it runs on LeandrOS as-is |
 | `/usr/sbin/alpine-sysroot` | `alpine-sysroot [--arch A] ROOT PKG...`: seeds `ROOT/etc/apk` with the keys, repositories and `resolv.conf`, then runs `apk.static --root ROOT [--initdb] --arch <native> add PKG...` |
-| `/etc/apk/keys`, `/etc/apk/repositories` | the Alpine release keys, and 3.21 main + community over https |
+| `/etc/apk/keys`, `/etc/apk/repositories` | the Alpine release keys, and the locked release's main + community over https |
 | `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/cert.pem` | Alpine's CA bundle. The image had no CA store before; Firefox uses NSS's own |
 
 ### Live-root apk
@@ -115,7 +123,7 @@ Running Alpine binaries *outside* a chroot, against the guest's libc, is a separ
 - `DT_NEEDED libc.musl-<arch>.so.1` needs neither a rewrite nor a symlink for the dynamic
   linker. musl's `load_library` treats any `libc.*` name as itself (the reserved-name check
   in `ldso/dynlink.c`), and the guest's interpreter is that same musl.
-- (Obsolete: the guest `libc.so` exports exactly Alpine 3.21 musl's dynamic symbols, including
+- (Obsolete: the guest `libc.so` exports exactly the then-current Alpine musl's dynamic symbols, including
   `__stack_chk_guard`; no preload is needed.) The old obstacle was aarch64's `__stack_chk_guard`, which the guest `libc.so` does not
   export. This was the (since retired) zig-built libc's ld.lld visibility problem recorded in the musl-dynamic notes.
   Until libc exports it, use `LD_PRELOAD=/usr/lib/libleandros_ssp.so.1` for such binaries.
@@ -180,10 +188,10 @@ Known gaps:
 | ripgrep (vanilla Alpine package, [lock](../../ports/alpine/)) | `rg`, behind the `grep` shim | [programs.md](programs.md) |
 | [portal](../../ports/portal/) | xdg-desktop-portal frontend (Alpine) + xdg-desktop-portal-cosmic (cross-built, unmodified) | [build.sh](../../ports/portal/build.sh), [../desktop/session.md](../desktop/session.md#the-desktop-portal) |
 | [apk](../../ports/apk/) | `apk.static`, `alpine-sysroot`, Alpine keys/repositories and a CA bundle for in-guest builds; `claude-code-install` and its `claude` launcher | [build.sh](../../ports/apk/build.sh), [In-guest builds](#in-guest-builds-apk-without-containers), [below](#the-claude-code-cli) |
-| git (vanilla Alpine package, [lock](../../ports/alpine/)) | git + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, symlinks in the staged tree become hard links in the image | [build-in-alpine.sh](../../ports/git/build-in-alpine.sh), [programs.md](programs.md#sshd) |
-| [pipewire](../../ports/pipewire/) | PipeWire 1.2.7 + WirePlumber from Alpine, the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
-| [gstreamer](../../ports/gstreamer/) | GStreamer 1.24.11 (core, plugins-base/good whitelist, gst-libav on FFmpeg 6.1) and the PipeWire plugin 1.2.7 from Alpine 3.21, `gst-launch-1.0`/`gst-inspect-1.0`, a 30 s test clip, and the `-dev` files merged into the cross sysroot for cosmic-player's gstreamer-rs crates | this file |
-| iso-codes (vanilla Alpine package, [lock](../../ports/alpine/)) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [build.sh](../../ports/iso-codes/build.sh) |
+| git (vanilla Alpine package, [lock](../../ports/alpine/)) | git + git-remote-https, less, nano, OpenSSH's `sftp-server` and `/etc/terminfo`, symlinks in the staged tree become hard links in the image | [programs.md](programs.md#sshd) |
+| [pipewire](../../ports/pipewire/) | PipeWire + WirePlumber from Alpine (version per the lock; 1.6 at the time of writing), the `leandros-snd-sink` virtio-snd sink, `pipewire-pulse`, `cosmic-applet-audio`, a ScreenCast-enabled `cosmic.portal` | [build.sh](../../ports/pipewire/build.sh), [../audio.md](../audio.md) |
+| [gstreamer](../../ports/gstreamer/) | GStreamer 1.24.11 (core, plugins-base/good whitelist, gst-libav on FFmpeg 6.1) and the PipeWire plugin from Alpine (1.2.7 when this row was written; 1.6 on the edge lock), `gst-launch-1.0`/`gst-inspect-1.0`, a 30 s test clip, and the `-dev` files merged into the cross sysroot for cosmic-player's gstreamer-rs crates | this file |
+| iso-codes (vanilla Alpine package, [lock](../../ports/alpine/)) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [world](../../ports/alpine/world) |
 | kbd-bkeymaps (Alpine) + [kbd-keymaps](../../ports/kbd-keymaps/) | `/usr/share/bkeymaps/<dir>/<name>.bmap.gz` for `loadkmap` (aliases for kbd names such as `de-latin1`, `uk`); the README and `gen-defkeymap.py` (kernel default map) stay |
 | firefox (vanilla Alpine package, [lock](../../ports/alpine/)) | Alpine's prebuilt Firefox, its closure, FFmpeg and libpulse, the launcher and prefs | [below](#firefox) |
 | [sudo-rs](../../ports/sudo-rs/) | `su` and `sudo` (sudo-rs v0.2.15, static musl, `pam-leandros`), five patches, `/etc/sudoers` and `/etc/shells` | [README.md](../../ports/sudo-rs/README.md), [../servers/security.md](../servers/security.md#su-and-sudo) |
@@ -247,7 +255,7 @@ Known gaps:
 - **portal** and **pipewire** are both Alpine repackages plus one cross-built or compiled
   LeandrOS piece (the COSMIC backend; the virtio-snd sink). The real `libpipewire-0.3.so.0`
   replaces an inert stub that cosmic-settings-daemon and the portal backend were originally
-  linked against (same 1.2.7 ABI, no rebuild). PipeWire's sink is the graph driver, timed like
+  linked against (same ABI, no rebuild). PipeWire's sink is the graph driver, timed like
   spa-alsa's timer-based scheduling against a `GET_DELAY` ioctl, rather than a blocking writer
   that would have kept the kernel spool full and spun a CPU.
 - **sysbus** is one binary with one subcommand per service, so busd's `.service` files are
@@ -274,11 +282,11 @@ audio.
 
 **Sandboxes are on by default** (since 2026-11-08): the parent and fork server are unsandboxed; content, GMP (ClearKey), RDD, socket and utility processes run with `Seccomp: 2`, `NoNewPrivs: 1`, a user namespace (plus net and IPC where Firefox asks for them) and the void chroot. `LEANDROS_FIREFOX_SANDBOX=0` in `ports/firefox/firefox.sh` disables them. The kernel mechanisms are in [../kernel/namespaces.md](../kernel/namespaces.md#firefoxs-content-sandbox); the harness is `.claude/skills/run-leandros/ffsandbox.py`. `/etc/ld.so.conf` and `/etc/localtime` ship on disk because the sandbox policy reads them.
 
-**Gecko is not compiled.** Firefox is Alpine's prebuilt package, staged by mkfs from the lock `ports/alpine/<arch>.lock` together with its closure (GTK3, NSS, fonts, system FFmpeg and `libpulse`) like every other vanilla Alpine package ([above](#how-ports-are-built)); `ports/firefox/` holds only the launcher, the prefs file, the desktop entry and the icon list. The pinned version is whatever the lock says (151.0.3 on v3.24 at the time of writing). Libraries Firefox `dlopen`s rather than links (FFmpeg, `libpulse`) are invisible to a `DT_NEEDED` walk, so they are named in `ports/alpine/world` explicitly. Without FFmpeg, Firefox fell back to Cisco's OpenH264 plugin, a glibc build whose load failure crashed the media process; without `libpulse` there was no audio backend.
+**Gecko is not compiled.** Firefox is Alpine's prebuilt package, staged by mkfs from the lock `ports/alpine/<arch>.lock` together with its closure (GTK3, NSS, fonts, system FFmpeg and `libpulse`) like every other vanilla Alpine package ([above](#how-ports-are-built)); `ports/firefox/` holds only the launcher, the prefs file, the desktop entry and the icon list. The pinned version is whatever the lock says (161.0 on the edge lock at the time of writing). Libraries Firefox `dlopen`s rather than links (FFmpeg, `libpulse`) are invisible to a `DT_NEEDED` walk, so they are named in `ports/alpine/world` explicitly. Without FFmpeg, Firefox fell back to Cisco's OpenH264 plugin, a glibc build whose load failure crashed the media process; without `libpulse` there was no audio backend.
 
 `/bin/firefox` ([firefox.sh](../../ports/firefox/firefox.sh)) refuses to start without a GPU
 renderer rather than let WebRender fall back to software, and
-[leandros-policy.js (+ leandros-tuning.js)](../../ports/firefox/leandros-policy.js) holds the distro policy (updates and telemetry off, the W+X pref); stock WebRender, Fission and VA-API are left on. The rest (I/O and
+[leandros-policy.js (+ leandros-tuning.js)](../../ports/firefox/leandros-policy.js) holds the distro policy (updates and telemetry off, the W+X pref); stock WebRender, Fission and VA-API are left on. The launcher is thin: it refuses to start without `/dev/dri/renderD128` (exit 78; `LEANDROS_FIREFOX_ALLOW_SOFTWARE=1` overrides for debugging), switches the sandboxes off only on `LEANDROS_FIREFOX_SANDBOX=0`, and otherwise leaves Firefox's own defaults to decide WebRender, Wayland, VA-API and the process model; the distro prefs are installed as `/usr/lib/firefox/defaults/pref/leandros-*.js`. Its RDD sandbox broker can read iHD's device attributes because sysfs stages `device`, `driver`, `irq`, `resource` and `modalias` in the DRM PCI directory. The rest (I/O and
 startup tuning for slow storage) is in leandros-tuning.js.
 
 **Fewer disk writes (lane quietio, lane ffchurn).** On the PC's USB 2.0 stick a write command costs up to 1 s and stalls the whole system, so the profile writes as little as it can: the disk cache is off (`browser.cache.disk.enable` false, memory cache 256 MiB), session store snapshots every 5 minutes instead of 15 s, Safe Browsing list downloads, telemetry, Normandy/studies, search and add-on update checks, speculative prefetch and Contile are off. `security.remote_settings.intermediates.enabled=false` stops the intermediate-CA preloading churn: on a new profile Remote Settings fetches the 1771 certificate attachments of `security-state/intermediates` and caches each as an IndexedDB Blob, i.e. one file and one `fsync` per certificate (PC boot 17: files 1..380, one about every 5 s, each fsync a multi-second F2FS checkpoint). Measured on a new profile in the first 6 minutes in QEMU on example.com: aarch64 4568 to 623 fsyncs and 1993 to 49 blob files, x86_64 4533 to 671. The certificates only help TLS servers that send an incomplete chain. Two prefs that did nothing were dropped: `services.settings.server=""` (release builds ignore any override of the server URL, so it never turned Remote Settings off) and `toolkit.storage.synchronous` (the pref does not exist in Firefox 136; IndexedDB runs WAL with `synchronous=NORMAL`, so a commit does not fsync, only WAL checkpoints and Blob files do). With `f2fs.fsync=lazy` ([filesystems.md](../servers/filesystems.md#performance-on-slow-media)) the remaining fsyncs return at once.
@@ -369,17 +377,10 @@ creates a 32 GiB sparse image, attaches a loop device, writes GPT, syncs partiti
 loop ioctls, `BLKPG` add/delete, `seek(End(0))` for device size, `fsync` — and the kernel side
 of it is the VFS block layer ([../servers/filesystems.md](../servers/filesystems.md)).
 
-The formatters are in-tree Rust because the repository is Rust and the originals are C:
-
-- **mkfs.fat** ([ports/mkfs-fat](../../ports/mkfs-fat/)) wraps the `fatfs` crate behind a
-  dosfstools-compatible CLI, FAT32 forced.
-- **mkfs.xfs** ([ports/mkfs-xfs](../../ports/mkfs-xfs/README.md)) is an XFS v5 writer from
-  scratch: the feature set `mkfs.xfs` 7.x enables by default plus exchange-range and parent
-  pointers, geometry computed exactly as xfsprogs does so the superblock is byte-identical to
-  the real tool's for a given size, every field confirmed against images written by xfsprogs
-  7.1.1 and checked clean by `xfs_repair -n`. It follows libxfs's growfs path
-  (`xfs_ag_init_headers`) rather than mkfs's transactional one. `XFS_SB_VERSION2_FTYPE` must not
-  be set on v5; it refuses devices under 300 MiB or fewer than two AGs.
+The formatters are the vanilla Alpine `dosfstools` and `xfsprogs` packages (staged from the
+lock like every other Alpine package, execed by bare name). The earlier in-tree Rust
+`mkfs.fat` (a `fatfs` wrapper) and `mkfs.xfs` (an XFS v5 writer) were removed when the image
+switched to vanilla Alpine packages; the real tools run on the same kernel contract.
 
 `disktester` loads its KDL scenario relative to the working directory, so it is run as
 `cd /root/disks-rs && disktester`; "failed to parse KDL" means the file was not found.
@@ -470,7 +471,7 @@ Kernel defects the bring-up found:
 
 ## GStreamer (ports/gstreamer)
 
-Alpine 3.21 repackage, same recipe as `ports/pipewire` (`build-in-alpine.sh` in a container of the target
+Alpine repackage, same recipe as `ports/pipewire` (`build-in-alpine.sh` in a container of the target
 architecture, closure walk; ELFs unmodified, the runtime libc is Alpine musl). It stages `usr/lib/gstreamer-1.0` (53 plugins: no alsa/pulse/v4l2/soup/gtk/gl),
 `gst-plugin-scanner`, and `clip-mpeg4-vorbis.mkv` (30 s, MPEG-4 + Vorbis, generated in the container).
 GLib and FFmpeg are byte-identical to the copies the Firefox and PipeWire ports already stage, so the
@@ -486,8 +487,8 @@ is overwritten). `cosmic-player` (`ports/cosmic-apps`) builds against it with up
   `videotestsrc ! fakesink` and the clip's demux/avdec_mpeg4/vorbisdec chain run, and
   `filesrc ! matroskademux ! vorbisdec ! audioconvert ! audioresample ! pipewiresink` streams into
   `leandros_output` (cycles=424 in 7 s). x86_64 is not built or tested.
-- **Patched port: gst-plugin-pipewire 1.2.7.** The plugin is rebuilt from vendored sources
-  (`ports/gstreamer/data/gst-pipewire-1.2.7`, built by `build-in-alpine.sh`) with a deadlock patch:
+- **Patched port: gst-plugin-pipewire (vendored 1.6.12, rebased to match Alpine's PipeWire).** The plugin is rebuilt from vendored sources
+  (`ports/gstreamer/data/gst-pipewire-1.6.12`, built by `build-in-alpine.sh`) with a deadlock patch:
   `on_param_changed` holds the PipeWire thread-loop lock while it waits for the buffer pool to activate,
   and the pool activation needs `setcaps`, which needs that same lock; additionally `do_start` could lose
   its wake-up. With the patch `playbin ... audio-sink=pipewiresink` (what cosmic-player uses) reaches PLAYING

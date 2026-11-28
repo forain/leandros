@@ -14,7 +14,7 @@ this page.
 | `login` | Authenticates against `/etc/shadow`, sets supplementary groups, drops privilege via `setresgid`/`setresuid`, sets `XDG_RUNTIME_DIR`, execs the account's shell |
 | `utmpd` | Serves `/run/utmps/utmp` on `/run/utmps/.utmpd-socket` using the skarnet `utmps` protocol, which is what Alpine's busybox `who` speaks; started and respawned by init ([below](#utmpx)) |
 | `greeter-launch` | `cosmic-comp`'s kiosk child: becomes the `cosmic-greeter` account, verifies the drop by reading `getuid()` back, execs the greeter ([../desktop/login.md](../desktop/login.md)) |
-| `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and is the fallback when init is unreachable. As a non-root user with a D-Bus session in the environment it execs `leandros-sysbus power`, so the request goes through login1 like `systemctl poweroff` on Linux |
+| `poweroff` / `reboot` / `halt` | One binary dispatching on `argv[0]` (hardlinked); asks init for an orderly shutdown over `/run/user/initctl`; `-f` does `sync` + `reboot(2)` directly (root only), and on the Pi 5 `reboot N [tryboot]` sets a one-shot boot partition (`reboot 3` = MBR partition 3, as on Raspberry Pi OS) and `tryboot`, `tryboot-commit`, `tryboot-hold` and `tryboot-release` drive the firmware trial-boot deadline, all directly without init. `-f` is also the fallback when init is unreachable. As a non-root user with a D-Bus session in the environment it execs `leandros-sysbus power`, so the request goes through login1 like `systemctl poweroff` on Linux |
 | `w`, `users`, `lastlog` | utmp/lastlog readers ([below](#utmpx)) |
 | `ps` | Process status from `/proc`, procps-compatible ([below](#ps)) |
 | `meminfo` | One-line `sysinfo` sample of buddy-allocator total/free, so a session script can read a series rather than a point |
@@ -59,6 +59,8 @@ session or the logger, and the compositor or greetd's worker only as a last reso
 kernel OOM killer and systemd-oomd would. After three victims in one episode it kills greetd,
 whose exit sweeps the tree and respawns the login under the usual backoff. This contains, rather
 than fixes, an unbounded output queue in cosmic-session's launch-pad.
+
+**Boot-time account repair.** Before it supervises anything, init runs `/usr/sbin/shadowfix` (10 s limit, killed on timeout; atomic and idempotent) and sets `/usr/sbin/unix_chkpwd` to `root:root 4755`, so real PAM can authenticate non-root callers ([security.md](../servers/security.md#etcshadow)). `/var/run` is an on-disk symlink to `/run` (tmpfs), as on Alpine.
 
 **Power-off** requests arrive as one line (`poweroff|reboot|halt`) on `/run/user/initctl` and are
 authorised from `SO_PEERCRED` ([../desktop/session.md](../desktop/session.md#shut-down-and-restart)).
@@ -131,7 +133,7 @@ reason the monitor can trust the unprivileged child: it cannot vouch for a login
   - A shell gets a `/dev/ptmx` pty. It runs as a non-login shell with `argv[0]` set to its
     path, like `/bin/login`.
   - An exec request runs `shell -c cmd` on pipes, with stderr sent as extended data 1.
-  - `sftp` runs Alpine's `/usr/lib/ssh/sftp-server` (from [ports/git](ports.md#port-index)).
+  - `sftp` runs Alpine's `/usr/lib/ssh/sftp-server` (from the Alpine `openssh-sftp-server` package).
     `scp` works through it.
   - The environment is `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH` (with `/usr/bin` first),
     `XDG_RUNTIME_DIR`, `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY`, `TERM`, and the locale
@@ -149,12 +151,13 @@ reason the monitor can trust the unprivileged child: it cannot vouch for a login
 | `leandro` | `leandro` | 1000 | `/home/leandro` | `audio`, `video`, `input` |
 
 plus the system account `cosmic-greeter` (uid 990, shell `/bin/false`, in `video` and
-`input`). The `/etc/shadow` format is LeandrOS's own `$sha256$<salt>$<hex>`, the SHA-256 of
-salt followed by password, verified by an embedded SHA-256 in
-[userland/login](../../userland/login/src/main.rs) and by `pam-leandros`; there is no
-`crypt(3)`. The image builder computes the same hash with Python's `hashlib`, and the two must
-stay byte-for-byte in sync (a `pam-leandros` host test asserts it). There is no `passwd(1)` to
-change a password.
+`input`). The `/etc/shadow` format is sha512-crypt `$6$` (`rounds=65536`), verified by
+[`lib/shadowhash`](../../lib/shadowhash/shadowhash.rs) in
+[userland/login](../../userland/login/src/main.rs) and sshd, and by Alpine's `pam_unix` for sudo, su and
+greetd; a legacy `$sha256$<salt>$<hex>` field still verifies in `login` and sshd and is rewritten on the
+next successful login (`shadowfix` converts the development ones at boot, since PAM cannot verify
+them, see [security.md](../servers/security.md#etcshadow)). There is no `crypt(3)` and no `passwd(1)` to change
+a password.
 
 `login` reads the username and password (without echoing itself on a pty, where the line
 discipline already echoes), sets the account's supplementary groups before dropping
@@ -193,14 +196,14 @@ leandros-libc.
 |---|---|---|
 | coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `id`, `env`, …) | [uutils/coreutils](https://github.com/uutils/coreutils), sibling `../coreutils` | One static musl multicall binary built with upstream's `feat_os_unix_musl` set (which drops `stdbuf`, the one utility that needs a cdylib); every command name is a hardlink, the list derived from the checkout's `Cargo.toml` and `src/uu`. Also installed as `/usr/bin/env`. `sync FILE` fsyncs just that file (a local patch in the sibling checkout; upstream's whole-system `sync` made fsync-heavy scripts pay for a full checkpoint), guarded by the `syncfile` suite. |
 | `btm` / `bottom` | sibling `../bottom-leandros` | system monitor, static musl |
-| `mkfs.fat`, `mkfs.xfs` | [ports/mkfs-fat](../../ports/mkfs-fat/), [ports/mkfs-xfs](../../ports/mkfs-xfs/README.md) | in-tree Rust formatters for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
+| `mkfs.fat`, `mkfs.xfs` | Alpine `dosfstools` and `xfsprogs` | vanilla packages for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
 | `disktester` | sibling `../disks-rs` | AerynOS's provisioning tester, unmodified |
 | `gpuprobe` | the Mesa GPU stage | reports virtio-gpu capsets and creates a real GBM + EGL context; `/bin/gpu-env` decides the renderer from it |
-| `git`, `less`, `nano`, `sftp-server` | [ports/git](../../ports/git/build.sh) | Alpine's git (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
+| `git`, `less`, `nano`, `sftp-server` | vanilla Alpine packages ([lock](../../ports/alpine/)) | Alpine's git (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
 | `su`, `sudo` | [ports/sudo-rs](../../ports/sudo-rs/README.md) | sudo-rs v0.2.15, set-user-ID root; `/etc/sudoers` lets `root` and `%wheel` run anything ([security](../servers/security.md#su-and-sudo)) |
 | `kmscube` | [ports/gl-stack](../../ports/gl-stack/NOTES.md) | the first dynamic `ET_DYN` + `PT_INTERP` binary; a KMS/GL smoke test |
 
-The image ships ripgrep as `rg` ([ports/ripgrep](../../ports/ripgrep), stripped), and `grep`, `egrep` and `fgrep` are a thin shim over it ([`userland/grep`](../../userland/grep), host-tested); `pi-sync` refuses to update a Pi root that lacks rg, grep or dmesg. `busctl` (from [ports/sysbus](../../ports/sysbus): `busctl call`, `--user`/`--system`, `-q`, the usual signature characters) is staged at `/usr/bin/busctl` and is how scripts drive login1, PipeWire's volume path and the like. `leandros-sysbus power <PowerOff|Reboot|Halt|Can*>` is the login1 client behind a regular user's `poweroff`. Other additions since the last survey: `netctl metric` and `netctl watch --stamp` ([../servers/netctl.md](../servers/netctl.md)), the netlink and local-UDP regression programs `netlinktest` and `udpselftest` ([../servers/networking.md](../servers/networking.md)), `btd`, `btctl` and `bthid` for Bluetooth ([../servers/bluetooth.md](../servers/bluetooth.md)), and `kmodctl` for loadable kernel modules. Scripts that run in the guest may rely on `grep`, but still not on `awk` or `sed` beyond what uutils provides.
+The image ships ripgrep as `rg` (vanilla Alpine package), and `grep`, `egrep` and `fgrep` are a thin shim over it ([`userland/grep`](../../userland/grep), host-tested); `grep -c` prints `0` (and `file:0` for every file) when nothing matches, like GNU grep, because the front end passes `--include-zero` to rg; regress checks `-c` and `-v -c` counts and the `-q`/`-l`/missing-file exit codes; `pi-sync` refuses to update a Pi root that lacks rg, grep or dmesg. `busctl` (from [ports/sysbus](../../ports/sysbus): `busctl call`, `--user`/`--system`, `-q`, the usual signature characters) is staged at `/usr/bin/busctl` and is how scripts drive login1, PipeWire's volume path and the like. `leandros-sysbus power <PowerOff|Reboot|Halt|Can*>` is the login1 client behind a regular user's `poweroff`. Other additions since the last survey: `netctl metric` and `netctl watch --stamp` ([../servers/netctl.md](../servers/netctl.md)), the netlink and local-UDP regression programs `netlinktest` and `udpselftest` ([../servers/networking.md](../servers/networking.md)), `btd`, `btctl` and `bthid` for Bluetooth ([../servers/bluetooth.md](../servers/bluetooth.md)), and `kmodctl` for loadable kernel modules. Scripts that run in the guest may rely on `grep`, but still not on `awk` or `sed` beyond what uutils provides.
 
 ### ps
 
@@ -295,7 +298,7 @@ It never blocks boot, and a failed step leaves no stamp, so the next boot retrie
 Login records follow the Alpine/musl `struct utmpx` (400 bytes) so Alpine's busybox
 (`/bin/busybox.static who`, `... last`) reads them unmodified. The shared writer is
 `lib/utmpx/utmpx.rs` (`core` only, raw syscalls; `#[path]`-included by init, login, utmpd,
-sshd and `pam-leandros`).
+sshd and greetd's `session-leandros`).
 
 | File | Content | Reader |
 |---|---|---|

@@ -9,7 +9,7 @@ Everything above the microkernel core that a Linux program would call "the kerne
 | `vfs` | [`servers/vfs`](../../servers/vfs) | the fd tables, mount routing, tmpfs (`/tmp`, `/dev/shm`, `/run/user`), `/dev`, `/proc`, `/sys/class/block`, pipes, eventfd/timerfd/signalfd/inotify, block devices | `VFS_*` tags (`open`/`read`/`write`/`close`/`ioctl`/…) | [vfs.md](vfs.md) |
 | `f2fs` | [`servers/f2fs`](../../servers/f2fs) | `/` and `/data` | the same `VFS_*` tags, forwarded by the VFS | [filesystems.md](filesystems.md) |
 | `xattr` | [`servers/xattr`](../../servers/xattr) | not a server: the shared xattr/ACL/permission contract crate | — | [filesystems.md](filesystems.md#extended-attributes-and-posix-acls), [security.md](security.md) |
-| `net` | [`servers/net`](../../servers/net) | AF_INET (smoltcp with Reno/CUBIC, DHCPv4, ICMP), IPv6 (SLAAC, NDP, PMTU), `NETLINK_ROUTE` and the nf_tables control plane, AF_UNIX, `/proc/net/*` | `NET_*` tags | [networking.md](networking.md) |
+| `net` | [`servers/net`](../../servers/net) | AF_INET (smoltcp with Reno/CUBIC, DHCPv4, ICMP), IPv6 (SLAAC, DHCPv6, NDP, PMTU), `NETLINK_ROUTE` and the nf_tables control plane, AF_UNIX, `/proc/net/*` | `NET_*` tags | [networking.md](networking.md) |
 | `tty` | [`servers/tty`](../../servers/tty) | console termios, job control, PTYs, the six VTs and their keyboard, POSIX timers | `TTY_IOCTL`, `TIMER_*`, plus direct calls | [tty-and-vt.md](tty-and-vt.md) |
 | `drm` | [`servers/drm`](../../servers/drm) | `/dev/dri/card0`, `/dev/dri/renderD128` | Linux DRM ioctls carried as VFS ioctl messages | [../graphics/drm-kms.md](../graphics/drm-kms.md) |
 | `evdev` | [`servers/evdev`](../../servers/evdev) | `/dev/input/eventN` | Linux `input_event` reads | [../input.md](../input.md) |
