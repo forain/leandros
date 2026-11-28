@@ -37,7 +37,7 @@ Things worth knowing:
 
 ### Why it is arranged this way
 
-The greeter's role comes from its *account*, not its file name; greetd must run with `vt = "none"`; its control socket cannot live in `/run` (F2FS has no socket nodes); there is no PAM stack, so `ports/greetd/pam-leandros` supplies the libpam ABI; and `cosmic-comp` itself still runs as root. These constraints, and the reasons for each, are in [the desktop login design](../desktop/login.md).
+The greeter's role comes from its *account*, not its file name; greetd must run with `vt = "none"`; its control socket cannot live in `/run` (F2FS has no socket nodes); since 2026-11-24 greetd, `su` and `sudo` authenticate through the real Linux-PAM (Alpine's `libpam`, with a setuid `unix_chkpwd`) rather than the earlier in-tree libpam ABI stand-in, and a boot-time repair of `/etc/shadow` migrates the old development hashes without ever adding or locking root; and `cosmic-comp` itself still runs as root. These constraints, and the reasons for each, are in [the desktop login design](../desktop/login.md).
 
 ## Opting out: text login only
 

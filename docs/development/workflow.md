@@ -42,8 +42,11 @@ Scarce machines are arbitrated by `lock.sh <kind> <command…>` in the orchestra
 
 **Lane discipline learned the hard way.**
 
-- *Small lanes, short reports, fresh agents.* A lane has a tool-call budget (about 60), keeps tool output tiny, and when it runs out writes a hand-off file (done, in progress, next steps, the exact lines to change) instead of continuing in a bloated context.
-- *Lanes test AArch64 only; both architectures run once per merge batch on `main`.* An x86-64 or hardware claim is made on the machine that can make it ([the accelerator is not the arch](methodology.md#the-accelerator-is-not-the-architecture)).
+- *Small lanes, short reports, fresh agents.* A lane has a tool-call budget (150 since 2026-11-27, 60 before), keeps tool output tiny, and when it runs out writes a hand-off file (done, in progress, next steps, the exact lines to change) instead of continuing in a bloated context.
+- *Lanes test one architecture; both run once per merge batch on `main`.* The architecture a lane tests follows the machine it runs on: AArch64 while the work was done on the Mac, x86-64 per lane since 2026-11-20 when it moved to the Linux desktop. An x86-64 or hardware claim is made on the machine that can make it ([the accelerator is not the arch](methodology.md#the-accelerator-is-not-the-architecture)).
+- *Lanes do not run the full x86-64 regress, and few farm runs at once.* The merge queue runs the full regress on both architectures, so a lane runs only the suites for the code it touched (`runtests.py --suite <name>` or a single command), and at most four lanes have farm test runs going at once (a rule of 2026-11-27, to keep the farm's load low enough for the timing-sensitive suites).
+- *Check the diff before queueing a lane.* Look at `git diff --stat` against the base and at `TODO.md` for duplicated entries: one lane's merge once reverted the move to Alpine edge, and two TODO merges left duplicate entries that had to be cleaned out.
+- *Checking out in a primary checkout is forbidden.* A lane gets its own worktree slot; with no free slot it stops instead of using the main checkout.
 - *A lane worktree is about 4 GiB* (images are dense; it was 9 to 18 GiB before the image slimming), and a full disk failed lanes twice on 2026-10-19/20. Remove the worktree after merging, and copy images with `cp -c` (clone) on macOS. The ports' target cache (`~/Library/Caches/leandros-ports`) grew to 236 GB once; check it first when the disk fills.
 - *Shared build outputs.* `build-all.sh` in a worktree (not the main checkout) uses a private, APFS-cloned `../leandros-artifacts/m5-session-ship-<worktree>` tree (sysbus/busd/fonts; override with `LEANDROS_M5_SHIP`); delete it with the worktree. The 19 GB m6 cargo targets stay shared: `m6-session-bins/build-rust.sh` takes a per-target-dir lock (`.buildlock-*`, stale-pid aware), and `LEANDROS_M6_TARGET=<dir>` opts into a private target.
 - *Never `git stash`* (the stash is shared by every worktree) and never switch the branch of the main checkout: commit work in progress on the lane branch and merge `main` into it.
@@ -89,7 +92,7 @@ All in [`.claude/skills/run-leandros/`](../../.claude/skills/run-leandros) unles
 
 | Tool | Purpose |
 |---|---|
-| `runtests.py <arch> <tag> [--suite regress\|net\|drm] [--gpu …] [--repeat N]` | Boot, log in as root, run the suites; one `=== cmd: RC=n [status, secs] fails=k` line each, `summary.json`; exit 0 iff all passed ([testing](testing.md)) |
+| `runtests.py <arch> <tag> [--suite regress\|net\|drm] [--gpu …] [--repeat N] [--shards K]` | Boot, log in as root, run the suites; one `=== cmd: RC=n [status, secs] fails=k` line each, `summary.json`; exit 0 iff all passed ([testing](testing.md)) |
 | `liveness-run.py <label> "<cmd>" [--wav] [--timeout S]` | Run one guest command with a persistent timestamped serial reader, a userspace heartbeat, optional WAV-growth tracking and — only on a stall — a host-side sample of the QEMU process. Use it for any workload where "it hung" is a possible outcome. |
 | `clockdrift.py <secs> <label>` | Guest clock against host wall time: `guest=… host=… ratio=… err=…`. Expect \|err\| < 0.5 % idle; use 30 s windows, since a 10 s window carries ±0.5 % of serial noise. |
 | `ffsession.py`, `doomsession.py`, `coldstart-bench.py` | Scripted desktop sessions: greeter login, `cosmic-term`, Firefox; DOOM under COSMIC; app and dialog launch latency (VNC-polled, ±0.3 s) |
