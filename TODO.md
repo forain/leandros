@@ -133,3 +133,4 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - Every port/container script takes its Alpine release from `ports/alpine/toolchain.lock` via `scripts/lib/alpine-release.sh`; bumping `alpine-lock.py refresh` moves them all. Mesa 25.3.6 ship-set rebuilt on 3.24 (3 LeandrOS patches apply clean); gst-pipewire vendored sources rebased to 1.6.8 (build fails loudly if Alpine's pipewire moves).
 - Open: the aarch64 ship-set on 3.24 was built under qemu-user; real-GPU (laptop/PC/Pi) runs of the 3.24 stage not done.
 - ffsandbox harness (lane/ffsbfix 2026-11-28): benign broker 'Failed errno -22 op readlink' + 'Recording mapping' ignored (Linux logs the same); page now fetches loopback http so the lazy socket process spawns and is checked (Seccomp 2); x86_64+aarch64 'on' pass.
+- reboot/restart/poweroff now run the dma_shutdown Device-stage hooks (lane/rebootshut; device trial via device-update.sh pending)

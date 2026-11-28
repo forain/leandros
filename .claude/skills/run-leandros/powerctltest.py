@@ -180,6 +180,13 @@ def run(arch, scale):
     m = re.search(r"reboot requested by pid \d+ \(uid (\d+)\): (\w+)", text)
     step("user_reboot_cmd", m and m.group(1) == uid and m.group(2) == "authorised"
          and "System is going down" in text, m.group(0) if m else text.strip()[-200:])
+    t = time.time()
+    while time.time() - t < 30 * scale and "[POWER] device-shutdown:" not in log_since(mark):
+        time.sleep(1)
+    text = log_since(mark)
+    step("reboot_device_shutdown", re.search(r"\[POWER\] phase 4 .*\n(?:.*\n)*?\[POWER\] device-shutdown: quiesced \d+ hook", text)
+         and "[POWER] phase 5 " in text.split("[POWER] device-shutdown:", 1)[-1],
+         "device-shutdown line between phase 4 and phase 5" if "[POWER] device-shutdown:" in text else "no device-shutdown line")
     ser.close()
     if not step("boot3", root_login()):
         return
@@ -198,6 +205,7 @@ def run(arch, scale):
         time.sleep(1)
     text = log_since(mark)
     m = re.search(r"power-?off requested by pid \d+ \(uid (\d+)\): (\w+)", text)
+    step("poweroff_device_shutdown", "[POWER] device-shutdown: quiesced" in text, "poweroff ran device shutdown")
     step("user_poweroff_dbus", m and m.group(1) == uid and m.group(2) == "authorised"
          and driver._qemu_pid() is None, (m.group(0) if m else text.strip()[-200:])
          + ("" if driver._qemu_pid() is None else " QEMU still running"))
