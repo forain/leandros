@@ -251,6 +251,8 @@ def main():
             print("podman_v6_ping_diag5(host 1 0): " + dg.strip().replace("\n", " | "), flush=True)
             _, dg = run(f"podman create --name pbd2 --network pb6 {IMG} true >/dev/null 2>&1; podman inspect pbd2 2>&1 | grep -i -A3 'sysctl'; f=$(podman inspect -f '{{{{.OCIConfigPath}}}}' pbd2 2>/dev/null); echo cfg=$f; grep -c . $f; grep -i -A3 'sysctl' $f | head; podman rm -f pbd2 >/dev/null 2>&1")
             print("podman_v6_ping_diag6: " + dg.strip().replace("\n", " | ")[:700], flush=True)
+            _, dg = run(f"podman --log-level=debug run --rm --network pb6 {IMG} true 2>&1 | grep -i -e sysctl -e 'containers.conf' -e 'ping_group' | cut -c1-220 | head -12")
+            print("podman_v6_ping_diag7: " + dg.strip().replace("\n", " | ")[:1200], flush=True)
             print("podman_v6_ping_diag4: " + dg.strip().replace("\n", " | "), flush=True)
             print("podman_v6_ping_diag3: " + dg.strip().replace("\n", " | ")[-300:], flush=True)
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
