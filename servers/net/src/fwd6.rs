@@ -161,35 +161,53 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
     if let Some(t) = rt { route6_l3(br, port, &p, &t, f); return None; }
     let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { fwd::stat6(fwd::S6_NOROUTE); return None };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { fwd::stat6(fwd::S6_NOMAC); return None };
-    fwd::stat6(fwd::S6_NAT);
     let now = sched::monotonic_ns();
     let cmac: [u8; 6] = f[6..12].try_into().unwrap();
     let rport = if p.proto == PROTO_ICMP6 { 0 } else { p.dport };
+    // Nftables is loaded but no nat/postrouting rule masquerades this packet (no such chain, or its verdict is not
+    // masquerade): Linux forwards it unchanged with the container source address if FORWARD accepts, and conntrack still
+    // tracks the flow, so the flow gets an identity entry (nicip = container address, nat = container port) that the
+    // reverse path (replies, ICMPv6 errors as `ct state related`) matches like a NAT66 one, with nothing to rewrite.
+    let nomasq = crate::nfnl::has_tables(0) && {
+        if !crate::nfnl::has_hook(0, crate::nfnl::H_POST) { true } else {
+            let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+            let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
+            crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq
+        }
+    };
     let mut st = FWD.lock();
     USED6.store(true, Ordering::Relaxed);
     fwd::USED.store(true, Ordering::Relaxed);
     fwd::sweep_pub(&mut st, now);
     let found = st.ct6.iter_mut().find(|e| e.kind == 0 && e.proto == p.proto && e.br == br && e.port == port && e.cip == p.src && e.cport == p.sport
-        && e.rip == p.dst && e.rport == rport).map(|e| { e.last = now; e.cmac = cmac; (e.nat, e.replied) });
-    let nat = match found {
-        Some((n, rep)) => {
+        && e.rip == p.dst && e.rport == rport).map(|e| { e.last = now; e.cmac = cmac; (e.nat, e.replied, e.nicip) });
+    let (nat, snat) = match found {
+        Some((n, rep, sip)) => {
             // Established flows traverse the filter hook too, so a rule added mid-flow bites.
             if crate::nfnl::has_tables(0) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
                 let mut m = crate::nfnl::Pkt { rel: false, est: rep, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
                 if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return None; }
             }
-            n
+            (n, sip)
         }
         None => {
             if p.proto == PROTO_TCP && p.flags & 0x12 != 0x02 { return None; }
             drop(st);
-            if crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
+            if nomasq || crate::nfnl::has_hook(0, crate::nfnl::H_POST) {
                 let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
                 let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
                 if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return None; }
-                if crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq { return None; }
             }
+            if nomasq {
+                let mut g = FWD.lock();
+                if fwd::ct4_len(&g) + g.ct6.len() >= fwd::CT_CAP { return None; }
+                g.ct6.push(Ct6 { proto: p.proto, nat: p.sport, cip: p.src, cport: p.sport, cmac, br, port, bmac, rip: p.dst, rport,
+                    nic, nicip: p.src, last: now, replied: false, tst: 0, fins: 0, ..Ct6::BLANK });
+                st = g;
+                fwd::stat6(fwd::S_NONAT);
+                (p.sport, p.src)
+            } else {
             let mut pick = None;
             let claimed = if crate::nfnl::has_tables(0) { crate::nfnl::dnat_ports(0) } else { Vec::new() };
             for _ in 0..16 {
@@ -212,14 +230,16 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
             }
             let Some(n) = pick else { return None };
             st = FWD.lock();
-            n
+            (n, nicip)
+            }
         }
     };
     if p.proto == PROTO_TCP {
-        if let Some(e) = st.ct6.iter_mut().find(|e| e.nat == nat && e.proto == PROTO_TCP) { fwd::tcp_fsm(&mut e.tst, &mut e.fins, p.flags, true); }
+        if let Some(e) = st.ct6.iter_mut().find(|e| e.nat == nat && e.proto == PROTO_TCP && e.kind == 0 && e.cip == p.src && e.cport == p.sport) { fwd::tcp_fsm(&mut e.tst, &mut e.fins, p.flags, true); }
     }
+    if snat != p.src { fwd::stat6(fwd::S6_NAT); }
     f[21] -= 1;
-    f[22..38].copy_from_slice(&nicip);
+    f[22..38].copy_from_slice(&snat);
     if p.proto != PROTO_ICMP6 { f[54..56].copy_from_slice(&nat.to_be_bytes()); } else { f[58..60].copy_from_slice(&nat.to_be_bytes()); }
     finish(&mut f, &p);
     f[6..12].copy_from_slice(&nicmac);
