@@ -21,6 +21,7 @@ mod dev;
 mod device;
 mod eventfd;
 mod iface;
+mod irqfd;
 mod kick;
 mod memslot;
 mod run;

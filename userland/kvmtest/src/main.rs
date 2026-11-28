@@ -762,12 +762,151 @@ unsafe fn ph_forkvm() -> bool {
     pass(n, b"child could not run/see the VM; parent guest kept running and stayed interruptible")
 }
 
+
+// ---- irqfd (plan step 7a): eventfd write -> SPI in the guest; level resample -------------------------
+extern "C" {
+    fn eventfd(init: u32, flags: c_int) -> c_int;
+    fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
+}
+const KVM_IRQFD: usize = 0x4020_AE76;
+const KVM_SET_DEVICE_ATTR: usize = 0x4018_AEE1;
+const EFD_NONBLOCK: c_int = 0x800;
+const IRQFD_DEASSIGN: u32 = 1;
+const IRQFD_RESAMPLE: u32 = 2;
+const EAGAIN: c_int = 11;
+const IRQ_VECTORS: usize = 0x800;
+const IRQ_HANDLER: usize = IRQ_VECTORS + 0x280;
+#[repr(C)]
+struct IrqfdArg { fd: u32, gsi: u32, flags: u32, resamplefd: u32, pad: [u8; 16] }
+#[repr(C)]
+struct DevAttr { flags: u32, group: u32, attr: u64, addr: u64 }
+
+/// GICv3 guest at EL1: enable the sysreg interface, VBAR = RAM+0x800, unmask IRQs, WFI. The IRQ
+/// vector (VBAR+0x280) reads IAR1, reports the INTID at MMIO+4, writes EOIR1 and ERETs. After the
+/// handler the main line reports "done" at MMIO+8. MMIO+0 = "ready" (before the first WFI).
+const fn irq_blob() -> [u32; IRQ_HANDLER / 4 + 5] {
+    let mut b = [0u32; IRQ_HANDLER / 4 + 5];
+    let main: [u32; 19] = [
+        0xd28000e0, // movz x0, #7
+        0xd518cca0, // msr ICC_SRE_EL1, x0
+        0xd5033fdf, // isb
+        0xd2801fe0, // movz x0, #0xff
+        0xd5184600, // msr ICC_PMR_EL1, x0
+        0xd2800020, // movz x0, #1
+        0xd518cce0, // msr ICC_IGRPEN1_EL1, x0
+        0xd5033fdf, // isb
+        0xd2a80000, // movz x0, #0x4000, lsl #16
+        0xf2810000, // movk x0, #0x800
+        0xd518c000, // msr vbar_el1, x0
+        0xd5033fdf, // isb
+        0xd2a12001, // movz x1, #0x900, lsl #16
+        0x52800022, // movz w2, #1
+        0xb9000022, // str w2, [x1]
+        0xd50342ff, // msr daifclr, #2
+        0xd5033fdf, // isb
+        0xd503201f, // nop (the pending SPI is taken at the daifclr/isb, before this)
+        0xb9000822, // str w2, [x1, #8]
+    ];
+    let h: [u32; 5] = [
+        0xd538cc00, // mrs x0, ICC_IAR1_EL1
+        0xd2a12001, // movz x1, #0x900, lsl #16
+        0xb9000420, // str w0, [x1, #4]
+        0xd518cc20, // msr ICC_EOIR1_EL1, x0
+        0xd69f03e0, // eret
+    ];
+    let mut i = 0;
+    while i < 19 { b[i] = main[i]; i += 1; }
+    b[19] = 0x14000000; // b .
+    let mut j = 0;
+    while j < 5 { b[IRQ_HANDLER / 4 + j] = h[j]; j += 1; }
+    b
+}
+static IRQ_BLOB: [u32; IRQ_HANDLER / 4 + 5] = irq_blob();
+
+unsafe fn dev_attr(dev: c_int, group: u32, attr: u64, val: u64, len: usize) -> bool {
+    let mut v = val;
+    let a = DevAttr { flags: 0, group, attr, addr: &mut v as *mut u64 as u64 };
+    let _ = len;
+    ioctl(dev, KVM_SET_DEVICE_ATTR, &a as *const DevAttr) == 0
+}
+
+/// One guest run. `resample`: level SPI + resamplefd; else an edge SPI with no resamplefd.
+unsafe fn irq_case(n: &[u8], kvm: c_int, resample: bool) -> bool {
+    let Some(c) = setup(n, kvm, &IRQ_BLOB) else { return false; };
+    let probe = IrqfdArg { fd: 0, gsi: 1, flags: 0, resamplefd: 0, pad: [0; 16] };
+    // irqfd needs the in-kernel irqchip
+    if ioctl(c.vm, KVM_IRQFD, &probe as *const IrqfdArg) >= 0 || errno() != EINVAL { return fail(n, b"irqfd without a vGIC must be EINVAL", errno() as u64); }
+    let mut cd = CreateDev { ty: KVM_DEV_TYPE_ARM_VGIC_V3, fd: 0, flags: 0 };
+    if ioctl(c.vm, KVM_CREATE_DEVICE, &mut cd as *mut CreateDev) != 0 { return fail(n, b"create vGICv3 errno", errno() as u64); }
+    let g = cd.fd as c_int;
+    if !dev_attr(g, 0, 2, 0x0800_0000, 8) || !dev_attr(g, 0, 3, 0x080a_0000, 8) { return fail(n, b"vGIC dist/redist address errno", errno() as u64); }
+    if !dev_attr(g, 4, 0, 0, 0) { return fail(n, b"vGIC CTRL_INIT errno", errno() as u64); }
+    // GICD_CTLR = ARE|EnableGrp1, IGROUPR1 bit 1 (INTID 33 = group 1), ISENABLER1 bit 1, ICFGR2 bit 3 = edge
+    if !dev_attr(g, 1, 0x0, 0x12, 4) { return fail(n, b"GICD_CTLR errno", errno() as u64); }
+    if !dev_attr(g, 1, 0x84, 0x2, 4) { return fail(n, b"GICD_IGROUPR1 errno", errno() as u64); }
+    if !resample && !dev_attr(g, 1, 0xc08, 0x8, 4) { return fail(n, b"GICD_ICFGR2 errno", errno() as u64); }
+    if !dev_attr(g, 1, 0x104, 0x2, 4) { return fail(n, b"GICD_ISENABLER1 errno", errno() as u64); }
+    let e = eventfd(0, EFD_NONBLOCK);
+    let r = eventfd(0, EFD_NONBLOCK);
+    if e < 0 || r < 0 { return fail(n, b"eventfd errno", errno() as u64); }
+    let bad = IrqfdArg { fd: e as u32, gsi: 1, flags: 0x80, resamplefd: 0, pad: [0; 16] };
+    if ioctl(c.vm, KVM_IRQFD, &bad as *const IrqfdArg) >= 0 || errno() != EINVAL { return fail(n, b"irqfd unknown flag must be EINVAL", errno() as u64); }
+    let nofd = IrqfdArg { fd: 999, gsi: 1, flags: 0, resamplefd: 0, pad: [0; 16] };
+    if ioctl(c.vm, KVM_IRQFD, &nofd as *const IrqfdArg) >= 0 || errno() != 9 { return fail(n, b"irqfd bad fd must be EBADF", errno() as u64); }
+    let big = IrqfdArg { fd: e as u32, gsi: 5000, flags: 0, resamplefd: 0, pad: [0; 16] };
+    if ioctl(c.vm, KVM_IRQFD, &big as *const IrqfdArg) >= 0 || errno() != EINVAL { return fail(n, b"irqfd gsi out of range must be EINVAL", errno() as u64); }
+    let a = IrqfdArg { fd: e as u32, gsi: 1, flags: if resample { IRQFD_RESAMPLE } else { 0 }, resamplefd: r as u32, pad: [0; 16] };
+    if ioctl(c.vm, KVM_IRQFD, &a as *const IrqfdArg) != 0 { return fail(n, b"KVM_IRQFD assign errno", errno() as u64); }
+    if ioctl(c.vm, KVM_IRQFD, &a as *const IrqfdArg) >= 0 || errno() != 16 { return fail(n, b"duplicate irqfd must be EBUSY", errno() as u64); }
+    let Some(v) = expect_mmio(n, &c, b"ready", MMIO_GPA, true, 4) else { return false; };
+    if !want(n, b"guest ready marker", v, 1) { return false; }
+    let one = 1u64;
+    if write(e, &one as *const u64 as *const u8, 8) != 8 { return fail(n, b"eventfd write errno", errno() as u64); }
+    let mut reports = 0u64;
+    loop {
+        let (rc, e2) = vrun(c.vcpu);
+        if rc != 0 { return fail(n, b"KVM_RUN after eventfd write, errno", e2 as u64); }
+        if rd32(c.run, R_EXIT_REASON) != EXIT_MMIO { return fail(n, b"exit_reason (want MMIO)", rd32(c.run, R_EXIT_REASON) as u64); }
+        let (addr, val) = (rd64(c.run, R_MMIO_ADDR), rd64(c.run, R_MMIO_DATA) & 0xffff_ffff);
+        if addr == MMIO_GPA + 4 {
+            reports += 1;
+            if val != 33 { return fail(n, b"guest IAR1 INTID (eventfd write -> SPI 33)", val); }
+            if reports > 3 { return fail(n, b"interrupt storm: SPI 33 delivered more than 3 times", reports); }
+        } else if addr == MMIO_GPA + 8 { break; } else { return fail(n, b"unexpected mmio addr", addr); }
+    }
+    if !want(n, b"SPI 33 deliveries to the guest", reports, 1) { return false; }
+    let mut cnt = 0u64;
+    if read(e, &mut cnt as *mut u64 as *mut u8, 8) >= 0 || errno() != EAGAIN { return fail(n, b"irqfd eventfd must be drained (EAGAIN)", cnt); }
+    if resample {
+        if read(r, &mut cnt as *mut u64 as *mut u8, 8) != 8 { return fail(n, b"resamplefd not signalled after the guest EOI, errno", errno() as u64); }
+        if !want(n, b"resamplefd count", cnt, 1) { return false; }
+    } else if read(r, &mut cnt as *mut u64 as *mut u8, 8) >= 0 {
+        return fail(n, b"resamplefd signalled without RESAMPLE", cnt);
+    }
+    let d = IrqfdArg { fd: e as u32, gsi: 1, flags: IRQFD_DEASSIGN, resamplefd: 0, pad: [0; 16] };
+    if ioctl(c.vm, KVM_IRQFD, &d as *const IrqfdArg) != 0 { return fail(n, b"KVM_IRQFD deassign errno", errno() as u64); }
+    if ioctl(c.vm, KVM_IRQFD, &d as *const IrqfdArg) >= 0 || errno() != 2 { return fail(n, b"second deassign must be ENOENT", errno() as u64); }
+    close(e); close(r);
+    true
+}
+
+unsafe fn ph_irqfd() -> bool {
+    let n = b"irqfd";
+    let kvm = open_kvm();
+    if kvm < 0 { return fail(n, b"open errno", errno() as u64); }
+    let probe = ioctl(kvm, KVM_CHECK_EXTENSION, 32usize);
+    if probe <= 0 { close(kvm); return skip(n, b"no in-kernel vGIC (KVM_CAP_IRQFD=0)"); }
+    if !irq_case(n, kvm, false) { return false; }
+    if !irq_case(n, kvm, true) { return false; }
+    pass(n, b"edge irqfd: eventfd write -> guest took SPI 33 (eventfd drained); level irqfd: EOI signalled the resamplefd; deassign ok")
+}
+
 // ---- driver -----------------------------------------------------------------------------------
-const PHASES: [(&[u8], unsafe fn() -> bool); 16] = [
+const PHASES: [(&[u8], unsafe fn() -> bool); 17] = [
     (b"open", ph_open), (b"caps", ph_caps), (b"memslot", ph_memslot), (b"regs", ph_regs), (b"reglist", ph_reglist),
     (b"mmio", ph_mmio), (b"psci", ph_psci), (b"wfi", ph_wfi), (b"sysoff", ph_sysoff),
     (b"immexit", ph_immexit), (b"sigkick", ph_sigkick), (b"smp", ph_smp),
-    (b"vgicv2", ph_vgicv2), (b"sigstress", ph_sigstress), (b"unmap", ph_unmap), (b"forkvm", ph_forkvm),
+    (b"vgicv2", ph_vgicv2), (b"sigstress", ph_sigstress), (b"unmap", ph_unmap), (b"forkvm", ph_forkvm), (b"irqfd", ph_irqfd),
 ];
 
 unsafe fn cstr_eq(p: *const u8, s: &[u8]) -> bool {

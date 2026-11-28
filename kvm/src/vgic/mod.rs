@@ -267,8 +267,9 @@ impl Vgic {
         let (ty, vcpu, id) = abi_shim::irq_line_decode(irq);
         match ty {
             abi_shim::IRQ_TYPE_SPI => {
-                let intid = id + NR_PRIV;
-                if intid >= self.nr_irqs {
+                // Linux: userspace passes the INTID itself, and an SPI below 32 is EINVAL.
+                let intid = id;
+                if intid < NR_PRIV || intid >= self.nr_irqs {
                     return Err(abi_shim::EINVAL);
                 }
                 Ok(self.set_line(intid, 0, level != 0))
@@ -347,6 +348,11 @@ impl Vgic {
         struct Cand {
             e: LrEntry,
             level: bool,
+            /// Active level interrupt whose line is still high (the guest is in its handler and
+            /// the run returned to userspace): listed active-only with the EOI bit, so the
+            /// guest's EOI empties the LR and raises the maintenance interrupt that resamples
+            /// the line. A pending+active LR would instead be re-delivered at once.
+            relist: bool,
         }
         let mut cands: Vec<Cand> = Vec::new();
         if self.dist_enabled {
@@ -377,11 +383,12 @@ impl Vgic {
                             src: s,
                             prio: i.prio,
                             group1: i.group1,
-                            pending: pend,
+                            pending: pend && !(i.active && !i.edge && intid >= NR_SGI),
                             active: i.active && n == 0,
                             eoi: false,
                         },
                         level: !i.edge && intid >= NR_SGI,
+                        relist: pend && i.active && !i.edge && intid >= NR_SGI,
                     });
                 }
             }
@@ -392,7 +399,7 @@ impl Vgic {
         while slot < nr_lr && next < cands.len() {
             if self.cpus[vcpu].lr_owner[slot].is_none() {
                 let c = &mut cands[next];
-                c.e.eoi = c.level && c.e.pending && !c.e.active;
+                c.e.eoi = c.level && ((c.e.pending && !c.e.active) || c.relist);
                 lrs[slot] = codec.encode(&c.e);
                 self.cpus[vcpu].lr_owner[slot] =
                     Some(LrOwner { intid: c.e.intid, src: c.e.src, act: c.e.active, eoi: c.e.eoi });
@@ -438,7 +445,9 @@ impl Vgic {
                 i.latch = true;
             }
             i.active = if o.act { act } else { i.active || act };
-            if empty && o.eoi && !i.edge {
+            // An LR carrying the EOI bit stays non-empty in ELRSR until the maintenance interrupt
+            // is serviced, so the guest's EOI is recognised by its state going invalid.
+            if !pend && !act && o.eoi && !i.edge {
                 self.resample.push(o.intid);
             }
         }

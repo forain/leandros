@@ -9,6 +9,7 @@ pub mod sysreg;
 pub use abi::*;
 
 pub mod ioevent;
+pub mod irqfd;
 pub mod memslot;
 pub mod s2;
 pub mod vmid;

@@ -43,6 +43,7 @@ pub struct Vm {
     pub vtcr: u64,
     pub vcpus: Mutex<[Option<Weak<Vcpu>>; KVM_MAX_VCPUS as usize]>,
     pub ioevents: Mutex<Vec<IoEvent>>,
+    pub irqfds: Mutex<::kvm::irqfd::IrqfdTable>,
     /// Object id of the in-kernel irqchip device (0 = none).
     pub vgic_dev: AtomicU32,
     /// The in-kernel vGIC state machine (created by KVM_CREATE_DEVICE; `vgicdev.rs`).
@@ -75,6 +76,7 @@ impl Drop for Vm {
         for pa in pas { mm::vmm::unpin_user_page(pa as usize); }
         VMIDS.lock().release(self.vmid.get_mut());
         self.drop_ioevents();
+        self.drop_irqfds();
         NVMS.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -102,7 +104,7 @@ pub(super) fn create(pid: u32, arg: usize) -> isize {
         id, tgid: sched::tgid_of(pid), as_root, ipa_bits: want,
         slots: Mutex::new(SlotTable::new()), s2: Mutex::new(s2), vmid: Mutex::new(slot),
         vttbr: AtomicU64::new(vttbr), vtcr, vcpus: Mutex::new([const { None }; KVM_MAX_VCPUS as usize]),
-        ioevents: Mutex::new(Vec::new()), vgic_dev: AtomicU32::new(0), vgic: Mutex::new(None),
+        ioevents: Mutex::new(Vec::new()), irqfds: super::irqfd::new_table(), vgic_dev: AtomicU32::new(0), vgic: Mutex::new(None),
     });
     NVMS.fetch_add(1, Ordering::AcqRel);
     { let mut v = VMS.lock(); v.retain(|w| w.strong_count() > 0); v.push(Arc::downgrade(&vm)); }
@@ -126,13 +128,7 @@ pub(super) fn ioctl(vm: &Arc<Vm>, pid: u32, cmd: usize, arg: usize) -> isize {
         KVM_IRQ_LINE => match rd::<KvmIrqLevel>(arg) { Ok(l) => irq_line(vm, &l), Err(e) => e },
         KVM_CREATE_DEVICE => device::create(vm, pid, arg),
         KVM_IOEVENTFD => match rd::<KvmIoeventfd>(arg) { Ok(a) => vm.ioeventfd(pid, &a), Err(e) => e },
-        KVM_IRQFD => match rd::<KvmIrqfd>(arg) {
-            Ok(a) => match (vm.has_vgic(), vgic()) {
-                (true, Some(b)) => match b.irqfd(vm, &a) { Ok(()) => 0, Err(e) => -(e as isize) },
-                _ => -22,
-            },
-            Err(e) => e,
-        },
+        KVM_IRQFD => match rd::<KvmIrqfd>(arg) { Ok(a) => vm.irqfd(pid, &a), Err(e) => e },
         KVM_ENABLE_CAP => -22,
         _ => -25, // ENOTTY
     }

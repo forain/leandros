@@ -3557,6 +3557,30 @@ pub fn eventfd_slot_signal_unref(slot: usize) -> bool {
     true
 }
 
+/// Hook run after every eventfd write(2) (KVM_IRQFD). Zero = none: the write path then costs one
+/// relaxed load. The hook gets the slot, runs in the writer's task context with no vfs lock held.
+static EVENTFD_SET_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+pub fn eventfd_set_hook(f: Option<fn(usize)>) {
+    EVENTFD_SET_HOOK.store(f.map_or(0, |f| f as usize), core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn eventfd_run_set_hook(slot: usize) {
+    let h = EVENTFD_SET_HOOK.load(core::sync::atomic::Ordering::Relaxed);
+    if h != 0 {
+        let f: fn(usize) = unsafe { core::mem::transmute(h) };
+        f(slot);
+    }
+}
+
+/// Reset eventfd `slot`'s counter to zero (what Linux's irqfd does after injecting).
+pub fn eventfd_slot_drain(slot: usize) {
+    if slot >= MAX_EVENTFDS { return; }
+    let mut counters = EVENTFD_COUNTERS.lock();
+    if counters[slot] != u64::MAX { counters[slot] = 0; }
+}
+
 /// Drop the reference `eventfd_slot_ref` took, from task context. Frees the
 /// slot if it was the last one, exactly as `release_vnode` does.
 pub fn eventfd_slot_unref(slot: usize) {
@@ -11582,6 +11606,7 @@ fn handle_write(pid: u32, fd: usize, buf_ptr: usize, count: usize, ap: u64) -> M
             // eventfd is mio/tokio's runtime waker: a POLLIN edge for whoever
             // is parked in epoll_wait (K2 real blocking).
             sched::wake_poll_key(eventfd_key(slot));
+            eventfd_run_set_hook(slot);
             val_reply(8)
         }
         VnodeKind::DevStdio { .. } => {

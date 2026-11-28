@@ -73,7 +73,6 @@ impl VgicBackend for Backend {
         kick::kick_mask(vm, kicks);
         Ok(())
     }
-    // irqfd: TODO(kvm-run) needs an eventfd write hook in servers/vfs (`eventfd_set_hook`,
-    // plan section 3 item 7). Default ENOSYS: QEMU with an in-kernel irqchip requires it.
+    // irqfd lives in `irqfd.rs` (it needs the caller's fd table), not in this trait.
 }
 pub(super) static BACKEND: Backend = Backend;
