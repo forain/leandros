@@ -42,6 +42,10 @@ fn copy_out(s: &str, buf: *mut u8, cap: usize) -> usize {
 }
 
 extern "C" fn pm_shutdown(_: usize, _buf: *mut u8, _cap: usize) -> i32 { nvme::shutdown_all(); 0 }
+/// rmmod: delete the queues and complete CC.SHN while bus mastering is still on. Left to exit(), the
+/// admin commands run after quiesce_pci() cleared BME and MSI: no completion can be written, so each waits
+/// out its 10 s timeout and the 5 s exit() budget ends in a Zombie (EBUSY on the next rmmod).
+extern "C" fn pm_unload(_: usize, _buf: *mut u8, _cap: usize) -> i32 { nvme::shutdown_all(); 0 }
 extern "C" fn pm_kexec(_: usize, buf: *mut u8, cap: usize) -> i32 {
     let mut s = String::new();
     for l in nvme::kexec_disable() { s.push_str(&l); s.push('\n'); }
@@ -52,7 +56,7 @@ static PM: kmod_kapi::pm::KPmOps = kmod_kapi::pm::KPmOps {
     size: core::mem::size_of::<kmod_kapi::pm::KPmOps>() as u32,
     phase: kmod_kapi::pm::pm_phase::BLOCK,
     suspend: None, resume: None, freeze: None, thaw: None,
-    shutdown: Some(pm_shutdown), kexec_quiesce: Some(pm_kexec), resume_check: None, unload_quiesce: None,
+    shutdown: Some(pm_shutdown), kexec_quiesce: Some(pm_kexec), resume_check: None, unload_quiesce: Some(pm_unload),
 };
 
 static DONE: AtomicBool = AtomicBool::new(false);
