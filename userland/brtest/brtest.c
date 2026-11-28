@@ -1115,6 +1115,17 @@ static int route_default(int s, int oif, const char *gw) {
     nl_attr(&m, RTA_GATEWAY, &g, 4); nl_attr(&m, RTA_OIF, &oif, 4);
     return nl_do(s, &m);
 }
+/* Count identity (nat == cport) and NATed IPv4 conntrack lines in /proc/net/nic, adding to the counters. */
+static void ct_ident_scan(int *ident, int *nated) {
+    FILE *tf = fopen("/proc/net/nic", "r");
+    char l[1024];
+    while (tf && fgets(l, sizeof l, tf)) {
+        int pr, nt, cp, rp, a[8];
+        if (sscanf(l, "fwd_ct: proto %d nat %d %d.%d.%d.%d:%d->%d.%d.%d.%d:%d", &pr, &nt, &a[0], &a[1], &a[2], &a[3], &cp, &a[4], &a[5], &a[6], &a[7], &rp) != 12) continue;
+        if (nt == cp) (*ident)++; else (*nated)++;
+    }
+    if (tf) fclose(tf);
+}
 static const unsigned char VICTIM_MAC[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0xaa };
 static int g_fwd_mode; /* 0 = UDP DNS query, 1 = ping the QEMU gateway; expect success */
 static int g_fwd_expect = 1;
@@ -1503,6 +1514,18 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
             (void)brc;
         } else kill(c, SIGKILL);
     }
+    /* The identity entry dies with the netns (veth forget is asynchronous after the holder exits), so it
+     * must be observed while the child is alive: poll until it shows up, then reap. */
+    int seen_ident = 0, seen_nated = 0;
+    if (g_fwd_ident) {
+        for (int i = 0; i < 600 && seen_ident == 0; i++) {
+            int id = 0, nt = 0;
+            ct_ident_scan(&id, &nt);
+            if (id > seen_ident) seen_ident = id;
+            if (nt > seen_nated) seen_nated = nt;
+            if (seen_ident == 0) usleep(50000);
+        }
+    }
     int rc = wait_child(c);
     if (mode == 5) {
         /* netns teardown (veth/vif forget) is asynchronous; on a loaded TCG box it takes longer than 0.5 s */
@@ -1536,15 +1559,8 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
         CHECK(msg, stat_get("route_nonat") > nonat0 && nat_scan() == 0);
     }
     if (g_fwd_ident) {
-        int ident = 0, nated = 0;
-        FILE *tf = fopen("/proc/net/nic", "r");
-        char l[1024];
-        while (tf && fgets(l, sizeof l, tf)) {
-            int pr, nt, cp, rp, a[8];
-            if (sscanf(l, "fwd_ct: proto %d nat %d %d.%d.%d.%d:%d->%d.%d.%d.%d:%d", &pr, &nt, &a[0], &a[1], &a[2], &a[3], &cp, &a[4], &a[5], &a[6], &a[7], &rp) != 12) continue;
-            if (nt == cp) ident++; else nated++;
-        }
-        if (tf) fclose(tf);
+        int ident = seen_ident, nated = seen_nated;
+        ct_ident_scan(&ident, &nated);
         snprintf(msg, sizeof msg, "%s: the flow is tracked by an identity conntrack entry (%d identity, %d NATed)", name, ident, nated);
         CHECK(msg, ident >= 1 && nated == 0);
     }
