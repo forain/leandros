@@ -18,7 +18,9 @@ These are development credentials, well known by design. `cosmic-greeter` is a s
 
 ### /etc/shadow
 
-The hash format is sha512-crypt `$6$[rounds=N$]<salt>$<hash>` (the image builder writes `rounds=65536` with a fixed per-user salt); legacy `$sha256$<salt>$<hex>` fields still verify. It is verified by `/bin/login`, sshd and `pam-leandros` through one shared source, [`lib/shadowhash`](../../lib/shadowhash/shadowhash.rs) (no libc `crypt`), and produced by `shadow_hash` in the image builder. `/etc/shadow` is mode `0600`. There is no `passwd(1)`.
+The hash format is sha512-crypt `$6$[rounds=N$]<salt>$<hash>` (the image builder writes `rounds=65536` with a fixed per-user salt); legacy `$sha256$<salt>$<hex>` fields still verify. `/bin/login` and sshd verify it through [`lib/shadowhash`](../../lib/shadowhash/shadowhash.rs) (no libc `crypt`); sudo, su and greetd verify it through **real Linux-PAM** (Alpine's `linux-pam`, `pam_unix` and its setuid `unix_chkpwd`, see [su and sudo](#su-and-sudo)). The image builder produces it with `shadow_hash`. `/etc/shadow` is mode `0600`. There is no `passwd(1)`.
+
+**Shadow records must be what musl's `getspnam` accepts**: exactly nine fields, digits or empty in the numeric ones, a final newline and no CR. Older images wrote `root:HASH:`, which makes `unix_chkpwd` report "cannot retrieve authentication info". The builder now writes full nine-field records, and [`shadowfix`](../../userland/shadowfix/src/main.rs), which PID 1 runs at every boot (10 s limit), repairs a file that does not conform. It pads short records, fixes a missing newline or a CR, drops trailing empty extra fields, replaces a `$sha256$` development hash that verifies against its account's own name by a `$6$` one of the same password (PAM cannot verify `$sha256$`), and adds a `name:*::0:99999:7:::` record (no password, not locked, so key logins still work) for a passwd account without one. It never adds a root record or locks root, refuses an empty or root-less shadow, and reports a record it cannot repair loudly without touching it. `/bin/login` and sshd rehash a legacy hash on a successful login, under a bounded, logged lock on the password files (`O_CLOEXEC|O_NOFOLLOW`, not created on a read-only `/etc`). PID 1 also resets `unix_chkpwd` to `4755 root` every boot, because `apk upgrade linux-pam` reinstalls it as Alpine ships it (`2755 root:shadow`), which cannot read our `0600 root:root` shadow.
 
 ## Logging in
 
@@ -26,12 +28,13 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 
 - **Serial getty** — `/bin/login` on the console in a fresh session. It reads `/etc/passwd` and `/etc/shadow`, verifies the password, parses `/etc/group` member lists and calls `setgroups` (initgroups without a libc), then `setresgid` and `setresuid`, and execs the account's shell. Every interactive harness logs in this way.
 - **Text VTs** — the same `/bin/login` on `/dev/tty2..6` ([tty-and-vt.md](tty-and-vt.md#virtual-terminals)), with `setsid` and `TIOCSCTTY`; `login` does not echo the username itself on a pty, or it would appear twice.
-- **Graphical login** (the default) — `greetd` runs `cosmic-comp` in kiosk mode **as root**, whose child `/bin/greeter-launch` looks up `cosmic-greeter`, `setgroups`/`setresgid`/`setresuid`s to it, **reads `getuid()` back** to prove the drop, and execs `cosmic-greeter`. Authentication crosses greetd's IPC to its session worker, which uses `pam-leandros` (the libpam application ABI backed by `/etc/shadow`) and starts the session entirely as the user. A launcher that reports a drop it did not perform would produce a login screen indistinguishable from a correct one, which is why the uid is checked. Details: [../desktop/login.md](../desktop/login.md).
+- **Graphical login** (the default) — `greetd` runs `cosmic-comp` in kiosk mode **as root**, whose child `/bin/greeter-launch` looks up `cosmic-greeter`, `setgroups`/`setresgid`/`setresuid`s to it, **reads `getuid()` back** to prove the drop, and execs `cosmic-greeter`. Authentication crosses greetd's IPC to its session worker, which uses real Linux-PAM (`/etc/pam.d/greetd` includes Alpine's `base-auth`) and starts the session entirely as the user. A launcher that reports a drop it did not perform would produce a login screen indistinguishable from a correct one, which is why the uid is checked. Details: [../desktop/login.md](../desktop/login.md).
 
 `touch /etc/leandros/text-login` disables the graphical login.
 
 **SSH** is a fourth way in. `/usr/sbin/sshd` ([../userland/programs.md](../userland/programs.md#sshd)) listens on `0.0.0.0:22` from boot.
-- It checks passwords against the same `/etc/shadow` hash as `/bin/login`, and keys against `~/.ssh/authorized_keys`.
+- It checks passwords against the same `/etc/shadow` hash as `/bin/login`, and keys against `~/.ssh/authorized_keys`. Beyond that it supports `AuthorizedPrincipalsFile`, `RevokedKeys` (a plain list or a binary KRL) and `Match` on `Host`, `LocalAddress`, `LocalPort` and `RDomain`.
+- The login's utmp record is written in the child before it execs, as OpenSSH does, so `w` and `who` in the first command see the session, and a failed exec leaves no stale row.
 - It allows root to log in with a key but not with a password.
 - It forwards TCP (`-L`, `-R`) unless the key line has `no-port-forwarding`/`restrict`; `permitopen=`/`permitlisten=` restrict the destinations. The listener and monitor run as root, but the russh network code runs in a per-connection child (uid 22, chroot `/var/empty`, no_new_privs, seccomp allow-list) that holds no host key; see [../design/sshd-privsep.md](../design/sshd-privsep.md).
 - Its children drop privilege the way `login` does (setgroups, then setresgid, then setresuid) and read the ids back.
@@ -39,12 +42,12 @@ Three login paths exist, all supervised and respawned by PID 1 ([`userland/init`
 
 ## su and sudo
 
-`/bin/su` and `/bin/sudo` are [sudo-rs](../../ports/sudo-rs/README.md) v0.2.15, statically linked against musl and `pam-leandros`, installed `04755 root`. User-facing usage is in [../getting-started/logging-in.md](../getting-started/logging-in.md#switching-user-su-and-sudo).
+`/bin/su` and `/bin/sudo` are [sudo-rs](../../ports/sudo-rs/README.md) v0.2.15, dynamic musl PIEs linked against Alpine's real `libpam.so.0` ([`scripts/lib/realpam.sh`](../../scripts/lib/realpam.sh)), installed `04755 root`. The build puts the dynamic musl loader and libpam in place so libpam can `dlopen` `pam_unix` and the other modules; the old `pam-leandros` shim was retired. User-facing usage is in [../getting-started/logging-in.md](../getting-started/logging-in.md#switching-user-su-and-sudo).
 
 - **Policy**: `/etc/sudoers` (`0440`, from [`ports/sudo-rs/data/sudoers`](../../ports/sudo-rs/data/sudoers)) grants `root` and `%wheel` everything, with `env_reset`, a `secure_path`, `env_keep` for `WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, `XDG_SESSION_DESKTOP`, `XDG_CURRENT_DESKTOP`, the locale and `TERM`/`COLORTERM`, and `timestamp_timeout=5`. `wheel` is gid 10; `leandro` is its only member, so `cosmic-greeter` is refused. `/etc/shells` lists the login shells.
-- **PAM**: `pam-leandros` answers services `su`/`su-l` with `pam_rootok` (a real uid of 0 needs no password) and, for `su`, `su-l`, `sudo` and `sudo-i`, exports `XDG_RUNTIME_DIR=/run/user/<target uid>` from `pam_open_session` when that directory exists — the job `pam_systemd` does on Linux.
+- **PAM**: the stacks are in [`ports/pam-rundir/data`](../../ports/pam-rundir/data) (`su`, `su-l`, `sudo`, `sudo-i`) and [`ports/greetd/data/pam.d-greetd`](../../ports/greetd/data/pam.d-greetd): they include Alpine's `base-auth`/`base-account`/`base-session-noninteractive`, `su` adds `pam_rootok` (a real uid of 0 needs no password), and `ports/pam-rundir/pam_rundir.c` is the provider for the `-session optional pam_rundir.so` slot, which exports `XDG_RUNTIME_DIR=/run/user/<target uid>` from `pam_open_session` when that directory exists, the job `pam_systemd` does on Linux. greetd's own session worker is `session-leandros` (utmpx records). `sudotest` has red/green PAM cases, including `AT_SECURE` (`LD_PRELOAD` ignored by setuid su/sudo) and locked accounts.
 - **Credential cache**: timestamp records live in `/run/user/.sudo-rs/ts` (tmpfs, so they do not survive a reboot). sudo scopes a record by the parent process and its start time, which is why `/proc/<pid>/stat`'s `starttime` must be the real creation time (it was the current uptime until 2026-10-17, so the 5-minute cache never matched).
-- **Local patches** ([`ports/sudo-rs/patches`](../../ports/sudo-rs/patches)): a failed `chown` of the pty follower is not fatal (the VFS keeps no pty owner); `/dev/tty` that is not a tty is treated as absent, so sudo runs without a pty (as on Linux with `ENXIO`); a bare `-E` keeps every caller variable under `SETENV` (`PATH` stays `secure_path`); and the tmpfs timestamp directory.
+- **Local patches** ([`ports/sudo-rs/patches`](../../ports/sudo-rs/patches)): only a standalone-workspace patch and one that makes a bare `-E` keep every caller variable under `SETENV` (`PATH` stays `secure_path`). The pty-chown and timestamp-directory patches were dropped when `/var/run` became an on-disk symlink to `/run` (tmpfs, as on Alpine; the VFS follows `/var/run/<x>` into the tmpfs and f2fs re-dispatches absolute symlink targets into `/run`, `/tmp`, `/dev` and `/proc`).
 - `/etc/profile` returns right after setting `PATH` and `XDG_RUNTIME_DIR` when `XDG_SEAT` is unset, so `su -` and `sudo -i` do not run the graphical session's start-up steps.
 
 ## Credentials in the kernel
@@ -120,10 +123,10 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 
 | Gap | Notes |
 |---|---|
-| No real PAM stack | `pam-leandros` implements the application ABI greetd needs (including the environment table, which *is* greetd's session `envp`); `open_session`/`setcred` are stubs, which is correct for greetd. Whether to keep extending it or port Linux-PAM (which `dlopen`s its modules) is undecided. |
+| PAM only for sudo, su and greetd | These use real Linux-PAM. `/bin/login` and sshd still verify `/etc/shadow` themselves (`lib/shadowhash`) and run no PAM account or session stack. |
 | utmpx is plain files | `/run/utmps/utmp`, `/var/log/wtmp` and `/var/log/lastlog` are written directly by `login`, init, sshd and the PAM shim (all root) with no locking beyond `flock`; the `utmpd` socket accepts `putline` only from uid 0. See [../userland/programs.md](../userland/programs.md#utmpx). |
 | Private IPC syscalls unchecked | `SYS_IPC_SEND` to any port id, `SYS_SPAWN` and the debug serial-write syscall carry no credential checks. |
-| Coarse host privilege | Capabilities and user namespaces exist ([../kernel/namespaces.md](../kernel/namespaces.md)), but most host-wide checks (module load, device nodes, raw sockets, rlimit raises) test euid 0 in the initial namespace rather than an individual capability. |
+| Coarse host privilege | Capabilities and user namespaces exist ([../kernel/namespaces.md](../kernel/namespaces.md)); some host-wide checks (nvidia admin, DRM debug ioctls, connect to a mounted-socket DAC, the overlay self-test) require a host capability, so a user namespace whose map covers kuid 0 no longer passes them. Most others (module load, device nodes, raw sockets, rlimit raises) still test euid 0 in the initial namespace rather than an individual capability. |
 | rlimits stored, mostly not enforced | Only `RLIMIT_NICE` and `RLIMIT_RTPRIO` act; all others default to unlimited. |
 | `protected_regular` / `protected_fifos` | `O_CREAT` on another user's file in sticky `/tmp` is not restricted. |
 | `setsid()` by a group leader | Succeeds (Linux: `EPERM`); left because of session-start risk, with no privilege gain. |
@@ -147,7 +150,7 @@ The project's broader list of desktop limitations lives in [../desktop/limitatio
 
 - [filesystems.md](filesystems.md#extended-attributes-and-posix-acls) — the xattr/ACL contract.
 - [vfs.md](vfs.md) — where the checks sit in path resolution.
-- [../desktop/login.md](../desktop/login.md) — greetd, the greeter, `pam-leandros`.
+- [../desktop/login.md](../desktop/login.md) — greetd, the greeter, PAM.
 - [../desktop/limitations.md](../desktop/limitations.md) — what the desktop still cannot do.
 - [../kernel/processes.md](../kernel/processes.md) — credentials, chroot and priorities in the process model.
 - [../kernel/namespaces.md](../kernel/namespaces.md) — user namespaces, capabilities, seccomp and the mount/PID/network namespaces.

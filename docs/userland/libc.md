@@ -41,7 +41,7 @@ translation layer. Nothing in those projects is patched to know it is running on
 
 ### Static musl
 
-Rust crates (busd, greetd, `leandros-sysbus`, `mkfs.xfs`, `killmt`, `spawnwedge`) are built
+Rust crates (busd, greetd, `leandros-sysbus`, `killmt`, `spawnwedge`) are built
 with `cargo +nightly` for the musl targets using Rust's self-contained musl CRT and
 `rust-lld`; no cross-gcc is needed. Sibling projects (brush, coreutils, bottom, disks-rs) link
 through `scripts/toolchain/<arch>-linux-musl-cc` wrappers
@@ -102,7 +102,7 @@ FUNC sizes are not compared, Alpine builds `-Os`). Layout:
   `/usr/sbin/busybox.static cp /lib/ld-musl-<arch>.so.1.recovery /lib/ld-musl-<arch>.so.1`.
 
 `apk del musl` is refused; `musl` is pinned in
-`/etc/apk/world`, so any bump (3.24 / musl 1.2.6) needs the full test set. The build sysroot,
+`/etc/apk/world`, so any bump (edge, musl 1.2.6) needs the full test set. The build sysroot,
 the Firefox and git ports still apply the rewrite below (a parallel lane replaces them). Alpine's loader is
 stripped; install `musl-dbg` to symbolize it.
 

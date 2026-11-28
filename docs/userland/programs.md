@@ -149,12 +149,13 @@ reason the monitor can trust the unprivileged child: it cannot vouch for a login
 | `leandro` | `leandro` | 1000 | `/home/leandro` | `audio`, `video`, `input` |
 
 plus the system account `cosmic-greeter` (uid 990, shell `/bin/false`, in `video` and
-`input`). The `/etc/shadow` format is LeandrOS's own `$sha256$<salt>$<hex>`, the SHA-256 of
-salt followed by password, verified by an embedded SHA-256 in
-[userland/login](../../userland/login/src/main.rs) and by `pam-leandros`; there is no
-`crypt(3)`. The image builder computes the same hash with Python's `hashlib`, and the two must
-stay byte-for-byte in sync (a `pam-leandros` host test asserts it). There is no `passwd(1)` to
-change a password.
+`input`). The `/etc/shadow` format is sha512-crypt `$6$` (`rounds=65536`), verified by
+[`lib/shadowhash`](../../lib/shadowhash/shadowhash.rs) in
+[userland/login](../../userland/login/src/main.rs) and sshd, and by Alpine's `pam_unix` for sudo, su and
+greetd; a legacy `$sha256$<salt>$<hex>` field still verifies in `login` and sshd and is rewritten on the
+next successful login (`shadowfix` converts the development ones at boot, since PAM cannot verify
+them, see [security.md](../servers/security.md#etcshadow)). There is no `crypt(3)` and no `passwd(1)` to change
+a password.
 
 `login` reads the username and password (without echoing itself on a pty, where the line
 discipline already echoes), sets the account's supplementary groups before dropping
@@ -193,7 +194,7 @@ leandros-libc.
 |---|---|---|
 | coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `id`, `env`, …) | [uutils/coreutils](https://github.com/uutils/coreutils), sibling `../coreutils` | One static musl multicall binary built with upstream's `feat_os_unix_musl` set (which drops `stdbuf`, the one utility that needs a cdylib); every command name is a hardlink, the list derived from the checkout's `Cargo.toml` and `src/uu`. Also installed as `/usr/bin/env`. `sync FILE` fsyncs just that file (a local patch in the sibling checkout; upstream's whole-system `sync` made fsync-heavy scripts pay for a full checkpoint), guarded by the `syncfile` suite. |
 | `btm` / `bottom` | sibling `../bottom-leandros` | system monitor, static musl |
-| `mkfs.fat`, `mkfs.xfs` | [ports/mkfs-fat](../../ports/mkfs-fat/), [ports/mkfs-xfs](../../ports/mkfs-xfs/README.md) | in-tree Rust formatters for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
+| `mkfs.fat`, `mkfs.xfs` | Alpine `dosfstools` and `xfsprogs` | vanilla packages for disks-rs ([ports.md](ports.md#disks-rs-mkfsfat-and-mkfsxfs)) |
 | `disktester` | sibling `../disks-rs` | AerynOS's provisioning tester, unmodified |
 | `gpuprobe` | the Mesa GPU stage | reports virtio-gpu capsets and creates a real GBM + EGL context; `/bin/gpu-env` decides the renderer from it |
 | `git`, `less`, `nano`, `sftp-server` | [ports/git](../../ports/git/build.sh) | Alpine's git (https through libcurl/OpenSSL), its pager, an editor (`/etc/gitconfig` sets `core.editor = nano`) and OpenSSH's sftp server. `git`, `git-upload-pack`, `git-receive-pack`, `git-upload-archive`, `less` and `nano` are also in `/bin`, because the console login's `PATH` is `/bin` |
@@ -295,7 +296,7 @@ It never blocks boot, and a failed step leaves no stamp, so the next boot retrie
 Login records follow the Alpine/musl `struct utmpx` (400 bytes) so Alpine's busybox
 (`/bin/busybox.static who`, `... last`) reads them unmodified. The shared writer is
 `lib/utmpx/utmpx.rs` (`core` only, raw syscalls; `#[path]`-included by init, login, utmpd,
-sshd and `pam-leandros`).
+sshd and greetd's `session-leandros`).
 
 | File | Content | Reader |
 |---|---|---|
