@@ -134,3 +134,4 @@ Items marked (?) were not re-verified since the 2026-10 reconciliation.
 - Open: the aarch64 ship-set on 3.24 was built under qemu-user; real-GPU (laptop/PC/Pi) runs of the 3.24 stage not done.
 - ffsandbox harness (lane/ffsbfix 2026-11-28): benign broker 'Failed errno -22 op readlink' + 'Recording mapping' ignored (Linux logs the same); page now fetches loopback http so the lazy socket process spawns and is checked (Seccomp 2); x86_64+aarch64 'on' pass.
 - reboot/restart/poweroff now run the dma_shutdown Device-stage hooks (lane/rebootshut; device trial via device-update.sh pending)
+- brtest nftnat_nonat_ident flake (lane/brflake 2026-11-28): the check read conntrack after the netns child exited, racing the async veth forget() that purges its entries; the test now polls for the identity entry while the child lives
