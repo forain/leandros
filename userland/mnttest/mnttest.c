@@ -2409,6 +2409,37 @@ static int ot_setattr(int m) {
     if (osetattr(AT_FDCWD, "/tmp/otk", 0, 0, 1) == 0 || errno != EPERM) return 14; /* locked ro */
     return 0;
 }
+/* lane edgebwrap: bubblewrap 0.13 (Alpine edge, flatpak run) binds
+ * /proc/self/ns/user onto a file at /run/.userns, then applies mount_setattr
+ * to it: by path, by an O_PATH fd with AT_EMPTY_PATH (+AT_RECURSIVE), and
+ * through an open_tree(OPEN_TREE_CLONE) clone of the bound file. Each step
+ * must succeed on an nsfs file mount (rc names the failing step). */
+static int ot_nsfs_setattr(int m) {
+    (void)m;
+    const char *f = "/tmp/otn.userns";
+    if (unshare(CLONE_NEWNS) < 0) return 91;
+    int fd = open(f, O_RDWR | O_CREAT, 0444); if (fd < 0) return 92; close(fd);
+    if (mount("/proc/self/ns/user", f, "none", MS_BIND, NULL) < 0) { printf("  nsfs bind errno=%d\n", errno); return 1; }
+    if (osetattr(AT_FDCWD, f, 0, 1, 0) < 0) { printf("  setattr path errno=%d\n", errno); return 2; }
+    if (ot_mi_ro(f) != 1) return 3;
+    fd = open(f, O_PATH | O_CLOEXEC);
+    if (fd < 0) { printf("  O_PATH errno=%d\n", errno); return 4; }
+    if (osetattr(fd, "", 0x1000 | OT_REC, 0x1 | 0x2 | 0x4, 0) < 0) { printf("  setattr fd errno=%d\n", errno); return 5; }
+    close(fd);
+    int t = otree(AT_FDCWD, f, OT_CLONE | OT_CLOEXEC);
+    if (t < 0) { printf("  open_tree nsfs errno=%d\n", errno); return 6; }
+    if (osetattr(t, "", 0x1000 | OT_REC, 0x1 | 0x2 | 0x4, 0) < 0) { printf("  setattr clone errno=%d\n", errno); return 7; }
+    const char *g = "/tmp/otn.userns2";
+    fd = open(g, O_RDWR | O_CREAT, 0444); if (fd < 0) return 92; close(fd);
+    if (omove(t, "", AT_FDCWD, g, 4) < 0) { printf("  move_mount errno=%d\n", errno); return 8; }
+    close(t);
+    if (ot_mi_ro(g) != 1) return 9;
+    t = otree(AT_FDCWD, "/proc/self/ns/user", OT_CLONE | OT_CLOEXEC);
+    if (t < 0) { printf("  open_tree magic errno=%d\n", errno); return 10; }
+    close(t);
+    if (umount(g) < 0 || umount(f) < 0) return 11;
+    return 0;
+}
 static void opentree_suite(void) {
     report("opentree_noclone_handle", nn_in_child(ot_noclone, 0));
     report("opentree_crun_sys_clone_move", nn_in_child(ot_crun_sys, 0));
@@ -2417,6 +2448,7 @@ static void opentree_suite(void) {
     report("opentree_detached_release", nn_in_child(ot_release, 0));
     report("opentree_move_existing", nn_in_child(ot_move, 0));
     report("opentree_setattr_ro_and_locked", nn_in_child(ot_setattr, 0));
+    report("opentree_nsfs_file_setattr_bwrap", nn_in_child(ot_nsfs_setattr, 0));
 }
 
 /* lane fdbindprop: crun's etc/hosts sequence - bind a source onto a target in a

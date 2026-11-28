@@ -16,7 +16,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL"; exit 3; }
+  [ "${ALPINE_REL:?}" = edge ] || grep -q "^${ALPINE_REL}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL"; exit 3; }
   PKGS="gstreamer gstreamer-tools gst-plugins-base gst-plugins-good gst-libav gst-plugin-pipewire"
   DEVPKGS="pipewire-dev gstreamer-dev gst-plugins-base-dev glib-dev util-linux-dev pcre2-dev"
   if [ "$(uname -m)" = "$ARCH" ]; then

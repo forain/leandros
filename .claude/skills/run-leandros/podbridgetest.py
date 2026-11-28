@@ -146,6 +146,7 @@ def main():
         rc, base = run("nft list ruleset | md5sum")
         rc, out = srv_tcp("pbpub", "-p 18081:80", 80)
         rc, rs = run("nft list ruleset 2>&1")
+        print("podbridge: nft ruleset after -p 18081:80:\n" + rs[-6000:], flush=True)
         check("podman_nft_driver", re.search(r"dport 18081", rs) is not None and "NETAVARK-HOSTPORT-DNAT" in rs,
               "ruleset: " + rs.strip()[-160:].replace("\n", " | "))
         for nm, u in (("lo", "127.0.0.1"), ("nicip", nicip)):
@@ -239,6 +240,21 @@ def main():
         # the 1 s IPv6 DAD on the container veth (tentative address is held out of the stack, as on Linux): wait it out
         rc, out = run(f"podman run --rm --network pb6 {IMG} sh -c 'sleep 2; ping -6 -c3 -W 5 {gw6}' 2>&1")
         check6("podman_v6_ping", rc == 0 and re.search(r" 0% packet loss", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
+        if rc != 0:
+            _, dg = run(f"podman run --rm --network pb6 {IMG} sh -c 'cat /proc/sys/net/ipv4/ping_group_range; grep -i cap /proc/self/status; id' 2>&1")
+            print("podman_v6_ping_diag: " + dg.strip().replace("\n", " | "), flush=True)
+            _, dg = run(f"podman create --name pbdiag --network pb6 {IMG} true >/dev/null 2>&1; podman inspect --format '{{{{.HostConfig.Sysctls}}}}' pbdiag 2>&1; podman rm -f pbdiag >/dev/null 2>&1; grep -rn sysctl /usr/share/containers/containers.conf /etc/containers/containers.conf 2>&1 | head -5; podman --version; crun --version | head -1")
+            print("podman_v6_ping_diag2: " + dg.strip().replace("\n", " | "), flush=True)
+            _, dg = run(f"podman run --rm --network pb6 --sysctl net.ipv4.ping_group_range='0 0' {IMG} sh -c 'cat /proc/sys/net/ipv4/ping_group_range; ping -6 -c1 -W 5 {gw6}' 2>&1")
+            _, dg = run(f"cat /proc/sys/net/ipv4/ping_group_range; podman run --log-level=debug --rm --network pb6 {IMG} true 2>&1 | grep -i 'sysctl\\|ping_group' | cut -c1-200 | head -8")
+            _, dg = run(f"echo '1 0' > /proc/sys/net/ipv4/ping_group_range; podman run --rm --network pb6 {IMG} cat /proc/sys/net/ipv4/ping_group_range 2>&1; echo '0 2147483647' > /proc/sys/net/ipv4/ping_group_range")
+            print("podman_v6_ping_diag5(host 1 0): " + dg.strip().replace("\n", " | "), flush=True)
+            _, dg = run(f"podman create --name pbd2 --network pb6 {IMG} true >/dev/null 2>&1; podman inspect pbd2 2>&1 | grep -i -A3 'sysctl'; f=$(podman inspect -f '{{{{.OCIConfigPath}}}}' pbd2 2>/dev/null); echo cfg=$f; grep -c . $f; grep -i -A3 'sysctl' $f | head; podman rm -f pbd2 >/dev/null 2>&1")
+            print("podman_v6_ping_diag6: " + dg.strip().replace("\n", " | ")[:700], flush=True)
+            _, dg = run(f"podman --log-level=debug run --rm --network pb6 {IMG} true 2>&1 | grep -i -e sysctl -e 'containers.conf' -e 'ping_group' | cut -c1-220 | head -12")
+            print("podman_v6_ping_diag7: " + dg.strip().replace("\n", " | ")[:1200], flush=True)
+            print("podman_v6_ping_diag4: " + dg.strip().replace("\n", " | "), flush=True)
+            print("podman_v6_ping_diag3: " + dg.strip().replace("\n", " | ")[-300:], flush=True)
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
         check6("podman_v6_dns_udp", rc == 0 and re.search(r"Address.*:.*:", out) is not None, f"rc={rc} " + out.strip()[-160:].replace("\n", " | "))
         if port6 and v6ok:

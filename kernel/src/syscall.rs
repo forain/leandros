@@ -8711,6 +8711,14 @@ fn sys_statx(dirfd: usize, path_ptr: usize, flags: usize, _mask: usize, statxbuf
         core::ptr::write_unaligned((statxbuf + 132) as *mut u32, rmin);
         core::ptr::write_unaligned((statxbuf + 136) as *mut u32, dmaj);
         core::ptr::write_unaligned((statxbuf + 140) as *mut u32, dmin);
+        // STATX_MNT_ID (0x1000): stx_mnt_id@144. libglnx's chase (flatpak/ostree on
+        // Alpine edge) refuses a statx without a mount id. st_dev names the
+        // mount (a bind mount shares its source's id, which only makes
+        // mount-crossing checks lenient).
+        let dev = (stat_ptr as *const u64).read_unaligned();
+        core::ptr::write_unaligned((statxbuf + 144) as *mut u64, dev);
+        let m = core::ptr::read_unaligned(statxbuf as *const u32);
+        core::ptr::write_unaligned(statxbuf as *mut u32, m | 0x1000);
     }
     let rv = 0;
     if unsafe { ua::copy_to_user(statxbuf_user, statxbuf as *const u8, 256) } != 0 { return -14; }
@@ -9687,6 +9695,16 @@ fn fd_mount_ns_path(fd: usize) -> Result<Vec<u8>, isize> {
     if let Ok((4, id)) = vfs::nsfd_target(current_pid(), fd) {
         if let Some((ns, p)) = vfs::mnt::attached_at(id as sched::ns::NsId) {
             if ns == sched::current_mntns() { return Ok(p); }
+        }
+    }
+    // A descriptor opened on a bound nsfs file (bwrap's /run/.userns) is an
+    // anon_inode with no backing path: it names the mount it was opened through.
+    if vfs::nsfd_target(current_pid(), fd).is_ok() {
+        let mns = sched::current_mntns();
+        if let Some((n, m)) = vfs::fd_mnt(current_pid(), fd) {
+            if mns != 0 && n as sched::ns::NsId == mns {
+                if let Some(p) = vfs::mnt::nsfs_mountpoint(mns, m) { return Ok(p); }
+            }
         }
     }
     let mut host = fd_host_path(fd).ok_or(-2isize)?;
