@@ -116,13 +116,27 @@ The match arms read like Linux's `syscall_64.tbl` grouped by subsystem, and each
 
 Before the resolver existed only `open`, `chdir`, `execve` and `pivot_root` resolved anything; every other path syscall forwarded the raw user string, so the VFS saw `a.txt`, matched nothing and answered `ENOENT` — `cd /tmp; ls a.txt` failed while `ls /tmp/a.txt` worked. Ignoring `dirfd` broke every TOCTOU-safe traversal (GNU fts, `uucore::safe_traversal`): `rm /tmp/a/f` from another cwd did `unlinkat(dirfd, "f")` and got `ENOENT` on a file that existed. `renameat` honouring its dirfds, not just its paths, was the difference between a clean COSMIC session log and a storm of `ENOENT`s from atomic state-file writes. Having one resolver means chroot confinement and `AT_*` handling are implemented once.
 
+### File handles are classed per filesystem
+
+`name_to_handle_at`/`open_by_handle_at` encode a handle the way the owning filesystem does, as Linux does (lanes fhandle, fhgeneric, fhlink, kernfsfh):
+
+- **f2fs and tmpfs** by inode number. A handle decodes through the filesystem (f2fs `i_pino`/`i_name` and a real `i_generation`, kept to 31 bits so it cannot depend on the clock; the tmpfs pool), so a renamed file reopens, a deleted one gives `ESTALE`, a generation mismatch gives `ESTALE`, and a handle to a hard link survives unlinking the name it recorded. `AT_HANDLE_FID` returns identity only.
+- **procfs, devpts, mqueue, fuse**: `name_to_handle_at` answers `EOPNOTSUPP`.
+- **sysfs and cgroup2** keep a table; cgroup2 ids are never reused ([namespaces.md](namespaces.md#cgroup-v2)).
+
+The path table remains only as the fallback.
+
+### Probed syscalls that answer ENOSYS on purpose, and statx mount ids
+
+Kernel keyrings and `statmount`/`listmount` answer `ENOSYS` without a log line, as a Linux built without `CONFIG_KEYS` (or older than 6.8) does; podman, crun and systemd helpers probe them once and fall back to `/proc/self/mountinfo`. `statx` reports `STATX_MNT_ID` (`stx_mnt_id` at offset 144) derived from `st_dev`: libglnx's `chase` (flatpak, ostree) refuses a `statx` without it. A bind mount shares its source's id, which only makes mount-crossing checks lenient.
+
 ## Limitations and open work
 
 - `KPATH_MAX` is 256 bytes, far below Linux's 4096.
 - No vDSO: `clock_gettime` and `gettimeofday` are real syscalls. On AArch64 a one-page `rt_sigreturn` trampoline is mapped at `0x7fff_ff00_0000` instead (musl installs handlers without `SA_RESTORER`).
 - `getcpu` reports CPU 0; `sched_setaffinity` is accepted and ignored ([scheduler.md](scheduler.md#affinity)).
 - Several pointer arguments are still validated only shallowly (ioctl `arg` for block/DRM/tty, `getdents64`/`getcwd` buffers checked for one byte, `mount`, the `memfd_create` name), and some server paths still dereference user memory under their own locks (lane uptrfault's list); a bad pointer there kills the caller instead of returning `EFAULT`.
-- epoll: nested-epoll `ELOOP` and `EPOLLEXCLUSIVE` `EINVAL` checks are missing; `CLOSE_RANGE_UNSHARE` in a multithreaded caller lets siblings see the closes ([TODO.md](../../TODO.md)).
+- epoll: nested-epoll `ELOOP` and `EPOLLEXCLUSIVE` `EINVAL` checks are missing (a nested registration does follow its instance across `dup`/`close`, see [event-loop.md](event-loop.md#nested-epoll-follows-the-instance-not-the-number)); `CLOSE_RANGE_UNSHARE` in a multithreaded caller lets siblings see the closes ([TODO.md](../../TODO.md)).
 
 ## Code and tests
 
