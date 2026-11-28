@@ -47,7 +47,8 @@ The image ships Alpine's container stack (`podman`, `crun`, `conmon`, `netavark`
 | Suite | What it covers |
 |---|---|
 | `nstest`, `idmaptest`, `mnttest`, `forktest`, `seccomptest`, `cgtest`, `bpftest`, `inotifytest`, `fusetest` | per-feature kernel behaviour; in the default regress |
-| `netlinktest`, `tuntest`, `brtest` | netlink writes, tun/tap, veth, bridge, NAT (`brtest` includes forged-MAC and port-reservation cases) |
+| `netlinktest`, `tuntest`, `brtest` | netlink writes, tun/tap, veth, bridge, NAT (`brtest` includes forged-MAC, port-reservation and non-masqueraded identity-conntrack cases) |
+| `leakns`, `leakdns` | 16 leaked uid-1001 user-namespace holders must not break DNS or later runs (the namespace-limit leak class above) |
 | `podbridge` | root `podman run` on the bridge: echo, host and bridge `wget`, DNS, 20x churn, no leaks (opt-in; needs a `LEANDROS_IMAGE_ARCHIVE` image) |
 | `podpasta` | rootless `podman` on pasta: echo, host `wget`, `-p` forward, IPv6 address/route and `ping -6`, DNS, churn, no leaked namespaces (opt-in, same image) |
 
