@@ -666,7 +666,7 @@ a real `SUBMIT_CL` queue (out-of-memory binner overflow, hang reset, multi-sync)
 
 ## Updating a running Pi over the network
 
-Once the Pi has network and sshd, no SD swap is needed. The board's FAT partition is not reachable from
+Once the Pi has network and sshd, no SD swap is needed. The board's FAT partition is not mounted by
 LeandrOS, so kernels live in the root at `/boot/pi/{trial,good,prev}/{kernel,initrd,info}` and are entered
 with `kexec`; the firmware always boots the card's `kernel.img` (the factory kernel), which this flow never
 writes, so **a power cycle is the recovery** and `pi-boot good` returns to the promoted kernel.
