@@ -1118,6 +1118,7 @@ static int route_default(int s, int oif, const char *gw) {
 static const unsigned char VICTIM_MAC[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0xaa };
 static int g_fwd_mode; /* 0 = UDP DNS query, 1 = ping the QEMU gateway; expect success */
 static int g_fwd_expect = 1;
+static int g_fwd_ident;         /* nftnat_nonat_ident: the routed-unchanged flow must be tracked by an identity conntrack entry (nat == cport) */
 static int g_fwd_nonat;         /* nftnat_nonat_route: expect the route-without-NAT counter to move */
 static const char *g_fwd_nft;   /* nft ruleset loaded before the container starts (nftnat_*) */
 static int g_fwd_expect_ovr = -1;
@@ -1533,6 +1534,19 @@ static void fwd_case(const char *name, int mode, int ipfwd) {
     if (g_fwd_nonat) {
         snprintf(msg, sizeof msg, "%s: routed to the NIC subnet with the source kept (route_nonat %ld -> %ld), no NAT mapping", name, nonat0, stat_get("route_nonat"));
         CHECK(msg, stat_get("route_nonat") > nonat0 && nat_scan() == 0);
+    }
+    if (g_fwd_ident) {
+        int ident = 0, nated = 0;
+        FILE *tf = fopen("/proc/net/nic", "r");
+        char l[1024];
+        while (tf && fgets(l, sizeof l, tf)) {
+            int pr, nt, cp, rp, a[8];
+            if (sscanf(l, "fwd_ct: proto %d nat %d %d.%d.%d.%d:%d->%d.%d.%d.%d:%d", &pr, &nt, &a[0], &a[1], &a[2], &a[3], &cp, &a[4], &a[5], &a[6], &a[7], &rp) != 12) continue;
+            if (nt == cp) ident++; else nated++;
+        }
+        if (tf) fclose(tf);
+        snprintf(msg, sizeof msg, "%s: the flow is tracked by an identity conntrack entry (%d identity, %d NATed)", name, ident, nated);
+        CHECK(msg, ident >= 1 && nated == 0);
     }
     ip_forward_set(0);
     if (g_fwd_nft) system("nft delete table inet netavark");
@@ -2046,6 +2060,7 @@ static void nftnat_nonat_route(void) { g_fwd_nft = FN_RULES_NONAT; g_fwd_expect_
 static const char FN_RULES_POSTNOMASQ[] =
  "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n }\n"
  " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip saddr 10.250.0.0/24 masquerade\n }\n}\n";
+static void nftnat_nonat_ident(void) { g_fwd_nft = FN_RULES_NONAT; g_fwd_expect_ovr = 0; g_fwd_nonat = 1; g_fwd_ident = 1; fwd_case("nftnat_nonat_ident", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; g_fwd_nonat = 0; g_fwd_ident = 0; }
 static void nftnat_postnomasq(void) { g_fwd_nft = FN_RULES_POSTNOMASQ; g_fwd_expect_ovr = 0; g_fwd_nonat = 1; fwd_case("nftnat_postnomasq", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; g_fwd_nonat = 0; }
 static void nftnat_internal(void) { g_fwd_nft = FN_RULES_FMT_A; g_fwd_expect_ovr = 0; fwd_case("nftnat_internal", 0, 1); g_fwd_nft = NULL; g_fwd_expect_ovr = -1; }
 static void nftnat_masq_ok(void) { g_fwd_nft = FN_RULES_FMT_B; fwd_case("nftnat_masq_ok", 0, 1); g_fwd_nft = NULL; }
@@ -2078,15 +2093,6 @@ static void nftfwd_related_on(void) {
     g_fwd_nft = FR_RULES_ON;
     g_fwd_msg = "ICMP port-unreachable is delivered by `ct state related accept` under a default-drop policy (ECONNREFUSED)";
     fwd_case("nftfwd_related_accept", 3, 1);
-    g_fwd_nft = NULL; g_fwd_msg = NULL;
-}
-/* conntrack tracks a routed-unchanged flow too: with no nat chain at all the ICMP error of a forwarded flow is still `ct state related` */
-static const char FR_RULES_ON_NONAT[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
-static void nftfwd_related_nonat(void) {
-    g_fwd_nft = FR_RULES_ON_NONAT;
-    g_fwd_msg = "ICMP port-unreachable of a routed-unchanged flow (no nat chain) is delivered by `ct state related accept` (ECONNREFUSED)";
-    fwd_case("nftfwd_related_nonat", 3, 1);
     g_fwd_nft = NULL; g_fwd_msg = NULL;
 }
 
@@ -2717,6 +2723,7 @@ int main(int argc, char **argv) {
     if (want("nftnat_internal")) nftnat_internal();
     if (want("nftnat_nonat_route")) nftnat_nonat_route();
     if (want("nftnat_postnomasq")) nftnat_postnomasq();
+    if (want("nftnat_nonat_ident")) nftnat_nonat_ident();
     if (want("nftnat_xbridge")) nftnat_xbridge();
     if (want("nftnat_masq_ok")) nftnat_masq_ok();
     if (want("fwd_udp")) fwd_udp();
@@ -2732,7 +2739,6 @@ int main(int argc, char **argv) {
     if (want("nftfwd6_related_accept")) nftfwd6_related_on();
     if (want("nftfwd_related_drop")) nftfwd_related_off();
     if (want("nftfwd_related_accept")) nftfwd_related_on();
-    if (want("nftfwd_related_nonat")) nftfwd_related_nonat();
     if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
     if (want("nftnat_hairpin_icmp_related")) nftnat_hairpin_icmp_on();
     if (want("nftnat_hairpin_icmp_dropped")) nftnat_hairpin_icmp_off();
