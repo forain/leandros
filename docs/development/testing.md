@@ -117,7 +117,7 @@ Added in the 2026-11-11 to 11-17 wave:
 
 | Suite or command | What it guards |
 |---|---|
-| `slow` (group) | The long host tests kept out of the ten-minute `regress`: `f2fsorphantest`, `f2fscptest`, `f2fscrashtest`, `pagecache-crashtest`, `usbunplugtest`, `powerctltest`, `f2fsfulltest`. Each has its own timeout (`HOST_TIMEOUTS` in `runtests.py`) because a single 300 s default either killed them or hid a hang. Gate with `--suite slow` |
+| `slow` (group) | The long host tests kept out of the ten-minute `regress`: `f2fsorphantest`, `f2fscptest`, `f2fscrashtest`, `pagecache-crashtest`, `usbunplugtest`, `powerctltest`, `f2fsfulltest` (and `trialwatchtest`, which the full `regress` also runs, scheduled first). Each has its own timeout (`HOST_TIMEOUTS` in `runtests.py`) because a single 300 s default either killed them or hid a hang. Gate with `--suite slow` |
 | `virgl` (group) and `audio-session`, `video`, `clickmove`, `udevhot`, `coreutils` | `host:virglsessiontest.py <name>`: each boots a virgl COSMIC session of its own and checks one thing (audio reaching the sink, video playback, a click moving the pointer, a hot-plugged device, a brush guest running coreutils). `virgl` runs the first four |
 | `portalshot` | A live session where the portal `Screenshot` call must return response 0 and a non-empty PNG. The probe grants the PermissionStore permission first, as the Access dialog would, otherwise the portal waits on a dialog nobody answers |
 | `vkwl` | x86-64 `--venus`: a Vulkan swapchain on a Wayland surface into cosmic-comp, frame callbacks counted |
@@ -126,11 +126,28 @@ Added in the 2026-11-11 to 11-17 wave:
 | `harness` | `harnesstest.py`: the harness itself (line-buffered output, automatic `-D` when host tracing is on, quoted commands surviving the ssh hop) |
 | `podsmoke`, `podbridge`, `podpasta`, `podpause` | Root and rootless `podman run`, the default bridge, pasta port forwarding, pause/unpause |
 
+Added in the 2026-11-17 to 11-28 wave (suite names as in `SUITES`; `host:` scripts boot their own VM):
+
+| Suite or command | What it guards |
+|---|---|
+| `flatpak`, `appstream` | `flatpaktest.py`: a network-free Flatpak run against a local OSTree repo and a `--user` remote of its own (install, run under the real `bubblewrap`, on both architectures); `appstreamtest.py`: the appstream refresh against a local `file://` OSTree `appstream2` branch, using the guest's architecture |
+| `kmodbuild`, `kmodsuite` | `kmodbuildtest.py` builds the modules; `kmodsuitetest.py` boots a private `=m` kernel (build-id checked) and runs the real `kmodctl` to load and unload `virtio_net`, `nvme`, `iwlwifi`, `brcmf` and `sdhci`. Both are in the default list |
+| `v6inject` | `v6injecttest.py`: router advertisements (including the MTU option), DAD claims and a DHCPv6 peer injected from a Linux peer on a second NIC (ten cases) |
+| `leakdns` | Sixteen leaked uid-1001 user-namespace holders must not break DNS and the stack teardown that follows |
+| `conloss` | `conlosstest.py` and `/bin/conloss`: console lines survive a flood, and `/proc/sysstat` carries the UART drop counters; it compares only its own run's lines, since a shared VM log holds earlier ones |
+| `failevid` | A failing suite saves its serial log, its full output and the host load (and, for a timeout, a CPU sample of the QEMU process) so the failure carries its own evidence |
+| `deadtimer` | `timertest deadtick` re-arms a stall inside one boot until the x86-64 LAPIC periodic tick really dies, so the fix is shown to be the thing that keeps it alive |
+| `sdlocktest.sh` (not in `runtests`) | [`scripts/sdlocktest.sh`](../../scripts/sdlocktest.sh): boots the QEMU `raspi4b` build with a given image as the SD card and checks the write-grant verdict (granted for an f2fs volume labelled `leandros-root`, locked with a stated reason for anything else) |
+| `usbprofile-test.sh`, `scripts/check-usbroot-nosdhci.sh` (not in `runtests`) | The Pi 5 USB-root profile builds without the SD driver and its stick image writer and tryboot staging tools work |
+
+**Running the whole regress faster.** `runtests.py --shards K` splits the command list over K concurrent runs, longest first by the durations recorded from earlier runs (`$RUNTESTS_DURATIONS`, default under `~/.cache/leandros/`), each with its own VM, run id and reflink copy of the images, and then merges them into the same `=== ` lines and one summary; every command still runs, and the overall result is PASS only if every shard passes. Self-booting host suites each get a private fsynced clone of the tree's boot image, root image and UEFI variables: before that, QEMU's image write locks made concurrent suites die instantly with no output. Their output is captured to `logs/<suite>.log`. A full x86-64 regress including the build took about 1030 s sharded against about 2600 s before.
+
 **Harness behaviour worth knowing before trusting a result.**
 
 - *Long command lines are staged.* brush repaints the whole edit line for every input burst, so typing an N-byte line costs O(N^2) serial output. Lines longer than `LEANDROS_LONG_LINE` (default 600) are written to a guest file in 300-byte typed pieces and run with `.`; `raw` mode (the `rawline` suite) never stages. Before this, a 3.7 KB line was cancelled and retried until the suite timed out with the guest idle.
 - *The prompt is found under kernel log lines.* A prompt glued to a timestamped kernel line (`[   26.096999] [USB-MSC] ...`, any tag, any case) used to hide it, so the driver waited out a 3 s timeout per command; that looked like an echo stall on x86-64 and was the harness.
 - *Arch-only host suites skip* on the other architecture instead of failing, and `runtests` re-boots its VM after a host script that booted its own.
+- *Lines the harness parses are written with one `write()` each* (init's status and reboot-request lines), so another writer cannot splice into them. Splicing was the real cause of two sightings once read as lost output: an aarch64 diagnostic that bypassed the console lock ("lost console line") and long x86-64 console lines, which are now staged and written whole up to 2048 bytes.
 - *Output is line-buffered* and the box farm's runs are detached, so a dead waiter loses nothing (see [workflow](workflow.md#locks-the-regress-farm-and-lane-discipline)).
 - `ffsession.py --noterm` skips the cosmic-term step, which the session tests (`blanktest`, `portalshot`, the virgl suites) do not need and which was their main flake; `ffsession` runs under an inner time budget and prints `DIAG` lines (serial tail, `steps.json`) when it is killed, so a timeout carries its own evidence.
 
