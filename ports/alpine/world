@@ -34,7 +34,7 @@ passt
 fuse-overlayfs
 slirp4netns
 shadow-subids
-containers-common
+container-libs
 nftables
 tzdata
 # Desktop input/GL userland that used to be cross-built (ports/input-stack, ports/gl-stack/build-kmscube.sh):

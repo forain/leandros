@@ -18031,6 +18031,13 @@ fn stat_common_inner(path_ptr: usize, stat_ptr: usize, follow: bool) -> Message 
         return err_reply(-2);
     }
 
+    // A bound nsfs file (/.leandros-ns/<kind>/<id>, the backing of a mount of
+    // /proc/<pid>/ns/<x>): a read-only empty regular file, like its open fd
+    // (open_tree/move_mount stat the mount point, bwrap's /run/.userns).
+    if let Some((k, id)) = alias::ns_src(path) {
+        write_stat_full(stat_ptr, 0o100444, 1, 0, sched::ns::ns_ino(k as usize, id), 0, 0);
+        return ok_reply();
+    }
     // /proc/<pid>, /proc/<pid>/<file>, /proc/<pid>/task[/<tid>[/<file>]]:
     // owned by the process's effective ids, as on Linux.
     if let Some(r) = proc_ns_file(path, sched::current_pid()) {

@@ -12,3 +12,5 @@ mesa-egl
 mesa-gl
 mesa-gles
 mesa-gbm
+# edge: libpipewire-0.3 is staged by ports/pipewire (the real Alpine build, patchelf-adjusted); some package now depends on it
+pipewire-libs
