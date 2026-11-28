@@ -12,7 +12,7 @@ which targets exist, how far each one gets, and the drivers behind them.
 | x86-64 (QEMU q35) | Limine UEFI | Working |
 | AArch64 (QEMU virt) | Limine UEFI (default), or DTB via `-kernel` (`--direct`) | Working |
 | AArch64 (QEMU raspi4b) | BCM2711 board model, `--raspi4b` | SDHCI and mailbox test path only |
-| Raspberry Pi 5 | RPi firmware flat-image load + BCM2712 DTB (`--rpi5`), or RPi UEFI + Limine | Boot-ready: serial console, F2FS root on the SD card, shell prompt |
+| Raspberry Pi 5 | RPi firmware flat-image load + BCM2712 DTB (`--rpi5`), or RPi UEFI + Limine | Serial console, F2FS root on the SD card (written only if it is LeandrOS's own), Ethernet, Wi-Fi, USB, HDMI display through the HVS and COSMIC rendering on V3D on a real monitor (2026-11-25), tryboot A/B card kernels, dual boot with Raspberry Pi OS or Batocera, USB-root profile |
 | x86-64 real PC (UEFI) | Limine UEFI from a USB stick | Root on the stick, USB keyboard/mouse, Realtek Ethernet, Intel HD Audio; NVIDIA RTX 3070 boots GSP-RM and renders through NVK/Zink, so COSMIC and Firefox run |
 | AWS EC2 (Nitro, x86_64 and Graviton) | Limine UEFI from an EBS AMI | Image and AMI tooling, EBS NVMe quirks, the ENA driver (mock-tested, LLQ, MSI-X) and IMDS first-boot setup; unproven on a real instance ([aws-ec2.md](aws-ec2.md)) |
 | x86-64 laptop (HP EliteBook 840 G5, all Intel) | Limine UEFI from a USB stick | Root on the stick, i915 with iris/ANV so COSMIC runs, Wi-Fi, Bluetooth, e1000e, ACPI battery/AC/backlight, I2C touchpad, webcam, microphone; external outputs opt-in; S3 unresolved |
@@ -46,13 +46,14 @@ virtual hardware itself is described in [virtual-machines.md](virtual-machines.m
 ## Pages in this section
 
 - [raspberry-pi-5.md](raspberry-pi-5.md) — the `rpi5` build, SD-card preparation and deployment, the
-  serial console, the six bring-up bugs QEMU could not show, SDHCI, the VideoCore mailbox
-  framebuffer, and the V3D groundwork.
+  serial console, the six bring-up bugs QEMU could not show, SDHCI and its write lock, card kernel slots
+  (tryboot) and dual boot, the VideoCore mailbox framebuffer, V3D scanout through the HVS, PCIe/RP1, Wi-Fi,
+  HDMI audio and `scripts/device-update.sh`.
 - [pc.md](pc.md) — booting a real x86_64 PC: the USB-stick root (xHCI, bulk-only transport, SCSI,
   `/dev/root`), USB keyboards and mice, the on-stick kernel log, CPU enumeration on sparse APIC
   IDs, the NVIDIA RTX 3070 (GSP-RM, NVK, KMS, Zink), the r8169 NIC, the test stick, the storage
   performance work that the slow stick forced, and the HP EliteBook 840 G5 (ACPI power, warm reboot,
-  suspend, I2C touchpad, USB-C guards, webcam).
+  suspend, I2C touchpad, USB-C guards, webcam) and its trial-kernel update script.
 - [virtual-machines.md](virtual-machines.md) — the QEMU machine models, HVF and the GICv3 port, the
   virtio device set, direct boot, the UTM VM on macOS, and the GPU-capable QEMU build for the Mac.
 - [drivers.md](drivers.md) — the `drivers` crate and its satellites (`usb`, `nvidia-rm`, `wifi`; also the r8169 and Intel HD Audio drivers):

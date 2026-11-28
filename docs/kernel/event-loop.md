@@ -145,6 +145,14 @@ Laptop playback censuses (lanes deskplay, playcost, panelwake, percpu, epnameles
 
 **Why.** Number-keyed items broke the moment a description outlived its number: a registration made before `fork`, `dup` or `SCM_RIGHTS` either vanished with the original fd or reported a stale `POLLNVAL` forever, and with fd-number reuse a new fd inherited someone else's registration. Before the change, `polltest`'s Linux-derived expectations failed four ways on the base kernel (fork `0 1 0 0 0 0` instead of `1 2 0 0 1 0`, SCM `0 0` instead of `n1=1 n2=0`, and both `close_range` cases). Each new expectation was first run on a Linux host, and both architectures now print the Linux numbers exactly.
 
+### Nested epoll follows the instance, not the number
+
+**Choice.** When an epoll descriptor that is itself registered in another instance (a nested registration) loses its number while the instance lives on (the number was closed after a `dup`, or only a fork child's copy survives), the registration moves to a surviving number of the same instance; with the instance's last reference it is removed, as Linux's `eventpoll_release` does.
+
+**Why.** The registration used to stay on the dead number, so the outer instance never reported the inner one again (a tokio runtime that duplicates its reactor fd lost every wakeup). `epolltest` has twelve nested-wake variants (threads and processes), in regress (lanes epref, nestep).
+
+**Diagnosing a hang.** `/proc/pollfds` lists every poll-family parker with its descriptors, wake tags and `revents`, plus the virtio-gpu fence and out-fence state; the session harnesses dump it when a desktop wait gives up.
+
 ### Blocking, not spinning
 
 `ppoll`, `epoll_wait`, `select`, `wait4`/`waitid`, `nanosleep` and the net daemon all park rather than yield-spin, so an idle system is genuinely idle (`48e38c6`, `2c924ea`). Before that, init's getty-loop `usleep(1 s)` alone kept PID 1 at 100% CPU churning the scheduler run loop. `idletest` guards it.

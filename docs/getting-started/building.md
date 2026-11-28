@@ -19,6 +19,10 @@ A full build from clean takes from several minutes on a fast machine to most of 
 
 ## What the build does
 
+**A failed step fails the build.** `build-all.sh` ends with `BUILD FAILED: <step> (exit N)` on any failing step, and the final kernel, direct-boot kernel and initrd must exist for it to succeed; optional ports and best-effort steps still only warn. Callers that pipe the script (`| tail`, `| tee`) see the pipe's status, so use `set -o pipefail` or `PIPESTATUS`.
+
+**COSMIC binaries are cached by content.** The COSMIC builds (apps, applets, panel, installer, compositor, idle) go through a binary cache keyed by a hash of the build scripts, patches, sources, cargo config, toolchain, environment and the sysroot it links (`scripts/lib/cosmic-cache.sh`). A hit copies the cached binaries and does not run cargo; the log shows `[cosmic-cache] hit|miss`. Anything uncertain is part of the key, because a wrong reuse is worse than a rebuild, and the apps build one cargo target directory per libcosmic revision.
+
 Once per run it downloads and caches the Limine bootloader binaries (version 11.4.1, in `.limine-cache/`), builds the input-stack shims (`libseat`, `libudev`, needs the clang/lld toolchain) and, when `../doomgeneric` exists, stages the SoundFont. Then, for each architecture:
 
 1. **In-tree userland** (`scripts/build-userland.sh --release`): the programs and regression suites under `userland/`, plus the two C conformance tests (`privtest`, `nettest`) (the build runs `scripts/toolchain/ensure.sh <arch>` first and fails with a fix-it line if the clang/lld toolchain or its locked musl sysroot is missing; see [prerequisites](prerequisites.md#the-clanglld-musl-cross-toolchain)).
@@ -46,7 +50,7 @@ Which drivers are built in, left out or built as loadable modules is decided by 
 ./scripts/menuconfig.sh olddefconfig                       # fill symbols added since .config was written
 ```
 
-The shipped defconfigs are in [configs/](../../configs) (`x86_64`, `aarch64`, `x86_64_laptop`, `rpi5`); all drivers are `y` and `CONFIG_MODULES` is unset, so nothing changes unless you ask. `=m` needs `CONFIG_MODULES=y` and makes the build also produce `.kmod` files in the initrd and fail on a build-id mismatch ([bidcheck](../kernel/modules.md#8-testing)). The full story, including the kernel-side stubs for `=n`/`=m`, is in [Loadable kernel modules](../kernel/modules.md).
+The shipped defconfigs are in [configs/](../../configs) (`x86_64`, `aarch64`, `x86_64_laptop`, `rpi5`, `rpi5_usbroot`, `raspi4b`); all drivers are `y` and `CONFIG_MODULES` is unset, so nothing changes unless you ask. `=m` needs `CONFIG_MODULES=y` and makes the build also produce `.kmod` files in the initrd and fail on a build-id mismatch ([bidcheck](../kernel/modules.md#8-testing)). The full story, including the kernel-side stubs for `=n`/`=m`, is in [Loadable kernel modules](../kernel/modules.md).
 
 ## Release builds only
 
@@ -54,7 +58,7 @@ Always build release targets. Debug builds hang or crash early in boot — they 
 
 ## Container-staged ports
 
-Firefox, the xdg-desktop-portal frontend and PipeWire/WirePlumber are repackaged from Alpine 3.21's prebuilt packages inside a container of the target architecture (Firefox is about 290 MB of image content). The first staging takes minutes, because the foreign architecture runs under emulation; afterwards a port is skipped while its `ports/<name>/out/<arch>/.stamp` is newer than the port's scripts.
+Firefox, the xdg-desktop-portal frontend and PipeWire/WirePlumber are repackaged from Alpine's prebuilt packages inside a container of the target architecture (Firefox is about 290 MB of image content). The Alpine release is read from one place, the first line of `ports/alpine/toolchain.lock` (via `scripts/lib/alpine-release.sh`), and the per-architecture `ports/alpine/<arch>.lock` files pin every resolved package; the image currently tracks Alpine's rolling `edge`, and `scripts/alpine-lock.py refresh` re-resolves it, so every port follows one bump. Every staging step goes through one retrying helper that keeps per-attempt logs and reports the real error. The first staging takes minutes, because the foreign architecture runs under emulation; afterwards a port is skipped while its `ports/<name>/out/<arch>/.stamp` is newer than the port's scripts.
 
 When no container tool answers within `LEANDROS_CT_TIMEOUT` seconds (default 20), or the staging run fails, the build reuses a previously packaged tree: this worktree's `ports/<name>/out/<arch>`, then the main checkout's, then `$LEANDROS_ARTIFACTS/<name>-out/<arch>`. With none of those it stops loudly — an image silently missing its audio stack or portal is worse than a clear error.
 
@@ -66,6 +70,10 @@ When no container tool answers within `LEANDROS_CT_TIMEOUT` seconds (default 20)
 | `LEANDROS_CT_TIMEOUT=<s>` | Container probe timeout |
 | `LEANDROS_BRUSH_DIR` | Build brush from another checkout |
 | `LEANDROS_BRUSH_UNCHECKED=1` | Build an off-pin brush (local brush development) |
+| `RPI5_USBROOT=1` (with `--rpi5`) | Build the Pi 5 profile without the SD driver (`configs/rpi5_usbroot_defconfig`) for a USB-stick root; the kernel tag gets a `-usbroot` suffix |
+| `LEANDROS_KERNEL_TAG=<tag>` | Replace the default build tag (revision, dirty flag, UTC time) that appears in `uname -v`; the device update script looks for it |
+| `LEANDROS_LIBFLATPAK_REBUILD=1`, `LEANDROS_SKIP_LIBFLATPAK=1` | Force or skip staging the `libflatpak` port that `cosmic-store` links |
+| `LEANDROS_ARTIFACTS` | The out-of-tree staging directory (default `~/code/leandros-artifacts`) |
 
 The brush pin check exists because an unpatched `../brush` once shipped a `/bin/sh` whose `cmd &` was still an unstarted in-process task when the next command ran, so `daemon & exec session` dropped PipeWire from the session — on one architecture only, because only one machine's checkout lagged. Fix a mismatch with `ports/brush/sync.sh apply ../brush`.
 

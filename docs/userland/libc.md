@@ -12,7 +12,7 @@ musl, and the `../relibc` sibling checkout is no longer needed.)
 | Library | Where | Used by | Linkage |
 |---|---|---|---|
 | leandros-libc | [userland/libc](../../userland/libc/src/lib.rs) | `init`, `login`, `shell`, `greeter-launch`, `mount`, `aplay`, `vfstest`, DOOM, … | static, target `<arch>-unknown-none` |
-| musl 1.2.5 | Rust's self-contained musl, Alpine's musl (static, via the clang wrapper), and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
+| musl 1.2.6 (Alpine edge) | Rust's self-contained musl, Alpine's musl (static, via the clang wrapper), and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
 
 The `MUSL_LINKED` tests (`pthreadtest`, `sigtest`, `timertest`, `polltest`, `drmsmoke`, `vttest`,
 `ping`, …) are `no_std` crates linked against static `<arch>-unknown-linux-musl` through the clang/lld
@@ -41,7 +41,7 @@ translation layer. Nothing in those projects is patched to know it is running on
 
 ### Static musl
 
-Rust crates (busd, greetd, `leandros-sysbus`, `mkfs.xfs`, `killmt`, `spawnwedge`) are built
+Rust crates (busd, greetd, `leandros-sysbus`, `killmt`, `spawnwedge`) are built
 with `cargo +nightly` for the musl targets using Rust's self-contained musl CRT and
 `rust-lld`; no cross-gcc is needed. Sibling projects (brush, coreutils, bottom, disks-rs) link
 through `scripts/toolchain/<arch>-linux-musl-cc` wrappers
@@ -62,7 +62,7 @@ of image.
 
 The desktop needs dynamic linking: `dlopen` sits on the critical path in cosmic-comp's EGL
 loading, Mesa's GBM/DRI loader and cosmic-panel's `use_system_lib`. So the image ships a real
-`ld-musl-<arch>.so.1` and `libc.so` (musl 1.2.5), and the ported stack is dynamically linked
+`ld-musl-<arch>.so.1` and `libc.so` (musl 1.2.6 from the Alpine edge lock), and the ported stack is dynamically linked
 against them.
 
 The kernel side is in [../kernel/processes.md](../kernel/processes.md): an `ET_DYN` main
@@ -102,7 +102,7 @@ FUNC sizes are not compared, Alpine builds `-Os`). Layout:
   `/usr/sbin/busybox.static cp /lib/ld-musl-<arch>.so.1.recovery /lib/ld-musl-<arch>.so.1`.
 
 `apk del musl` is refused; `musl` is pinned in
-`/etc/apk/world`, so any bump (3.24 / musl 1.2.6) needs the full test set. The build sysroot,
+`/etc/apk/world`, so any bump (edge, musl 1.2.6) needs the full test set. The build sysroot,
 the Firefox and git ports still apply the rewrite below (a parallel lane replaces them). Alpine's loader is
 stripped; install `musl-dbg` to symbolize it.
 

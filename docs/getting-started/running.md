@@ -53,7 +53,7 @@ A hypervisor virtualises; it does not translate. A mismatched host/guest archite
 
 Machine configuration:
 
-- **AArch64**: `-machine virt,gic-version=3`, 4 CPUs (SMP via PSCI `CPU_ON`), 4 GiB. GICv3 because QEMU 11.1 and later refuse `-accel hvf` on a GICv2 machine ("HVF does not support GICv2 emulation") — a launch refusal, not a guest hang; the kernel detects and drives either GIC. `-cpu host` under HVF/KVM; `-cpu max,lpa2=off` under TCG, because `max` advertises FEAT_LPA2 and Limine 11.4.1 wedges on it in its final hand-off, spinning on one instruction with the kernel entry already in `x0`.
+- **AArch64**: `-machine virt,gic-version=3` (`gic-version=host` under KVM, which mirrors the host GIC; a Pi 5 is GICv2), 4 CPUs (SMP via PSCI `CPU_ON`), 4 GiB. GICv3 because QEMU 11.1 and later refuse `-accel hvf` on a GICv2 machine ("HVF does not support GICv2 emulation") — a launch refusal, not a guest hang; the kernel detects and drives either GIC. `-cpu host` under HVF/KVM; `-cpu max,lpa2=off` under TCG, because `max` advertises FEAT_LPA2 and Limine 11.4.1 wedges on it in its final hand-off, spinning on one instruction with the kernel entry already in `x0`.
 - **x86-64**: `-machine q35`, 4 CPUs as 2 cores × 2 threads (exercising the scheduler's SMT-aware idle-CPU selection), 4 GiB. `-cpu host` under KVM, `-cpu max` under TCG.
 - **HVF is only wired to the AArch64 UEFI path.** Direct boot under HVF hangs on an upstream QEMU bug (the PL011 TX FIFO drains on a virtual-time timer that is not serviced while an HVF vCPU runs), so `--direct` and `--raspi4b` always use TCG. See [virtual machines](../hardware/virtual-machines.md).
 
@@ -154,6 +154,7 @@ Before launching, the runner prints `STALE IMAGE` if the boot image is older tha
 | `LEANDROS_QEMU_PREFIX` | Use the QEMU (and firmware) under this prefix |
 | `LEANDROS_VNC`, `LEANDROS_NO_VIEWER` | macOS VNC listener / suppress the auto-viewer |
 | `LEANDROS_NET=user`, `LEANDROS_MAC` | Force SLIRP / set the NIC MAC |
+| `LEANDROS_SLIRP_RESOLV=<file>\|host` | Linux hosts only. When the host resolver is a VPN forwarder whose UDP relay drops replies under load, `run-qemu.sh` starts QEMU in a private user and mount namespace whose `/etc/resolv.conf` lists the real upstream resolvers (SLIRP forwards DNS to whatever the host file names). The guest still resolves through its own code and a real DNS server. `<file>` picks the list; `host` turns the namespace off |
 | `LEANDROS_SSH_PORT` | Host port forwarded to the guest's sshd on SLIRP |
 | `LEANDROS_RUN_ID` | Scopes the derived MAC (and the driver's paths) per instance |
 | `LEANDROS_USB_IMAGE` | Boot this USB-stick image as-is |

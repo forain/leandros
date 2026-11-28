@@ -60,7 +60,7 @@ m3 sysroot (mirroring the libseat/libudev shims).
 
 In the **login** role none of that is used: `greeter.rs` contains no PAM calls at
 all and authentication crosses greetd IPC, which authenticates through
-`ports/greetd/pam-leandros`. The shim matters only as a link-time and load-time
+the real Linux-PAM `greetd` stack (see [`ports/greetd/README.md`](../greetd/README.md)). The shim matters only as a link-time and load-time
 dependency.
 
 ## Build

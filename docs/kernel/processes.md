@@ -95,6 +95,7 @@ When a non-leader thread calls `execve`, `dethread_current_group` → `take_over
 - `exit_group(code)` ends the *process*: `claim_group_exit` makes exactly one thread the owner (the leader's `group_exit_owner`), `reparent_children` hands live children to init, `run_group_kill` loops `kill_next_group_member` until every sibling has actually stopped (opening an IRQ window while it waits, because the other CPU may be waiting on *this* one for a TLB-shootdown acknowledgement), and `run_exit_teardown` releases each reaped sibling's fds, sockets, epoll instances, VT and evdev grabs. If the owner is not the leader, it also runs the leader's teardown and sends the parent's `SIGCHLD`, which only the leader's own `exit` would otherwise have sent.
 - `exit_group_signal(signo)` is the only path for a default-action kill: it stamps `term_signal` on every thread **before** the group kill (a sibling logged to `EXIT_LOG` first would otherwise lose it), then exits with code `128 + signo` for the serial exit log while the wait status carries the real signal.
 - A thread that finds the group already dying (`AlreadyDying`) just marks itself Zombie and leaves the CPU: no fd teardown, no `clear_child_tid`, no `SIGCHLD`.
+- **A group kill waits for a sibling that is already inside `exit()`.** `kill_next_group_member` used to reap any non-running sibling; a member that had entered `exit` but was not yet a Zombie was therefore zombied mid-exit, and its `clear_child_tid` write, the futex wake on that TID word, `thread_children_on_exit`, `clear_comm` and the pidfd wake never ran. A `pthread_join` in another process on a shared-memory TID word then waited forever. Such a member is now treated like a klock holder: the loop answers `Deferred`, the member finishes its own exit (it cannot return to user mode, so waiting is safe), and only a member that is already a Zombie, such as a delayed leader, is reaped by the killer (`61a67f46`, lane groupkillexit; `pthreadtest gkexit`, red before the fix, uses an `exithold` knob to park a thread inside `exit`).
 
 On the way out, `release_exiting_address_space` drops the last thread's address space *before* the task is marked Zombie (after the `clear_child_tid` write): it detaches TTBR0/CR3 under `RUN_QUEUE`, sets `page_table = 0`, then drops the space once `busy` clears. This matches Linux, where `exit_mm` runs before `exit_notify`, and it closed a measurement window in which `sysinfo` read straight after `wait4` still counted the dead child's 8–15 MiB.
 
@@ -164,6 +165,22 @@ A kernel thread (`kthread::spawn`, the `kexit` canary, drivers such as `btusb`) 
 
 **Refuted.** A suspected ~121 KiB-per-exec leak on this path ("order-5 blocks 601→374") was fragmentation plus a measurement window, not a leak: a plain exec and a takeover exec both leak nothing by buddy census. The window (an address space dropped later by the reaping CPU) was then closed in the kernel by `release_exiting_address_space`.
 
+### A zombie stays a zombie, whatever else the exit path does
+
+**Choice.** `exit()` sets `Task.zombie_marked` at the Zombie transition, and everything outside the dispatcher reads `Task::eff_state()` (Zombie while the mark is set): `/proc/<pid>/stat`, the task brief, the `wait` scan, the pidfd exit check and the group-exit notice. `exit()` also re-asserts Zombie right before its final yield, so the dispatch loop reaps the task at that switch-out.
+
+**Why.** After the transition `exit()` still runs a tail that takes sleeping locks (the orphan-pgrp scan, the pidfd wake and the `SIGCHLD` notice must all follow the Zombie state, so the tail cannot be moved earlier). A contended lock parks the task through `block_on_port_until`, which overwrote Zombie with Blocked; a later wake left it Ready and it was never reaped. `/proc` then showed it running, `kill(pid, 0)` and `wait` disagreed with the pidfd, and a parent could hang. A Zombie moved to Blocked is counted as `zomb_blocked` in `/proc/rqhold`. Guard: `syscalltest pidfd_zombie_contend` (2000 forks whose children open pipes and sockets while four threads churn the same tables).
+
+**The same rule at the other end of the life.** The dispatcher may recycle a zombie's run-queue slot before the parent waits, so a process with a logged but unconsumed exit record (`exit_logged_zombie`) is still a zombie to every observer: `/proc/<pid>/stat` reads `Z` and `kill(pid, 0)` succeeds (the signal is discarded), as on Linux, where the task is `EXIT_ZOMBIE` before the pidfd is published. Once a `wait` has consumed the exit the pid is gone for `kill`, `/proc` and `pidfd_open` alike (`reaped_zombie`), even while the slot lingers until the dispatch loop removes it (lanes exitorder, zombblock, serfix).
+
+### The last members of a group leaving while the leader is parked
+
+**Symptom.** If every non-leader thread exited while the leader was parked off-CPU (a delayed leader), the leader's slot, kernel stack and address space leaked and the parent received neither `SIGCHLD` nor a `wait4` result.
+
+**Cause.** The dispatch loop marked its own pending address-space drop (`AS_DROP_TGID`) before checking whether the removal left the group settled, so the settle check always saw the mark and never reaped the leader.
+
+**Fix (lanes lateleader, lateleader2).** The group is re-checked after a removed member's drop is done, and only when a drop is pending (otherwise it is settled in the same hold); a settled leader clears the mark and logs it; the parent is notified exactly once, using the parent recorded in the exit log (`exit_logged_parent`, since reparenting may have changed it). `/proc/leandros_asfree` counts the rechecks and settle reaps (`ll_recheck_reaps`, `ll_settle_reaps`), and its root-only knobs `exitrace <tgid> <n> <w|l>` and `dropdelay <tgid> <us>` reproduce the race on demand for `pthreadtest late_leader`.
+
 ### Exit-log side table rather than delaying the reaper
 
 **Choice.** The scheduler reaps zombies eagerly and records exit codes in `EXIT_LOG`; `wait` falls back to it.
@@ -196,7 +213,6 @@ Several races between a non-leader `execve` (which de-threads the group), a fata
 
 - **`AT_RANDOM` is derived from the tick counter**, not from the kernel CSPRNG that `getrandom` uses, so it is predictable; it seeds libc stack-protector canaries and pointer guards. `execve` honours the set-user-ID/set-group-ID bits (`/bin/su`, `/bin/sudo`; see [../servers/security.md](../servers/security.md#su-and-sudo)); `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` carry the real and new effective ids, and `AT_SECURE` is set when they differ.
 - **`CLOSE_RANGE_UNSHARE` and `unshare(CLONE_FILES)` cannot split a thread off its process's fd table.** Fd tables are keyed by tgid. In a single-threaded caller, such as a vfork child before exec, the result is the same as Linux. A thread that asks gets the closes applied to its siblings too (`close_range`), or EINVAL (`unshare`).
-- A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
 - The non-leader `execve` takeover window is closed for fatal signals (above); what remains open is only the ordinary race that a group exit begun elsewhere in the same instant fails the exec with the signal, which is Linux's behaviour too.
 - No core dumps.

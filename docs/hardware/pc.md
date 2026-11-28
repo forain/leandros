@@ -412,6 +412,8 @@ kernel threads, work queues, hrtimers, a kernel virtual address allocator with `
 IDT vector allocator with MSI/MSI-X, and `request_firmware` reading files from the mounted root. See
 [drivers.md](drivers.md) and [kernel/scheduler.md](../kernel/scheduler.md).
 
+The shim's `os_is_administrator` answers from the **host** `CAP_SYS_ADMIN` capability (lane idroot0, 2026-11-21), not from `euid == 0`: a process that is root only inside a user namespace (a rootless container) is no longer RM's administrator, as on Linux. The same change moved the DRM debug ioctls to the same check.
+
 The bring-up runs the Linux `nv_pci_probe` + `nv_start_device` sequence step by step in an `[nvrm]`
 kernel thread started after userspace init (so init's PID is unchanged and the root filesystem,
 which holds the 63 MB GSP image at `/lib/firmware/nvidia/570.86.16/gsp_ga10x.bin`, can appear):
@@ -553,6 +555,10 @@ Thunderbolt NHI state (firmware connection manager) and the Intel SMBus; the inv
 Several drivers here are loadable modules (e1000e, HDA, iwlwifi, UVC, USB HID, USB storage, NVMe, USB Bluetooth);
 see [kernel/modules.md](../kernel/modules.md) for how they are built, aliased and autoloaded.
 
+### Updating the laptop kernel
+
+`scripts/device-update.sh laptop <expected-tag> --via-linux USER@HOST` ([scripts/device-update.sh](../../scripts/device-update.sh), lanes devdeploy1 and devupdfix, 2026-11-27) does the whole trial cycle inside **one** device lock, so the check that the booted kernel is the one just deployed and the promote cannot be separated. It needs a build newer than HEAD's commit and `LEANDROS_REMOTE` set to the laptop. Steps: `remote.py deploy-kernel --reboot` (the laptop's firmware default is Linux, so the trial reboot must hop through Linux with `--via-linux`; see [development/remote.md](../development/remote.md#trial-kernels)); ssh works; `booted_slot` is `trial` and `booted_kid` equals the deployed id; `uname -v` contains the tag; the `espctl klog` has no panic, WDOG or oops line; then a **netwatch window** (default 180 s, `DEVUPDATE_NETWATCH_WAIT` overrides) in which the trial must stay up, proven by a marker file the script writes on *this* boot (the marker `remote.py` writes is created before the reboot, so it cannot serve; the first version used it and could never promote); finally `remote.py promote`, and the new `good` id must equal the deployed one. Any failure exits 1, prints the recovery (a power cycle boots the old good, or pick it in the Limine menu) and leaves the previous good in place. It never changes the default boot entry and never prints a command line or secret. The Pi form is in [raspberry-pi-5.md](raspberry-pi-5.md#scriptsdevice-updatesh).
+
 ### ACPI power, battery, backlight and hotkeys
 
 Lane `lappower` added `drivers/src/acpi_power/`: an AML interpreter in pure `core`+`alloc` behind a `Host` trait
@@ -566,6 +572,7 @@ and EC GPE clearing (other GPE methods only with `acpi_power.gpe=1`). It exposes
   plus `drivers/src/power_sysfs.rs`; backlight drives the PCH BLC PWM in `i915/backlight.rs`). upower reads the supply
   from sysfs, which is what the COSMIC battery applet shows. A battery reporting `now==0 && full==0` (a failed EC
   read) is treated as absent.
+- `/sys/class/leds/<vendor>::kbd_backlight` (lane kbdlight, 2026-11-26): a hardware driver registers get/set callbacks with `kbd_register`; `acpi_power.fake=1` serves a fake `hp::kbd_backlight` (max 2) for tests, and `brightness_hw_changed` reports a change the hardware made (the Fn key). UPower's `KbdBacklight` serves the first `kbd_backlight` LED and is not exported when there is none, as upowerd does, so the COSMIC applet hides the slider instead of showing NaN %. This unit has no keyboard-backlight driver yet; only the plumbing exists.
 - an "ACPI Power Buttons" evdev switch device (lid as `SW_LID`, power button), and PS/2 E0 20/2E/30 as mute and volume
   keys. The HP brightness keys arrive as PS/2 set-1 `E0 12`/`E0 17` and map to `KEY_BRIGHTNESSDOWN`/`UP` (lane `bkeys`);
   other unmapped scancodes log `kbd: unmapped sc e0 xx dn|up` (rate-limited). `brightness` is writable by root and, since
@@ -628,7 +635,7 @@ part proven on hardware paths.
 
 See [graphics/drm-kms.md](../graphics/drm-kms.md#the-i915-backend) for the connector, second-CRTC, hot-plug and power-well work. In short:
 the eDP panel is the only lit output by default; HDMI and the two DP++ ports (DDI-B and DDI-C, both routed to USB-C/dock)
-are probed and reported as extra connectors only with `i915.extout=1`, and no external display has been lit yet.
+are probed and reported as extra connectors only with `i915.extout=1`, and no external display has been lit yet. A connector that probed a valid EDID (checksum and header checked) carries the 128-byte block in `KmsConnInfo`, so the extra connectors serve it through sysfs `edid` and the `EDID` blob property, as the virtio-gpu connector does (lane i915edid).
 
 **KMS features beyond the basics (lane i915feat).** Cursor planes take 64, 128 and 256 pixel ARGB images (`CAP_CURSOR_W/H` 256, `/proc/i915` `cursor_size`). Async page flips (`PLANE_CTL` bit 9, the atomic and legacy flip flags) are accepted when the framebuffer matches the plane's pitch and size and refused with `EINVAL` together with `ALLOW_MODESET`. `WAIT_VBLANK` and `CRTC_GET_SEQUENCE` read the pipe frame counter, and `IN_FENCE_FD` is honoured as a CPU wait before the commit. Limits: the vblank wait polls the counter every 500 us rather than taking the interrupt, `DRM_VBLANK_EVENT`/`SIGNAL` return `EINVAL`, a non-blocking commit blocks on an unsignalled in-fence, and wide cursors use the capped plane-1A watermark. Verified on the laptop (23 new `kms_*` cases pass, no FIFO underruns).
 

@@ -50,12 +50,16 @@ greeter and user alike, would die at creation. The patch resolves the path with
 path the kernel recorded at our own `execve` — before the fork, so a failure is
 a returned error rather than a panic in a child that cannot report one.
 
-**2. There is no PAM stack.** greetd authenticates through `pam-sys`, a raw FFI
-binding to `libpam`. `pam-leandros/` (in this directory, Rust) supplies that ABI
-and implements the one part that must do real work — checking a password against
-`/etc/shadow` in the same `$sha256$<salt>$<hex>` scheme `/bin/login` validates.
-The patch adds it as a dependency and a `use pam_leandros as _;` so it is
-actually linked.
+**2. Real Linux-PAM, plus session bookkeeping.** greetd authenticates through
+`pam-sys`, which links Alpine's real `libpam.so.0` (the `linux-pam` apk from
+`ports/alpine/<arch>.lock`; `build.sh` puts its libraries on the link path through
+`scripts/lib/realpam.sh`). greetd is therefore a dynamic musl PIE, and libpam
+`dlopen`s `pam_unix` and friends at run time. `/etc/pam.d/greetd`
+(`data/pam.d-greetd`) includes Alpine's `base-*` stacks from `/usr/lib/pam.d`.
+`pam_unix` checks `/etc/shadow` through `unix_chkpwd` (setuid, 4755), which
+needs nine-field shadow records; `shadowfix` pads older records at boot. The
+patch only adds utmpx/wtmp/lastlog and session-cgroup bookkeeping around
+`pam_open_session` (`session/worker.rs`).
 
 **3. `std::fs::canonicalize` is avoided in `fakegreet`**
 (`patches/0002-fakegreet-leandros.patch`). It is musl's `realpath(3)`, which
@@ -71,39 +75,14 @@ the VFS, as on Linux, so `AF_UNIX` bind works there.
 Everything else upstream does is either already supported or configured away —
 see the config file for the VT case.
 
-## Why `pam-leandros` is an rlib, and the two empty archives
+## PAM environment and the session scope
 
-A Rust `staticlib` embeds its own copy of `std`; linking one into greetd (also
-`std`) duplicates every `std` symbol. So `pam-leandros` is an ordinary rlib that
-greetd depends on, and its `#[no_mangle] extern "C"` definitions resolve
-`pam-sys`'s undefined references exactly as a real `libpam.a` would.
-
-`pam-sys`'s build script still emits `cargo:rustc-link-lib=pam` and
-`...=pam_misc` unconditionally, so `build.sh` puts two **empty** archives by
-those names on the link path. The linker finds them and pulls nothing out.
-
-`pam-leandros` is copied *outside* the greetd source tree during the build: it
-declares its own `[workspace]` (so it can be tested standalone), and a second
-workspace root inside greetd's workspace directory is a hard cargo error.
-
-## Relationship to the existing `libpam.so.0` shim
-
-`leandros-artifacts/m6-session-bins/src/libpam-shim/` already provides a libpam
-shim, as a C shared library, for `cosmic-greeter`'s **lock-screen** role. It is
-not reusable here as-is:
-
-- `pam_get_user` and `pam_misc_drop_env` are not defined in it at all, and
-  greetd calls both — that is a link failure, not a runtime one.
-- `pam_putenv` is a no-op and `pam_getenvlist` returns an empty list. greetd
-  builds a session's **entire** environment through those two functions, so with
-  that shim a session would start with a completely empty environment —
-  including no `GREETD_SOCK`, which `cosmic-greeter` `.expect()`s.
-
-`pam-leandros` implements all four properly. The two implementations now share
-only the `/etc/shadow` scheme; keeping them in step is a real maintenance edge,
-and folding the lock-screen shim onto this crate (built additionally as a
-`cdylib` named `libpam.so.0`) is the obvious follow-up — it would also retire a
-C file from a Rust-only project.
+greetd builds a session's entire environment from `pam_putenv` and
+`pam_getenvlist`, so what real PAM exports is what the session sees. The
+`XDG_RUNTIME_DIR` export for the target user comes from `pam_rundir.so`
+(`ports/pam-rundir`), the provider of the `-session optional pam_rundir.so` slot
+in Alpine's `base-session`. `/etc/pam.d/greetd` deliberately does not use it:
+the greeter session runs as root and keeps the greeter account's runtime dir.
 
 ## Configuration
 
@@ -122,8 +101,9 @@ C file from a Rust-only project.
   Only the greeter client drops privileges, inside a launcher that replaces the
   greeter half of `default_session.command` when it lands.
 
-`data/pam.d-greetd` → `/etc/pam.d/greetd` exists only because greetd refuses to
-start without it. Nothing reads the contents.
+`data/pam.d-greetd` → `/etc/pam.d/greetd` is the real PAM service stack for
+greetd (Alpine's `base-auth`, `base-account`, `base-password` and the
+non-interactive `base-session`).
 
 ## Landmines
 
@@ -167,7 +147,7 @@ greeter exit, greetd start the scheduled session, that session fail on the
 unstaged `/usr/bin/env`, and greetd bring a fresh greeter back — which is
 `SIGCHLD` being delivered to greetd's tokio signal stream, the port's largest
 untested dependency. A wrong password leaves the greeter up with the field
-cleared and starts nothing, so `pam-leandros` really is checking `/etc/shadow`.
+cleared and starts nothing, so PAM really is checking `/etc/shadow`.
 Guest RAM made no difference: the screen is byte-identical at `-m 2G` and
 `-m 4G`.
 

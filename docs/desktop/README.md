@@ -13,7 +13,8 @@ into the login path, the running session, and what still does not work.
 
 | Page | What it covers |
 |---|---|
-| [login.md](login.md) | greetd + cosmic-greeter, `greeter-launch`, `pam-leandros`, `vt = "none"`, the socket directories, the renderer gate |
+| [login.md](login.md) | greetd + cosmic-greeter, `greeter-launch`, real Linux-PAM, `vt = "none"`, the socket directories, the renderer gate |
+| [flatpak.md](flatpak.md) | libflatpak in cosmic-store, the apk-backed PackageKit facade, busd service activation |
 | [session.md](session.md) | `cosmic-session`, busd and D-Bus activation, `ServiceUnknown`, the system services, applets, pop-launcher, the portal, power-off |
 | [limitations.md](limitations.md) | What the desktop still cannot do, and which gaps are recorded rather than designed |
 
@@ -230,7 +231,7 @@ Summarised here; the full list with causes is [limitations.md](limitations.md).
 
 | Where | What |
 |---|---|
-| [ports/greetd/](../../ports/greetd/) | greetd recipe, patches, `pam-leandros`, `greetd.conf`, `/etc/profile`, `gpu-env`, the greeter launchers |
+| [ports/greetd/](../../ports/greetd/) | greetd recipe, patches, PAM stack, `greetd.conf`, `/etc/profile`, `gpu-env`, the greeter launchers |
 | [userland/greeter-launch/](../../userland/greeter-launch/) | the greeter's privilege drop |
 | [artifacts/m6-session-data/start-cosmic-leandros](../../artifacts/m6-session-data/start-cosmic-leandros) | the session launcher (POSIX sh, brush-safe) |
 | [ports/busd/](../../ports/busd/), [ports/dbus/session-pkg/](../../ports/dbus/session-pkg/) | the broker, its patches, `session.conf`, the `.service` files |

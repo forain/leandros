@@ -89,6 +89,18 @@ One laptop serves every lane, so deploy, measure and promote happen inside **one
 
 Logins for scripted desktop sessions are stored outside the repository; read them from there at use time and never print them. Secrets are kept off the media: `espctl scrub-psk` removes `wifi.psk=` tokens from `limine.conf` and `factory.conf` on the ESP, and `espctl oneshot <entry-file> <save-path>` boots a foreign Limine entry once (for example a Linux comparison baseline) with `oneshot-restore` as the recovery.
 
+### `scripts/device-update.sh`: deploy, verify, promote in one command
+
+[`scripts/device-update.sh`](../../scripts/device-update.sh) `<laptop|pi> <expected-tag> [--via-linux USER@HOST]` does the whole verify-then-promote rule in one script, inside one hold of the device lock. It needs a kernel built in the same tree (`build-all.sh --arch x86_64` for the laptop, `--arch aarch64 --rpi5` for the Pi, never the USB-root profile) that is newer than `HEAD`'s commit, and the tag must appear in the booted kernel's `uname -v` (set it with `LEANDROS_KERNEL_TAG`, see [building](../getting-started/building.md#what-the-build-does)).
+
+1. It deploys (`remote.py deploy-kernel --reboot` on the laptop, `pi-deploy` by kexec on the Pi) and waits for the machine to come back.
+2. It checks that ssh works, that the **booted slot is the trial and its id is the one just deployed**, that `uname -v` contains the tag, and that the kernel log has no panic, watchdog or oops line. On the laptop it also waits out the netwatch window (default 180 s, `DEVUPDATE_NETWATCH_WAIT=S` overrides) and requires that a marker written on this boot survived, so a trial that reboots itself is caught. On the Pi it prints `/proc/leandros_sd`, the SD driver's write-policy state.
+3. Only if every check passed does it promote the trial to good. Any failure exits 1, prints the recovery step and leaves the previous good kernel in place; it never changes the default boot entry and never prints command lines or secrets.
+
+On the dual-boot laptop, whose firmware default is Linux, always pass `--via-linux`. `LEANDROS_REMOTE=qemu` runs the same flow against a VM with no netwatch wait, which is how the script itself is tested.
+
+[`scripts/check-rpi5.sh`](../../scripts/check-rpi5.sh) is the seconds-long compile check for the Pi 5 kernel variant (`cargo check` with exactly the feature set `build-all.sh --rpi5` derives from the Kconfig, plus the host-side `rpi_misc_logic` tests, a check that the SD driver's command writes stay gated, and a build of the `hdmi-audio` module). Run it before merging kernel or driver changes, since most lanes never boot a Pi; `CHECK_PROFILE=usbroot` checks the no-SD-driver profile and `CHECK_FEATURE=raspi4b` the Pi 4 variant.
+
 ## The Raspberry Pi 5 flow
 
 A Pi 5 with network and the remote key takes kernels the same way, without an SD swap. The firmware boots the card's `kernel.img` (the factory kernel) and the LeandrOS root holds the real kernels in `/boot/pi/{trial,good,prev}/{kernel,initrd,info}`; the card's FAT partition is not reachable from LeandrOS, so a new kernel is staged into the root and entered with `kexec` ([boot.md](../kernel/boot.md#kexec-leandros-to-leandros)). Build with `./scripts/build-all.sh --arch aarch64 --rpi5` (release only), then:
