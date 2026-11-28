@@ -2295,13 +2295,16 @@ static void nftnat6_nonat_route(void) { nft6_nonat_case("nftnat6_nonat_route", F
 static void nftnat6_postnomasq(void) { nft6_nonat_case("nftnat6_postnomasq", FN6_RULES_POSTNOMASQ); }
 
 /* ---- ICMPv6 errors of a tracked NAT66 v6 flow are `ct state related` --------------------------------------- */
-/* A container sends UDP with hop limit 2 to an off-link address: the forwarder decrements it, slirp answers the
+/* (netavark always installs the subnet masquerade, so the rulesets carry it: without one the packet is routed unchanged and untracked.)
+ * A container sends UDP with hop limit 2 to an off-link address: the forwarder decrements it, slirp answers the
  * hop-limit-1 packet with an ICMPv6 time-exceeded that quotes the NAT'd flow. Under a default-drop FORWARD policy
  * it reaches the container only when `ct state related` is accepted. */
 static const char FR6_RULES_OFF[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n}\n";
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established accept\n }\n"
+" chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip6 saddr fd00:97::/64 masquerade\n }\n}\n";
 static const char FR6_RULES_ON[] =
- "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n"
+" chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip6 saddr fd00:97::/64 masquerade\n }\n}\n";
 static int g_r6_expect;
 static int g_r6_hl = 2;
 static int rel6_body(void) {
