@@ -119,7 +119,7 @@ pub(crate) const S6_RX: usize = 29;
 pub(crate) const S6_RX_L4: usize = 30;
 pub(crate) const S6_RX_HIT: usize = 31;
 pub(crate) const S6_RX_MISS: usize = 32;
-const S_NONAT: usize = 33;
+pub(crate) const S_NONAT: usize = 33;
 const S_PARKED: usize = 34;
 #[inline] pub(crate) fn stat6(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }
 #[inline] fn stat(i: usize) { STAT[i].fetch_add(1, Ordering::Relaxed); }

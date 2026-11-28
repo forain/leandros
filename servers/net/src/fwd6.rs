@@ -161,10 +161,35 @@ pub(crate) fn divert(br: Sid, port: Sid, bmac: [u8; 6], mut f: Vec<u8>) -> Optio
     if let Some(t) = rt { route6_l3(br, port, &p, &t, f); return None; }
     let Some((nic, nh, nicip)) = crate::ip6::nic_route6(p.dst) else { fwd::stat6(fwd::S6_NOROUTE); return None };
     let Some(nicmac) = drivers::netdev::get(nic as usize).and_then(|n| n.mac()) else { fwd::stat6(fwd::S6_NOMAC); return None };
-    fwd::stat6(fwd::S6_NAT);
     let now = sched::monotonic_ns();
     let cmac: [u8; 6] = f[6..12].try_into().unwrap();
     let rport = if p.proto == PROTO_ICMP6 { 0 } else { p.dport };
+    // Nftables is loaded but no nat/postrouting rule masquerades this packet (no such chain, or its verdict is not
+    // masquerade): Linux forwards it unchanged with the container source address if FORWARD accepts (v4: fwd::ingress).
+    let nomasq = crate::nfnl::has_tables(0) && {
+        if !crate::nfnl::has_hook(0, crate::nfnl::H_POST) { true } else {
+            let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+            let mut m = crate::nfnl::Pkt { rel: false, est: false, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
+            crate::nfnl::eval(0, crate::nfnl::H_POST, &mut m).1 != crate::nfnl::Nat::Masq
+        }
+    };
+    if nomasq && !FWD.lock().ct6.iter().any(|e| e.kind == 0 && e.proto == p.proto && e.br == br && e.port == port && e.cip == p.src && e.cport == p.sport) {
+        let est = p.proto == PROTO_TCP && p.flags & 0x12 != 0x02;
+        let mut oif = [0u8; 16]; oif[..4].copy_from_slice(b"eth0");
+        let mut m = crate::nfnl::Pkt { rel: false, est, l4: p.proto, src: [0; 4], dst: [0; 4], sport: p.sport, dport: rport, oif, mark: 0, local: false, v6: Some((p.src, p.dst)) };
+        if !crate::nfnl::eval(0, crate::nfnl::H_FWD, &mut m).0 { return None; }
+        fwd::stat6(fwd::S_NONAT);
+        f[21] -= 1;
+        f[6..12].copy_from_slice(&nicmac);
+        let mut st = FWD.lock();
+        USED6.store(true, Ordering::Relaxed);
+        fwd::USED.store(true, Ordering::Relaxed);
+        emit(&mut st, now, nic, nh, nicip, nicmac, f);
+        drop(st);
+        drivers::netdev::kick();
+        return None;
+    }
+    fwd::stat6(fwd::S6_NAT);
     let mut st = FWD.lock();
     USED6.store(true, Ordering::Relaxed);
     fwd::USED.store(true, Ordering::Relaxed);
