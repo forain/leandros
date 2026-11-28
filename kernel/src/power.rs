@@ -482,6 +482,7 @@ fn kernel_power_off() -> ! {
     serial_print_str("reboot: Power down\n");
     machine_prepare();
     quiesce_phase2(&cfg, &bm);
+    device_shutdown_hooks();
     phase(PH_STOPCPUS);
     stop_other_cpus();
     phase(PH_FINAL);
@@ -504,6 +505,22 @@ fn kernel_power_off() -> ! {
         serial_print_str("reboot: PSCI SYSTEM_OFF failed; System halted\n");
         arch_aarch64::power::halt_forever();
     }
+}
+
+/// Linux `device_shutdown()` for restart and power-off: every registered
+/// DMA engine (Device stage, as kexec runs them) is stopped before the
+/// firmware or the next OS takes over. Hooks are bounded spin loops; the Bus
+/// stage (PCIe PERST#) stays kexec-only. Never reached from panic or
+/// emergency restart, which do not go through kernel_restart/kernel_power_off.
+fn device_shutdown_hooks() {
+    let (ok, bad) = drivers::dma_shutdown::run(drivers::dma_shutdown::Stage::Device);
+    let mut l = alloc::format!("device-shutdown: quiesced {} hook(s):", ok.len());
+    for n in &ok { l.push(' '); l.push_str(n); }
+    if !bad.is_empty() {
+        l.push_str(" FAILED:");
+        for n in &bad { l.push(' '); l.push_str(n); }
+    }
+    serial_print_str(&alloc::format!("[POWER] {}\n", l));
 }
 
 /// Restart from kernel context (netwatch): the reboot(2) path, no caller checks.
@@ -532,6 +549,7 @@ fn kernel_restart() -> ! {
     })));
     machine_prepare();
     quiesce_phase2(&cfg, &bm);
+    device_shutdown_hooks();
     phase(PH_STOPCPUS);
     stop_other_cpus();
     phase(PH_FINAL);
