@@ -213,7 +213,6 @@ Several races between a non-leader `execve` (which de-threads the group), a fata
 
 - **`AT_RANDOM` is derived from the tick counter**, not from the kernel CSPRNG that `getrandom` uses, so it is predictable; it seeds libc stack-protector canaries and pointer guards. `execve` honours the set-user-ID/set-group-ID bits (`/bin/su`, `/bin/sudo`; see [../servers/security.md](../servers/security.md#su-and-sudo)); `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` carry the real and new effective ids, and `AT_SECURE` is set when they differ.
 - **`CLOSE_RANGE_UNSHARE` and `unshare(CLONE_FILES)` cannot split a thread off its process's fd table.** Fd tables are keyed by tgid. In a single-threaded caller, such as a vfork child before exec, the result is the same as Linux. A thread that asks gets the closes applied to its siblings too (`close_range`), or EINVAL (`unshare`).
-- A signal-killed group still becomes waitable when its leader is reaped, before a sibling's CPU drops the last address-space reference; `killmt` tolerates the window, the kernel still has it.
 - `with_task_address_space` (evdev/drm) reads a page-table root without taking a reference, a latent race against any address-space drop.
 - The non-leader `execve` takeover window is closed for fatal signals (above); what remains open is only the ordinary race that a group exit begun elsewhere in the same instant fails the exec with the signal, which is Linux's behaviour too.
 - No core dumps.

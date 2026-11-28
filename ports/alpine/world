@@ -1,4 +1,4 @@
-# Alpine packages (latest stable, release recorded in the lock) shipped vanilla in the LeandrOS image (both arches).
+# Alpine packages (tracks Alpine edge; the release is recorded in the lock and the toolchain.lock header) shipped vanilla in the LeandrOS image (both arches).
 # `scripts/alpine-lock.py refresh <arch>` resolves this into <arch>.lock.
 apk-tools-static
 alpine-keys

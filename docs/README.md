@@ -39,6 +39,8 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 - [Filesystems and storage](servers/filesystems.md) — F2FS (including performance on slow media and the storage knob table), xattrs and POSIX ACLs, block devices
 - [Networking](servers/networking.md) — smoltcp TCP/IP and IPv6, nftables and a complete AF_UNIX
 - [TTYs and virtual terminals](servers/tty-and-vt.md) — line discipline, job control, PTYs, VT switching
+- [Network control](servers/netctl.md) — the `/dev/netctl` protocol
+- [Bluetooth](servers/bluetooth.md) — the `/dev/hci0` host seam and `btd.sock`
 - [Users and security](servers/security.md) — accounts, login, permission enforcement
 
 ### 5. Devices and media
@@ -47,8 +49,9 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 - [Input](input.md) — evdev, virtio-input, libinput and the seat/udev shims
 
 ### 6. [Desktop](desktop/README.md)
-- [Graphical login](desktop/login.md) — greetd, cosmic-greeter, `pam-leandros`
+- [Graphical login](desktop/login.md) — greetd, cosmic-greeter, real Linux-PAM
 - [The COSMIC session](desktop/session.md) — cosmic-session, D-Bus, panel and applets
+- [Flatpak, PackageKit and service activation](desktop/flatpak.md) — libflatpak, the apk-backed PackageKit facade, busd activation
 - [Limitations](desktop/limitations.md) — what the desktop still cannot do
 
 ### 7. [Userland](userland/README.md)
@@ -61,6 +64,7 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 - [Virtual machines](hardware/virtual-machines.md) — QEMU, HVF/KVM/TCG, UTM
 - [Raspberry Pi 5](hardware/raspberry-pi-5.md) — building, SD card preparation, bring-up
 - [PC hardware](hardware/pc.md) — USB boot, USB input, NVIDIA, r8169, HD Audio, storage on a slow stick
+- [AWS EC2](hardware/aws-ec2.md) — image and AMI tooling, ENA, IMDS first boot
 - [Drivers](hardware/drivers.md) — PCI, virtio, SDHCI, USB, Wi-Fi
 
 ### 9. [Development](development/README.md)
@@ -68,6 +72,8 @@ New here? Read [Overview](overview/README.md), then [Getting started](getting-st
 - [Testing](development/testing.md) — regression suites and how to trust them
 - [Remote machines](development/remote.md) — SSH to the laptop/PC, trial kernels, `netwatch=`
 - [Debugging](development/debugging.md) — watchdog lines, task dumps, capture pitfalls
+- [Profiling](development/profiling.md) — `pcsample` and `pcprof`
+- [Self-hosting](development/selfhost.md) — building the kernel inside a LeandrOS guest
 - [Methodology](development/methodology.md) — measuring at the destination, refuted premises
 - [Conventions](development/conventions.md) — project rules for code and commits
 

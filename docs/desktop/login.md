@@ -67,7 +67,7 @@ init
    sets the account's supplementary groups (`video`, `input`), `setresgid`/`setresuid`s,
    **reads `getuid()` back**, and `execve`s `/bin/cosmic-greeter-login`.
 4. **cosmic-greeter** authenticates over greetd's IPC (it makes no PAM calls of its own in
-   the login role). greetd's session worker authenticates through `pam-leandros`, then
+   the login role). greetd's session worker authenticates through PAM, then
    starts the session selected in `/usr/share/wayland-sessions/cosmic.desktop` as the user,
    through `source_profile`.
 5. **`/etc/profile`** ([ports/greetd/data/profile](../../ports/greetd/data/profile)) gives
@@ -113,8 +113,8 @@ rather than of greetd.
   cosmic-session's supervision. Staged under another name, that spawn fails once per boot
   with one log line and never restart-storms, and no COSMIC patch is needed
   ([ports/cosmic-greeter/README.md](../../ports/cosmic-greeter/README.md)).
-  `libpam.so.0` stays staged because it is `DT_NEEDED` by the greeter ELF even though the
-  login role never calls it.
+  `libpam.so.0` is the real Linux-PAM library, `DT_NEEDED` by the greeter ELF (the login
+  role never calls it).
 
 ### `vt = "none"` is the only workable terminal mode for greetd itself
 
@@ -153,42 +153,27 @@ removes it again before `pam_getenvlist` builds the environment, so no session e
 it. This was measured — the first attempt keyed on it, and the uid-990 greeter died with
 `NoCompositor`.
 
-### No PAM stack: `pam-leandros`
+### Real Linux-PAM
 
-There is no PAM in the system. greetd authenticates through `pam-sys`, a raw FFI binding to
-`libpam`, so [ports/greetd/pam-leandros](../../ports/greetd/pam-leandros/) supplies that
-application ABI in Rust, backed by the same `$sha256$<salt>$<hex>` `/etc/shadow` scheme that
-`/bin/login` validates.
+greetd authenticates through `pam-sys`, which links Alpine's real `libpam.so.0` (the locked
+`linux-pam` apk). greetd is a dynamic musl PIE and libpam `dlopen`s `pam_unix`, which checks
+`/etc/shadow` through the setuid `unix_chkpwd`. `/etc/pam.d/greetd` includes Alpine's `base-*`
+stacks. Two LeandrOS-side pieces keep it working:
 
-- **Its `pam_putenv`/`pam_getenvlist` do real work.** greetd builds a session's *entire*
-  environment out of that table — `pam_putenv` in, `pam_getenvlist` out, and that list is
-  the `execve` envp; nothing of greetd's own environment is inherited. That is why the COSMIC
-  render environment reaches the session through `/etc/profile` and
-  `source_profile = true`. It is also why a stub here fails silently and totally: the
-  greeter `.expect()`s `GREETD_SOCK`, so stub env functions produce a greeter panic that
-  looks nothing like a PAM fault.
-- **`pam_get_user` and `pam_misc_drop_env`** are implemented too; the older C shim lacked
-  both, which made it a link failure for greetd rather than a runtime one.
-- **`open_session` / `setcred` are stubs, correctly.** Those were predicted to be the
-  most likely to matter and were neither.
-- **A failed `pam_authenticate` is rate limited.** It stalls 1 s by default (Linux-PAM's
-  `pam_unix` uses about 2 s, `login` about 3 s); `pam_fail_delay` is honoured (the longest
-  request wins, capped at 10 s). `/bin/login` does not use PAM but applies the same 1 s
-  stall after each wrong attempt. `sudotest` drives the ABI directly and `/bin/login`
-  (wrong, then right) to guard both.
-- **An rlib, not a staticlib.** A Rust `staticlib` embeds its own `std`; linking one into
-  greetd duplicates every `std` symbol. As an rlib, its `#[no_mangle] extern "C"`
-  definitions resolve `pam-sys`'s references exactly as `libpam.a` would; `build.sh` puts
-  two empty `libpam`/`libpam_misc` archives on the link path to satisfy `pam-sys`'s
-  unconditional `rustc-link-lib` lines.
-- **A shim that answers "yes" is indistinguishable from one that authenticates.** A wrong
-  password was shown to be rejected (field cleared, nothing started) before this was
-  trusted, and a host test asserts that root's shadow field is byte-identical to what
-  `mkfs-f2fs-populated.py` writes.
-
-`cosmic-greeter`'s lock-screen role links a different, older shim (`libpam.so.0`, C, in the
-artifacts tree). The two share only the `/etc/shadow` scheme; folding the lock-screen shim
-onto `pam-leandros` built as a `cdylib` is the recorded follow-up.
+- **Nine-field shadow records.** `unix_chkpwd` reports "no such user" for a short record, so
+  the image writer emits full records and `shadowfix` (run by init once per boot) pads older
+  roots; it never adds or unlocks an account.
+- **`pam_rundir.so`** ([ports/pam-rundir](../../ports/pam-rundir/)) fills the
+  `-session optional pam_rundir.so` slot in Alpine's `base-session`, exporting
+  `XDG_RUNTIME_DIR=/run/user/<uid>` when that directory exists. The `greetd` stack leaves it
+  out on purpose (the greeter session is root and keeps the greeter account's runtime dir);
+  `sudo` and `su` use it.
+- **greetd builds the session environment from PAM.** It is exactly what went through
+  `pam_putenv`, read back with `pam_getenvlist`; nothing of greetd's own environment is
+  inherited. That is why the COSMIC render environment reaches the session through
+  `/etc/profile` and `source_profile = true`.
+- **A failed authentication is rate limited** by `pam_unix`'s own fail delay; `/bin/login`
+  does not use PAM but applies a 1 s stall after each wrong attempt.
 
 ### The greetd deltas
 
@@ -197,7 +182,7 @@ greetd is pinned at `d6733e9` (0.10.3-22) and carries three patches
 
 | Patch | Why |
 |---|---|
-| `0001-leandros.patch` | greetd re-executes itself via `/proc/self/exe` for each session worker; the VFS synthesises that path inside `readlink(2)` only, so `execve` on it is `ENOENT`. The patch resolves it with `current_exe()` before the fork. It also links `pam-leandros`. |
+| `0001-leandros.patch` | greetd re-executes itself via `/proc/self/exe` for each session worker; the VFS synthesises that path inside `readlink(2)` only, so `execve` on it is `ENOENT`. The patch resolves it with `current_exe()` before the fork. It also adds utmpx/wtmp/lastlog and session-cgroup bookkeeping around the PAM session. |
 | `0002-fakegreet-leandros.patch` | avoids `std::fs::canonicalize` (musl's `realpath` via `open(O_PATH)` + `/proc/self/fd`), which fakegreet `.unwrap()`ed |
 
 Of the five workspace crates, `agreety` is not built (`/bin/login` has that role);
@@ -209,19 +194,17 @@ init respawns the graphical login, but a login that exits within `DM_STABLE_SECS
 
 ### Login diagnostics and the greetd build cache
 
-Lane lapgreet added diagnostics for a first greetd login after boot that sometimes failed on the laptop (not reproduced: 3/3 and then 4/4 boots logged in within 6 s; the cause stays open). `greetd.log` now keeps four boots (`greetd.log`, `.1` to `.3`), rotated when the logger starts, each file capped at 4 MB (past the cap the file restarts instead of renaming, so earlier boots survive) and headed `=== boot (uptime N s) ===`. Trace lines show the IPC sequence (`greetd: ipc <type>`, the command's argv0, `session exited status=.. after N ms`, `greeter exited after start_session`), `pam-leandros: auth user=.. rc=.. in N ms` (never the secret) and `start-cosmic: <uptime> step ...`. The kernel logs `drm: SET_MASTER EBUSY open_id N (holder open_id M)` and `drm: master released open_id N (last close)` (8 lines a boot); a healthy login shows the master released before start-cosmic runs.
+Lane lapgreet added diagnostics for a first greetd login after boot that sometimes failed on the laptop (not reproduced: 3/3 and then 4/4 boots logged in within 6 s; the cause stays open). `greetd.log` now keeps four boots (`greetd.log`, `.1` to `.3`), rotated when the logger starts, each file capped at 4 MB (past the cap the file restarts instead of renaming, so earlier boots survive) and headed `=== boot (uptime N s) ===`. Trace lines show the IPC sequence (`greetd: ipc <type>`, the command's argv0, `session exited status=.. after N ms`, `greeter exited after start_session`), the PAM authentication result and time (never the secret) and `start-cosmic: <uptime> step ...`. The kernel logs `drm: SET_MASTER EBUSY open_id N (holder open_id M)` and `drm: master released open_id N (last close)` (8 lines a boot); a healthy login shows the master released before start-cosmic runs.
 
-greetd is staged by a hash of the `pam-leandros` source: `greetd-lane/<arch>/<srchash>/{greetd,fakegreet,greetd.srchash}`. `ports/greetd/build.sh` skips cargo when that hash directory exists (`FORCE=1` rebuilds), and `scripts/mkfs-f2fs-populated.py` always uses the hash directory of its own checkout, building it when missing (about 20 s warm; `GREETD_NO_AUTOBUILD=1` disables). Two worktrees therefore cannot ship each other's greetd, and the old mtime-based freshness guard (which gave false "stale" errors and let stale binaries through) became the hash check. The greeter has no GPU path on a Pi without one: init skips greetd when the GPU precheck refuses.
+greetd is staged by a hash of its source inputs: `greetd-lane/<arch>/<srchash>/{greetd,fakegreet,greetd.srchash}`. `ports/greetd/build.sh` skips cargo when that hash directory exists (`FORCE=1` rebuilds), and `scripts/mkfs-f2fs-populated.py` always uses the hash directory of its own checkout, building it when missing (about 20 s warm; `GREETD_NO_AUTOBUILD=1` disables). Two worktrees therefore cannot ship each other's greetd, and the old mtime-based freshness guard (which gave false "stale" errors and let stale binaries through) became the hash check. The greeter has no GPU path on a Pi without one: init skips greetd when the GPU precheck refuses.
 
 ## Limitations & open work
 
 - **cosmic-comp still runs as root in the greeter session.** libseat is a shim with no
   seatd behind it, so the compositor cannot be handed a revocable device fd by a broker.
   The user session's compositor runs as the user, but the greeter's does not.
-- **No real PAM.** Whether to extend the shim or port Linux-PAM (which `dlopen`s
-  its modules) is undecided. The shim's `pam_open_session`/`pam_close_session` for the `greetd`
-  service write the utmpx/wtmp/lastlog records (line `greetd`); the greeter's own
-  `greetd-greeter` session is not recorded.
+- **The greeter's own session is not recorded.** greetd's PAM session writes the
+  utmpx/wtmp/lastlog records (line `greetd`) for the user's login only.
 - **Landmines recorded in the port** ([ports/greetd/README.md](../../ports/greetd/README.md#landmines)):
   greetd's parent-to-worker channel is a `UnixDatagram` socketpair (a message up to
   212960 bytes goes through, a larger one is `EMSGSIZE`, as on Linux); `prctl(PR_SET_PDEATHSIG)` is accepted and does nothing; cosmic-comp's
@@ -240,7 +223,7 @@ greetd is staged by a hash of the `pam-leandros` source: `greetd-lane/<arch>/<sr
 | Where | What |
 |---|---|
 | [ports/greetd/data/](../../ports/greetd/data/) | `greetd.conf`, `profile`, `greeter-env`, `greeter-real`, `greeter-fake`, `gpu-env`, `cosmic.desktop`, `pam.d-greetd` |
-| [ports/greetd/pam-leandros/](../../ports/greetd/pam-leandros/) | the libpam application ABI (Rust), with host tests |
+| [ports/pam-rundir/](../../ports/pam-rundir/) | `pam_rundir.so` and the `sudo`/`su` PAM stacks |
 | [userland/greeter-launch/src/main.rs](../../userland/greeter-launch/src/main.rs) | drop to the greeter account, verify, exec |
 | [userland/login/src/main.rs](../../userland/login/src/main.rs) | the text login and the shadow scheme |
 | [userland/init/src/main.rs](../../userland/init/src/main.rs) | supervision, respawn backoff, `/run/user` seeding, the greetd log |

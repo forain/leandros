@@ -176,7 +176,7 @@ Known gaps:
 | [busd](../../ports/busd/) | the session D-Bus broker actually used, and its five patches | [README.md](../../ports/busd/README.md), [../desktop/session.md](../desktop/session.md#busd) |
 | [dbus](../../ports/dbus/) | the reference `dbus-daemon` runtime notes, a zbus test client, and the **session package**: `dbus-run-session`, `session.conf`, the `.service` files | [RUNTIME-NOTES.md](../../ports/dbus/RUNTIME-NOTES.md) |
 | [sysbus](../../ports/sysbus/) | `leandros-sysbus`: login1, locale1, UPower, power-profiles, PolicyKit1, RealtimeKit1, and the `probe` client | [README.md](../../ports/sysbus/README.md) |
-| [greetd](../../ports/greetd/) | upstream greetd, its config, its launchers, and `pam-leandros` — the libpam application ABI `pam-sys` binds to, backed by `/etc/shadow` | [README.md](../../ports/greetd/README.md), [../desktop/login.md](../desktop/login.md) |
+| [greetd](../../ports/greetd/) | upstream greetd, its config, its launchers, linked against Alpine's real Linux-PAM (stack in `/etc/pam.d/greetd`) | [README.md](../../ports/greetd/README.md), [../desktop/login.md](../desktop/login.md) |
 | [cosmic-greeter](../../ports/cosmic-greeter/) | greeter build configuration (`--no-default-features`), and why there is no patch | [README.md](../../ports/cosmic-greeter/README.md) |
 | [cosmic-session](../../ports/cosmic-session/) | session build recipe, and the retired `env_rx` patch with its retirement measurement | [README.md](../../ports/cosmic-session/README.md) |
 | [cosmic-comp](../../ports/cosmic-comp/) | the one approved COSMIC patch (closed-window texture leak) and its build | [README.md](../../ports/cosmic-comp/README.md) |
@@ -194,7 +194,7 @@ Known gaps:
 | iso-codes (vanilla Alpine package, [lock](../../ports/alpine/)) | Debian iso-codes 4.18.0 JSON tables (sha256-pinned) for Settings' Region page | [world](../../ports/alpine/world) |
 | kbd-bkeymaps (Alpine) + [kbd-keymaps](../../ports/kbd-keymaps/) | `/usr/share/bkeymaps/<dir>/<name>.bmap.gz` for `loadkmap` (aliases for kbd names such as `de-latin1`, `uk`); the README and `gen-defkeymap.py` (kernel default map) stay |
 | firefox (vanilla Alpine package, [lock](../../ports/alpine/)) | Alpine's prebuilt Firefox, its closure, FFmpeg and libpulse, the launcher and prefs | [below](#firefox) |
-| [sudo-rs](../../ports/sudo-rs/) | `su` and `sudo` (sudo-rs v0.2.15, static musl, `pam-leandros`), five patches, `/etc/sudoers` and `/etc/shells` | [README.md](../../ports/sudo-rs/README.md), [../servers/security.md](../servers/security.md#su-and-sudo) |
+| [sudo-rs](../../ports/sudo-rs/) | `su` and `sudo` (sudo-rs v0.2.15, dynamic musl, real Linux-PAM), five patches, `/etc/sudoers` and `/etc/shells` | [README.md](../../ports/sudo-rs/README.md), [../servers/security.md](../servers/security.md#su-and-sudo) |
 | [brush](../../ports/brush/) | the pin and patches for the sibling brush checkout, and `sync.sh` | [README.md](../../ports/brush/README.md), [below](#brush) |
 | dosfstools, xfsprogs (vanilla Alpine packages, [lock](../../ports/alpine/)) | `mkfs.fat`, `mkfs.xfs` for disks-rs, found by bare name via /bin symlinks |
 | [openrm](../../ports/openrm/) | NVIDIA's open GPU resource manager built freestanding for the x86_64 kernel (feature `nvidia`) | [../hardware/pc.md](../hardware/pc.md) |
@@ -247,8 +247,7 @@ Known gaps:
   Alpine containers on both architectures before anything was booted, which is how busd's
   routing was known to work on Linux when LeandrOS-side symptoms appeared.
 - **greetd**: three patches (`/proc/self/exe` re-exec, fakegreet's `canonicalize`, the
-  socket directory), `pam-leandros` as an rlib with two empty archives satisfying `pam-sys`'s
-  link lines, and a Landmines section worth reading before touching the login path
+  socket directory), a dynamic link against Alpine's real `libpam.so.0`, and a Landmines section worth reading before touching the login path
   ([../desktop/login.md](../desktop/login.md)).
 - **pop-launcher**: built at exactly the revision `cosmic-launcher` pins, because the JSON
   wire protocol has no version field; plugins as hardlinks to the multicall binary.
@@ -263,7 +262,7 @@ Known gaps:
 
 **The portal build cache.** `ports/portal/build-backend.sh` used to put worktree paths (`out/stub-<arch>`, `out/sdk-<arch>`) into cargo's rustflags, which are part of a unit's hash; with one shared `CARGO_TARGET_DIR` every lane worktree produced a complete second set of hashes, and the cache grew to 236 GB. The SDK and stub directories are now reached through symlinks under `$CACHE/portal-stable/<arch>/`, refreshed on each build, so the flags are worktree-independent (a second worktree builds in 0.71 s with one hash). A guard wipes `deps`, `.fingerprint` and `build` when more than three `xdg_desktop_portal_cosmic` `.d` files accumulate. After one full build the cache is 2.5 GB. busd's shared target is path-free and unaffected. If the disk fills, check `~/Library/Caches/leandros-ports` first.
 
-**greetd staging.** greetd is built into a hash directory of the `pam-leandros` source, and mkfs builds it when missing; see [../desktop/login.md](../desktop/login.md#login-diagnostics-and-the-greetd-build-cache).
+**greetd staging.** greetd is built into a hash directory of its source inputs, and mkfs builds it when missing; see [../desktop/login.md](../desktop/login.md#login-diagnostics-and-the-greetd-build-cache).
 
 ### Data ports
 

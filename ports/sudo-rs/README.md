@@ -10,13 +10,14 @@ su that Debian/Ubuntu ship; it uses PAM for authentication and reads a standard
 
 ## The LeandrOS deltas
 
-**PAM is `pam-leandros`** (`patches/0001-pam-leandros.patch`). There is no Linux-PAM
-here; `ports/greetd/pam-leandros` implements the libpam application ABI against
-`/etc/shadow` (the same `$sha256$salt$hex` scheme `/bin/login` verifies) and is
-linked in as an rlib, exactly as greetd links it. sudo-rs's `#[link(name = "pam")]`
-is satisfied by an empty `libpam.a` the build puts on the link path. The patch also
-adds an empty `[workspace]` so cargo does not treat the tree as a member of the
-LeandrOS repo-root workspace.
+**PAM is Alpine's real Linux-PAM.** sudo-rs's `#[link(name = "pam")]` resolves to
+the locked `linux-pam` `libpam.so.0` (`scripts/lib/realpam.sh` puts it on the link
+path), so `sudo` and `su` are dynamic musl PIEs (`PT_INTERP`
+`/lib/ld-musl-<arch>.so.1`) and libpam can `dlopen` `pam_unix`, which verifies
+passwords against `/etc/shadow` through the setuid `unix_chkpwd`. The only patch
+to the PAM side is an empty `[workspace]` (`patches/0001-standalone-workspace.patch`)
+so cargo does not treat the tree as a member of the LeandrOS repo-root workspace.
+The binaries are installed set-user-ID root (04755); they are no longer static.
 
 **A pty follower is chownable** with no patch: the VFS's devpts gives `/dev/pts/<n>` the
 opener's uid, group tty (5), mode 0620, and chown/chmod/stat work on it.
@@ -34,17 +35,17 @@ exactly as `VAR=value` arguments would, so the policy decides as ogsudo does:
 allowed with SETENV (which `ALL` implies), refused otherwise. `PATH` stays
 `secure_path`'s and `SUDO_*` stay sudo's.
 
-What a distribution's `/etc/pam.d/{su,su-l,sudo}` stack would do is in
-pam-leandros, keyed on the service name:
+The service stacks are ordinary PAM files, shipped from `ports/pam-rundir/data/`
+as `/etc/pam.d/{sudo,sudo-i,su,su-l}`:
 
-- `pam_rootok` for `su`/`su-l`: a caller whose real uid is 0 switches without a
-  password. (sudo exempts root itself, in its policy code.)
-- `pam_systemd`'s `XDG_RUNTIME_DIR` for `su`/`su-l`/`sudo`/`sudo-i`:
-  `pam_open_session` exports `XDG_RUNTIME_DIR=/run/user/<uid of the target>` when
-  init has created that directory. su and sudo merge the PAM environment into the
-  command's, so `su leandro -c firefox` and `sudo -u leandro firefox` reach the
-  user's Wayland and PipeWire sockets, not root's unreadable `/run/user/0`.
-  greetd's services are untouched.
+- `su`/`su-l` start with `auth sufficient pam_rootok.so`: a caller whose real uid
+  is 0 switches without a password. (sudo exempts root in its policy code.)
+- All four include Alpine's `base-*` stacks, then `-session optional
+  pam_rundir.so` (`ports/pam-rundir`), which exports
+  `XDG_RUNTIME_DIR=/run/user/<uid of the target>` when init has created that
+  directory. su and sudo merge the PAM environment into the command's, so
+  `su leandro -c firefox` reaches the user's Wayland and PipeWire sockets, not
+  root's.
 
 ## Configuration
 
