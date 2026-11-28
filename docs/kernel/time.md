@@ -108,6 +108,20 @@ Knock-on: the minimum `nanosleep(500 µs)` went from 1.12 ms to 0.53 ms, `FUTEX_
 
 **Hazard found on the way (keep in mind for any LAPIC work).** The first x86 attempt kept the LAPIC periodic and wrote a short initial count. QEMU's `apic_timer` re-arms a periodic timer from its previous `next_time`, so a microsecond-scale period that falls behind makes QEMU's main loop spin in `timerlist_run_timers` under the big lock forever: the guest froze right after `login:` with the monitor and serial sockets refusing connections. Fix one: one-shot mode for short countdowns. Fix two: the restore to periodic must write the full initial count *before* flipping the LVT to periodic — the reverse order left a one-MMIO window of "periodic with a tiny count" and reproduced the wedge about ten minutes in.
 
+### A stalled one-shot-to-periodic flip must not kill the tick (x86-64)
+
+**Symptom.** On a KVM guest whose vCPU was descheduled by the host for one tick or more, a CPU's local APIC tick could stop for good.
+
+**Cause.** `program_periodic` switches the LAPIC from one-shot to periodic with two writes. If the vCPU stalls between the first write and the flip, the one-shot has already expired and its interrupt is pending; the flip does not restart the countdown (KVM keeps the expired timer), the pending interrupt finds `ST_PERIODIC` and programs nothing, and the tick is dead.
+
+**Fix (lanes deadtimer, deadtimer2), three independent parts, bits of `timer.fixmask` (default 7):**
+
+1. a third write of the initial count after the flip (the SDM: a write to the initial count restarts the countdown in whichever mode is current), so the periodic timer is live whatever happened in between;
+2. `check_alive` (called from the idle-wake and IRQ-window paths; one `rdtsc` on the live path): a CPU that has taken no timer interrupt for 4 ticks restores periodic mode, with a re-check under IRQs off; it logs nothing because it runs where the console may be held, so the counts are in `/proc/leandros_timer` (`dead_recovered`, by LAPIC state);
+3. a stale one-shot deadline, more than 4 ticks in the past, never fires and is ignored (`stale_ignored`) so it cannot shadow later deadlines in `arm_deadline`.
+
+**Test.** The debug knob `timer.dead_delay=<cpu>` (re-armable through `/proc/leandros_timer`, root only) stalls 15 ms once between the two writes; `stall_consumed` must be exactly 1. `deadtimertest.py` and the strict `timertest deadtick` run in the x86_64 regress aggregate; the fix-2-only variant re-arms the stall within one boot until it really kills the tick, and reports INCONCLUSIVE when it never does. With both bit 0 and bit 1 clear (`timer.fixmask=0`) the stall kills the tick, which is the red case the test expects.
+
 ### Round up, never truncate, when converting time
 
 **Choice.** Every relative interval becomes a deadline that is at least as far away as asked (`fb398c7`, since superseded by the nanosecond deadlines above).

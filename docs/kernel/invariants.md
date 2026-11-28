@@ -25,6 +25,11 @@ The hard rules the kernel depends on, each with the failure that taught it. Brea
 | 17 | [Every write that creates signal work kicks the signal hint](#every-write-that-creates-signal-work-kicks-the-signal-hint) | Sampled re-check; `miss` in `/proc/rqhold`; `sigtest sigfast` |
 | 18 | [A fault kill and a forgotten guard must leave the lock accounting balanced](#a-fault-kill-and-a-forgotten-guard-must-leave-the-lock-accounting-balanced) | `force_release_held()`; `spin_held` in `/proc/lockstat`; `scmtest`, `privtest` |
 | 19 | [User memory is reached only through `uaccess`](#user-memory-is-reached-only-through-uaccess) | SMAP/PAN (`pan=strict`); `privtest`, `uaccesstest` |
+| 20 | [An exiting task stays a zombie, and a group kill never reaps a member inside `exit()`](#an-exiting-task-stays-a-zombie-and-a-group-kill-never-reaps-a-member-inside-exit) | `pidfd_zombie_contend`, `pthreadtest gkexit`, `late_leader` |
+| 21 | [A process's memory is freed by its owner, observers hold only a `Weak`](#a-processs-memory-is-freed-by-its-owner-observers-hold-only-a-weak) | `memtest wait_releases_memory_exactly`, `/proc/leandros_asfree` |
+| 22 | [A sleeping lock must not strand a granted sleeper behind a spinner](#a-sleeping-lock-must-not-strand-a-granted-sleeper-behind-a-spinner) | `blkstealtest`, the 20 s bounded wait |
+| 23 | [A timer mode flip must be recoverable, and a console line is written whole](#a-timer-mode-flip-must-be-recoverable-and-a-console-line-is-written-whole) | `deadtimertest.py`, `conlosstest` |
+| 24 | [A named `root=` never falls back to a guess](#a-named-root-never-falls-back-to-a-guess) | `rootstricttest.py` |
 
 ## Never touch user memory under an IRQ-off spinlock
 
@@ -155,6 +160,34 @@ A new `static mut` must fit one of those categories and say which in a comment; 
 **Rule.** Kernel code, in-kernel servers and drivers read and write the current task's user memory only through `sched::uaccess` (`copy_from_user`, `copy_to_user`, `read_user`, `write_user`, `copy_user_str`, or a `UserAccess` window), with no filesystem, tty or driver lock held across the copy: copy in, work on a kernel buffer, copy out.
 
 **Why.** Under `pan=strict` a raw access is a hardware fault (see [memory.md](memory.md#smepsmap-and-pan-are-on-uaccess-is-the-only-way-in)), and independent of that a bad pointer under a lock killed the caller while it held the lock, wedging every later user. The 2026-10-19 audit (lane uaccess) converted `rt_sigaction`, `sigaltstack`, `getdents64` (kernel bounce buffer of up to 64 KiB, copied out with nothing held), `memfd_create`, the pty and console ioctls (`tty_ioctl_bounce`: per-command size and direction), the VT/KD ioctls and the kernel-side ioctls. A read path that must fault a never-touched page in uses the fault-tolerant copy, not a `virt_to_phys` write that gives up on an absent page: that was the console `read(0, buf, n)` returning `EFAULT` for a `.data` page that had never been touched (lane ttyefault; `uaccesstest` covers console, pipe, `readv`, file, socket, pty and anonymous mmap destinations).
+
+## An exiting task stays a zombie, and a group kill never reaps a member inside `exit()`
+
+**Rule.** Once `exit()` has made a task a Zombie, nothing in the tail of `exit()` may change that state for any observer, and a group kill must not reap a sibling that is already inside `exit()` but not yet a Zombie.
+
+**Why (bugs that taught us).** (1) `exit()` runs a tail that takes sleeping locks after the Zombie transition; a contended lock parked the task Blocked, `/proc` showed it running and a parent could hang. `Task::zombie_marked` / `eff_state()` and a re-assert before the final yield fixed it. (2) `kill_next_group_member` reaped such a sibling mid-exit, skipping its `clear_child_tid` write and futex wake, so a `pthread_join` on a shared TID word in another process waited forever; the member is now deferred like a klock holder. (3) The last members of a group leaving while the leader was parked off-CPU leaked the leader, because the settle check ran while its own drop mark was still set. Details and tests: [processes.md](processes.md#a-zombie-stays-a-zombie-whatever-else-the-exit-path-does).
+
+## A process's memory is freed by its owner, observers hold only a `Weak`
+
+**Rule.** Exit and exec close the address space themselves (`closed` under `busy`, `release_contents()`), whatever the `Arc` count; any code that looks at another process's space holds a `Weak` while it waits and a strong reference only while it holds `busy`. The teardown ring's seqlock writer fences after the zeroing store.
+
+**Why.** A `/proc` reader parked in its busy wait with a strong clone delayed the free past `wait4`; `sysinfo` right after `wait4` then "leaked" the child. The ring entry's fields were once visible before its sequence word was cleared on aarch64, because a Release store only orders earlier stores. Details: [memory.md](memory.md#teardown-is-the-owners-decision-not-the-last-arcs).
+
+## A sleeping lock must not strand a granted sleeper behind a spinner
+
+**Rule.** If a lock hands ownership to a sleeping waiter, a non-sleeping arrival that finds the owner has not yet run must be able to take it back, and a waiter that cannot sleep must be bounded.
+
+**Why.** The sleeper can be Ready on the arrival's own CPU, which is spinning with preemption off, so the grant is never consumed (the f2fs `fsync` soft-lockups). `IoMutex` queues non-sleepers as `Prio { max_bypass: 16 }`, steals back an un-run hand-off, and gives up after 20 s with `EIO`. See [scheduler.md](scheduler.md#kernel-threads-sleeping-locks-and-deferred-work).
+
+## A timer mode flip must be recoverable, and a console line is written whole
+
+**Rule.** Any sequence that leaves a per-CPU timer in a state only an interrupt can leave must have a self-check that restores it (`check_alive` for the x86 LAPIC), and a console line is staged and written under one hold of the console lock, never byte by byte from another path.
+
+**Why.** A host stall between the two writes of the one-shot to periodic flip left KVM's expired one-shot pending and the CPU's tick dead ([time.md](time.md#a-stalled-one-shot-to-periodic-flip-must-not-kill-the-tick-x86-64)). The aarch64 "lost console line" was a diagnostic written byte by byte to the PL011, spliced into a user `write(2)`; no byte was lost ([arch-aarch64.md](arch-aarch64.md)).
+
+## A named `root=` never falls back to a guess
+
+**Rule.** If the command line names a root, the kernel resolves that device or reports an error; unknown forms and duplicate PARTUUIDs are refused. Details: [boot.md](boot.md#choosing-the-root-root-is-strict).
 
 ## See also
 

@@ -46,6 +46,10 @@ The blocked-set and `SA_RESETHAND` updates happen *inside the handler arm*, next
 
 **What counts as "interrupted".** Blocking syscalls use `has_deliverable_signal()` as their `EINTR` condition: a pending, unmasked signal that would actually run a handler or terminate. A bare `pending & !mask` test would make every child exit spuriously interrupt a parent that never installed a `SIGCHLD` handler. Callers that *park* on the answer use `has_deliverable_signal_locked` inside the same `RUN_QUEUE` hold that marks them Blocked, because `deliver_signal` only performs a Blocked → Ready wake and a signal landing between a separate check and the park would be stranded.
 
+### Signalling a zombie, and a reaped one
+
+`kill(2)` follows Linux's process states, not the run queue's slot lifetime. A process that has exited but has not been waited for is a zombie: `kill(pid, 0)` and any real signal succeed and the signal is discarded, even after the dispatcher has recycled its run-queue slot (the exit log still holds the record, `absent_zombie`). A zombie that a `wait` has already reaped is `ESRCH` for `kill`, `killpg` and the `kill(-1, …)` sweep, as it already was for `pidfd_open` (`reaped_zombie`, lanes exitorder and serfix). A task parked Blocked by a contended lock after its Zombie transition still counts as a zombie: see [processes.md](processes.md#a-zombie-stays-a-zombie-whatever-else-the-exit-path-does).
+
 ### The lock-free signal hint
 
 Every syscall return used to take `RUN_QUEUE` twice (the claim of leader-parked signals and the delivery loop) and every `interrupted()` once more, almost always to find nothing: on the laptop during video playback that was ~150 k of 195 k `RUN_QUEUE` acquisitions per second and ~0.5 CPU of lock spinning. Now each task has `Task::sig_hint: AtomicU32` ("this thread may have signal work"), readable without the lock through a per-CPU pointer to the running task's hint (`CURRENT_SIGHINT`, published at dispatch next to `CURRENT_AS`). `deliver_pending_signals` returns at once when it reads 0, and `has_deliverable_signal` answers `false`.

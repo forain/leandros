@@ -83,9 +83,15 @@ The LAPIC timer gives each CPU a 100 Hz tick on an absolute TSC grid, plus one-s
 
 The PIT is optional. `timer::init` tolerates a stub port `0x61` with no 8254 behind it (QEMU `pit=off`, AWS Nitro), and when no stated frequency exists it falls back to the KVM pvclock (kvmclock) source, printed as `[TSC] <MHz> (kvmclock)`; that closes the old "pvclock not needed" gap. The LAPIC timer is then calibrated against the TSC (shortest of three windows, as the PIT path does) rather than assumed, with a 625 MHz default only when no TSC source exists (suite `nitrox86`).
 
+**A stalled mode flip can kill the local tick.** `program_periodic` writes the LAPIC initial count, flips the LVT from one-shot to periodic, and (since lane deadtimer) writes the count again, because a vCPU stall of a tick or more between the first write and the flip leaves an expired one-shot that KVM does not restart. `check_alive` recovers a periodic CPU that has been silent for 4 ticks and ignores a stale one-shot deadline; per-CPU `LOCAL_TICKS`, the recovery counts by state and the `timer.dead_delay` / `timer.fixmask` debug knobs are exported through `arch_timer_cpu_stats` to `/proc/leandros_timer`. The full story is in [time.md](time.md#a-stalled-one-shot-to-periodic-flip-must-not-kill-the-tick-x86-64).
+
 ### COM1 receive trigger level
 
 `serial` programs the 16550 FIFO control register so the RX trigger level is 14 bytes. FCR used to be left as firmware set it (1 byte), and QEMU's 16550 then delivers one byte per host main-loop pass: the 100 Hz tick drain got a few bytes per tick, so a 3-4 KB typed line arrived slower than a test harness typed it and the echo missed its timeout. A 4.4 KB unpaced line now arrives in under a second. Received bytes and timer/UART interrupt counts appear under `timerstat` in `/proc/stat` (both arches count cpu0 timer IRQs in `on_tick`), which is how a stall is told apart from a lost interrupt.
+
+### Console lines are staged and written whole
+
+The kernel console stages each line per CPU and writes it to COM1 and the persistent log under one hold of the console lock. The stage holds 2048 entries (`STAGE_CAP`; it was 240, so a long `[fsync]` summary was cut and user rows could land in the middle of it) and a line is written in 256-entry pieces without releasing the lock between them. A line whose newline the UART dropped is ended before the next write (`UART_LINE_OPEN`), so two lines never fuse. Only a line longer than 2048 entries is cut. The architecture-independent half is in `kernel/src/main.rs`.
 
 ### Interrupt vectors, MSI and MSI-X
 
