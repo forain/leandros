@@ -187,6 +187,8 @@ lock and does block I/O.
 
 Every load logs one line, `[FW] <path>: <n> bytes crc32=0x…` (zlib's CRC-32 over the loaded pages), added after two PC boots lost KMS and the cause had to be excluded: the GSP preload reuses the value, and `nv_put_firmware` recomputes it after RM has consumed the image, so corruption of the in-memory copy between load and use (stray DMA, a use-after-free) prints `CHANGED SINCE LOAD`. `scripts/nvidia-test-stick.sh` prints the host-side CRC of every staged file for comparison.
 
+**Where the blobs come from.** Device firmware (iwlwifi, i915, rtl_nic, Intel Bluetooth, brcmfmac/cypress and the BCM4345C0 patch RAM) is taken from pinned Alpine `linux-firmware-*` and `bluez-firmware` packages by [scripts/alpine_firmware.py](../../scripts/alpine_firmware.py) (lane alpfw, 2026-11-23), replacing six per-driver `fetch.sh` ports. `ports/alpine/firmware.list` names `<arch> <package> <member path> <destination>` lines; `refresh` resolves them against the locked Alpine release and writes `firmware.lock` (apk sha256 pins); `stage <arch>` downloads and verifies the apks and materialises **only the listed files**, decompressing the `.zst` Alpine ships (the kernel has no zstd loader, so it sees the same plain files it always requested) and following the symlinks Alpine uses across subpackages. `check` fails when a locked package has a newer version. These files are not part of the image's apk database. The laptop trial that proved it loaded `iwlwifi-8265-36` and associated.
+
 ## Kernel facilities for drivers
 
 The NVIDIA work needed generic facilities that any future real-hardware driver can use (`a1a6d71`):
@@ -270,8 +272,14 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
 | `iwlwifi.ht=0` / `wmm` / `1` | `1` | legacy association exactly as before / WMM only / WMM + HT20 + RX Block Ack |
 | `iwlwifi.ba=0` | on | decline ADDBA: HT rates without A-MPDU |
 | `iwlwifi.htrate=0` | on | HT association, legacy TX rates |
-| `iwlwifi.txsgi=0\|1` | unset | short guard interval: unset lets the rate-control column search try SGI when the AP receives it (HT only; VHT 80 stays long GI), `1` starts on SGI, `0` never uses it |
-| `iwlwifi.txmimo=1` | off | TX MIMO2 MCS 12–15 (off because Bluetooth coexistence shares an antenna) |
+| `iwlwifi.txsgi=0\|1` | unset | short guard interval, tri-state and honoured by the rate-control column search: unset lets it try SGI when the AP receives it (HT only; VHT 80 stays long GI), `1` starts on SGI, `0` never uses it |
+| `iwlwifi.txmimo=0` | on | two-stream TX is on at both bands since lanes iwl5g and iwlmimo24 (2026-11-21; 2.4 GHz HT20 TX went from 35 to 59 Mbit/s on the laptop); `0` turns it off everywhere. It was opt-in (`txmimo=1`, MCS 12–15) because Bluetooth coexistence shares an antenna |
+| `iwlwifi.vht=0` / `iwlwifi.vhttx=0` | on / on | VHT at 80 MHz on 5 GHz where the AP and NVM allow it / VHT TX rates on a VHT link (5 GHz VHT80 2x2 verified on the laptop; TX had been stuck at HT40 single stream) |
+| `iwlwifi.tx40=0` | on | on a 40 MHz link, transmit HT at 20 MHz (receive stays 40 MHz) |
+| `iwlwifi.txstbc=0`, `iwlwifi.txldpc=0` | on | no STBC / no LDPC on transmit |
+| `iwlwifi.txq_high=N`, `iwlwifi.txq_low=N` | 64, 32 | TX queue hold and release marks (clamped 8–200 and 1–200); the pure-ACK cap follows the high mark |
+| `iwlwifi.txpwr=max\|dB` | unset | send `REDUCE_TX_POWER_CMD` (diagnostic; off by default) |
+| `iwlwifi.lqrts=1` | off | RTS protection for aggregates in the LQ command (diagnostic; cut 2.4 GHz A-MPDU subframe loss about threefold without moving throughput) |
 | `iwlwifi.smps=static\|dynamic` | off | the SM power save we advertise; `static` makes the AP send one stream |
 | `iwlwifi.ldpc=0` | on | do not advertise LDPC receive |
 | `iwlwifi.ht40_24=0` | on | do not use 40 MHz on 2.4 GHz; by default 20/40 is used only when the AP offers it and no 40 MHz-intolerant BSS is seen in the span |
@@ -297,6 +305,7 @@ Kernel command-line knobs (`[iwlwifi] QoS/HT: …` in the boot log shows which a
   BARs sent, and `misaligned` (sequence number ≠ ring index; must stay 0).
 - `fw_stats:` — the firmware statistics above plus our per-chain beacon energy EWMA.
 - `rx_quality:` also counts the AP's 40 MHz frames (`40 MHz frames N`).
+- `tx_hold:` and `txq_feed:` — whether the TX queue is currently held at its high mark (episodes, high mark, cap) and the ring depth the driver saw when it enqueued and when responses arrived. They showed that the 2.4 GHz TX gap was a link-mode flip, not host starvation.
 
 `scripts/wifibench.py`, run from a wired machine against `LEANDROS_REMOTE`, measures the real link:
 N MB each way over SSH, ping, and the deltas of the AP's retry share and our retries per frame.

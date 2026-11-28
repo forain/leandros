@@ -22,6 +22,8 @@ The grid is not fixed-width ASCII any more. **Tab stops are programmable**: a bi
 
 Width and tab-stop logic live in one file, [`drivers/src/wcwidth.rs`](../../drivers/src/wcwidth.rs), compiled twice: into the framebuffer console and, through `#[path]`, into the tty server's per-VT text mirror. They must agree to the cell, or a VT switch would repaint the saved plane differently from how it was first drawn. `vttest` reads the cell grid back (code points as hex, `80000000` for a continuation cell) to check both emulators.
 
+**Deferred autowrap** (lane btmwidth, 2026-11-23). Writing the last column does not wrap at once: the cursor stays on that column with a pending-wrap flag, and the wrap happens only when the next printable character arrives, as in xterm and Linux. Wrapping eagerly made a line that ended exactly at the right margin on the bottom row scroll the console by eight rows. The emulator also implements ICH, DCH, ECH, REP, IL and DL and DECAWM (`CSI ? 7 h/l`), and the framebuffer console and the tty server's per-VT emulator share one East-Asian-Wide table. `/proc/vtgrid` (for tests) prints the cell grid of a VT after a `vtgrid <vt> <col> <row>` header, and `vttest` replays a recorded bottom-of-screen frame against it.
+
 ### A real VT emulator
 
 The console is a terminal, not a print sink:

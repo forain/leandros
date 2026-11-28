@@ -21,13 +21,13 @@ Every library `DT_NEEDED`s musl's `libc.so` and runs under `ld-musl` — not rel
 
 ### The GPU stack: Alpine, natively
 
-[`ports/mesa/build-gpu-stack.sh`](../../ports/mesa/build-gpu-stack.sh) `<arch>` runs [`build-gpu-stack-alpine.sh`](../../ports/mesa/build-gpu-stack-alpine.sh) inside an Alpine 3.21 container **of the target architecture** (podman or Docker; the build takes 2–5 minutes natively and hours under qemu-user), and writes the ship-set to a `gpu-stage-<arch>` directory that the image packer ([`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-populated.py)) prefers. Zink and the Venus ICD come out of one tree so they are ABI-consistent.
+[`ports/mesa/build-gpu-stack.sh`](../../ports/mesa/build-gpu-stack.sh) `<arch>` runs [`build-gpu-stack-alpine.sh`](../../ports/mesa/build-gpu-stack-alpine.sh) inside an Alpine container **of the target architecture** (the release comes from [`ports/alpine/toolchain.lock`](../../ports/alpine/toolchain.lock) through `scripts/lib/alpine-release.sh`, the one place every port reads it; it tracks Alpine edge since 2026-11-27, and the ship-sets were rebuilt on 3.24 with all three patches on 2026-11-22 before that) (podman or Docker; the build takes 2–5 minutes natively and hours under qemu-user), and writes the ship-set to a `gpu-stage-<arch>` directory that the image packer ([`scripts/mkfs-f2fs-populated.py`](../../scripts/mkfs-f2fs-populated.py)) prefers. Zink and the Venus ICD come out of one tree so they are ABI-consistent.
 
 The link recipe exists because Alpine's toolchain and LeandrOS's libc differ:
 
 - LeandrOS's musl `libc.so` lacked `__stack_chk_guard` until the dynamic.list relink exported it ([libc.md](../userland/libc.md)), which Alpine's static libstdc++/libgcc reference, so a local guard ([`ssp_guard.c`](../../ports/mesa/ssp_guard.c), shipped as `libleandros_ssp.so.1`) supplies it and the C++ runtime is linked statically.
 - Alpine binaries name `libc.musl-<arch>.so.1`; every shipped ELF has that `DT_NEEDED` rewritten to `libc.so` with `patchelf`. Shipping a second musl was rejected.
-- `libdisplay-info` is pinned to Alpine edge's 0.3.0, because 3.21's 0.2.0 yields a `.so.2` dependency against a sysroot that ships `.so.3` — it builds and then fails to load.
+- `libdisplay-info` was pinned to Alpine edge's 0.3.0 while the container was on 3.21 (0.2.0 yielded a `.so.2` dependency against a sysroot that ships `.so.3`: it builds and then fails to load). With one Alpine release for the whole tree the build and the sysroot agree again, and libxkbcommon, xkeyboard-config, libinput, libevdev, mtdev, pixman, libdisplay-info and kmscube now come from Alpine packages as well (lane alplibs): the runtime is in the image's apk world, the `-dev` parts are unpacked into the sysroot by `scripts/alpine-dev.py`. Every Alpine staging step, including this GPU stack and `nvk-tests`, goes through `leandros_alpine_stage` with retries and a kept per-attempt log (lane ctrretry).
 - NVK needs Mesa's Rust shader compiler NAK; its crates are fetched once on the host, verified against each wrap's sha256, and the container builds offline from that cache.
 
 ### Patches
@@ -37,7 +37,9 @@ Mesa patches live in [`ports/mesa/patches`](../../ports/mesa/patches) and are ap
 - `0001-egl-robust-access-unsupported-is-bad-attribute` — return `EGL_BAD_ATTRIBUTE` instead of `EGL_BAD_MATCH` when a robust context is requested on a driver without robust buffer access. wgpu retries without robustness only on `BAD_ATTRIBUTE`, so on virgl over a host GL without robust access (ANGLE on macOS) it never got a context and every libcosmic client fell back to the CPU.
 - `0002-virgl-no-triangle-fans-on-gles-hosts` — on hosts flagged GLES, draw triangle fans as indexed lists. MoltenVK draws only the first triangle of a fan, and Mesa's scissored clears are 4-vertex fans, so half of every such clear was lost.
 
-Both are scoped to the hosts that need them; the request still fails, or the fan is still drawn, everywhere else.
+- `0003-v3dv-single-device-display-fd` — on the Raspberry Pi 5 there is one v3d device with a primary and a render node and no separate display device. `v3dv` normally opens the display device of the pair (`vc4`) as its display fd, and the Wayland WSI needs a DRM fd to initialise and to compare against; the patch opens the v3d primary node as the display fd when no other display device was found. `libvulkan_broadcom.so` (`v3dv`, built with `VKDRV=...,broadcom` on aarch64, no LLVM) is the Pi's Vulkan ICD.
+
+The first two are scoped to the hosts that need them; the request still fails, or the fan is still drawn, everywhere else.
 
 ### Where it started: cross-compiling on a Mac
 
@@ -89,7 +91,7 @@ The `drm_version` string-length convention elsewhere in the tree counts the trai
 ## Limitations and open work
 
 - The ship-set is built outside the repository's build (`build-all.sh` consumes a staged directory); a new machine needs the stage built or copied.
-- v3d has no real hardware backend yet; the post-contract `kmscube` fault is open.
+- v3d: the kernel backend is real on the Pi (see [drm-kms.md](drm-kms.md#the-v3d-backend)) and COSMIC renders on it on a real monitor, but its frame rate has not been measured. wgpu's GLES backend cannot run on v3d (no vertex-stage storage buffers), so `gpu-env` runs libcosmic clients on `v3dv` Vulkan there.
 - NVK is built but only meaningful with the NVIDIA kernel bring-up (see [PC hardware](../hardware/pc.md)).
 
 ## Code and tests

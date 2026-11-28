@@ -94,8 +94,9 @@ this page is the explanation.
 ### Display, input and hardware
 
 - **QEMU was the first place the desktop was verified.** COSMIC now also renders on the
-  HP EliteBook's Intel graphics and on an NVIDIA RTX 3070 PC, but the Raspberry Pi 5 has no
-  desktop yet, and low frame rates and software video decode remain open
+  HP EliteBook's Intel graphics, on an NVIDIA RTX 3070 PC and, since 2026-11-25, on a Raspberry Pi 5
+  (v3d, scanned out through the HVS, on a real monitor attached before power-on; its frame rate is
+  unmeasured and HDMI audio is unconfirmed). Low frame rates and software video decode remain open
   ([../hardware/README.md](../hardware/README.md)).
 - **cosmic-comp is never fully idle.** It does an allocate/free cycle per wakeup; the kernel
   side of the idle cost was cut (greeter dispatches roughly halved, host QEMU CPU at idle
@@ -118,7 +119,7 @@ kept here because each was a real, recorded gap and the reason it closed is wort
 | **No `#!` scripts** — every launcher had to be run as `sh <script>` | `execve` follows Linux `binfmt_script` semantics (`3762fb6`, `userland/exectest`); the launchers are still invoked through `sh` |
 | **The greeter's power buttons do nothing** — cosmic-greeter was built without its `logind` feature and had no system bus | built with `--features logind`, run under `dbus-run-session` with its own bus; shut down and restart work from the greeter and, via `leandros-sysbus power`, for a regular user ([session.md](session.md#power-off-and-restart-from-the-greeter-and-as-a-user)) |
 | **Battery and Bluetooth applets have nothing to show** — UPower answered "no battery" and there was no bluez | UPower reads `/sys/class/power_supply`; the `org.bluez` shim over btd serves the Bluetooth applet and Settings ([../servers/bluetooth.md](../servers/bluetooth.md)) |
-| **Only the clock stand-in and five applets** | time, battery, notifications, status-area, input-sources, a11y, app-list, power and Bluetooth are staged, plus cosmic-files, cosmic-edit, cosmic-store (its backend is the PackageKit facade over apk, `leandros-sysbus packagekit`, with a build-time Alpine appstream snapshot; no Flatpak), cosmic-screenshot and a Firefox launcher entry |
+| **Only the clock stand-in and five applets** | time, battery, notifications, status-area, input-sources, a11y, app-list, power and Bluetooth are staged, plus cosmic-files, cosmic-edit, cosmic-store (its backend is the PackageKit facade over apk, `leandros-sysbus packagekit`, with a build-time Alpine appstream snapshot, and a Flatpak backend on a libflatpak port that lists Flathub apps), cosmic-screenshot and a Firefox launcher entry |
 | **No power-off** — the shutdown dialog's Confirm failed | login1 → init → `reboot(2)` → ACPI S5 / PSCI, with a clean f2fs unmount |
 
 ## Refuted limitations

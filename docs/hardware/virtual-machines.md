@@ -51,6 +51,10 @@ consequences shape how results are read:
 - **TCG is a different timing world.** A COSMIC session on TCG takes minutes to settle; races that
   never fire under KVM or HVF can fire constantly under TCG and vice versa.
 
+### aarch64 KVM on a Pi 5
+
+A Raspberry Pi 5 running Linux is an aarch64 KVM host, and `run-qemu.sh` supports it (lane macscripts, 2026-11-22). Its GIC is a GICv2, which KVM cannot present as GICv3, so under KVM the machine line mirrors the host (`gic-version=host`) instead of `gic-version=3`; the kernel drives GICv2 or GICv3 by detection, so the same image boots. The harness scripts that cloned images with the macOS-only `cp -c` go through one helper (`imgclone.CPC`: `cp --reflink=auto --sparse=always` on Linux) in 37 scripts, so they run on Linux hosts. This host's QEMU has no virglrenderer, so the tests that need a virgl GPU (`blanktest`, `portalshottest`) fail there for environmental reasons and `powerctl`'s and `usbunplug`'s `emptyhot` cases skip. The `uartgap` transmit-gap bound (1500 us) is enforced only on aarch64 KVM, taking the minimum over up to three boots because the host can deschedule the vCPU while the guest counter keeps running.
+
 ### HVF and the GICv3 port
 
 QEMU 11.1 refuses to start an HVF guest on a GICv2 machine (`HVF does not support GICv2

@@ -3,7 +3,7 @@
 LeandrOS boots on a real Raspberry Pi 5 (BCM2712, Cortex-A76) from its SD card: firmware → kernel →
 init → F2FS root on the card → `pivot_root` → getty → `login:` → an interactive `brush` shell, all
 over the board's debug UART, and since late October 2026 also over the network (Ethernet, Wi-Fi, USB),
-with Bluetooth, HDMI audio and a V3D-rendered GL stack. This page covers the `rpi5` build, preparing and
+with Bluetooth, HDMI audio, a V3D-rendered GL stack and, since 2026-11-25, the COSMIC desktop on a real monitor. This page covers the `rpi5` build, preparing and
 updating a card, the bring-up bugs that only real silicon exposed, the RP1 / Wi-Fi / GPU / board drivers,
 and the network kernel-update flow. Bluetooth has its own page: [servers/bluetooth.md](../servers/bluetooth.md).
 
@@ -18,9 +18,13 @@ and the network kernel-update flow. Bluetooth has its own page: [servers/bluetoo
 | USB (RP1 DWC3, two xHCI roots) | Probed and enumerated on hardware (`lsusb` shows two 1d6b:0003 root hubs) |
 | Wi-Fi (CYW43455 over SDIO, `wifi0`) | **Working**: firmware download, WPA2 join with a host 4-way handshake, DHCP; survives kexec |
 | Bluetooth | `/dev/hci0` over uarta, `btd`/`bthid` supervised by init; see [servers/bluetooth.md](../servers/bluetooth.md) |
-| Network kernel updates | **Working**: `remote.py pi-deploy` / `pi-boot` / `pi-promote` / `pi-sync`; serial push as the no-network fallback |
-| V3D 7.1 GPU | Ladder green on hardware (`v3d.probe=1`); Mesa `v3d` renders GLES; no display path for scanout apps yet |
-| HDMI audio | Implemented (IEC958, MAI, dma40 ring) as a PipeWire backend; audible output not confirmed in the lane notes |
+| Network kernel updates | **Working**: `remote.py pi-deploy` / `pi-boot` / `pi-promote` / `pi-sync`, wrapped by `scripts/device-update.sh`; serial push as the no-network fallback |
+| Card kernel (tryboot A/B) | **Working** on a real card: `remote.py pi-card`, firmware `tryboot`, a kernel-side trial deadline; see [Card kernel slots](#card-kernel-slots-and-dual-boot) |
+| SD write safety | A card that is not LeandrOS's own is never written; see [SD write lock](#sd-write-lock) |
+| V3D 7.1 GPU | Ladder green on hardware (`v3d.probe=1`); Mesa `v3d` renders GLES and `v3dv` Vulkan; `V3D` is `y`/`m`/`n`; `scripts/pi-gpu-smoke.sh` 4/5 with a headless sink (the fifth needs a monitor) |
+| Display scanout | **Working on a real monitor** (2026-11-25): firmware-framebuffer copy and HVS zero-copy flip at 59-60 fps; see [V3D scanout and the HVS](#v3d-scanout-and-the-hvs) |
+| COSMIC desktop | **Renders on v3d** on a real monitor (2026-11-25); fps not measured, the monitor must be attached before power-on |
+| HDMI audio | Implemented (IEC958, MAI, dma40 ring) as a PipeWire backend; D0 DREQ cells corrected (2026-11-25); audible output not confirmed (the test monitor has no speakers) |
 | Watchdog, panic reset, fan, RNG, RTC, thermal | Implemented; fan curve and wedge/panic behaviour confirmed on the Pi where noted below |
 | HDMI console via the VideoCore mailbox | Implemented and proven on QEMU `raspi4b` (`f480fbe`) |
 | SMP | Four cores via PSCI; kexec keeps all four (secondaries are parked, not powered off) |
@@ -252,6 +256,69 @@ Multi-block transfers were added afterwards and are covered below.
   went without timer ticks; the driver now opens IRQ windows per sector and every 1024 spins of its polled
   waits, and takes the DEVICES lock per block on reads.
 
+## SD write lock
+
+The SD driver writes only to a card that is LeandrOS's own. At probe it evaluates a pure grant policy
+(`rpi_misc_logic::sdgrant`, host-tested): the card must carry an F2FS root whose volume label is `leandros-root`,
+the probe is fail-closed (a command line it cannot read, or a failed read, never grants), and the answer is
+one gate that every write passes ([sdhci.rs](../../drivers/src/sdhci.rs)). Before 2026-11-26 the rpi5 build
+exposed a foreign card's partitions read-write and fell back to the first `0x83` partition (found with a
+Raspberry Pi OS card). Now:
+
+- A **locked** card exposes no foreign partitions (`sdhci.expose=ro` registers them read-only for inspection);
+  the grant is dropped when the card is replaced (card-detect is sampled at grant time).
+- The **boot FAT** and the whole-card node (`/dev/mmcblk0` plus MBR partition nodes, lane sdraw; `BLKRRPART`
+  re-reads the table; raw writes over the mounted root filesystem are `EBUSY`) are read-only unless a live
+  `BLKWRWIN` window covers the write. This is how `espctl pi` changes a card without ever mounting
+  the FAT through a filesystem driver.
+- `sdhci.trust=` is the explicit override for a card without the label (logged when used).
+- `/proc/leandros_sd` reports `state=` (`granted`, `locked`, `locked-ro-exposed`, `unprobed`), the reason, whether
+  the card is `own` or `foreign`, the grant range and `writes_issued` / `writes_refused`. `scripts/device-update.sh`
+  prints it after a Pi trial boot.
+- The module build (`sdhci` as `=m`) follows the same power and 1.8 V pin policy as the built-in driver: no
+  1.8 V request on an unpowered card (lane sdpins).
+
+## Card kernel slots and dual boot
+
+`kexec` updates ([below](#updating-a-running-pi-over-the-network)) never change what the firmware boots by
+itself, so a power cycle always returns to the card's own `kernel.img`. To change that kernel safely there is a
+second flow built on the firmware's **tryboot** feature:
+
+- **Card side** (`userland/espctl/src/picard.rs`, `espctl pi ...`). The card's boot FAT is not mounted; every
+  write is an explicit raw sector write on an allowlist, ordered so that a power cut at any sector boundary
+  leaves a bootable card. Verbs: `setup` (one time: allocates free FAT sectors and adds `slots/`,
+  `tryboot.txt`, `cmdline_try.txt`; never touches `config.txt` or `kernel.img`), `stage` (writes kernel and
+  initrd into `slots/sN/`, verifies from the medium, sets the slot digit in `tryboot.txt`), `try`, `commit`
+  (copies the one differing 512-byte sector of `tryboot.txt` into `config.txt`, so `os_prefix=slots/sN/`
+  becomes the default), `abort`, `rollback`.
+- **Host side** (`remote.py pi-card VERB [--dry-run]`, [scripts/pi_card.py](../../scripts/pi_card.py)). The gate:
+  nothing reaches the card unless the build is a self-contained rpi5 direct-boot kernel that the Pi has already
+  run through `pi-deploy`. It never prints the command line (which carries credentials).
+- **Kernel side** ([kernel/src/tryboot.rs](../../kernel/src/tryboot.rs)). `reboot(RESTART2, "tryboot")` sets the
+  firmware's `SET_REBOOT_FLAGS`, reads it back and notifies the firmware; the next reset reads `tryboot.txt`,
+  whose `cmdline_try.txt` carries `leandros.tryboot=1`. A trial boot then runs a `tryboot` kthread that
+  reboots plainly after `tryboot.deadline=<seconds>` (default 900) unless the trial is confirmed
+  (`reboot tryboot-commit`). A plain reboot consumes no tryboot flag, so the firmware reads `config.txt` and
+  boots the good slot. A commit in progress holds the deadline (a 300 s lease). The command line is never
+  printed.
+- **`reboot [N] [tryboot]`** follows raspberrypi/linux: a leading number is a one-shot boot partition (values
+  of 63 and above ignored), and a `tryboot` without a number targets partition 1, where LeandrOS's
+  `tryboot.txt` lives. On a dual-boot card (`autoboot.txt` pointing at another partition) this lets Linux run
+  `reboot 1` to enter LeandrOS and LeandrOS run `reboot 3` to enter Linux; the SD root is chosen as the
+  partition with the F2FS magic, not the first `0x83`. Verified on the real Pi 2026-11-21.
+
+### Other boot media
+
+- `RPI5_USBROOT=1 ./scripts/build-all.sh --arch aarch64 --rpi5` builds the **USB-root profile** (`rpi5_usbroot`
+  defconfig, kernel tag suffix `-usbroot`): no SD driver; the root is found by `PARTUUID` on a USB stick.
+  [scripts/write-usb-rpi5.py](../../scripts/write-usb-rpi5.py) writes the stick (root F2FS, a home volume, a raw log
+  partition, no ESP; it refuses anything that is not a whole, unmounted USB disk of the confirmed size).
+- [scripts/stage-batocera-rpi5.sh](../../scripts/stage-batocera-rpi5.sh) stages a `leandros/` folder and a
+  `tryboot.txt` on a Batocera Pi 5 boot partition (dry run unless `--apply`), checksumming every other file before
+  and after; `--rollback` removes exactly the two things it created. That makes a second Pi that normally runs
+  Batocera bootable into LeandrOS for a trial without touching its own system. The repository holds the staging
+  tools and their tests only; nothing in it drives that Pi as a test farm.
+
 ## Display: the VideoCore mailbox framebuffer
 
 **The Pi 5 firmware publishes no `simple-framebuffer` node, and `config.txt` cannot make it.** Its
@@ -311,6 +378,65 @@ page flips and the cursor, plus all of OpenGL through V3D. The 1.58–1.82 s per
 an old `framebuffer.rs` comment predates the write-back shadow buffer and is stale; a scroll is now a
 cached memmove plus a write-only blit, single-digit milliseconds. See
 [graphics/console.md](../graphics/console.md).
+
+## V3D scanout and the HVS
+
+Mesa's `v3d` is a single-device driver: a GBM scanout surface is a v3d buffer object whose GEM handle goes
+straight to `ADDFB2`. [drivers/src/v3d_scanout.rs](../../drivers/src/v3d_scanout.rs) is the Pi's `KmsBackend` for such
+buffers and puts them on screen through one of three pluggable sinks. Nothing registers when no sink exists, so an
+`ADDFB2` of a v3d buffer fails instead of looking usable. A present first waits for the buffer's last GPU job
+(the GPU is not coherent with a CPU copy).
+
+| Sink | When | What it does |
+|---|---|---|
+| `HvsPlane` | The default when firmware channel 0 runs a matching one-plane list; `hvs.plane=0` opts out | Zero-copy scanout of the buffer by the HVS, paced by vblank |
+| `FwCopy` | The fallback for a frame the plane cannot show | A pitch-converting copy into the firmware framebuffer (`kms_v3d::present`); needs a monitor at power-on for the mailbox to grant one |
+| `Headless` | Opt-in, `v3d.headless=WxH` | A RAM surface: a present copies the buffer in and logs a frame count and CRC, read back from `/proc/v3d_headless`; the pixels from `/proc/v3d_headless_fb` (raw XRGB8888). No monitor needed, so a compositor can run on the real GPU and be checked over SSH |
+
+**The HVS plane** ([drivers/src/hvs_plane.rs](../../drivers/src/hvs_plane.rs), layout from Linux rpi-6.12 `vc4_regs.h`,
+D0 stepping). The firmware leaves channel 0 running a one-plane display list (unity scale, linear, XRGB8888).
+The driver copies that list (8 words plus END) into one of two free display-list RAM slots, changes only the
+address and pitch words, and writes the slot's start into `DISP0_LPTRS` once per flip; the HVS picks it up at the
+next frame start. Nothing else is written: channel 1 and the firmware's own list stay untouched, and `restore()`
+puts the firmware list back on a console switch, VT switch, panic or kexec. A buffer is scanned out only when it
+matches the firmware plane (same size, XRGB rows, 16-byte aligned); the buffer is held until the HVS has certainly
+left it. If the takeover or the first latch fails, the plane turns itself off and the copy sink takes over
+(`[hvs] plane off, falling back to the copy sink`).
+
+**Flip events follow the real latch.** A page-flip event is completed when the new list is the one the HVS runs,
+and the driver learns the vblank phase from the instants it sees a latch. The first version set the phase to the
+observation time, so one late worker poisoned every later prediction, and it looked only just before a predicted
+boundary, then skipped a whole frame when the real boundary came later (the panel's true period is about
+16.683 ms, not 16.667). Since lane hvsphase (2026-11-27):
+
+- `next_check_at` gives each predicted boundary a window of +-(300 us + 0.2 % of the time since the phase was
+  learned), looks at the window's start and then every 250 us until the window ends; before any latch is seen it
+  polls every 1 ms.
+- `latched_phase` adopts an observation that lies near a predicted boundary (so the phase tracks the real period)
+  and keeps the grid point when the observation is far from every prediction (a busy worker), instead of
+  poisoning the phase with the delay.
+- `wait_latch` used to sleep with the state spin lock held; the lock is now released around every sleep and
+  `queue` is serialised by a turn flag. The Pi's lock-sleep violation count went from 3 to 0. The v3d `wait_bo`
+  op sleeps (a timed park) instead of yield-polling.
+
+**`/proc/leandros_hvs`** (lane hvscount; write `reset` to zero it) shows what the flip path is doing: `live`,
+`flips`, `waits`, `busy_refused`, `events`, `missed` (events later than one frame), the `late_bound` histogram (an
+UPPER bound of event lateness, only for events with a pending observation before them), `late_unbounded`, the raw
+`STATUS` ring and `latch_status`, `frame_period_ns`, `fence_wait_ns`, `takeover_ms` and `ksync_violations`. The
+scan-line histograms are marked UNVERIFIED in the output: the STATUS bit layout is not confirmed. The pure timing
+functions have host tests with a simulated latch (`drivers/v3d-tests`). One flip event of 8 ms or more
+still shows after hvsphase, probably the takeover flip.
+
+**On a real monitor (2026-11-25).** M3 (frame copy), M4 (HVS zero-copy, 59-60 fps) and M5 (COSMIC on v3d)
+passed on the first Pi: cubes and the desktop were seen. The monitor must be attached before power-on, because the
+firmware sets up HDMI then. `ports/greetd/data/gpu-env` selects the v3d path when `/bin/gpuprobe gl` renders on
+a non-software renderer and the Broadcom Vulkan ICD is in the image: GL is native `v3d`, and clients use wgpu on Vulkan
+(`v3dv`), because wgpu's GLES backend cannot run on v3d (it needs vertex-shader storage buffers, which v3d does
+not offer). The `v3dv` WSI needs a DRM display fd, and there is no separate display device, so a Mesa patch
+([ports/mesa/patches/0003-v3dv-single-device-display-fd.patch](../../ports/mesa/patches/0003-v3dv-single-device-display-fd.patch))
+opens the v3d primary node as the display fd; see [graphics/mesa.md](../graphics/mesa.md). Still open for the desktop: the
+HDMI pixel clock reads 148352 kHz against 148500, PipeWire starts before HDMI audio is ready, and frame rate has
+not been measured.
 
 ## GPU acceleration groundwork
 
@@ -462,7 +588,9 @@ How the bring-up works and why it looks the way it does:
   `wifi0` stack (`pisshrace`) were each fixed; the `piwedge` raw-UART diagnostics (`brcmf dp on|off|rx|yield`
   bisection, IRQ trail, stage markers) remain for the next one.
 
-Open: BSS `84:78:48:d8:7e:79` rejected with reason 2 on every boot in the last lane note; WPA3 is deferred.
+**No sleeping under a spin lock, no checkpoint under the radio lock.** The radio used to sit behind a spin mutex that was held across every radio operation, and the `/etc/brcmf.ctl` poll ran inside it; each VFS open then counted as an F2FS writer and could run a locked checkpoint (`F2FS_MOUNTS` holds of 56-200 s). The radio lock is now a sleeping mutex (`SharedRadio` is a `KMutex`), the control-file poll runs on the driver thread outside it (handed over through `CTL_PENDING`), and F2FS counts an open as a writer only with write flags and never runs a locked checkpoint for a caller that may not sleep. Measured on the Pi: bulk sync 0.4 to 0.7 MB/s, `F2FS_MOUNTS` holds 56-87 s down to 13 ms, no `[HUNG]` or `[WDOG]`. `brcmf` also builds as a module (`kmodport`; the `kmodsuite` regress suite loads and unloads it).
+
+Open: one AP rejected with reason 2 on every boot in the last lane note; WPA3 is deferred.
 
 ## DMA, GPIO and HDMI audio
 
@@ -480,8 +608,17 @@ Open: BSS `84:78:48:d8:7e:79` rejected with reason 2 on every boot in the last l
 - **HDMI audio** (`drivers/src/hdmi_audio/`, `pihdmi-audio`): IEC958 subframes, MAI/ACR registers (the D0
   7-bit `VC6_D` threshold layout), audio InfoFrame, fed by a dma40 cyclic ring on hdmi0, registered as a
   PipeWire backend. A read-only probe (`hdmi.probe=0` disables) decides HDMI vs DVI, measured pixel clock
-  and the audio gate first (`pihdmi-probe`). The lane notes record the path as host-tested; they do not
-  record audible output.
+  and the audio gate first (`pihdmi-probe`). Audible output is still unconfirmed (the monitor used has no speakers).
+  Lane hdmidreq (2026-11-25) addressed a restart loop seen on D0 silicon (not yet tried on the Pi afterwards):
+  - The pacing check accumulates the DMA position (sampled every 500 us into an unwrapped total) and decides
+    once after its window, so a racing engine can no longer pass by aliasing. It gets one full retry with
+    the same DREQ cell; only when the stepping is unknown is the other stepping's cell tried, once, and never
+    another FIFO address.
+  - The stall policy is wall-clock (300 ms without movement; an unavailable position counts as nothing moved).
+    After 5 restarts without progress, or a stall right after a client `SET_PARAMS` restart, the stream is
+    **dead**: DMA and MAI stop, and input is drained through a null sink at the stream's own rate so the writer
+    never blocks. One log line says why; the next `SET_PARAMS` or a re-train gives it one restart again.
+  - Open follow-ups: the InfoFrame retry deadline, rate-meter accounting, and the `setup_intact` readback fallback.
 
 ## V3D GPU
 
@@ -499,9 +636,10 @@ a real `SUBMIT_CL` queue (out-of-memory binner overflow, hang reset, multi-sync)
 - **Mesa `v3d` renders GLES on the Pi** (`pigpu2`). It had fallen back to softpipe because the Pi root still
   carried the virtio-pci sysfs identity for card0/renderD128 and `pi-sync` skips `/sys/dev/char/226:*`.
   `scripts/pi-v3d-sysfs.sh` rewrites the identity to a platform device once per root. `es31test --fbo`
-  and `vkprobe` ship in the aarch64 set. kmscube has no display path on the Pi yet.
+  and `vkprobe` ship in the aarch64 set. The display path for kmscube and the compositor is the
+  [scanout section above](#v3d-scanout-and-the-hvs); kmscube also runs headless (57 fps, CRC checked).
 - `kexec` quiesces V3D (`pikexecdma2`); `V3D` is a tristate (`y`/`m`/`n`) in the kernel-module work
-  ([kernel/modules.md](../kernel/modules.md)). Proven on the Pi: `=y` and `=m` both run kmscube at about 60 fps, `vkprobe` and `es31test` pass; with `=m` the kernel image contains no `v3d_real`/`ClQueue`. `scripts/pi-gpu-smoke.sh` scores 5/5 on `=y` or `=m` (run it with no compositor holding card0).
+  ([kernel/modules.md](../kernel/modules.md)). Proven on the Pi: `=y` and `=m` both run kmscube at about 60 fps, `vkprobe` and `es31test` pass; with `=m` the kernel image contains no `v3d_real`/`ClQueue`. `scripts/pi-gpu-smoke.sh` scores 5/5 on `=y` or `=m` with a monitor (run it with no compositor holding card0), 4/5 without one (the kmscube scanout needs a monitor; headless kmscube, `es31test` 4096/4096 and `vkprobe` 16384/16384 pass). The kernel half is a `kenv` seam plus a `KV3dOps` table, so the same driver builds in or as a module.
 
 ## Board support: watchdog, panic, fan, identity
 
@@ -520,13 +658,15 @@ a real `SUBMIT_CL` queue (out-of-memory binner overflow, hang reset, multi-sync)
   OTP/firmware MAC tag fails (`[otp] mac=none`), so `auto` falls back to the Ethernet MAC from the firmware's
   `smsc95xx.macaddr` + 2 (Wi-Fi uses + 1). Changing the address invalidates existing bonds: re-pair once, or
   use `bt.bdaddr=keep`.
+- **Undervoltage and throttling** (lane uvolt). The firmware's `GET_THROTTLED` word is polled from the board
+  thread; a change is logged, and `/proc/thermal` has a `power:` line. `power.uvolt=off` disables it.
 - **Misc** (`pimisc`): hardware RNG (`rng200`, boot seed plus reseed source), firmware RTC read at boot and
   written back by `clock_settime`, AVS thermal reading, an `ondemand`-style ARM clock governor, and a device
   inventory (`artifacts/notes/pi5-device-inventory-2026-10-26.md`).
 
 ## Updating a running Pi over the network
 
-Once the Pi has network and sshd, no SD swap is needed. The board's FAT partition is not reachable from
+Once the Pi has network and sshd, no SD swap is needed. The board's FAT partition is not mounted by
 LeandrOS, so kernels live in the root at `/boot/pi/{trial,good,prev}/{kernel,initrd,info}` and are entered
 with `kexec`; the firmware always boots the card's `kernel.img` (the factory kernel), which this flow never
 writes, so **a power cycle is the recovery** and `pi-boot good` returns to the promoted kernel.
@@ -558,6 +698,10 @@ python3 scripts/remote.py pi-sync          # update the root fs in place from th
   console to the in-guest `serrx` (framed, CRC-checked, go-back-N, sha256 verified, atomic rename), and
   `scripts/pi-serial-kexec.sh` pushes a kernel and initrd and kexecs. It refuses a port another process has
   open and never kills it.
+
+### `scripts/device-update.sh`
+
+`scripts/device-update.sh pi <expected-tag>` (or `laptop`) is the one-command form of build, deploy, verify and promote, run inside **one** device lock so the booted-trial check and the promote cannot be separated (the earlier wrong-promote incident). For the Pi: it refuses a build older than HEAD's commit, then `pi-deploy`, then checks that ssh works, that the booted slot is `trial` and its `info` begins with the current commit, that `uname -v` contains the tag, that the kernel log has no panic, WDOG or oops line, prints `/proc/leandros_sd`, and only then runs `pi-promote` and confirms `good` is the new commit. Any failed check exits 1 and the previous good stays; after a power cycle `pi-boot good` returns to it. It never changes the default boot entry and never prints a command line or secret. Build the Pi kernel with `--rpi5` (never `RPI5_USBROOT`). The laptop form is described in [pc.md](pc.md#updating-the-laptop-kernel).
 
 ## Init without a GPU, and background daemons
 
@@ -608,9 +752,12 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
 
 ## Limitations and open work
 
-- No display path for scanout GL apps (kmscube) on the V3D yet; desktop on the Pi is not there.
-- HDMI audio output, the HDMI console and the SD speed negotiation have not been confirmed by ear/eye in the
-  lane notes; HDMI console and SD ladder are QEMU-proven.
+- The desktop renders, but its frame rate is unmeasured and a flip event of 8 ms or more still occurs
+  occasionally (see [V3D scanout and the HVS](#v3d-scanout-and-the-hvs)). The monitor must be attached at power-on.
+- HDMI audio output has not been confirmed by ear; D0 uses DREQ 12/13 and the pacing check is the only proof that
+  data flows. The HDMI console is proven on hardware by the colour-bar and desktop runs; the SD speed negotiation
+  is QEMU-proven.
+- A trial deadline that expires while the Pi has booted Linux (dual-boot card) is not exercised.
 - SDHCI is PIO and single-sector by default; `sdhci.multi=1` is unproven on the Pi (see above).
 - Wi-Fi: WPA3 deferred; one AP rejects with reason 2 every boot; weak-signal BSSes still produce handshake
   timeouts (now back-off, not a blocked profile).
@@ -637,9 +784,10 @@ controller looked healthy and "CMD8 always times out" was blamed on QEMU's block
   [arch/aarch64/src/smp.rs](../../arch/aarch64/src/smp.rs),
   [kernel/src/main.rs](../../kernel/src/main.rs) (`INITRD_PHYS`, PCIe off, mailbox, `BAR_HOLD_SECS`)
 - RP1 / network / board: `drivers/src/brcmstb_pcie.rs`, `rp1.rs`, `rp1_usb.rs`, `macb.rs`, `dwc3_hw.rs`,
-  `bcm2712_dma40/`, `bcm2712_gpio.rs`, `hdmi_audio/`, `v3d/`, `rpi_misc.rs`, `rpi_pm.rs`, `brcmf/`
+  `bcm2712_dma40/`, `bcm2712_gpio.rs`, `hdmi_audio/`, `v3d/`, `v3d_scanout.rs`, `hvs_plane.rs`, `rpi_misc.rs`, `rpi_pm.rs`, `brcmf/`
   (host tests: `drivers/brcmf-tests`, `macb-tests`, `dwc3-tests`, `rp1-tests`, `bcm2712-tests`),
-  `scripts/remote.py` (`pi-*`), `scripts/pi-serial-push.py`, `scripts/pi-v3d-sysfs.sh`
+  `scripts/remote.py` (`pi-*`), `scripts/pi_card.py`, `scripts/device-update.sh`, `scripts/pi-serial-push.py`, `scripts/pi-v3d-sysfs.sh`,
+  `kernel/src/tryboot.rs`, `userland/espctl/src/picard.rs`
 - Regression: the `raspi4b` boot (`run-qemu.sh --raspi4b`) for SDHCI and the mailbox; the aarch64
   `--direct` QEMU boot, the only QEMU path that exercises the entry stub's cache/TCR/PUD code (Limine
   branches around it). Real-board verification is a serial capture showing the prompt.
