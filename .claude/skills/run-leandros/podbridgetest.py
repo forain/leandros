@@ -249,6 +249,8 @@ def main():
             _, dg = run(f"cat /proc/sys/net/ipv4/ping_group_range; podman run --log-level=debug --rm --network pb6 {IMG} true 2>&1 | grep -i 'sysctl\\|ping_group' | cut -c1-200 | head -8")
             _, dg = run(f"echo '1 0' > /proc/sys/net/ipv4/ping_group_range; podman run --rm --network pb6 {IMG} cat /proc/sys/net/ipv4/ping_group_range 2>&1; echo '0 2147483647' > /proc/sys/net/ipv4/ping_group_range")
             print("podman_v6_ping_diag5(host 1 0): " + dg.strip().replace("\n", " | "), flush=True)
+            _, dg = run(f"podman create --name pbd2 --network pb6 {IMG} true >/dev/null 2>&1; podman inspect pbd2 2>&1 | grep -i -A3 'sysctl'; f=$(podman inspect -f '{{{{.OCIConfigPath}}}}' pbd2 2>/dev/null); echo cfg=$f; grep -c . $f; grep -i -A3 'sysctl' $f | head; podman rm -f pbd2 >/dev/null 2>&1")
+            print("podman_v6_ping_diag6: " + dg.strip().replace("\n", " | ")[:700], flush=True)
             print("podman_v6_ping_diag4: " + dg.strip().replace("\n", " | "), flush=True)
             print("podman_v6_ping_diag3: " + dg.strip().replace("\n", " | ")[-300:], flush=True)
         rc, out = run(f"podman run --rm --network pb6 {IMG} nslookup -type=AAAA example.com {dns6} 2>&1")
