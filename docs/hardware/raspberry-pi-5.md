@@ -609,7 +609,7 @@ Open: one AP rejected with reason 2 on every boot in the last lane note; WPA3 is
   7-bit `VC6_D` threshold layout), audio InfoFrame, fed by a dma40 cyclic ring on hdmi0, registered as a
   PipeWire backend. A read-only probe (`hdmi.probe=0` disables) decides HDMI vs DVI, measured pixel clock
   and the audio gate first (`pihdmi-probe`). Audible output is still unconfirmed (the monitor used has no speakers).
-  Lane hdmidreq (2026-11-25) fixed a restart loop seen on D0 silicon:
+  Lane hdmidreq (2026-11-25) addressed a restart loop seen on D0 silicon (not yet tried on the Pi afterwards):
   - The pacing check accumulates the DMA position (sampled every 500 us into an unwrapped total) and decides
     once after its window, so a racing engine can no longer pass by aliasing. It gets one full retry with
     the same DREQ cell; only when the stepping is unknown is the other stepping's cell tried, once, and never

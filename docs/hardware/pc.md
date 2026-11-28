@@ -412,6 +412,8 @@ kernel threads, work queues, hrtimers, a kernel virtual address allocator with `
 IDT vector allocator with MSI/MSI-X, and `request_firmware` reading files from the mounted root. See
 [drivers.md](drivers.md) and [kernel/scheduler.md](../kernel/scheduler.md).
 
+The shim's `os_is_administrator` answers from the **host** `CAP_SYS_ADMIN` capability (lane idroot0, 2026-11-21), not from `euid == 0`: a process that is root only inside a user namespace (a rootless container) is no longer RM's administrator, as on Linux. The same change moved the DRM debug ioctls to the same check.
+
 The bring-up runs the Linux `nv_pci_probe` + `nv_start_device` sequence step by step in an `[nvrm]`
 kernel thread started after userspace init (so init's PID is unchanged and the root filesystem,
 which holds the 63 MB GSP image at `/lib/firmware/nvidia/570.86.16/gsp_ga10x.bin`, can appear):
