@@ -103,17 +103,42 @@ pub fn pick_slots(base: usize, step: usize, tries: usize, mut read: impl FnMut(u
 /// One frame at 60.000 Hz, the period `next_check_at` assumes.
 pub const FRAME_NS: u64 = 16_666_667;
 
-/// When to look at the HVS next: just before the next frame boundary predicted from the last
-/// observed latch, then in 250 us steps; 1 ms steps until a boundary has been observed.
+/// Uncertainty (ns) of a boundary predicted `elapsed` ns after the phase was learned: a fixed
+/// 300 us poll margin plus 0.2 % of the elapsed time (the panel's true period is not exactly
+/// 60.000 Hz, e.g. 16.683 ms, so the prediction drifts with every idle frame).
+fn boundary_slack(elapsed: u64) -> u64 { 300_000 + elapsed / 500 }
+
+/// When to look at the HVS next. Before a boundary has been observed: every 1 ms. After: the
+/// predicted boundaries `phase + k*FRAME_NS` each carry a window of +-`boundary_slack`; look at
+/// the window's start, then every 250 us until the window is over. (The old logic looked only
+/// just before the prediction and, when the real boundary came later, skipped to the next frame:
+/// up to one frame late.)
 pub fn next_check_at(phase_ns: u64, now: u64) -> u64 {
     if phase_ns == 0 { return now + 1_000_000; }
-    let k = now.saturating_sub(phase_ns) / FRAME_NS + 1;
-    let t = (phase_ns + k * FRAME_NS).saturating_sub(300_000);
-    if t <= now + 50_000 { now + 250_000 } else { t }
+    let mut k = now.saturating_sub(phase_ns) / FRAME_NS;
+    loop {
+        let pred = phase_ns + k * FRAME_NS;
+        let slack = boundary_slack(pred - phase_ns);
+        if now < pred + slack {
+            let start = pred.saturating_sub(slack);
+            return if now + 50_000 < start { start } else { now + 250_000 };
+        }
+        k += 1;
+    }
 }
 
-/// The phase to remember when a latch is seen at `now` (the observation time, not the latch).
-pub fn latched_phase(_prev_ns: u64, now: u64) -> u64 { now }
+/// The phase to remember when a latch is seen at `now` (observation time). When `now` lies near
+/// a predicted boundary it is adopted (it tracks the real period); when it lies far from every
+/// prediction the observation itself was late (busy worker), so the grid point is kept instead
+/// of poisoning the phase with the delay.
+pub fn latched_phase(prev_ns: u64, now: u64) -> u64 {
+    if prev_ns == 0 || now <= prev_ns { return now; }
+    let el = now - prev_ns;
+    let b = prev_ns + (el / FRAME_NS) * FRAME_NS;
+    let d = now - b;
+    let tol = 1_000_000 + el / 500;
+    if d < tol || FRAME_NS - d < tol { now } else { b }
+}
 
 /// Upper edges (us) of the event-lateness histogram buckets; the last bucket is open.
 pub const LATE_EDGES_US: [u64; 6] = [250, 500, 1000, 2000, 4000, 8000];
@@ -345,6 +370,19 @@ mod hw {
     }
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
+    type Guard = spin::MutexGuard<'static, Option<State>>;
+    /// A `queue` call is between its entry and exit (it may sleep with the state lock released).
+    static QUEUING: AtomicBool = AtomicBool::new(false);
+    struct QueueTurn;
+    impl QueueTurn {
+        fn take() -> QueueTurn {
+            while QUEUING.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                sched::kthread::sleep_ns(500_000);
+            }
+            QueueTurn
+        }
+    }
+    impl Drop for QueueTurn { fn drop(&mut self) { QUEUING.store(false, Ordering::Release); } }
 
     #[inline]
     fn rd(off: usize) -> u32 { unsafe { ((VA.load(Ordering::Relaxed) + off) as *const u32).mmio_read() } }
@@ -446,21 +484,29 @@ mod hw {
         }
     }
 
-    /// Wait until the list in `slot` is the one the HVS runs.
-    fn wait_latch(s: &mut State, slot: usize) -> bool {
+    /// Wait until the list in `slot` is the one the HVS runs. The state lock is a spin lock, so it
+    /// is released around every sleep (sleeping with it held is a violation); `queue` is
+    /// serialised by `QUEUING`, so no other flip can slip in meanwhile. The tick may complete the
+    /// flip while the lock is free: then nothing is pending any more and the wait is over.
+    fn wait_latch(mut g: Guard, slot: usize) -> (Guard, bool) {
         let t0 = sched::monotonic_ns();
         loop {
-            if (rd(CH_DL) & 0xfff) as usize == slot { return true; }
+            if (rd(CH_DL) & 0xfff) as usize == slot { return (g, true); }
             let now = sched::monotonic_ns();
-            if now.wrapping_sub(t0) > LATCH_TIMEOUT_NS { return false; }
+            if now.wrapping_sub(t0) > LATCH_TIMEOUT_NS { return (g, false); }
+            let s = g.as_mut().unwrap();
             s.waits += 1;
             stats::WAITS.fetch_add(1, Ordering::Relaxed);
             // A list written mid-frame latches at the next frame start, up to one period away:
             // sleep most of 6 ms in one go, then poll every 2 ms (few wakeups beat tight polling).
             let since = now.wrapping_sub(s.issued_ns);
+            let dur = if since < 6_000_000 { 6_000_000 - since } else { 2_000_000 };
             let v0 = ksync_now();
-            sched::kthread::sleep_ns(if since < 6_000_000 { 6_000_000 - since } else { 2_000_000 });
+            drop(g);
+            sched::kthread::sleep_ns(dur);
+            g = STATE.lock();
             stats::KSYNC.fetch_add(ksync_now().wrapping_sub(v0), Ordering::Relaxed);
+            match g.as_ref() { Some(s) if s.pending => {} _ => return (g, true) }
         }
     }
 
@@ -577,6 +623,7 @@ mod hw {
     /// (EBUSY / wait_idle); a flip that still finds one pending waits for its latch.
     pub fn queue(obj: u32, phys: u64, w: u32, h: u32, pitch: u32, ev: u32) -> Result<(), DriverError> {
         if DEAD.load(Ordering::Relaxed) { return Err(DriverError::NotFound); }
+        let _turn = QueueTurn::take();
         let mut g = STATE.lock();
         let s = g.as_mut().ok_or(DriverError::NotFound)?;
         if !bo_matches(&s.fw, w, h, phys, pitch) { return Err(DriverError::InvalidParameter); }
@@ -584,15 +631,18 @@ mod hw {
         poll(s);
         if s.pending {
             let cur = s.slots[s.cur];
-            if !wait_latch(s, cur) {
+            let (g2, ok) = wait_latch(g, cur);
+            g = g2;
+            let Some(s) = g.as_mut() else { return Err(DriverError::NotFound) };
+            if !ok {
                 give_up(&format!("slot {} never became active (lact={:#x})", cur, rd(CH_DL) & 0xfff));
                 let n = sched::monotonic_ns();
                 latched(s, n);
                 return Err(DriverError::Io);
             }
-            let n = sched::monotonic_ns();
-            latched(s, n);
+            if s.pending { let n = sched::monotonic_ns(); latched(s, n); }
         }
+        let s = g.as_mut().ok_or(DriverError::NotFound)?;
         if !dri::v3d_scanout_ref_obj(obj) { return Err(DriverError::NotFound); }
         let next = s.cur ^ 1;
         let off = s.slots[next];
@@ -614,19 +664,25 @@ mod hw {
         stats::FLIPS.fetch_add(1, Ordering::Relaxed);
         if s.flips == 1 {
             // Prove the takeover took before trusting it for good.
-            if !wait_latch(s, off) {
+            let (g2, ok) = wait_latch(g, off);
+            g = g2;
+            let Some(s) = g.as_mut() else { return Err(DriverError::NotFound) };
+            if !ok {
                 give_up("first list never latched");
                 let n = sched::monotonic_ns();
                 latched(s, n);
                 return Err(DriverError::Io);
             }
             let n = sched::monotonic_ns();
-            stats::TAKEOVER_NS.store(n.wrapping_sub(s.issued_ns), Ordering::Relaxed);
-            latched(s, n);
+            if s.pending {
+                stats::TAKEOVER_NS.store(n.wrapping_sub(s.issued_ns), Ordering::Relaxed);
+                latched(s, n);
+            }
         } else {
             let n = s.issued_ns;
             arm(next_check(s, n));
         }
+        let Some(s) = g.as_mut() else { return Ok(()) };
         if crate::kms_v3d::flip_log_due(s.flips) {
             serial_debug(&format!(
                 "[hvs] flip {} slot={} ptr={:#x} pitch={} lptrs={:#x} lact={:#x} frcnt={} frames={} waits={} ticks={}\n",
@@ -845,10 +901,8 @@ mod tests {
     }
 
     /// (a) The first event is observed 8 ms late (worker delayed). The phase must not inherit that
-    /// error: the next event must be less than 0.5 ms late. EXPECTED RED on the current logic
-    /// (phase := observation time makes every later prediction 8 ms late).
+    /// error: the next event must be less than 0.5 ms late. (Was red while phase := observation time.)
     #[test]
-    #[ignore = "red until hvsphase"]
     fn late_observation_does_not_poison_next_event() {
         let mut s = Sim::new(FRAME_NS);
         s.phase = B0;
@@ -865,9 +919,8 @@ mod tests {
 
     /// (b) The panel's true period is 16.683 ms, not 16.666667: after an idle gap the predicted
     /// boundary drifts. 20, 60 and 300 idle frames: the next event must be <0.5 ms late.
-    /// EXPECTED RED on the current logic.
+    /// (Was red while the check skipped to the next frame after a drifted boundary.)
     #[test]
-    #[ignore = "red until hvsphase"]
     fn real_period_after_idle_is_prompt() {
         for idle in [20u64, 60, 300] {
             let p = 16_683_000;
