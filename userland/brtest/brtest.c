@@ -2080,6 +2080,15 @@ static void nftfwd_related_on(void) {
     fwd_case("nftfwd_related_accept", 3, 1);
     g_fwd_nft = NULL; g_fwd_msg = NULL;
 }
+/* conntrack tracks a routed-unchanged flow too: with no nat chain at all the ICMP error of a forwarded flow is still `ct state related` */
+static const char FR_RULES_ON_NONAT[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy drop;\n  ct state new accept\n  ct state established,related accept\n }\n}\n";
+static void nftfwd_related_nonat(void) {
+    g_fwd_nft = FR_RULES_ON_NONAT;
+    g_fwd_msg = "ICMP port-unreachable of a routed-unchanged flow (no nat chain) is delivered by `ct state related accept` (ECONNREFUSED)";
+    fwd_case("nftfwd_related_nonat", 3, 1);
+    g_fwd_nft = NULL; g_fwd_msg = NULL;
+}
 
 /* ---- IPv6 established flows traverse FORWARD (NAT66 through the NIC) -------------------------------------- */
 static char g_gw6[64];
@@ -2207,6 +2216,8 @@ static int fwd6_nonat_body(void) {
     struct timeval tv = { 1, 0 };
     setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     for (int k = 0; k < 3; k++) ping6_sock(ic, g_gw6, 1 + k);   /* the reply cannot return (the peer has no route to fd00:97::/64); only the forward is checked */
+    write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 6;                   /* keep the netns (and its tracked flow) until the parent has looked */
     return 0;
 }
 static void nft6_nonat_case(const char *name, const char *rules) {
@@ -2240,9 +2251,24 @@ static void nft6_nonat_case(const char *name, const char *rules) {
         ok = rd_to(dd[0], &ch) == 1;
         snprintf(msg, sizeof msg, "%s: netns configured", name); CHECK(msg, ok);
         if (ok) write(cc[1], &ch, 1);
+        ok = ok && rd_to(dd[0], &ch) == 1;
+    }
+    int ident = 0, nated = 0;
+    if (ok) {
+        FILE *tf = fopen("/proc/net/nic", "r");
+        char l[1024];
+        while (tf && fgets(l, sizeof l, tf)) {
+            char cip[64], rip[64], nip[64]; int pr, nt, cp, rp;
+            if (sscanf(l, "fwd_ct6: proto %d nat %d cip %63s cport %d rip %63s rport %d nicip %63s", &pr, &nt, cip, &cp, rip, &rp, nip) != 7) continue;
+            if (!strcmp(cip, nip)) ident++; else nated++;
+        }
+        if (tf) fclose(tf);
+        write(cc[1], &ch, 1);
     }
     int rc = c > 0 ? wait_child(c) : -1;
     snprintf(msg, sizeof msg, "%s: child ran (exit %d)", name, rc); CHECK(msg, rc == 0);
+    snprintf(msg, sizeof msg, "%s: the flow is tracked by an identity conntrack entry (%d identity, %d NATed)", name, ident, nated);
+    CHECK(msg, ident >= 1 && nated == 0);
     long nonat1 = stat_get("route_nonat"), nat1 = stat_get("v6_nat");
     snprintf(msg, sizeof msg, "%s: v6 packets routed to the NIC with the container source kept (route_nonat %ld -> %ld)", name, nonat0, nonat1);
     CHECK(msg, nonat1 > nonat0);
@@ -2706,6 +2732,7 @@ int main(int argc, char **argv) {
     if (want("nftfwd6_related_accept")) nftfwd6_related_on();
     if (want("nftfwd_related_drop")) nftfwd_related_off();
     if (want("nftfwd_related_accept")) nftfwd_related_on();
+    if (want("nftfwd_related_nonat")) nftfwd_related_nonat();
     if (want("nftnat_hairpin_midflow")) nftnat_hairpin_midflow();
     if (want("nftnat_hairpin_icmp_related")) nftnat_hairpin_icmp_on();
     if (want("nftnat_hairpin_icmp_dropped")) nftnat_hairpin_icmp_off();
