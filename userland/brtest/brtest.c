@@ -2191,6 +2191,77 @@ static void nftfwd6_midflow(void) {
     close(s);
 }
 
+/* ---- v6 forwarding without a matching masquerade rule: routed unchanged, like Linux ---------------------------- */
+static int fwd6_nonat_body(void) {
+    g_ip6 = "fd00:97::2";
+    int e = v6_conf_eth0(); if (e) return e;
+    int cs = nl_sock();
+    int idx = link_get(cs, "eth0", NULL, NULL);
+    if (route6_default(cs, idx, "fd00:97::1")) return 3;
+    close(cs);
+    sleep(2);
+    char ch = 'r'; write(done_[1], &ch, 1);
+    if (rd_to(ctl[0], &ch) != 1) return 4;
+    int ic = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (ic < 0) return 5;
+    struct timeval tv = { 1, 0 };
+    setsockopt(ic, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    for (int k = 0; k < 3; k++) ping6_sock(ic, g_gw6, 1 + k);   /* the reply cannot return (the peer has no route to fd00:97::/64); only the forward is checked */
+    return 0;
+}
+static void nft6_nonat_case(const char *name, const char *rules) {
+    char msg[200];
+    int have = gw6_find() == 0;
+    snprintf(msg, sizeof msg, "%s: the NIC has a global v6 address (slirp router ::2)", name); CHECK(msg, have);
+    if (!have) return;
+    { int hp = ping6_once(g_gw6, 0); printf("DIAG host ping %s -> %d\n", g_gw6, hp); fflush(stdout); }
+    long nonat0 = stat_get("route_nonat"), nat0 = stat_get("v6_nat");
+    FILE *nf = fopen("/tmp/fn.nft", "w");
+    if (nf) { fputs(rules, nf); fclose(nf); }
+    snprintf(msg, sizeof msg, "%s: nft -f loads the ruleset", name);
+    CHECK(msg, system("nft -f /tmp/fn.nft >/tmp/fn.err 2>&1") == 0);
+    int s = nl_sock();
+    unsigned char brmac[6] = { 0x02, 0x00, 0x5e, 0x97, 0x00, 0x06 };
+    int ok = br_new(s, "br0", brmac) == 0;
+    int bidx = link_get(s, "br0", NULL, NULL);
+    ok = ok && bidx > 0 && addr6_add(s, bidx, "fd00:97::1", 64) == 0 && link_set_up(s, bidx) == 0 && ip_forward_set(1) == 0 && ip6_forward_set(1) == 0;
+    snprintf(msg, sizeof msg, "%s: br0 fd00:97::1/64 up, ipv6 forwarding=1", name); CHECK(msg, ok);
+    pid_t c = spawn_ns(fwd6_nonat_body);
+    int cc[2] = { ctl[0], ctl[1] }, dd[2] = { done_[0], done_[1] };
+    int fc = c > 0 ? netns_fd_of(c) : -1;
+    ok = c > 0 && veth_new_m(s, "vethS", "eth0", fc, bidx) == 0;
+    if (fc >= 0) close(fc);
+    int iv = link_get(s, "vethS", NULL, NULL);
+    ok = ok && iv > 0 && link_set_up(s, iv) == 0;
+    snprintf(msg, sizeof msg, "%s: netns + veth", name); CHECK(msg, ok);
+    char ch = 'g';
+    if (ok) {
+        write(cc[1], &ch, 1);
+        ok = rd_to(dd[0], &ch) == 1;
+        snprintf(msg, sizeof msg, "%s: netns configured", name); CHECK(msg, ok);
+        if (ok) write(cc[1], &ch, 1);
+    }
+    int rc = c > 0 ? wait_child(c) : -1;
+    snprintf(msg, sizeof msg, "%s: child ran (exit %d)", name, rc); CHECK(msg, rc == 0);
+    long nonat1 = stat_get("route_nonat"), nat1 = stat_get("v6_nat");
+    snprintf(msg, sizeof msg, "%s: v6 packets routed to the NIC with the container source kept (route_nonat %ld -> %ld)", name, nonat0, nonat1);
+    CHECK(msg, nonat1 > nonat0);
+    snprintf(msg, sizeof msg, "%s: no NAT66 mapping was made (v6_nat %ld -> %ld)", name, nat0, nat1);
+    CHECK(msg, nat1 == nat0);
+    system("nft delete table inet netavark");
+    ip6_forward_set(0); ip_forward_set(0);
+    if (iv > 0) link_del(s, iv);
+    link_del(s, bidx);
+    close(s);
+}
+static const char FN6_RULES_NONAT[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n }\n}\n";
+static const char FN6_RULES_POSTNOMASQ[] =
+ "table inet netavark {\n chain FORWARD { type filter hook forward priority filter; policy accept;\n  ct state invalid drop\n }\n"
+ " chain POSTROUTING { type nat hook postrouting priority srcnat; policy accept;\n  ip6 saddr fd00:250::/64 masquerade\n }\n}\n";
+static void nftnat6_nonat_route(void) { nft6_nonat_case("nftnat6_nonat_route", FN6_RULES_NONAT); }
+static void nftnat6_postnomasq(void) { nft6_nonat_case("nftnat6_postnomasq", FN6_RULES_POSTNOMASQ); }
+
 /* ---- ICMPv6 errors of a tracked NAT66 v6 flow are `ct state related` --------------------------------------- */
 /* A container sends UDP with hop limit 2 to an off-link address: the forwarder decrements it, slirp answers the
  * hop-limit-1 packet with an ICMPv6 time-exceeded that quotes the NAT'd flow. Under a default-drop FORWARD policy
@@ -2625,6 +2696,8 @@ int main(int argc, char **argv) {
     if (want("fwd_udp")) fwd_udp();
     if (want("nftfwd_midflow_established")) nftfwd_midflow();
     if (want("nftfwd6_midflow_established")) nftfwd6_midflow();
+    if (want("nftnat6_nonat_route")) nftnat6_nonat_route();
+    if (want("nftnat6_postnomasq")) nftnat6_postnomasq();
     if (want("nftfwd6_related_drop")) nftfwd6_related_off();
     if (want("nftfwd_local_te_drop")) nftfwd_local_te_off();
     if (want("nftfwd_local_te_accept")) nftfwd_local_te_on();
