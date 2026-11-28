@@ -21,7 +21,7 @@ use sched::{irqctx, kthread};
 
 const ALL: [&str; 11] = ["irqctx", "sync", "kthread", "workqueue", "hrtimer", "atomicpool", "kva", "pci", "msi", "firmware", "gpulock"];
 /// Opt-in only (not in `all`): a timing report, not a pass/fail facility test.
-const EXTRA: [&str; 5] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw"];
+const EXTRA: [&str; 8] = ["memperf", "kmodwin", "kmodload", "kmodkapi", "spinfw", "kvmmem", "elcheck", "kvmswitch"];
 
 /// UART only (`arch_serial_putc`), never the framebuffer console: a console
 /// print flushes the framebuffer through virtio-gpu, and a test thread
@@ -83,7 +83,10 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
             "msi" => t_msi(),
             "firmware" => t_firmware(fw.as_deref()),
             "gpulock" => t_gpulock(),
+            "kvmmem" => t_kvmmem(),
             "spinfw" => t_spinfw(fw.as_deref()),
+            "elcheck" => t_elcheck(),
+            "kvmswitch" => t_kvmswitch(),
             _ => continue,
         };
         if t.skipped && t.fails == 0 { say!("{} SKIP", t.name); skip += 1; }
@@ -91,6 +94,94 @@ fn run(names: Vec<&'static str>, fw: Option<String>) {
         else { say!("{} FAIL ({} checks failed)", t.name, t.fails); fail += 1; }
     }
     say!("summary: {} pass, {} fail, {} skip; sleep-in-atomic detections {}", pass, fail, skip, irqctx::sleep_violations());
+}
+
+// ── elcheck (kvm-vhe) ───────────────────────────────────────────────────────
+
+/// CurrentEL: EL1 in a default build (every entry path drops EL2 to EL1); EL2
+/// with VHE (E2H=TGE=1) and the host tick on CNTHP (INTID 26) in a `drv-kvm`
+/// build booted with `virtualization=on`. A `drv-kvm` build on a machine
+/// without EL2 stays at EL1 and is checked as such. Not in `ktest=all`.
+fn t_elcheck() -> T {
+    let mut t = T::new("elcheck");
+    #[cfg(not(target_arch = "aarch64"))]
+    { t.skip("aarch64 only"); }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use arch_aarch64::hyp;
+        let el = hyp::current_el();
+        say!("elcheck: CurrentEL={} at_el2={} vhe={} hcr={:#x}", el, hyp::at_el2(), hyp::vhe(), hyp::host_hcr());
+        t.check(el == 1 || el == 2, "CurrentEL is EL1 or EL2");
+        t.check(hyp::at_el2() == (el == 2), "hyp::at_el2() agrees with CurrentEL");
+        if cfg!(not(feature = "drv-kvm")) {
+            t.check(el == 1, "default build (no drv-kvm) runs at EL1");
+        } else if el == 2 {
+            t.check(hyp::vhe(), "EL2 host has HCR_EL2.E2H set");
+            t.check(hyp::host_hcr() & hyp::HCR_TGE != 0, "EL2 host has HCR_EL2.TGE set");
+            t.check(arch_aarch64::gic::ppi_virt_timer() == 26, "host tick is CNTHP (INTID 26), not CNTV (27)");
+        }
+    }
+    t
+}
+
+// ── kvmswitch (kvm-switch) ──────────────────────────────────────────────────
+
+/// Enter a one-page guest (hand-built stage 2, IPA 0x4000_0000) that executes
+/// `hvc #0`, and check the exit. Opt-in; needs a `drv-kvm` build running at EL2
+/// with VHE (`virtualization=on`), otherwise SKIP. Written, not yet run.
+fn t_kvmswitch() -> T {
+    let mut t = T::new("kvmswitch");
+    #[cfg(not(all(target_arch = "aarch64", feature = "drv-kvm")))]
+    { t.skip("needs aarch64 + drv-kvm"); }
+    #[cfg(all(target_arch = "aarch64", feature = "drv-kvm"))]
+    {
+        use arch_aarch64::kvm::{enter, VcpuHw};
+        use arch_aarch64::hyp;
+        if !hyp::vhe() { t.skip("not running at EL2 with VHE"); return t; }
+        const IPA: u64 = 0x4000_0000;
+        let pages: Vec<usize> = (0..4).filter_map(|_| mm::buddy::alloc(0)).collect();
+        if pages.len() != 4 { t.check(false, "allocate 4 pages"); return t; }
+        let (l1, l2, l3, code) = (pages[0], pages[1], pages[2], pages[3]);
+        unsafe {
+            for p in &pages { core::ptr::write_bytes(mm::phys_to_virt(*p) as *mut u8, 0, 4096); }
+            let w = |pa: usize, idx: usize, v: u64| (mm::phys_to_virt(pa) as *mut u64).add(idx).write_volatile(v);
+            w(l1, (IPA >> 30) as usize, l2 as u64 | 3);
+            w(l2, ((IPA >> 21) & 0x1FF) as usize, l3 as u64 | 3);
+            // page: MemAttr WB (0b1111<<2), S2AP RW, SH inner, AF; XN clear (executable)
+            w(l3, ((IPA >> 12) & 0x1FF) as usize, code as u64 | 3 | (0xF << 2) | (3 << 6) | (3 << 8) | (1 << 10));
+            (mm::phys_to_virt(code) as *mut u32).write_volatile(0xD400_0002); // hvc #0
+            let va = mm::phys_to_virt(code);
+            core::arch::asm!("dc civac, {0}", "dsb ish", "ic ialluis", "dsb ish", "isb", in(reg) va, options(nostack));
+        }
+        let parange: u64;
+        unsafe { core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) parange, options(nomem, nostack)); }
+        // T0SZ=32 (4 GiB IPA), SL0=1 (start L1), WB/WB/IS, 4K granule, PS=PARange, RES1 bit 31
+        let vtcr = 32 | (1 << 6) | (1 << 8) | (1 << 10) | (3 << 12) | ((parange & 0xF).min(6) << 16) | (1 << 31);
+        unsafe { core::arch::asm!("msr vtcr_el2, {}", "isb", in(reg) vtcr, options(nomem, nostack)); }
+        let mut hw = VcpuHw::new_boot(IPA);
+        hw.vttbr = l1 as u64 | (0x7E57u64 << 48);
+        hw.vtcr = vtcr; // VTCR is per VM (kvmfix1): enter loads it from VcpuHw
+        hw.gp[5] = 0x1234_5678;
+        hw.vmpidr = 0x8000_0000;
+        let hcr_before = hyp::host_hcr();
+        // A host IRQ pending at entry (tick) exits the guest before its first instruction
+        // (EXIT_IRQ, stale ESR): re-enter until the guest reaches its hvc.
+        let mut r = unsafe { enter(&mut hw) };
+        let mut irq_exits = 0;
+        while r.kind == arch_aarch64::kvm::hw::EXIT_IRQ && irq_exits < 64 {
+            irq_exits += 1;
+            r = unsafe { enter(&mut hw) };
+        }
+        say!("kvmswitch: irq_exits={}", irq_exits);
+        say!("kvmswitch: kind={} esr={:#x} far={:#x} hpfar={:#x} pc={:#x}", r.kind, r.esr, r.far, r.hpfar, hw.pc);
+        t.check(r.kind == arch_aarch64::kvm::hw::EXIT_SYNC, "exit kind is sync");
+        t.check(matches!(arch_aarch64::kvm::esr::decode_raw(&r), arch_aarch64::kvm::esr::Exit::Hvc { imm: 0 }), "exit decodes as hvc #0");
+        t.check(hw.pc == IPA + 4, "guest pc is the instruction after hvc");
+        t.check(hw.gp[5] == 0x1234_5678, "guest x5 survived the round trip");
+        t.check(hyp::host_hcr() == hcr_before && hyp::vhe(), "host HCR_EL2 restored (TGE/E2H)");
+        for p in pages { mm::buddy::free(p, 0); }
+    }
+    t
 }
 
 // ── irqctx ──────────────────────────────────────────────────────────────────
@@ -2176,4 +2267,74 @@ fn kmodkapi_k2b(t: &mut T) {
     let m2 = exports::kapi_irqs_masked();
     exports::kapi_irq_restore(f1);
     t.check(m1 && m2 && exports::kapi_irqs_masked() == was, "k2b: irq_save masks, nested restore keeps mask, outer restore returns to the prior state");
+}
+
+// ── kvmmem: pin_user_page / unpin / range-invalidate hook / MADV_DONTFORK ─────
+// Opt-in (`ktest=kvmmem`). Uses a private AddressSpace (never installed), so it
+// needs no user process: pages fault in through the same code the fault path uses.
+static KVMMEM_CALLS: AtomicUsize = AtomicUsize::new(0);
+static KVMMEM_AS: AtomicUsize = AtomicUsize::new(0);
+static KVMMEM_BYTES: AtomicUsize = AtomicUsize::new(0);
+fn kvmmem_hook(as_id: usize, _va: usize, len: usize) {
+    if as_id == KVMMEM_AS.load(Ordering::Relaxed) {
+        KVMMEM_CALLS.fetch_add(1, Ordering::Relaxed);
+        KVMMEM_BYTES.fetch_add(len, Ordering::Relaxed);
+    }
+}
+
+fn t_kvmmem() -> T {
+    use mm::vmm::AddressSpace;
+    use mm::paging::PageFlags;
+    extern "C" { fn arch_alloc_page_table_root() -> usize; }
+    let mut t = T::new("kvmmem");
+    let root = unsafe { arch_alloc_page_table_root() };
+    if root == 0 { t.skip("no page table root"); return t; }
+    let mut as_ = AddressSpace::new(root);
+    KVMMEM_AS.store(root, Ordering::Relaxed);
+    mm::vmm::set_range_invalidate_hook(kvmmem_hook);
+    let base = 0x5000_0000usize;
+    let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
+    t.check(as_.map_lazy(base, 4 * 4096, flags, false), "map 4 lazy pages");
+
+    // pin faults in and takes a reference
+    let p0 = as_.pin_user_page(base, true);
+    t.check(p0.is_some(), "pin_user_page(write) faults the page in");
+    let p0 = p0.unwrap_or(0);
+    t.check(mm::pageref::get(p0) == 2, "pin adds one reference (2)");
+    t.check(as_.pin_user_page(base + 0x123, false) == Some(p0), "second pin of the same page returns the same frame");
+    t.check(mm::pageref::get(p0) == 3, "refcount 3 after two pins");
+    t.check(as_.pin_user_page(base + 8 * 4096, false).is_none(), "pin outside any VMA fails");
+    mm::vmm::unpin_user_page(p0);
+    mm::vmm::unpin_user_page(p0);
+    t.check(mm::pageref::get(p0) == 1, "unpin x2 returns the count to baseline");
+
+    // invalidate hook reaches every path
+    let c0 = KVMMEM_CALLS.load(Ordering::Relaxed);
+    let _ = as_.mprotect(base, 4096, mm::vmm::PROT_READ);
+    t.check(KVMMEM_CALLS.load(Ordering::Relaxed) > c0, "mprotect calls the invalidate hook");
+    let c1 = KVMMEM_CALLS.load(Ordering::Relaxed);
+    let _ = as_.discard_range(base + 4096, 4096);
+    t.check(KVMMEM_CALLS.load(Ordering::Relaxed) > c1, "MADV_DONTNEED (discard_range) calls the hook");
+
+    // a pinned frame outlives unmap_range and is freed by the last unpin
+    let p1 = as_.pin_user_page(base + 2 * 4096, true).unwrap_or(0);
+    let c2 = KVMMEM_CALLS.load(Ordering::Relaxed);
+    let b2 = KVMMEM_BYTES.load(Ordering::Relaxed);
+    as_.unmap_range(base, 4 * 4096);
+    t.check(KVMMEM_CALLS.load(Ordering::Relaxed) > c2, "unmap_range calls the hook");
+    t.check(KVMMEM_BYTES.load(Ordering::Relaxed) - b2 >= 4 * 4096, "hook covers the unmapped range");
+    t.check(p1 != 0 && mm::pageref::get(p1) == 1, "pinned frame still referenced (not freed) after unmap");
+    mm::vmm::unpin_user_page(p1); // last reference: frame goes back to the buddy
+
+    // MADV_DONTFORK marks the VMA; DOFORK clears it
+    t.check(as_.map_lazy(base, 4 * 4096, flags, false), "remap 4 lazy pages");
+    t.check(as_.set_dontfork(base + 4096, 2 * 4096, true), "set_dontfork on the middle pages");
+    let df = |a: &AddressSpace, va| a.find(va).map_or(false, |r| r.map_flags & mm::vmm::MAP_DONTFORK != 0);
+    t.check(!df(&as_, base) && df(&as_, base + 4096) && df(&as_, base + 2 * 4096) && !df(&as_, base + 3 * 4096), "only the middle range is DONTFORK");
+    t.check(as_.set_dontfork(base + 4096, 2 * 4096, false) && !df(&as_, base + 4096), "DOFORK clears it");
+    t.check(!as_.set_dontfork(base, 16 * 4096, true), "DONTFORK over an unmapped range fails (ENOMEM)");
+
+    KVMMEM_AS.store(0, Ordering::Relaxed);
+    drop(as_);
+    t
 }

@@ -68,4 +68,13 @@ config NVIDIA
 	depends on ARCH_X86_64
 	default n
 
+config KVM
+	bool "KVM host support (EL2/VHE; /dev/kvm, Linux KVM ioctl ABI)"
+	depends on ARCH_ARM64
+	default n
+	help
+	  Keep the kernel at EL2 with VHE (HCR_EL2.E2H=TGE=1) instead of
+	  dropping to EL1 at boot. Off: every entry path drops to EL1 exactly
+	  as before. Cargo feature drv-kvm.
+
 source "drivers/Kconfig"

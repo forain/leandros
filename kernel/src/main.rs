@@ -58,6 +58,13 @@ core::arch::global_asm!(
     ".set EARLY_UART_BASE, 0x09000000",
     ".set EARLY_LOWMEM_DESC, 0x705",   // QEMU virt: 0..1GiB is all MMIO
 );
+// KVM_VHE selects the entry behaviour at EL2 (entry_aarch64.s): 0 = drop to EL1
+// (the only behaviour of a default build), 1 = stay at EL2 with VHE when the
+// CPU has it (Kconfig KVM / feature drv-kvm).
+#[cfg(all(target_arch = "aarch64", feature = "drv-kvm"))]
+core::arch::global_asm!(".equ KVM_VHE, 1");
+#[cfg(all(target_arch = "aarch64", not(feature = "drv-kvm")))]
+core::arch::global_asm!(".equ KVM_VHE, 0");
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(include_str!("entry_aarch64.s"));
 #[cfg(target_arch = "x86_64")]
@@ -3006,6 +3013,7 @@ fn a64_platform_init(hhdm: u64) {
         if let Some(g) = p.gtdt {
             gic.ppi_virt = g.virt;
             gic.ppi_phys = g.ns_el1;
+            arch_aarch64::hyp::note_gtdt_el2(g.el2);
             serial_print_str("[ACPI] GTDT virt="); serial_print_hex(g.virt as usize);
             serial_print_str(" ns_el1="); serial_print_hex(g.ns_el1 as usize);
             serial_print_str("\n");

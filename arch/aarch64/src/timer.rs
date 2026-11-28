@@ -91,10 +91,63 @@ fn cntvct() -> u64 {
     c
 }
 
+/// Host tick timer selection. Without the `kvm` feature the host always uses
+/// the EL1 virtual timer (CNTV). At EL2 under VHE (kvm builds only) it uses
+/// `cntp_*_el0`, which E2H redirects to the EL2 physical timer CNTHP (INTID 26);
+/// the EL1 virtual timer then belongs to guests.
+#[cfg(feature = "kvm")]
+#[inline]
+fn hyp_timer() -> bool { super::hyp::at_el2() }
+
 #[inline]
 fn write_cval(v: u64) {
     unsafe {
+        #[cfg(feature = "kvm")]
+        if hyp_timer() {
+            core::arch::asm!("msr cntp_cval_el0, {}", in(reg) v, options(nomem, nostack));
+            return;
+        }
         core::arch::asm!("msr cntv_cval_el0, {}", in(reg) v, options(nomem, nostack));
+    }
+}
+
+#[inline]
+fn read_cval() -> u64 {
+    let v: u64;
+    unsafe {
+        #[cfg(feature = "kvm")]
+        if hyp_timer() {
+            core::arch::asm!("mrs {}, cntp_cval_el0", out(reg) v, options(nomem, nostack));
+            return v;
+        }
+        core::arch::asm!("mrs {}, cntv_cval_el0", out(reg) v, options(nomem, nostack));
+    }
+    v
+}
+
+#[inline]
+fn read_ctl() -> u64 {
+    let v: u64;
+    unsafe {
+        #[cfg(feature = "kvm")]
+        if hyp_timer() {
+            core::arch::asm!("mrs {}, cntp_ctl_el0", out(reg) v, options(nomem, nostack));
+            return v;
+        }
+        core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) v, options(nomem, nostack));
+    }
+    v
+}
+
+#[inline]
+fn write_ctl(v: u64) {
+    unsafe {
+        #[cfg(feature = "kvm")]
+        if hyp_timer() {
+            core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) v, options(nomem, nostack));
+            return;
+        }
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) v, options(nomem, nostack));
     }
 }
 
@@ -257,8 +310,7 @@ pub fn init() {
 
         write_cval(grid.wrapping_add(iv));
         // Enable the timer: ENABLE=1, IMASK=0.
-        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64,
-                         options(nomem, nostack));
+        write_ctl(1);
         core::arch::asm!("isb", options(nomem, nostack));
 
         // Unmask IRQ exceptions at EL1 (clear DAIF.I, bit 7).
@@ -292,8 +344,8 @@ pub fn check_alive() -> bool {
     let ctl: u64;
     let cval: u64;
     unsafe {
-        core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) ctl, options(nomem, nostack));
-        core::arch::asm!("mrs {}, cntv_cval_el0", out(reg) cval, options(nomem, nostack));
+        ctl = read_ctl();
+        cval = read_cval();
     }
     let iv = interval();
     let grid = GRID_CPU[cpu].load(Ordering::Relaxed);
@@ -301,7 +353,7 @@ pub fn check_alive() -> bool {
     let next = grid.wrapping_add((now.wrapping_sub(grid) / iv + 1).wrapping_mul(iv));
     unsafe {
         write_cval(next);
-        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
+        write_ctl(1);
         core::arch::asm!("isb", options(nomem, nostack));
     }
     extern "C" { fn arch_serial_putc(c: u8); fn print_number(n: u32); fn print_hex(n: usize); }

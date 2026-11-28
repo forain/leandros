@@ -1,0 +1,13 @@
+[package]
+name = "kvmtest"
+version.workspace = true
+edition.workspace = true
+build = "../muslrt/build.rs"
+
+[[bin]]
+name = "kvmtest"
+path = "src/main.rs"
+
+# No dependencies: static musl through the shared muslrt build script (see
+# MUSL_LINKED in scripts/build-userland.sh). The ABI constants are local
+# copies; kvm/src/abi.rs (lane kvm-abi) holds the checked ones.

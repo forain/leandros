@@ -521,7 +521,30 @@ def _kvm_usable(guest_arch: str) -> bool:
 def _gic_version(accel_flags) -> str:
     """virt GIC: 3 everywhere (HVF refuses v2), except KVM, where the host's own
     GIC must be mirrored (Pi 5 is GICv2; KVM cannot emulate v3 there)."""
+    if os.environ.get("LEANDROS_VIRT") == "1" and os.environ.get("LEANDROS_GIC") and "kvm" not in accel_flags:
+        return os.environ["LEANDROS_GIC"]  # kvmv2 suite: GICv2 virt machine
     return "host" if "kvm" in accel_flags else "3"
+
+
+def _virt_on(flags=None) -> bool:
+    """LEANDROS_VIRT=1: aarch64 QEMU `virt` with virtualization=on (EL2 + VHE; the
+    kvm-vhe boot check, plan kvm-plan.md section 6 item 1). TCG only: under HVF/KVM
+    there is no nested EL2 (A76 has no FEAT_NV), so the knob is inert and its test SKIPs."""
+    if os.environ.get("LEANDROS_VIRT") != "1":
+        return False
+    return flags is None or "tcg" in " ".join(flags)
+
+
+def _virt_machine() -> str:
+    return ",virtualization=on" if _virt_on() else ""
+
+
+def _virt_cpu(default: str) -> str:
+    """Pi-like core (no SVE/SME/MTE/PAuth/LPA2) when LEANDROS_VIRT=1; the fallback
+    `max,lpa2=off,sve=off,sme=off,pauth=off,mte=off` is LEANDROS_VIRT_CPU."""
+    if not _virt_on():
+        return default
+    return os.environ.get("LEANDROS_VIRT_CPU", "cortex-a76")
 
 
 def _accel_flags(guest_arch: str, mode: str):
@@ -541,8 +564,11 @@ def _accel_flags(guest_arch: str, mode: str):
     # LEANDROS_TCG_THREAD=single|multi: TCG threading, to tell a guest SMP
     # race from an MTTCG artefact (x86 TSO emulated on a weakly ordered host).
     tcg = "tcg" + (f",thread={os.environ['LEANDROS_TCG_THREAD']}" if os.environ.get("LEANDROS_TCG_THREAD") else "")
+    if guest_arch == "aarch64" and os.environ.get("LEANDROS_VIRT") == "1" \
+            and mode != "uefi-hvf" and not _is_apple_silicon() and not _kvm_usable(guest_arch):
+        return ["-cpu", _virt_cpu(tcg_cpu), "-accel", tcg]
     if mode == "uefi-tcg":
-        return ["-cpu", tcg_cpu, "-accel", tcg]
+        return ["-cpu", _virt_cpu(tcg_cpu), "-accel", tcg]
     if mode == "uefi-hvf" or (guest_arch == "aarch64" and _is_apple_silicon()):
         return ["-cpu", "host", "-accel", "hvf"]
     if _kvm_usable(guest_arch):
@@ -1077,7 +1103,7 @@ def _build_cmd(arch, mode="uefi", venus=False, virgl=False):
             # gic-version=3: QEMU >= 11.1 HVF refuses a GICv2 machine outright;
             # the kernel detects v2/v3 at boot, so TCG uses the same line.
             # KVM on an aarch64 Linux host (Pi 5 = GICv2) needs gic-version=host.
-            "-machine", "virt,gic-version=" + _gic_version(cpu_flags), "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
+            "-machine", "virt,gic-version=" + _gic_version(cpu_flags) + (_virt_machine() if _virt_on(cpu_flags) else ""), "-smp", os.environ.get("LEANDROS_SMP", "4"), *cpu_flags, "-m", _guest_mem(),
             "-boot", "menu=on,splash-time=0",
             "-drive", f"if=pflash,unit=0,format=raw,readonly=on,file={fw}",
             "-drive", f"if=pflash,unit=1,format=raw,file={vars_fd}",
@@ -1306,7 +1332,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             _qemu_bin("qemu-system-aarch64"),
-            "-machine", "virt,gic-version=3", "-smp", "4", "-cpu", "max", "-m", _guest_mem(), "-accel", "tcg",
+            "-machine", "virt,gic-version=3" + _virt_machine(), "-smp", "4", "-cpu", _virt_cpu("max"), "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             # Stand-in for the Limine disk (vda in the UEFI layout): a bare

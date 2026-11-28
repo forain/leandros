@@ -16,6 +16,7 @@ dependencies = [
  "boot",
  "drivers",
  "evdev-server",
+ "kvm",
  "leandros-lib",
  "mm",
  "sched",
@@ -238,6 +239,7 @@ dependencies = [
  "ipc",
  "kmod-abi",
  "kmod-elf",
+ "kvm",
  "leandros-lib",
  "limine",
  "miniz_oxide",
@@ -558,6 +560,10 @@ dependencies = [
  "leandros-lib",
  "spin",
 ]
+
+[[package]]
+name = "kvm"
+version = "0.1.0"
 
 [[package]]
 name = "leandros-lib"

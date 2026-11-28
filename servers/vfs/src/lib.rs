@@ -1924,6 +1924,9 @@ pub enum VnodeKind {
     PidFd { pid: u32 },
     /// bpf(2) program fd (lane bpfsys); one `sched::bpfcg` reference per fd.
     BpfProg { id: u32 },
+    /// A KVM object fd (VM, vCPU or device). `id` = kind<<28 | serial; the kernel's
+    /// kvm module owns the object and is called through `set_kvm_hooks` (drv-kvm).
+    KvmObj { id: u32 },
     /// An opened /proc/<pid>/ns/<name> (nsfs-like): `kind` indexes
     /// `sched::ns::NS_NAMES`, `id` is the namespace, on which every copy of
     /// the descriptor holds one reference (`pipe_ref_inc` / `pipe_ref_dec`).
@@ -3115,6 +3118,7 @@ fn pipe_ref_inc(kind: &VnodeKind) {
         VnodeKind::EventFd { slot } => { EVENTFD_REFS.lock()[*slot] += 1; }
         VnodeKind::NsFd { id, .. } => sched::ns::hold_raw(*id),
         VnodeKind::BpfProg { id } => { sched::bpfcg::prog_get(*id); }
+        VnodeKind::KvmObj { id } => kvm_obj_get(*id),
         VnodeKind::Mq { slot } => { mqueue::ref_inc(*slot); }
         VnodeKind::TimerFd { slot } => { TIMERFD_REFS.lock()[*slot] += 1; }
         // A dynamic-device open is shared by every duplicate of its fd, so the
@@ -3184,6 +3188,7 @@ fn pipe_ref_dec(kind: &VnodeKind) {
         }
         VnodeKind::NsFd { id, .. } => sched::ns::put_raw(*id),
         VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(*id),
+        VnodeKind::KvmObj { id } => kvm_obj_put(*id),
         VnodeKind::TimerFd { slot } => {
             let mut refs = TIMERFD_REFS.lock();
             refs[*slot] = refs[*slot].saturating_sub(1);
@@ -11724,6 +11729,7 @@ fn handle_close(pid: u32, fd: usize) -> Message {
         }
         VnodeKind::Mq { slot } => { mqueue::ref_dec(slot, pid); }
         VnodeKind::BpfProg { id } => sched::bpfcg::prog_put(id),
+        VnodeKind::KvmObj { id } => kvm_obj_put(id),
         VnodeKind::NsFd { id, .. } => sched::ns::put_raw(id),
         VnodeKind::EventFd { slot } => {
             // Refcounted: an eventfd is dup-able, so free the pool slot only when
@@ -13693,6 +13699,45 @@ pub fn install_bpf_prog(pid: u32, id: u32) -> isize {
     fd as isize
 }
 
+/// KVM object reference hooks (set once by the kernel's kvm module; unset = no-ops).
+static KVM_OBJ_GET: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+static KVM_OBJ_PUT: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
+
+pub fn set_kvm_hooks(get: fn(u32), put: fn(u32)) {
+    KVM_OBJ_GET.store(get as usize, atomic::Ordering::Release);
+    KVM_OBJ_PUT.store(put as usize, atomic::Ordering::Release);
+}
+fn kvm_obj_get(id: u32) {
+    let f = KVM_OBJ_GET.load(atomic::Ordering::Acquire);
+    if f != 0 { let f: fn(u32) = unsafe { core::mem::transmute(f) }; f(id); }
+}
+fn kvm_obj_put(id: u32) {
+    let f = KVM_OBJ_PUT.load(atomic::Ordering::Acquire);
+    if f != 0 { let f: fn(u32) = unsafe { core::mem::transmute(f) }; f(id); }
+}
+
+/// Install a KVM object fd (the caller's object reference moves to the fd;
+/// on failure it stays with the caller). Close-on-exec as with KVM_SET_CLOEXEC
+/// semantics QEMU passes (`O_CLOEXEC`).
+pub fn install_kvm_obj(pid: u32, id: u32) -> isize {
+    let pid = sched::tgid_of(pid);
+    let mut tbls = TblSlot::new();
+    let tbl = match get_or_create(pid, &mut tbls) { Some(t) => t, None => return -23 };
+    let fd = match tbl.alloc_fd() { Some(f) => f, None => return -24 };
+    tbl.fds.set(fd, FdEntry { kind: VnodeKind::KvmObj { id }, flags: O_CLOEXEC, in_use: true, ofd: ofd::alloc() });
+    fd as isize
+}
+
+/// The KVM object id an fd names, if it is a KVM object fd.
+pub fn kvm_obj_of_fd(pid: u32, fd: usize) -> Option<u32> {
+    if fd >= FD_NUMBER_CEIL { return None; }
+    let pid = sched::tgid_of(pid);
+    match with_tbl(pid, |t| t.fds.get(fd).map(|e| e.kind)).flatten()? {
+        VnodeKind::KvmObj { id } => Some(id),
+        _ => None,
+    }
+}
+
 /// The program a bpf fd names: `Ok(id)`, `Err(-9)` for a closed fd, `Err(-22)`
 /// for an open fd that is not a bpf program.
 pub fn bpf_prog_of_fd(pid: u32, fd: usize) -> Result<u32, i32> {
@@ -14989,7 +15034,7 @@ fn poll_vnode_k(kind: &VnodeKind, pid: u32) -> (u32, u64, u64, Option<u64>) {
             let ev = if reaped { POLLIN | POLLHUP } else if exited { POLLIN } else { 0 };
             (ev, exited as u64, sched::poll_tag(sched::poll_class::PIDFD, pid))
         }
-        VnodeKind::NsFd { .. } | VnodeKind::BpfProg { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
+        VnodeKind::NsFd { .. } | VnodeKind::BpfProg { .. } | VnodeKind::KvmObj { .. } => (0, 0, sched::poll_tag(sched::poll_class::PIDFD, 0)),
         VnodeKind::Inotify { inst } => {
             // Never fires: accepted watches silently produce no events. Its
             // own tag, not the broadcast mask — with POLL_TAG_ALL every event
@@ -17865,7 +17910,7 @@ fn handle_fstat(pid: u32, fd: usize, stat_ptr: usize) -> Message {
         // eventfd/timerfd/signalfd/inotify are anon-inode files and report S_IFREG.
         VnodeKind::EventFd { .. } | VnodeKind::TimerFd { .. } | VnodeKind::Mq { .. }
         | VnodeKind::SignalFd { .. } | VnodeKind::Inotify { .. }
-        | VnodeKind::PidFd { .. } | VnodeKind::BpfProg { .. } => (S_IFREG | 0o600, 0, 0),
+        | VnodeKind::PidFd { .. } | VnodeKind::BpfProg { .. } | VnodeKind::KvmObj { .. } => (S_IFREG | 0o600, 0, 0),
         // An open_tree(OPEN_TREE_CLONE) descriptor (kind 4) is the cloned
         // mount's root: Linux reports the type of that root, and crun decides
         // between creating a directory or a file mount point from it.
@@ -18379,6 +18424,7 @@ fn handle_fd_path(pid: u32, fd: usize, buf_ptr: usize, buf_len: usize) -> Messag
             VnodeKind::TimerFd { .. } => FdInfo::Static(b"timerfd"),
             VnodeKind::PidFd { .. } => FdInfo::Static(b"anon_inode:[pidfd]"),
             VnodeKind::BpfProg { .. } => FdInfo::Static(b"anon_inode:bpf-prog"),
+            VnodeKind::KvmObj { id } => FdInfo::Static(match id >> 28 { 1 => b"anon_inode:kvm-vm", 2 => b"anon_inode:kvm-vcpu", _ => b"anon_inode:kvm-device" }),
             VnodeKind::NsFd { .. } => FdInfo::Static(b"anon_inode:[nsfs]"),
             VnodeKind::DevUrandom => FdInfo::Static(b"/dev/urandom"),
             // ttyname(3) readlinks /proc/self/fd/N and stats what it reads

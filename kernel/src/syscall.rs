@@ -34,6 +34,9 @@ use vfs_server as vfs;
 mod syncfile_ioctl;
 #[path = "v4l2.rs"]
 pub(crate) mod v4l2;
+#[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+#[path = "kvm/mod.rs"]
+pub(crate) mod kvm_dev;
 use net_server;
 use tty_server;
 use evdev_server;
@@ -3056,6 +3059,12 @@ fn sys_mmap_inner(addr: usize, len: usize, prot: usize,
         return -17; // EEXIST
     }
 
+    // KVM vCPU fd: the kvm_run page (drv-kvm; inert for every other fd).
+    #[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+    if flags & MAP_ANONYMOUS == 0 {
+        if let Some(r) = kvm_dev::mmap_vcpu(sched::current_pid(), fd, len, off, flags, prot, virt, place) { return r; }
+    }
+
     let end = match virt.checked_add(len) {
         Some(e) => e,
         None    => return -22,
@@ -5979,7 +5988,17 @@ fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
 /// may ignore, MADV_FREE included (its contract allows the old data to stay).
 fn sys_madvise(addr: usize, len: usize, advice: usize) -> isize {
     const MADV_DONTNEED: usize = 4;
+    const MADV_DONTFORK: usize = 10;
+    const MADV_DOFORK: usize = 11;
     if addr & 0xFFF != 0 { return -22; } // EINVAL
+    // Gated on drv-kvm: a default build keeps the silent no-op of main (ungating needs a forktest).
+    if cfg!(feature = "drv-kvm") && (advice == MADV_DONTFORK || advice == MADV_DOFORK) && len != 0 {
+        return match with_current_address_space_mut(|as_| as_.set_dontfork(addr, len, advice == MADV_DONTFORK)) {
+            Some(true)  => 0,
+            Some(false) => -12,
+            None        => -22,
+        };
+    }
     if advice != MADV_DONTNEED || len == 0 { return 0; }
     match with_current_address_space_mut(|as_| as_.discard_range(addr, len)) {
         Some(true)  => 0,
@@ -13074,6 +13093,8 @@ fn sys_ioctl(fd: usize, cmd: usize, arg: usize, frame_ptr: usize) -> isize {
     // gate in drivers::sync_file is open and the fd/flags are ones it handles.
     if let Some(r) = syncfile_ioctl::intercept(pid, fd, cmd, arg) { return r; }
     if let Some(r) = v4l2::intercept(pid, fd, cmd, arg) { return r; }
+    #[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+    if let Some(r) = kvm_dev::intercept(pid, fd, cmd, arg) { return r; }
 
     // ── PRIME / dmabuf export+import (intercepted here, not in the DRM server) ──
     // The DRM server (drivers crate) has no fd-table access; building a dmabuf fd

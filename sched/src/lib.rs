@@ -2251,6 +2251,36 @@ pub fn try_deliver_signal(pid: Pid, signo: u32, info: task::SigInfo) -> Option<i
     Some(ret)
 }
 
+/// KVM: hook that kicks a CPU out of guest mode (set by the drv-kvm glue to an
+/// SGI sender; 0 = none, the default and every non-KVM build).
+static KVM_KICK_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Mark the calling thread as inside (`task::VCPU_IN_GUEST`) or outside the
+/// guest for [`post_signal_thread`]'s kick. Lock-free: the task is reached through
+/// this CPU's `CURRENT_SIGHINT` pointer (`&task.sig_hint`). The caller runs with
+/// IRQs masked, so it cannot migrate between the mode store and guest entry.
+pub fn set_current_vcpu_mode(mode: u8) {
+    let cpu = unsafe { cpu_id() }.min(MAX_CPUS - 1);
+    let p = CURRENT_SIGHINT[cpu].load(Ordering::Relaxed);
+    if p.is_null() { return; }
+    let t = unsafe { (p as *const u8).sub(core::mem::offset_of!(task::Task, sig_hint)) as *const task::Task };
+    unsafe { (*t).vcpu_mode.store(mode, Ordering::SeqCst); }
+}
+
+/// Install the guest-mode kick used by `post_signal_thread` (lane kvm-run).
+pub fn set_kvm_kick_hook(f: fn(usize)) {
+    KVM_KICK_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+fn kvm_kick_cpu(cpu: usize) {
+    let p = KVM_KICK_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if p != 0 {
+        let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(p) };
+        f(cpu);
+    }
+}
+
 /// The RUN_QUEUE-held half of `deliver_signal`/`try_deliver_signal`: returns
 /// `(ret, woke, resumed)` for the caller to act on after unlocking. Split out
 /// exactly as `post_signal_process` is split from `deliver_signal_process`,
@@ -2293,6 +2323,16 @@ fn post_signal_thread(rq: &mut runqueue::RunQueue, pid: Pid, signo: u32, info: t
             }
             t.signal_pending |= 1 << (signo - 1);
             t.sig_kick();
+            // KVM: a vCPU thread inside the guest only notices the signal when
+            // it exits; kick its CPU (no-op SGI) so KVM_RUN returns EINTR.
+            // Dekker with the vCPU side: sig_hint store -> fence -> vcpu_mode load here,
+            // vcpu_mode store -> fence -> signal check there. Only when KVM hooked in.
+            if KVM_KICK_HOOK.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            if t.vcpu_mode.load(core::sync::atomic::Ordering::Acquire) == task::VCPU_IN_GUEST {
+                if let Some(cpu) = t.on_cpu() { kvm_kick_cpu(cpu); }
+            }
             if t.state == TaskState::Blocked {
                 t.set_state(TaskState::Ready);
                 woke = true;

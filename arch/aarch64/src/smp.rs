@@ -175,12 +175,20 @@ pub struct ApBootParams {
     ttbr1:      u64, // +0x18
     sctlr:      u64, // +0x20  (BSP's SCTLR: MMU + caches on)
     entry_virt: u64, // +0x28  (aarch64_ap_entry_high, kernel virtual)
+    boot_vhe:   u64, // +0x30  (1 = the BSP runs at EL2 with E2H; APs must match)
 }
 
 #[no_mangle]
 pub static mut AP_BOOT_PARAMS: ApBootParams = ApBootParams {
-    mair: 0, tcr: 0, ttbr0: 0, ttbr1: 0, sctlr: 0, entry_virt: 0,
+    mair: 0, tcr: 0, ttbr0: 0, ttbr1: 0, sctlr: 0, entry_virt: 0, boot_vhe: 0,
 };
+
+// KVM_VHE selects the AP stub's EL2 behaviour: 0 = drop to EL1 (default
+// builds, unchanged), 1 = stay at EL2 with VHE when the CPU has it.
+#[cfg(feature = "kvm")]
+core::arch::global_asm!(".equ KVM_VHE, 1");
+#[cfg(not(feature = "kvm"))]
+core::arch::global_asm!(".equ KVM_VHE, 0");
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(r#"
@@ -206,6 +214,54 @@ aarch64_ap_entry:
     cmp   x4, #2
     b.ne  .Lap_at_el1
 
+.if KVM_VHE
+    // KVM_VHE=1: stay at EL2 with VHE exactly like the BSP (entry_aarch64.s).
+    // The BSP already decided: boot_entered_el2 != 0 and E2H set in its HCR_EL2
+    // means VHE; a CPU without VH falls through to the EL1 drop. The AP also drops
+    // to EL1 when the BSP itself did not stay in VHE (boot_vhe == 0), so the whole
+    // system runs one mode.
+    adrp  x4, AP_BOOT_PARAMS
+    add   x4, x4, :lo12:AP_BOOT_PARAMS
+    ldr   x4, [x4, #0x30]
+    cbz   x4, .Lap_drop_to_el1
+    mrs   x4, id_aa64mmfr1_el1
+    ubfx  x4, x4, #8, #4
+    cbz   x4, .Lap_drop_to_el1
+    movz  x4, #0x8800, lsl #16    // RW | TGE
+    mov   x5, #1
+    lsl   x5, x5, #34             // E2H
+    orr   x4, x4, x5
+    mrs   x5, id_aa64isar1_el1
+    mov   x6, #0x0ff0
+    movk  x6, #0x0ff0, lsl #16
+    and   x5, x5, x6
+    cbz   x5, 1f
+    mov   x5, #3
+    lsl   x5, x5, #40             // APK | API
+    orr   x4, x4, x5
+1:  msr   hcr_el2, x4
+    isb
+    mov   x4, #0x0c03             // E2H CNTHCTL: EL0PCTEN|EL0VCTEN|EL1PCTEN|EL1PTEN
+    msr   cnthctl_el2, x4
+    msr   cntvoff_el2, xzr
+    movz  x4, #0x0333, lsl #16    // CPTR_EL2 (E2H): FPEN|ZEN|SMEN
+    msr   cptr_el2, x4
+    mrs   x4, id_aa64pfr0_el1
+    ubfx  x4, x4, #24, #4
+    cbz   x4, 2f
+    mrs   x4, S3_4_C12_C9_5       // ICC_SRE_EL2
+    mov   x5, #0x9
+    orr   x4, x4, x5
+    msr   S3_4_C12_C9_5, x4
+    isb
+2:  movz  x4, #0x0800             // SCTLR_EL2 (via sctlr_el1 alias): MMU off
+    movk  x4, #0x30d0, lsl #16
+    msr   sctlr_el1, x4
+    isb
+    msr   daifset, #0xf
+    b     .Lap_at_el1
+.endif
+.Lap_drop_to_el1:
     mrs   x4, cnthctl_el2
     orr   x4, x4, #3              // EL1PCTEN | EL1PCEN
     msr   cnthctl_el2, x4
@@ -548,6 +604,7 @@ pub unsafe fn smp_init(mpidrs: &[u64], overflow: usize) {
         ttbr1,
         sctlr,
         entry_virt: aarch64_ap_entry_high as *const () as u64,
+        boot_vhe: super::hyp::vhe() as u64,
     };
     // Make sure the params and page tables are visible before CPU_ON. The
     // stub reads AP_BOOT_PARAMS with the MMU (and so the caches) off, so

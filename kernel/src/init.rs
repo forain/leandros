@@ -106,6 +106,8 @@ pub fn init_task_main(boot_info: &boot::BootInfo) {
 
     // /dev/video0: V4L2 capture over UVC cameras (ENODEV until one enumerates).
     crate::syscall::v4l2::init();
+    #[cfg(all(feature = "drv-kvm", target_arch = "aarch64"))]
+    crate::syscall::kvm_dev::init();
 
     // Initialize PipeWire server
     match pipewire_server::init(crate::boot_cmdline().unwrap_or("")) {

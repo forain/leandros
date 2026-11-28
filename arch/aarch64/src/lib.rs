@@ -5,7 +5,9 @@
 pub mod early;
 pub mod exception;
 pub mod gic;
+pub mod hyp;
 pub mod its;
+pub mod kvm;
 pub mod mmu;
 pub mod paging;
 pub mod power;
@@ -243,6 +245,8 @@ pub fn init(boot_info: &boot::BootInfo) {
 
         // Initialize GIC (needs virtual addresses; helpers use mm::phys_to_virt)
         gic::init();
+        // Boot line: which exception level the kernel runs at (see hyp.rs).
+        hyp::report();
 
         // Ensure timer is in a sane state
         init_timer();
