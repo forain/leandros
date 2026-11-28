@@ -5,9 +5,10 @@
 # verify it, and promote it, all inside ONE lock3.sh hold (the wrong-promote
 # rule: verify the trial id + uname and promote in the same hold).
 #
-#   laptop: remote.py deploy-kernel --reboot [--via-linux ...]  (needs LEANDROS_REMOTE)
+#   laptop: remote.py deploy-kernel --reboot [--via-linux ...]  (needs LEANDROS_REMOTE; on the
+#           dual-boot laptop ALWAYS pass --via-linux forain@<ip>: its firmware default is Linux)
 #           build: ./scripts/build-all.sh --arch x86_64
-#   pi:     remote.py pi-deploy (kexec)   (LEANDROS_REMOTE=pi, LEANDROS_PI_HOST)
+#   pi:     remote.py pi-deploy (kexec)   (LEANDROS_REMOTE=pi:<ip>, or =pi with LEANDROS_PI_HOST)
 #           build: ./scripts/build-all.sh --arch aarch64 --rpi5   (never RPI5_USBROOT)
 #
 # <expected-tag> must appear in `uname -v` of the booted kernel.
@@ -38,6 +39,7 @@ fail() { echo "DEVICE-UPDATE FAILED ($DEV): $*" >&2; echo "NOT promoted; the pre
 
 if [ "$DEV" = pi ]; then
   export LEANDROS_REMOTE=${LEANDROS_REMOTE:-pi}
+  [ "$LEANDROS_REMOTE" != pi ] || [ -n "${LEANDROS_PI_HOST:-}" ] || fail "no Pi address: use LEANDROS_REMOTE=pi:<ip> or set LEANDROS_PI_HOST"
   KERNEL=$REPO/target/final-aarch64/kernel-direct; INITRD=$REPO/initrd-aarch64.cpio
   BUILD="./scripts/build-all.sh --arch aarch64 --rpi5"
 else
@@ -80,7 +82,7 @@ uname_check() {
 st() { $RM espctl status 2>/dev/null | sed -n "s/^$1=//p" | head -1; }
 
 if [ "$DEV" = laptop ]; then
-  $RM run true >/dev/null 2>&1 || fail "ssh to the laptop does not work before deploy"
+  $RM run true >/dev/null 2>&1 || fail "ssh to the laptop does not work before deploy (is it in its Linux? boot LeandrOS first; pass --via-linux USER@HOST so the trial reboot hops through Linux)"
   OLD_GOOD=$(st good); echo "old good: ${OLD_GOOD:-?}"
   $RM deploy-kernel --reboot ${VIA:+--via-linux "$VIA"} > "$OUT/deploy.txt" 2>&1; rc=$?
   grep -aE '^(kernel |initrd |slot id=|back after|NEW KERNEL|NOT the new|REBOOT FAILED|f2fs rf)' "$OUT/deploy.txt" | cut -c1-200
@@ -101,9 +103,12 @@ if [ "$DEV" = laptop ]; then
   W=${DEVUPDATE_NETWATCH_WAIT:-180}
   case ${LEANDROS_REMOTE:-} in qemu*) W=${DEVUPDATE_NETWATCH_WAIT:-0};; esac
   if [ "$W" -gt 0 ]; then
+    # our own marker, written on THIS boot (remote.py's /tmp/.remdbg-alive is written before
+    # the reboot so it is absent by design on the new boot and cannot serve here)
+    $RM run 'echo devupd > /tmp/.devupd-alive && sync' >/dev/null 2>&1 || fail "ssh failed (marker)"
     up=$($RM run 'cut -d. -f1 /proc/uptime' 2>/dev/null) || fail "ssh failed (uptime)"
     need=$((W + 20 - up)); [ $need -gt 0 ] && { echo "netwatch window: waiting ${need}s"; sleep $need; }
-    $RM run 'test -e /tmp/.remdbg-alive' >/dev/null 2>&1 || fail "netwatch window: the trial rebooted (marker gone) or ssh lost"
+    $RM run 'test -e /tmp/.devupd-alive' >/dev/null 2>&1 || fail "netwatch window: the trial rebooted (marker gone) or ssh lost"
     ok "no netwatch reboot within ${W}s"
   else
     echo "netwatch window skipped (W=0)"
