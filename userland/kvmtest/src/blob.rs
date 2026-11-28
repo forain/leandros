@@ -72,7 +72,7 @@ pub static SPIN: [u32; 1] = [
 /// memslot: store 0xbabecafe at RAM+0x1000, then SYSTEM_OFF
 pub static MEMSLOT: [u32; 9] = [
     0xd2a80001, // movz x1, #0x4000, lsl #16
-    0x91401021, // add x1, x1, #4, lsl #12
+    0x91400421, // add x1, x1, #1, lsl #12
     0x52995fc2, // movz w2, #0xcafe
     0x72b757c2, // movk w2, #0xbabe, lsl #16
     0xb9000022, // str w2, [x1]
