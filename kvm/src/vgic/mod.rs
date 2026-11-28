@@ -112,6 +112,8 @@ pub struct Vgic {
     /// v2 GICV/GICC base.
     pub cpu_base: Option<u64>,
     pub ready: bool,
+    /// KVM_DEV_ARM_VGIC_CTRL_INIT was requested (the vGIC goes `ready` once addresses are set too).
+    pub inited: bool,
     kicks: KickMask,
     resample: Vec<u32>,
 }
@@ -140,6 +142,7 @@ impl Vgic {
             redist_count: 0,
             cpu_base: None,
             ready: false,
+            inited: false,
             kicks: 0,
             resample: Vec::new(),
         };

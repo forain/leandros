@@ -894,8 +894,12 @@ unsafe fn ph_irqfd() -> bool {
     let n = b"irqfd";
     let kvm = open_kvm();
     if kvm < 0 { return fail(n, b"open errno", errno() as u64); }
-    let probe = ioctl(kvm, KVM_CHECK_EXTENSION, 32usize);
-    if probe <= 0 { close(kvm); return skip(n, b"no in-kernel vGIC (KVM_CAP_IRQFD=0)"); }
+    // The test drives a GICv3 guest: a GICv2 host (kvmv2) has no v3 vGIC.
+    let pvm = ioctl(kvm, KVM_CREATE_VM, 0usize);
+    if pvm < 0 { return fail(n, b"CREATE_VM errno", errno() as u64); }
+    let (r3, _) = create_dev(pvm, KVM_DEV_TYPE_ARM_VGIC_V3, KVM_CREATE_DEVICE_TEST);
+    close(pvm);
+    if r3 < 0 { close(kvm); return skip(n, b"no GICv3 vGIC on this host"); }
     if !irq_case(n, kvm, false) { return false; }
     if !irq_case(n, kvm, true) { return false; }
     pass(n, b"edge irqfd: eventfd write -> guest took SPI 33 (eventfd drained); level irqfd: EOI signalled the resamplefd; deassign ok")

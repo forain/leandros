@@ -475,7 +475,16 @@ fn attr_addr_and_init_rules() {
     assert_eq!(Vgic::device_version(KVM_DEV_TYPE_ARM_VGIC_V2), Some(Version::V2));
     assert_eq!(Vgic::device_version(8), None);
     let mut g = Vgic::new(Version::V3, 64, 2);
-    assert_eq!(g.attr_set(GRP_CTRL, CTRL_INIT, &mut 0), Err(ENXIO));
+    // Linux/QEMU order: INIT may come before the base addresses; the vGIC goes live once both are set.
+    {
+        let mut e = Vgic::new(Version::V3, 64, 2);
+        assert_eq!(e.attr_set(GRP_CTRL, CTRL_INIT, &mut 0), Ok(()));
+        assert!(!e.ready);
+        e.attr_set(GRP_ADDR, V3_ADDR_DIST, &mut { DIST }).unwrap();
+        assert!(!e.ready);
+        e.attr_set(GRP_ADDR, V3_ADDR_REDIST, &mut { REDIST }).unwrap();
+        assert!(e.ready);
+    }
     assert_eq!(g.attr_get(GRP_ADDR, V3_ADDR_DIST, &mut 0), Err(ENXIO));
     assert_eq!(g.attr_set(GRP_ADDR, V3_ADDR_DIST, &mut 0x8000_1000), Err(EINVAL)); // not 64K aligned
     assert_eq!(g.attr_set(GRP_ADDR, V2_ADDR_DIST, &mut 0x8000_0000), Err(ENXIO)); // v2 attr on v3
