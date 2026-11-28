@@ -160,10 +160,19 @@ fn t_kvmswitch() -> T {
         unsafe { core::arch::asm!("msr vtcr_el2, {}", "isb", in(reg) vtcr, options(nomem, nostack)); }
         let mut hw = VcpuHw::new_boot(IPA);
         hw.vttbr = l1 as u64 | (0x7E57u64 << 48);
+        hw.vtcr = vtcr; // VTCR is per VM (kvmfix1): enter loads it from VcpuHw
         hw.gp[5] = 0x1234_5678;
         hw.vmpidr = 0x8000_0000;
         let hcr_before = hyp::host_hcr();
-        let r = unsafe { enter(&mut hw) };
+        // A host IRQ pending at entry (tick) exits the guest before its first instruction
+        // (EXIT_IRQ, stale ESR): re-enter until the guest reaches its hvc.
+        let mut r = unsafe { enter(&mut hw) };
+        let mut irq_exits = 0;
+        while r.kind == arch_aarch64::kvm::hw::EXIT_IRQ && irq_exits < 64 {
+            irq_exits += 1;
+            r = unsafe { enter(&mut hw) };
+        }
+        say!("kvmswitch: irq_exits={}", irq_exits);
         say!("kvmswitch: kind={} esr={:#x} far={:#x} hpfar={:#x} pc={:#x}", r.kind, r.esr, r.far, r.hpfar, hw.pc);
         t.check(r.kind == arch_aarch64::kvm::hw::EXIT_SYNC, "exit kind is sync");
         t.check(matches!(arch_aarch64::kvm::esr::decode_raw(&r), arch_aarch64::kvm::esr::Exit::Hvc { imm: 0 }), "exit decodes as hvc #0");
