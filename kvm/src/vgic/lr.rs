@@ -182,7 +182,7 @@ impl<C: LrCodec> VgicHw for MockHw<C> {
         let mut m = 0;
         for (i, &r) in self.lrs.iter().enumerate() {
             let e = self.codec.decode(r);
-            if !e.pending && !e.active {
+            if !e.pending && !e.active && !e.eoi { // ELRSR: an invalid LR with its EOI bit set is not empty until the MI is serviced
                 m |= 1 << i;
             }
         }

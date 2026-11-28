@@ -149,7 +149,7 @@ fn edge_spi_lifecycle() {
     let mut hw = MockHw::new(V3Codec, 4);
     assert!(!g.pending(0));
     assert_eq!(g.irq_line(abi_shim::irq_line_decode(0).0 << 24 | 0, 1), Err(EINVAL)); // type CPU rejected
-    let k = g.irq_line(1 << 24, 1).unwrap(); // SPI 0 = intid 32
+    let k = g.irq_line(1 << 24 | 32, 1).unwrap(); // KVM_IRQ_LINE takes the INTID itself (Linux: SPI < 32 is EINVAL)
     assert_eq!(k, 1);
     assert!(g.pending(0));
     run_hw(&mut g, 0, &mut hw);
@@ -162,8 +162,8 @@ fn edge_spi_lifecycle() {
     assert_eq!(d(&mut g, 0x304), 1); // active
     assert!(!g.pending(0));
     // second edge while active: pending+active
-    g.irq_line(1 << 24, 0).unwrap();
-    g.irq_line(1 << 24, 1).unwrap();
+    g.irq_line(1 << 24 | 32, 0).unwrap();
+    g.irq_line(1 << 24 | 32, 1).unwrap();
     assert!(g.pending(0));
     run_hw(&mut g, 0, &mut hw);
     let e = V3Codec.decode(hw.lrs[0]);
@@ -323,7 +323,8 @@ fn ppi_line_and_irq_line_validation() {
     assert_eq!(g.irq_line(2 << 24 | 5 << 16 | 27, 1), Err(EINVAL)); // no vcpu 5
     assert_eq!(g.irq_line(2 << 24 | 40, 1), Err(EINVAL));
     assert_eq!(g.irq_line(1 << 24 | 500, 1), Err(EINVAL)); // out of range spi
-    assert_eq!(g.irq_line(1 << 24 | 31, 1), Ok(0)); // SPI not enabled: no kick
+    assert_eq!(g.irq_line(1 << 24 | 31, 1), Err(EINVAL)); // not an SPI
+    assert_eq!(g.irq_line(1 << 24 | 63, 1), Ok(0)); // SPI not enabled: no kick
 }
 
 #[test]
@@ -474,7 +475,16 @@ fn attr_addr_and_init_rules() {
     assert_eq!(Vgic::device_version(KVM_DEV_TYPE_ARM_VGIC_V2), Some(Version::V2));
     assert_eq!(Vgic::device_version(8), None);
     let mut g = Vgic::new(Version::V3, 64, 2);
-    assert_eq!(g.attr_set(GRP_CTRL, CTRL_INIT, &mut 0), Err(ENXIO));
+    // Linux/QEMU order: INIT may come before the base addresses; the vGIC goes live once both are set.
+    {
+        let mut e = Vgic::new(Version::V3, 64, 2);
+        assert_eq!(e.attr_set(GRP_CTRL, CTRL_INIT, &mut 0), Ok(()));
+        assert!(!e.ready);
+        e.attr_set(GRP_ADDR, V3_ADDR_DIST, &mut { DIST }).unwrap();
+        assert!(!e.ready);
+        e.attr_set(GRP_ADDR, V3_ADDR_REDIST, &mut { REDIST }).unwrap();
+        assert!(e.ready);
+    }
     assert_eq!(g.attr_get(GRP_ADDR, V3_ADDR_DIST, &mut 0), Err(ENXIO));
     assert_eq!(g.attr_set(GRP_ADDR, V3_ADDR_DIST, &mut 0x8000_1000), Err(EINVAL)); // not 64K aligned
     assert_eq!(g.attr_set(GRP_ADDR, V2_ADDR_DIST, &mut 0x8000_0000), Err(ENXIO)); // v2 attr on v3
@@ -635,4 +645,27 @@ fn shrink_to_created_vcpus_before_init() {
     g.set_nr_vcpus(1); // too late: ignored
     assert_eq!(g.nr_vcpus, 2);
     g.set_nr_vcpus(0); // clamps
+}
+
+/// A userspace exit between the guest's ack and EOI (an MMIO access in the handler) must not
+/// make the still-high level line re-deliver: the active LR carries the EOI bit, so the EOI
+/// empties it, raises the maintenance interrupt and the line gets resampled.
+#[test]
+fn level_spi_exit_between_ack_and_eoi_still_resamples() {
+    let mut g = v3(32, 1);
+    enable_all(&mut g, true);
+    dw(&mut g, 0x104, 1);
+    let mut hw = MockHw::new(V3Codec, 4);
+    g.set_line(32, 0, true);
+    run_hw(&mut g, 0, &mut hw);
+    assert_eq!(hw.ack(), Some((32, 0)));
+    g.sync_out(0, &mut hw, &V3Codec); // exit to userspace in the handler
+    assert!(g.take_resample().is_empty());
+    run_hw(&mut g, 0, &mut hw); // re-enter: active, line high
+    let e = V3Codec.decode(hw.lrs[0]);
+    assert!(e.active && !e.pending && e.eoi);
+    hw.eoi(32);
+    assert!(hw.maintenance_asserted());
+    g.sync_out(0, &mut hw, &V3Codec);
+    assert_eq!(g.take_resample(), vec![32]);
 }

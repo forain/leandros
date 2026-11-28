@@ -75,14 +75,32 @@ impl Vgic {
             || (ICC_AP1R0_EL1..ICC_AP1R0_EL1 + 4).contains(&r)
     }
 
+    /// Go live once INIT was requested and the base addresses are set.
+    fn try_ready(&mut self) -> Result<(), i32> {
+        let v3 = self.version == Version::V3;
+        let ok = if v3 { self.dist_base.is_some() && self.redist_base.is_some() } else { self.dist_base.is_some() && self.cpu_base.is_some() };
+        if !ok {
+            return Ok(());
+        }
+        if v3 && self.redist_count != 0 && (self.redist_count as usize) < self.nr_vcpus {
+            return Err(EINVAL);
+        }
+        self.ready = true;
+        Ok(())
+    }
+
     fn attr_access(&mut self, group: u32, attr: u64, val: &mut u64, write: bool) -> Result<(), i32> {
         self.attr_has(group, attr)?;
         let v3 = self.version == Version::V3;
         match group {
-            GRP_ADDR => self.addr_access(attr, val, write),
+            GRP_ADDR => {
+                self.addr_access(attr, val, write)?;
+                if write && self.inited && !self.ready { let _ = self.try_ready(); }
+                Ok(())
+            }
             GRP_NR_IRQS => {
                 if write {
-                    if self.ready {
+                    if self.inited {
                         return Err(EBUSY);
                     }
                     let n = *val as u32;
@@ -96,25 +114,18 @@ impl Vgic {
                 Ok(())
             }
             GRP_CTRL => {
-                if self.ready {
+                if self.ready || self.inited {
                     return Ok(());
                 }
-                let ok = if v3 {
-                    self.dist_base.is_some() && self.redist_base.is_some()
-                } else {
-                    self.dist_base.is_some() && self.cpu_base.is_some()
-                };
-                if !ok {
-                    return Err(ENXIO);
-                }
-                if v3 && self.redist_count != 0 && (self.redist_count as usize) < self.nr_vcpus {
-                    return Err(EINVAL);
-                }
-                self.ready = true;
-                Ok(())
+                // Linux: INIT builds the distributor state and does NOT need the base addresses;
+                // QEMU issues it before it maps the regions. The addresses are checked when the
+                // vGIC goes live (`try_ready`, on the last address write, or here if already set).
+                self.inited = true;
+                self.try_ready()
             }
             _ => {
-                if !self.ready {
+                // Linux: register access needs INIT (vgic_initialized), not the mapped addresses.
+                if !self.inited {
                     return Err(EBUSY);
                 }
                 self.reg_access(group, attr, val, write)

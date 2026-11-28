@@ -211,11 +211,13 @@ fn run_loop(vm: &Arc<Vm>, v: &Arc<Vcpu>, run: *mut KvmRun, gfp: *mut u8) -> isiz
         sched::set_current_vcpu_mode(sched::task::VCPU_OUTSIDE);
         v.in_guest.store(false, Ordering::SeqCst);
         super::timer::save(hw, forced);
-        let k = vgic_leave(vm, v, hw);
+        let (k, eoi) = vgic_leave(vm, v, hw);
         // Let a pending host interrupt in before the exit is handled.
         unsafe { core::arch::asm!("msr daifclr, #2", "isb", "msr daifset, #2", options(nomem, nostack)); }
         sched::ksync::irq_restore(flags);
         if k != 0 { super::kick::kick_mask(vm, k & !(1u64 << v.id)); }
+        // Guest EOI of level SPIs: de-assert and signal the irqfd resamplefds.
+        if !eoi.is_empty() { vm.resample(&eoi); }
         let Some(raw) = raw else { store_hw(v, hw); continue };
 
         let flow = handle_exit(vm, v, hw, run, &raw);
@@ -257,10 +259,10 @@ fn vgic_enter(vm: &Vm, v: &Vcpu, hw: &VcpuHw) {
 }
 
 /// Fold the list registers back; returns the vCPU kick mask the fold produced.
-fn vgic_leave(vm: &Vm, v: &Vcpu, hw: &mut VcpuHw) -> u64 {
+fn vgic_leave(vm: &Vm, v: &Vcpu, hw: &mut VcpuHw) -> (u64, Vec<u32>) {
     let mut guard = vm.vgic.lock();
-    let Some(g) = guard.as_mut() else { return 0 };
-    if !g.ready { return 0; }
+    let Some(g) = guard.as_mut() else { return (0, Vec::new()) };
+    if !g.ready { return (0, Vec::new()); }
     let id = v.id as usize;
     match g.version {
         Version::V3 => {
@@ -274,7 +276,7 @@ fn vgic_leave(vm: &Vm, v: &Vcpu, hw: &mut VcpuHw) -> u64 {
             g.sync_out(id, &mut h, &V2Codec);
         }
     }
-    g.take_kicks()
+    (g.take_kicks(), g.take_resample())
 }
 
 // ---- exits ----------------------------------------------------------------------------
