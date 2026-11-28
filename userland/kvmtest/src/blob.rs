@@ -102,3 +102,13 @@ pub static SMP1: [u32; 3] = [
     0xb9001120, // str w0, [x9, #16]
     0x14000000, // b .
 ];
+
+/// counter: increment the word at RAM+0x1000 forever (a guest that keeps touching its RAM)
+pub static COUNTER: [u32; 6] = [
+    0xd2a80001, // movz x1, #0x4000, lsl #16
+    0x91400421, // add x1, x1, #1, lsl #12
+    0xb9400022, // ldr w2, [x1]
+    0x11000442, // add w2, w2, #1
+    0xb9000022, // str w2, [x1]
+    0x17fffffd, // b #-12
+];

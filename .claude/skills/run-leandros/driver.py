@@ -1332,7 +1332,7 @@ def _build_direct_cmd(arch):
             sys.exit(f"ERROR: direct-boot kernel not found: {kernel}")
         return [
             _qemu_bin("qemu-system-aarch64"),
-            "-machine", "virt,gic-version=3" + _virt_machine(), "-smp", "4", "-cpu", _virt_cpu("max"), "-m", _guest_mem(), "-accel", "tcg",
+            "-machine", "virt,gic-version=" + _gic_version(["-accel", "tcg"]) + _virt_machine(), "-smp", "4", "-cpu", _virt_cpu("max"), "-m", _guest_mem(), "-accel", "tcg",
             "-kernel", kernel,
             "-device", f"loader,file={initrd},addr=0x48000000,force-raw=on",
             # Stand-in for the Limine disk (vda in the UEFI layout): a bare
