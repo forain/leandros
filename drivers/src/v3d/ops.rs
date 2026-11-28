@@ -177,8 +177,11 @@ extern "C" fn wait_bo(fence: u64, timeout_ns: u64) -> bool {
     loop {
         reap();
         if kenv::fence_signalled(fence) { return true; }
-        if kenv::sched::monotonic_ns() >= deadline { return false; }
-        kenv::yield_now("v3d-scanout");
+        let now = kenv::sched::monotonic_ns();
+        if now >= deadline { return false; }
+        // A timed park, not a yield loop: the fence signals from the IRQ/reap path, and a
+        // 250 us granule keeps the added latency negligible without spinning a CPU.
+        crate::kenv::sleep_until(core::cmp::min(now + 250_000, deadline));
     }
 }
 

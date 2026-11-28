@@ -563,20 +563,14 @@ buffer_recycle (GstMiniObject *obj)
     return TRUE;
   }
 
-  GST_OBJECT_LOCK (data->pool);
-  if (!obj->dispose) {
-    GST_OBJECT_UNLOCK (data->pool);
-    return TRUE;
-  }
-
-  GST_BUFFER_FLAGS (obj) = data->flags;
-
   pw_thread_loop_lock (src->stream->core->loop);
   if (!obj->dispose) {
     pw_thread_loop_unlock (src->stream->core->loop);
-    GST_OBJECT_UNLOCK (data->pool);
     return TRUE;
   }
+
+  GST_OBJECT_LOCK (data->pool);
+  GST_BUFFER_FLAGS (obj) = data->flags;
 
   gst_mini_object_ref (obj);
 
@@ -587,9 +581,8 @@ buffer_recycle (GstMiniObject *obj)
   else
     GST_LOG_OBJECT (src, "recycle buffer %p", obj);
 
-  pw_thread_loop_unlock (src->stream->core->loop);
-
   GST_OBJECT_UNLOCK (data->pool);
+  pw_thread_loop_unlock (src->stream->core->loop);
 
   return FALSE;
 }
@@ -839,6 +832,17 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
 
       video_size += d->chunk->size;
     }
+
+    /* If the buffer number is smaller than the plane number,
+     * update the stride and offset for the remaining planes.
+     */
+    if (n_datas && n_datas < n_planes) {
+      for (i = n_datas; i < n_planes; i++) {
+        meta->stride[i] = gst_video_format_info_extrapolate_stride (info->finfo, i, b->buffer->datas[0].chunk->stride);
+        meta->offset[i] = meta->offset[i-1] +
+            meta->stride[i-1] * GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (info->finfo, i-1, GST_VIDEO_INFO_HEIGHT(info));
+      }
+    }
   }
 
   if (b->buffer->n_datas != gst_buffer_n_memory(data->buf)) {
@@ -1074,10 +1078,6 @@ wait_negotiated (GstPipeWireSrc *this)
     GST_DEBUG_OBJECT (this, "waiting for NEGOTIATED, now %s", pw_stream_state_as_string (state));
     if (state == PW_STREAM_STATE_ERROR)
       break;
-    if (this->flushing) {
-      state = PW_STREAM_STATE_ERROR;
-      break;
-    }
 
     if (this->negotiated)
       break;
@@ -1137,6 +1137,7 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
 
   GST_DEBUG_OBJECT (basesrc, "have common caps (sanitized): %" GST_PTR_FORMAT, possible_caps);
 
+  pw_thread_loop_lock (pwsrc->stream->core->loop);
   if (pw_stream_get_state(pwsrc->stream->pwstream, NULL) == PW_STREAM_STATE_STREAMING) {
     g_autoptr (GstCaps) current_caps = NULL;
     g_autoptr (GstCaps) preferred_new_caps = NULL;
@@ -1148,6 +1149,7 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
       GST_DEBUG_OBJECT (pwsrc,
                         "Stream running and new caps equal current ones. "
                         "Skipping renegotiation.");
+      pw_thread_loop_unlock (pwsrc->stream->core->loop);
       goto no_nego_needed;
     }
   }
@@ -1156,7 +1158,6 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
   possible = gst_caps_to_format_all (possible_caps);
 
   /* first disconnect */
-  pw_thread_loop_lock (pwsrc->stream->core->loop);
   if (pw_stream_get_state(pwsrc->stream->pwstream, &error) != PW_STREAM_STATE_UNCONNECTED) {
     GST_DEBUG_OBJECT (basesrc, "disconnect capture");
     pw_stream_disconnect (pwsrc->stream->pwstream);
@@ -1613,7 +1614,8 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
 
           old = pwsrc->last_buffer;
           pwsrc->last_buffer = gst_buffer_copy (buf);
-          gst_buffer_unref (old);
+          if (old != NULL)
+            gst_buffer_unref (old);
           gst_buffer_add_parent_buffer_meta (pwsrc->last_buffer, buf);
 
           clock = gst_element_get_clock (GST_ELEMENT_CAST (pwsrc));
@@ -1779,8 +1781,11 @@ gst_pipewire_src_change_state (GstElement * element, GstStateChange transition)
        * be moved from idle to suspended, which would mean format cleared via
        * handle_format_change. Wait for new format to avoid basesrc calling
        * create() and get not-negotiated error as response. */
-      if (wait_negotiated(this) == PW_STREAM_STATE_ERROR)
+      if (wait_negotiated(this) == PW_STREAM_STATE_ERROR) {
+        pw_thread_loop_unlock (this->stream->core->loop);
         goto open_failed;
+      }
+
       pw_thread_loop_unlock (this->stream->core->loop);
       break;
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:

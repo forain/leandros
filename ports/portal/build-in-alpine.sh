@@ -43,7 +43,7 @@ esac
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
   [ "$(uname -m)" = "$ARCH" ] || { echo "container is $(uname -m), wanted $ARCH"; exit 3; }
-  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
+  [ "${ALPINE_REL:?}" = edge ] || grep -q "^${ALPINE_REL}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
   apk add --no-cache xdg-desktop-portal glib-dev binutils file patchelf build-base
   XDPVER=$(apk info -e -v xdg-desktop-portal)
   echo "package: $XDPVER $(apk info -e -v glib) (alpine $(cat /etc/alpine-release))"

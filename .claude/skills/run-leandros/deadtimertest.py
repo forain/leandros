@@ -18,6 +18,7 @@ import glob
 import os
 import subprocess
 import sys
+import hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 arch = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LEANDROS_TEST_ARCH", "x86_64")
@@ -54,7 +55,9 @@ for b in boots:
     for attempt in range(3 if racy else 1):
         retry = False
         # Unique run id and out dir per attempt: a leftover wedged VM or log never aliases the next.
-        rid = f"{BASE_RID}-deadtimer{cpu}m{m}a{attempt}-{os.getpid()}"
+        # Short and independent of the ref: the id lands in /tmp/leandros-<id>-serial.sock, and a
+        # unix socket path may not exceed 108 bytes (a 40-char sha in BASE_RID overflowed it).
+        rid = f"{hashlib.sha1(BASE_RID.encode()).hexdigest()[:8]}-dt{cpu}m{m}a{attempt}-{os.getpid()}"
         out_base = os.path.join(BASE_OUT, f"deadtimer-{os.getpid()}-{cpu}-{m}-a{attempt}")
         os.makedirs(out_base, exist_ok=True)
         env = dict(os.environ, LEANDROS_RUN_ID=rid, FFSESSION_OUT=out_base)

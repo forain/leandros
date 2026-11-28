@@ -15,6 +15,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
 
@@ -33,10 +34,11 @@ fi
 for arch in "${ARCHES[@]}"; do
   # libdbus-1 (Alpine dbus-dev + dbus-libs) must be in the sysroot first (libdbus-sys finds it via pkg-config).
   python3 "$(dirname "$0")/../../scripts/alpine-dev.py" merge "$arch" "${LEANDROS_ARTIFACTS:-$HOME/code/leandros-artifacts}/m3-gl-stack/sysroot-$arch" > /dev/null
-  if ! "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-bluetooth > /dev/null; then
+  cosmic_cache_build cosmic-applet-bluetooth "$arch" "$SRC" "-p cosmic-applet-bluetooth" "" \
+    "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-bluetooth|cosmic-applet-bluetooth-$arch" -- \
+    sh -c '"$0" "$@" > /dev/null' "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-bluetooth || {
     echo "cosmic-applet-bluetooth: build failed for $arch (log: $M6/logs/cosmic-applets-$arch.log)" >&2
     exit 1
-  fi
-  stage_file 0755 "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-bluetooth" "$M6_OUT/cosmic-applet-bluetooth-$arch"
+  }
   echo "staged $arch: $M6_OUT/cosmic-applet-bluetooth-$arch"
 done

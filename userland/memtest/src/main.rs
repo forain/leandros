@@ -146,6 +146,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8, _envp: *const *
     if !test_asfree_mt_kill() { failures += 1; }
     if !test_asfree_leader_exit_first() { failures += 1; }
     if !test_asfree_vfork() { failures += 1; }
+    if !test_asfree_reaper_close() { failures += 1; }
     if !test_late_leader_all() { failures += 1; }
     if !test_wait_memory_drift() { failures += 1; }
     if !test_mempolicy_single_node() { failures += 1; }
@@ -2998,7 +2999,36 @@ unsafe fn vfork_run(path: *const u8, argv: *const *const u8, envp: *const *const
 /// A vfork child shares the parent's address space: its exit, and its exec,
 /// must record NO teardown for that space (nothing for the parent's tgid nor
 /// the child's), while the exec'd image's own exit records its one.
-unsafe fn test_asfree_vfork() -> bool {
+unsafe fn test_asfree_vfork() -> bool { bounded_isolated(b"asfree_vfork\0", test_asfree_vfork_body, 30) }
+
+/// Run `f` in a forked copy of this process and wait at most `secs` for it: a
+/// case that can hang when the code under test is broken (a vfork parent that
+/// is never resumed) fails fast with a clear message instead of stalling the
+/// whole suite until the outer timeout. The copy prints its own verdict; only
+/// a timeout is reported here.
+unsafe fn bounded_isolated(name: &[u8], f: unsafe fn() -> bool, secs: u32) -> bool {
+    let pid = fork();
+    if pid < 0 { return report(name, false); }
+    if pid == 0 { exit(if f() { 0 } else { 1 }); }
+    let mut st = -1i32;
+    let mut waited_ms = 0u32;
+    loop {
+        let r = syscall4(nr::WAIT4, pid as usize, &mut st as *mut i32 as usize, 1, 0) as isize;
+        if r == pid as isize { return st == 0; }
+        if r < 0 { return report(name, false); }
+        if waited_ms >= secs * 1000 { break; }
+        usleep(20_000);
+        waited_ms += 20;
+    }
+    syscall2(nr::KILL, pid as usize, 9);
+    let mut st2 = -1i32;
+    syscall4(nr::WAIT4, pid as usize, &mut st2 as *mut i32 as usize, 0, 0);
+    let msg = b"  HANG: no verdict within the time bound (a vfork parent or waiter was never resumed); killed\n";
+    write(STDOUT_FILENO, msg.as_ptr(), msg.len());
+    report(name, false)
+}
+
+unsafe fn test_asfree_vfork_body() -> bool {
     let name = b"asfree_vfork\0";
     let me = getpid();
     let envp = [core::ptr::null::<u8>()];
@@ -3041,6 +3071,104 @@ unsafe fn test_asfree_vfork() -> bool {
     report(name, ok_read1 && ok_read2 && reported && st1 == 0 && st2 == 0
         && exit_child_entries == 0 && exit_parent_delta == 0
         && exec_child_entries == 0 && exec_parent_delta == 0 && at_wait == 1)
+}
+
+#[repr(align(16))]
+struct CloneStack([u8; 4096]);
+static mut CLONE_STACK: CloneStack = CloneStack([0; 4096]);
+
+/// clone(CLONE_VM|SIGCHLD) onto `CLONE_STACK`: the child (a separate thread
+/// group sharing this process's address space) blocks in read(`fd`) for one
+/// byte, then exit(0). It touches no memory but its own stack. Returns its pid.
+#[cfg(target_arch = "x86_64")]
+unsafe fn clone_vm_sleeper(fd: i32) -> i64 {
+    let r: i64;
+    let top = (&raw mut CLONE_STACK as *mut u8).add(4096);
+    core::arch::asm!(
+        "mov eax, 56", "mov edi, 0x111", "xor edx, edx", "xor r10d, r10d", "xor r8d, r8d",
+        "syscall",
+        "test rax, rax", "jnz 2f",
+        "mov rsi, rsp", "sub rsi, 16", "mov edi, r12d", "mov edx, 1", "xor eax, eax", "syscall",
+        "xor edi, edi", "mov eax, 60", "syscall",
+        "2:",
+        in("r12") fd as i64, inout("rsi") top => _,
+        lateout("rax") r, out("rdi") _, out("rdx") _, out("r10") _, out("r8") _,
+        out("rcx") _, out("r11") _,
+        options(nostack),
+    );
+    r
+}
+#[cfg(target_arch = "aarch64")]
+unsafe fn clone_vm_sleeper(fd: i32) -> i64 {
+    let r: i64;
+    let top = (&raw mut CLONE_STACK as *mut u8).add(4096);
+    core::arch::asm!(
+        "mov x0, #0x111", "mov x2, xzr", "mov x3, xzr", "mov x4, xzr", "mov x8, #220",
+        "svc #0",
+        "cbnz x0, 2f",
+        "mov x0, x9", "mov x1, sp", "sub x1, x1, #16", "mov x2, #1", "mov x8, #63", "svc #0",
+        "mov x0, xzr", "mov x8, #93", "svc #0",
+        "2:",
+        in("x9") fd as i64, inout("x1") top => _,
+        lateout("x0") r, out("x2") _, out("x3") _, out("x4") _, out("x8") _,
+        options(nostack),
+    );
+    r
+}
+
+/// The reaper-only close: P and C are two thread groups sharing one address
+/// space (C = CLONE_VM sharer). P's exit leaves the space (C holds it) and
+/// parks in the `exitrace` window, still in the run queue; C exits meanwhile
+/// and leaves it too (P's slot still holds it); C's removal is not the last
+/// either. When P's window ends, P's removal is the last holder: only the
+/// reaper's close can free the space. With a stray strong reference armed
+/// (`hold`) a plain Arc drop cannot free it, so the entry must be in the ring
+/// when wait4(P) returns, and not before.
+unsafe fn test_asfree_reaper_close() -> bool { bounded_isolated(b"asfree_reaper_close\0", test_asfree_reaper_close_body, 30) }
+
+unsafe fn test_asfree_reaper_close_body() -> bool {
+    let name = b"asfree_reaper_close\0";
+    let (mut ready, mut go, mut go2) = ([0i32; 2], [0i32; 2], [0i32; 2]);
+    if pipe(ready.as_mut_ptr()) != 0 || pipe(go.as_mut_ptr()) != 0 || pipe(go2.as_mut_ptr()) != 0 { return report(name, false); }
+    let pid = fork();
+    if pid < 0 { return report(name, false); }
+    if pid == 0 {
+        close(ready[0]); close(go[1]); close(go2[1]);
+        let c = clone_vm_sleeper(go[0]);
+        // Tell the parent the sharer's pid, then exit leaving it behind.
+        let mut w = [0u8; 16];
+        fmt_num(if c > 0 { c as usize } else { 0 }, &mut w);
+        write(ready[1], w.as_ptr(), 16);
+        let mut b = [0u8; 1];
+        read(go2[0], b.as_mut_ptr(), 1); // exit only once the parent has armed the hold
+        exit(0);
+    }
+    close(ready[1]); close(go[0]); close(go2[0]);
+    let mut w = [0u8; 16];
+    let n = read(ready[0], w.as_mut_ptr(), 16);
+    let sharer = if n == 16 { parse_num(&w[..w.iter().position(|&b| b == 0).unwrap_or(16)]).unwrap_or(0) } else { 0 };
+    let before = asfree_count(pid).unwrap_or(99);
+    let armed = asfree_do(b"hold", pid, 0);
+    let mut cb = [0u8; 48];
+    let cn = asfree_fmt(b"exitrace", pid, 2, &mut cb);
+    cb[cn] = b' '; cb[cn + 1] = b'l';
+    let raced = asfree_cmd(&cb[..cn + 2]); // P parks (<= 2 s) in exit after its release step
+    write(go2[1], b"x".as_ptr(), 1);
+    usleep(400_000); // P is parked in exit, C still holds the space
+    write(go[1], b"x".as_ptr(), 1); // C exits while P is still parked
+    usleep(400_000);
+    let mid = asfree_count(pid).unwrap_or(99);
+    let status = wait_status(pid);
+    let at_wait = asfree_count(pid).unwrap_or(99);
+    asfree_do(b"release", pid, 0);
+    close(ready[0]); close(go[1]); close(go2[1]);
+    write(STDOUT_FILENO, b"  armed=".as_ptr(), 8); print_dec(armed as usize);
+    write(STDOUT_FILENO, b" sharer=".as_ptr(), 8); print_dec(sharer);
+    write(STDOUT_FILENO, b" before=".as_ptr(), 8); print_dec(before);
+    write(STDOUT_FILENO, b" before_wait=".as_ptr(), 13); print_dec(mid);
+    write(STDOUT_FILENO, b" at_wait=".as_ptr(), 9); print_dec(at_wait);
+    write(STDOUT_FILENO, b"\n".as_ptr(), 1);
+    report(name, armed && raced && sharer > 0 && status == 0 && mid == before && at_wait == before + 1)
 }
 
 /// Whole-test drift: after a batch of children has come and gone, free RAM +

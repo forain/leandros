@@ -5,6 +5,7 @@
 set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-both}" in
@@ -17,10 +18,11 @@ esac
 [[ -e "$HERE/target" ]] || ln -s "$M6/src/cosmic-files/target" "$HERE/target"
 sh "$M6/gen-cargo-config.sh" "$HERE" > /dev/null
 for arch in "${ARCHES[@]}"; do
-  if ! "$M6/build-rust.sh" "$HERE" "$arch" --no-default-features --features wgpu,wayland > /dev/null; then
+  cosmic_cache_build leandros-installer "$arch" "$HERE" "--no-default-features --features wgpu,wayland" "" \
+    "$HERE/target/$arch-unknown-linux-musl/release/leandros-installer|leandros-installer-$arch" -- \
+    sh -c '"$0" "$@" > /dev/null' "$M6/build-rust.sh" "$HERE" "$arch" --no-default-features --features wgpu,wayland || {
     echo "leandros-installer: build failed for $arch (log: $M6/logs/leandros-installer-$arch.log)" >&2
     exit 1
-  fi
-  stage_file 0755 "$HERE/target/$arch-unknown-linux-musl/release/leandros-installer" "$M6_OUT/leandros-installer-$arch"
+  }
   echo "leandros-installer: $arch -> $M6_OUT/leandros-installer-$arch"
 done

@@ -930,7 +930,17 @@ fn rule_inner(cx: &mut Cx, exprs: &[u8]) -> Option<Flow> {
                 }
             }
             // ct state: ESTABLISHED (2) for a flow whose reply was seen, else NEW (8).
-            b"ct" => { let dreg = g(1)?; let st: u32 = if cx.m.rel { 4 } else if cx.m.est { 2 } else { 8 }; rset(&mut regs, dreg, &st.to_ne_bytes())?; }
+            // `ct <key> set <reg>` (NFTA_CT_SREG=4; netavark 2.x `ct mark set meta mark | 0x1000` before dnat) has no dreg:
+            // it only marks the flow, which our forwarder does not consult, so it is accepted and ignored.
+            b"ct" => {
+                if g(4).is_some() { continue; }
+                let dreg = g(1)?;
+                match g(2) {
+                    // NFT_CT_MARK: no per-flow mark is kept; reads as 0
+                    Some(3) => rset(&mut regs, dreg, &0u32.to_ne_bytes())?,
+                    _ => { let st: u32 = if cx.m.rel { 4 } else if cx.m.est { 2 } else { 8 }; rset(&mut regs, dreg, &st.to_ne_bytes())?; }
+                }
+            }
             b"fib" => {
                 let dreg = g(1)?;
                 let local = g(3)? & 2 != 0 && cx.m.local;

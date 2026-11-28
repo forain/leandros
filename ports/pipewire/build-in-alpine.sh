@@ -27,7 +27,7 @@ esac
 (
   set -e
   [ -f /netretry/netretry.sh ] && { . /netretry/netretry.sh; net_shim; }
-  grep -q "^${ALPINE_REL:?}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
+  [ "${ALPINE_REL:?}" = edge ] || grep -q "^${ALPINE_REL}\." /etc/alpine-release || { echo "want Alpine $ALPINE_REL, got $(cat /etc/alpine-release)"; exit 3; }
   # pipewire-pulse: the PulseAudio protocol server (module-protocol-pulse
   # under `pipewire -c pipewire-pulse.conf`). Firefox's cubeb, like most
   # desktop apps, only speaks PulseAudio (libpulse, staged by ports/firefox);

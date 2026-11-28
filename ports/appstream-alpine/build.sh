@@ -31,7 +31,7 @@ esac
 
 branch_of() {
   local lock="$ROOT/ports/alpine/$1.lock" b=""
-  [[ -f "$lock" ]] && b="$(sed -n 's/^# release \(v[0-9.]*\).*/\1/p' "$lock" | head -1)"
+  [[ -f "$lock" ]] && b="$(sed -n 's/^# release \(v[0-9.]*\|edge\).*/\1/p' "$lock" | head -1)"
   if [[ -z "$b" ]]; then
     b="$(net_curl -fsSL --max-time 30 "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/$1/latest-releases.yaml" \
          | sed -n 's/^ *branch: *\(v[0-9.]*\).*/\1/p' | head -1 || true)"

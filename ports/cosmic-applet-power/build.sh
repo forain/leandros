@@ -15,6 +15,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/stage-lib.sh"
 
 . "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/m6out.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/../../scripts/lib/cosmic-cache.sh"
 M6="$HOME/code/leandros-artifacts/m6-session-bins"
 SRC="$M6/src/cosmic-applets"
 
@@ -31,10 +32,11 @@ if [[ ! -x "$M6/build-rust.sh" || ! -d "$SRC/cosmic-applet-power" ]]; then
 fi
 
 for arch in "${ARCHES[@]}"; do
-  if ! "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-power > /dev/null; then
+  cosmic_cache_build cosmic-applet-power "$arch" "$SRC" "-p cosmic-applet-power" "" \
+    "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-power|cosmic-applet-power-$arch" -- \
+    sh -c '"$0" "$@" > /dev/null' "$M6/build-rust.sh" "$SRC" "$arch" -p cosmic-applet-power || {
     echo "cosmic-applet-power: build failed for $arch (log: $M6/logs/cosmic-applets-$arch.log)" >&2
     exit 1
-  fi
-  stage_file 0755 "$SRC/target/$arch-unknown-linux-musl/release/cosmic-applet-power" "$M6_OUT/cosmic-applet-power-$arch"
+  }
   echo "staged $arch: $M6_OUT/cosmic-applet-power-$arch"
 done

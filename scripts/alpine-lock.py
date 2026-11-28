@@ -365,7 +365,8 @@ def cmd_refresh(arch, cached, generated):
     global REL
     if not REL:
         old_rel = lock_release(arch)
-        REL = old_rel if (PIN and old_rel) else latest_stable(arch)
+        # edge is sticky (LEANDROS_ALPINE_RELEASE=edge selects it the first time); PIN keeps any release
+        REL = old_rel if ((PIN or old_rel == "edge") and old_rel) else latest_stable(arch)
     world = world_for(arch)
     held = set(read_list(os.path.join(ADIR, "held")))
     idx = load_index(arch, cached)
@@ -381,7 +382,9 @@ def cmd_refresh(arch, cached, generated):
         if c != p["C"]:
             die("%s: control checksum %s != index %s" % (n, c, p["C"]))
         pkgs[n] = e
+    _rel = REL
     old = read_lock(arch)[2] if os.path.exists(lock_path(arch)) else None
+    REL = _rel   # read_lock() adopts the OLD lock's release; the refresh keeps the one it resolved against
     write_lock(arch, pkgs, [(d, r) for d, r in heldrec], old)
     print("%s: %d packages, %d held references" % (arch, len(pkgs), len(heldrec)))
     bad = policy_violations(pkgs)
@@ -425,7 +428,7 @@ def cmd_check(arch):
     global REL
     pkgs, _, _ = read_lock(arch)
     cur = REL
-    new = latest_stable(arch)
+    new = cur if cur == "edge" else latest_stable(arch)
     stale = []
     if new != cur:
         print("%s: latest-stable is %s, lock is %s" % (arch, new, cur))
