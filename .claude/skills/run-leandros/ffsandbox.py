@@ -44,6 +44,7 @@ dump('SBE access\\n');var mk=await a.createMediaKeys();window.keepMK=mk;dump('SB
 var se=mk.createSession();window.keepSE=se;se.addEventListener('message',function(e){dump('SBE message '+e.messageType+'\\n');});
 await se.generateRequest('keyids',new TextEncoder().encode(JSON.stringify({kids:['AAECAwQFBgcICQoLDA0ODw']})));
 dump('SBE generateRequest-resolved\\n');}catch(e){dump('SBE error '+e+'\\n');}})();
+setInterval(function(){fetch('http://127.0.0.1:9/sb',{cache:'no-store'}).catch(function(){});},3000);
 setInterval(function(){dump('SBV '+v.currentTime.toFixed(2)+'\\n');},2000);</script></body></html>""")
 collect = os.path.join(W, "sbcollect.sh")
 open(collect, "w").write(r'''for d in /proc/[0-9]*; do
@@ -110,8 +111,12 @@ def run(mode):
         if m and m[1] in procs:
             procs[m[1]]["root"] = m[2].strip() or "-"
     # MOZ_SANDBOX_LOGGING also prints policy-building chatter; only the rest counts as an error.
+    # "Failed errno -22 op readlink path /etc|/usr|...": SandboxBrokerClient::DoCall logs EVERY failed broker call when
+    # MOZ_SANDBOX_LOGGING=1 (security/sandbox/linux/SandboxBrokerClient.cpp, "Failed errno %d op %s"). musl's realpath()
+    # (zoneinfo/localtime lookups) readlink()s each path component; readlink on a non-symlink is EINVAL on Linux too, so
+    # Linux/Alpine logs the identical lines. Benign; the counted errors are EACCES/denials.
     noise = re.compile(r"policy for |fixing recursive|removing redundant|Couldn't open video device|adding (read|write)"
-                       r"|\[fslock\]|attempt to open unexpected file /usr/lib/lib(?:softokn3|freeblpriv3)\.so|using seccomp tsync|Parent path is|Adding paths from|[Ff]ailed errno -2\b")
+                       r"|\[fslock\]|attempt to open unexpected file /usr/lib/lib(?:softokn3|freeblpriv3)\.so|using seccomp tsync|Parent path is|Recording mapping |Adding paths from|[Ff]ailed errno -2\b|[Ff]ailed errno -22 op readlink\b")
     real = re.compile(r"errno -13\b|EACCES|denied|seccomp sandbox violation", re.I)
 
     def counted(l):
@@ -161,6 +166,13 @@ def run(mode):
                     ok = False; print(f"  FAIL {t} {p} NoNewPrivs={v['st'].get('NoNewPrivs:')}")
                 if t in ("tab", "rdd", "utility", "gmplugin") and v["root"] != "/.leandros-void":
                     ok = False; print(f"  FAIL {t} {p} root={v['root']}")
+        # The socket (network) process starts lazily on the first http(s) channel; the page fetches a loopback http URL
+        # every 3 s to force it. It is sandboxed (Seccomp 2, NNP 1) but keeps the real root (needs the network).
+        if not any(ptype(v["cmd"]) == "socket" for v in procs.values()):
+            ok = False; print("  FAIL no socket process")
+        for v in procs.values():
+            if ptype(v["cmd"]) == "socket" and v["st"].get("Seccomp:") != "2":
+                ok = False; print(f"  FAIL socket Seccomp={v['st'].get('Seccomp:')}")
         if not any(ptype(v["cmd"]) == "tab" for v in procs.values()):
             ok = False; print("  FAIL no tab process")
         eme = [l.strip() for l in ff.splitlines() if "SBE " in l]
