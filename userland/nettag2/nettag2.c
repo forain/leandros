@@ -647,7 +647,12 @@ static void connect_lo_case(void) {
             if (k == 1 && (r == 0 || e != ECONNREFUSED)) { fail(n, "connect %d to a closed port: rv %d errno %d", i, r, e); bad = 1; }
             if (k == 0 && d > worst_ok) worst_ok = d;
             if (k == 1 && d > worst_ref) worst_ref = d;
-            if (!bad && d > LIMIT_US) { char cb[160]; fail(n, "connect %d (%s) took %lld us %s", i, k ? "refused" : "accepted", d, canary_report(t1, t1 + d, cb, sizeof cb)); bad = 1; }
+            /* Load-robust bound: a vCPU stall the spin canary saw inside the window is host
+             * steal, not a kernel wake-up delay, so it is subtracted before the 20 ms bound
+             * (a lost wake or a parked connect leaves the canary quiet and is not excused). */
+            long long stall = canary_max(canary_spin_ev, &canary_spin_n, t1, t1 + d);
+            if (stall > d) stall = d;
+            if (!bad && d - stall > LIMIT_US) { char cb[160]; fail(n, "connect %d (%s) took %lld us (%lld us after host stall) %s", i, k ? "refused" : "accepted", d, d - stall, canary_report(t1, t1 + d, cb, sizeof cb)); bad = 1; }
             close(s);
             if (k == 0) { int c = accept(l, NULL, NULL); if (c >= 0) close(c); }
         }
