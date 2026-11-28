@@ -3,6 +3,7 @@
 //!   /bin/kvmtest [phase...|all]
 //!
 //! Phases: open caps memslot regs reglist mmio psci wfi sysoff immexit sigkick smp
+//!         vgicv2 sigstress unmap forkvm
 //! Output: `KVMTEST <phase> PASS|FAIL|SKIP detail`, then
 //! `KVMTEST summary pass=N fail=N skip=N`. The exit status is the FAIL count.
 //! Without /dev/kvm (x86_64, hosts without EL2) it prints `SKIP no /dev/kvm`
@@ -40,6 +41,9 @@ extern "C" {
     fn pthread_create(t: *mut usize, attr: *const c_void, f: extern "C" fn(*mut c_void) -> *mut c_void, arg: *mut c_void) -> c_int;
     fn pthread_join(t: usize, ret: *mut *mut c_void) -> c_int;
     fn __errno_location() -> *mut c_int;
+    fn mprotect(addr: *mut c_void, len: usize, prot: c_int) -> c_int;
+    fn fork() -> c_int;
+    fn waitpid(pid: c_int, status: *mut c_int, opts: c_int) -> c_int;
 }
 
 #[panic_handler]
@@ -58,6 +62,11 @@ const KVM_GET_ONE_REG: usize = 0x4010_AEAB;
 const KVM_SET_ONE_REG: usize = 0x4010_AEAC;
 const KVM_GET_REG_LIST: usize = 0xC008_AEB0;
 const KVM_RUN: usize = 0xAE80;
+const KVM_CREATE_DEVICE: usize = 0xC00C_AEE0;
+const KVM_CREATE_DEVICE_TEST: u32 = 1;
+const KVM_DEV_TYPE_ARM_VGIC_V2: u32 = 5;
+const KVM_DEV_TYPE_ARM_VGIC_V3: u32 = 7;
+const ENODEV: c_int = 19;
 
 const EXIT_MMIO: u32 = 6;
 const EXIT_INTR: u32 = 10;
@@ -554,11 +563,211 @@ unsafe fn ph_smp() -> bool {
     pass(n, b"vcpu1 POWER_OFF -> PSCI CPU_ON -> ran at RAM+0x100 with x0=ctx")
 }
 
+// ---- no-v2-vGIC claim + plan step 6 stress ------------------------------------------------------
+#[repr(C)]
+struct CreateDev { ty: u32, fd: u32, flags: u32 }
+
+unsafe fn create_dev(vm: c_int, ty: u32, flags: u32) -> (c_int, c_int) {
+    let mut cd = CreateDev { ty, fd: 0, flags };
+    let rc = ioctl(vm, KVM_CREATE_DEVICE, &mut cd as *mut CreateDev);
+    (rc, if rc < 0 { errno() } else { 0 })
+}
+
+/// The host GIC decides which vGIC exists: v3 host -> only the v3 device (v2 refused, ENODEV);
+/// v2 host -> v3 refused (ENODEV) and v2 refused (ENODEV) while GICH_VA is not set.
+unsafe fn ph_vgicv2() -> bool {
+    let n = b"vgicv2";
+    let kvm = open_kvm();
+    if kvm < 0 { return fail(n, b"open errno", errno() as u64); }
+    let vm = ioctl(kvm, KVM_CREATE_VM, 0usize);
+    if vm < 0 { return fail(n, b"CREATE_VM errno", errno() as u64); }
+    let (r3, e3) = create_dev(vm, KVM_DEV_TYPE_ARM_VGIC_V3, KVM_CREATE_DEVICE_TEST);
+    let (r2, e2) = create_dev(vm, KVM_DEV_TYPE_ARM_VGIC_V2, KVM_CREATE_DEVICE_TEST);
+    let (rb, eb) = create_dev(vm, 99, 0);
+    if rb >= 0 || eb != ENODEV { return fail(n, b"unknown device type must be ENODEV, errno", eb as u64); }
+    if r3 == 0 {
+        // GICv3 host
+        if r2 >= 0 || e2 != ENODEV { return fail(n, b"v3 host: v2 vGIC must be ENODEV, rc", r2 as u64); }
+        return pass(n, b"GICv3 host: v3 vGIC offered, v2 refused with ENODEV");
+    }
+    if e3 != ENODEV { return fail(n, b"v2 host: v3 vGIC must be ENODEV, errno", e3 as u64); }
+    // real (non-TEST) creates must fail the same way, and leave the VM without an irqchip
+    let (r3b, e3b) = create_dev(vm, KVM_DEV_TYPE_ARM_VGIC_V3, 0);
+    if r3b >= 0 || e3b != ENODEV { return fail(n, b"v2 host: v3 create must be ENODEV, errno", e3b as u64); }
+    if r2 >= 0 { // GICH_VA present: a v2 vGIC is legitimately offered
+        close(vm); close(kvm);
+        return pass(n, b"GICv2 host with GICH_VA: v2 vGIC offered, v3 refused with ENODEV");
+    }
+    if e2 != ENODEV { return fail(n, b"v2 host, no GICH_VA: v2 vGIC must be ENODEV, errno", e2 as u64); }
+    let (r2b, e2b) = create_dev(vm, KVM_DEV_TYPE_ARM_VGIC_V2, 0);
+    if r2b >= 0 || e2b != ENODEV { return fail(n, b"v2 host, no GICH_VA: v2 create must be ENODEV, errno", e2b as u64); }
+    pass(n, b"GICv2 host, no GICH_VA: v2 and v3 vGIC both refused with ENODEV")
+}
+
+static STOP: AtomicU64 = AtomicU64::new(0);
+extern "C" fn spammer(_a: *mut c_void) -> *mut c_void {
+    unsafe { while STOP.load(SeqCst) == 0 { pthread_kill(KICK_TARGET, SIGUSR1); usleep(300); } }
+    null_mut()
+}
+
+unsafe fn ph_sigstress() -> bool {
+    let n = b"sigstress";
+    let kvm = open_kvm();
+    if kvm < 0 { return fail(n, b"open errno", errno() as u64); }
+    let Some(c) = setup(n, kvm, &blob::SPIN) else { return false; };
+    signal(SIGUSR1, on_usr1 as *const () as usize);
+    KICK_TARGET = pthread_self();
+    let probe0 = open_kvm(); close(probe0); // lowest free fd before the loop
+    STOP.store(0, SeqCst);
+    let mut th = 0usize;
+    if pthread_create(&mut th, null(), spammer, null_mut()) != 0 { return fail(n, b"pthread_create", 0); }
+    let (mut by_sig, mut by_imm) = (0u32, 0u32);
+    let mut i = 0u32;
+    while i < 1000 {
+        if i & 1 == 1 {
+            wr8(c.run, R_IMMEDIATE_EXIT, 1);
+            let (rc, e) = vrun(c.vcpu);
+            wr8(c.run, R_IMMEDIATE_EXIT, 0);
+            if rc != -1 || e != EINTR { STOP.store(1, SeqCst); pthread_join(th, null_mut()); return fail(n, b"immediate_exit KVM_RUN errno", e as u64); }
+            by_imm += 1;
+        } else {
+            let (rc, e) = vrun(c.vcpu);
+            if !((rc < 0 && e == EINTR) || (rc == 0 && rd32(c.run, R_EXIT_REASON) == EXIT_INTR)) {
+                STOP.store(1, SeqCst); pthread_join(th, null_mut());
+                return fail(n, b"signalled KVM_RUN must be EINTR, errno", e as u64);
+            }
+            by_sig += 1;
+        }
+        i += 1;
+    }
+    STOP.store(1, SeqCst);
+    pthread_join(th, null_mut());
+    if get_u64(c.vcpu, REG_PC) != Some(RAM_GPA) { return fail(n, b"spin guest pc moved", get_u64(c.vcpu, REG_PC).unwrap_or(0)); }
+    let probe1 = open_kvm(); close(probe1);
+    if probe0 != probe1 { return fail(n, b"fd leak: lowest free fd changed to", probe1 as u64); }
+    Line::new().s(b"KVMTEST sigstress PASS 1000 KVM_RUN returns (").d(by_sig as u64).s(b" signal, ").d(by_imm as u64).s(b" immediate_exit), no hang, no fd leak").flush(); PASS += 1;
+    true
+}
+
+static RUN_VCPU: AtomicU64 = AtomicU64::new(0);
+static RUN_RC: AtomicU64 = AtomicU64::new(0xdead);
+static RUN_ERRNO: AtomicU64 = AtomicU64::new(0);
+static RUN_EXIT: AtomicU64 = AtomicU64::new(0);
+static RUN_DONE: AtomicU64 = AtomicU64::new(0);
+static RUN_PTR: AtomicU64 = AtomicU64::new(0);
+extern "C" fn run_thread(_a: *mut c_void) -> *mut c_void {
+    unsafe {
+        let (rc, e) = vrun(RUN_VCPU.load(SeqCst) as c_int);
+        RUN_RC.store(rc as i64 as u64, SeqCst);
+        RUN_ERRNO.store(e as u64, SeqCst);
+        RUN_EXIT.store(rd32(RUN_PTR.load(SeqCst) as *mut u8, R_EXIT_REASON) as u64, SeqCst);
+        RUN_DONE.store(1, SeqCst);
+    }
+    null_mut()
+}
+
+/// Starts the COUNTER guest in a thread; returns the thread id once the counter moves.
+unsafe fn start_counter(n: &[u8], c: &Ctx) -> Option<usize> {
+    for (i, w) in blob::COUNTER.iter().enumerate() { (c.ram as *mut u32).add(i).write_volatile(*w); }
+    RUN_VCPU.store(c.vcpu as u64, SeqCst); RUN_PTR.store(c.run as u64, SeqCst);
+    RUN_DONE.store(0, SeqCst); RUN_RC.store(0xdead, SeqCst);
+    let mut th = 0usize;
+    if pthread_create(&mut th, null(), run_thread, null_mut()) != 0 { fail(n, b"pthread_create", 0); return None; }
+    let ctr = c.ram.add(0x1000) as *const u32;
+    let mut t = 0;
+    while ctr.read_volatile() == 0 && t < 2000 { usleep(5_000); t += 1; }
+    if ctr.read_volatile() == 0 { fail(n, b"counter guest never ran", 0); return None; }
+    Some(th)
+}
+
+/// Waits up to `ms` for the run thread to finish.
+unsafe fn wait_run(ms: u32) -> bool {
+    let mut t = 0;
+    while RUN_DONE.load(SeqCst) == 0 && t < ms { usleep(1000); t += 1; }
+    RUN_DONE.load(SeqCst) != 0
+}
+
+unsafe fn ph_unmap_one(n: &[u8], protect: bool) -> bool {
+    let kvm = open_kvm();
+    if kvm < 0 { return fail(n, b"open errno", errno() as u64); }
+    let Some(c) = setup(n, kvm, &blob::COUNTER) else { return false; };
+    let Some(th) = start_counter(n, &c) else { return false; };
+    signal(SIGUSR1, on_usr1 as *const () as usize);
+    usleep(20_000);
+    // another thread (here: main) pulls the guest RAM out from under the running vCPU
+    let r = if protect { mprotect(c.ram as *mut c_void, RAM_SIZE, 0) } else { munmap(c.ram as *mut c_void, RAM_SIZE) };
+    if r != 0 { return fail(n, b"munmap/mprotect errno", errno() as u64); }
+    // the guest's next access must be refused (stage-2 torn down): KVM_RUN must come back by itself
+    let self_exit = wait_run(3000);
+    if !self_exit {
+        pthread_kill(th, SIGUSR1); // unblock so the test can report instead of hanging
+        wait_run(3000);
+        return fail(n, b"guest kept running on unmapped/protected RAM (stage-2 not invalidated), kick needed", 1);
+    }
+    pthread_join(th, null_mut());
+    let rc = RUN_RC.load(SeqCst) as i64; let e = RUN_ERRNO.load(SeqCst); let ex = RUN_EXIT.load(SeqCst);
+    let ok = (rc < 0 && e != EINTR as u64) || (rc == 0 && ex != EXIT_INTR as u64);
+    if !ok { return fail(n, b"KVM_RUN after RAM removal: rc/errno/exit unexpected, errno", e); }
+    Line::new().s(b"KVMTEST ").s(n).s(b" PASS KVM_RUN returned by itself: rc=").d(rc as u64).s(b" errno=").d(e).s(b" exit_reason=").d(ex).flush(); PASS += 1;
+    if protect { mprotect(c.ram as *mut c_void, RAM_SIZE, 3); }
+    true
+}
+unsafe fn ph_unmap() -> bool {
+    let a = ph_unmap_one(b"unmap", false);
+    CUR = b"mprotect";
+    let b = ph_unmap_one(b"mprotect", true);
+    a && b
+}
+
+/// fork() while a vCPU runs: the child must not drive the VM or see guest stores; the parent's VM lives on.
+unsafe fn ph_forkvm() -> bool {
+    let n = b"forkvm";
+    let kvm = open_kvm();
+    if kvm < 0 { return fail(n, b"open errno", errno() as u64); }
+    let Some(c) = setup(n, kvm, &blob::COUNTER) else { return false; };
+    let Some(th) = start_counter(n, &c) else { return false; };
+    signal(SIGUSR1, on_usr1 as *const () as usize);
+    let ctr = c.ram.add(0x1000) as *const u32;
+    let pid = fork();
+    if pid < 0 { return fail(n, b"fork errno", errno() as u64); }
+    if pid == 0 {
+        // child: no vCPU thread, no usable guest mapping
+        let mut bad = 0;
+        let (rc, _) = vrun(c.vcpu);
+        if rc >= 0 { bad |= 1; }
+        let nv = ioctl(c.vm, KVM_CREATE_VCPU, 5usize);
+        if nv >= 0 { bad |= 2; }
+        let a = ctr.read_volatile();
+        usleep(100_000);
+        let b = ctr.read_volatile();
+        if a != b { bad |= 4; } // the child's RAM copy must be frozen: guest stores go to the parent's pages
+        _exit(bad);
+    }
+    let mut st: c_int = 0;
+    if waitpid(pid, &mut st, 0) != pid { return fail(n, b"waitpid errno", errno() as u64); }
+    let code = (st >> 8) & 0xff;
+    if st & 0x7f != 0 { return fail(n, b"child killed by signal", (st & 0x7f) as u64); }
+    if code & 1 != 0 { return fail(n, b"child KVM_RUN on the inherited vcpu fd succeeded", 1); }
+    if code & 2 != 0 { return fail(n, b"child KVM_CREATE_VCPU on the inherited vm fd succeeded", 2); }
+    if code & 4 != 0 { return fail(n, b"child sees guest stores (stale stage-2 shares COW page)", 4); }
+    // parent's VM keeps working: the counter still advances and KVM_RUN is still interruptible
+    let a = ctr.read_volatile();
+    usleep(100_000);
+    let b = ctr.read_volatile();
+    if a == b { return fail(n, b"parent guest stalled after fork, counter", a as u64); }
+    pthread_kill(th, SIGUSR1);
+    if !wait_run(3000) { return fail(n, b"parent KVM_RUN not interruptible after fork", 0); }
+    pthread_join(th, null_mut());
+    if RUN_RC.load(SeqCst) as i64 != -1 || RUN_ERRNO.load(SeqCst) != EINTR as u64 { return fail(n, b"parent KVM_RUN after kick, errno", RUN_ERRNO.load(SeqCst)); }
+    pass(n, b"child could not run/see the VM; parent guest kept running and stayed interruptible")
+}
+
 // ---- driver -----------------------------------------------------------------------------------
-const PHASES: [(&[u8], unsafe fn() -> bool); 12] = [
+const PHASES: [(&[u8], unsafe fn() -> bool); 16] = [
     (b"open", ph_open), (b"caps", ph_caps), (b"memslot", ph_memslot), (b"regs", ph_regs), (b"reglist", ph_reglist),
     (b"mmio", ph_mmio), (b"psci", ph_psci), (b"wfi", ph_wfi), (b"sysoff", ph_sysoff),
     (b"immexit", ph_immexit), (b"sigkick", ph_sigkick), (b"smp", ph_smp),
+    (b"vgicv2", ph_vgicv2), (b"sigstress", ph_sigstress), (b"unmap", ph_unmap), (b"forkvm", ph_forkvm),
 ];
 
 unsafe fn cstr_eq(p: *const u8, s: &[u8]) -> bool {
