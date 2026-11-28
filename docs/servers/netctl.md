@@ -468,6 +468,10 @@ It is dropped when a stored profile has the same SSID. It cannot be edited throu
   - records by whole 48-byte parts. Readers zero-extend or truncate, `NcQuery.elem_size` handles list strides, and the profile file grows through `header_size`/`entry_size`.
 - `NETCTL_ABI_VERSION` changes only for an incompatible change. A client that finds a different version must not issue commands.
 
+## The `netctl` command
+
+[`userland/netctl`](../../userland/netctl/src/main.rs) takes `-h`/`--help` on every subcommand (usage on stdout, exit 0, no action), rejects an unknown option with exit 2, and accepts an SSID that starts with `-` after `--`. A help request before any `--` never reaches the daemon, so `netctl connect --help` no longer tries to join an SSID named `--help`; `netctltest` has CLI cases for it.
+
 ## Code and tests
 
 - [`lib/netctl-abi`](../../lib/netctl-abi): types, ioctl numbers, event encoder and `Reassembler`, profile parser and serializer, CRC-32, helpers (NM quality, channel ↔ frequency, UUID text, deterministic UUIDs, secret validation).

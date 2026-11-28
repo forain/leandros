@@ -12,7 +12,7 @@ musl, and the `../relibc` sibling checkout is no longer needed.)
 | Library | Where | Used by | Linkage |
 |---|---|---|---|
 | leandros-libc | [userland/libc](../../userland/libc/src/lib.rs) | `init`, `login`, `shell`, `greeter-launch`, `mount`, `aplay`, `vfstest`, DOOM, … | static, target `<arch>-unknown-none` |
-| musl 1.2.5 | Rust's self-contained musl, Alpine's musl (static, via the clang wrapper), and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
+| musl 1.2.6 (Alpine edge) | Rust's self-contained musl, Alpine's musl (static, via the clang wrapper), and a shipped `ld-musl` + `libc.so` | brush, coreutils, busd, greetd, COSMIC, Mesa, PipeWire, Firefox, MAME, and the `MUSL_LINKED` tests in [scripts/build-userland.sh](../../scripts/build-userland.sh) | static or dynamic |
 
 The `MUSL_LINKED` tests (`pthreadtest`, `sigtest`, `timertest`, `polltest`, `drmsmoke`, `vttest`,
 `ping`, …) are `no_std` crates linked against static `<arch>-unknown-linux-musl` through the clang/lld
@@ -62,7 +62,7 @@ of image.
 
 The desktop needs dynamic linking: `dlopen` sits on the critical path in cosmic-comp's EGL
 loading, Mesa's GBM/DRI loader and cosmic-panel's `use_system_lib`. So the image ships a real
-`ld-musl-<arch>.so.1` and `libc.so` (musl 1.2.5), and the ported stack is dynamically linked
+`ld-musl-<arch>.so.1` and `libc.so` (musl 1.2.6 from the Alpine edge lock), and the ported stack is dynamically linked
 against them.
 
 The kernel side is in [../kernel/processes.md](../kernel/processes.md): an `ET_DYN` main
